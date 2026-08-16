@@ -1,6 +1,7 @@
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::ModelManager;
+use crate::settings::AppSettings;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -56,13 +57,14 @@ pub fn free_disk_bytes_for(path: &std::path::Path) -> Option<u64> {
 pub fn health_check(
     db: &Database,
     model_mgr: &ModelManager,
+    settings: &AppSettings,
     data_dir: Option<&std::path::Path>,
 ) -> AppResult<serde_json::Value> {
     let info = db.info()?;
     let segment_count = info["segmentCount"].as_i64().unwrap_or(0);
     let db_size = info["sizeBytes"].as_i64().unwrap_or(0);
     let uptime = INSTANT.elapsed().as_secs();
-    let missing_required = model_mgr.missing_required_model_names();
+    let missing_required = model_mgr.missing_required_model_names_for(&settings.asr_model_size);
     let missing_optional = model_mgr.missing_optional_model_names();
     // True-10 audit: the auto-snapshot safety net could silently stop for months (warn-only in a
     // detached thread) and disk exhaustion was checked nowhere. Both are now health signals.
@@ -74,6 +76,7 @@ pub fn health_check(
         "uptime": uptime,
         "segment_count": segment_count,
         "memory_mb": current_memory_mb(),
+        "primary_asr_model": format!("{:?}", settings.asr_model_size),
         "missing_models": missing_required,
         "missing_optional_models": missing_optional,
         "snapshot_last_success_epoch_secs": snapshot_health.last_success_epoch_secs,

@@ -60,7 +60,9 @@
                 <div
                   class="flex items-center justify-between gap-4 rounded-token px-2 py-1.5 text-sm transition-colors hover:bg-surface-2"
                 >
-                  <span class="text-muted">{s.description}</span>
+                  <span class="text-muted"
+                    >{s.descriptionKey ? $t(s.descriptionKey) : s.description}</span
+                  >
                   <kbd class="shrink-0">{modLabel(s)}</kbd>
                 </div>
               {/each}

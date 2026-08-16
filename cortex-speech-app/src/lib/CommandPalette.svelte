@@ -30,13 +30,21 @@
   let activeIndex = $state(0);
   let listEl: HTMLDivElement | undefined = $state();
 
+  const shortcutCategoryKeys: Record<string, string> = {
+    general: 'general',
+    file: 'fileOperations',
+    edit: 'editing',
+    navigation: 'navigation',
+    playback: 'playback',
+  };
+
   const commands = $derived.by<Command[]>(() => {
     const fromShortcuts: Command[] = (globalKeyboardManager?.getAll() ?? [])
       .filter((s) => !reviewActive || s.allowInReview)
       .map((s, i) => ({
         id: `sc-${i}`,
-        label: s.description,
-        category: s.category,
+        label: s.descriptionKey ? $t(s.descriptionKey) : s.description,
+        category: $t(shortcutCategoryKeys[s.category] ?? s.category),
         hint: globalKeyboardManager?.formatShortcut(s),
         run: s.action,
       }));
@@ -107,15 +115,8 @@
   }
 </script>
 
-<Modal {open} {onClose} size="lg">
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div
-    role="combobox"
-    aria-expanded="true"
-    aria-controls="cmdk-list"
-    tabindex="-1"
-    onkeydown={onKeydown}
-  >
+<Modal {open} {onClose} size="lg" ariaLabel={$t('cmdk.title')}>
+  <div>
     <div class="flex items-center gap-3 border-b border-line px-4 py-3.5">
       <svg
         class="text-subtle"
@@ -132,12 +133,19 @@
       <!-- svelte-ignore a11y_autofocus -->
       <input
         autofocus
+        role="combobox"
+        aria-expanded="true"
+        aria-controls="cmdk-list"
+        aria-activedescendant={filtered[activeIndex]
+          ? `cmdk-option-${filtered[activeIndex].id}`
+          : undefined}
         class="flex-1 bg-transparent text-sm text-default outline-none placeholder:text-subtle"
-        placeholder="Search commands…"
+        placeholder={$t('cmdk.search')}
         bind:value={query}
-        aria-label="Search commands"
+        aria-label={$t('cmdk.search')}
         spellcheck="false"
         autocomplete="off"
+        onkeydown={onKeydown}
       />
       <kbd>Esc</kbd>
     </div>
@@ -145,6 +153,7 @@
     <div bind:this={listEl} id="cmdk-list" class="max-h-[58vh] overflow-auto p-2" role="listbox">
       {#each filtered as cmd, i (cmd.id)}
         <button
+          id={`cmdk-option-${cmd.id}`}
           type="button"
           role="option"
           aria-selected={i === activeIndex}
@@ -168,9 +177,9 @@
     </div>
 
     <div class="flex items-center gap-3 border-t border-line px-4 py-2 text-[11px] text-subtle">
-      <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
-      <span><kbd>↵</kbd> run</span>
-      <span class="ms-auto tnum">{filtered.length} command{filtered.length === 1 ? '' : 's'}</span>
+      <span><kbd>↑</kbd><kbd>↓</kbd> {$t('cmdk.navigate')}</span>
+      <span><kbd>↵</kbd> {$t('cmdk.run')}</span>
+      <span class="ms-auto tnum">{$t('cmdk.count').replace('{n}', String(filtered.length))}</span>
     </div>
   </div>
 </Modal>

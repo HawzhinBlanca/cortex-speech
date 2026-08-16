@@ -1,6 +1,7 @@
 import { get } from 'svelte/store';
 import { openSettings } from './stores/settingsStore';
 import { t } from './i18n';
+import { formatUnknownError } from './errorText';
 
 export type ErrorAction = {
   label: string;
@@ -32,12 +33,7 @@ function openModelsSettings(): void {
 export function parseActionableError(error: unknown): ActionableError {
   // Never surface the literal string "undefined"/"null" to the user: a nullish error (e.g. a
   // resource event with no message) must degrade to a readable fallback, not String(undefined).
-  const raw =
-    error instanceof Error
-      ? error.message
-      : error === undefined || error === null || error === ''
-        ? 'Unknown error'
-        : String(error);
+  const raw = formatUnknownError(error);
 
   if (isModelError(raw)) {
     return {

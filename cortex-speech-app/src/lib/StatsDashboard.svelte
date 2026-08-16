@@ -147,7 +147,8 @@
     // (18.7%) by counting clips marked bad, and read a THIRD field order (normalized first) that
     // disagreed with both the backend and the effective-transcript rule.
     const countedForChars = items.filter(
-      (segment) => !isHumanRejected(segment) && !isPlaceholderTranscript(effectiveTranscript(segment)),
+      (segment) =>
+        !isHumanRejected(segment) && !isPlaceholderTranscript(effectiveTranscript(segment)),
     );
     const totalChars = countedForChars.reduce(
       (sum, segment) => sum + effectiveTranscript(segment).length,

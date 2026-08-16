@@ -62,7 +62,9 @@
 >
   <!-- Undo/Redo Action Bar -->
   <div class="flex items-center justify-between border-b border-cortex-800/60 pb-3">
-    <h3 class="text-xs font-bold text-cortex-400 uppercase tracking-widest">{$t('history.stack')}</h3>
+    <h3 class="text-xs font-bold text-cortex-400 uppercase tracking-widest">
+      {$t('history.stack')}
+    </h3>
     <div class="flex gap-1.5">
       <button
         class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 flex items-center gap-1 relative

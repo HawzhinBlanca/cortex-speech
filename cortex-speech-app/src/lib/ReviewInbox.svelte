@@ -26,6 +26,9 @@
   let queue: SpeechSegment[] = [];
   let currentIndex = 0;
   let isLoading = false;
+  // A transport/database failure is not an empty queue. Keep the failure as first-class state so
+  // the reviewer is never shown the celebratory "Inbox zero" claim when nothing was actually read.
+  let loadError: string | null = null;
   let isEditing = false;
   let editText = '';
   let editTextarea: HTMLTextAreaElement | null = null;
@@ -74,7 +77,9 @@
       const next = { ...settings, juryAutonomyLevel: val };
       await api.updateSettings(next);
       settings = next;
-      statusMsg = $t('inbox.status.autonomySet', { level: $t(`inbox.autonomy.${autonomyKey(val)}`) });
+      statusMsg = $t('inbox.status.autonomySet', {
+        level: $t(`inbox.autonomy.${autonomyKey(val)}`),
+      });
     } catch (e) {
       autonomyLevel = previous; // revert so the dial never lies about the persisted state
       statusMsg = $t('inbox.status.autonomyFailed', { err: String(e) });
@@ -100,7 +105,9 @@
   /// clipping > 0.1). Kept identical on purpose: two definitions of "bad audio" that drift apart would
   /// show a green chip on a clip the gate refused to trust.
   function hasPoorAudio(seg: { snrDb?: number | null; clippingRatio?: number | null }): boolean {
-    return (seg.snrDb != null && seg.snrDb < 5) || (seg.clippingRatio != null && seg.clippingRatio > 0.1);
+    return (
+      (seg.snrDb != null && seg.snrDb < 5) || (seg.clippingRatio != null && seg.clippingRatio > 0.1)
+    );
   }
 
   function confidenceBand(
@@ -109,7 +116,8 @@
     poorAudio = false,
   ): { label: string; icon: string; color: string } {
     const pct = (c: number) => ({ pct: String(Math.round(c * 100)) });
-    if (conf == null) return { label: tr('inbox.band.unknown'), icon: '❓', color: 'var(--text-subtle)' };
+    if (conf == null)
+      return { label: tr('inbox.band.unknown'), icon: '❓', color: 'var(--text-subtle)' };
     // External review 2026-08-06 #2: `agreementScore` is model AGREEMENT, and agreement is not
     // trustworthiness. Every recognizer can confidently agree on the same garbage when the audio is
     // bad — which is exactly why the jury vetoes those clips. Rendering that as a green "97%" told the
@@ -119,17 +127,26 @@
       return { label: tr('inbox.band.poorAudio', pct(conf)), icon: '🔊', color: 'var(--warning)' };
     }
     if (conf >= 0.9)
-      return { label: tr('inbox.band.veryConfident', pct(conf)), icon: '✅', color: 'var(--success)' };
+      return {
+        label: tr('inbox.band.veryConfident', pct(conf)),
+        icon: '✅',
+        color: 'var(--success)',
+      };
     if (conf >= 0.75)
       return { label: tr('inbox.band.fairlySure', pct(conf)), icon: '🟡', color: 'var(--warning)' };
     if (conf >= 0.55)
-      return { label: tr('inbox.band.unsure', pct(conf)), icon: '⚠️', color: 'rgb(var(--orange-400-rgb))' };
+      return {
+        label: tr('inbox.band.unsure', pct(conf)),
+        icon: '⚠️',
+        color: 'rgb(var(--orange-400-rgb))',
+      };
     return { label: tr('inbox.band.low', pct(conf)), icon: '🔴', color: 'var(--danger)' };
   }
 
   // ── Queue loading ─────────────────────────────────────────────────────────────
   async function loadQueue() {
     isLoading = true;
+    loadError = null;
     try {
       queue = await api.getEscalationQueue(200);
       currentIndex = 0;
@@ -137,7 +154,8 @@
       // reload would fire a backend clear against a segment no longer in view.
       history = [];
     } catch (e) {
-      statusMsg = $t('inbox.status.loadFailed', { err: String(e) });
+      loadError = $t('inbox.status.loadFailed', { err: String(e) });
+      statusMsg = loadError;
     } finally {
       isLoading = false;
     }
@@ -150,8 +168,7 @@
     isRunningJury = true;
     statusMsg = $t('inbox.status.running');
     try {
-      const allSegs = await api.getSegments();
-      const targetIds = allSegs.filter((s) => !s.verified).map((s) => s.id);
+      const targetIds = await api.getSegmentIdsForView({ verified: false });
       if (targetIds.length === 0) {
         statusMsg = $t('inbox.status.noUnverified');
         isRunningJury = false;
@@ -374,7 +391,10 @@
     // palette input) — each mis-fire silently stamps a human adjudication on the current clip.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+    if (
+      target &&
+      (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+    ) {
       return;
     }
     // Match on the PHYSICAL key (layout-independent): with the owner's Central Kurdish layout
@@ -460,12 +480,12 @@
 </script>
 
 <!-- ── Root container ──────────────────────────────────────────────────────── -->
-<div class="inbox-root" role="main" aria-label={$t('reviewInbox')}>
+<div class="inbox-root" role="dialog" aria-modal="true" aria-labelledby="review-inbox-title">
   <!-- Header -->
   <div class="inbox-header">
     <div class="inbox-title">
       <span class="inbox-icon">📬</span>
-      <h2>{$t('reviewInbox')}</h2>
+      <h2 id="review-inbox-title">{$t('reviewInbox')}</h2>
       {#if pendingCount > 0}
         <span class="inbox-badge">{pendingCount}</span>
       {/if}
@@ -479,7 +499,8 @@
       title={$t('inbox.runJuryTitle')}
     >
       {#if isRunningJury}
-        <span class="spinner inline-block" style="width:10px;height:10px;"></span> {$t('inbox.runningJury')}
+        <span class="spinner inline-block" style="width:10px;height:10px;"></span>
+        {$t('inbox.runningJury')}
       {:else}
         ⚡ {$t('inbox.runJury')}
       {/if}
@@ -489,10 +510,9 @@
            The backend hard-refuses T2 egress when the opt-in is off (the run stays local) — surface
            that state here so it's not silent, mirroring the gated Scribe buttons. -->
       <span
+        class="local-only-badge"
         data-testid="jury-local-only"
-        style="font-size: 0.68rem; opacity: 0.75; margin-left: 6px; white-space: nowrap;"
-        title="Cloud T2 (Gemini) escalation is OFF in Settings — this run stays fully local (T0/T1); contested segments go to your inbox and no audio leaves your machine."
-        >🔒 Local only</span
+        title={$t('inbox.localOnlyTitle')}>🔒 {$t('inbox.localOnly')}</span
       >
     {/if}
 
@@ -500,10 +520,12 @@
     <div class="autonomy-dial" role="group" aria-label={$t('inbox.autonomyLevel')}>
       {#each [['observe', '👁', 'inbox.autonomy.observe'], ['propose', '💡', 'inbox.autonomy.propose'], ['act_confirm', '✅', 'inbox.autonomy.actConfirm'], ['act_auto', '🤖', 'inbox.autonomy.actAuto']] as [val, emoji, key]}
         <button
+          type="button"
           class="dial-btn"
           class:active={autonomyLevel === val}
+          aria-pressed={autonomyLevel === val}
           onclick={() => setAutonomy(val as typeof autonomyLevel)}
-          title={val}>{emoji} {$t(key)}</button
+          title={$t(key)}>{emoji} {$t(key)}</button
         >
       {/each}
     </div>
@@ -513,14 +535,21 @@
 
   {#if isLoading}
     <div class="inbox-loading">
-      <span class="spinner"></span> {$t('inbox.loadingQueue')}
+      <span class="spinner"></span>
+      {$t('inbox.loadingQueue')}
+    </div>
+  {:else if loadError}
+    <div class="inbox-empty" role="alert" data-testid="review-inbox-load-error">
+      <h3>{$t('inbox.loadErrorTitle')}</h3>
+      <p>{loadError}</p>
+      <button class="btn btn-primary" onclick={loadQueue}>{$t('inbox.retry')}</button>
     </div>
   {:else if queue.length === 0}
     <div class="inbox-empty">
       <div class="empty-icon">🎉</div>
       <h3>{$t('inbox.zero')}</h3>
       <p>{$t('inbox.zeroHint')}</p>
-      <div style="display: flex; gap: 10px; margin-top: 10px;">
+      <div class="empty-actions">
         <button class="btn btn-primary" onclick={triggerJuryPipeline} disabled={isRunningJury}>
           {isRunningJury ? $t('inbox.runningJury') : '⚡ ' + $t('inbox.runJuryPipeline')}
         </button>
@@ -665,17 +694,41 @@
 
           <!-- Verb bar (Prodigy-style) -->
           <div class="verb-bar" role="group" aria-label={$t('inbox.reviewActions')}>
-            <button class="verb-btn accept" onclick={accept} title={$t('inbox.acceptTitle')} id="inbox-accept">
-              <span class="verb-key">A</span> {$t('inbox.accept')}
+            <button
+              class="verb-btn accept"
+              onclick={accept}
+              title={$t('inbox.acceptTitle')}
+              id="inbox-accept"
+            >
+              <span class="verb-key">A</span>
+              {$t('inbox.accept')}
             </button>
-            <button class="verb-btn edit" onclick={startEdit} title={$t('inbox.editTitle')} id="inbox-edit">
-              <span class="verb-key">E</span> {$t('inbox.edit')}
+            <button
+              class="verb-btn edit"
+              onclick={startEdit}
+              title={$t('inbox.editTitle')}
+              id="inbox-edit"
+            >
+              <span class="verb-key">E</span>
+              {$t('inbox.edit')}
             </button>
-            <button class="verb-btn reject" onclick={reject} title={$t('inbox.rejectTitle')} id="inbox-reject">
-              <span class="verb-key">X</span> {$t('inbox.reject')}
+            <button
+              class="verb-btn reject"
+              onclick={reject}
+              title={$t('inbox.rejectTitle')}
+              id="inbox-reject"
+            >
+              <span class="verb-key">X</span>
+              {$t('inbox.reject')}
             </button>
-            <button class="verb-btn skip" onclick={skip} title={$t('inbox.skipTitle')} id="inbox-skip">
-              <span class="verb-key">⎵</span> {$t('inbox.skip')}
+            <button
+              class="verb-btn skip"
+              onclick={skip}
+              title={$t('inbox.skipTitle')}
+              id="inbox-skip"
+            >
+              <span class="verb-key">⎵</span>
+              {$t('inbox.skip')}
             </button>
             <button
               class="verb-btn flag"
@@ -683,7 +736,8 @@
               title={$t('inbox.flagTitle')}
               id="inbox-flag"
             >
-              <span class="verb-key">F</span> {$t('inbox.flag')}
+              <span class="verb-key">F</span>
+              {$t('inbox.flag')}
             </button>
             <button
               class="verb-btn undo"
@@ -692,7 +746,8 @@
               id="inbox-undo"
               disabled={history.length === 0}
             >
-              <span class="verb-key">⌫</span> {$t('undo')}
+              <span class="verb-key">⌫</span>
+              {$t('undo')}
             </button>
           </div>
 
@@ -711,6 +766,7 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-width: 0;
     background: var(--app-bg);
     color: var(--text);
     font-family: var(--font-sans);
@@ -721,6 +777,7 @@
   /* ── Header ─────────────────────────────────────────────────────────────────── */
   .inbox-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 12px;
     padding: 12px 16px;
@@ -732,10 +789,15 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .inbox-title h2 {
     margin: 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-size: 0.95rem;
     font-weight: 600;
     color: var(--accent);
@@ -766,6 +828,7 @@
   /* ── Autonomy Dial ───────────────────────────────────────────────────────────── */
   .autonomy-dial {
     display: flex;
+    flex-wrap: wrap;
     gap: 4px;
   }
   .dial-btn {
@@ -787,6 +850,12 @@
     background: var(--accent);
     border-color: var(--accent);
     color: var(--text-on-accent);
+  }
+  .local-only-badge {
+    margin-inline-start: 6px;
+    font-size: 0.68rem;
+    opacity: 0.75;
+    white-space: nowrap;
   }
 
   /* ── Loading / Empty ─────────────────────────────────────────────────────────── */
@@ -813,6 +882,14 @@
     text-align: center;
     max-width: 300px;
   }
+  .empty-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    margin-top: 10px;
+  }
   .spinner {
     display: inline-block;
     width: 18px;
@@ -832,6 +909,8 @@
   .inbox-body {
     display: flex;
     flex: 1;
+    min-width: 0;
+    min-height: 0;
     overflow: hidden;
   }
 
@@ -911,6 +990,8 @@
   /* ── Focus Card ─────────────────────────────────────────────────────────────── */
   .focus-card {
     flex: 1;
+    min-width: 0;
+    min-height: 0;
     overflow-y: auto;
     padding: 20px 24px;
     display: flex;
@@ -1192,6 +1273,92 @@
     }
     to {
       opacity: 1;
+    }
+  }
+
+  /* WCAG reflow: at a 320 CSS-pixel viewport the App overlay leaves roughly 272px after padding.
+     Stack the rail above the card and let header controls form deliberate rows; nothing is clipped
+     behind the root's overflow boundary, while the queue remains a one-axis scroll region. */
+  @media (max-width: 480px) {
+    .inbox-root {
+      border-radius: 8px;
+    }
+    .inbox-header {
+      align-items: center;
+      gap: 8px;
+      padding: 10px;
+    }
+    .inbox-title {
+      order: 1;
+      flex: 1 1 calc(100% - 2.5rem);
+    }
+    .close-btn {
+      order: 2;
+      flex: 0 0 auto;
+    }
+    .inbox-header > .btn {
+      order: 3;
+      flex: 1 1 auto;
+      min-width: 0;
+      white-space: normal;
+    }
+    .local-only-badge {
+      order: 3;
+      flex: 0 1 auto;
+      min-width: 0;
+      margin-inline-start: 0;
+      white-space: normal;
+    }
+    .autonomy-dial {
+      order: 4;
+      display: grid;
+      flex: 1 1 100%;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      width: 100%;
+    }
+    .dial-btn {
+      min-width: 0;
+      padding: 5px 6px;
+      white-space: normal;
+    }
+    .inbox-body {
+      flex-direction: column;
+    }
+    .queue-rail {
+      width: 100%;
+      max-height: 6.5rem;
+      border-right: 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .rail-list {
+      display: flex;
+      flex: 0 0 auto;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 4px;
+    }
+    .rail-row {
+      flex: 0 0 7rem;
+      min-width: 0;
+    }
+    .rail-item {
+      width: calc(100% - 4px);
+      margin: 1px 2px;
+    }
+    .focus-card {
+      width: 100%;
+      padding: 12px;
+    }
+    .inbox-loading,
+    .inbox-empty {
+      min-width: 0;
+      padding: 16px;
+    }
+    .empty-actions {
+      flex-direction: column;
+    }
+    .empty-actions .btn {
+      width: 100%;
     }
   }
 </style>

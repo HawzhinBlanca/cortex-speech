@@ -15,21 +15,18 @@ test.describe('Dataset validation panel', () => {
     await expect(panel.locator('#validation-title')).toBeVisible();
     await expect(panel).toHaveAttribute('aria-modal', 'true');
 
-    await panel.getByRole('button', { name: /close|داخستن/i }).first().click();
+    await panel
+      .getByRole('button', { name: /close|داخستن/i })
+      .first()
+      .click();
     await expect(panel).not.toBeVisible();
   });
 
   test('validate button stays disabled with no segments', async ({ page }) => {
     await page.addInitScript(() => {
-      const internals = window.__TAURI_INTERNALS__;
-      if (!internals) return;
-      const invoke = internals.invoke.bind(internals);
-      internals.invoke = async (cmd: string) => {
-        // The store loads via the paged command now; keep the legacy override too.
-        if (cmd === 'get_segments_page') return { items: [], total: 0, nextCursor: null };
-        if (cmd === 'get_segments') return [];
-        return invoke(cmd);
-      };
+      // The shared mock reads this marker at invocation time. This avoids relying on the undefined
+      // ordering of multiple addInitScript callbacks to wrap __TAURI_INTERNALS__ safely.
+      localStorage.setItem('__cortex_e2e_empty_library__', '1');
     });
 
     await page.goto('/');

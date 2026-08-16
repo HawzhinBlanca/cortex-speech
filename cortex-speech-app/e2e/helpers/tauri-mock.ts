@@ -18,8 +18,15 @@ export async function installTauriMock(page: Page): Promise<void> {
     const mockSettings = {
       model_dir: '',
       output_dir: '',
-      asr_provider: 'Local',
-      asr_model_size: 'CTC300M',
+      asr_provider: 'SherpaOnnxCtc',
+      // Mirror the production factory contract: the fine-tuned OmniASR-7B champion is the sole
+      // automatic ASR. Smaller/cloud engines must not appear merely because the browser fixture is
+      // older than the backend default.
+      asr_model_size: 'WSL7B',
+      multi_engine_hypotheses: false,
+      use_finetuned_asr: false,
+      cloud_stt_opt_in: false,
+      external_asr_script_path: '/root/cortex_env/cortex_7b_client.py',
       vad_threshold: 0.5,
       min_segment_duration_ms: 3000,
       max_segment_duration_ms: 15000,
@@ -33,7 +40,7 @@ export async function installTauriMock(page: Page): Promise<void> {
       enable_diarization: true,
       max_speakers: 8,
       max_wer_threshold: 0.35,
-      max_cer_threshold: 0.20,
+      max_cer_threshold: 0.2,
       enforce_quality_gates: false,
       theme: 'Dark',
     };
@@ -71,6 +78,7 @@ export async function installTauriMock(page: Page): Promise<void> {
       expectedErrorBound: 0.05,
       isCalibrated: false,
     };
+    const emptyLibrary = () => window.localStorage.getItem('__cortex_e2e_empty_library__') === '1';
 
     let eventId = 1;
     const eventHandlers = new Map<number, (payload: unknown) => void>();
@@ -111,7 +119,16 @@ export async function installTauriMock(page: Page): Promise<void> {
       ) => {
         switch (cmd) {
           case 'get_segments_page':
-            return { items: [mockSegment], total: 1, nextCursor: null };
+            return emptyLibrary()
+              ? { items: [], total: 0, nextCursor: null }
+              : { items: [mockSegment], total: 1, nextCursor: null };
+          case 'get_segment':
+            if (emptyLibrary()) throw new Error('Segment no longer exists');
+            return mockSegment;
+          case 'get_segment_ids_for_view':
+            return emptyLibrary() ? [] : [mockSegment.id];
+          case 'get_signal_anomaly_segments':
+            return [];
           case 'app_health':
             // Healthy report matching the real app_health contract, so the health loop's
             // real code path runs in e2e instead of dereferencing the default null.
@@ -202,8 +219,22 @@ export async function installTauriMock(page: Page): Promise<void> {
             return { total_spans: 2, failures: 0, total_duration_ms: 12.5, avg_duration_ms: 6.25 };
           case 'get_recent_spans':
             return [
-              { operation: 'diff.compute', start: '0', duration_ms: 5.0, metadata: {}, success: true, error: null },
-              { operation: 'asr.transcribe', start: '0', duration_ms: 7.5, metadata: {}, success: true, error: null },
+              {
+                operation: 'diff.compute',
+                start: '0',
+                duration_ms: 5.0,
+                metadata: {},
+                success: true,
+                error: null,
+              },
+              {
+                operation: 'asr.transcribe',
+                start: '0',
+                duration_ms: 7.5,
+                metadata: {},
+                success: true,
+                error: null,
+              },
             ];
           case 'clear_tracing_spans':
             return null;
@@ -276,7 +307,8 @@ export async function installTauriMock(page: Page): Promise<void> {
                 id: 'finetuned-mms-ckb',
                 family: 'mms-ckb',
                 model_card_name: 'MMS-CTC-1B (ckb)',
-                checkpoint_sha256: 'a1b2c3d4e5f600112233445566778899aabbccddeeff00112233445566778899',
+                checkpoint_sha256:
+                  'a1b2c3d4e5f600112233445566778899aabbccddeeff00112233445566778899',
                 checkpoint_path: '',
                 source: 'fine-tune',
                 license: 'CC-BY-NC-4.0',
@@ -286,7 +318,8 @@ export async function installTauriMock(page: Page): Promise<void> {
                 id: 'omniasr-ctc-300m',
                 family: 'omniasr',
                 model_card_name: null,
-                checkpoint_sha256: '00112233445566778899aabbccddeeffa1b2c3d4e5f6000000000000deadbeef',
+                checkpoint_sha256:
+                  '00112233445566778899aabbccddeeffa1b2c3d4e5f6000000000000deadbeef',
                 checkpoint_path: '',
                 source: 'bundled',
                 license: 'CC-BY-4.0',
@@ -300,9 +333,28 @@ export async function installTauriMock(page: Page): Promise<void> {
               model_load_ms: 0,
             };
           case 'get_dataset_stats':
+            if (emptyLibrary()) {
+              return {
+                totalSegments: 0,
+                verifiedCount: 0,
+                pendingCount: 0,
+                totalDurationSeconds: 0,
+                verificationRate: 0,
+                uniqueSpeakers: 0,
+                durationHistogram: {
+                  under5s: 0,
+                  under10s: 0,
+                  under15s: 0,
+                  under30s: 0,
+                  over30s: 0,
+                },
+                topSpeakers: [],
+              };
+            }
             return {
               totalSegments: 1,
               verifiedCount: 0,
+              pendingCount: 1,
               totalDurationSeconds: 1.5,
               verificationRate: 0,
               uniqueSpeakers: 1,
@@ -313,7 +365,9 @@ export async function installTauriMock(page: Page): Promise<void> {
                 under30s: 0,
                 over30s: 0,
               },
-              topSpeakers: [{ speakerId: 'SPEAKER_00', segmentCount: 1, totalDurationSeconds: 1.5 }],
+              topSpeakers: [
+                { speakerId: 'SPEAKER_00', segmentCount: 1, totalDurationSeconds: 1.5 },
+              ],
             };
           case 'validate_dataset_cmd':
             return {
@@ -357,10 +411,9 @@ export async function installTauriMock(page: Page): Promise<void> {
       },
     };
 
-    (window as unknown as { __emitTauriEvent?: (event: string, payload: unknown) => void }).__emitTauriEvent = (
-      event: string,
-      payload: unknown,
-    ) => {
+    (
+      window as unknown as { __emitTauriEvent?: (event: string, payload: unknown) => void }
+    ).__emitTauriEvent = (event: string, payload: unknown) => {
       const ids = eventListenerIds.get(event) ?? [];
       for (const id of ids) {
         const cb = eventHandlers.get(id);
@@ -371,11 +424,7 @@ export async function installTauriMock(page: Page): Promise<void> {
 }
 
 /** Emit a mocked Tauri event into the page (for progress UI tests). */
-export async function emitTauriEvent(
-  page: Page,
-  event: string,
-  payload: unknown,
-): Promise<void> {
+export async function emitTauriEvent(page: Page, event: string, payload: unknown): Promise<void> {
   await page.evaluate(
     ({ event, payload }) => {
       const w = window as unknown as { __emitTauriEvent?: (e: string, p: unknown) => void };

@@ -75,6 +75,48 @@ All ingested and benchmarked datasets must be audited against this provenance le
 
 ---
 
+## 🗣️ Dialect Labelling (owner instruction, 2026-08-15)
+
+Every clip sourced from the **Kawa ba Hawlery** podcast (`KBHP-EP*.wav`) is **Hawleri** —
+recorded as **`Sorani Hawleri`**. This is the whole of that import: 13,790 clips, all of
+the owner-managed `_batch_remaining` and `_prepped_16k` source folders, i.e. **every clip in the
+library that currently has playable audio**.
+
+The original podcast corpus (the `SoraniVoice_PC_` material) is a DIFFERENT dialect and must never
+be merged into the Hawleri label. It stays in the library, pending, until reviewers finish it — see
+the audio-loss entry in `docs/RELIABILITY_FINDINGS_2026-08-15.md`.
+
+**Status — ENFORCED IN CODE for review routing (2026-08-16).** `src-tauri/src/dialect.rs` holds the
+explicit source→dialect map and the reviewer roster:
+
+| source fragment | dialect |
+|---|---|
+| `KBHP` | `hawleri` — all 32 Kawa ba Hawlery episodes, owner-confirmed |
+| `SoraniVoice_PC_` | `sorani` — the original corpus |
+| anything else | **unmapped**, and served to no restricted reviewer |
+
+There is deliberately **no per-row dialect column**. Dialect belongs to the RECORDING: 13,797 clips
+come from 32 files, so a per-clip column would be 13,797 chances to disagree with itself. The map is
+also never a filename *guess* — an unmapped corpus fails closed rather than being silently labelled,
+because a wrong dialect label is worse than a missing one.
+
+**Reviewer routing.** `<data_dir>/reviewer_dialects.json` maps each reviewer to the dialects they may
+judge; a reviewer absent from it is unrestricted, so adding the file cannot silently remove anyone's
+work. Re-read on every queue fetch, so the owner can change it without restarting the app. A reviewer
+whose dialect currently has no clips is told exactly that, rather than shown "all clips reviewed".
+
+Why this is an integrity control and not a convenience: someone judging a dialect they do not speak
+produces confident WRONG verdicts, and downstream those are indistinguishable from good ones. Roza,
+Alle and Sabat had already made 13 decisions on Hawleri clips purely because the queue held nothing
+else — those should be re-reviewed.
+
+**Still open:** the EXPORT does not yet emit a dialect field, so a dataset exported today carries no
+dialect column. It does not carry a wrong one. Same map, applied at export, is the remaining step.
+
+Why this matters beyond tidiness: the fairness gate already measures CER disparity across speaker
+axes, and a **14.79-point dialect gap** was measured earlier. A corpus that cannot say which clips
+are Hawleri cannot measure — or correct — that gap.
+
 ## 🚫 Takedown & Right to Erasure Process
 
 If you identify your voice or name in any dataset compiled or published by Cortex Speech, you may request immediate removal:

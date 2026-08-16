@@ -46,7 +46,9 @@ export interface EscalationEvidence {
  * not caught up, the reviewer should see the raw string, not a silently shorter list — a UI that drops
  * what it does not recognise hides exactly the new information someone just added.
  */
-export function parseEscalationEvidence(evidenceJson: string | null | undefined): EscalationEvidence | null {
+export function parseEscalationEvidence(
+  evidenceJson: string | null | undefined,
+): EscalationEvidence | null {
   if (!evidenceJson || !evidenceJson.trim()) return null;
   let parsed: unknown;
   try {

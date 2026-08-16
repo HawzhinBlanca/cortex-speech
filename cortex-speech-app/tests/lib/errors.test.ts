@@ -25,4 +25,21 @@ describe('parseActionableError', () => {
     const out = parseActionableError('something specific failed');
     expect(out.message).toBe('something specific failed');
   });
+
+  it('stays actionable when coercion hooks throw', () => {
+    const hostile = new Proxy(
+      {},
+      {
+        getPrototypeOf: () => {
+          throw new Error('hostile prototype');
+        },
+        get: () => {
+          throw new Error('hostile property');
+        },
+      },
+    );
+
+    expect(() => parseActionableError(hostile)).not.toThrow();
+    expect(parseActionableError(hostile).message).toBe('Unknown error');
+  });
 });

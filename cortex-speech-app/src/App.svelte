@@ -22,6 +22,7 @@
     filteredSegments,
     segmentStats,
     libraryLoadError,
+    libraryTruncated,
   } from './lib/stores/segmentStore';
   import { settings, showSettings, openSettings } from './lib/stores/settingsStore';
   import {
@@ -31,7 +32,7 @@
     statusMessage,
   } from './lib/stores/uiStore';
   import { notifications } from './lib/stores/notificationStore';
-  import { isVerifiedGood, hasRealTranscript } from './lib/segmentQuality';
+  import { isVerifiedGood } from './lib/segmentQuality';
   import { historyStore } from './lib/stores/historyStore';
   import { initKeyboardManager, globalKeyboardManager, modKeyLabel } from './lib/keyboard';
   import { focusTrap } from './lib/actions/focusTrap';
@@ -114,6 +115,15 @@
   let segmentsLoading = $state(true);
   let sidebarOpen = $state(true);
   let statsOpen = $state(true);
+  const SIDEBAR_MEDIA_QUERY = '(min-width: 900px)';
+  const STATS_MEDIA_QUERY = '(min-width: 1200px)';
+  type ReviewPanelSnapshot = {
+    sidebarOpen: boolean;
+    statsOpen: boolean;
+    sidebarWide: boolean;
+    statsWide: boolean;
+  };
+  let reviewPanelSnapshot: ReviewPanelSnapshot | null = null;
   function loadPanelWidth(key: string, fallback: number): number {
     if (typeof localStorage === 'undefined') return fallback;
     const v = Number(localStorage.getItem(key));
@@ -214,7 +224,10 @@
         if (restored.filter_verified !== null && restored.filter_verified !== undefined) {
           filterVerified.set(restored.filter_verified);
         }
-        if (restored.selected_segment_id && get(segments).some((s) => s.id === restored.selected_segment_id)) {
+        if (
+          restored.selected_segment_id &&
+          get(segments).some((s) => s.id === restored.selected_segment_id)
+        ) {
           selectedSegmentId.set(restored.selected_segment_id);
         }
       }
@@ -318,7 +331,13 @@
       // located confidently (diverged / repeated), update only the alignment word and leave the
       // transcript untouched rather than corrupt the gold.
       const currentText = seg.annotatedTranscript ?? '';
-      const replaced = replaceWordToken(currentText, index, oldWord ?? '', fix, updatedWords.length);
+      const replaced = replaceWordToken(
+        currentText,
+        index,
+        oldWord ?? '',
+        fix,
+        updatedWords.length,
+      );
       const patch =
         replaced !== null ? { alignmentJson, annotatedTranscript: replaced } : { alignmentJson };
       segments.update((arr) => arr.map((s) => (s.id === seg.id ? { ...s, ...patch } : s)));
@@ -357,6 +376,21 @@
       currentTime = chunkPlaybackRange(parseSourceMeta(seg.alignmentJson)).startTime;
       wordTimestamps.set(parseWordTimestamps(seg.alignmentJson));
       loadWaveform(seg.audioPath, seg.alignmentJson);
+      // List pages deliberately omit large alignment/evidence JSON. Hydrate only the selected row,
+      // then reseat timing/waveform state if the user has not moved to another clip meanwhile.
+      void segments
+        .hydrate(seg.id)
+        .then((full) => {
+          if (get(selectedSegmentId) !== full.id) return;
+          currentTime = chunkPlaybackRange(parseSourceMeta(full.alignmentJson)).startTime;
+          wordTimestamps.set(parseWordTimestamps(full.alignmentJson));
+          void loadWaveform(full.audioPath, full.alignmentJson);
+        })
+        .catch((error) => {
+          if (get(selectedSegmentId) === seg.id) {
+            notifications.error($t('notifications.loadSegmentsFailed'), { detail: String(error) });
+          }
+        });
     }
   });
   // Tap a word → play EXACTLY that word; with an index (double-tap / F2), also open its inline editor
@@ -434,13 +468,15 @@
   });
 
   $effect(() => {
-    const mqStats = window.matchMedia('(min-width: 1200px)');
-    const mqSidebar = window.matchMedia('(min-width: 900px)');
+    const mqStats = window.matchMedia(STATS_MEDIA_QUERY);
+    const mqSidebar = window.matchMedia(SIDEBAR_MEDIA_QUERY);
 
     function onStatsChange(e: MediaQueryListEvent | MediaQueryList) {
+      if (reviewPanelSnapshot !== null) return;
       statsOpen = e.matches;
     }
     function onSidebarChange(e: MediaQueryListEvent | MediaQueryList) {
+      if (reviewPanelSnapshot !== null) return;
       sidebarOpen = e.matches;
     }
 
@@ -477,7 +513,11 @@
       // that never errors, or a dead loop thread, showed nothing. last_success aging past 3
       // intervals (30 min) on a non-empty library is the honest stall signal.
       const lastOk = h.snapshot_last_success_epoch_secs;
-      if (lastOk != null && Date.now() / 1000 - lastOk > 3 * 600 && ($segmentStats?.total ?? 0) > 0) {
+      if (
+        lastOk != null &&
+        Date.now() / 1000 - lastOk > 3 * 600 &&
+        ($segmentStats?.total ?? 0) > 0
+      ) {
         notifications.error(
           $t('notifications.snapshotStale', {
             minutes: String(Math.round((Date.now() / 1000 - lastOk) / 60)),
@@ -485,10 +525,14 @@
         );
       }
       if (h.free_disk_bytes != null && h.free_disk_bytes < 2 * GiB) {
-        notifications.error($t('notifications.lowDisk', { gb: (h.free_disk_bytes / GiB).toFixed(1) }));
+        notifications.error(
+          $t('notifications.lowDisk', { gb: (h.free_disk_bytes / GiB).toFixed(1) }),
+        );
       }
       if ((h.missing_models?.length ?? 0) > 0) {
-        notifications.error($t('notifications.missingModels', { models: h.missing_models.join(', ') }));
+        notifications.error(
+          $t('notifications.missingModels', { models: h.missing_models.join(', ') }),
+        );
       }
     } catch (e) {
       console.error('health check failed', e);
@@ -679,6 +723,7 @@
         key: 'o',
         ctrl: true,
         description: 'Open audio file',
+        descriptionKey: 'openAudioFile',
         action: handleOpenFile,
         category: 'file',
       },
@@ -686,6 +731,7 @@
         key: 'i',
         ctrl: true,
         description: 'Import directory',
+        descriptionKey: 'importDirectory',
         action: handleImport,
         category: 'file',
       },
@@ -693,6 +739,7 @@
         key: 't',
         ctrl: true,
         description: 'Transcribe selected',
+        descriptionKey: 'transcribe',
         action: handleTranscribe,
         category: 'file',
       },
@@ -703,6 +750,7 @@
         ctrl: true,
         shift: true,
         description: 'Review & correct',
+        descriptionKey: 'reviewCorrect.label',
         action: enterReviewMode,
         category: 'navigation',
       },
@@ -710,6 +758,7 @@
         key: 's',
         ctrl: true,
         description: 'Save annotation',
+        descriptionKey: 'saveAnnotation',
         action: handleSaveAnnotation,
         category: 'edit',
       },
@@ -717,6 +766,7 @@
         key: 'z',
         ctrl: true,
         description: 'Undo',
+        descriptionKey: 'undo',
         action: () => handleUndo(),
         category: 'edit',
         // handleUndo self-guards on the review surfaces with a helpful "use Backspace here" notice —
@@ -728,6 +778,7 @@
         ctrl: true,
         shift: true,
         description: 'Redo',
+        descriptionKey: 'redo',
         action: () => handleRedo(),
         category: 'edit',
         allowInReview: true, // handleRedo self-guards on review surfaces (no-op there)
@@ -736,12 +787,14 @@
         key: 'd',
         ctrl: true,
         description: 'Toggle verified',
+        descriptionKey: 'toggleVerified',
         action: handleToggleVerify,
         category: 'edit',
       },
       {
         key: 'Delete',
         description: 'Delete segment',
+        descriptionKey: 'deleteSegment',
         action: handleDeleteWithConfirm,
         category: 'edit',
       },
@@ -749,6 +802,7 @@
         key: 'f',
         ctrl: true,
         description: 'Focus search',
+        descriptionKey: 'focusSearch',
         action: () => document.querySelector<HTMLInputElement>('[type=search]')?.focus(),
         category: 'navigation',
         allowInEditable: true,
@@ -757,6 +811,7 @@
         key: ',',
         ctrl: true,
         description: 'Open settings',
+        descriptionKey: 'openSettings',
         // Don't open Settings UNDER the Review Inbox overlay (z-50 vs z-[100]) where it would be
         // invisible while its close-time auto-save writes a stale snapshot. Require the inbox closed.
         action: () => {
@@ -769,6 +824,7 @@
         ctrl: true,
         shift: true,
         description: 'Validate dataset',
+        descriptionKey: 'validateDataset',
         action: openValidationPanel,
         category: 'navigation',
       },
@@ -777,6 +833,7 @@
         ctrl: true,
         shift: true,
         description: 'Open Review Inbox',
+        descriptionKey: 'reviewInbox',
         action: openReviewInbox,
         category: 'navigation',
       },
@@ -784,6 +841,7 @@
         key: '/',
         ctrl: true,
         description: 'Keyboard shortcuts',
+        descriptionKey: 'keyboardShortcuts',
         action: () => showKeyboardHelp.set(true),
         category: 'navigation',
       },
@@ -791,6 +849,7 @@
         key: 's',
         shift: true,
         description: 'Toggle sidebar panel',
+        descriptionKey: 'toggleSidebar',
         action: () => (sidebarOpen = !sidebarOpen),
         category: 'navigation',
       },
@@ -798,18 +857,21 @@
         key: 'd',
         shift: true,
         description: 'Toggle stats dashboard',
+        descriptionKey: 'toggleStats',
         action: () => (statsOpen = !statsOpen),
         category: 'navigation',
       },
       {
         key: 'j',
         description: 'Next segment',
+        descriptionKey: 'nextSegment',
         action: () => navigateSegment('down'),
         category: 'navigation',
       },
       {
         key: 'k',
         description: 'Previous segment',
+        descriptionKey: 'prevSegment',
         action: () => navigateSegment('up'),
         category: 'navigation',
       },
@@ -817,12 +879,14 @@
         key: '/',
         shift: true,
         description: 'Keyboard shortcuts (? key)',
+        descriptionKey: 'keyboardShortcuts',
         action: () => showKeyboardHelp.set(true),
         category: 'navigation',
       },
       {
         key: '?',
         description: 'Keyboard shortcuts (? key)',
+        descriptionKey: 'keyboardShortcuts',
         action: () => showKeyboardHelp.set(true),
         category: 'navigation',
       },
@@ -830,6 +894,7 @@
         key: ' ',
         ctrl: true,
         description: 'Play/pause',
+        descriptionKey: 'playPause',
         action: () => (isAudioPlaying = !isAudioPlaying),
         category: 'playback',
       },
@@ -837,12 +902,14 @@
         key: 'Enter',
         ctrl: true,
         description: 'Toggle verification',
+        descriptionKey: 'toggleVerified',
         action: handleToggleVerify,
         category: 'playback',
       },
       {
         key: 'ArrowLeft',
         description: 'Rewind 5s',
+        descriptionKey: 'rewind',
         action: () => {
           clearWordOverride(); // a manual scrub leaves word-playback mode
           currentTime = Math.max(0, currentTime - 5);
@@ -852,6 +919,7 @@
       {
         key: 'ArrowRight',
         description: 'Forward 5s',
+        descriptionKey: 'forward',
         action: () => {
           clearWordOverride();
           currentTime = Math.min(playerDuration, currentTime + 5);
@@ -862,6 +930,7 @@
         key: 'k',
         ctrl: true,
         description: 'Command palette',
+        descriptionKey: 'cmdk.title',
         action: () => (showCommandPalette = true),
         category: 'general',
         allowInEditable: true,
@@ -897,9 +966,31 @@
   // panels so the reviewer sees only the clip + the edit box.
   function enterReviewMode() {
     if (!requireDesktopRuntime()) return;
+    if (viewMode !== 'review') {
+      reviewPanelSnapshot = {
+        sidebarOpen,
+        statsOpen,
+        sidebarWide: window.matchMedia(SIDEBAR_MEDIA_QUERY).matches,
+        statsWide: window.matchMedia(STATS_MEDIA_QUERY).matches,
+      };
+    }
     viewMode = 'review';
     sidebarOpen = false;
     statsOpen = false;
+  }
+
+  function leaveReviewMode(nextView: 'curate' | 'insights' = 'curate') {
+    const sidebarWide = window.matchMedia(SIDEBAR_MEDIA_QUERY).matches;
+    const statsWide = window.matchMedia(STATS_MEDIA_QUERY).matches;
+    const snapshot = reviewPanelSnapshot;
+
+    // Preserve the user's exact pre-review panel choices when the viewport class is unchanged. If
+    // they resized during review, apply the current responsive defaults instead of restoring a panel
+    // that no longer fits.
+    sidebarOpen = snapshot?.sidebarWide === sidebarWide ? snapshot.sidebarOpen : sidebarWide;
+    statsOpen = snapshot?.statsWide === statsWide ? snapshot.statsOpen : statsWide;
+    reviewPanelSnapshot = null;
+    viewMode = nextView;
   }
 
   function openWslConsole() {
@@ -1080,18 +1171,16 @@
     }
   }
 
-  // When the OmniASR-7B champion is unavailable or fails (its WSL server is down), the app NEVER
-  // silently drops to a smaller model. It surfaces a choice: retry the champion once its server is
-  // up, or transcribe this one clip with the offline model. The dialog names both engines so the
-  // owner always knows which produced the text.
-  function promptChampionFallback(retryChampion: () => void, useOffline: () => void) {
+  // When the OmniASR-7B champion is unavailable, stop and retry only that engine. Optional local
+  // engines remain available after explicitly selecting a non-champion mode in Settings; a runtime
+  // failure must never turn into a convenient one-click downgrade of the production transcript.
+  function promptChampionRetry(retryChampion: () => void) {
     showConfirmDialog.set({
       title: $t('asr.championUnavailableTitle'),
       message: $t('asr.championUnavailableMessage'),
       confirmLabel: $t('asr.tryAgain'),
       danger: false,
       onConfirm: retryChampion,
-      secondary: { label: $t('asr.useOfflineModel'), onClick: useOffline },
     });
   }
 
@@ -1099,6 +1188,10 @@
     const seg = $selectedSegment;
     if (!seg || $isProcessing) return;
     if (!requireDesktopRuntime()) return;
+    if (seg.verified || seg.humanDecision) {
+      notifications.info($t('asr.reopenBeforeRetranscribe'));
+      return;
+    }
     // Re-transcription replaces this segment's text with fresh MACHINE output, so drop any pending
     // autosave for it first — otherwise the debounced pre-edit annotation fires AFTER this write and
     // clobbers the new transcript (the same clobber the delete paths already cancel against).
@@ -1109,36 +1202,9 @@
     statusMessage.set($t('transcribing'));
     try {
       const result = await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
-      const rawTranscript = result.rawTranscript;
-      // Machine output never enters the human-only annotation field (by law — the 2026-08-12
-      // incident class; pinned by test_machine_never_writes_annotated_policy.py). The old
-      // normalized text describes the DELETED draft, so it must not outrank the fresh raw at the
-      // annotated ?? normalized ?? raw display precedence — null unless recomputed here.
-      let normalizedTranscript: string | null = null;
-      if ($settings.autoNormalize) {
-        // Best-effort: a normalize failure (rate limit, validation) must never discard the
-        // just-succeeded multi-second GPU transcription — save the raw result and say what failed.
-        try {
-          normalizedTranscript = await api.normalizeText(result.text);
-        } catch (normalizeError) {
-          notifications.error($t('notifications.normalizeFailed'), { detail: String(normalizeError) });
-        }
-      }
-      const updatedSeg = {
-        // freshRow-by-id: the store row may have gained columns (speaker id autosave, background
-        // align stamps) during the multi-second ASR await — never upsert the stale pre-await copy.
-        ...($segments.find((s) => s.id === seg.id) ?? seg),
-        rawTranscript,
-        normalizedTranscript,
-        // A re-transcription is machine output — reset verified so it isn't kept as human-verified.
-        verified: false,
-      };
-      await api.updateSegment(updatedSeg);
-      // Align LAST, with the segment id: align_segment persists the merged word timings and stamps
-      // the honest alignment_quality in the backend. Order matters — updateSegment upserts the WHOLE
-      // row including alignment_quality (insert_segment ON CONFLICT), so aligning before it would let
-      // the stale quality from `seg` clobber a fresh ctc_forced stamp. Best-effort: a failed align
-      // keeps the successfully saved transcript.
+      // `transcribe_segment` commits the complete champion result server-side after every enabled
+      // refinement succeeds. Never whole-row-upsert the pre-inference UI row here: alignment,
+      // provenance, or a concurrent review decision may have changed during the long 7B call.
       if ($settings.autoAlign) {
         // VERBATIM LAW: align against the champion's verbatim output — timing the refined
         // paraphrase would stamp confident word timings onto words the speaker never said.
@@ -1148,7 +1214,9 @@
             const ts = await api.alignSegment(seg.audioPath, alignText, seg.alignmentJson, seg.id);
             wordTimestamps.set(ts);
           } catch (alignError) {
-            notifications.error($t('notifications.alignmentFailed'), { detail: String(alignError) });
+            notifications.error($t('notifications.alignmentFailed'), {
+              detail: String(alignError),
+            });
           }
         }
       }
@@ -1159,10 +1227,9 @@
       if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
-      // The champion (7B) is the primary engine. If it's down, offer retry-or-offline instead of a
-      // dead-end error — the app never silently substitutes a smaller model on this path.
+      // The champion (7B) is the production engine. If it is down, fail closed and retry only it.
       if (api.is7bUnavailableError(e)) {
-        promptChampionFallback(handleTranscribe, handleTranscribeFinetuned);
+        promptChampionRetry(handleTranscribe);
       } else {
         notifyActionableError(e, $t('errors.transcriptionFailed'));
       }
@@ -1392,7 +1459,9 @@
     }
     try {
       const description = await historyStore.undo();
-      notifications.info($t('notifications.undone', { what: description ?? $t('notifications.lastActionReverted') }));
+      notifications.info(
+        $t('notifications.undone', { what: description ?? $t('notifications.lastActionReverted') }),
+      );
       await loadSegments();
       if (historyPanel) {
         historyPanel.recordAction(`Reverted: ${description ?? 'action'}`, 'edit');
@@ -1408,7 +1477,11 @@
     if (viewMode === 'review' || $showReviewInbox) return;
     try {
       const description = await historyStore.redo();
-      notifications.info($t('notifications.redone', { what: description ?? $t('notifications.lastActionReapplied') }));
+      notifications.info(
+        $t('notifications.redone', {
+          what: description ?? $t('notifications.lastActionReapplied'),
+        }),
+      );
       await loadSegments();
       if (historyPanel) {
         historyPanel.recordAction(`Redone: ${description ?? 'action'}`, 'edit');
@@ -1474,7 +1547,10 @@
     if (!requireDesktopRuntime()) return;
     showConfirmDialog.set({
       title: $t('deleteSegment'),
-      message: $t('deleteSegmentConfirm').replace('{name}', seg.audioPath.split(/[/\\]/).pop() ?? ''),
+      message: $t('deleteSegmentConfirm').replace(
+        '{name}',
+        seg.audioPath.split(/[/\\]/).pop() ?? '',
+      ),
       onConfirm: handleDelete,
     });
   }
@@ -1636,18 +1712,32 @@
     }
   }
 
+  async function resolveViewIds(
+    transcriptState: 'any' | 'real' | 'missing' = 'any',
+    verified: boolean | null = $filterVerified,
+    query: string | null = $searchQuery.trim() || null,
+  ): Promise<string[] | null> {
+    try {
+      return await api.getSegmentIdsForView({ verified, query, transcriptState });
+    } catch (error) {
+      notifications.error($t('notifications.loadSegmentsFailed'), { detail: String(error) });
+      return null;
+    }
+  }
+
   async function handleBatchTranscribe(mode: 'empty' | 'selected' | 'filtered') {
     if ($isProcessing) return;
     if (!requireDesktopRuntime()) return;
 
     const ids =
       mode === 'empty'
-        ? $segments.filter((s) => !s.rawTranscript?.trim()).map((s) => s.id)
+        ? await resolveViewIds('missing', null, null)
         : mode === 'selected'
           ? $selectedSegmentId
             ? [$selectedSegmentId]
             : []
-          : $filteredSegments.map((s) => s.id);
+          : await resolveViewIds();
+    if (ids === null) return;
 
     if (mode === 'selected' && !$selectedSegmentId) {
       notifications.warning($t('batchTranscribe.noSelection'));
@@ -1685,10 +1775,11 @@
           // (update_asr_transcript_if_unreviewed's verified=0 guard), so the placeholder could never be
           // filled — and it dishonestly counts as verified. Root of the recurring class iter 127 only
           // band-aided at the count. Same hasRealTranscript gate the verified tally uses.
-          $segments.filter((s) => !s.verified && hasRealTranscript(s)).map((s) => s.id)
+          await resolveViewIds('real', false, null)
         : $selectedSegmentId
           ? [$selectedSegmentId]
           : [];
+    if (ids === null) return;
 
     if (mode === 'selected' && !$selectedSegmentId) {
       notifications.warning($t('batchVerify.noSelection'));
@@ -1719,7 +1810,8 @@
       notifications.warning($t('batchAssignSpeaker.noSpeaker'));
       return;
     }
-    const ids = $filteredSegments.map((s) => s.id);
+    const ids = await resolveViewIds();
+    if (ids === null) return;
     if (ids.length === 0) {
       notifications.info($t('batchAssignSpeaker.nothingToAssign'));
       return;
@@ -1739,7 +1831,8 @@
   async function handleBatchNormalize() {
     if ($isProcessing) return;
     if (!requireDesktopRuntime()) return;
-    const ids = $filteredSegments.filter((s) => s.rawTranscript?.trim()).map((s) => s.id);
+    const ids = await resolveViewIds('real');
+    if (ids === null) return;
     if (ids.length === 0) {
       notifications.info($t('batchNormalize.nothingToNormalize'));
       return;
@@ -1766,7 +1859,8 @@
         ? $selectedSegmentId
           ? [$selectedSegmentId]
           : []
-        : $filteredSegments.map((s) => s.id);
+        : await resolveViewIds();
+    if (ids === null) return;
     if (mode === 'selected' && !$selectedSegmentId) {
       notifications.warning($t('rediarize.noSelection'));
       return;
@@ -1792,10 +1886,11 @@
     }
   }
 
-  function handleDeleteFilteredWithConfirm() {
+  async function handleDeleteFilteredWithConfirm() {
     if ($isProcessing) return;
     if (!requireDesktopRuntime()) return;
-    const ids = $filteredSegments.map((s) => s.id);
+    const ids = await resolveViewIds();
+    if (ids === null) return;
     if (ids.length === 0) {
       notifications.info($t('batchDelete.nothingToDelete'));
       return;
@@ -1943,7 +2038,12 @@
   }
 </script>
 
-<div class="h-screen flex flex-col bg-app text-default" data-testid="app-root">
+<div
+  class="h-screen flex flex-col bg-app text-default"
+  data-testid="app-root"
+  inert={$showReviewInbox}
+  aria-hidden={$showReviewInbox ? 'true' : undefined}
+>
   {#if quarantineNotice}
     <div
       class="flex items-center justify-between gap-3 border-b border-red-600/50 bg-red-950/50 px-4 py-2"
@@ -2036,7 +2136,7 @@
       </h1>
       <span
         class="text-[10px] text-cortex-500 bg-cortex-900 px-2 py-0.5 rounded-full border border-cortex-800/50"
-        >v2.0</span
+        >v2.1.0</span
       >
       {#if tauriAvailable}
         <EngineStatusPill />
@@ -2396,14 +2496,9 @@
       view={viewMode}
       onSelect={(id) => {
         if (id === 'settings') openSettings();
-        else {
-          viewMode = id as 'curate' | 'insights' | 'review';
-          // Review is a focused, distraction-free mode — collapse the side panels.
-          if (id === 'review') {
-            sidebarOpen = false;
-            statsOpen = false;
-          }
-        }
+        else if (id === 'review') enterReviewMode();
+        else if (viewMode === 'review') leaveReviewMode(id as 'curate' | 'insights');
+        else viewMode = id as 'curate' | 'insights';
       }}
     />
     <!-- Left Panel: Segment List -->
@@ -2539,6 +2634,8 @@
               itemHeight={56}
               selectedId={$selectedSegmentId}
               onSelect={selectSegment}
+              hasMore={$libraryTruncated}
+              onEndReached={() => void segments.loadMore()}
             >
               {#snippet children(item: SpeechSegment)}
                 {@const sourceName = truncateFilename(segmentSourceFilename(item.audioPath))}
@@ -2603,7 +2700,11 @@
                           {item.speakerId}
                         </span>
                       {/if}
-                      <span class="text-[11px] text-cortex-500 truncate mt-0.5" dir="rtl" lang="ckb">
+                      <span
+                        class="text-[11px] text-cortex-500 truncate mt-0.5"
+                        dir="rtl"
+                        lang="ckb"
+                      >
                         {item.annotatedTranscript ?? item.rawTranscript ?? '...'}
                       </span>
                     </div>
@@ -2652,15 +2753,23 @@
                       stroke-linejoin="round"
                     >
                       <path d="M12 9v4M12 17h.01" />
-                      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                      <path
+                        d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"
+                      />
                     </svg>
                   </div>
                   <div class="max-w-[16rem]">
-                    <p class="text-sm font-semibold text-default">{$t('notifications.loadSegmentsFailed')}</p>
-                    <p class="mt-1 break-words text-xs leading-relaxed text-muted">{$libraryLoadError}</p>
+                    <p class="text-sm font-semibold text-default">
+                      {$t('notifications.loadSegmentsFailed')}
+                    </p>
+                    <p class="mt-1 break-words text-xs leading-relaxed text-muted">
+                      {$libraryLoadError}
+                    </p>
                   </div>
                   <div class="mt-1">
-                    <button class="btn btn-primary !text-xs" onclick={loadSegments}>{$t('retry')}</button>
+                    <button class="btn btn-primary !text-xs" onclick={loadSegments}
+                      >{$t('retry')}</button
+                    >
                   </div>
                 {:else if $searchQuery}
                   <div
@@ -2723,6 +2832,8 @@
     </ErrorBoundary>
     <PanelSplitter
       direction="horizontal"
+      label={$t('resizeSegmentsPanel')}
+      value={sidebarWidth}
       onResize={(delta) => (sidebarWidth = Math.max(200, Math.min(600, sidebarWidth + delta)))}
     />
 
@@ -2747,10 +2858,18 @@
                   d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
                 /></svg
               >
-              <span>{$t($segmentStats.pending === 1 ? 'reviewCorrect.ctaOne' : 'reviewCorrect.cta', { n: String($segmentStats.pending) })}</span>
+              <span
+                >{$t($segmentStats.pending === 1 ? 'reviewCorrect.ctaOne' : 'reviewCorrect.cta', {
+                  n: String($segmentStats.pending),
+                })}</span
+              >
             </div>
             <div class="flex items-center gap-2 shrink-0">
-              <button data-testid="review-nudge-start" class="btn btn-primary !text-xs" onclick={enterReviewMode}>
+              <button
+                data-testid="review-nudge-start"
+                class="btn btn-primary !text-xs"
+                onclick={enterReviewMode}
+              >
                 {$t('reviewCorrect.start')} →
               </button>
               <button
@@ -2765,10 +2884,10 @@
         {#if viewMode === 'insights'}
           <!-- P2.3: the readiness card's "N clips still awaiting review" blocker becomes a button that
                actually goes there, instead of naming a problem and leaving the reviewer to find it. -->
-          <StatsDashboard onOpenReview={() => (viewMode = 'review')} />
+          <StatsDashboard onOpenReview={enterReviewMode} />
           <RefineryPanel />
         {:else if viewMode === 'review'}
-          <ReviewMode onExport={handleExport} onDone={() => (viewMode = 'curate')} />
+          <ReviewMode onExport={handleExport} onDone={leaveReviewMode} />
         {:else if $selectedSegment}
           <div class="card overflow-hidden">
             {#if waveformError}
@@ -2863,43 +2982,45 @@
                     >
                   {/if}
                 </button>
-                <button
-                  data-testid="transcribe-constrained-btn"
-                  class="btn btn-secondary !text-xs"
-                  onclick={handleTranscribeConstrained}
-                  disabled={$isProcessing}
-                  title={$t('transcribeConstrainedTitle')}
-                >
-                  {$t('transcribeConstrained')}
-                </button>
-                <button
-                  data-testid="transcribe-finetuned-btn"
-                  class="btn btn-secondary !text-xs"
-                  onclick={handleTranscribeFinetuned}
-                  disabled={$isProcessing}
-                  title={$t('transcribeFinetunedTitle')}
-                >
-                  {$t('transcribeFinetuned')}
-                </button>
-                {#if $settings.cloudSttOptIn}
+                {#if $settings.asrModel !== 'wsl-7b'}
                   <button
-                    data-testid="transcribe-scribe-btn"
+                    data-testid="transcribe-constrained-btn"
                     class="btn btn-secondary !text-xs"
-                    onclick={handleTranscribeScribe}
+                    onclick={handleTranscribeConstrained}
                     disabled={$isProcessing}
-                    title={$t('scribe.transcribeTitle')}
+                    title={$t('transcribeConstrainedTitle')}
                   >
-                    {$t('scribe.transcribe')}
+                    {$t('transcribeConstrained')}
                   </button>
                   <button
-                    data-testid="add-scribe-vote-btn"
+                    data-testid="transcribe-finetuned-btn"
                     class="btn btn-secondary !text-xs"
-                    onclick={handleAddScribeVote}
+                    onclick={handleTranscribeFinetuned}
                     disabled={$isProcessing}
-                    title={$t('scribe.voteTitle')}
+                    title={$t('transcribeFinetunedTitle')}
                   >
-                    {$t('scribe.vote')}
+                    {$t('transcribeFinetuned')}
                   </button>
+                  {#if $settings.cloudSttOptIn}
+                    <button
+                      data-testid="transcribe-scribe-btn"
+                      class="btn btn-secondary !text-xs"
+                      onclick={handleTranscribeScribe}
+                      disabled={$isProcessing}
+                      title={$t('scribe.transcribeTitle')}
+                    >
+                      {$t('scribe.transcribe')}
+                    </button>
+                    <button
+                      data-testid="add-scribe-vote-btn"
+                      class="btn btn-secondary !text-xs"
+                      onclick={handleAddScribeVote}
+                      disabled={$isProcessing}
+                      title={$t('scribe.voteTitle')}
+                    >
+                      {$t('scribe.vote')}
+                    </button>
+                  {/if}
                 {/if}
                 <button
                   class="btn btn-secondary !text-xs"
@@ -2977,12 +3098,18 @@
                   <!-- Kurdish is RTL: this flex row of word-chips must be dir=rtl so the chips
                        lay out right-to-left; otherwise the first spoken word sits leftmost and the
                        words read reversed. -->
-                  <div class="flex flex-wrap gap-x-1.5 gap-y-2" dir="rtl" lang="ckb" bind:this={interactiveStripEl}>
+                  <div
+                    class="flex flex-wrap gap-x-1.5 gap-y-2"
+                    dir="rtl"
+                    lang="ckb"
+                    bind:this={interactiveStripEl}
+                  >
                     {#each $wordTimestamps as w, idx}
                       <!-- Word times are CLIP-relative; compare/seek against the clip offset so an
                            offset chunk highlights + seeks correctly (not at the whole-file position). -->
                       {@const isActive =
-                        currentTime - chunkStartTime >= w.start && currentTime - chunkStartTime <= w.end}
+                        currentTime - chunkStartTime >= w.start &&
+                        currentTime - chunkStartTime <= w.end}
                       <!-- Single click / Enter / Space = play just this word (listen). Double-click /
                            F2 = edit it inline. Decoupled so a listen tap never opens an input under
                            the keyboard and silently rewrites the transcript on blur. -->
@@ -2994,7 +3121,9 @@
                           : 'text-cortex-200 hover:bg-cortex-800 hover:text-white'}"
                         onclick={() => playWordClip(w)}
                         ondblclick={() => playWordClip(w, idx)}
-                        title="{w.word} ({w.start.toFixed(2)}s - {w.end.toFixed(2)}s) — {$t('review.wordChipHint')}"
+                        title="{w.word} ({w.start.toFixed(2)}s - {w.end.toFixed(2)}s) — {$t(
+                          'review.wordChipHint',
+                        )}"
                         role="button"
                         tabindex="0"
                         aria-keyshortcuts="Enter Space F2"
@@ -3111,7 +3240,13 @@
             {#if $wordTimestamps.length > 0}
               <div class="space-y-1">
                 <span class="text-[11px] text-cortex-400">{$t('wordTimestamps')}</span>
-                <div class="flex flex-wrap gap-1 max-h-20 overflow-y-auto" role="group" aria-label={$t('wordTimestamps')} dir="rtl" lang="ckb">
+                <div
+                  class="flex flex-wrap gap-1 max-h-20 overflow-y-auto"
+                  role="group"
+                  aria-label={$t('wordTimestamps')}
+                  dir="rtl"
+                  lang="ckb"
+                >
                   {#each $wordTimestamps as w}
                     <button
                       type="button"
@@ -3124,7 +3259,8 @@
                           e.preventDefault();
                         }
                       }}
-                      aria-label={$t('review.playWordAria').replace('{word}', w.word)}>{w.word}</button
+                      aria-label={$t('review.playWordAria').replace('{word}', w.word)}
+                      >{w.word}</button
                     >
                   {/each}
                 </div>
@@ -3229,9 +3365,11 @@
     </ErrorBoundary>
 
     <!-- Right Panel: Stats -->
-    {#if $filteredSegments.length > 0}
+    {#if $filteredSegments.length > 0 && viewMode !== 'insights'}
       <PanelSplitter
         direction="horizontal"
+        label={$t('resizeStatsPanel')}
+        value={statsWidth}
         onResize={(delta) => (statsWidth = Math.max(200, Math.min(600, statsWidth - delta)))}
       />
       <ErrorBoundary>
@@ -3509,7 +3647,12 @@
            Correct queue keep pre-decision data, and a reviewer could unknowingly overwrite a
            just-recorded reject with an accept. loadSegments routes through the loadSeq-guarded
            segments.load(), so the refresh is race-safe. -->
-      <ReviewInbox onClose={() => { showReviewInbox.set(false); void loadSegments(); }} />
+      <ReviewInbox
+        onClose={() => {
+          showReviewInbox.set(false);
+          void loadSegments();
+        }}
+      />
     </ErrorBoundary>
   </div>
 {/if}

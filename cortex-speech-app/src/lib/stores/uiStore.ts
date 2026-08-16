@@ -1,12 +1,7 @@
 import { writable, type Writable } from 'svelte/store';
 
 export type PipelinePhase =
-  | 'idle'
-  | 'importing'
-  | 'reference_transcribing'
-  | 'detecting'
-  | 'transcribing'
-  | 'adjudicating';
+  'idle' | 'importing' | 'reference_transcribing' | 'detecting' | 'transcribing' | 'adjudicating';
 
 export const pipelinePhase = writable<PipelinePhase>('idle');
 export const filesProcessed = writable(0);

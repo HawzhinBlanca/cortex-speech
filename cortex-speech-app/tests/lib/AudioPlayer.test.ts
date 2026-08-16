@@ -5,6 +5,7 @@ import { get } from 'svelte/store';
 import AudioPlayer from '../../src/lib/AudioPlayer.svelte';
 import { notifications } from '../../src/lib/stores/notificationStore';
 import { locale } from '../../src/lib/i18n';
+import { ckb } from '../../src/lib/i18n/ckb';
 
 const invokeMock = vi.mocked(invoke);
 
@@ -68,15 +69,47 @@ describe('AudioPlayer', () => {
       expect(audio.src).toContain('asset://localhost/C:/media/sample.wav');
     });
     expect(loadMock).toHaveBeenCalledOnce();
-    expect(invokeMock).toHaveBeenCalledWith('register_media_asset', { audioPath: 'C:\\input\\sample.wav' });
+    expect(invokeMock).toHaveBeenCalledWith('register_media_asset', {
+      audioPath: 'C:\\input\\sample.wav',
+    });
     expect(invokeMock).toHaveBeenCalledWith('get_media_asset_url', { id: 'grant-1' });
 
     Object.defineProperty(audio, 'duration', { configurable: true, value: 42 });
     await fireEvent.loadedMetadata(audio);
 
     expect(screen.getByRole('button', { name: 'Play' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Playback Speed' })).toHaveAttribute('type', 'button');
-    expect(screen.getByRole('button', { name: 'Toggle Loop Playback' })).toHaveTextContent('Loop Off');
+    expect(screen.getByRole('button', { name: 'Playback Speed' })).toHaveAttribute(
+      'type',
+      'button',
+    );
+    expect(screen.getByRole('button', { name: 'Toggle Loop Playback' })).toHaveTextContent(
+      'Loop Off',
+    );
+  });
+
+  it('gives the seek slider a localized name and uses a wrap-safe control layout', async () => {
+    mockMediaResolution('C:\\media\\sample.wav');
+    render(AudioPlayer, { props: { audioPath: 'C:\\input\\sample.wav' } });
+    const audio = document.querySelector('audio') as HTMLAudioElement;
+    await waitFor(() => expect(audio.src).toContain('asset://localhost/C:/media/sample.wav'));
+    Object.defineProperty(audio, 'duration', { configurable: true, value: 42 });
+    await fireEvent.loadedMetadata(audio);
+
+    const controls = screen.getByTestId('audio-player-controls');
+    expect(controls).toHaveClass('flex-wrap');
+    expect(screen.getByTestId('audio-player-timeline')).toHaveClass('min-w-0', 'flex-1');
+    expect(screen.getByRole('slider', { name: 'Seek audio' })).toHaveClass('min-w-0');
+
+    locale.set('ckb');
+    await waitFor(() => {
+      expect(screen.getByRole('toolbar', { name: ckb['audio.controls'] })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: ckb['audio.play'] })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: ckb['audio.playbackSpeed'] })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: ckb['audio.loopToggle'] })).toHaveTextContent(
+        ckb['audio.loopOff'],
+      );
+      expect(screen.getByRole('slider', { name: ckb['audio.seek'] })).toBeInTheDocument();
+    });
   });
 
   it('shows a retry path when media registration fails', async () => {
@@ -172,6 +205,7 @@ describe('AudioPlayer', () => {
   });
 
   it('reports loop replay failures instead of silently swallowing them', async () => {
+    locale.set('ckb');
     mockMediaResolution('C:\\media\\clip.wav');
     playMock.mockRejectedValueOnce(new Error('autoplay denied'));
     render(AudioPlayer, {
@@ -188,15 +222,17 @@ describe('AudioPlayer', () => {
     });
     Object.defineProperty(audio, 'duration', { configurable: true, value: 30 });
     await fireEvent.loadedMetadata(audio);
-    await fireEvent.click(screen.getByRole('button', { name: 'Toggle Loop Playback' }));
+    await fireEvent.click(screen.getByRole('button', { name: ckb['audio.loopToggle'] }));
     audio.currentTime = 20;
 
     await fireEvent.timeUpdate(audio);
 
     await waitFor(() => {
-      expect(screen.getByText('Loop playback failed')).toBeInTheDocument();
+      expect(screen.getByText(ckb['audio.loopFailed'])).toBeInTheDocument();
     });
     const state = get(notifications);
-    expect(state.some((item) => item.type === 'error' && item.message === 'Loop playback failed')).toBe(true);
+    expect(
+      state.some((item) => item.type === 'error' && item.message === ckb['audio.loopFailed']),
+    ).toBe(true);
   });
 });

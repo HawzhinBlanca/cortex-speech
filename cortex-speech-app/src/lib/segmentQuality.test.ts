@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { hasRealTranscript, isVerifiedGood, isHumanRejected, effectiveTranscript } from './segmentQuality';
+import {
+  hasRealTranscript,
+  isVerifiedGood,
+  isHumanRejected,
+  effectiveTranscript,
+} from './segmentQuality';
 import type { SpeechSegment } from './types';
 
 const seg = (over: Partial<SpeechSegment>): SpeechSegment =>
@@ -26,7 +31,11 @@ describe('hasRealTranscript', () => {
   it('is true when ANY field carries real content (never under-counts a good clip)', () => {
     expect(hasRealTranscript(seg({ rawTranscript: 'کوردی' }))).toBe(true);
     // A placeholder raw but a real human annotation is still real content.
-    expect(hasRealTranscript(seg({ rawTranscript: '[Pending WSL 7B ASR]', annotatedTranscript: 'کوردی' }))).toBe(true);
+    expect(
+      hasRealTranscript(
+        seg({ rawTranscript: '[Pending WSL 7B ASR]', annotatedTranscript: 'کوردی' }),
+      ),
+    ).toBe(true);
     expect(hasRealTranscript(seg({ rawTranscript: '', normalizedTranscript: 'سڵاو' }))).toBe(true);
   });
 
@@ -51,9 +60,9 @@ describe('effectiveTranscript', () => {
     // The rule the old stats order missed entirely: a human edit lives in verdictTranscript, and
     // measuring annotated/raw instead reports the text the human REPLACED.
     for (const humanDecision of ['accept', 'edit', 'human_accept', 'human_edit', 'EDIT']) {
-      expect(
-        effectiveTranscript({ ...base, verdictTranscript: 'corrected', humanDecision }),
-      ).toBe('corrected');
+      expect(effectiveTranscript({ ...base, verdictTranscript: 'corrected', humanDecision })).toBe(
+        'corrected',
+      );
     }
     expect(
       effectiveTranscript({ ...base, verdictTranscript: 'corrected', verdict: 'human_accept' }),
@@ -63,7 +72,11 @@ describe('effectiveTranscript', () => {
   it('ignores a verdict transcript that no human decision stands behind', () => {
     // A machine verdict is not a human edit — annotated still wins.
     expect(
-      effectiveTranscript({ ...base, annotatedTranscript: 'annotated', verdictTranscript: 'machine' }),
+      effectiveTranscript({
+        ...base,
+        annotatedTranscript: 'annotated',
+        verdictTranscript: 'machine',
+      }),
     ).toBe('annotated');
   });
 

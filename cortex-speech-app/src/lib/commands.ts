@@ -46,7 +46,6 @@ export async function importAudioFile(path: string): Promise<{ status: string; s
   return invoke('import_audio_file', { path });
 }
 
-
 export async function cancelOperation(): Promise<void> {
   return invoke<void>('cancel_operation');
 }
@@ -54,9 +53,9 @@ export async function cancelOperation(): Promise<void> {
 /**
  * Sentinel the backend embeds (pipeline.rs `ASR_7B_UNAVAILABLE_TAG`) in every error that means
  * "the OmniASR-7B champion is the selected engine but it is unavailable / failed". When a transcribe
- * call rejects carrying this token, the UI offers the user an explicit choice — retry the champion
- * or transcribe this clip with the offline model — instead of a dead-end. The app NEVER silently
- * downgrades to a smaller model on the primary path. Keep in sync with the Rust constant.
+ * call rejects carrying this token, the UI offers a champion retry. Optional engines require an
+ * explicit non-champion selection in Settings; the production path never downgrades after failure.
+ * Keep in sync with the Rust constant.
  */
 export const ASR_7B_UNAVAILABLE_TAG = 'E_ASR_7B_UNAVAILABLE';
 
@@ -175,29 +174,20 @@ export async function getSegmentConsensus(segmentId: string): Promise<SegmentCon
   return invoke<SegmentConsensus>('get_segment_consensus', { segmentId });
 }
 
-export async function getSegments(verified?: boolean): Promise<SpeechSegment[]> {
-  const data = await invoke<SpeechSegment[]>('get_segments', { verified });
-  // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
-  // app understands" into "your library is empty" — a failure that looks exactly like success. Every
-  // caller of these three already has a user-visible error path (segmentStore raises a PERSISTENT
-  // banner with Retry, ValidationPanel and ReviewMode toast, ReviewInbox writes a status line); the
-  // silent fallback bypassed all of them and left console.error, which no user opens, as the only
-  // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
-  // to review" — both are clean bills of health issued by a broken read.
-  if (!Array.isArray(data)) {
-    throw new Error(
-      `get_segments returned ${typeof data}, not a segment array — the library could not be read`,
-    );
-  }
-  return data;
-}
-
 export interface GetSegmentsPageOptions {
   verified?: boolean | null;
   query?: string | null;
   sort?: string;
   limit?: number;
   cursor?: string | null;
+}
+
+export async function getSegment(segmentId: string): Promise<SpeechSegment> {
+  const data = await invoke<SpeechSegment>('get_segment', { segmentId });
+  if (!data || typeof data.id !== 'string') {
+    throw new Error(`get_segment returned an invalid payload for ${segmentId}`);
+  }
+  return data;
 }
 
 export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Promise<SegmentsPage> {
@@ -223,28 +213,29 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
   return data;
 }
 
-/**
- * M2.5 / P1.4: segments ordered suspect-first — escalated (jury doubts) first, then lowest agent
- * confidence, then chronological. Feeds the ReviewMode suspect-first queue toggle so the reviewer
- * lands on the riskiest clips first.
- */
-export async function getSegmentsSuspectFirst(verified?: boolean): Promise<SpeechSegment[]> {
-  const data = await invoke<SpeechSegment[]>('get_segments_suspect_first', { verified });
-  // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
-  // app understands" into "your library is empty" — a failure that looks exactly like success. Every
-  // caller of these three already has a user-visible error path (segmentStore raises a PERSISTENT
-  // banner with Retry, ValidationPanel and ReviewMode toast, ReviewInbox writes a status line); the
-  // silent fallback bypassed all of them and left console.error, which no user opens, as the only
-  // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
-  // to review" — both are clean bills of health issued by a broken read.
-  if (!Array.isArray(data)) {
-    throw new Error(`get_segments_suspect_first returned ${typeof data}, not a segment array`);
+export async function getSegmentIdsForView(
+  options: {
+    verified?: boolean | null;
+    query?: string | null;
+    transcriptState?: 'any' | 'real' | 'missing';
+  } = {},
+): Promise<string[]> {
+  const data = await invoke<string[]>('get_segment_ids_for_view', {
+    verified: options.verified ?? null,
+    query: options.query ?? null,
+    transcriptState: options.transcriptState ?? 'any',
+  });
+  if (!Array.isArray(data) || data.some((id) => typeof id !== 'string')) {
+    throw new Error('get_segment_ids_for_view returned an invalid payload');
   }
   return data;
 }
 
-export async function searchSegments(query: string): Promise<SpeechSegment[]> {
-  return invoke<SpeechSegment[]>('search_segments', { query });
+export async function getSignalAnomalySegments(limit = 100): Promise<SpeechSegment[]> {
+  const data = await invoke<SpeechSegment[]>('get_signal_anomaly_segments', { limit });
+  if (!Array.isArray(data))
+    throw new Error('get_signal_anomaly_segments returned an invalid payload');
+  return data;
 }
 
 export async function updateSegment(segment: SpeechSegment): Promise<void> {
@@ -495,6 +486,8 @@ export interface CouchStatus {
   running: boolean;
   /** One entry per named reviewer; empty when stopped. */
   reviewers: CouchReviewer[];
+  /** SHA-256 of the TLS certificate, verified against the trusted desktop during first pairing. */
+  certificateFingerprint: string | null;
 }
 
 /** Start the server. An empty list starts a single-reviewer session under the default name. */

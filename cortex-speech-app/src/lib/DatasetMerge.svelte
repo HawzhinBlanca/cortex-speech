@@ -55,7 +55,9 @@
 >
   <div class="card w-full max-w-2xl shadow-2xl flex flex-col max-h-[80vh]">
     <header class="flex items-center justify-between p-4 border-b border-cortex-800/50">
-      <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">{$t('merge.title')}</h2>
+      <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">
+        {$t('merge.title')}
+      </h2>
       <button class="text-cortex-500 hover:text-cortex-300" onclick={close}>✕</button>
     </header>
 

@@ -43,7 +43,9 @@ describe('reviewProgress', () => {
   });
 
   it('rounds the bar percentage', () => {
-    expect(reviewProgress(clips([true, false, false]), clips([true, false, false])).percent).toBe(33);
+    expect(reviewProgress(clips([true, false, false]), clips([true, false, false])).percent).toBe(
+      33,
+    );
     expect(reviewProgress(clips([true, true, false]), clips([true, true, false])).percent).toBe(67);
   });
 });

@@ -13,6 +13,25 @@ use crate::validation::input as validate;
 use crate::{aligner, audio, AppState};
 use tauri::State;
 
+fn canonical_alignment_inputs(
+    requested_audio_path: String,
+    requested_alignment_json: Option<String>,
+    stored_segment: Option<crate::db::SpeechSegment>,
+    segment_id: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let Some(id) = segment_id else {
+        return Ok((requested_audio_path, requested_alignment_json));
+    };
+    let stored = stored_segment.ok_or_else(|| format!("Segment '{id}' no longer exists"))?;
+    if stored.audio_path != requested_audio_path {
+        return Err(format!("Segment '{id}' audio path changed; reload it before aligning"));
+    }
+    // A list-page row intentionally carries alignment_json = null. When an id is available, the DB
+    // row is the authority: its JSON contains source_start/source_end, and accepting the lightweight
+    // caller value would align the entire source file then persist words-only JSON over chunk identity.
+    Ok((stored.audio_path, stored.alignment_json))
+}
+
 /// Opt-in: transcribe a segment with the CONSTRAINED Kurdish-token CTC decode (guarantees
 /// Kurdish-script output) via the `ort` raw-logits path, instead of the default sherpa-onnx
 /// decode. Additive — it does NOT touch the default `transcribe_segment` path. Loads a fresh ort
@@ -197,6 +216,20 @@ pub async fn align_segment(
     let pipeline = state.lock_pipeline().clone();
     let db = state.db_arc();
     run_blocking(move || {
+        let stored_segment = if let Some(ref id) = segment_id {
+            let db_guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            db_guard
+                .get_segment_by_id(id)
+                .map_err(|error| format!("Failed to reload segment {id} before alignment: {error}"))?
+        } else {
+            None
+        };
+        let (audio_path, alignment_json) =
+            canonical_alignment_inputs(audio_path, alignment_json, stored_segment, segment_id.as_deref())?;
+        validate::validate_file_path(&audio_path)?;
+        if let Some(ref aj) = alignment_json {
+            validate::validate_alignment_json(aj)?;
+        }
         let (timestamps, quality) =
             pipeline.align(&audio_path, &text, alignment_json.as_deref()).map_err(|e| e.to_string())?;
         // Persist the word timings INTO alignment_json (merged with existing chunk metadata) AND stamp
@@ -208,8 +241,12 @@ pub async fn align_segment(
             if !timestamps.is_empty() {
                 let merged = crate::chunking::merge_word_timestamps(alignment_json.as_deref(), &timestamps);
                 let db = db.lock().unwrap_or_else(|p| p.into_inner());
-                db.update_segment_alignment(id, &merged, quality.as_db_str())
+                let persisted = db
+                    .update_segment_alignment_if_unchanged(id, alignment_json.as_deref(), &merged, quality.as_db_str())
                     .map_err(|error| format!("Failed to persist word timings + quality for {id}: {error}"))?;
+                if !persisted {
+                    return Err(format!("Segment {id} changed while alignment was running; reload it and try again"));
+                }
             }
         }
         Ok(timestamps)
@@ -243,4 +280,40 @@ pub async fn check_audio(path: String) -> Result<serde_json::Value, String> {
         }))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_alignment_inputs;
+    use crate::db::SpeechSegment;
+
+    #[test]
+    fn alignment_with_segment_id_uses_stored_chunk_metadata() {
+        let stored_json = r#"{"source_start_ms":12000,"source_end_ms":13000,"chunk_index":2,"chunk_count":4}"#;
+        let stored = SpeechSegment {
+            id: "seg-1".to_string(),
+            audio_path: "C:\\audio\\book.wav".to_string(),
+            alignment_json: Some(stored_json.to_string()),
+            ..SpeechSegment::default()
+        };
+
+        let (_, alignment) = canonical_alignment_inputs(stored.audio_path.clone(), None, Some(stored), Some("seg-1"))
+            .expect("stored segment should be canonical");
+
+        assert_eq!(alignment.as_deref(), Some(stored_json));
+    }
+
+    #[test]
+    fn alignment_rejects_a_stale_audio_path_for_a_segment_id() {
+        let stored = SpeechSegment {
+            id: "seg-1".to_string(),
+            audio_path: "C:\\audio\\current.wav".to_string(),
+            ..SpeechSegment::default()
+        };
+
+        let error = canonical_alignment_inputs("C:\\audio\\stale.wav".to_string(), None, Some(stored), Some("seg-1"))
+            .expect_err("stale caller path must fail closed");
+
+        assert!(error.contains("audio path changed"));
+    }
 }

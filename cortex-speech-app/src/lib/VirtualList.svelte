@@ -11,8 +11,17 @@
     children?: Snippet<[SpeechSegment]>;
     onSelect?: (item: SpeechSegment) => void;
     selectedId?: string | null;
+    hasMore?: boolean;
+    onEndReached?: () => void;
   }
-  let { items, itemHeight = 64, overscan = 5, children }: Props = $props();
+  let {
+    items,
+    itemHeight = 64,
+    overscan = 5,
+    children,
+    hasMore = false,
+    onEndReached,
+  }: Props = $props();
 
   let container: HTMLDivElement;
   let scrollTop = $state(0);
@@ -38,6 +47,11 @@
   let visibleItems = $derived(rows.slice(startIndex, endIndex));
   let offsetY = $derived(startIndex * itemHeight);
 
+  // Fill a tall viewport without requiring a synthetic scroll, then continue in bounded pages.
+  $effect(() => {
+    if (hasMore && totalHeight <= containerHeight + itemHeight * overscan) onEndReached?.();
+  });
+
   onMount(() => {
     if (!container) return;
     containerHeight = container.clientHeight;
@@ -53,6 +67,9 @@
 
   function handleScroll() {
     scrollTop = container.scrollTop;
+    if (hasMore && scrollTop + containerHeight >= totalHeight - itemHeight * overscan) {
+      onEndReached?.();
+    }
   }
 </script>
 

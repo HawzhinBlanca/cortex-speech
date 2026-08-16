@@ -112,7 +112,11 @@
                them unless the base direction is RTL (matching App.svelte's word-chip rows). <bdi>
                isolates each chip so an embedded LTR token (or the Replace "raw → ann" arrow) can't
                reorder the row or swap the two words within a chip. -->
-          <div class="flex flex-wrap gap-x-1 gap-y-1 text-sm font-mono leading-relaxed" dir="rtl" lang="ckb">
+          <div
+            class="flex flex-wrap gap-x-1 gap-y-1 text-sm font-mono leading-relaxed"
+            dir="rtl"
+            lang="ckb"
+          >
             {#each diff.changes as change}
               <span class={opClass(change.op)}><bdi>{change.value}</bdi></span>
             {/each}

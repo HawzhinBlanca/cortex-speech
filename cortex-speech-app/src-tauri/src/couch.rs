@@ -1,9 +1,9 @@
-//! couch.rs — "Couch Review": a LAN-only, token-gated phone review page served by the desktop app.
+//! couch.rs — "Couch Review": a TLS-protected, paired phone review page served by the desktop app.
 //!
 //! The owner starts it from Settings, opens the shown URL on a phone on the SAME Wi-Fi, and reviews
 //! clips (listen → correct → save) from the couch. Decisions land in the same database through the
-//! same functions the desktop review uses (`record_human_decision_by` + whole-row upsert), so a phone
-//! review is indistinguishable from a desktop one.
+//! same human-decision transaction the desktop review uses, with phone finalization committed in that
+//! transaction, so a phone review cannot leave a half-written row.
 //!
 //! MULTI-REVIEWER. The owner names the people who will review; each gets their OWN token, and therefore
 //! their own URL, identity, and undo history. Three properties make more than one reviewer safe — each
@@ -35,13 +35,14 @@
 //!   * Read + review only: the API can list the queue, stream one clip's audio, record a decision,
 //!     and undo it. No export, no settings, no keys, no file paths are reachable.
 //!
-//! Transport here is plain HTTP. That is honest for a home LAN or a WireGuard tailnet, where the token
-//! never crosses a network the owner does not control — and it is why this must NOT be naively
-//! port-forwarded: there is no TLS in this server. The one sanctioned public path is DEVICE-TERMINATED
-//! TLS in front of it (Tailscale Serve/Funnel — TLS ends on this PC, relays proxy ciphertext), per
-//! docs/REMOTE_PUBLIC_LINKS_PLAN.md phase 5.
+//! Transport is TLS on every interface. A locally generated certificate is persisted with its private
+//! key protected by Windows DPAPI; Settings exposes its SHA-256 fingerprint for first-device pairing.
+//! Reviewer links carry a pairing secret in the URL fragment, exchange it for a distinct Secure,
+//! HttpOnly session cookie, and never send the pairing secret in a URL or data request.
 
 use crate::db::{Database, SpeechSegment};
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,9 @@ const LISTENER_RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 /// shutdown of any thread it does not reach, so `stop()` can never hang on `join()` (the single-thread
 /// version of this hazard was caught live — see `stop`).
 const ACCEPT_POLL: Duration = Duration::from_millis(250);
+const TLS_IDENTITY_FILE: &str = "couch_tls_identity.json";
+const COUCH_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_SESSIONS_PER_REVIEWER: usize = 8;
 
 /// Per-reviewer request budget (P1.6). Every desktop IPC command is throttled; these HTTP routes were
 /// the one unthrottled way into the database, so a phone stuck in a reload loop could hammer it
@@ -116,16 +120,19 @@ static COUCH_RATE_LIMITER: crate::throttle::GlobalRateLimiter =
     crate::throttle::GlobalRateLimiter::new_with_burst(120, 60);
 
 /// One undoable phone decision: the pre-decision snapshot to restore, plus the row's
-/// post-decision `updated_at` fingerprint — the staleness fence `api_undo` compares before
+/// post-decision monotonic revision — the staleness fence `api_undo` compares atomically while
 /// restoring (text-provenance audit #2/#3: the old fence keyed only on `reviewed_by`, which no
 /// non-decision writer touches, so a batch normalize / desktop edit / champion re-draft between
 /// decision and undo was silently reverted to the snapshot).
 struct UndoEntry {
+    /// Identifies THIS in-flight submit. Two requests from the same reviewer can overlap; removing
+    /// `stack.pop()` on one failure could otherwise discard the other request's successful undo entry.
+    operation_id: String,
     seg_id: String,
     prev: SpeechSegment,
-    /// `None` until the decision's final row write lands: an entry with no stamp is a decision
+    /// `None` until the decision's final row write lands: an entry with no revision is a decision
     /// whose write never completed, and restoring over an unverifiable state is not a safe inverse.
-    decided_stamp: Option<String>,
+    decided_revision: Option<i64>,
 }
 
 /// Per-session state shared by the accept threads. One mutex: the critical sections are map lookups,
@@ -145,6 +152,13 @@ struct CouchState {
     /// them from the owner's view while every serving thread kept honouring the token forever — a
     /// revoke that revokes nothing. One shared map means removal takes effect on the next request.
     reviewers: HashMap<String, String>,
+    /// Pairing secret -> reviewer. Production links expose only these secrets (in the fragment); a
+    /// successful claim mints a different random session token into `reviewers`. Kept separate so a
+    /// copied link is not itself the long-lived cookie used on every audio/data request.
+    pairing_codes: HashMap<String, String>,
+    /// Session token -> issue time. Production sessions are bounded and expire even if a client never
+    /// revisits. Legacy unit fixtures omit this metadata and remain valid only inside their test state.
+    session_issued: HashMap<String, Instant>,
     /// (segment id, reviewer) pairs this session actually SERVED as spot checks.
     ///
     /// A spot check must be identified by why the clip was HANDED OUT, never by its current state.
@@ -201,6 +215,8 @@ struct CouchHandle {
     /// on the handle because `stop()` has no other context, and forgetting to clear the file would
     /// leave "Stop" issuing working links again on the next launch.
     data_dir: Option<PathBuf>,
+    /// SHA-256 over the certificate DER, shown on the trusted desktop for first-device verification.
+    certificate_fingerprint: String,
 }
 
 /// One reviewer's private way in. Two people never share a link, so two people never share an identity.
@@ -223,11 +239,13 @@ pub struct CouchStatus {
     pub running: bool,
     /// One entry per named reviewer, each with its own token/URL. Empty when stopped.
     pub reviewers: Vec<CouchReviewer>,
+    /// Colon-separated SHA-256 fingerprint of the self-signed TLS certificate.
+    pub certificate_fingerprint: Option<String>,
 }
 
 impl CouchStatus {
     fn stopped() -> Self {
-        CouchStatus { running: false, reviewers: Vec::new() }
+        CouchStatus { running: false, reviewers: Vec::new(), certificate_fingerprint: None }
     }
 }
 
@@ -271,6 +289,117 @@ const DEFAULT_REVIEWER: &str = "owner";
 /// Where a started session is remembered, so a link keeps working after the app is closed and
 /// reopened (`{data_dir}/couch_session.json`).
 const SESSION_FILE: &str = "couch_session.json";
+/// Durable deny marker written by Stop before the server is torn down. If deleting a stale session
+/// file fails (permissions/AV/disk fault), startup still refuses to resurrect its credentials.
+const SESSION_REVOCATION_FILE: &str = "couch_session.revoked";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedTlsIdentity {
+    certificate_pem: String,
+    protected_private_key_pem: String,
+    subject_alt_names: Vec<String>,
+}
+
+struct TlsIdentity {
+    certificate_pem: Vec<u8>,
+    private_key_pem: Vec<u8>,
+    fingerprint: String,
+}
+
+fn tls_subject_alt_names() -> Vec<String> {
+    let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string(), lan_ip()];
+    if let Ok(host) = std::env::var("COMPUTERNAME") {
+        let host = host.trim();
+        if !host.is_empty() {
+            names.push(host.to_string());
+            names.push(format!("{host}.local"));
+        }
+    }
+    if let Some(ip) = tailscale_ip() {
+        names.push(ip);
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn certificate_der_from_pem(pem: &str) -> Result<Vec<u8>, String> {
+    let encoded: String = pem.lines().filter(|line| !line.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("decode Couch TLS certificate PEM: {e}"))
+}
+
+fn certificate_fingerprint(pem: &str) -> Result<String, String> {
+    let digest = Sha256::digest(certificate_der_from_pem(pem)?);
+    Ok(digest.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":"))
+}
+
+fn generate_tls_identity(subject_alt_names: &[String]) -> Result<TlsIdentity, String> {
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(subject_alt_names.to_vec())
+        .map_err(|e| format!("generate Couch TLS certificate: {e}"))?;
+    let certificate_pem = cert.pem();
+    let private_key_pem = signing_key.serialize_pem();
+    let fingerprint = certificate_fingerprint(&certificate_pem)?;
+    Ok(TlsIdentity {
+        certificate_pem: certificate_pem.into_bytes(),
+        private_key_pem: private_key_pem.into_bytes(),
+        fingerprint,
+    })
+}
+
+fn save_tls_identity(data_dir: &Path, identity: &TlsIdentity, subject_alt_names: &[String]) -> Result<(), String> {
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("create Couch TLS identity directory: {e}"))?;
+    let private_key = String::from_utf8(identity.private_key_pem.clone())
+        .map_err(|_| "generated Couch TLS private key was not UTF-8 PEM".to_string())?;
+    let saved = SavedTlsIdentity {
+        certificate_pem: String::from_utf8(identity.certificate_pem.clone())
+            .map_err(|_| "generated Couch TLS certificate was not UTF-8 PEM".to_string())?,
+        protected_private_key_pem: crate::dpapi::protect(&private_key)?,
+        subject_alt_names: subject_alt_names.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| format!("serialize Couch TLS identity: {e}"))?;
+    let final_path = data_dir.join(TLS_IDENTITY_FILE);
+    let temp_path = data_dir.join(format!("{TLS_IDENTITY_FILE}.tmp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temp_path, bytes).map_err(|e| format!("write Couch TLS identity staging file: {e}"))?;
+    crate::atomic_file::replace_file(&temp_path, &final_path)
+        .map_err(|e| format!("replace Couch TLS identity atomically: {e}"))
+}
+
+fn load_tls_identity(data_dir: &Path, required_names: &[String]) -> Result<Option<TlsIdentity>, String> {
+    let path = data_dir.join(TLS_IDENTITY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read Couch TLS identity {}: {error}", path.display())),
+    };
+    let saved: SavedTlsIdentity =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse Couch TLS identity {}: {e}", path.display()))?;
+    if required_names.iter().any(|name| !saved.subject_alt_names.contains(name)) {
+        return Ok(None);
+    }
+    let private_key_pem = crate::dpapi::unprotect(&saved.protected_private_key_pem)?;
+    let fingerprint = certificate_fingerprint(&saved.certificate_pem)?;
+    Ok(Some(TlsIdentity {
+        certificate_pem: saved.certificate_pem.into_bytes(),
+        private_key_pem: private_key_pem.into_bytes(),
+        fingerprint,
+    }))
+}
+
+fn load_or_create_tls_identity(data_dir: Option<&Path>) -> Result<TlsIdentity, String> {
+    let names = tls_subject_alt_names();
+    if let Some(dir) = data_dir {
+        if let Some(identity) = load_tls_identity(dir, &names)? {
+            return Ok(identity);
+        }
+    }
+    let identity = generate_tls_identity(&names)?;
+    if let Some(dir) = data_dir {
+        save_tls_identity(dir, &identity, &names)?;
+    }
+    Ok(identity)
+}
 
 /// One remembered session: the reviewer names and the tokens their links carry.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -307,6 +436,39 @@ struct SavedSession {
 /// link: anyone holding one can review until the owner presses Stop or revokes that reviewer.
 fn session_path(data_dir: &Path) -> PathBuf {
     data_dir.join(SESSION_FILE)
+}
+
+fn session_revocation_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(SESSION_REVOCATION_FILE)
+}
+
+/// Establish the durable revocation fact before reporting Stop success or shutting down the live
+/// server. A failure leaves the live handle registered, so the owner gets an honest error instead of
+/// a false "stopped" state whose old links return on restart.
+fn write_session_revocation(data_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| format!("create Couch Review state directory {}: {e}", data_dir.display()))?;
+    let path = session_revocation_path(data_dir);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => return Ok(()),
+        Ok(_) => return Err(format!("Couch Review revocation marker {} is not a file", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("inspect Couch Review revocation marker {}: {e}", path.display())),
+    }
+    let tmp = data_dir.join(format!("{SESSION_REVOCATION_FILE}.tmp-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&tmp, b"revoked\n").and_then(|()| crate::atomic_file::replace_file(&tmp, &path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("persist Couch Review revocation marker {}: {e}", path.display())
+    })
+}
+
+fn clear_session_revocation(data_dir: &Path) -> Result<(), String> {
+    let path = session_revocation_path(data_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove Couch Review revocation marker {}: {e}", path.display())),
+    }
 }
 
 /// Returns Err when the session could NOT be written. Most callers treat that as advisory — a link
@@ -365,11 +527,14 @@ fn save_session(
     Ok(())
 }
 
-fn clear_session(data_dir: &Path) {
+fn clear_session(data_dir: &Path) -> Result<(), String> {
     let path = session_path(data_dir);
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
             tracing::warn!("Couch Review session file not removed ({}): {e}", path.display());
+            Err(format!("Couch Review stopped securely, but its stale session file could not be removed: {e}"))
         }
     }
 }
@@ -380,6 +545,16 @@ type RememberedSession = (HashMap<String, String>, HashSet<(String, String)>);
 /// Read back a remembered session, or None if there is none / it is unreadable / it belongs to a
 /// different library.
 fn load_session(data_dir: &Path, db_path: &str) -> Option<RememberedSession> {
+    // Stop writes this marker BEFORE teardown. It is authoritative even if the stale credential file
+    // could not be deleted; unreadable marker metadata also fails closed.
+    match std::fs::metadata(session_revocation_path(data_dir)) {
+        Ok(_) => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!("Couch Review session not resumed: revocation state could not be read: {e}");
+            return None;
+        }
+    }
     let raw = std::fs::read_to_string(session_path(data_dir)).ok()?;
     let saved: SavedSession = serde_json::from_str(&raw).ok()?;
     if saved.db_path != db_path {
@@ -525,9 +700,16 @@ fn start_on_port(
         return Err(format!("Couch Review cannot open the library: {e}"));
     }
 
+    let tls_identity = load_or_create_tls_identity(data_dir.as_deref())?;
     let server = Arc::new(
-        tiny_http::Server::http(("0.0.0.0", port))
-            .map_err(|e| format!("Couch server could not bind port {port}: {e}"))?,
+        tiny_http::Server::https(
+            ("0.0.0.0", port),
+            tiny_http::SslConfig::load_from_mem(
+                tls_identity.certificate_pem.clone(),
+                tls_identity.private_key_pem.clone(),
+            ),
+        )
+        .map_err(|e| format!("Couch TLS server could not bind port {port}: {e}"))?,
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -537,7 +719,7 @@ fn start_on_port(
         served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
     let session_store = data_dir.as_ref().map(|dir| (dir.clone(), db_path.clone()));
     let state =
-        Arc::new(Mutex::new(CouchState { reviewers: tokens, spot_checks, session_store, ..CouchState::default() }));
+        Arc::new(Mutex::new(CouchState { pairing_codes: tokens, spot_checks, session_store, ..CouchState::default() }));
     // One accept thread per reviewer. tiny_http hands a request to whichever thread is free, so a
     // reviewer downloading a clip no longer blocks another reviewer's save — with a single reviewer this
     // is exactly the previous one-thread server. Each thread owns its own WAL connection (SQLite
@@ -551,7 +733,7 @@ fn start_on_port(
                 // running would leave orphans serving live tokens on port 8737 with no handle in COUCH —
                 // unstoppable from Settings, and blocking every later start with a bind failure.
                 shutdown.store(true, Ordering::SeqCst);
-                server.unblock();
+                let _ = server.unblock();
                 for join in joins {
                     let _ = join.join();
                 }
@@ -562,22 +744,35 @@ fn start_on_port(
     // Read the port back off the socket rather than trusting the argument: a caller may pass 0 to
     // mean "any free port", and the issued URLs must carry the port that was ACTUALLY bound.
     let bound = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(port);
-    let handle = CouchHandle { shutdown, server, port: bound, state, joins, data_dir: data_dir.clone() };
+    let handle = CouchHandle {
+        shutdown,
+        server,
+        port: bound,
+        state,
+        joins,
+        data_dir: data_dir.clone(),
+        certificate_fingerprint: tls_identity.fingerprint,
+    };
     let status = status_of(&handle);
     // Remember it only once the server is actually serving. Saving earlier would leave a session file
     // pointing at a start that failed, and the next launch would resume links to nothing.
     if let Some(dir) = data_dir.as_deref() {
         let (reviewers, checks) = {
             let st = lock_state(&handle.state);
-            (st.reviewers.clone(), st.spot_checks.clone())
+            (st.pairing_codes.clone(), st.spot_checks.clone())
         };
-        // Advisory here: a session that fails to persist still serves every link it just issued, and
-        // save_session has already logged why. Only `revoke` treats this as an error worth raising.
-        let _ = save_session(dir, &reviewers, &db_path, &checks);
+        // Advisory here: a session that fails to persist still serves every link it just issued. A
+        // prior Stop marker is cleared ONLY after the fresh token map is durably written; clearing it
+        // first could revive the stale pre-Stop file if the new save then failed.
+        if save_session(dir, &reviewers, &db_path, &checks).is_ok() {
+            if let Err(e) = clear_session_revocation(dir) {
+                tracing::warn!("Couch Review is running, but this fresh session will not auto-resume: {e}");
+            }
+        }
     }
     *guard = Some(handle);
     tracing::info!(
-        "Couch Review started on port {bound} for {} reviewer(s) (token gated; stop from Settings)",
+        "Couch Review started with TLS on port {bound} for {} reviewer(s) (paired sessions; stop from Settings)",
         names.len()
     );
     Ok(status)
@@ -585,7 +780,24 @@ fn start_on_port(
 
 /// Stop the couch server and drop every session token (revoking all reviewer links at once).
 pub fn stop() -> Result<CouchStatus, String> {
+    stop_with_data_dir(None)
+}
+
+/// Stop with an AppState-provided data directory. The fallback matters when the server is already
+/// stopped: pressing Stop again must retry cleanup of a session file whose first deletion failed.
+pub fn stop_with_data_dir(fallback_data_dir: Option<&Path>) -> Result<CouchStatus, String> {
     let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());
+    let durable_dir =
+        guard.as_ref().and_then(|handle| handle.data_dir.clone()).or_else(|| fallback_data_dir.map(Path::to_path_buf));
+
+    // Persist the deny fact BEFORE taking the only live handle. If this fails, leave the server
+    // registered and running and return an error; we must never claim revocation that a restart can
+    // silently undo.
+    if let Some(dir) = durable_dir.as_deref() {
+        write_session_revocation(dir)?;
+    }
+
+    let mut cleanup_error = None;
     if let Some(mut h) = guard.take() {
         h.shutdown.store(true, Ordering::SeqCst);
         // unblock() makes the accept loops stop yielding requests so the threads exit. (A bare TCP
@@ -593,7 +805,7 @@ pub fn stop() -> Result<CouchStatus, String> {
         // join() deadlocked; caught by the live end-to-end test.) The loops additionally poll with
         // `recv_timeout`, so a thread unblock() fails to reach still exits within ACCEPT_POLL rather
         // than wedging stop() forever — the same deadlock class, now impossible for any thread count.
-        h.server.unblock();
+        let _ = h.server.unblock();
         for join in h.joins.drain(..) {
             let _ = join.join();
         }
@@ -601,16 +813,29 @@ pub fn stop() -> Result<CouchStatus, String> {
         // STOP IS THE REVOKE. Closing the app remembers the session so a link keeps working; pressing
         // Stop is the owner deciding it should not. Forgetting this line would make "stopping revokes
         // every link" a lie the moment the app reopened.
-        if let Some(dir) = h.data_dir.as_deref() {
-            clear_session(dir);
+        if let Some(dir) = durable_dir.as_deref() {
+            if let Err(e) = clear_session(dir) {
+                // The revocation marker remains, so stale credentials cannot resume. Surface the
+                // cleanup failure and let a second Stop retry it instead of swallowing it.
+                cleanup_error = Some(e);
+            }
         }
         // Drop the Server BEFORE waking it. Dropping is what sets tiny_http's internal close flag, so
         // the order decides whether the wake-up connection means "exit" or "serve me".
         drop(h);
         release_listener(port);
         tracing::info!("Couch Review stopped");
+    } else if let Some(dir) = durable_dir.as_deref() {
+        // Retry path after a previous Stop securely shut down but could not remove the stale file.
+        if let Err(e) = clear_session(dir) {
+            cleanup_error = Some(e);
+        }
     }
-    Ok(CouchStatus::stopped())
+    if let Some(error) = cleanup_error {
+        Err(error)
+    } else {
+        Ok(CouchStatus::stopped())
+    }
 }
 
 /// Make sure the listening socket is really gone, and not just scheduled to be.
@@ -664,13 +889,18 @@ fn release_listener(port: u16) {
 /// A guarantee proven only by a copy of the code is not proven at all.
 fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
     let mut st = lock_state(state);
-    let Some(token) = st.reviewers.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(t, _)| t.clone()) else {
+    let roster = if st.pairing_codes.is_empty() { &st.reviewers } else { &st.pairing_codes };
+    if !roster.values().any(|reviewer| reviewer.eq_ignore_ascii_case(name)) {
         return Err(format!("No reviewer named '{name}' in this session"));
-    };
-    if st.reviewers.len() <= 1 {
+    }
+    let distinct_reviewers: HashSet<String> = roster.values().map(|reviewer| reviewer.to_lowercase()).collect();
+    if distinct_reviewers.len() <= 1 {
         return Err("That is the only reviewer — stop Couch Review instead".to_string());
     }
-    st.reviewers.remove(&token);
+    st.pairing_codes.retain(|_, reviewer| !reviewer.eq_ignore_ascii_case(name));
+    st.reviewers.retain(|_, reviewer| !reviewer.eq_ignore_ascii_case(name));
+    let live_sessions: HashSet<String> = st.reviewers.keys().cloned().collect();
+    st.session_issued.retain(|token, _| live_sessions.contains(token));
     // Their held clips go back to the pool at once; leaving them leased would strand real work behind
     // someone who can no longer reach the server.
     st.leases.retain(|_, (who, _)| !who.eq_ignore_ascii_case(name));
@@ -684,7 +914,7 @@ fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
     // Snapshot under the lock and write outside it, like the batch-serve path: save_session does DPAPI
     // plus file IO, which has no business inside the request-path mutex.
     let persist =
-        st.session_store.clone().map(|(dir, db_path)| (dir, db_path, st.reviewers.clone(), st.spot_checks.clone()));
+        st.session_store.clone().map(|(dir, db_path)| (dir, db_path, st.pairing_codes.clone(), st.spot_checks.clone()));
     drop(st);
     if let Some((dir, db_path, reviewers, checks)) = persist {
         // Access is already denied in memory at this point, so this is not a rollback — it is the
@@ -724,22 +954,23 @@ fn status_of(h: &CouchHandle) -> CouchStatus {
     // opens a socket, and every reviewer's URL differs only in its token.
     let lan = lan_ip();
     let tailscale = tailscale_ip();
-    let mut reviewers: Vec<CouchReviewer> = lock_state(&h.state)
-        .reviewers
+    let state = lock_state(&h.state);
+    let link_credentials = if state.pairing_codes.is_empty() { &state.reviewers } else { &state.pairing_codes };
+    let mut reviewers: Vec<CouchReviewer> = link_credentials
         .iter()
         // `#t=`, not `?t=`: a fragment never leaves the browser, so a link pasted into a chat app
         // hands its preview bot the empty shell rather than a live credential. The page claims the
         // fragment via POST /api/claim into the HttpOnly cookie on first open.
         .map(|(token, name)| CouchReviewer {
             name: name.clone(),
-            url: format!("http://{lan}:{}/#t={token}", h.port),
-            tailscale_url: tailscale.as_ref().map(|ip| format!("http://{ip}:{}/#t={token}", h.port)),
+            url: format!("https://{lan}:{}/#t={token}", h.port),
+            tailscale_url: tailscale.as_ref().map(|ip| format!("https://{ip}:{}/#t={token}", h.port)),
         })
         .collect();
     // HashMap iteration order is randomized per process, so sort for a stable Settings list — otherwise
     // the URLs visibly reshuffle on every status poll and the owner cannot tell whose link is whose.
     reviewers.sort_by(|a, b| a.name.cmp(&b.name));
-    CouchStatus { running: true, reviewers }
+    CouchStatus { running: true, reviewers, certificate_fingerprint: Some(h.certificate_fingerprint.clone()) }
 }
 
 /// Best-effort LAN IPv4 of this machine. UDP `connect` only SELECTS the outbound interface via the
@@ -793,7 +1024,7 @@ fn spawn_server_loop(
                     // the whole server down with it — a port that accepts and never answers hangs
                     // every phone and defeats the watchdog, which cannot tell it from a wedge.
                     shutdown.store(true, Ordering::SeqCst);
-                    server.unblock();
+                    let _ = server.unblock();
                     return;
                 }
             };
@@ -802,9 +1033,13 @@ fn spawn_server_loop(
                 // within ACCEPT_POLL even if unblock() only wakes one of them, so stop()/join() is
                 // bounded no matter how many reviewers are running.
                 let mut request = match server.recv_timeout(ACCEPT_POLL) {
-                    Ok(Some(request)) => request,
+                    Ok(Ok(Some(request))) => request,
                     // None = timed out (poll again) or unblocked (the shutdown check catches it).
-                    Ok(None) => continue,
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(e)) => {
+                        tracing::warn!("Couch Review request parse error: {e}");
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!("Couch Review accept error: {e}");
                         continue;
@@ -832,13 +1067,13 @@ type Reply = (u16, &'static str, Vec<u8>, Vec<(&'static str, String)>);
 /// the URL exactly once, and from then on the cookie carries it.
 ///
 /// `HttpOnly` is the point — the SERVER sets it, so page JavaScript can never read the token back
-/// out. Setting it from JS would have been simpler and strictly worse. No `Secure` flag, and that is
-/// honest rather than an oversight: this is plain HTTP on a LAN or tailnet, and marking a cookie
-/// Secure there would stop it being sent at all. `SameSite=Strict` keeps it off cross-site requests.
+/// out. `Secure` is mandatory because Couch Review now serves TLS on every interface;
+/// `SameSite=Strict` keeps it off cross-site requests and a 24-hour sliding lifetime narrows exposure
+/// from a lost phone without interrupting an active reviewer.
 fn page_reply_with_cookie(token: &str, body: Vec<u8>) -> (Reply, Option<String>) {
     (
         (200, "text/html; charset=utf-8", body, vec![]),
-        Some(format!("{COUCH_COOKIE}={token}; Path=/; Max-Age=604800; SameSite=Strict; HttpOnly")),
+        Some(format!("{COUCH_COOKIE}={token}; Path=/; Max-Age=86400; SameSite=Strict; Secure; HttpOnly")),
     )
 }
 
@@ -847,10 +1082,9 @@ fn page_reply_with_cookie(token: &str, body: Vec<u8>) -> (Reply, Option<String>)
 /// The reply moves it into the HttpOnly cookie and the page strips the fragment. From that moment the
 /// token never appears in any URL, log line, or preview-bot fetch.
 ///
-/// Deliberately NOT single-use: chat-app preview bots fetch a pasted link within seconds, before the
-/// human taps it. A one-shot claim would be burned by the bot and 401 the actual reviewer. The bot
-/// never sees the fragment at all, which is the whole protection — repeat claims by the same holder
-/// are simply the reviewer opening their link again.
+/// The pairing secret and session credential are deliberately distinct. Re-opening a pairing link may
+/// mint a fresh session (preview bots never see fragments), but the secret itself never rides on audio
+/// or decision requests and can be revoked independently of every already-issued cookie.
 fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) {
     #[derive(serde::Deserialize)]
     struct ClaimBody {
@@ -859,10 +1093,40 @@ fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) 
     let Ok(parsed) = serde_json::from_slice::<ClaimBody>(body) else {
         return (err_reply(400, "bad json"), None);
     };
-    let Some(reviewer) = lock_state(state).reviewers.get(&parsed.token).cloned() else {
+    let mut guard = lock_state(state);
+    let reviewer = guard.pairing_codes.get(&parsed.token).or_else(|| guard.reviewers.get(&parsed.token)).cloned();
+    let Some(reviewer) = reviewer else {
         // Same answer as every other bad credential: no hint whether the token was close.
         return (err_reply(401, "unauthorized"), None);
     };
+    let now = Instant::now();
+    let expired: Vec<String> = guard
+        .session_issued
+        .iter()
+        .filter(|(_, issued)| now.duration_since(**issued) >= COUCH_SESSION_TTL)
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in expired {
+        guard.session_issued.remove(&token);
+        guard.reviewers.remove(&token);
+    }
+    while guard.reviewers.values().filter(|name| *name == &reviewer).count() >= MAX_SESSIONS_PER_REVIEWER {
+        let oldest = guard
+            .session_issued
+            .iter()
+            .filter(|(token, _)| guard.reviewers.get(*token) == Some(&reviewer))
+            .min_by_key(|(_, issued)| **issued)
+            .map(|(token, _)| token.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        guard.session_issued.remove(&oldest);
+        guard.reviewers.remove(&oldest);
+    }
+    let session_token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    guard.reviewers.insert(session_token.clone(), reviewer.clone());
+    guard.session_issued.insert(session_token.clone(), now);
+    drop(guard);
     (
         (
             200,
@@ -870,7 +1134,7 @@ fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) 
             serde_json::json!({ "ok": true, "reviewer": reviewer }).to_string().into_bytes(),
             vec![],
         ),
-        Some(format!("{COUCH_COOKIE}={}; Path=/; Max-Age=604800; SameSite=Strict; HttpOnly", parsed.token)),
+        Some(format!("{COUCH_COOKIE}={session_token}; Path=/; Max-Age=86400; SameSite=Strict; Secure; HttpOnly")),
     )
 }
 
@@ -939,8 +1203,8 @@ const COUCH_COOKIE: &str = "cortex_couch";
 /// send cookies. Only a pre-fragment legacy link stops working, which is exactly the link that must
 /// stop working. Reissuing a session regenerates every token anyway.
 fn token_from_request(request: &tiny_http::Request) -> Option<String> {
-    let cookies = request.headers().iter().find(|h| h.field.equiv("Cookie"))?;
-    cookies.value.as_str().split(';').find_map(|kv| {
+    let cookies = request.headers().get("Cookie")?;
+    cookies.as_str().split(';').find_map(|kv| {
         let (name, value) = kv.split_once('=')?;
         (name.trim() == COUCH_COOKIE).then(|| value.trim().to_string())
     })
@@ -949,7 +1213,7 @@ fn token_from_request(request: &tiny_http::Request) -> Option<String> {
 /// One request header by name, case-insensitively (tiny_http's `equiv` does the casing, and requires
 /// a `'static` name — every caller passes a literal).
 fn request_header(request: &tiny_http::Request, name: &'static str) -> Option<String> {
-    request.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
+    request.headers().get(name).map(|value| value.as_str().to_string())
 }
 
 fn handle_request(
@@ -960,6 +1224,13 @@ fn handle_request(
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
     let method = request.method().clone();
+
+    // Reject a declared oversized body before authentication or body parsing. The patched parser
+    // drains an abandoned connection through a fixed buffer, so even usize::MAX cannot allocate from
+    // this untrusted value; this explicit 413 also avoids waiting for bytes that will never be sent.
+    if request.body_length().is_some_and(|length| length > MAX_BODY_BYTES) {
+        return (err_reply(413, "body too large"), None);
+    }
 
     // EVERY DATA route is token-gated. Two routes are deliberately reachable without a credential,
     // and the distinction is the Phase-2 design (docs/REMOTE_PUBLIC_LINKS_PLAN.md):
@@ -978,8 +1249,19 @@ fn handle_request(
     // The token still RESOLVES the reviewer everywhere else: an unknown token has no identity, so
     // there is no path on which a decision can be written without a name attached. Resolved from the
     // SHARED map on every request, so a revoked token stops working immediately.
-    let authenticated = token_from_request(request)
-        .and_then(|token| lock_state(state).reviewers.get(&token).cloned().map(|name| (token, name)));
+    let authenticated = token_from_request(request).and_then(|token| {
+        let mut guard = lock_state(state);
+        if guard
+            .session_issued
+            .get(&token)
+            .is_some_and(|issued| Instant::now().duration_since(*issued) >= COUCH_SESSION_TTL)
+        {
+            guard.session_issued.remove(&token);
+            guard.reviewers.remove(&token);
+            return None;
+        }
+        guard.reviewers.get(&token).cloned().map(|name| (token, name))
+    });
 
     if let (tiny_http::Method::Get, "/") = (&method, path.as_str()) {
         let shell = include_str!("../assets/couch.html").as_bytes().to_vec();
@@ -987,7 +1269,12 @@ fn handle_request(
             // Authenticated page load: RE-plant the cookie. This is the sliding expiry — an active
             // reviewer's cookie renews on every visit, so a bookmark used weekly never dies while
             // the session lives. (A fixed Max-Age from first claim would expire mid-engagement.)
-            Some((token, _)) => page_reply_with_cookie(&token, shell),
+            Some((token, _)) => {
+                if let Some(issued) = lock_state(state).session_issued.get_mut(&token) {
+                    *issued = Instant::now();
+                }
+                page_reply_with_cookie(&token, shell)
+            }
             // Unauthenticated: the bare shell, NO cookie. This is what a preview bot receives.
             None => ((200, "text/html; charset=utf-8", shell, vec![]), None),
         };
@@ -1076,6 +1363,19 @@ fn read_body(request: &mut tiny_http::Request) -> Result<Vec<u8>, String> {
 
 /// The review text shown/edited on the phone: same precedence as the desktop editor
 /// (human-curated annotated transcript when present, else the raw draft).
+///
+/// DELIBERATELY NOT `quality::effective_transcript`, even though that is the canonical VERBATIM LAW
+/// accessor and this looks like a duplicate of it. `effective_transcript` puts `verdict_transcript`
+/// first for a human-decided clip — and on a SPOT-CHECK clip that field holds the ANSWER KEY. The
+/// listening QC works precisely by serving a already-answered clip with its RAW, known-wrong draft;
+/// showing the stored answer instead would hand every reviewer the solution and auto-pass every
+/// check, silently. Tried 2026-08-15; caught by
+/// `every_decision_lands_in_the_append_only_audit_trail`, which saw the spot check reclassify from
+/// "edit" to "accept" because the submitted text then matched what was served.
+///
+/// Phone finalization now shares the human-decision transaction, so a correction cannot exist in
+/// `verdict_transcript` while the row remains pending. This precedence remains separate solely to
+/// protect blinded spot checks from seeing their answer key.
 fn review_text(seg: &SpeechSegment) -> String {
     seg.annotated_transcript.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| seg.raw_transcript.clone())
 }
@@ -1106,11 +1406,25 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // below genuinely need every pending row (they depend on in-memory LEASE state, which no SQL
     // aggregate can see), but a row that is only being COUNTED does not need anything except its id.
     // The <= 25 clips actually served are hydrated after the lock is released.
-    let pending_ids = match db.pending_segment_ids() {
+    // Dialect roster, re-read per fetch so the owner can change who reviews what without restarting
+    // the app. A reviewer with no entry is unrestricted, exactly as before this existed.
+    let allowed_dialects: Option<Vec<String>> = {
+        let guard = lock_state(state);
+        guard
+            .session_store
+            .as_ref()
+            .map(|(data_dir, _db_path)| data_dir.clone())
+            .and_then(|dir| crate::dialect::load_roster(&dir).get(reviewer).cloned())
+    };
+    let pending_ids = match db.pending_segment_ids_for(allowed_dialects.as_deref()) {
         Ok(ids) => ids,
         Err(e) => return err_reply(500, &e.to_string()),
     };
     let pending_total = pending_ids.len();
+    // An empty queue means two very different things, and the page must not say "all clips reviewed"
+    // for the second: everything really is done, OR this reviewer is restricted to a dialect that has
+    // no work right now (today: everything playable is Hawleri, so a Sorani-only reviewer has none).
+    let restricted_and_empty = allowed_dialects.is_some() && pending_total == 0;
     let now = Instant::now();
     let mut guard = lock_state(state);
     let mut serving: Vec<String> = Vec::new();
@@ -1150,18 +1464,19 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // which the whole-library read never was. `get_segments_by_ids` re-imposes its own global ordering,
     // so the rows are indexed by id and re-emitted in `serving` order; handing a reviewer the same
     // clips in a different order than they were leased would be a silent behaviour change.
-    let rows = match db.get_segments_by_ids(&serving) {
+    let rows = match db.get_segments_by_ids_with_revisions(&serving) {
         Ok(rows) => rows,
         Err(e) => return err_reply(500, &e.to_string()),
     };
-    let by_id: std::collections::HashMap<&str, &SpeechSegment> = rows.iter().map(|s| (s.id.as_str(), s)).collect();
+    let by_id: std::collections::HashMap<&str, (&SpeechSegment, i64)> =
+        rows.iter().map(|(segment, revision)| (segment.id.as_str(), (segment, *revision))).collect();
     // filter_map, not unwrap: a clip can be deleted between the id query and this fetch. Serving one
     // fewer clip is correct; panicking on a race in the reviewer's request path is not. Its lease simply
     // expires.
     let mut queue: Vec<serde_json::Value> = serving
         .iter()
         .filter_map(|id| by_id.get(id.as_str()))
-        .map(|s| {
+        .map(|(s, revision)| {
             serde_json::json!({
                 "id": s.id,
                 "text": review_text(s),
@@ -1170,7 +1485,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 "speakerChange": holds_a_speaker_change(s),
                 // The row's change-fingerprint at serve time; the page echoes it on the decision so
                 // a draft replaced by a background writer in between is refused, never recorded.
-                "rowVersion": db.segment_row_stamp(&s.id).ok().flatten(),
+                "rowVersion": revision.to_string(),
             })
         })
         .collect();
@@ -1230,7 +1545,12 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 // than 409ing the reviewer. Snapshot under the lock, write outside it — save_session
                 // does DPAPI + file IO, which has no business inside the request-path mutex.
                 let persist = if grew {
-                    guard.session_store.clone().map(|s| (s, guard.reviewers.clone(), guard.spot_checks.clone()))
+                    let persisted_pairing_codes = if guard.pairing_codes.is_empty() {
+                        guard.reviewers.clone()
+                    } else {
+                        guard.pairing_codes.clone()
+                    };
+                    guard.session_store.clone().map(|s| (s, persisted_pairing_codes, guard.spot_checks.clone()))
                 } else {
                     None
                 };
@@ -1270,6 +1590,11 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
             "heldByOthers": held_by_others,
             "skippedByYou": skipped_by_you,
             "pendingTotal": pending_total,
+            // Their own completed AUDIO so far. Best-effort: a progress badge must never be the
+            // reason a reviewer cannot get work, so a failure here serves 0 rather than a 500.
+            "reviewedMs": db.reviewed_audio_ms(reviewer).unwrap_or(0),
+            // "there is no work in YOUR dialect", not "everything is reviewed".
+            "noWorkInYourDialect": restricted_and_empty,
         }),
     )
 }
@@ -1490,15 +1815,10 @@ fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
 /// NFC-compared because the write path canonicalizes, so a decomposed phone-IME paste would otherwise
 /// never match the value it just stored.
 ///
-/// This deliberately does NOT look at `verified`, and that is the whole point. One phone decision is
-/// TWO non-atomic writes: `record_human_decision_by` (which sets human_decision / verdict_transcript /
-/// reviewed_by) and then the row upsert (which sets verified / annotated_transcript). Keying the guard
-/// on `verified` meant a mid-submit failure — write one committed, write two refused — left a row the
-/// guard could not recognise, so the outbox replay ran the ENTIRE write a second time: a duplicate
-/// agent_examples pair into the DPO export, a correction_memory hit_count bumped as though it were an
-/// independent cross-segment confirmation, and that memory then graded against the very edit that
-/// created it. `verified` is an artefact of the second write; the identity of the decision lives in
-/// the first. Callers pair this with `prev.verified` to tell a COMPLETE repeat from a half-written one.
+/// This deliberately does NOT look at `verified`. Current phone decisions finalize atomically, but a
+/// row created by an older release can still contain a committed decision without phone finalization.
+/// Recognizing that legacy half-row lets replay finish only annotation/verification without minting a
+/// duplicate learning pair. Callers pair this with `prev.verified` to distinguish complete repeats.
 fn is_repeat_of_stored_decision(prev: &SpeechSegment, reviewer: &str, decision: &str, text: Option<&str>) -> bool {
     if prev.reviewed_by.as_deref() != Some(reviewer) {
         return false;
@@ -1541,7 +1861,7 @@ struct DecisionBody {
     /// review corpus cannot be wrong about.
     #[serde(default)]
     reviewer: Option<String>,
-    /// The row's `updated_at` as it was when the clip was SERVED (text-provenance audit #4). The
+    /// The row's monotonic database revision as it was when the clip was SERVED. The
     /// queue payload carries it and the page echoes it back, so a decision made against a draft
     /// that a background writer replaced in between is refused rather than recorded — the accept/
     /// edit classification and the DPO pair are only meaningful against the text the reviewer saw.
@@ -1551,10 +1871,10 @@ struct DecisionBody {
     row_version: Option<String>,
 }
 
-/// Record one phone decision through the exact desktop path: `record_human_decision_by` FIRST (its
-/// validation aborts before anything is committed), then the whole-row upsert built from the FRESH
-/// db row — never from the payload — so only `annotated_transcript`/`verified` can change. The decision
-/// is attributed to `reviewer`, and refused outright on a clip another reviewer currently holds.
+/// Record one phone decision through the shared human-decision path. Verdict, provenance/learning
+/// effects, annotation, and verification commit atomically; an accepted response can never leave a
+/// decided-but-pending row. The decision is attributed to `reviewer`, and refused outright on a clip
+/// another reviewer currently holds.
 ///
 /// `action: "skip"` is the one path that writes NOTHING to the corpus — see the block that handles it.
 fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
@@ -1577,8 +1897,8 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             return err_reply(409, &format!("this decision was made by {claimed}, not {reviewer}"));
         }
     }
-    let prev = match db.get_segment_by_id(&parsed.id) {
-        Ok(Some(seg)) => seg,
+    let (prev, request_revision) = match db.get_segment_by_id_with_revision(&parsed.id) {
+        Ok(Some(row)) => row,
         Ok(None) => return err_reply(404, "no such segment"),
         Err(e) => return err_reply(500, &e.to_string()),
     };
@@ -1711,7 +2031,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     }
 
     // SERVE/DECIDE VERSION FENCE (text-provenance audit #4). The queue stamped this clip's
-    // `updated_at` into the payload; if the row changed between serve and submit (batch
+    // monotonic revision into the payload; if the row changed between serve and submit (batch
     // re-transcribe, refine loop, desktop edit — all of which target exactly the unverified rows
     // the couch serves), the reviewer judged text that no longer exists: recording it would
     // misclassify accept-vs-edit against the NEW row and mint a DPO pair anti-training the fresher
@@ -1719,12 +2039,11 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // an already-recorded decision — its write one landed, so the stamp has legitimately moved.
     if !already_recorded {
         if let Some(served_stamp) = parsed.row_version.as_deref() {
-            match db.segment_row_stamp(&parsed.id) {
-                Ok(Some(current)) if current != served_stamp => {
-                    return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
-                }
-                Ok(_) => {}
-                Err(e) => return err_reply(500, &e.to_string()),
+            let Ok(served_revision) = served_stamp.parse::<i64>() else {
+                return err_reply(409, "this clip was served by an older page — reload for the fresh draft");
+            };
+            if served_revision != request_revision {
+                return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
             }
         }
     }
@@ -1755,6 +2074,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     //
     // It sits after validation so a REJECTED request (bad action, placeholder text, missing row) cannot
     // leave a 15-minute lease on a clip it never decided, locking other reviewers out of it.
+    let operation_id = (!already_recorded).then(|| uuid::Uuid::new_v4().to_string());
     {
         let now = Instant::now();
         let mut guard = lock_state(state);
@@ -1765,9 +2085,14 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         // No undo entry when finishing a half-written decision: `prev` is the HALF-DECIDED row, not the
         // pre-decision one, so storing it would make the undo button restore a corrupt snapshot. The
         // entry pushed by the original attempt is the true one and is deliberately left in place.
-        if !already_recorded {
+        if let Some(operation_id) = operation_id.as_ref() {
             let stack = guard.undo.entry(reviewer.to_string()).or_default();
-            stack.push(UndoEntry { seg_id: prev.id.clone(), prev: prev.clone(), decided_stamp: None });
+            stack.push(UndoEntry {
+                operation_id: operation_id.clone(),
+                seg_id: prev.id.clone(),
+                prev: prev.clone(),
+                decided_revision: None,
+            });
             // Bounded HERE, at the only site that grows it: the pushes in api_undo are restorations of
             // an entry just popped, so they cannot exceed what the stack already held.
             let overflow = stack.len().saturating_sub(UNDO_DEPTH);
@@ -1776,51 +2101,53 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             }
         }
     }
-    // Skipped entirely when the decision is already on the row: this is the write that mints the DPO
-    // pair and the correction memories, and running it twice for one human act is the corruption the
-    // half-written state used to cause.
-    if !already_recorded {
-        if let Err(e) =
-            crate::jury::record_human_decision_by(db, &parsed.id, decision, text.as_deref(), None, Some(reviewer))
-        {
-            let mut guard = lock_state(state);
-            guard.undo.entry(reviewer.to_string()).or_default().pop();
-            // The lease is deliberately KEPT. Handing the clip back the instant a write fails looks
-            // tidy, but the reviewer still has this clip open with their correction typed and now
-            // queued in the outbox — and a freed clip is picked up by the next reviewer's batch within
-            // seconds. Their replay then loses the race and is refused 409, destroying work that was
-            // never in conflict with anyone. An untouched lease expires on its own in LEASE_TTL, which
-            // is the right cost for a transient database error.
+    // New decisions finalize in the SAME transaction that mints the DPO pair/correction memories.
+    // A legacy half-written row is finalized without replaying those side effects.
+    let write_result = if already_recorded {
+        db.finalize_phone_human_decision_at_revision(&parsed.id, text.as_deref(), request_revision)
+    } else {
+        db.record_phone_human_decision_by_at_revision(&parsed.id, decision, text.as_deref(), reviewer, request_revision)
+    };
+    let decided_revision = match write_result {
+        Ok(Some(revision)) => revision,
+        Ok(None) => {
+            if let Some(operation_id) = operation_id.as_deref() {
+                let mut guard = lock_state(state);
+                if let Some(stack) = guard.undo.get_mut(reviewer) {
+                    stack.retain(|entry| entry.operation_id != operation_id);
+                }
+            }
+            return err_reply(409, "this clip changed while the decision was being saved — reload for the fresh draft");
+        }
+        Err(e) => {
+            if let Some(operation_id) = operation_id.as_deref() {
+                // Remove THIS request's provisional entry, never whichever same-reviewer request
+                // happened to push most recently while our database write was in flight.
+                let mut guard = lock_state(state);
+                if let Some(stack) = guard.undo.get_mut(reviewer) {
+                    stack.retain(|entry| entry.operation_id != operation_id);
+                }
+            }
+            // The lease is deliberately KEPT. The reviewer still has the clip open and their outbox can
+            // retry; freeing it immediately would hand the same work to another reviewer.
             return err_reply(500, &e.to_string());
         }
-    }
-    // Fresh row AFTER the (potentially slow) decision call — the same stale-spread rationale as the
-    // desktop submit(); a background writer may have updated other columns in the meantime.
-    let mut updated = match db.get_segment_by_id(&parsed.id) {
-        Ok(Some(seg)) => seg,
-        Ok(None) => return err_reply(404, "segment vanished"),
-        Err(e) => return err_reply(500, &e.to_string()),
     };
-    if let Some(t) = text {
-        updated.annotated_transcript = Some(t);
-    }
-    updated.verified = true; // "reviewed" — a 'reject' decision keeps it out of exports
-    if let Err(e) = db.insert_segment(&updated) {
-        return err_reply(500, &e.to_string());
-    }
-    // Stamp the undo entry with the row's POST-decision fingerprint, now that the final write has
-    // landed — api_undo refuses to restore unless the row still carries exactly this stamp, which
+    // Stamp the undo entry with the row's POST-decision revision returned by the SAME transaction —
+    // api_undo refuses to restore unless the row still carries exactly this value, which
     // is what makes undo safe against every intervening writer, not only re-reviews. On a resumed
-    // half-written decision the original attempt's entry (stamp still None) is the one completed.
-    let decided_stamp = db.segment_row_stamp(&parsed.id).ok().flatten();
+    // half-written decision the original attempt's entry (revision still None) is the one completed.
     {
         let mut guard = lock_state(state);
-        if let Some(entry) = guard
-            .undo
-            .get_mut(reviewer)
-            .and_then(|stack| stack.iter_mut().rev().find(|e| e.seg_id == parsed.id && e.decided_stamp.is_none()))
-        {
-            entry.decided_stamp = decided_stamp;
+        if let Some(stack) = guard.undo.get_mut(reviewer) {
+            let entry = if let Some(operation_id) = operation_id.as_deref() {
+                stack.iter_mut().find(|entry| entry.operation_id == operation_id)
+            } else {
+                stack.iter_mut().rev().find(|entry| entry.seg_id == parsed.id && entry.decided_revision.is_none())
+            };
+            if let Some(entry) = entry {
+                entry.decided_revision = Some(decided_revision);
+            }
         }
     }
     // Decided, so the lease has served its purpose — release it rather than waiting out the TTL. (The
@@ -1851,62 +2178,33 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
         return err_reply(409, "nothing to undo");
     };
     let id = entry.seg_id.clone();
-    // STALENESS FENCE. `prev` is a whole-row snapshot taken at decision time and never refreshed, and
-    // the restore below rewrites EVERY column from it. If ANYONE touched the clip in between, undo
-    // silently destroys that work and reverts the row to a state nobody agreed to. The fence is the
-    // row's `updated_at` fingerprint captured when the decision's final write landed: `reviewed_by`
-    // alone was not enough (audit #2/#3) — batch normalize, the refine loop, a desktop edit and a
-    // champion re-draft all rewrite text columns WITHOUT touching `reviewed_by`, so every one of
-    // them slipped past the old fence and was reverted. Refuse instead, and keep the entry so
-    // nothing is lost either way; the reviewed_by check stays first purely for its better message.
-    match db.get_segment_by_id(&id) {
-        Ok(Some(fresh)) if fresh.reviewed_by.as_deref() != Some(reviewer) => {
-            let owner = fresh.reviewed_by.clone();
+    // STALENESS + ATOMICITY FENCE. The full-row restore and learning-example retraction happen in ONE
+    // database transaction whose UPDATE includes both reviewer and monotonic revision predicates.
+    // There is no check-then-write window, and a failed restore cannot leave a half-undone row.
+    let Some(expected_revision) = entry.decided_revision else {
+        lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
+        return err_reply(409, "the prior decision did not finish cleanly — retry the decision before undoing it");
+    };
+    let restored_revision = match db.undo_phone_human_decision(&entry.prev, reviewer, expected_revision) {
+        Ok(Some(revision)) => revision,
+        Ok(None) => {
+            let owner = db.get_segment_by_id(&id).ok().flatten().and_then(|row| row.reviewed_by);
             lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
             return match owner {
-                Some(other) => {
+                Some(other) if other != reviewer => {
                     err_reply(409, &format!("{other} has reviewed this clip since — undo would erase their work"))
                 }
                 None => {
                     err_reply(409, "this clip has been changed at the desktop since — undo would erase that change")
                 }
+                _ => err_reply(409, "this clip has been changed since the decision — undo would erase that change"),
             };
-        }
-        Ok(Some(_)) => {
-            let fresh_stamp = match db.segment_row_stamp(&id) {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-                    return err_reply(500, &e.to_string());
-                }
-            };
-            if entry.decided_stamp.is_none() || fresh_stamp != entry.decided_stamp {
-                lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-                return err_reply(409, "this clip has been changed since the decision — undo would erase that change");
-            }
-        }
-        Ok(None) => {
-            lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-            return err_reply(404, "no such segment");
         }
         Err(e) => {
             lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
             return err_reply(500, &e.to_string());
         }
-    }
-    let prev = entry.prev.clone();
-    if let Err(e) = db.clear_human_decision(&id) {
-        lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-        return err_reply(500, &e.to_string());
-    }
-    if let Err(e) = db.insert_segment_full(&prev) {
-        // The snapshot is the ONLY copy of the pre-decision row and clear_human_decision has already
-        // committed, so dropping it here left the clip permanently half-undone: unverified columns
-        // cleared, the retracted edit still sitting in annotated_transcript, and nothing anywhere able
-        // to put it back. Push it back so a retry — or the next reviewer's ↩ — can still complete it.
-        lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-        return err_reply(500, &e.to_string());
-    }
+    };
     // The clip is pending again and this reviewer is about to see it — hold it for them so a second
     // reviewer's queue cannot grab the clip out from under the person mid-correction.
     //
@@ -1942,7 +2240,7 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     // The restore rewrote the row, so the page's served rowVersion is stale by construction. Hand
     // back the fresh fingerprint so the immediate re-decision (the whole point of undo) is not
     // refused by the serve/decide fence it would otherwise trip.
-    let row_version = db.segment_row_stamp(&id).ok().flatten();
+    let row_version = restored_revision.to_string();
     json_reply(200, serde_json::json!({ "id": id, "rowVersion": row_version }))
 }
 
@@ -1967,13 +2265,52 @@ mod tests {
     }
 
     fn seg(id: &str, raw: &str) -> SpeechSegment {
+        // A REAL file on disk, one per clip. `pending_segment_ids` refuses to serve a clip whose audio
+        // has gone missing (2026-08-15), so the old shared "/audio/a.wav" placeholder would drop every
+        // fixture out of the queue and leave the lease/batch tests below asserting against an empty
+        // list — passing while proving nothing. One process-wide temp dir, cleaned up on exit.
+        static AUDIO: std::sync::LazyLock<tempfile::TempDir> =
+            std::sync::LazyLock::new(|| tempfile::tempdir().expect("fixture audio dir"));
+        let path = AUDIO.path().join(format!("{id}.wav"));
+        std::fs::write(&path, b"RIFF").expect("fixture audio file");
         SpeechSegment {
             id: id.into(),
-            audio_path: "/audio/a.wav".into(),
+            audio_path: path.to_string_lossy().into_owned(),
             raw_transcript: raw.into(),
             duration_ms: 1500,
             ..SpeechSegment::default()
         }
+    }
+
+    #[test]
+    fn the_phone_never_serves_a_spot_check_its_own_answer_key() {
+        // Pins the reason review_text must NOT delegate to quality::effective_transcript. On a gold
+        // answer-key clip, verdict_transcript holds the ANSWER and raw_transcript holds the
+        // known-wrong draft the trap depends on. Serving the answer would auto-pass every listening
+        // check while looking perfectly healthy — the QC would measure nothing and say nothing.
+        let mut answer_key = seg("g1", "دەقی هەڵە");
+        answer_key.is_gold = true;
+        answer_key.verified = true;
+        answer_key.human_decision = Some("edit".into());
+        answer_key.verdict = Some("human_edit".into());
+        answer_key.verdict_transcript = Some("دەقی ڕاست".into());
+        assert_eq!(
+            review_text(&answer_key),
+            "دەقی هەڵە",
+            "a spot check must be served its WRONG draft; serving the stored answer defeats the QC"
+        );
+    }
+
+    #[test]
+    fn review_text_prefers_a_human_annotation_over_the_raw_draft() {
+        let mut annotated = seg("s2", "raw draft");
+        annotated.annotated_transcript = Some("human typed".into());
+        assert_eq!(review_text(&annotated), "human typed");
+
+        // ...and a blank annotation never beats a good draft (the blank-overwrite class).
+        let mut blank = seg("s3", "raw draft");
+        blank.annotated_transcript = Some("   ".into());
+        assert_eq!(review_text(&blank), "raw draft");
     }
 
     #[test]
@@ -1987,6 +2324,42 @@ mod tests {
             assert_eq!(first, 100, "{ip} not in CGNAT range");
             assert!((64..128).contains(&second), "{ip} not in CGNAT range");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tls_identity_is_persistent_and_the_private_key_is_dpapi_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = load_or_create_tls_identity(Some(tmp.path())).expect("generate TLS identity");
+        let second = load_or_create_tls_identity(Some(tmp.path())).expect("reload TLS identity");
+        assert_eq!(first.fingerprint, second.fingerprint, "phones must see a stable certificate across restarts");
+        let stored = std::fs::read_to_string(tmp.path().join(TLS_IDENTITY_FILE)).unwrap();
+        assert!(!stored.contains("PRIVATE KEY"), "the TLS private key must never be stored as plaintext PEM");
+        let parsed: SavedTlsIdentity = serde_json::from_str(&stored).unwrap();
+        assert!(crate::dpapi::is_protected(&parsed.protected_private_key_pem));
+        assert_eq!(certificate_fingerprint(&parsed.certificate_pem).unwrap(), first.fingerprint);
+    }
+
+    #[test]
+    fn pairing_mints_distinct_secure_bounded_sessions() {
+        let state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-secret".to_string(), "Sara".to_string())]),
+            ..CouchState::default()
+        });
+        for _ in 0..(MAX_SESSIONS_PER_REVIEWER + 3) {
+            let (reply, cookie) = api_claim(br#"{"token":"pair-secret"}"#, &state);
+            assert_eq!(reply.0, 200);
+            let cookie = cookie.expect("claim sets cookie");
+            assert!(cookie.contains("Secure") && cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+            assert!(!cookie.contains("pair-secret"), "pairing secret and data-session credential must be distinct");
+        }
+        let guard = lock_state(&state);
+        assert_eq!(guard.reviewers.len(), MAX_SESSIONS_PER_REVIEWER);
+        assert_eq!(guard.session_issued.len(), MAX_SESSIONS_PER_REVIEWER);
+        assert!(
+            !guard.reviewers.contains_key("pair-secret"),
+            "pairing code must not authenticate data routes directly"
+        );
     }
 
     // REMOVED with token_from_url itself: the query-string credential path. What it pinned - that an
@@ -2062,15 +2435,10 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_decision_is_finished_on_replay_and_never_recorded_twice() {
-        // One phone decision is TWO non-atomic writes: record_human_decision_by, then the row upsert.
-        // A failure between them (SQLITE_BUSY against a desktop batch, SQLITE_FULL) used to be
-        // unrecoverable in two separate ways at once, and this pins both.
-        //
-        // Made deterministic with the validation asymmetry the failure exploits: write one is a plain
-        // UPDATE that never calls validate_segment, write two goes through insert_segment which does —
-        // and which rejects a UNC audio_path. Flipping that column forces exactly the half-written row
-        // a transient fault produces, with no sleeps and no I/O races.
+    fn a_legacy_interrupted_decision_is_finished_on_replay_and_never_recorded_twice() {
+        // Releases before atomic phone finalization could commit verdict/learning effects while leaving
+        // verified=0. Construct that durable legacy state directly, then prove an outbox replay repairs
+        // it without repeating any learning side effect.
         let tmp = tempfile::tempdir().unwrap();
         let (db, path) = test_db(tmp.path());
         db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
@@ -2086,32 +2454,16 @@ mod tests {
             c.query_row("SELECT COALESCE(SUM(hit_count), 0) FROM correction_memory", [], |r| r.get(0)).unwrap()
         };
 
-        side.execute(
-            "UPDATE speech_segments SET audio_path = ?1 WHERE id = 's1'",
-            rusqlite::params![r"\\evil\share\a.wav"],
-        )
-        .unwrap();
-        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
-        assert_eq!(code, 500, "the row upsert must fail here — that is the state under test");
+        db.record_human_decision_by("s1", "edit", Some(fix), None, Some("Sara")).unwrap();
 
         let half = db.get_segment_by_id("s1").unwrap().unwrap();
-        assert!(!half.verified, "write two did NOT land");
-        assert_eq!(half.reviewed_by.as_deref(), Some("Sara"), "write one DID land — this is the half-written row");
+        assert!(!half.verified, "legacy desktop-style decision is not phone-finalized");
+        assert_eq!(half.reviewed_by.as_deref(), Some("Sara"));
         let pairs_after_failure = pairs(&side);
         let hits_after_failure = memory_hits(&side);
-        assert!(
-            pairs_after_failure >= 1,
-            "the failing submit still minted the learning pair; nothing to test otherwise"
-        );
+        assert!(pairs_after_failure >= 1, "the legacy decision must have a learning pair to deduplicate");
 
-        // The clip stays leased across the failure. (This is the write-TWO branch, which always held
-        // the lease; the write-ONE branch that used to release it is covered by the SQLITE_BUSY test
-        // below. Pinned here anyway so the two failure paths cannot drift apart.)
-        let held = { lock_state(&state).holder("s1", Instant::now()).map(str::to_string) };
-        assert_eq!(held.as_deref(), Some("Sara"), "a failed write must not release the reviewer's lease");
-
-        // The outbox replays. The row is writable again (the real-world analogue: the DB is no longer busy).
-        side.execute("UPDATE speech_segments SET audio_path = '/audio/a.wav' WHERE id = 's1'", []).unwrap();
+        // The outbox replays against the current atomic endpoint.
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "the replay must succeed, not 409 or 500");
 
@@ -2119,10 +2471,6 @@ mod tests {
         assert!(done.verified, "the replay FINISHES the interrupted write");
         assert_eq!(done.annotated_transcript.as_deref(), Some(fix));
 
-        // DEFECT 2 (the dedup key): the guard keyed on `verified`, which only write two sets, so it
-        // could not recognise its own half-written row and replayed the ENTIRE decision — a second DPO
-        // pair from one human edit, and a correction_memory hit_count bumped as though a second,
-        // independent segment had confirmed it.
         assert_eq!(pairs(&side), pairs_after_failure, "a replay must not mint a second learning pair");
         assert_eq!(memory_hits(&side), hits_after_failure, "a replay must not bump correction_memory hit_count");
     }
@@ -3054,6 +3402,22 @@ mod tests {
         format!("{COUCH_COOKIE}={token}")
     }
 
+    fn tls_agent(data_dir: &Path) -> ureq::Agent {
+        let saved: SavedTlsIdentity = serde_json::from_slice(
+            &std::fs::read(data_dir.join(TLS_IDENTITY_FILE)).expect("read generated Couch TLS identity"),
+        )
+        .expect("parse generated Couch TLS identity");
+        let mut roots = rustls::RootCertStore::empty();
+        let mut pem = std::io::Cursor::new(saved.certificate_pem.as_bytes());
+        for certificate in rustls_pemfile::certs(&mut pem) {
+            roots
+                .add(certificate.expect("parse generated Couch TLS certificate"))
+                .expect("trust generated certificate");
+        }
+        let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        ureq::AgentBuilder::new().tls_config(Arc::new(config)).timeout(std::time::Duration::from_secs(10)).build()
+    }
+
     /// Drive `handle_request`'s auth + throttle path without a live socket, by issuing a real request
     /// against a loopback server and handing it to the handler exactly as an accept thread would.
     ///
@@ -3071,7 +3435,7 @@ mod tests {
             let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
             let _ = agent.get(&url).set("Cookie", &cookie).call();
         });
-        let mut request = server.recv().unwrap();
+        let mut request = server.recv().unwrap().unwrap();
         let (reply, cookie) = handle_request(&mut request, db, state);
         let _ = respond_with_cookie(request, reply.clone(), cookie);
         let _ = client.join();
@@ -3221,7 +3585,7 @@ mod tests {
         );
 
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock();
+        let _ = server.unblock();
         let _ = join.join();
     }
 
@@ -3291,7 +3655,7 @@ mod tests {
         // because "this assertion disappeared" and "this protection disappeared" are different facts.
 
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock();
+        let _ = server.unblock();
         let _ = join.join();
     }
 
@@ -3314,7 +3678,7 @@ mod tests {
             let r = agent.get(&url).call().expect("large body is served");
             (r.header("content-length").map(str::to_string), r.header("transfer-encoding").map(str::to_string))
         });
-        let request = server.recv().unwrap();
+        let request = server.recv().unwrap().unwrap();
         let _ = respond_with_cookie(request, (200, "audio/wav", vec![0u8; BIG], vec![]), None);
         let (content_length, transfer_encoding) = client.join().expect("client thread");
 
@@ -3566,7 +3930,9 @@ mod tests {
         // The issued URL must actually WORK — this is what the deleted-field mutant breaks.
         let sara = status.reviewers.iter().find(|r| r.name == "Sara").expect("Sara was issued a link");
         let token = sara.url.split("#t=").nth(1).expect("the URL carries a fragment token").to_string();
-        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+        assert!(sara.url.starts_with("https://"), "production Couch links must never use plaintext HTTP");
+        assert!(status.certificate_fingerprint.is_some(), "the trusted desktop must expose the TLS fingerprint");
+        let agent = tls_agent(tmp.path());
         // Read the port back out of the URL the owner is actually handed. That doubles as an assertion
         // that the issued link carries the port that was really bound — with an ephemeral port, a URL
         // built from the REQUESTED port would say ":0" and reach nothing.
@@ -3578,13 +3944,29 @@ mod tests {
             .and_then(|p| p.parse().ok())
             .unwrap_or_else(|| panic!("the issued URL must carry a real port: {}", sara.url));
         assert_ne!(bound_port, 0, "an issued link must never advertise port 0");
-        let url = format!("http://127.0.0.1:{bound_port}/api/queue");
+        let base = format!("https://127.0.0.1:{bound_port}");
+        let unpaired = agent.get(&format!("{base}/api/queue")).set("Cookie", &cookie_for(&token)).call();
+        assert!(
+            matches!(unpaired, Err(ureq::Error::Status(401, _))),
+            "a pairing secret must not work as a reusable data-session cookie: {unpaired:?}"
+        );
+        let claim = agent
+            .post(&format!("{base}/api/claim"))
+            .send_json(ureq::json!({ "token": token }))
+            .expect("pairing secret must mint a session over TLS");
+        let session_cookie = claim
+            .header("Set-Cookie")
+            .and_then(|value| value.split(';').next())
+            .expect("pairing response sets a session cookie")
+            .to_string();
+        assert!(claim.header("Set-Cookie").is_some_and(|value| value.contains("Secure")));
+        let url = format!("{base}/api/queue");
         let code =
-            agent.get(&url).set("Cookie", &cookie_for(&token)).call().map(|r| r.status()).unwrap_or_else(|e| match e {
+            agent.get(&url).set("Cookie", &session_cookie).call().map(|r| r.status()).unwrap_or_else(|e| match e {
                 ureq::Error::Status(c, _) => c,
                 other => panic!("the issued link did not reach the server: {other}"),
             });
-        assert_eq!(code, 200, "a token issued by start() must authenticate against the running server");
+        assert_eq!(code, 200, "a paired TLS session must authenticate against the running server");
 
         // Two reviewers were named, so each must have a DISTINCT token — one shared credential would
         // erase the attribution the whole design rests on.
@@ -3598,7 +3980,7 @@ mod tests {
         // credential that worked above is what makes this an assertion about the token rather than
         // about an anonymous request - drop the cookie here and the 401 would be trivially true and
         // prove nothing.
-        let after = agent.get(&url).set("Cookie", &cookie_for(&token)).call();
+        let after = agent.get(&url).set("Cookie", &session_cookie).call();
         assert!(
             matches!(after, Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Transport(_))),
             "a stopped server must not keep honouring its tokens: {after:?}"
@@ -3702,7 +4084,7 @@ mod tests {
         // exit would, without touching the remembered session.
         if let Some(mut h) = COUCH.lock().unwrap_or_else(|p| p.into_inner()).take() {
             h.shutdown.store(true, Ordering::SeqCst);
-            h.server.unblock();
+            let _ = h.server.unblock();
             for join in h.joins.drain(..) {
                 let _ = join.join();
             }
@@ -3737,6 +4119,29 @@ mod tests {
     }
 
     #[test]
+    fn durable_stop_marker_blocks_a_stale_session_and_cleanup_errors_are_not_swallowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db_path = data_dir.join("library.db").to_string_lossy().to_string();
+        let reviewers = HashMap::from([("old-secret".to_string(), "Sara".to_string())]);
+        save_session(data_dir, &reviewers, &db_path, &HashSet::new()).unwrap();
+        assert!(load_session(data_dir, &db_path).is_some(), "precondition: stale credentials can resume");
+
+        write_session_revocation(data_dir).unwrap();
+        assert!(session_path(data_dir).is_file(), "the stale credential file intentionally remains");
+        assert!(
+            load_session(data_dir, &db_path).is_none(),
+            "the revocation marker, not successful cleanup, is the authority on restart"
+        );
+
+        clear_session(data_dir).unwrap();
+        std::fs::create_dir(session_path(data_dir)).unwrap();
+        let error = clear_session(data_dir).expect_err("a failed session-file removal must be surfaced");
+        assert!(error.contains("could not be removed"));
+        std::fs::remove_dir(session_path(data_dir)).unwrap();
+    }
+
+    #[test]
     fn revoking_one_reviewer_must_outlive_a_restart_the_way_stop_does() {
         let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // The reason revoke exists is a LOST PHONE. Dropping the token from the in-memory map denied
@@ -3768,7 +4173,7 @@ mod tests {
         // point of durable links), which is precisely why the revoke has to be remembered with it.
         if let Some(mut h) = COUCH.lock().unwrap_or_else(|p| p.into_inner()).take() {
             h.shutdown.store(true, Ordering::SeqCst);
-            h.server.unblock();
+            let _ = h.server.unblock();
             for join in h.joins.drain(..) {
                 let _ = join.join();
             }
@@ -4160,7 +4565,7 @@ mod tests {
         let after = fetch();
 
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock();
+        let _ = server.unblock();
         let _ = join.join();
 
         // NO decided clip may come back. This is the assertion that protects the reviewer from being
@@ -4246,7 +4651,7 @@ mod tests {
 
         // THE RESTART, mid-batch, with the phone still holding the rest of its queue.
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock();
+        let _ = server.unblock();
         let _ = join.join();
         drop(server);
 
@@ -4264,7 +4669,7 @@ mod tests {
         assert_eq!(replay, 200, "an outbox replay across a restart must be answered as already-done");
 
         shutdown2.store(true, Ordering::SeqCst);
-        server2.unblock();
+        let _ = server2.unblock();
         let _ = join2.join();
 
         let db = Database::open(&db_path).unwrap();
@@ -4376,7 +4781,7 @@ mod tests {
         }
 
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock();
+        let _ = server.unblock();
         let _ = join.join();
 
         // Spot checks are served ALONGSIDE real work and are already-verified clips, so `served` may
@@ -4485,7 +4890,7 @@ mod tests {
         let throttled: usize = results.iter().map(|(_, t)| t).sum();
 
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock();
+        let _ = server.unblock();
         for join in joins {
             join.join().expect("every server thread joins cleanly under load");
         }
@@ -4689,15 +5094,15 @@ mod tests {
         let resp =
             agent.post(&format!("{base}/api/decision")).set("Cookie", &cookie_for("saratoken123")).send_string(&huge);
         match resp {
-            Err(ureq::Error::Status(400, r)) => assert!(
+            Err(ureq::Error::Status(413, r)) => assert!(
                 r.into_string().unwrap_or_default().contains("body too large"),
                 "an over-cap body must be REFUSED, not silently truncated into a parse error"
             ),
-            other => panic!("expected 400 body-too-large, got {other:?}"),
+            other => panic!("expected 413 body-too-large, got {other:?}"),
         }
 
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock(); // the fix under test: unblock() (not a bare connect) ends the accept loops
+        let _ = server.unblock(); // the fix under test: unblock() (not a bare connect) ends the accept loops
         for join in joins {
             join.join().expect("every server thread joins cleanly after unblock()");
         }
@@ -4900,7 +5305,41 @@ mod tests {
         }
 
         shutdown.store(true, Ordering::SeqCst);
-        server.unblock();
+        let _ = server.unblock();
+        let _ = join.join();
+    }
+
+    #[test]
+    fn a_header_only_huge_content_length_is_rejected_and_the_server_survives() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_db, db_path) = test_db(tmp.path());
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let state = Arc::new(Mutex::new(CouchState::default()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path, state, shutdown.clone()).unwrap();
+
+        let mut hostile = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        hostile.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(
+            hostile,
+            "POST /api/claim HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            usize::MAX
+        )
+        .unwrap();
+        hostile.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        hostile.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 413"), "oversized declaration must be rejected: {response}");
+
+        // A second connection proves the accept loop and host process survived the hostile header.
+        let shell = ureq::get(&format!("http://127.0.0.1:{port}/")).call().unwrap();
+        assert_eq!(shell.status(), 200);
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = server.unblock();
         let _ = join.join();
     }
 

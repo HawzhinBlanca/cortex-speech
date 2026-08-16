@@ -81,7 +81,17 @@ fn audiobook_mp3_fingerprint_reimport_not_duplicate() {
         None => return,
     };
 
-    let (_sr, pcm) = audio::decode_to_pcm_with_timeout(&path, std::time::Duration::from_secs(120)).expect("decode");
+    // Re-import identity is based on the first bounded window; never decode a 30+ minute book into
+    // one allocation merely to inspect ten seconds. Abort the streaming decoder deliberately after
+    // its first callback (the API propagates callback errors as its cancellation mechanism).
+    let mut first = None;
+    let stopped = audio::decode_pcm_windows(&path, audio::DECODE_WINDOW_MS, |window| {
+        first = Some(window);
+        Err(cortex_speech_app_lib::error::AppError::Other("first-window-collected".into()))
+    });
+    assert!(stopped.is_err(), "the first-window callback deliberately cancels the remaining decode");
+    let window = first.expect("streaming decoder must produce a first window");
+    let (_sr, pcm) = audio::ensure_pcm_16khz(window.sample_rate, window.pcm).expect("resample first window");
     let fp = AudioFingerprint::new();
 
     assert!(

@@ -18,7 +18,9 @@ export function isHumanRejected(seg: Pick<SpeechSegment, 'humanDecision' | 'verd
 }
 
 /** A clip a human has confirmed GOOD: verified (accept/edit) and NOT rejected. */
-export function isVerifiedGood(seg: Pick<SpeechSegment, 'verified' | 'humanDecision' | 'verdict'>): boolean {
+export function isVerifiedGood(
+  seg: Pick<SpeechSegment, 'verified' | 'humanDecision' | 'verdict'>,
+): boolean {
   return seg.verified && !isHumanRejected(seg);
 }
 
@@ -31,7 +33,12 @@ export function isVerifiedGood(seg: Pick<SpeechSegment, 'verified' | 'humanDecis
 export function isPlaceholderTranscript(text: string | null | undefined): boolean {
   const t = (text ?? '').trim();
   const lower = t.toLowerCase();
-  return t.startsWith('[ASR unavailable') || t.startsWith('[Pending') || lower === 'n/a' || lower === 'null';
+  return (
+    t.startsWith('[ASR unavailable') ||
+    t.startsWith('[Pending') ||
+    lower === 'n/a' ||
+    lower === 'null'
+  );
 }
 
 /**
@@ -44,12 +51,16 @@ export function isPlaceholderTranscript(text: string | null | undefined): boolea
  * was measured as whatever stale text sat in annotated/raw. One helper, one order.
  */
 export function effectiveTranscript(
-  seg: Pick<SpeechSegment, 'rawTranscript' | 'annotatedTranscript' | 'verdictTranscript' | 'humanDecision' | 'verdict'>,
+  seg: Pick<
+    SpeechSegment,
+    'rawTranscript' | 'annotatedTranscript' | 'verdictTranscript' | 'humanDecision' | 'verdict'
+  >,
 ): string {
   const nonEmpty = (t: string | null | undefined) => (t ?? '').trim();
   const humanDecided =
-    ['accept', 'edit', 'human_accept', 'human_edit'].includes((seg.humanDecision ?? '').toLowerCase()) ||
-    ['human_accept', 'human_edit'].includes((seg.verdict ?? '').toLowerCase());
+    ['accept', 'edit', 'human_accept', 'human_edit'].includes(
+      (seg.humanDecision ?? '').toLowerCase(),
+    ) || ['human_accept', 'human_edit'].includes((seg.verdict ?? '').toLowerCase());
   const verdictText = nonEmpty(seg.verdictTranscript);
   if (humanDecided && verdictText) return verdictText;
   // VERBATIM LAW (2026-08-12): human text else the champion's verbatim raw — never an undecided
@@ -67,9 +78,17 @@ export function effectiveTranscript(
  * never under-counts a genuinely-good clip; it excludes only clips that are placeholder/empty EVERYWHERE.
  */
 export function hasRealTranscript(
-  seg: Pick<SpeechSegment, 'rawTranscript' | 'normalizedTranscript' | 'annotatedTranscript' | 'verdictTranscript'>,
+  seg: Pick<
+    SpeechSegment,
+    'rawTranscript' | 'normalizedTranscript' | 'annotatedTranscript' | 'verdictTranscript'
+  >,
 ): boolean {
-  return [seg.annotatedTranscript, seg.verdictTranscript, seg.normalizedTranscript, seg.rawTranscript].some((t) => {
+  return [
+    seg.annotatedTranscript,
+    seg.verdictTranscript,
+    seg.normalizedTranscript,
+    seg.rawTranscript,
+  ].some((t) => {
     const s = (t ?? '').trim();
     return s.length > 0 && !isPlaceholderTranscript(s);
   });

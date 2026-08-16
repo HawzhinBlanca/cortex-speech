@@ -29,7 +29,7 @@
   /* Text */
   --text: #e8eef6;
   --text-muted: #97a4b6;
-  --text-subtle: #7d8c9c;  /* WCAG 2.2 AA: >=4.5:1 on all dark surfaces (was #6d7c8c = 4.19, failed axe) */
+  --text-subtle: #7d8c9c; /* WCAG 2.2 AA: >=4.5:1 on all dark surfaces (was #6d7c8c = 4.19, failed axe) */
   --text-on-accent: #04121d;
 
   /* Accent — vivid sky, used with restraint */
@@ -422,6 +422,7 @@
     white-space: nowrap;
     border: 1px solid transparent;
     cursor: pointer;
+    min-height: 2rem;
     user-select: none;
     transition:
       transform var(--dur-1) var(--ease),
@@ -493,6 +494,7 @@
     font-size: 0.75rem;
     gap: 0.3rem;
     border-radius: var(--r-sm);
+    min-height: 1.75rem;
   }
   /* Always-dark terminal surface (bg-black) — pin the palette to dark values so
      log text stays light-on-black regardless of the app theme. */

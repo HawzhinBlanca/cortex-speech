@@ -414,8 +414,19 @@ mod tests {
     #[test]
     #[ignore = "live: set ELEVENLABS_API_KEY and SCRIBE_TEST_AUDIO"]
     fn live_transcribe_segments() {
-        let key = std::env::var("ELEVENLABS_API_KEY").expect("set ELEVENLABS_API_KEY");
-        let audio = std::env::var("SCRIBE_TEST_AUDIO").expect("set SCRIBE_TEST_AUDIO");
+        let Some(key) = std::env::var("ELEVENLABS_API_KEY").ok().or_else(|| {
+            let appdata = std::env::var("APPDATA").ok()?;
+            crate::api_keys::ApiKeys::load(&std::path::Path::new(&appdata).join("cortex-speech")).elevenlabs
+        }) else {
+            eprintln!("ElevenLabs key is not configured; skipping live Scribe request");
+            return;
+        };
+        let audio = std::env::var("SCRIBE_TEST_AUDIO").unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fleurs_ckb_sample.wav")
+                .to_string_lossy()
+                .into_owned()
+        });
         let segs = transcribe_segments(&audio, &key, DEFAULT_MODEL, "kur").expect("transcribe_segments");
         assert!(!segs.is_empty(), "expected at least one segment");
         for s in &segs {

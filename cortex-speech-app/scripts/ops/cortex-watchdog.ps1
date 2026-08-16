@@ -42,7 +42,33 @@ $exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } else {
 }
 $dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
 $port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
-$probeUrl = "http://127.0.0.1:$port/"
+# TLS FIRST, then plain HTTP. Couch Review serves TLS on every interface with a self-signed
+# certificate it generates locally, so an http:// probe against it does not fail cleanly — it comes
+# back as "corrupt message of type InvalidContentType", which this script read as a DEAD PORT and
+# answered by force-killing a perfectly healthy app, every five minutes, forever.
+#
+# MEASURED 2026-08-16: exactly that. Three probes 5s apart, then a kill, then a relaunch, in a loop —
+# the watchdog became the outage it exists to prevent. Both schemes are tried because the same script
+# has to supervise an older HTTP build and the current TLS one.
+#
+# Certificate validation is disabled for THIS probe only: the certificate is self-signed by design
+# and this is a localhost liveness check, not an authentication decision. It reads no response body.
+$probeUrls = @("https://127.0.0.1:$port/", "http://127.0.0.1:$port/")
+try {
+    Add-Type -TypeDefinition @'
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public static class CortexProbeCerts {
+    public static void TrustAll() {
+        ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+    }
+}
+'@ -ErrorAction Stop
+    [CortexProbeCerts]::TrustAll()
+} catch {
+    # Already loaded in this session, or the type exists — either way the callback is set.
+}
 $logDir = Join-Path $dataDir 'logs'
 $log = Join-Path $logDir 'watchdog.log'
 
@@ -95,13 +121,19 @@ if ($Register) {
 # 20s clears busy_timeout with margin, and one answer out of three attempts is enough to prove life.
 $alive = $false
 foreach ($attempt in 1..3) {
-    try {
-        Invoke-WebRequest -Uri $probeUrl -UseBasicParsing -TimeoutSec 20 | Out-Null
-        $alive = $true   # 2xx/3xx
-    } catch {
-        # A status-carrying refusal (401 et al.) is the server ANSWERING — alive. Only a transport
-        # failure (refused, timeout, reset) leaves .Response empty and means dead.
-        if ($null -ne $_.Exception.Response) { $alive = $true }
+    foreach ($probeUrl in $probeUrls) {
+        try {
+            Invoke-WebRequest -Uri $probeUrl -UseBasicParsing -TimeoutSec 20 | Out-Null
+            $alive = $true   # 2xx/3xx
+        } catch {
+            # A status-carrying refusal (401 et al.) is the server ANSWERING — alive. Only a transport
+            # failure (refused, timeout, reset) leaves .Response empty and means dead.
+            if ($null -ne $_.Exception.Response) { $alive = $true }
+            # An SSL/content-type mismatch is ALSO the server answering — it spoke, we mis-heard it.
+            # Treating a protocol mismatch as death is what turned this watchdog into a kill loop.
+            elseif ($_.Exception.Message -match 'SSL|TLS|secure channel|corrupt message|InvalidContentType') { $alive = $true }
+        }
+        if ($alive) { break }
     }
     if ($alive) { break }
     if ($attempt -lt 3) { Start-Sleep -Seconds 5 }

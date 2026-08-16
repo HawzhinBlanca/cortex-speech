@@ -1,8 +1,9 @@
 # Cortex
 
-Offline-first desktop app for **Central Kurdish (Sorani)** speech transcription, transcript
-curation, and dataset export. Tauri v2 + Svelte 5 + Rust, running **Meta OmniASR CTC** locally via
-**sherpa-onnx** with **Silero VAD** — no cloud required.
+Desktop app for **Central Kurdish (Sorani)** speech transcription, transcript curation, and dataset
+export. Tauri v2 + Svelte 5 + Rust. The quality-first default is the local **OmniASR-7B Champion**
+server under WSL; bundled **Meta OmniASR CTC** via sherpa-onnx is an explicitly selected fallback.
+Neither path requires a cloud service.
 
 > The desktop application lives in **[`cortex-speech-app/`](cortex-speech-app/)**.
 > Start there: [`cortex-speech-app/README.md`](cortex-speech-app/README.md) has setup, model
@@ -11,7 +12,9 @@ curation, and dataset export. Tauri v2 + Svelte 5 + Rust, running **Meta OmniASR
 ## What works today (honest status)
 
 - **End-to-end pipeline runs on real audio:** import → VAD chunk → ASR → review/annotate →
-  validate → verify → export (JSON/JSONL/CSV/Parquet/HuggingFace/WAV). Fully offline.
+  validate → verify → export (JSON/JSONL/CSV/Parquet/HuggingFace/WAV). The default Champion path
+  requires its separately provisioned WSL model server to be healthy before import; it fails closed
+  instead of silently downgrading.
 - **Measured accuracy (not estimated):** first reproducible Sorani scorecard is **29.40% CER**
   (95% CI [26.29, 32.54], N=400, seed=42) on the stock OmniASR-CTC-300M model — see
   [`cortex-speech-app/docs/EVAL.md`](cortex-speech-app/docs/EVAL.md) for the full breakdown,

@@ -11,6 +11,7 @@ use crate::models::ModelManager;
 use crate::normalizer::SoraniNormalizer;
 use crate::settings::AppSettings;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,51 @@ pub struct TranscriptionDraft {
     pub confidence_source: Option<String>,
     pub model_version_id: Option<String>,
     pub cloud_call: bool,
+}
+
+/// A primary transcript that was already computed for this exact PCM during the current operation.
+/// Multi-engine hypothesis population may reuse it only for the identical model id; every independent
+/// voter still runs normally.
+#[derive(Clone, Copy)]
+struct PrimaryHypothesis<'a> {
+    model_id: &'a str,
+    transcript: &'a str,
+    confidence: Option<f64>,
+}
+
+impl<'a> PrimaryHypothesis<'a> {
+    fn from_segment(segment: &'a SpeechSegment) -> Option<Self> {
+        let model_id = segment.model_version_id.as_deref()?;
+        let transcript = segment.raw_transcript.as_str();
+        // An empty transcript can be a genuine completed decode (for example, non-speech). Keep it
+        // as completion provenance so the same deterministic model is not run again, but do not
+        // insert it as jury evidence below. Explicit unavailable/not-run results remain retryable.
+        if crate::quality::is_placeholder_transcript(transcript)
+            || matches!(segment.confidence_source.as_deref(), Some("not_available" | "not_run"))
+        {
+            return None;
+        }
+        Some(Self { model_id, transcript, confidence: segment.confidence })
+    }
+}
+
+fn reuse_primary_or_infer<E>(
+    primary: Option<PrimaryHypothesis<'_>>,
+    candidate_model_id: &str,
+    infer: impl FnOnce() -> Option<Result<(String, Option<f64>), E>>,
+) -> Option<Result<(String, Option<f64>), E>> {
+    if let Some(primary) = primary.filter(|primary| primary.model_id == candidate_model_id) {
+        return if primary.transcript.trim().is_empty() {
+            None
+        } else {
+            Some(Ok((primary.transcript.to_string(), primary.confidence)))
+        };
+    }
+    infer()
+}
+
+fn auxiliary_hypotheses_enabled(settings: &AppSettings) -> bool {
+    settings.multi_engine_hypotheses && settings.asr_model_size != crate::settings::AsrModelSize::WSL7B
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +418,10 @@ impl Drop for Wsl7bPermit<'_> {
 /// preflight probe AND passed to the client via `CORTEX_7B_PORT`, so the app, client, and server can't
 /// drift (a mismatch would even green-light the preflight against the wrong service).
 pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+/// Stable provenance id for the owner's sole production ASR. Keep selection, persisted hypotheses,
+/// review filtering, and health/readiness checks tied to one identifier so an auxiliary model can
+/// never be mistaken for the champion by string drift between subsystems.
+pub(crate) const CHAMPION_MODEL_ID: &str = "omniasr-wsl-7b";
 
 /// Stable marker in the Err that `transcribe()` returns for a legit-but-EMPTY 7B result — a REACHABLE
 /// server that produced no words (a silent/music/noise clip), which parse_wsl_segment_result surfaces as
@@ -382,15 +432,14 @@ pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.
 pub(crate) const WSL_7B_EMPTY_RESULT_MARKER: &str = "WSL 7B returned an empty transcript";
 
 /// Machine-readable sentinel embedded in every "the OmniASR-7B champion is the selected primary
-/// engine but it is unavailable / failed" error. The frontend matches on this token to offer the
-/// user an EXPLICIT choice — retry the champion once its server is up, or transcribe this one clip
-/// with the offline model — instead of a dead-end error. The app NEVER silently substitutes a
-/// smaller model on the primary path; a small-model transcript is produced only on a deliberate
-/// user action. Keep the value in sync with `ASR_7B_UNAVAILABLE_TAG` in `src/lib/commands.ts`.
+/// engine but it is unavailable / failed" error. The frontend matches on this token to offer one
+/// safe recovery: restore the champion service and retry. The app NEVER silently substitutes a
+/// smaller model on the primary path. Keep the value in sync with `ASR_7B_UNAVAILABLE_TAG` in
+/// `src/lib/commands.ts`.
 pub(crate) const ASR_7B_UNAVAILABLE_TAG: &str = "E_ASR_7B_UNAVAILABLE";
 
 /// Wrap a primary-7B transcription failure so the UI can classify it (see [`ASR_7B_UNAVAILABLE_TAG`])
-/// and present the retry-or-offline choice. Preserves the original actionable text.
+/// and present the champion-retry recovery. Preserves the original actionable text.
 pub(crate) fn tag_7b_unavailable(err: AppError) -> AppError {
     let msg = err.to_string();
     if msg.contains(ASR_7B_UNAVAILABLE_TAG) {
@@ -616,9 +665,29 @@ fn agent_stage(
     }
 }
 
-fn multi_model_hypothesis_stage(db: &Database, file: impl Into<String>, segments: &[SpeechSegment]) -> PipelineEvent {
+fn multi_model_hypothesis_stage(
+    db: &Database,
+    settings: &crate::settings::AppSettings,
+    file: impl Into<String>,
+    segments: &[SpeechSegment],
+) -> PipelineEvent {
     let file = file.into();
     let total = segments.len().max(1);
+
+    // The production champion is intentionally single-engine. Requiring two auxiliary ASRs here made
+    // a healthy 7B import look blocked and encouraged silent 300M/1B/MMS execution solely to satisfy a
+    // metric. Training-grade multi-model proof remains enforced in its dedicated export gates; it is
+    // simply not a requirement of the champion transcription/review flow.
+    if settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+        return agent_stage(
+            "multi_model_hypotheses",
+            "not_required",
+            file,
+            "Champion-only mode: the fine-tuned OmniASR 7B transcript is sent to human review; auxiliary ASR coverage is not required or executed",
+            segments.len(),
+            total,
+        );
+    }
     if segments.is_empty() {
         return agent_stage(
             "multi_model_hypotheses",
@@ -730,7 +799,7 @@ impl LiveConsent {
     fn cloud_llm(&self) -> bool {
         self.cloud_llm.load(Ordering::SeqCst)
     }
-    fn cloud_stt(&self) -> bool {
+    pub fn cloud_stt(&self) -> bool {
         self.cloud_stt.load(Ordering::SeqCst)
     }
     fn jury_cloud(&self) -> bool {
@@ -810,11 +879,26 @@ impl ProcessingPipeline {
         }
     }
 
+    /// The shared live-consent handle, for work that runs on a blocking thread and therefore cannot
+    /// hold `AppState`. A long-running upload loop must re-read consent per item: withdrawing it is a
+    /// STOP instruction, and a batch that checked once at its start keeps uploading after the user
+    /// has switched cloud off (audit 2026-08-06; the same shape recurred in the Scribe vote batch).
+    pub fn consent_handle(&self) -> Arc<LiveConsent> {
+        Arc::clone(&self.consent)
+    }
+
     pub fn update_settings(&mut self, settings: AppSettings) {
-        // Consent FIRST, and through the shared Arc so it reaches clones already running an import.
-        // The snapshot swap below is visible only to this instance; that is fine for preferences and
-        // was the bug for consent.
-        self.consent.apply(&settings);
+        // Fail-safe in BOTH directions, which needs two different mechanisms:
+        //
+        // WITHDRAWAL is a stop instruction, so it is applied to the SHARED handle and reaches every
+        // clone already running an import or an upload batch. That is the 2026-08-06 audit fix.
+        //
+        // GRANTING must NOT reach those clones: a run the user began understanding nothing would
+        // leave the machine must stay offline for its whole length. So instead of raising the shared
+        // flags, this instance is handed a FRESH handle. Clones keep the one they started with —
+        // which `revoke_consent_now` can still lower, but nothing can raise.
+        self.revoke_consent_now(&settings);
+        self.consent = Arc::new(LiveConsent::from_settings(&settings));
         self.settings = Arc::new(settings);
     }
 
@@ -858,7 +942,7 @@ impl ProcessingPipeline {
 
     /// Pre-load the pooled Meta OmniASR CTC recognizer.
     pub fn warmup_asr(&self) -> Result<(), String> {
-        if self.should_use_wsl_primary_asr() {
+        if self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
             tracing::info!("WSL 7B model selected: skipping local ONNX ASR pool warm-up.");
             return Ok(());
         }
@@ -876,58 +960,43 @@ impl ProcessingPipeline {
     /// (models missing?)" even though the model was present on disk. The engine was offered in the
     /// UI and could not load.
     fn asr_model_root(&self) -> std::path::PathBuf {
-        self.root_for_size(&self.active_local_asr_model_size())
+        self.root_for_size(&self.selected_asr_model_size())
     }
 
     /// The models root that actually contains THIS engine's weights.
     fn root_for_size(&self, size: &crate::settings::AsrModelSize) -> std::path::PathBuf {
+        // A recognizer needs BOTH its weights and tokens from one root. Resolving only the model
+        // filename can select a partial user download and orphan a complete bundled pair, so prefer
+        // the first root where the whole engine passes the same size-aware presence gate as loading.
+        for root in std::iter::once(self.model_manager.models_dir.clone()).chain(crate::models::model_root_candidates())
+        {
+            if asr::omniasr_model_present(&root, size) {
+                return root;
+            }
+        }
+
         let (model_path, _) = asr::omniasr_model_paths(std::path::Path::new(""), size);
         let relative = model_path.to_string_lossy().replace('\\', "/");
         self.model_manager.resolve_root_for(relative.trim_start_matches('/'))
     }
 
-    /// Is this engine installed in EITHER root? Probing one root for several engines is the same
-    /// all-or-nothing mistake one level down: a bundled-only engine reads as absent and the app
-    /// silently downgrades to a weaker one.
+    /// Probe this exact engine in the root selected for its complete weights+tokens pair.
     fn size_present(&self, size: &crate::settings::AsrModelSize) -> bool {
         asr::omniasr_model_present(&self.root_for_size(size), size)
     }
 
     fn asr_config(&self) -> asr::AsrLoadConfig {
         asr::AsrLoadConfig {
-            model_size: self.active_local_asr_model_size(),
+            model_size: self.selected_asr_model_size(),
             enable_gpu: self.settings.enable_gpu,
             num_threads: self.settings.num_asr_threads,
             language: self.settings.language.clone(),
         }
     }
 
-    fn active_local_asr_model_size(&self) -> crate::settings::AsrModelSize {
-        use crate::settings::AsrModelSize;
-        // Each engine is probed in the root that CONTAINS it (round-26 per-file rule). Asking one
-        // root about several engines reports a bundled-only engine as absent and downgrades
-        // silently — measured 2026-08-13 with an empty user-dir CTC-1B beside a 1 GB bundled copy.
-        if self.settings.asr_model_size == AsrModelSize::WSL7B {
-            if self.size_present(&AsrModelSize::CTC1B) {
-                return AsrModelSize::CTC1B;
-            }
-            return AsrModelSize::CTC300M;
-        }
-        if self.size_present(&self.settings.asr_model_size) {
-            return self.settings.asr_model_size.clone();
-        }
-        let fallback = match self.settings.asr_model_size {
-            AsrModelSize::CTC1B => AsrModelSize::CTC300M,
-            _ => AsrModelSize::CTC1B,
-        };
-        if self.size_present(&fallback) {
-            tracing::warn!(
-                "Requested ASR model {:?} is not installed in either models root; falling back to {:?}",
-                self.settings.asr_model_size,
-                fallback
-            );
-            return fallback;
-        }
+    /// Return exactly the configured engine. Missing assets fail at the selected engine's load path;
+    /// substituting another installed engine would silently trade accuracy and falsify provenance.
+    fn selected_asr_model_size(&self) -> crate::settings::AsrModelSize {
         self.settings.asr_model_size.clone()
     }
 
@@ -957,15 +1026,12 @@ impl ProcessingPipeline {
     }
 
     /// F2 — the no-silent-downgrade guard. True when the selected primary engine is WSL 7B but no
-    /// client script is configured AND the fine-tuned engine is not available to serve as the
-    /// primary instead. In that state the only thing left below is stock local CTC — which the owner
-    /// never selected — so every primary-transcription entry point must FAIL LOUDLY here rather than
-    /// silently downgrading (the fail-hard contract documented in settings.rs). Hypothesis
-    /// generation is unaffected: it calls the ASR pool directly, not this primary path.
+    /// client script is configured. In that state every primary-transcription entry point must FAIL
+    /// LOUDLY here rather than silently downgrading (the fail-hard contract documented in
+    /// settings.rs). Auxiliary hypothesis generation is also disabled whenever WSL7B is selected.
     fn wsl7b_primary_unresolved(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && self.settings.external_asr_script_path().is_none()
-            && !(self.finetuned_override_active() && Self::finetuned_model_paths().is_some())
     }
 
     /// F6 — fast preflight before an import that will drive the WSL 7B primary: confirm the warm
@@ -981,6 +1047,9 @@ impl ProcessingPipeline {
     /// told "started". Checking here makes an unreachable champion an immediate, actionable refusal
     /// instead of a halt after the first write. A no-op when the champion is not the primary.
     pub fn preflight_primary_engine(&self) -> AppResult<()> {
+        if self.wsl7b_primary_unresolved() {
+            return Err(Self::primary_engine_unavailable_error());
+        }
         self.wsl_7b_server_preflight()
     }
 
@@ -1012,9 +1081,8 @@ impl ProcessingPipeline {
                     return Err(AppError::Validation(format!(
                         "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B server is not responding on \
                          127.0.0.1:{WSL_7B_SERVER_PORT} (in WSL). Start it (e.g. wsl python \
-                         cortex_7b_server.py from scripts/) and try again, or transcribe with the \
-                         offline model. The import was not started, so nothing was left \
-                         half-transcribed."
+                         cortex_7b_server.py from scripts/) and retry the champion. The import was \
+                         not started, so nothing was left half-transcribed."
                     )));
                 }
                 Ok(None) => {
@@ -1022,8 +1090,8 @@ impl ProcessingPipeline {
                         kill_and_reap_wsl_child(&mut child, "7B preflight probe");
                         return Err(AppError::Validation(format!(
                             "{ASR_7B_UNAVAILABLE_TAG}: Timed out checking the OmniASR-7B server (WSL \
-                             not responding). Ensure WSL and the 7B server are running and try \
-                             again, or transcribe with the offline model."
+                             not responding). Ensure WSL and the 7B server are running, then retry \
+                             the champion."
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -1037,25 +1105,26 @@ impl ProcessingPipeline {
     }
 
     /// The actionable, UI-classified error returned whenever [`Self::wsl7b_primary_unresolved`]
-    /// holds. Carries [`ASR_7B_UNAVAILABLE_TAG`] so the frontend presents the two deliberate ways
-    /// forward — start the 7B server (with the client script set) and retry the champion, or
-    /// transcribe this one clip with the offline model — never a silent downgrade.
+    /// holds. Carries [`ASR_7B_UNAVAILABLE_TAG`] so the frontend presents the safe recovery path:
+    /// configure/start the 7B service and retry the champion. No smaller-engine substitution is
+    /// offered from the production flow.
     fn primary_engine_unavailable_error() -> AppError {
-        // Tagged so the UI offers the retry-or-offline choice rather than a dead-end (see
+        // Tagged so the UI can offer a champion retry rather than a dead-end (see
         // ASR_7B_UNAVAILABLE_TAG). The app never silently downgrades to a smaller model.
         AppError::Validation(format!(
             "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B (the champion) is the selected engine but its WSL \
              client script is not configured (Settings → \"External ASR script path\" is empty). \
-             Start the 7B server and set that path to transcribe with the champion, or choose the \
-             offline model for this clip. Refusing to silently downgrade to a smaller model you did \
-             not select."
+             Set that path, start the 7B server, and retry the champion — or choose the offline \
+             model in Settings if you deliberately want the smaller local engine. Refusing to \
+             silently downgrade to a smaller model you did not select."
         ))
     }
 
     fn local_asr_model_id(&self) -> &'static str {
-        match self.active_local_asr_model_size() {
+        match self.selected_asr_model_size() {
             crate::settings::AsrModelSize::CTC1B => "omniasr-ctc-1b",
-            crate::settings::AsrModelSize::CTC300M | crate::settings::AsrModelSize::WSL7B => "omniasr-ctc-300m",
+            crate::settings::AsrModelSize::CTC300M => "omniasr-ctc-300m",
+            crate::settings::AsrModelSize::WSL7B => "omniasr-wsl-7b",
         }
     }
 
@@ -1545,7 +1614,7 @@ impl ProcessingPipeline {
                         segment_count,
                         segment_count.max(1),
                     ));
-                    callback(multi_model_hypothesis_stage(&db, fname.clone(), &segments));
+                    callback(multi_model_hypothesis_stage(&db, &self.settings, fname.clone(), &segments));
                     succeeded += 1;
                     // P3.2: record this file as done in the resume journal (best-effort).
                     if let Some(ref jid) = job_id {
@@ -1803,9 +1872,18 @@ impl ProcessingPipeline {
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
         self.shadow_log_loop0(db, &persisted);
         self.enqueue_background_alignments(&persisted);
-        for (seg_id, f32_pcm) in pcm_cache {
-            if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
-                log_hypothesis_population_failure(&seg_id, &error);
+        {
+            let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
+                .iter()
+                .filter_map(|segment| {
+                    PrimaryHypothesis::from_segment(segment).map(|primary| (segment.id.as_str(), primary))
+                })
+                .collect();
+            for (seg_id, f32_pcm) in pcm_cache {
+                let primary = primary_by_segment.get(seg_id.as_str()).copied();
+                if let Err(error) = self.populate_hypotheses_reusing_primary(db, &seg_id, &f32_pcm, primary) {
+                    log_hypothesis_population_failure(&seg_id, &error);
+                }
             }
         }
         Ok(persisted)
@@ -2054,9 +2132,18 @@ impl ProcessingPipeline {
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
         self.shadow_log_loop0(db, &persisted);
         self.enqueue_background_alignments(&persisted);
-        for (seg_id, f32_pcm) in all_pcm_cache {
-            if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
-                log_hypothesis_population_failure(&seg_id, &error);
+        {
+            let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
+                .iter()
+                .filter_map(|segment| {
+                    PrimaryHypothesis::from_segment(segment).map(|primary| (segment.id.as_str(), primary))
+                })
+                .collect();
+            for (seg_id, f32_pcm) in all_pcm_cache {
+                let primary = primary_by_segment.get(seg_id.as_str()).copied();
+                if let Err(error) = self.populate_hypotheses_reusing_primary(db, &seg_id, &f32_pcm, primary) {
+                    log_hypothesis_population_failure(&seg_id, &error);
+                }
             }
         }
         Ok(persisted)
@@ -2082,7 +2169,7 @@ impl ProcessingPipeline {
     ) -> AppResult<(Vec<SpeechSegment>, Vec<(String, Vec<f32>)>)> {
         let chunk_count = chunk_ranges.len() as u32;
         let chunk_total = chunk_ranges.len().max(1);
-        let active_asr_model_size = self.active_local_asr_model_size();
+        let active_asr_model_size = self.selected_asr_model_size();
         let model_id = match active_asr_model_size {
             crate::settings::AsrModelSize::CTC300M => "omniasr-ctc-300m".to_string(),
             crate::settings::AsrModelSize::CTC1B => "omniasr-ctc-1b".to_string(),
@@ -2670,15 +2757,9 @@ impl ProcessingPipeline {
                         let stored_ok =
                             !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
                         if stored_ok {
-                            if let Err(e) = insert_hypothesis_checked(
-                                db,
-                                &seg.id,
-                                "omniasr-wsl-7b",
-                                seg.raw_transcript.clone(),
-                                None,
-                            ) {
-                                tracing::warn!("could not record omniasr-wsl-7b provenance for {}: {e}", seg.id);
-                            }
+                            // `attempt_champion` routes through `transcribe`, whose DB helper commits
+                            // transcript + sole champion hypothesis atomically. Replacing hypotheses
+                            // again here used to create a second, fallible write after success.
                             updated += 1;
                             None
                         } else {
@@ -2846,64 +2927,29 @@ impl ProcessingPipeline {
             status: "Building whole-file reference transcript".into(),
         });
         let mut chunks_done = 0usize;
-        // Cloud STT (ElevenLabs Scribe) first when opted in and a key is configured: one API call,
-        // segmented from word timestamps. On ANY error, fall through to the local ASR path below so
-        // an import never fails just because the cloud is unavailable.
-        let result = 'transcribe: {
-            if let Some(scribe_key) = self.scribe_api_key_if_enabled() {
-                if let Some(token) = cancel.as_ref() {
-                    if let Err(e) = token.check() {
-                        break 'transcribe Err(e);
-                    }
-                }
-                on_event(PipelineEvent::Phase { phase: "transcribing".into() });
-                on_event(agent_stage(
-                    "audio_chunking",
-                    "running",
-                    fname.clone(),
-                    "Transcribing whole file with ElevenLabs Scribe (cloud)",
-                    0,
-                    1,
-                ));
-                match self.import_single_file_via_scribe(path, &db, &scribe_key) {
-                    Ok(segs) => {
-                        chunks_done = segs.len();
-                        break 'transcribe Ok(segs);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Scribe import failed ({e}); falling back to local ASR");
-                        on_event(agent_stage(
-                            "audio_chunking",
-                            "running",
-                            fname.clone(),
-                            "Scribe unavailable — using local ASR",
-                            0,
-                            estimated_chunks,
-                        ));
-                    }
-                }
-            }
-            self.process_single_file_with_progress(path, &db, cancel.as_ref(), |current, total| {
-                chunks_done = current;
-                let total = total.max(estimated_chunks);
-                self.set_import_status(current, total, &fname);
-                on_event(PipelineEvent::Phase { phase: "transcribing".into() });
-                on_event(agent_stage(
-                    "audio_chunking",
-                    "running",
-                    fname.clone(),
-                    format!("Preparing chunk {current}/{total}"),
-                    current,
-                    total,
-                ));
-                on_event(PipelineEvent::Progress {
-                    current,
-                    total,
-                    file: fname.clone(),
-                    status: format!("Transcribing chunk {current}/{total}"),
-                });
-            })
-        };
+        // Imports always use the configured primary engine. Optional cloud tools may be invoked only
+        // through their explicit per-segment actions; a consent toggle can never replace the 7B
+        // champion for an entire import or create a mixed-engine dataset after a cloud failure.
+        let result = self.process_single_file_with_progress(path, &db, cancel.as_ref(), |current, total| {
+            chunks_done = current;
+            let total = total.max(estimated_chunks);
+            self.set_import_status(current, total, &fname);
+            on_event(PipelineEvent::Phase { phase: "transcribing".into() });
+            on_event(agent_stage(
+                "audio_chunking",
+                "running",
+                fname.clone(),
+                format!("Preparing chunk {current}/{total}"),
+                current,
+                total,
+            ));
+            on_event(PipelineEvent::Progress {
+                current,
+                total,
+                file: fname.clone(),
+                status: format!("Transcribing chunk {current}/{total}"),
+            });
+        });
 
         match &result {
             Ok(segments) => {
@@ -2925,7 +2971,7 @@ impl ProcessingPipeline {
                     segment_count,
                     segment_count.max(1),
                 ));
-                on_event(multi_model_hypothesis_stage(&db, fname.clone(), segments));
+                on_event(multi_model_hypothesis_stage(&db, &self.settings, fname.clone(), segments));
 
                 // Post-import jury adjudication is intentionally NOT run here. The import COMMAND
                 // (commands.rs `import_audio_file`) runs it on a background thread with its OWN WAL
@@ -2955,113 +3001,6 @@ impl ProcessingPipeline {
         });
         // `running` is cleared by `_status_guard` on scope exit (covers early-return error paths too).
         result
-    }
-
-    /// The ElevenLabs Scribe key to use for cloud STT, or `None` when cloud STT is not opted in or no
-    /// key is configured. Mirrors the cloud-LLM opt-in gate; the key lives in `secrets.env` next to
-    /// the database and is never read unless the user has explicitly opted in (privacy by default).
-    fn scribe_api_key_if_enabled(&self) -> Option<String> {
-        // Snapshot AND live consent — see LiveConsent. Returning None here means the key is never
-        // even read from disk, so a mid-import withdrawal stops the upload at the source.
-        if !self.settings.cloud_stt_opt_in || !self.consent.cloud_stt() {
-            return None;
-        }
-        let data_dir = std::path::Path::new(&self.db_path).parent()?;
-        crate::api_keys::ApiKeys::load(data_dir).elevenlabs
-    }
-
-    /// Import a file using ElevenLabs Scribe as the transcriber: ONE API call for the whole file,
-    /// segmented from Scribe's word timestamps into source-file slices (no local ASR/VAD/diarization).
-    /// Persists and returns the segments. The caller falls back to the local path on error, so this
-    /// surfaces failures rather than masking them. Acoustic-quality/diarization fields are left unset.
-    pub fn import_single_file_via_scribe(
-        &self,
-        path: &Path,
-        db: &Database,
-        api_key: &str,
-    ) -> AppResult<Vec<SpeechSegment>> {
-        let duration_ms = audio::get_duration_ms(path)?;
-        if duration_ms == 0 {
-            return Err(AppError::Validation("Empty audio file".into()));
-        }
-        let audio_path = path.to_string_lossy().to_string();
-        let model_id = crate::scribe_api::DEFAULT_MODEL;
-        let scribe_segs = crate::scribe_api::transcribe_segments(
-            &audio_path,
-            api_key,
-            model_id,
-            crate::scribe_api::SORANI_LANGUAGE_CODE,
-        )?;
-        let segments = Self::build_scribe_speech_segments(
-            &scribe_segs,
-            &audio_path,
-            duration_ms,
-            self.settings.auto_normalize,
-            self.settings.verbalize_numbers,
-            model_id,
-        );
-        if segments.is_empty() {
-            return Err(AppError::Other("Scribe returned no segments".into()));
-        }
-        db.insert_segments_batch(&segments)?;
-        Ok(segments)
-    }
-
-    /// Build persistable [`SpeechSegment`]s from Scribe segments. Each becomes a source-file slice
-    /// (`audio_path` + `SegmentSourceMeta` time range) so it plays back the right region; text is
-    /// stored in logical (reading) order and normalized when auto-normalize is on. A segment with an
-    /// open end (0) extends to the file duration. Acoustic-quality fields stay `None` — Scribe gives
-    /// text and timing, not waveform metrics.
-    fn build_scribe_speech_segments(
-        scribe_segs: &[crate::scribe_api::ScribeSegment],
-        audio_path: &str,
-        total_duration_ms: i64,
-        auto_normalize: bool,
-        verbalize_numbers: bool,
-        model_id: &str,
-    ) -> Vec<SpeechSegment> {
-        let chunk_count = scribe_segs.len() as u32;
-        scribe_segs
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let start = s.source_start_ms.max(0);
-                let end = if s.source_end_ms > start { s.source_end_ms } else { total_duration_ms.max(start) };
-                let meta = crate::chunking::SegmentSourceMeta {
-                    source_start_ms: start,
-                    source_end_ms: end,
-                    chunk_index: i as u32,
-                    chunk_count,
-                };
-                let normalized = if auto_normalize && !s.text.trim().is_empty() {
-                    let cfg = crate::normalizer::NormalizationConfig {
-                        normalize_numbers: auto_normalize,
-                        verbalize_numbers,
-                        normalize_hamza: true,
-                        remove_diacritics: false,
-                    };
-                    Some(crate::normalizer::SoraniNormalizer::with_config(cfg).normalize(&s.text))
-                } else {
-                    None
-                };
-                SpeechSegment {
-                    id: Uuid::new_v4().to_string(),
-                    audio_path: audio_path.to_string(),
-                    raw_transcript: s.text.clone(),
-                    normalized_transcript: normalized,
-                    alignment_json: Some(meta.to_alignment_json()),
-                    duration_ms: end.saturating_sub(start).max(0),
-                    // PROVENANCE: Scribe is the one path that uploads raw audio to a cloud provider, so
-                    // these rows must say so durably. `..Default::default()` here persisted
-                    // cloud_call=false and model_version_id=NULL for exactly the segments whose audio
-                    // left the machine. Scribe returns no per-segment confidence, so `confidence` stays
-                    // None and `confidence_source` honestly stays None with it.
-                    cloud_call: true,
-                    model_version_id: Some(model_id.to_string()),
-                    ..Default::default()
-                }
-            })
-            .collect()
     }
 
     /// Transcribe an audio file, optionally limited to a source-time range from chunk metadata.
@@ -3109,7 +3048,14 @@ impl ProcessingPipeline {
                         if let Some(id) = segment_id {
                             if let Ok(db) = self.open_db() {
                                 let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-                                if let Err(error) = self.populate_hypotheses(&db, id, &f32_pcm) {
+                                let primary = PrimaryHypothesis {
+                                    model_id: "finetuned-mms-ckb",
+                                    transcript: &raw_text,
+                                    confidence: None,
+                                };
+                                if let Err(error) =
+                                    self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary))
+                                {
                                     log_hypothesis_population_failure(id, &error);
                                 }
                             }
@@ -3175,8 +3121,8 @@ impl ProcessingPipeline {
 
                 drop(db);
 
-                // Tag a 7B failure (server down / timeout / empty) so the UI offers retry-or-offline
-                // instead of a dead-end — and NEVER silently falls through to a smaller model here.
+                // Tag a 7B failure (server down / timeout / empty) so the UI can offer a champion retry
+                // — and NEVER silently fall through to a smaller model here.
                 let (raw_transcript, confidence) =
                     self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;
 
@@ -3186,7 +3132,7 @@ impl ProcessingPipeline {
                 // stored transcript with "" (silent data loss). Both re-transcribe entry points route
                 // through here (batch_transcribe + the per-segment transcribe IPC) with no retry, unlike
                 // the import path which retries/escalates for exactly this transient. Surface it as the
-                // retry-or-offline 7B failure the tag above promises, leaving the existing transcript intact.
+                // retryable 7B failure the tag above promises, leaving the existing transcript intact.
                 if raw_transcript.trim().is_empty() {
                     return Err(tag_7b_unavailable(AppError::Other(format!(
                         "{WSL_7B_EMPTY_RESULT_MARKER} (the server is likely under load); the existing transcript is left unchanged"
@@ -3194,48 +3140,6 @@ impl ProcessingPipeline {
                 }
 
                 let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
-
-                let normalized_transcript = if self.settings.auto_normalize && !raw_transcript.is_empty() {
-                    let norm_config = crate::normalizer::NormalizationConfig {
-                        normalize_numbers: self.settings.auto_normalize,
-                        verbalize_numbers: self.settings.verbalize_numbers,
-                        normalize_hamza: true,
-                        remove_diacritics: false,
-                    };
-                    let norm = SoraniNormalizer::with_config(norm_config);
-                    Some(norm.normalize(&raw_transcript))
-                } else {
-                    None
-                };
-
-                // Use the safe update method: human decisions are never overwritten.
-                let updated = db
-                    .update_asr_transcript_if_unreviewed(
-                        &id,
-                        &raw_transcript,
-                        normalized_transcript.as_deref(),
-                        confidence,
-                        Some("external_provider"),
-                        Some("omniasr-wsl-7b"),
-                        false,
-                    )
-                    .map_err(|e| AppError::Other(format!("Failed to update segment in database: {}", e)))?;
-                if !updated {
-                    tracing::info!("WSL 7B: segment {id} has a human decision — transcript not overwritten.");
-                }
-
-                // Insert WSL 7B hypothesis for downstream jury comparison.
-                if let Err(error) =
-                    insert_hypothesis_checked(&db, &id, "omniasr-wsl-7b", raw_transcript.clone(), confidence)
-                {
-                    tracing::error!("{error}");
-                }
-
-                // Populate local hypotheses for comparison
-                let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-                if let Err(error) = self.populate_hypotheses(&db, &id, &f32_pcm) {
-                    log_hypothesis_population_failure(&id, &error);
-                }
 
                 // Stage 2: Dual-Pass LLM Refinement (OpenRouter when configured + key present)
                 let final_text = if let Some(refiner) = self.build_refiner() {
@@ -3247,15 +3151,11 @@ impl ProcessingPipeline {
                         // (no hypotheses recorded is a normal state) — but a DB READ FAILURE must be
                         // logged, not folded into "no context": the old unwrap_or_default() made a
                         // persistent DB problem silently produce unprimed GER forever with no trace.
-                        let hyps: Vec<String> = match db.get_hypotheses_for_segment(&id) {
-                            Ok(hyps) => hyps.into_iter().map(|h| h.transcript).collect(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "GER: could not load N-best hypotheses for {id}: {e}; refining unprimed"
-                                );
-                                Vec::new()
-                            }
-                        };
+                        // Champion mode has exactly one ASR input. Use the in-memory 7B draft rather
+                        // than rereading historical DB hypotheses: an older 300M/1B/MMS/Scribe row can
+                        // never leak into refinement, and no partial provenance write is needed before
+                        // the whole transcription/refinement result is ready to commit.
+                        let hyps = vec![raw_transcript.clone()];
                         let few_shot: Vec<(String, String)> = match crate::jury::get_few_shot_examples(&db, &id, 3) {
                             Ok(examples) => examples.into_iter().map(|e| (e.wrong_transcript, e.human_fix)).collect(),
                             Err(e) => {
@@ -3292,7 +3192,43 @@ impl ProcessingPipeline {
                 // before it is returned/stored (opt-in; default off; best-effort).
                 let final_text = apply_loop0_firing(self.settings.loop0_firing_enabled, &db, &final_text);
 
+                // Commit ONCE, after every enabled refinement succeeds. The former early write stored
+                // raw 7B text before an enabled refiner could fail, then the command returned an error
+                // with a partially changed row. The backend is the sole writer; the frontend reloads
+                // this authoritative row and never whole-row-upserts a stale pre-inference snapshot.
+                let normalized_transcript = if self.settings.auto_normalize && !final_text.is_empty() {
+                    let norm_config = crate::normalizer::NormalizationConfig {
+                        normalize_numbers: self.settings.auto_normalize,
+                        verbalize_numbers: self.settings.verbalize_numbers,
+                        normalize_hamza: true,
+                        remove_diacritics: false,
+                    };
+                    let norm = SoraniNormalizer::with_config(norm_config);
+                    Some(norm.normalize(&final_text))
+                } else {
+                    None
+                };
                 let cloud_call = self.llm_refinement_uses_cloud();
+                let champion = SegmentHypothesis {
+                    segment_id: id.clone(),
+                    model_id: CHAMPION_MODEL_ID.to_string(),
+                    transcript: raw_transcript.clone(),
+                    confidence,
+                };
+                let updated = db
+                    .commit_champion_transcript_if_unreviewed(
+                        &champion,
+                        normalized_transcript.as_deref(),
+                        Some("external_provider"),
+                        cloud_call,
+                    )
+                    .map_err(|e| AppError::Other(format!("Failed to commit champion transcript: {e}")))?;
+                if !updated {
+                    return Err(AppError::Validation(format!(
+                        "Segment {id} gained a human decision while the champion was running; its reviewed transcript was not overwritten"
+                    )));
+                }
+
                 return Ok(TranscriptionDraft {
                     raw_text: raw_transcript,
                     final_text,
@@ -3391,7 +3327,8 @@ impl ProcessingPipeline {
 
         if let Some(id) = segment_id {
             if let Ok(db) = self.open_db() {
-                if let Err(error) = self.populate_hypotheses(&db, id, &f32_pcm) {
+                let primary = PrimaryHypothesis { model_id: &model_id, transcript: &raw_text, confidence };
+                if let Err(error) = self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary)) {
                     log_hypothesis_population_failure(id, &error);
                 }
             }
@@ -3556,7 +3493,7 @@ impl ProcessingPipeline {
         let gold_segments = crate::eval::list_gold_segments(&db)?;
         let mut hypotheses = Vec::new();
 
-        let model_dir = self.model_manager.resolved_dir();
+        let model_dir = self.root_for_size(&model_size);
         let config = asr::AsrLoadConfig {
             model_size,
             enable_gpu: self.settings.enable_gpu,
@@ -3603,16 +3540,28 @@ impl ProcessingPipeline {
     }
 
     pub fn populate_hypotheses(&self, db: &Database, segment_id: &str, f32_pcm: &[f32]) -> AppResult<()> {
+        self.populate_hypotheses_reusing_primary(db, segment_id, f32_pcm, None)
+    }
+
+    fn populate_hypotheses_reusing_primary(
+        &self,
+        db: &Database,
+        segment_id: &str,
+        f32_pcm: &[f32],
+        primary: Option<PrimaryHypothesis<'_>>,
+    ) -> AppResult<()> {
         // Guarded HERE rather than at the five call sites: one shared gate cannot be forgotten by a
         // sixth caller, and every caller wants the same answer. See `multi_engine_hypotheses` for
         // what these three engines cost when sherpa-onnx has no GPU (measured: 2.5 clips/minute).
         // The champion's own hypothesis is written by the transcribe path, not here, so turning this
         // off never leaves a clip without the transcript a reviewer is served.
-        if !self.settings.multi_engine_hypotheses {
+        // The champion path stays single-engine even if a legacy settings file still carries the old
+        // `multi_engine_hypotheses=true` default. The user's accuracy contract is explicit: when WSL7B
+        // is selected, 300M/1B/MMS may not run automatically or influence the evidence mix. They remain
+        // available only after selecting a non-champion engine and explicitly enabling this experiment.
+        if !auxiliary_hypotheses_enabled(&self.settings) {
             return Ok(());
         }
-        let model_dir = self.model_manager.resolved_dir();
-
         // 1. OmniASR 300M
         let model_id_300m = "omniasr-ctc-300m";
         let config_300m = asr::AsrLoadConfig {
@@ -3621,14 +3570,20 @@ impl ProcessingPipeline {
             num_threads: self.settings.num_asr_threads,
             language: self.settings.language.clone(),
         };
-        let res_300m = self.asr_pool.with_service(&model_dir, &config_300m, |asr| {
-            if !asr.is_available() {
+        let model_dir_300m = self.root_for_size(&config_300m.model_size);
+        let res_300m = reuse_primary_or_infer(primary, model_id_300m, || {
+            if !self.size_present(&config_300m.model_size) {
                 return None;
             }
-            Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))
+            self.asr_pool.with_service(&model_dir_300m, &config_300m, |asr| {
+                if !asr.is_available() {
+                    return None;
+                }
+                Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, conf, _source)| (text, conf)))
+            })
         });
         match res_300m {
-            Some(Ok((text, conf, _source))) => insert_hypothesis_checked(db, segment_id, model_id_300m, text, conf)?,
+            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_300m, text, conf)?,
             Some(Err(error)) => {
                 tracing::warn!("{model_id_300m} hypothesis transcription failed for {segment_id}: {error}");
             }
@@ -3643,14 +3598,20 @@ impl ProcessingPipeline {
             num_threads: self.settings.num_asr_threads,
             language: self.settings.language.clone(),
         };
-        let res_1b = self.asr_pool.with_service(&model_dir, &config_1b, |asr| {
-            if !asr.is_available() {
+        let model_dir_1b = self.root_for_size(&config_1b.model_size);
+        let res_1b = reuse_primary_or_infer(primary, model_id_1b, || {
+            if !self.size_present(&config_1b.model_size) {
                 return None;
             }
-            Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))
+            self.asr_pool.with_service(&model_dir_1b, &config_1b, |asr| {
+                if !asr.is_available() {
+                    return None;
+                }
+                Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, conf, _source)| (text, conf)))
+            })
         });
         match res_1b {
-            Some(Ok((text, conf, _source))) => insert_hypothesis_checked(db, segment_id, model_id_1b, text, conf)?,
+            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_1b, text, conf)?,
             Some(Err(error)) => {
                 tracing::warn!("{model_id_1b} hypothesis transcription failed for {segment_id}: {error}");
             }
@@ -3662,17 +3623,21 @@ impl ProcessingPipeline {
         // a root cause of "the jury escalates ~everything": two weak kin models rarely agree with the 7B,
         // so IRT confidence stays low and T0 almost never auto-accepts. Only runs when the fine-tuned
         // model is installed (a no-op otherwise); a failure is best-effort and never fails population.
-        if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
+        let model_id_finetuned = "finetuned-mms-ckb";
+        let res_finetuned = reuse_primary_or_infer(primary, model_id_finetuned, || {
+            let (onnx, vocab) = Self::finetuned_model_paths()?;
             let chunk_i16: Vec<i16> = f32_pcm.iter().map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
-            match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_i16) {
-                Ok(text) if !text.trim().is_empty() => {
-                    insert_hypothesis_checked(db, segment_id, "finetuned-mms-ckb", text, None)?;
-                }
-                Ok(_) => tracing::debug!("finetuned-mms-ckb hypothesis empty for {segment_id}"),
-                Err(error) => {
-                    tracing::warn!("finetuned-mms-ckb hypothesis transcription failed for {segment_id}: {error}");
-                }
+            Some(Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_i16).map(|text| (text, None)))
+        });
+        match res_finetuned {
+            Some(Ok((text, _))) if !text.trim().is_empty() => {
+                insert_hypothesis_checked(db, segment_id, model_id_finetuned, text, None)?;
             }
+            Some(Ok(_)) => tracing::debug!("{model_id_finetuned} hypothesis empty for {segment_id}"),
+            Some(Err(error)) => {
+                tracing::warn!("{model_id_finetuned} hypothesis transcription failed for {segment_id}: {error}");
+            }
+            None => tracing::debug!("{model_id_finetuned} hypothesis model unavailable for {segment_id}"),
         }
 
         self.populate_wsl_hypothesis_if_configured(db, segment_id)?;

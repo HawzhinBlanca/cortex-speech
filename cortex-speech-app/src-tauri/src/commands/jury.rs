@@ -12,9 +12,10 @@
 //! cloud-opt-in + key check runs eagerly on the caller thread.
 
 use super::{
-    jury_db_source, open_jury_db_connection, reference_selection_evidence, reference_selection_for_segment,
-    require_cloud_llm_consent, require_cloud_stt_consent, resolve_t2_endpoint, run_blocking,
-    run_jury_pipeline_core_via, RATE_LIMITER, SCRIBE_VOTES_IN_FLIGHT, SCRIBE_VOTE_MODEL_ID, STRICT_RATE_LIMITER,
+    hypotheses_for_selected_asr, jury_db_source, open_jury_db_connection, reference_selection_evidence,
+    reference_selection_for_segment, require_cloud_llm_consent, require_cloud_stt_consent, resolve_t2_endpoint,
+    run_blocking, run_jury_pipeline_core_via, RATE_LIMITER, SCRIBE_VOTES_IN_FLIGHT, SCRIBE_VOTE_MODEL_ID,
+    STRICT_RATE_LIMITER,
 };
 use crate::validation::input as validate;
 use crate::AppState;
@@ -28,6 +29,16 @@ pub async fn run_t0_gate(
     RATE_LIMITER.check("run_t0_gate")?;
     let (autonomy, learn) = {
         let s = state.lock_settings();
+        if s.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+            // A one-model champion has no multi-ASR consensus to auto-accept. The full jury command
+            // reports the same not-required handoff; this thin T0 endpoint must not bypass it.
+            return Ok(crate::jury::T0GateReport {
+                total: segment_ids.len(),
+                auto_accepted: 0,
+                escalated: 0,
+                decisions: Vec::new(),
+            });
+        }
         (s.jury_autonomy_level.clone(), s.irt_ability_learning_enabled)
     };
     let db = state.db_arc();
@@ -53,6 +64,10 @@ pub async fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> R
     // Same cloud-STT privacy gate as transcribe_audio_with_scribe: no segment audio is uploaded to
     // ElevenLabs unless the user explicitly opted in, even if a key is present in secrets.env.
     require_cloud_stt_consent(&state)?;
+    // ...and the LIVE handle, re-read per segment inside the upload loop below. The check above only
+    // proves consent at the moment the batch was requested; a withdrawal during a long batch must
+    // stop the remaining uploads, because revoking is a stop instruction, not a preference.
+    let live_consent = state.lock_pipeline().consent_handle();
     for id in &ids {
         validate::validate_identifier(id)?;
     }
@@ -103,6 +118,12 @@ pub async fn add_scribe_votes(ids: Vec<String>, state: State<'_, AppState>) -> R
     let result = run_blocking(move || {
         let mut added = 0usize;
         for seg in to_vote {
+            // Voice is biometric data: stop at the first segment after the user withdraws consent,
+            // rather than finishing a batch they have already said no to.
+            if !live_consent.cloud_stt() {
+                tracing::warn!("Scribe vote batch stopped: cloud STT consent was withdrawn mid-batch");
+                break;
+            }
             // Send ONLY this segment's sliced audio window to Scribe — never the whole source file. The
             // whole file would store a whole-recording transcript against one segment's `scribe-v1` vote
             // (corrupting consensus) and cost ~N× more. `segment_audio_as_wav_bytes` decodes (cached) and
@@ -277,8 +298,14 @@ pub async fn run_t2_for_segment(
             .map_err(|e| format!("Cannot prepare segment audio '{}': {e}", seg.audio_path))?;
 
         // Build a single hypothesis from raw transcript (T2 will hear the audio and judge)
-        let mut hyps = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
+        let persisted = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
+        let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, &seg, persisted);
         if hyps.is_empty() {
+            if settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+                return Err(format!(
+                    "Segment {segment_id} has no current OmniASR 7B provenance; refusing to label another engine's stored draft as the champion for cloud review"
+                ));
+            }
             hyps.push(crate::db::SegmentHypothesis {
                 segment_id: segment_id.clone(),
                 model_id: "asr".into(),

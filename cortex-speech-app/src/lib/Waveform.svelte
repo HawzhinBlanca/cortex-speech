@@ -314,6 +314,31 @@
       selectionEnd = null;
     }
   }
+
+  function handleTimelineKeydown(e: KeyboardEvent) {
+    if (!onSeek || duration <= 0) return;
+    const step = e.shiftKey ? 5 : 1;
+    let next: number | null = null;
+    switch (e.key) {
+      case 'ArrowLeft':
+      case 'ArrowDown':
+        next = currentTime - step;
+        break;
+      case 'ArrowRight':
+      case 'ArrowUp':
+        next = currentTime + step;
+        break;
+      case 'Home':
+        next = 0;
+        break;
+      case 'End':
+        next = duration;
+        break;
+    }
+    if (next === null) return;
+    e.preventDefault();
+    onSeek(Math.max(0, Math.min(next, duration)));
+  }
 </script>
 
 <div
@@ -360,7 +385,9 @@
       aria-valuemin={0}
       aria-valuemax={duration}
       aria-valuenow={currentTime}
+      aria-valuetext={`${currentTime.toFixed(1)} seconds of ${duration.toFixed(1)} seconds`}
       tabindex="0"
+      onkeydown={handleTimelineKeydown}
       onpointerdown={handlePointerDown}
       onpointermove={handlePointerMove}
       onpointerup={handlePointerUp}

@@ -94,10 +94,7 @@
 
   async function reloadSignalAnomalySegments() {
     try {
-      const allSegments = await api.getSegments();
-      signalAnomalySegments = allSegments
-        .filter((s) => s.signalAnomalyScore !== undefined && s.signalAnomalyScore !== null)
-        .sort((a, b) => (b.signalAnomalyScore || 0) - (a.signalAnomalyScore || 0));
+      signalAnomalySegments = await api.getSignalAnomalySegments(100);
     } catch (e) {
       console.error('Failed to load signal-anomaly segments', e);
       notifications.error($t('validation.failed'), { detail: String(e) });
@@ -419,7 +416,11 @@
                           <span>CTC Match: {segment.ctcScore.toFixed(2)}</span>
                         {/if}
                         {#if segment.signalAnomalyScore !== undefined && segment.signalAnomalyScore !== null}
-                          <span>{$t('validation.signalAnomaly.score')}: {segment.signalAnomalyScore.toFixed(2)}</span>
+                          <span
+                            >{$t('validation.signalAnomaly.score')}: {segment.signalAnomalyScore.toFixed(
+                              2,
+                            )}</span
+                          >
                         {/if}
                       </div>
                     </div>
@@ -446,7 +447,9 @@
       {#if activeTab === 'signalAnomaly'}
         <div class="space-y-4">
           <div class="bg-cortex-900/30 p-3 rounded-lg border border-cortex-800/50 space-y-2">
-            <h3 class="text-xs font-semibold text-cortex-200">{$t('validation.signalAnomaly.title')}</h3>
+            <h3 class="text-xs font-semibold text-cortex-200">
+              {$t('validation.signalAnomaly.title')}
+            </h3>
             <p class="text-xs text-cortex-400 leading-relaxed">
               {$t('validation.signalAnomaly.description')}
             </p>
@@ -500,7 +503,9 @@
                       </p>
                       <div class="flex items-center gap-4 text-[10px] opacity-70 pt-1">
                         <span class="font-semibold text-amber-400"
-                          >{$t('validation.signalAnomaly.score')}: {segment.signalAnomalyScore?.toFixed(3)}</span
+                          >{$t('validation.signalAnomaly.score')}: {segment.signalAnomalyScore?.toFixed(
+                            3,
+                          )}</span
                         >
                         <span>{$t('duration')}: {(segment.durationMs / 1000).toFixed(2)}s</span>
                       </div>
@@ -546,7 +551,11 @@
           {$t('validation.activeLearning.run')}
         </button>
       {:else if activeTab === 'signalAnomaly'}
-        <button class="btn-secondary !text-xs" onclick={runSignalAnomalyDetection} disabled={signalAnomalyRunning}>
+        <button
+          class="btn-secondary !text-xs"
+          onclick={runSignalAnomalyDetection}
+          disabled={signalAnomalyRunning}
+        >
           {#if signalAnomalyRunning}
             {$t('validation.signalAnomaly.running')}
           {:else}

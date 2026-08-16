@@ -14,8 +14,10 @@ pub enum PendingWork {
     /// No signal-anomaly score yet.
     SignalAnomaly,
 }
+use base64::Engine as _;
 use rusqlite::{backup, params, types::Value, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
@@ -157,6 +159,31 @@ pub struct SegmentsPage {
     pub items: Vec<SpeechSegment>,
     pub total: usize,
     pub next_cursor: Option<String>,
+}
+
+/// Opaque continuation token for a stable keyset walk through the library list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentPageCursor {
+    version: u8,
+    sort: String,
+    scope: String,
+    anchor_rowid: i64,
+    total: usize,
+    emitted: usize,
+    last: SegmentPageKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentPageKey {
+    id: String,
+    created_at: String,
+    duration_ms: i64,
+    verified: bool,
+    confidence: f64,
+    active_learning: f64,
+    escalated: bool,
+    poor_audio: bool,
+    agreement: f64,
 }
 
 /// Rights attached to one source RECORDING (migration v49, deep-audit #6).
@@ -385,6 +412,56 @@ const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript
                     decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
                     reviewed_by, speaker_change_score";
 
+// List rows preserve the SpeechSegment wire shape but omit large payloads that are hydrated only
+// when a row is selected.
+const SEGMENT_LIST_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript, normalized_transcript,
+                    annotated_transcript, NULL AS alignment_json, duration_ms, speaker_id, verified,
+                    confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                    verdict, verdict_transcript, rationale, NULL AS evidence_json,
+                    agreement_score, escalated, human_decision, corrected_at, is_gold,
+                    alignment_quality, model_version_id, confidence_source, cloud_call,
+                    decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                    reviewed_by, speaker_change_score";
+
+fn canonical_segment_sort(sort: &str) -> &str {
+    match sort {
+        "active_learning" => "activeLearning",
+        "suspect_first" => "suspectFirst",
+        "oldest" | "duration" | "verified" | "confidence" | "activeLearning" | "suspectFirst" => sort,
+        _ => "newest",
+    }
+}
+
+fn segment_page_scope(verified: Option<bool>, text_query: Option<&str>) -> String {
+    let mut hash = Sha256::new();
+    hash.update(match verified {
+        Some(true) => b"verified:1".as_slice(),
+        Some(false) => b"verified:0".as_slice(),
+        None => b"verified:*".as_slice(),
+    });
+    hash.update(b"\0query:");
+    hash.update(text_query.unwrap_or_default().trim().as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.finalize())
+}
+
+fn decode_segment_cursor(raw: &str) -> AppResult<SegmentPageCursor> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| AppError::Validation("Invalid segment page cursor".into()))?;
+    let cursor: SegmentPageCursor =
+        serde_json::from_slice(&bytes).map_err(|_| AppError::Validation("Invalid segment page cursor".into()))?;
+    if cursor.version != 1 || cursor.anchor_rowid < 0 || cursor.last.id.is_empty() {
+        return Err(AppError::Validation("Unsupported segment page cursor".into()));
+    }
+    Ok(cursor)
+}
+
+fn encode_segment_cursor(cursor: &SegmentPageCursor) -> AppResult<String> {
+    let bytes =
+        serde_json::to_vec(cursor).map_err(|e| AppError::Validation(format!("Could not encode page cursor: {e}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
 /// Reject structurally-invalid segments at the DB write boundary, before they can
 /// corrupt the downstream split/stats/training-grade math that every later stage
 /// branches on. Guards the fields these insert paths actually persist; verdict and
@@ -404,6 +481,9 @@ fn validate_segment(seg: &SpeechSegment) -> AppResult<()> {
             "Segment '{}' has a negative duration_ms ({})",
             seg.id, seg.duration_ms
         )));
+    }
+    if let Some(alignment) = seg.alignment_json.as_deref() {
+        crate::validation::input::validate_alignment_json(alignment).map_err(AppError::Validation)?;
     }
     if let Some(split) = seg.split.as_deref() {
         if !VALID_SPLITS.contains(&split) {
@@ -1068,6 +1148,100 @@ impl Database {
         Ok(rows_changed > 0)
     }
 
+    /// Atomically commit a champion transcript and make its hypothesis the segment's sole vote.
+    ///
+    /// The champion runs outside SQLite, so a reviewer may verify or decide the segment while inference
+    /// is in flight. The guarded update is the compare-and-swap boundary: `Ok(false)` means the row still
+    /// exists but became human-owned before this commit. In that case its transcript and all existing
+    /// hypotheses remain untouched. A missing segment is an error rather than being misreported as a
+    /// review race.
+    ///
+    /// Transcript/provenance replacement and stale-hypothesis cleanup share one savepoint. If deleting
+    /// or inserting the sole champion hypothesis fails, the transcript update is rolled back too.
+    pub fn commit_champion_transcript_if_unreviewed(
+        &self,
+        champion: &SegmentHypothesis,
+        normalized_transcript: Option<&str>,
+        confidence_source: Option<&str>,
+        cloud_call: bool,
+    ) -> AppResult<bool> {
+        crate::validation::input::validate_identifier(&champion.segment_id).map_err(AppError::Validation)?;
+        crate::validation::input::validate_identifier(&champion.model_id).map_err(AppError::Validation)?;
+        crate::validation::input::validate_text(&champion.transcript, 100_000, "Champion transcript")
+            .map_err(AppError::Validation)?;
+        if let Some(normalized) = normalized_transcript {
+            crate::validation::input::validate_text(normalized, 100_000, "Normalized transcript")
+                .map_err(AppError::Validation)?;
+        }
+
+        let transcript_nfc = to_nfc(&champion.transcript);
+        let normalized_nfc = normalized_transcript.map(to_nfc);
+        self.conn.execute("SAVEPOINT champion_commit", [])?;
+        let result = (|| -> AppResult<bool> {
+            let rows_changed = self.conn.execute(
+                "UPDATE speech_segments
+                 SET raw_transcript        = ?2,
+                     normalized_transcript = ?3,
+                     confidence            = ?4,
+                     confidence_source     = COALESCE(?5, 'unknown'),
+                     model_version_id      = ?6,
+                     cloud_call            = ?7,
+                     updated_at            = datetime('now')
+                 WHERE id = ?1
+                   AND verified = 0
+                   AND (human_decision IS NULL OR human_decision = '')
+                   AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
+                params![
+                    champion.segment_id,
+                    transcript_nfc,
+                    normalized_nfc,
+                    champion.confidence,
+                    confidence_source,
+                    champion.model_id,
+                    cloud_call as i32,
+                ],
+            )?;
+
+            if rows_changed == 0 {
+                let exists: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM speech_segments WHERE id = ?1)",
+                    params![champion.segment_id],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(AppError::Validation(format!(
+                        "Cannot commit champion transcript: segment '{}' does not exist",
+                        champion.segment_id
+                    )));
+                }
+                return Ok(false);
+            }
+
+            self.conn.execute("DELETE FROM segment_hypotheses WHERE segment_id = ?1", params![champion.segment_id])?;
+            self.conn.execute(
+                "INSERT INTO segment_hypotheses
+                    (segment_id, model_id, transcript, confidence, model_version_id)
+                 VALUES (?1, ?2, ?3, ?4, ?2)",
+                params![champion.segment_id, champion.model_id, transcript_nfc, champion.confidence],
+            )?;
+            Ok(true)
+        })();
+
+        match result {
+            Ok(committed) => {
+                self.release_savepoint("champion_commit")?;
+                if committed {
+                    self.track_write()?;
+                }
+                Ok(committed)
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("champion_commit");
+                Err(error)
+            }
+        }
+    }
+
     /// Persist a batch (re)transcription result WITHOUT clobbering concurrent human work.
     ///
     /// Batch transcription runs in a background thread off a snapshot taken at batch start; a human can
@@ -1243,6 +1417,20 @@ impl Database {
         }
     }
 
+    /// Read the complete row and its database-owned review revision in ONE SQLite statement.
+    /// Couch Review must never pair a row snapshot from one instant with a revision fetched by a
+    /// second statement after a concurrent writer has already changed it.
+    pub fn get_segment_by_id_with_revision(&self, id: &str) -> AppResult<Option<(SpeechSegment, i64)>> {
+        let query = format!("SELECT {SEGMENT_SELECT_COLUMNS}, review_revision FROM speech_segments WHERE id = ?1");
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((Self::map_row(row)?, row.get(37)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Look up a segment by its `audio_path` column using the `idx_segments_audio_path` index.
     /// Used by the media registry to verify playback access without a full table scan.
     /// Returns `Ok(Some(...))` when found, `Ok(None)` when no segment matches the path.
@@ -1348,6 +1536,18 @@ impl Database {
             let Some(expected) = crate::quality::human_verified_text(&seg) else {
                 continue; // a machine verdict is not an answer key
             };
+            // The reviewer has to LISTEN to a check — that is the entire point of it — so a key whose
+            // audio file has gone is not a key, it is a broken clip in the middle of their batch.
+            //
+            // MEASURED 2026-08-15: every answer key came from the original corpus, whose audio had been
+            // deleted. `pending_segment_ids` had already been taught to skip unplayable WORK, but spot
+            // checks are injected here, on a separate path, so they bypassed that filter entirely and
+            // `/api/audio` answered 500. With SPOT_CHECK_EVERY = 8 that put a dead clip roughly every
+            // eighth item — which is exactly what the reviewers reported: the first few clips play,
+            // then one errors.
+            if !std::path::Path::new(&seg.audio_path).is_file() {
+                continue;
+            }
             // Only a clip whose raw draft is WRONG can distinguish listening from tapping.
             if learning_text_key(expected) == learning_text_key(&seg.raw_transcript) {
                 continue;
@@ -1437,6 +1637,25 @@ impl Database {
     /// would credit somebody for work they explicitly did not do and inflate the one number that says
     /// how fast the corpus is really being reviewed. A WHITELIST, not `action <> 'skip'`: the next
     /// non-decision event added to this trail must not silently re-open the hole.
+    /// Total AUDIO this reviewer has completed, in ms — what the phone shows them as progress, and
+    /// the basis the owner pays on (reviewers are paid per hour of audio reviewed, not per hour at
+    /// the desk).
+    ///
+    /// DISTINCT segment_id, so a network retry or a re-decision of the same clip cannot inflate it —
+    /// the same reason `ReviewerThroughput::clips` counts distinct. Scoped to ONE reviewer rather
+    /// than reusing `reviewer_throughput`, which walks every event of every reviewer: this runs on
+    /// each queue fetch from a phone, so it stays a single aggregate.
+    pub fn reviewed_audio_ms(&self, reviewer: &str) -> AppResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(s.duration_ms), 0)
+               FROM (SELECT DISTINCT segment_id FROM review_events
+                     WHERE reviewer = ?1 AND action IN ('accept', 'edit', 'reject')) e
+               JOIN speech_segments s ON s.id = e.segment_id",
+            params![reviewer],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn reviewer_throughput(&self) -> AppResult<Vec<ReviewerThroughput>> {
         let mut stmt = self.conn.prepare(
             "SELECT reviewer, segment_id, timestamp_ms FROM review_events
@@ -1658,18 +1877,50 @@ impl Database {
     /// 6,823 newer ones. A review queue is FIFO — an import must go to the BACK of the line, so
     /// adding more audio can never delay finishing what is already in progress. (The desktop library
     /// view keeps newest-first; that is a browsing order, not a work order.)
+    /// A clip whose AUDIO FILE IS GONE is never served either (2026-08-15). The reviewer cannot listen,
+    /// so the only verdicts they can give are guesses about text they never heard — and this is a
+    /// VERBATIM corpus, where an unheard "looks good" is worse than no decision at all.
+    ///
+    /// MEASURED that day: three staging folders under `SoraniVoice_PC_` had ceased to exist, taking the
+    /// audio for 1,031 clips (7% of the library) with them. 536 of those were still pending, and because
+    /// this queue is oldest-first they sat at the very HEAD of it — so every reviewer who opened a link
+    /// was handed unplayable clips first and reported "the audio does not play". Nothing detected it:
+    /// the rows are perfectly well-formed, and every gate in the sweep reads the database, not the disk.
+    ///
+    /// Existence is memoised PER DISTINCT PATH, not per row: segments are chunks of a recording, so a
+    /// few hundred files back the whole library and the check costs a few hundred `stat` calls rather
+    /// than one per pending row.
     pub fn pending_segment_ids(&self) -> AppResult<Vec<String>> {
+        self.pending_segment_ids_for(None)
+    }
+
+    /// As above, but only clips in dialects this reviewer can actually judge. `None` = unrestricted.
+    ///
+    /// Owner instruction 2026-08-16: a reviewer who does not speak Hawleri must not be handed Hawleri.
+    /// Judging a dialect you do not speak produces confident WRONG verdicts, and downstream those are
+    /// indistinguishable from good ones — so this is a corpus-integrity filter, not a convenience.
+    pub fn pending_segment_ids_for(&self, allowed_dialects: Option<&[String]>) -> AppResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM speech_segments
+            "SELECT id, audio_path FROM speech_segments
              WHERE verified = 0
                AND TRIM(COALESCE(raw_transcript, '')) <> ''
                AND NOT (TRIM(raw_transcript) LIKE '[%]')
              ORDER BY created_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut ids = Vec::new();
+        // Both checks are memoised per DISTINCT PATH: 13,797 clips come from 32 recordings, so this
+        // costs a few dozen stat calls and dialect lookups rather than one per pending row.
+        let mut servable: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         for row in rows {
-            ids.push(row?);
+            let (id, audio_path) = row?;
+            let ok = *servable.entry(audio_path.clone()).or_insert_with(|| {
+                std::path::Path::new(&audio_path).is_file()
+                    && crate::dialect::reviewer_may_judge(allowed_dialects, &audio_path)
+            });
+            if ok {
+                ids.push(id);
+            }
         }
         Ok(ids)
     }
@@ -1726,10 +1977,24 @@ impl Database {
         cursor: Option<&str>,
     ) -> AppResult<SegmentsPage> {
         let limit = limit.clamp(1, 500);
-        let offset = cursor.and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+        let sort = canonical_segment_sort(sort);
+        let scope = segment_page_scope(verified, text_query);
+        let decoded_cursor = cursor.map(decode_segment_cursor).transpose()?;
+        if let Some(ref cursor) = decoded_cursor {
+            if cursor.sort != sort || cursor.scope != scope {
+                return Err(AppError::Validation(
+                    "Segment page cursor does not match the active filter or sort".into(),
+                ));
+            }
+        }
+        let anchor_rowid = if let Some(ref cursor) = decoded_cursor {
+            cursor.anchor_rowid
+        } else {
+            self.conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM speech_segments", [], |row| row.get(0))?
+        };
 
-        let mut where_parts: Vec<String> = Vec::new();
-        let mut bind_values: Vec<Value> = Vec::new();
+        let mut where_parts: Vec<String> = vec!["rowid <= ?1".to_string()];
+        let mut bind_values: Vec<Value> = vec![Value::Integer(anchor_rowid)];
         if let Some(v) = verified {
             bind_values.push(Value::Integer(if v { 1 } else { 0 }));
             where_parts.push(format!("verified = ?{}", bind_values.len()));
@@ -1745,41 +2010,200 @@ impl Database {
             where_parts
                 .push(format!("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?{})", bind_values.len()));
         }
-        let where_sql =
-            if where_parts.is_empty() { String::new() } else { format!(" WHERE {}", where_parts.join(" AND ")) };
-        let order_sql = match sort {
-            "oldest" => "datetime(created_at) ASC, id ASC",
-            "duration" => "duration_ms DESC, id ASC",
-            "verified" => "verified DESC, datetime(created_at) DESC, id ASC",
-            "confidence" => "COALESCE(confidence, 1.0) ASC, id ASC",
-            "activeLearning" | "active_learning" => {
-                "ABS(((1.0 - COALESCE(confidence, 0.5)) + (0.1 * -COALESCE(ctc_score, -5.0))) - 0.35) ASC, id ASC"
-            }
-            "suspectFirst" | "suspect_first" => SUSPECT_FIRST_ORDER.as_str(),
-            _ => "datetime(created_at) DESC, id ASC",
+        let total = if let Some(ref cursor) = decoded_cursor {
+            cursor.total
+        } else {
+            let count_where_sql = format!(" WHERE {}", where_parts.join(" AND "));
+            let count_sql = format!("SELECT COUNT(*) FROM speech_segments{count_where_sql}");
+            let total: i64 =
+                self.conn.query_row(&count_sql, rusqlite::params_from_iter(bind_values.iter()), |row| row.get(0))?;
+            usize::try_from(total).map_err(|_| AppError::Validation("Segment count is out of range".into()))?
         };
 
-        let count_sql = format!("SELECT COUNT(*) FROM speech_segments{where_sql}");
-        let total: i64 =
-            self.conn.query_row(&count_sql, rusqlite::params_from_iter(bind_values.iter()), |row| row.get(0))?;
+        let created_expr = "COALESCE(datetime(created_at), '')";
+        let confidence_expr = "COALESCE(confidence, 1.0)";
+        let active_expr = "ABS(((1.0 - COALESCE(confidence, 0.5)) + (0.1 * -COALESCE(ctc_score, -5.0))) - 0.35)";
+        let poor_expr = format!(
+            "CASE WHEN COALESCE(snr_db, 99.0) < {} OR COALESCE(clipping_ratio, 0.0) > {} THEN 0 ELSE 1 END",
+            crate::quality::POOR_AUDIO_SNR_DB,
+            crate::quality::POOR_AUDIO_CLIPPING_RATIO,
+        );
+        let order_sql = match sort {
+            "oldest" => format!("{created_expr} ASC, id ASC"),
+            "duration" => "duration_ms DESC, id ASC".to_string(),
+            "verified" => format!("verified DESC, {created_expr} DESC, id ASC"),
+            "confidence" => format!("{confidence_expr} ASC, id ASC"),
+            "activeLearning" => format!("{active_expr} ASC, id ASC"),
+            "suspectFirst" => format!(
+                "escalated DESC, {poor_expr} ASC, COALESCE(agreement_score, 0.5) ASC, {created_expr} DESC, id ASC"
+            ),
+            _ => format!("{created_expr} DESC, id ASC"),
+        };
 
-        let mut page_values = bind_values.clone();
-        page_values.push(Value::Integer(limit as i64));
-        page_values.push(Value::Integer(offset as i64));
-        let limit_idx = page_values.len() - 1;
-        let offset_idx = page_values.len();
+        if let Some(cursor) = decoded_cursor.as_ref() {
+            let key = &cursor.last;
+            let mut bind = |value: Value| {
+                bind_values.push(value);
+                bind_values.len()
+            };
+            let keyset = match sort {
+                "oldest" => {
+                    let t1 = bind(Value::Text(key.created_at.clone()));
+                    let t2 = bind(Value::Text(key.created_at.clone()));
+                    let id = bind(Value::Text(key.id.clone()));
+                    format!("({created_expr} > COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))")
+                }
+                "duration" => {
+                    let d1 = bind(Value::Integer(key.duration_ms));
+                    let d2 = bind(Value::Integer(key.duration_ms));
+                    let id = bind(Value::Text(key.id.clone()));
+                    format!("(duration_ms < ?{d1} OR (duration_ms = ?{d2} AND id > ?{id}))")
+                }
+                "verified" => {
+                    let v1 = bind(Value::Integer(i64::from(key.verified)));
+                    let v2 = bind(Value::Integer(i64::from(key.verified)));
+                    let t1 = bind(Value::Text(key.created_at.clone()));
+                    let t2 = bind(Value::Text(key.created_at.clone()));
+                    let id = bind(Value::Text(key.id.clone()));
+                    format!("(verified < ?{v1} OR (verified = ?{v2} AND ({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))))")
+                }
+                "confidence" => {
+                    let c1 = bind(Value::Real(key.confidence));
+                    let c2 = bind(Value::Real(key.confidence));
+                    let id = bind(Value::Text(key.id.clone()));
+                    format!("({confidence_expr} > ?{c1} OR ({confidence_expr} = ?{c2} AND id > ?{id}))")
+                }
+                "activeLearning" => {
+                    let a1 = bind(Value::Real(key.active_learning));
+                    let a2 = bind(Value::Real(key.active_learning));
+                    let id = bind(Value::Text(key.id.clone()));
+                    format!("({active_expr} > ?{a1} OR ({active_expr} = ?{a2} AND id > ?{id}))")
+                }
+                "suspectFirst" => {
+                    let e1 = bind(Value::Integer(i64::from(key.escalated)));
+                    let e2 = bind(Value::Integer(i64::from(key.escalated)));
+                    let p1 = bind(Value::Integer(i64::from(!key.poor_audio)));
+                    let p2 = bind(Value::Integer(i64::from(!key.poor_audio)));
+                    let a1 = bind(Value::Real(key.agreement));
+                    let a2 = bind(Value::Real(key.agreement));
+                    let t1 = bind(Value::Text(key.created_at.clone()));
+                    let t2 = bind(Value::Text(key.created_at.clone()));
+                    let id = bind(Value::Text(key.id.clone()));
+                    format!("(escalated < ?{e1} OR (escalated = ?{e2} AND ({poor_expr} > ?{p1} OR ({poor_expr} = ?{p2} AND (COALESCE(agreement_score, 0.5) > ?{a1} OR (COALESCE(agreement_score, 0.5) = ?{a2} AND ({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))))))))")
+                }
+                _ => {
+                    let t1 = bind(Value::Text(key.created_at.clone()));
+                    let t2 = bind(Value::Text(key.created_at.clone()));
+                    let id = bind(Value::Text(key.id.clone()));
+                    format!("({created_expr} < COALESCE(datetime(?{t1}), '') OR ({created_expr} = COALESCE(datetime(?{t2}), '') AND id > ?{id}))")
+                }
+            };
+            where_parts.push(keyset);
+        }
+
+        let where_sql = format!(" WHERE {}", where_parts.join(" AND "));
+        bind_values.push(Value::Integer(limit as i64));
+        let limit_idx = bind_values.len();
         let page_sql = format!(
-            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments{where_sql} ORDER BY {order_sql} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+            "SELECT {SEGMENT_LIST_SELECT_COLUMNS} FROM speech_segments{where_sql} ORDER BY {order_sql} LIMIT ?{limit_idx}"
         );
         let mut stmt = self.conn.prepare(&page_sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(page_values.iter()), Self::map_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_values.iter()), Self::map_row)?;
         let mut items = Vec::new();
         for row in rows {
             items.push(row?);
         }
-        let next_offset = offset + items.len();
-        let next_cursor = if next_offset < total as usize { Some(next_offset.to_string()) } else { None };
-        Ok(SegmentsPage { items, total: total as usize, next_cursor })
+        let emitted = decoded_cursor.as_ref().map_or(0, |cursor| cursor.emitted) + items.len();
+        let next_cursor = if emitted < total && !items.is_empty() {
+            let Some(last) = items.last() else { unreachable!("positive limit with full page") };
+            let active_learning =
+                (((1.0 - last.confidence.unwrap_or(0.5)) + (0.1 * -last.ctc_score.unwrap_or(-5.0))) - 0.35).abs();
+            let poor_audio = last.snr_db.is_some_and(|v| v < crate::quality::POOR_AUDIO_SNR_DB)
+                || last.clipping_ratio.is_some_and(|v| v > crate::quality::POOR_AUDIO_CLIPPING_RATIO);
+            Some(encode_segment_cursor(&SegmentPageCursor {
+                version: 1,
+                sort: sort.to_string(),
+                scope,
+                anchor_rowid,
+                total,
+                emitted,
+                last: SegmentPageKey {
+                    id: last.id.clone(),
+                    created_at: last.created_at.clone().unwrap_or_default(),
+                    duration_ms: last.duration_ms,
+                    verified: last.verified,
+                    confidence: last.confidence.unwrap_or(1.0),
+                    active_learning,
+                    escalated: last.escalated,
+                    poor_audio,
+                    agreement: last.agreement_score.unwrap_or(0.5),
+                },
+            })?)
+        } else {
+            None
+        };
+        Ok(SegmentsPage { items, total, next_cursor })
+    }
+
+    /// Lightweight batch scope: return only ids plus the transcript needed for the optional content
+    /// gate. This lets whole-filter actions remain whole-filter actions without hydrating every row.
+    pub fn get_segment_ids_for_view(
+        &self,
+        verified: Option<bool>,
+        text_query: Option<&str>,
+        transcript_state: &str,
+    ) -> AppResult<Vec<String>> {
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bind_values: Vec<Value> = Vec::new();
+        if let Some(v) = verified {
+            bind_values.push(Value::Integer(i64::from(v)));
+            where_parts.push(format!("verified = ?{}", bind_values.len()));
+        }
+        if let Some(raw_query) = text_query.map(str::trim).filter(|value| !value.is_empty()) {
+            let match_query = to_fts5_match(&normalize_search_query(raw_query));
+            if match_query.is_empty() {
+                return Ok(Vec::new());
+            }
+            bind_values.push(Value::Text(format!(
+                "{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})"
+            )));
+            where_parts
+                .push(format!("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?{})", bind_values.len()));
+        }
+        let where_sql =
+            if where_parts.is_empty() { String::new() } else { format!(" WHERE {}", where_parts.join(" AND ")) };
+        let sql = format!("SELECT id, raw_transcript FROM speech_segments{where_sql} ORDER BY id ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let (id, transcript) = row?;
+            let placeholder = crate::quality::is_placeholder_transcript(&transcript);
+            if transcript_state == "any"
+                || (transcript_state == "real" && !placeholder)
+                || (transcript_state == "missing" && placeholder)
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn get_signal_anomaly_segments(&self, limit: usize) -> AppResult<Vec<SpeechSegment>> {
+        let sql = format!(
+            "SELECT {SEGMENT_LIST_SELECT_COLUMNS} FROM speech_segments
+             WHERE signal_anomaly_score IS NOT NULL
+             ORDER BY signal_anomaly_score DESC, id ASC LIMIT ?1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([limit.clamp(1, 500) as i64], Self::map_row)?;
+        let mut segments = Vec::new();
+        for row in rows {
+            segments.push(row?);
+        }
+        Ok(segments)
     }
 
     /// M2.5: Return segments ordered by suspect-first priority for ReviewInbox.
@@ -1856,6 +2280,32 @@ impl Database {
         // Match the single-query contract: created_at DESC (newest first), then id ASC. None sorts
         // last under DESC, mirroring SQLite ordering NULLs after non-NULLs in a descending sort.
         segments.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+        Ok(segments)
+    }
+
+    /// Couch Review variant of [`Self::get_segments_by_ids`]: each row and its revision come from the
+    /// same SQLite result row. Fetching the revision afterwards could stamp an older transcript with a
+    /// newer revision and let a decision against text the reviewer never saw pass its CAS fence.
+    pub fn get_segments_by_ids_with_revisions(&self, ids: &[String]) -> AppResult<Vec<(SpeechSegment, i64)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        const CHUNK: usize = 500;
+        let mut segments: Vec<(SpeechSegment, i64)> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let query = format!(
+                "SELECT {SEGMENT_SELECT_COLUMNS}, review_revision FROM speech_segments WHERE id IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self.conn.prepare(&query)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| Ok((Self::map_row(row)?, row.get(37)?)))?;
+            for row in rows {
+                segments.push(row?);
+            }
+        }
+        segments.sort_by(|a, b| b.0.created_at.cmp(&a.0.created_at).then_with(|| a.0.id.cmp(&b.0.id)));
         Ok(segments)
     }
 
@@ -2335,6 +2785,31 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically make one model the segment's sole machine hypothesis. Champion transcription uses
+    /// this after a successful 7B write so votes left by an older 300M/1B/MMS/Scribe run cannot remain
+    /// active evidence. DELETE + INSERT must be one savepoint: a failed insert may never leave a good
+    /// segment with no provenance merely because cleanup ran first.
+    pub fn replace_hypotheses_with(&self, hyp: &SegmentHypothesis) -> AppResult<()> {
+        let transcript = to_nfc(&hyp.transcript);
+        self.conn.execute("SAVEPOINT replace_hypotheses", [])?;
+        let result = (|| -> AppResult<()> {
+            self.conn.execute("DELETE FROM segment_hypotheses WHERE segment_id = ?1", params![hyp.segment_id])?;
+            self.conn.execute(
+                "INSERT INTO segment_hypotheses (segment_id, model_id, transcript, confidence)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![hyp.segment_id, hyp.model_id, transcript, hyp.confidence],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.release_savepoint("replace_hypotheses"),
+            Err(error) => {
+                self.cleanup_savepoint_after_error("replace_hypotheses");
+                Err(error)
+            }
+        }
+    }
+
     /// The rights attached to the recording this segment came from (migration v49, audit #6).
     ///
     /// Read as its own row lookup rather than as fields on [`SpeechSegment`]: that struct is already
@@ -2667,14 +3142,28 @@ impl Database {
         Ok(())
     }
 
-    /// The row's `updated_at` — the cheap change-fingerprint the couch serve/decide/undo fences
-    /// compare. Deliberately NOT a field on `SpeechSegment` (widening that struct breaks every
-    /// full-literal constructor); fetched exactly where a fence needs it.
+    /// The row's database-owned monotonic review revision, encoded as text to preserve the existing
+    /// Couch Review JSON wire shape (`rowVersion` was historically a timestamp string). Unlike
+    /// `updated_at`, this changes for every update even when several writes land in the same second.
     pub fn segment_row_stamp(&self, segment_id: &str) -> AppResult<Option<String>> {
         use rusqlite::OptionalExtension;
         Ok(self
             .conn
-            .query_row("SELECT updated_at FROM speech_segments WHERE id = ?1", params![segment_id], |row| row.get(0))
+            .query_row(
+                "SELECT CAST(review_revision AS TEXT) FROM speech_segments WHERE id = ?1",
+                params![segment_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn segment_review_revision(&self, segment_id: &str) -> AppResult<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![segment_id], |row| {
+                row.get(0)
+            })
             .optional()?)
     }
 
@@ -2775,6 +3264,7 @@ impl Database {
     /// exactly that window — and the background aligner swallowed the second write's error outright
     /// (`let _ =`), silently laundering heuristic timestamps whenever the quality stamp failed.
     pub fn update_segment_alignment(&self, segment_id: &str, alignment_json: &str, quality: &str) -> AppResult<()> {
+        crate::validation::input::validate_alignment_json(alignment_json).map_err(AppError::Validation)?;
         self.conn.execute(
             "UPDATE speech_segments
              SET alignment_json = ?2, alignment_quality = ?3, updated_at = datetime('now')
@@ -2783,6 +3273,29 @@ impl Database {
         )?;
         self.track_write()?;
         Ok(())
+    }
+
+    /// Persist alignment output only if the canonical alignment read before slow inference is still
+    /// current. SQLite `IS` is deliberately used instead of `=` so `None` compares NULL-safely. A
+    /// concurrent boundary/timing edit returns `Ok(false)` and is never overwritten.
+    pub fn update_segment_alignment_if_unchanged(
+        &self,
+        segment_id: &str,
+        expected_alignment: Option<&str>,
+        alignment_json: &str,
+        quality: &str,
+    ) -> AppResult<bool> {
+        crate::validation::input::validate_alignment_json(alignment_json).map_err(AppError::Validation)?;
+        let changed = self.conn.execute(
+            "UPDATE speech_segments
+             SET alignment_json = ?3, alignment_quality = ?4, updated_at = datetime('now')
+             WHERE id = ?1 AND alignment_json IS ?2",
+            params![segment_id, expected_alignment, alignment_json, quality],
+        )?;
+        if changed > 0 {
+            self.track_write()?;
+        }
+        Ok(changed > 0)
     }
 
     /// Record the within-clip speaker-change measurement (Migration v47).
@@ -3145,6 +3658,121 @@ impl Database {
         Ok(())
     }
 
+    /// Losslessly undo one phone decision as a single compare-and-swap transaction.
+    ///
+    /// The previous implementation committed `clear_human_decision` and the snapshot restore as two
+    /// independent writes. If the second failed, the row was permanently half-undone and the retry
+    /// fence rejected it because the first write had already cleared `reviewed_by`. Here the full-row
+    /// restore and retraction of its trainable example either both commit or both roll back. A revision
+    /// mismatch returns `Ok(None)` without changing anything.
+    pub fn undo_phone_human_decision(
+        &self,
+        previous: &SpeechSegment,
+        reviewer: &str,
+        expected_revision: i64,
+    ) -> AppResult<Option<i64>> {
+        validate_segment(previous)?;
+        let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(previous);
+        let verdict_transcript_nfc = previous.verdict_transcript.as_deref().map(to_nfc);
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE speech_segments SET
+                 created_at = COALESCE(:created_at, created_at),
+                 audio_path = :audio_path,
+                 raw_transcript = :raw_transcript,
+                 normalized_transcript = :normalized_transcript,
+                 annotated_transcript = :annotated_transcript,
+                 alignment_json = :alignment_json,
+                 duration_ms = :duration_ms,
+                 speaker_id = :speaker_id,
+                 verified = :verified,
+                 confidence = :confidence,
+                 ctc_score = :ctc_score,
+                 clipping_ratio = :clipping_ratio,
+                 rms_db = :rms_db,
+                 snr_db = :snr_db,
+                 split = :split,
+                 signal_anomaly_score = :signal_anomaly_score,
+                 verdict = :verdict,
+                 verdict_transcript = :verdict_transcript,
+                 rationale = :rationale,
+                 evidence_json = :evidence_json,
+                 agreement_score = :agreement_score,
+                 escalated = :escalated,
+                 human_decision = :human_decision,
+                 corrected_at = :corrected_at,
+                 is_gold = :is_gold,
+                 alignment_quality = :alignment_quality,
+                 model_version_id = COALESCE(:model_version_id, 'unknown@pre-registry'),
+                 confidence_source = COALESCE(:confidence_source, 'unknown'),
+                 cloud_call = :cloud_call,
+                 decoder_config_hash = :decoder_config_hash,
+                 normalizer_version = :normalizer_version,
+                 denoised = :denoised,
+                 diarized = :diarized,
+                 vad_backend = :vad_backend,
+                 reviewed_by = :reviewed_by,
+                 speaker_change_score = :speaker_change_score,
+                 updated_at = datetime('now')
+             WHERE id = :id
+               AND review_revision = :expected_revision
+               AND reviewed_by = :reviewer",
+            rusqlite::named_params! {
+                ":id": previous.id,
+                ":expected_revision": expected_revision,
+                ":reviewer": reviewer,
+                ":created_at": previous.created_at,
+                ":audio_path": previous.audio_path,
+                ":raw_transcript": raw_nfc,
+                ":normalized_transcript": normalized_nfc,
+                ":annotated_transcript": annotated_nfc,
+                ":alignment_json": previous.alignment_json,
+                ":duration_ms": previous.duration_ms,
+                ":speaker_id": previous.speaker_id,
+                ":verified": previous.verified as i32,
+                ":confidence": previous.confidence,
+                ":ctc_score": previous.ctc_score,
+                ":clipping_ratio": previous.clipping_ratio,
+                ":rms_db": previous.rms_db,
+                ":snr_db": previous.snr_db,
+                ":split": previous.split,
+                ":signal_anomaly_score": previous.signal_anomaly_score,
+                ":verdict": previous.verdict,
+                ":verdict_transcript": verdict_transcript_nfc,
+                ":rationale": previous.rationale,
+                ":evidence_json": previous.evidence_json,
+                ":agreement_score": previous.agreement_score,
+                ":escalated": previous.escalated as i32,
+                ":human_decision": previous.human_decision,
+                ":corrected_at": previous.corrected_at,
+                ":is_gold": previous.is_gold as i32,
+                ":alignment_quality": previous.alignment_quality,
+                ":model_version_id": previous.model_version_id,
+                ":confidence_source": previous.confidence_source,
+                ":cloud_call": previous.cloud_call as i32,
+                ":decoder_config_hash": previous.decoder_config_hash,
+                ":normalizer_version": previous.normalizer_version,
+                ":denoised": previous.denoised.map(i32::from),
+                ":diarized": previous.diarized.map(i32::from),
+                ":vad_backend": previous.vad_backend,
+                ":reviewed_by": previous.reviewed_by,
+                ":speaker_change_score": previous.speaker_change_score,
+            },
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        tx.execute("DELETE FROM agent_examples WHERE segment_id = ?1", params![previous.id])?;
+        let restored_revision: i64 =
+            tx.query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![previous.id], |row| {
+                row.get(0)
+            })?;
+        tx.commit()?;
+        self.track_write()?;
+        Ok(Some(restored_revision))
+    }
+
     /// Reverse a UI `flag()` escalation (the review-inbox Undo path): clear the `escalated` flag and the
     /// machine `'escalated'` verdict + rationale that flag wrote, WITHOUT touching a human_decision (flag
     /// never sets one). This is the exact inverse of flag — unlike `clear_human_decision`, which
@@ -3244,6 +3872,116 @@ impl Database {
         timestamp_ms: Option<i64>,
         annotator: Option<&str>,
     ) -> AppResult<()> {
+        self.record_human_decision_by_with_finalize(
+            segment_id,
+            decision,
+            corrected_transcript,
+            timestamp_ms,
+            annotator,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Phone review is a complete adjudication, so the transcript/verdict, attribution, learning
+    /// side-effects, annotation, and `verified` flag must share one commit. Keeping finalization in
+    /// this transaction prevents an interrupted second write from leaving a decided-but-pending row.
+    pub fn record_phone_human_decision_by(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        annotator: &str,
+    ) -> AppResult<()> {
+        let expected_revision = self
+            .segment_review_revision(segment_id)?
+            .ok_or_else(|| AppError::Other(format!("segment {segment_id} no longer exists")))?;
+        match self.record_phone_human_decision_by_at_revision(
+            segment_id,
+            decision,
+            corrected_transcript,
+            annotator,
+            expected_revision,
+        )? {
+            Some(_) => Ok(()),
+            None => Err(AppError::Other(
+                "segment changed while the phone decision was being recorded; reload and retry".into(),
+            )),
+        }
+    }
+
+    /// Atomically record a phone decision only if the row is still the exact revision that was
+    /// served/read. `Ok(None)` is a normal compare-and-swap miss: no row or learning side effect was
+    /// written. `Ok(Some(revision))` returns the post-decision revision for a safe undo token.
+    pub fn record_phone_human_decision_by_at_revision(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        annotator: &str,
+        expected_revision: i64,
+    ) -> AppResult<Option<i64>> {
+        self.record_human_decision_by_with_finalize(
+            segment_id,
+            decision,
+            corrected_transcript,
+            None,
+            Some(annotator),
+            Some(expected_revision),
+        )
+    }
+
+    /// Finish a row written by an older release that committed the decision but not phone
+    /// finalization. This intentionally does not replay learning/audit side effects.
+    pub fn finalize_phone_human_decision(&self, segment_id: &str, corrected_transcript: Option<&str>) -> AppResult<()> {
+        let expected_revision = self
+            .segment_review_revision(segment_id)?
+            .ok_or_else(|| AppError::Other(format!("segment {segment_id} no longer exists")))?;
+        match self.finalize_phone_human_decision_at_revision(segment_id, corrected_transcript, expected_revision)? {
+            Some(_) => Ok(()),
+            None => Err(AppError::Other(
+                "segment changed while the interrupted phone decision was being finalized; reload and retry".into(),
+            )),
+        }
+    }
+
+    pub fn finalize_phone_human_decision_at_revision(
+        &self,
+        segment_id: &str,
+        corrected_transcript: Option<&str>,
+        expected_revision: i64,
+    ) -> AppResult<Option<i64>> {
+        let corrected = corrected_transcript.map(|text| to_nfc(text.trim())).filter(|text| !text.is_empty());
+        let changed = self.conn.execute(
+            "UPDATE speech_segments
+             SET annotated_transcript = COALESCE(?2, annotated_transcript),
+                 verified = 1,
+                 updated_at = datetime('now')
+             WHERE id = ?1 AND human_decision IS NOT NULL AND review_revision = ?3",
+            params![segment_id, corrected, expected_revision],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let revision = self
+            .segment_review_revision(segment_id)?
+            .ok_or_else(|| AppError::Other(format!("segment {segment_id} disappeared after finalization")))?;
+        self.track_write()?;
+        Ok(Some(revision))
+    }
+
+    fn record_human_decision_by_with_finalize(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
+        annotator: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> AppResult<Option<i64>> {
+        // A revision is supplied only by the phone path, whose adjudication and finalization share
+        // one transaction. Desktop decisions intentionally have no optimistic CAS token here.
+        let finalize = expected_revision.is_some();
         let human_verdict = human_verdict_for_decision(decision)?;
         // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
         // update_*). Without it a decomposed (NFD) paste / IME input becomes the lone non-NFC label in an
@@ -3376,21 +4114,35 @@ impl Database {
         // The human's verdict, the learning pair, and the audit-ledger row commit together as one
         // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE speech_segments
              SET human_decision     = ?2,
                  verdict            = ?3,
                  verdict_transcript = COALESCE(?4, verdict_transcript),
                  escalated          = 0,
                  reviewed_by        = ?5,
+                 annotated_transcript = CASE WHEN ?6 THEN COALESCE(?4, annotated_transcript)
+                                             ELSE annotated_transcript END,
+                 verified           = CASE WHEN ?6 THEN 1 ELSE verified END,
                  corrected_at       = datetime('now'),
                  updated_at         = datetime('now')
-             WHERE id = ?1",
+             WHERE id = ?1
+               AND (?7 IS NULL OR review_revision = ?7)",
             // reviewed_by is set UNCONDITIONALLY (not COALESCEd): it names the author of the row's
             // CURRENT decision, so a desktop re-review of a clip a phone reviewer had decided must clear
             // the stale name rather than leave the previous reviewer credited for someone else's verdict.
-            params![segment_id, decision, human_verdict, corrected_transcript, annotator],
+            params![segment_id, decision, human_verdict, corrected_transcript, annotator, finalize, expected_revision],
         )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        // Migration v53's trigger increments this in the SAME statement. Capture it before commit so
+        // the caller can bind an undo entry to the exact post-decision row without a second-read race.
+        let decided_revision: i64 =
+            tx.query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![segment_id], |row| {
+                row.get(0)
+            })?;
 
         // Rejecting a clip retracts any prior EDIT's learning pair (round-24 hunt #9): a human who
         // edited a segment and then rejects it as garbage audio must not keep training the model to
@@ -3523,7 +4275,7 @@ impl Database {
 
         tx.commit()?;
         self.track_write()?;
-        Ok(())
+        Ok(Some(decided_revision))
     }
 
     /// Load all LOOP-0 correction memories for the firing rule. `apply_memories` applies the

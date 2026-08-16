@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -17,6 +18,9 @@ def command_surface() -> str:
     if "#[tauri::command]" not in text:
         raise AssertionError("no #[tauri::command] in the command surface — this gate would pass vacuously")
     return text
+
+
+from _policy_util import strip_comments  # noqa: E402
 
 
 def db_surface() -> str:
@@ -283,11 +287,11 @@ def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
         # flag is passed to it.)
         "run_wsl_segment_transcript_with_script(",
         "Some(&WSL_REFINE_CANCEL)",
-        # Writes go through the human-decision-safe update so a batch never clobbers reviewed text,
-        # and the 7B provenance is persisted instead of falling back to unknown/heuristic.
-        "db.update_asr_transcript_if_unreviewed(",
+        # Transcript + sole champion hypothesis share the human-decision-safe atomic commit, so the
+        # batch can neither clobber reviewed text nor leave provenance half-written.
+        "db.commit_champion_transcript_if_unreviewed(",
         'Some("external_provider")',
-        'Some("omniasr-wsl-7b")',
+        "crate::pipeline::CHAMPION_MODEL_ID.to_string()",
     ]
     missing = [pattern for pattern in required if pattern not in commands]
     if missing:
@@ -596,7 +600,8 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
         'tracing::error!("Batch verify DB update failed for {id}: {error}")',
         'tracing::error!("Batch speaker assignment DB update failed for {id}: {error}")',
         '.get_segments_by_ids(&segment_ids)\n        .map_err(|e| e.to_string())?',
-        'let mut hyps = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',
+        'let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',
+        'let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted);',
         'let few_shots = crate::jury::get_few_shot_examples(db, seg_id, 5).map_err(|e| e.to_string())?;',
         'let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;',
     ]
@@ -772,9 +777,11 @@ def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> Non
     # without their marker read as trustworthy alignment. The old two-statement pair
     # (update_segment_alignment_json then update_alignment_quality) had that window at both call sites —
     # and the background aligner swallowed the second write outright (`let _ =`), silently laundering
-    # heuristic timestamps whenever the stamp failed. Both sites must use the combined atomic
-    # db.update_segment_alignment(...) and report its failure (this gate's original intent: the stamp
-    # outcome is never swallowed).
+    # heuristic timestamps whenever the stamp failed. Both sites must use a combined atomic write and
+    # report its failure (this gate's original intent: the stamp outcome is never swallowed). The
+    # interactive command additionally runs slow inference after reading the canonical alignment, so
+    # its write must be a NULL-safe compare-and-swap against that exact input; otherwise a concurrent
+    # boundary edit can be overwritten even though timings + quality themselves share one statement.
     commands = command_surface()
     pipeline = pipeline_surface()
 
@@ -783,17 +790,25 @@ def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> Non
             if stale in text:
                 raise AssertionError(
                     f"{name} writes alignment via the split two-statement pair ({stale}) — timings and "
-                    "their quality marker must be one atomic db.update_segment_alignment(...) write"
+                    "their quality marker must be one atomic alignment write"
                 )
 
+    if "update_segment_alignment(id, &merged, quality.as_db_str())" in commands:
+        raise AssertionError(
+            "commands.rs uses an unconditional atomic alignment write — the interactive aligner must "
+            "compare-and-swap against the canonical alignment read before slow inference"
+        )
+
     required_commands = [
-        "db.update_segment_alignment(id, &merged, quality.as_db_str())",
+        ".update_segment_alignment_if_unchanged(id, alignment_json.as_deref(), &merged, quality.as_db_str())",
         'map_err(|error| format!("Failed to persist word timings + quality for {id}: {error}"))?;',
+        "if !persisted {",
+        'return Err(format!("Segment {id} changed while alignment was running; reload it and try again"));',
     ]
     missing = [pattern for pattern in required_commands if pattern not in commands]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"commands.rs must keep observable atomic alignment persistence:\n{formatted}")
+        raise AssertionError(f"commands.rs must keep observable CAS-protected atomic alignment persistence:\n{formatted}")
 
     required_pipeline = [
         "if let Err(error) = db.update_segment_alignment(",
@@ -1380,7 +1395,7 @@ def test_pipeline_wsl_retranscribe_rejects_an_empty_result() -> None:
     """The in-pipeline WSL-7B branch of transcribe() is the twin of the opt-in transcribe commands guarded
     above: run_wsl_segment_transcript returns Ok("") on a TRANSIENT empty result (server up but under load
     — documented in-code, observed 1-of-3 under stress), so map_err(tag_7b_unavailable) does NOT catch it.
-    Without an explicit empty guard, update_asr_transcript_if_unreviewed(&id, "", ...) overwrites a good,
+    Without an explicit empty guard, the champion commit with an empty draft overwrites a good,
     unverified stored transcript with "" — silent data loss on both re-transcribe entry points (per-segment
     IPC + batch_transcribe), unlike the import path which retries/escalates. The branch must reject an empty
     raw_transcript (return a tagged 7B-unavailable Err) BEFORE the DB write. transcribe() needs the WSL
@@ -1390,19 +1405,52 @@ def test_pipeline_wsl_retranscribe_rejects_an_empty_result() -> None:
     start = pipeline.find(anchor)
     if start == -1:
         raise AssertionError("run_wsl_segment_transcript call not found — this gate would pass vacuously")
-    # Match the METHOD CALL (`.update_asr_transcript_if_unreviewed(`), not a prose mention of the name in
-    # the guard's own comment — otherwise the search lands on the comment and excludes the guard below it.
-    write = pipeline.find(".update_asr_transcript_if_unreviewed(", start)
+    # Match the METHOD CALL, not a prose mention in the guard's own comment — otherwise the search
+    # lands on the comment and excludes the guard below it.
+    write = pipeline.find(".commit_champion_transcript_if_unreviewed(", start)
     if write == -1:
-        raise AssertionError("update_asr_transcript_if_unreviewed call not found after the WSL call — gate vacuous")
+        raise AssertionError("atomic champion commit not found after the WSL call — gate vacuous")
     between = pipeline[start:write]
     if "raw_transcript.trim().is_empty()" not in between or "return Err(tag_7b_unavailable(" not in between:
         raise AssertionError(
             "transcribe()'s WSL-7B branch writes raw_transcript without an empty guard between the "
-            "run_wsl_segment_transcript call and update_asr_transcript_if_unreviewed — a transient empty 7B "
+            "run_wsl_segment_transcript call and the atomic champion commit — a transient empty 7B "
             "result (Ok(\"\")) would overwrite a good stored transcript with a blank. Reject an empty "
             "raw_transcript with a tagged 7B-unavailable Err before the write."
         )
+
+
+def test_champion_transcript_and_provenance_commit_atomically() -> None:
+    """Every production 7B writer must commit the transcript and its sole provenance vote together.
+
+    A successful segment UPDATE followed by a failed hypothesis DELETE/INSERT leaves the row claiming
+    champion provenance while stale optional votes remain. The DB helper owns both mutations under one
+    savepoint, and callers may not recreate the former split write sequence.
+    """
+    db = db_surface()
+    required_db = [
+        "pub fn commit_champion_transcript_if_unreviewed(",
+        'self.conn.execute("SAVEPOINT champion_commit", [])?',
+        "AND verified = 0",
+        "AND (human_decision IS NULL OR human_decision = '')",
+        "DELETE FROM segment_hypotheses WHERE segment_id = ?1",
+        "INSERT INTO segment_hypotheses",
+        'self.release_savepoint("champion_commit")?',
+        'self.cleanup_savepoint_after_error("champion_commit")',
+    ]
+    missing = [pattern for pattern in required_db if pattern not in db]
+    if missing:
+        raise AssertionError(f"atomic champion DB commit is missing contracts: {missing}")
+
+    for name, source in (("pipeline.rs", pipeline_surface()), ("commands.rs", command_surface())):
+        if ".commit_champion_transcript_if_unreviewed(" not in source:
+            raise AssertionError(f"{name} does not route champion writes through the atomic DB helper")
+        for retired in (".update_asr_transcript_if_unreviewed(", ".replace_hypotheses_with("):
+            if retired in source:
+                raise AssertionError(
+                    f"{name} still performs retired split champion persistence via {retired}; "
+                    "transcript + sole hypothesis must commit together"
+                )
 
 
 def test_pipeline_duration_probe_failures_are_not_silent() -> None:
@@ -1549,7 +1597,9 @@ def test_file_dialog_commands_do_not_block_the_main_thread() -> None:
             idx = rest.find(marker)
             if idx != -1:
                 end = min(end, idx)
-        return rest[:end]
+        # Comments stripped: the body deliberately NAMES blocking_pick_file to explain why it must
+        # not be used, and a substring check cannot tell that apart from calling it.
+        return strip_comments(rest[:end])
 
     for sig in ("pub async fn open_audio_file", "pub async fn import_directory"):
         if sig not in commands:
@@ -1589,17 +1639,25 @@ def test_pipeline_hypothesis_population_reports_failures() -> None:
         "Failed to insert {model_id} hypothesis for {segment_id}: {error}",
         "hypothesis transcription failed for {segment_id}: {error}",
         "hypothesis model unavailable for {segment_id}",
-        "Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))",
-        # GER context loads are best-effort (refining unprimed is legitimate) but a DB READ FAILURE must
-        # be logged — the old unwrap_or_default() made a persistent DB problem silently produce unprimed
-        # GER forever with no trace.
-        "GER: could not load N-best hypotheses for {id}: {e}; refining unprimed",
+        # The primary-reuse path maps away only ConfidenceSource; the Result itself must remain intact
+        # so the `Some(Err(error))` arms above report inference failure rather than folding it into
+        # model-unavailable/None.
+        "asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE).map(",
+        # Champion GER must use only the fresh in-memory 7B draft. Loading historical DB hypotheses here
+        # can leak stale 300M/1B/MMS/Scribe text into the production transcript even though those engines
+        # are disabled in champion mode.
+        "let hyps = vec![raw_transcript.clone()];",
         "GER: could not load few-shot corrections for {id}: {e}; refining unprimed",
     ]
     missing = [pattern for pattern in required if pattern not in pipeline]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"pipeline.rs is missing explicit hypothesis failure handling:\n{formatted}")
+    if "db.get_hypotheses_for_segment(&id)" in pipeline:
+        raise AssertionError(
+            "champion GER reloads persisted hypotheses instead of using only its fresh in-memory 7B draft; "
+            "stale auxiliary ASR/Scribe evidence can contaminate the champion transcript"
+        )
 
 
 def test_asr_pool_recovers_poisoned_state_lock() -> None:
@@ -2130,31 +2188,45 @@ def test_bundled_only_models_resolve_per_file_not_all_or_nothing() -> None:
     for bad in (
         "self.asr_pool.warmup(&self.model_manager.resolved_dir()",
         "self.asr_pool.with_service(&self.model_manager.resolved_dir()",
+        "let model_dir = self.model_manager.resolved_dir();",
     ):
         if bad in src:
             raise AssertionError(
                 f"the ASR pool is loaded from all-or-nothing resolved_dir() ({bad}) — a bundled-only "
                 "engine will fail to load. Route it through root_for_size/asr_model_root."
             )
-    if "fn root_for_size" not in src or "fn size_present" not in src:
+    required_asr_resolution = (
+        "fn root_for_size",
+        "chain(crate::models::model_root_candidates())",
+        "if asr::omniasr_model_present(&root, size)",
+        "fn size_present",
+        "let model_dir = self.root_for_size(&model_size);",
+        "let model_dir_300m = self.root_for_size(&config_300m.model_size);",
+        "let model_dir_1b = self.root_for_size(&config_1b.model_size);",
+        "self.asr_pool.with_service(&model_dir_300m, &config_300m",
+        "self.asr_pool.with_service(&model_dir_1b, &config_1b",
+    )
+    missing = [pattern for pattern in required_asr_resolution if pattern not in src]
+    if missing:
         raise AssertionError(
             "pipeline must resolve each ASR engine's root PER ENGINE (root_for_size) and probe "
-            "availability per engine (size_present); one root for several engines is the same bug."
+            "availability per engine (size_present); one root for several engines is the same bug. "
+            f"Missing contracts: {missing}"
         )
 
 
 def test_wsl_refinement_loop_refuses_blank_draft() -> None:
-    """The WSL-7B batch refinement loop persists via update_asr_transcript_if_unreviewed, which writes
+    """The WSL-7B batch refinement loop persists via the atomic champion commit, which writes
     raw_transcript unconditionally (guarding only human-reviewed rows) — so a blank 7B result (Ok("") for a
     silent/music/noise clip, per parse_wsl_segment_result) would overwrite a good existing transcript. It
     must SKIP a blank draft. Runtime path needs the WSL server, so source-pinned. (blank-transcript-never-
     overwrites-good class; siblings transcribe_segment / batch_transcribe / batch_processor.)"""
     src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
-    if "update_asr_transcript_if_unreviewed" not in src:
-        raise AssertionError("WSL refinement persist call not found in commands.rs")
+    if "commit_champion_transcript_if_unreviewed" not in src:
+        raise AssertionError("atomic WSL refinement persist call not found in commands.rs")
     if "Ok((raw_transcript, _)) if raw_transcript.trim().is_empty()" not in src:
         raise AssertionError(
-            "the WSL-7B refinement loop does not guard a blank draft before update_asr_transcript_if_unreviewed "
+            "the WSL-7B refinement loop does not guard a blank draft before the atomic champion commit "
             '— an empty 7B result would overwrite a good transcript with "". Add the guarded match arm.'
         )
 
@@ -2244,6 +2316,7 @@ def main() -> None:
     test_session_cleanup_reports_failures()
     test_instance_lock_cleanup_reports_failures()
     test_commands_do_not_silently_default_critical_db_failures()
+    test_file_dialog_commands_do_not_block_the_main_thread()
     test_commands_batch_transcribe_reports_insert_failures()
     test_commands_jury_evidence_serialization_is_not_silent()
     test_jury_background_runs_report_failures()
@@ -2275,6 +2348,7 @@ def main() -> None:
     test_run_t2_for_segment_respects_the_autonomy_dial()
     test_optin_transcribe_commands_reject_a_blank_decode()
     test_pipeline_wsl_retranscribe_rejects_an_empty_result()
+    test_champion_transcript_and_provenance_commit_atomically()
     test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path()
     test_asr_load_gate_verifies_the_tokens_vocab_not_only_the_model()
     test_snapshot_restore_preserves_live_cloud_consent()

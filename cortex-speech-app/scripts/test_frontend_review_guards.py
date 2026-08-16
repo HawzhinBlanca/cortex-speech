@@ -34,6 +34,21 @@ def _function_body(src: str, sig: str) -> str:
     return rest[:end]
 
 
+def _matching_brace(src: str, opening: int) -> int:
+    """Return the closing brace paired with ``opening`` for a small source-policy region."""
+    if opening == -1 or src[opening] != "{":
+        return -1
+    depth = 0
+    for index in range(opening, len(src)):
+        if src[index] == "{":
+            depth += 1
+        elif src[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
 def test_retranscribe_guards_editor_writes_against_navigation() -> None:
     """ReviewMode.doRetranscribe(): after the multi-second ASR await, the DB/store write targets the
     captured seg by id (correct even if the reviewer navigated away), but the editor-state writes
@@ -61,23 +76,35 @@ def test_submit_guards_editor_writes_against_navigation() -> None:
     hundreds of ms), but editText/lastLoadedOriginal/editedChips belong to the CURRENT clip. Without a
     current-vs-seg recheck, navigating mid-await puts seg's text into another clip's editor (and submit never
     resets lastLoadedId, so that clip's load effect no-ops and never reloads its own text); a subsequent Save
-    persists it as that clip's human-verified gold — wrong-segment gold corruption (THE ONE LAW). The guard
-    `if (current?.id !== seg.id) return;` must sit between the store write and the editor write. Sibling of
-    doRetranscribe's identical guard (found by adversarial hunt-7 / iter 163)."""
+    persists it as that clip's human-verified gold — wrong-segment gold corruption (THE ONE LAW).
+
+    The windowed queue cannot simply early-return before removing the now-reviewed row: it captures the visible
+    id after the write, conditionally mutates editor state only when that id still belongs to seg, removes seg,
+    and then restores a genuinely navigated row. Pin that equivalent (and component-tested) state machine
+    instead of requiring the old literal early-return guard."""
     body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function submit(")
     # P2.3b: the persist is now the TARGETED field update (was a whole-row updateSegment). The
     # wrong-segment-guard invariant is unchanged — the guard must still sit between the store write and
     # the editor write; only the store-write marker moved.
     store_write = body.find("await api.updateSegmentFields(seg.id,")
-    editor_write = body.find("editText = text;")
-    guard = body.find("if (current?.id !== seg.id) return;")
+    visible_capture = body.find("const visibleId = current?.id ?? null;")
+    editor_guard = body.find("if (visibleId === seg.id)", visible_capture)
+    guard_open = body.find("{", editor_guard)
+    guard_close = _matching_brace(body, guard_open)
+    editor_write = body.find("editText = text;", editor_guard)
     if store_write == -1 or editor_write == -1:
         raise AssertionError("submit structure changed (store/editor write markers missing) — gate vacuous")
-    if guard == -1 or not (store_write < guard < editor_write):
+    if (
+        visible_capture == -1
+        or editor_guard == -1
+        or guard_open == -1
+        or guard_close == -1
+        or not (store_write < visible_capture < editor_guard < guard_open < editor_write < guard_close)
+    ):
         raise AssertionError(
-            "submit() writes editText without a current-vs-seg guard between the store write and the editor "
-            "write: navigating during the decision await would put seg's text into another clip's editor and "
-            "Save it as that clip's human gold. Add `if (current?.id !== seg.id) return;`."
+            "submit() writes editText without capturing the post-await visible id and guarding the editor "
+            "write with `if (visibleId === seg.id)`: navigating during the decision await would put seg's "
+            "text into another clip's editor and Save it as that clip's human gold."
         )
 
 
@@ -315,17 +342,17 @@ def test_segment_reload_invalidates_the_frozen_search_scope() -> None:
     retypes. load() must invalidate searchResults on reload so the scope falls back to applySearchScope's LIVE
     substring predicate (the searchResults===null branch) instead of a stale FTS snapshot."""
     src = _read("src/lib/stores/segmentStore.ts")
-    anchor = "set(dedupeById(acc));"
+    anchor = "set(dedupeById(page.items));"
     idx = src.find(anchor)
     if idx == -1:
-        raise AssertionError("segments load() commit point set(dedupeById(acc)) not found — this gate would pass vacuously")
+        raise AssertionError("segments load() page commit point not found — this gate would pass vacuously")
     # Widish window: the invalidation sits right after the reload commit, but its explanatory comment is long.
     window = src[idx : idx + 1200]
     if "searchResults.set(null)" not in window:
         raise AssertionError(
             "segments.load() does not invalidate searchResults after the reload commit — applySearchScope keeps "
             "filtering the fresh rows by the STALE frozen FTS id-set (new matches hidden, gone-stale matches "
-            "kept) in the curate filter and review queue. Add `searchResults.set(null)` after set(dedupeById(acc))."
+            "kept) in the curate filter and review queue. Invalidate it immediately after the page commit."
         )
 
 
@@ -357,13 +384,16 @@ def test_segment_stats_verified_excludes_placeholder_only_rows() -> None:
     ('[Pending WSL 7B ASR]', awaiting the 7B) as verified — yet export_dataset drops every placeholder/empty row
     via the training grade. A plain `s.verified` tally therefore OVER-counts what the exported dataset can
     actually contain (the recurring count-must-exclude-placeholder honesty class). The verified bucket must
-    require real content (hasRealTranscript), counting a verified-but-contentless clip toward neither — like a
-    rejected clip."""
+    require real content, counting a verified-but-contentless clip toward neither — like a rejected clip.
+
+    The library is now windowed, so the frontend must not derive corpus statistics from its partial page. The
+    authoritative SQL aggregate in stats.rs enforces the transcript/training-grade rule and is pinned by Rust
+    tests; this guard requires the store to consume that corpus-wide result."""
     src = _read("src/lib/stores/segmentStore.ts")
-    if "s.verified && hasRealTranscript(s)" not in src:
+    if "api.getDatasetStats()" not in src or "verified: stats.verifiedCount" not in src:
         raise AssertionError(
-            "segmentStats.verified counts bare `s.verified` rows, including batch-verified placeholders/empties "
-            "the export drops. Gate the verified bucket on `s.verified && hasRealTranscript(s)`."
+            "segmentStats.verified must come from the corpus-wide backend aggregate, whose verified bucket "
+            "excludes placeholder/empty/rejected rows; a bounded frontend page cannot compute this honestly."
         )
 
 
@@ -373,14 +403,13 @@ def test_verify_all_pending_excludes_placeholder_and_empty_rows() -> None:
     content filter, so "Verify All Pending" marks placeholder ('[Pending WSL 7B ASR]') / empty rows verified.
     They never ship (export drops placeholders) but they STRAND — the WSL-7B refinement loop skips verified
     rows (update_asr_transcript_if_unreviewed's `AND verified=0`), so the placeholder can never be filled — and
-    they dishonestly read as verified. The bulk list must exclude no-content rows via hasRealTranscript (hunt-5
-    / iter 161)."""
+    they dishonestly read as verified. Since the frontend is now windowed, the whole-view id query must request
+    only `real` transcripts instead of filtering the incomplete render window."""
     body = _function_body(_read("src/App.svelte"), "async function handleBatchVerify(")
-    if "!s.verified && hasRealTranscript(s)" not in body:
+    if "resolveViewIds('real', false, null)" not in body:
         raise AssertionError(
-            "handleBatchVerify('pending') selects `s => !s.verified` with no content filter — 'Verify All "
-            "Pending' marks placeholder/empty rows verified (stranding them from 7B refinement). Filter the "
-            "pending id list with `!s.verified && hasRealTranscript(s)`."
+            "handleBatchVerify('pending') must request unverified IDs with transcriptState='real'; otherwise "
+            "Verify All Pending can mark placeholders/empty rows verified or cover only the loaded page."
         )
 
 
@@ -548,8 +577,8 @@ def test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrat
 def test_library_reads_fail_loudly_instead_of_reporting_an_empty_library() -> None:
     """A malformed segments payload must THROW, never resolve to an empty result.
 
-    `getSegments` / `getSegmentsPage` / `getSegmentsSuspectFirst` each used to `console.error` and
-    return `[]` (or an empty page). That converts "the IPC payload was not what this app understands"
+    The bounded `getSegmentsPage` read used to `console.error` and return an empty page. That converts
+    "the IPC payload was not what this app understands"
     into "your library is empty" — a failure indistinguishable from success. ValidationPanel then shows
     no signal anomalies (a clean bill of health from a broken read), ReviewInbox reports nothing left to
     review, and the segment store renders an empty library.
@@ -561,11 +590,7 @@ def test_library_reads_fail_loudly_instead_of_reporting_an_empty_library() -> No
     """
     src = _read("src/lib/commands.ts")
 
-    for fn, marker in (
-        ("getSegments", "get_segments returned "),
-        ("getSegmentsPage", "get_segments_page returned "),
-        ("getSegmentsSuspectFirst", "get_segments_suspect_first returned "),
-    ):
+    for fn, marker in (("getSegmentsPage", "get_segments_page returned "),):
         if marker not in src:
             raise AssertionError(
                 f"{fn} no longer throws on a malformed payload. Returning an empty result there reports "

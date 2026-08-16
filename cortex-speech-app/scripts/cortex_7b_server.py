@@ -26,6 +26,8 @@ loop, and two replica THREADS in one interpreter serialize on the GIL — measur
 3090 Ti, vs the honest parallelism of processes. A single device (or CPU) runs the same serial
 loop inline, exactly like the original single-model server.
 """
+import json
+import math
 import os
 import socket
 import subprocess
@@ -34,6 +36,57 @@ import sys
 HOST = os.environ.get("CORTEX_7B_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORTEX_7B_PORT", "8799"))
 LANG = os.environ.get("CORTEX_7B_LANG", "ckb_Arab")
+MAX_REQUEST_BYTES = int(os.environ.get("CORTEX_7B_MAX_REQUEST_BYTES", str(16 * 1024)))
+REQUEST_READ_TIMEOUT_SECONDS = float(os.environ.get("CORTEX_7B_READ_TIMEOUT_SECONDS", "10"))
+JOB_TIMEOUT_SECONDS = float(os.environ.get("CORTEX_7B_JOB_TIMEOUT_SECONDS", "270"))
+FFMPEG_TIMEOUT_SECONDS = float(os.environ.get("CORTEX_7B_FFMPEG_TIMEOUT_SECONDS", "120"))
+
+
+def read_bounded_json_request(conn: socket.socket, max_bytes: int = MAX_REQUEST_BYTES) -> dict:
+    """Read exactly one bounded JSON line. A slow or oversized local client must not pin a worker."""
+    if max_bytes < 2:
+        raise ValueError("request limit is too small")
+    conn.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
+    buf = bytearray()
+    while b"\n" not in buf:
+        remaining = max_bytes + 1 - len(buf)
+        if remaining <= 0:
+            raise ValueError(f"request exceeds {max_bytes} bytes")
+        chunk = conn.recv(min(4096, remaining))
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            raise ValueError(f"request exceeds {max_bytes} bytes")
+    if not buf.strip():
+        raise ValueError("empty request")
+    try:
+        request = json.loads(bytes(buf).decode("utf-8").strip())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("request is not valid UTF-8 JSON") from exc
+    if not isinstance(request, dict):
+        raise ValueError("request must be a JSON object")
+    return request
+
+
+def validate_transcription_request(request: dict) -> tuple[str, object, object]:
+    audio_path = request.get("audio_path")
+    if not isinstance(audio_path, str) or not audio_path.strip():
+        raise ValueError("audio_path must be a non-empty string")
+    start_ms = request.get("start_ms")
+    end_ms = request.get("end_ms")
+    if (start_ms is None) != (end_ms is None):
+        raise ValueError("start_ms and end_ms must be provided together")
+    if start_ms is not None:
+        if isinstance(start_ms, bool) or isinstance(end_ms, bool):
+            raise ValueError("clip offsets must be finite numbers")
+        if not isinstance(start_ms, (int, float)) or not isinstance(end_ms, (int, float)):
+            raise ValueError("clip offsets must be finite numbers")
+        if not math.isfinite(start_ms) or not math.isfinite(end_ms):
+            raise ValueError("clip offsets must be finite numbers")
+        if start_ms < 0 or end_ms <= start_ms:
+            raise ValueError("clip offsets must satisfy 0 <= start_ms < end_ms")
+    return audio_path, start_ms, end_ms
 
 
 def parse_device_indices() -> list:
@@ -58,8 +111,8 @@ def worker(srv: socket.socket, tag: str) -> None:
     """One full replica: heavy imports, model load, then the proven serial accept loop. Runs in its
     own process per GPU (or inline for single-device/CPU). Everything CUDA lives below this line."""
     import copy
-    import json
     import tempfile
+    import threading
     from pathlib import Path
 
     import torch
@@ -184,6 +237,7 @@ def worker(srv: socket.socket, tag: str) -> None:
                 ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", audio_path,
                  "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "16000", "-"],
                 capture_output=True,
+                timeout=FFMPEG_TIMEOUT_SECONDS,
             )
             if proc.returncode != 0 or not proc.stdout:
                 # FAIL, never a silent empty clip: an empty tensor would transcribe to "" and the
@@ -220,17 +274,10 @@ def worker(srv: socket.socket, tag: str) -> None:
                 pass
 
     def handle(conn: socket.socket) -> None:
-        buf = b""
-        while not buf.endswith(b"\n"):
-            d = conn.recv(65536)
-            if not d:
-                break
-            buf += d
-        if not buf.strip():
-            return
         try:
-            req = json.loads(buf.decode("utf-8").strip())
-            text = transcribe(req["audio_path"], req.get("start_ms"), req.get("end_ms"))
+            req = read_bounded_json_request(conn)
+            audio_path, start_ms, end_ms = validate_transcription_request(req)
+            text = transcribe(audio_path, start_ms, end_ms)
             reply = {"transcript": text}
         except Exception as e:  # never fabricate — report the failure to the caller
             reply = {"error": str(e)}
@@ -247,11 +294,24 @@ def worker(srv: socket.socket, tag: str) -> None:
     print(f"[{tag}] serving on {HOST}:{PORT} (lang={LANG})", flush=True)
     while True:
         conn, _ = srv.accept()
+        watchdog = threading.Timer(
+            JOB_TIMEOUT_SECONDS,
+            lambda: (
+                print(
+                    f"[{tag}] FATAL: job exceeded {JOB_TIMEOUT_SECONDS:.0f}s; killing wedged worker",
+                    flush=True,
+                ),
+                os._exit(124),
+            ),
+        )
+        watchdog.daemon = True
+        watchdog.start()
         try:
             handle(conn)
         except Exception as e:
             print(f"[{tag}] handler error: {e}", flush=True)
         finally:
+            watchdog.cancel()
             conn.close()
 
 

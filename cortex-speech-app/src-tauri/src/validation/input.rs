@@ -117,12 +117,107 @@ pub fn validate_text(s: &str, max_len: usize, field_name: &str) -> Result<(), St
     Ok(())
 }
 
-/// Validate that a string is a valid JSON alignment metadata blob.
-pub fn validate_alignment_json(s: &str) -> Result<(), String> {
+/// Validate and size-bound an arbitrary JSON blob.
+pub fn validate_json_blob(s: &str) -> Result<serde_json::Value, String> {
     if s.len() > 500_000 {
-        return Err("Alignment metadata too large (max 500KB)".to_string());
+        return Err("JSON metadata too large (max 500KB)".to_string());
     }
-    serde_json::from_str::<serde_json::Value>(s).map_err(|e| format!("Invalid alignment JSON: {e}"))?;
+    serde_json::from_str::<serde_json::Value>(s).map_err(|e| format!("Invalid JSON metadata: {e}"))
+}
+
+fn json_f64(value: &serde_json::Value, field: &str) -> Result<f64, String> {
+    let n = value.as_f64().ok_or_else(|| format!("Alignment field '{field}' must be a finite number"))?;
+    if !n.is_finite() {
+        return Err(format!("Alignment field '{field}' must be finite"));
+    }
+    Ok(n)
+}
+
+fn validate_alignment_words(words: &[serde_json::Value]) -> Result<(), String> {
+    let mut previous_start = 0.0;
+    for (index, value) in words.iter().enumerate() {
+        let word = value.as_object().ok_or_else(|| format!("Alignment word {index} must be an object"))?;
+        let text = word
+            .get("word")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| format!("Alignment word {index} must contain non-empty text"))?;
+        if text.chars().count() > 1_000 {
+            return Err(format!("Alignment word {index} is too long"));
+        }
+        let start = json_f64(
+            word.get("start").ok_or_else(|| format!("Alignment word {index} is missing start"))?,
+            "words[].start",
+        )?;
+        let end =
+            json_f64(word.get("end").ok_or_else(|| format!("Alignment word {index} is missing end"))?, "words[].end")?;
+        if start < 0.0 || end < start {
+            return Err(format!("Alignment word {index} has an invalid time range"));
+        }
+        if index > 0 && start < previous_start {
+            return Err(format!("Alignment words are out of order at index {index}"));
+        }
+        if let Some(confidence) = word.get("confidence") {
+            let confidence = json_f64(confidence, "words[].confidence")?;
+            if !(0.0..=1.0).contains(&confidence) {
+                return Err(format!("Alignment word {index} confidence must be between 0 and 1"));
+            }
+        }
+        previous_start = start;
+    }
+    Ok(())
+}
+
+/// Validate the supported alignment schema: either a legacy word array, or an object containing
+/// source bounds and/or `words`. Unknown object keys are preserved for forward compatibility, but
+/// the timing fields used by playback/export are strictly typed and internally consistent.
+pub fn validate_alignment_json(s: &str) -> Result<(), String> {
+    let value = validate_json_blob(s)?;
+    match &value {
+        serde_json::Value::Array(words) => validate_alignment_words(words)?,
+        serde_json::Value::Object(object) => {
+            let has_start = object.contains_key("source_start_ms");
+            let has_end = object.contains_key("source_end_ms");
+            if has_start != has_end {
+                return Err("Alignment source_start_ms and source_end_ms must be provided together".into());
+            }
+            if has_start {
+                let start = object["source_start_ms"]
+                    .as_i64()
+                    .ok_or_else(|| "Alignment source_start_ms must be a non-negative integer".to_string())?;
+                let end = object["source_end_ms"]
+                    .as_i64()
+                    .ok_or_else(|| "Alignment source_end_ms must be a positive integer".to_string())?;
+                if start < 0 || end <= start {
+                    return Err("Alignment source range must satisfy 0 <= start < end".into());
+                }
+            }
+            let has_index = object.contains_key("chunk_index");
+            let has_count = object.contains_key("chunk_count");
+            if has_index != has_count {
+                return Err("Alignment chunk_index and chunk_count must be provided together".into());
+            }
+            if has_index {
+                let index = object["chunk_index"]
+                    .as_u64()
+                    .ok_or_else(|| "Alignment chunk_index must be a non-negative integer".to_string())?;
+                let count = object["chunk_count"]
+                    .as_u64()
+                    .ok_or_else(|| "Alignment chunk_count must be a positive integer".to_string())?;
+                if count == 0 || index >= count {
+                    return Err("Alignment chunk range must satisfy 0 <= chunk_index < chunk_count".into());
+                }
+            }
+            if let Some(words) = object.get("words") {
+                let words = words.as_array().ok_or_else(|| "Alignment words must be an array".to_string())?;
+                validate_alignment_words(words)?;
+            }
+            if !has_start && !object.contains_key("words") {
+                return Err("Alignment object must contain source bounds or words".into());
+            }
+        }
+        _ => return Err("Alignment JSON must be an object or word array".into()),
+    }
     Ok(())
 }
 
@@ -177,6 +272,33 @@ mod tests {
         assert!(validate_identifier("a".repeat(257).as_str()).is_err());
         assert!(validate_identifier("../evil").is_err());
         assert!(validate_identifier("good.name").is_ok());
+    }
+
+    #[test]
+    fn alignment_schema_rejects_ranges_and_words_that_break_editor_math() {
+        assert!(validate_alignment_json(
+            r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1,"words":[{"word":"x","start":0.0,"end":0.5,"confidence":0.9}]}"#
+        )
+        .is_ok());
+        assert!(validate_alignment_json(r#"{"words":[]}"#).is_ok());
+        assert!(validate_alignment_json(r#"[]"#).is_ok(), "legacy word arrays remain readable");
+
+        for invalid in [
+            r#"{"source_start_ms":1000,"source_end_ms":1000}"#,
+            r#"{"source_start_ms":0}"#,
+            r#"{"chunk_index":1,"chunk_count":1,"words":[]}"#,
+            r#"{"words":[{"word":"x","start":1.0,"end":0.5,"confidence":0.9}]}"#,
+            r#"{"words":[{"word":"x","start":0.0,"end":0.5,"confidence":1.1}]}"#,
+            r#"{"unrelated":true}"#,
+            r#"null"#,
+        ] {
+            assert!(validate_alignment_json(invalid).is_err(), "must reject {invalid}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_evidence_json_is_not_forced_through_the_alignment_schema() {
+        assert!(validate_json_blob(r#"{"votes":[{"model":"local","accepted":true}]}"#).is_ok());
     }
 
     #[test]

@@ -300,10 +300,9 @@ pub fn write_segment_verdict(
     if let Some(r) = rationale.as_deref() {
         validate::validate_text(r, 100_000, "Verdict rationale")?;
     }
-    // evidence_json is always serialized JSON; validate_alignment_json both confirms it parses as JSON
-    // and bounds it (max 500KB), which is stricter and more apt than a plain length cap.
+    // Evidence is arbitrary structured JSON, not alignment metadata; only parse and size-bound it.
     if let Some(ej) = evidence_json.as_deref() {
-        validate::validate_alignment_json(ej)?;
+        validate::validate_json_blob(ej)?;
     }
     let db = state.lock_db();
     db.write_segment_verdict(

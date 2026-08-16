@@ -17,7 +17,7 @@ use crate::history::Command;
 use crate::models;
 use crate::pipeline::PipelineEvent;
 use crate::quality;
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, AsrModelSize};
 use crate::stats;
 use crate::throttle::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::validation::input as validate;
@@ -178,8 +178,8 @@ fn build_agentic_readiness(
     let source_reference_models = settings.source_reference_models();
     if !settings.jury_cloud_opt_in {
         // Cloud whole-file references are an OPTIONAL enhancement the user has deliberately left off
-        // (offline-first). The jury runs local multi-model consensus fine without them, so this is the
-        // chosen, fully-functional configuration — NOT a degradation that should nag on every import.
+        // (offline-first). The selected primary ASR remains fully functional without them, so this is
+        // the chosen configuration — NOT a degradation that should nag on every import.
         //
         // But it is not "ready" either, and saying so was a green tick the feature had not earned: a
         // reviewer scanning the panel could not tell "source references are covering your data" from
@@ -194,7 +194,7 @@ fn build_agentic_readiness(
             "source_reference",
             "Whole-file source references",
             "not_required",
-            "Offline mode: cloud whole-file references are off by choice (an optional cross-check; whether local consensus can run is reported by the hypothesis-coverage check). Enable jury cloud opt-in to add Gemini whole-file references.",
+            "Offline mode: cloud whole-file references are off by choice (an optional cross-check). Primary ASR readiness is reported separately. Enable jury cloud opt-in to add Gemini whole-file references.",
         ));
     } else if settings.llm_api_key.trim().is_empty() {
         checks.push(readiness_check(
@@ -229,41 +229,83 @@ fn build_agentic_readiness(
     let wsl_ready = external_provider.get("available").and_then(serde_json::Value::as_bool).unwrap_or(false)
         && settings.external_asr_script_path().is_some();
 
+    let auxiliary_mode = settings.multi_engine_hypotheses && settings.asr_model_size != AsrModelSize::WSL7B;
+    let (primary_model_id, primary_label, primary_ready, primary_detail) = match &settings.asr_model_size {
+        AsrModelSize::WSL7B => {
+            let detail = if wsl_ready {
+                "WSL external ASR provider is configured and WSL reports healthy.".to_string()
+            } else {
+                external_provider
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("WSL external ASR provider is not ready.")
+                    .to_string()
+            };
+            ("omniasr-wsl-7b", "Primary OmniASR 7B", wsl_ready, detail)
+        }
+        AsrModelSize::CTC1B => (
+            "omniasr-ctc-1b",
+            "Selected OmniASR CTC 1B",
+            ctc_1b_ready,
+            if ctc_1b_ready {
+                "The explicitly selected CTC 1B model and tokens are available.".to_string()
+            } else {
+                "The explicitly selected CTC 1B model or tokens are missing.".to_string()
+            },
+        ),
+        AsrModelSize::CTC300M => (
+            "omniasr-ctc-300m",
+            "Selected OmniASR CTC 300M",
+            ctc_300m_ready,
+            if ctc_300m_ready {
+                "The explicitly selected CTC 300M model and tokens are available.".to_string()
+            } else {
+                "The explicitly selected CTC 300M model or tokens are missing.".to_string()
+            },
+        ),
+    };
+
+    // Report engines that this configuration can actually invoke, not every optional model merely
+    // installed on disk. In champion-only mode an installed CTC model is not an active hypothesis
+    // source and must not make the UI imply that it will run.
     let mut available_hypothesis_models = Vec::new();
-    if wsl_ready {
-        available_hypothesis_models.push("omniasr-wsl-7b".to_string());
+    if primary_ready {
+        available_hypothesis_models.push(primary_model_id.to_string());
     }
-    if ctc_1b_ready {
-        available_hypothesis_models.push("omniasr-ctc-1b".to_string());
-    }
-    if ctc_300m_ready {
-        available_hypothesis_models.push("omniasr-ctc-300m".to_string());
+    if auxiliary_mode {
+        for (ready, model_id) in
+            [(wsl_ready, "omniasr-wsl-7b"), (ctc_1b_ready, "omniasr-ctc-1b"), (ctc_300m_ready, "omniasr-ctc-300m")]
+        {
+            if ready && !available_hypothesis_models.iter().any(|existing| existing == model_id) {
+                available_hypothesis_models.push(model_id.to_string());
+            }
+        }
     }
 
-    if wsl_ready {
-        checks.push(readiness_check(
-            "primary_asr",
-            "Primary OmniASR 7B",
-            "ready",
-            "WSL external ASR provider is configured and WSL reports healthy.",
-        ));
+    if primary_ready {
+        checks.push(readiness_check("primary_asr", primary_label, "ready", primary_detail));
     } else {
-        let message = external_provider
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("WSL external ASR provider is not ready.");
         checks.push(readiness_check(
             "primary_asr",
-            "Primary OmniASR 7B",
-            "degraded",
+            primary_label,
+            "blocked",
             format!(
-                "{message} The app can still use local CTC hypotheses, but the requested 7B primary path is not ready."
+                "{primary_detail} The selected primary engine is unavailable; refusing to substitute another engine."
             ),
         ));
     }
 
     let required_hypothesis_models = quality::MIN_HYPOTHESIS_MODELS_FOR_TRAINING_READY_MACHINE;
-    if available_hypothesis_models.len() >= required_hypothesis_models {
+    if !auxiliary_mode {
+        checks.push(readiness_check(
+            "hypothesis_coverage",
+            "Multi-model hypothesis coverage",
+            "not_required",
+            format!(
+                "Single-engine mode: {primary_model_id} is the only automatic ASR source. Optional engines will not run. Training/export promotion still validates its required stored corroboration separately (minimum {required_hypothesis_models})."
+            ),
+        ));
+    } else if available_hypothesis_models.len() >= required_hypothesis_models {
         checks.push(readiness_check(
             "hypothesis_coverage",
             "Multi-model hypothesis coverage",
@@ -1009,9 +1051,10 @@ pub fn app_git_sha() -> String {
 pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("app_health")?;
     let data_dir = state.lock_data_dir().clone();
+    let settings = state.lock_settings().clone();
     let db = state.lock_db();
     let mm = state.lock_model_manager();
-    health::health_check(&db, &mm, data_dir.as_deref()).map_err(|e| e.to_string())
+    health::health_check(&db, &mm, &settings, data_dir.as_deref()).map_err(|e| e.to_string())
 }
 
 /// Decode ONLY a segment's clip window to 16 kHz mono PCM without loading the whole (possibly
@@ -1463,6 +1506,39 @@ pub struct SegmentConsensus {
     pub models: Vec<String>,
 }
 
+/// Restrict review evidence to the ASR mode the owner selected. In champion mode, hypotheses left by
+/// older builds (300M/1B/MMS/Scribe) are historical artifacts, not voters. If a pre-provenance 7B row
+/// has no hypothesis record, synthesize the one honest vote from the segment's persisted champion
+/// transcript so review still works without allowing stale engines back into the decision.
+fn hypotheses_for_selected_asr(
+    selected: &crate::settings::AsrModelSize,
+    segment: &crate::db::SpeechSegment,
+    mut hypotheses: Vec<crate::db::SegmentHypothesis>,
+) -> Vec<crate::db::SegmentHypothesis> {
+    if *selected != crate::settings::AsrModelSize::WSL7B {
+        return hypotheses;
+    }
+
+    hypotheses.retain(|hypothesis| {
+        hypothesis.model_id == crate::pipeline::CHAMPION_MODEL_ID
+            && !hypothesis.transcript.trim().is_empty()
+            && !crate::quality::is_placeholder_transcript(&hypothesis.transcript)
+    });
+    if hypotheses.is_empty()
+        && segment.model_version_id.as_deref() == Some(crate::pipeline::CHAMPION_MODEL_ID)
+        && !segment.raw_transcript.trim().is_empty()
+        && !crate::quality::is_placeholder_transcript(&segment.raw_transcript)
+    {
+        hypotheses.push(crate::db::SegmentHypothesis {
+            segment_id: segment.id.clone(),
+            model_id: crate::pipeline::CHAMPION_MODEL_ID.to_string(),
+            transcript: segment.raw_transcript.clone(),
+            confidence: segment.confidence,
+        });
+    }
+    hypotheses
+}
+
 /// Offline best-of-N consensus DRAFT for a segment: an ability-weighted vote over its ASR hypotheses
 /// (no cloud) so review can start from a transcript better than any single model and highlight exactly
 /// where the models disagreed. Empty when the segment has no hypotheses to vote over.
@@ -1470,10 +1546,17 @@ pub struct SegmentConsensus {
 pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> Result<SegmentConsensus, String> {
     RATE_LIMITER.check("get_segment_consensus")?;
     validate::validate_identifier(&segment_id)?;
-    let hyps = {
+    let selected = state.lock_settings().asr_model_size.clone();
+    let (segment, hyps) = {
         let db = state.lock_db();
-        db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?
+        let segment = db
+            .get_segment_by_id(&segment_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))?;
+        let hypotheses = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
+        (segment, hypotheses)
     };
+    let hyps = hypotheses_for_selected_asr(&selected, &segment, hyps);
     // Distinct producing engines, in first-seen order, straight from the recorded hypotheses (never
     // inferred) so the review badge can honestly say which model(s) made the draft.
     let mut models: Vec<String> = Vec::new();
@@ -1494,6 +1577,17 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
         (min, mean)
     };
     Ok(SegmentConsensus { draft, words, model_count, min_agreement, mean_agreement, models })
+}
+
+/// Hydrate one selected list row with its full alignment/evidence payload.
+#[tauri::command]
+pub fn get_segment(segment_id: String, state: State<'_, AppState>) -> Result<SpeechSegment, String> {
+    RATE_LIMITER.check("get_segment")?;
+    validate::validate_identifier(&segment_id)?;
+    let db = state.lock_db();
+    db.get_segment_by_id(&segment_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))
 }
 
 #[tauri::command]
@@ -1517,14 +1611,44 @@ pub fn get_segments_page(
         _ => return Err(format!("Invalid segment sort: {sort}")),
     }
     if let Some(ref cursor) = cursor {
-        validate::validate_text(cursor, 32, "Segment page cursor")?;
-        if !cursor.chars().all(|ch| ch.is_ascii_digit()) {
+        validate::validate_text(cursor, 2048, "Segment page cursor")?;
+        if !cursor.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
             return Err("Invalid segment page cursor".to_string());
         }
     }
     let limit = limit.unwrap_or(200).clamp(1, 500);
     let db = state.lock_db();
     db.get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_segment_ids_for_view(
+    verified: Option<bool>,
+    query: Option<String>,
+    transcript_state: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    RATE_LIMITER.check("get_segment_ids_for_view")?;
+    if let Some(ref query) = query {
+        validate::validate_text(query, 1000, "Search query")?;
+    }
+    let transcript_state = transcript_state.unwrap_or_else(|| "any".into());
+    match transcript_state.as_str() {
+        "any" | "real" | "missing" => {}
+        _ => return Err("Invalid transcript state".into()),
+    }
+    let db = state.lock_db();
+    db.get_segment_ids_for_view(verified, query.as_deref(), &transcript_state).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_signal_anomaly_segments(
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<SpeechSegment>, String> {
+    RATE_LIMITER.check("get_signal_anomaly_segments")?;
+    let db = state.lock_db();
+    db.get_signal_anomaly_segments(limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
 /// Apply the whitelisted curation fields from an autosave `fields` object onto a segment row. Pure and
@@ -1787,6 +1911,18 @@ impl Drop for RestoreReservation {
     }
 }
 
+fn take_mandatory_pre_restore_snapshot(
+    db: &crate::db::Database,
+    data_dir: &Path,
+) -> Result<std::path::PathBuf, String> {
+    crate::snapshot::take_pinned_snapshot(db, data_dir, "prerestore", 3).map_err(|e| {
+        format!(
+            "Database restore refused because the mandatory pre-restore safety snapshot failed: {e}. \
+             The current library has not been overwritten. Free disk space or fix the destination permissions, then retry."
+        )
+    })
+}
+
 /// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
 /// be writing, and pin a rotation-exempt copy of the CURRENT live DB first so a mis-restore of the
 /// wrong snapshot is itself recoverable (previously only from a ≤10-min rolling snapshot that
@@ -1812,13 +1948,13 @@ fn prepare_restore(state: &State<'_, AppState>) -> Result<RestoreReservation, St
                     restored library and re-arm stale undo history."
             .to_string());
     }
-    if let Some(data_dir) = state.lock_data_dir().clone() {
-        let db = state.lock_db();
-        match crate::snapshot::take_pinned_snapshot(&db, &data_dir, "prerestore", 3) {
-            Ok(path) => tracing::info!("pre-restore snapshot pinned at {}", path.display()),
-            Err(e) => tracing::warn!("pre-restore snapshot failed (continuing with restore): {e}"),
-        }
-    }
+    let data_dir = state
+        .lock_data_dir()
+        .clone()
+        .ok_or_else(|| "Database restore refused: the app data directory is unavailable, so a mandatory pre-restore safety snapshot cannot be created.".to_string())?;
+    let db = state.lock_db();
+    let pinned = take_mandatory_pre_restore_snapshot(&db, &data_dir)?;
+    tracing::info!("pre-restore snapshot pinned at {}", pinned.display());
     Ok(reservation)
 }
 
@@ -1905,6 +2041,17 @@ pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<crate::snapsh
     Ok(crate::snapshot::list_snapshots(&data_dir))
 }
 
+/// A dataset snapshot may restore dataset-coupled thresholds, but it must never change which ASR
+/// engine the operator is currently running or re-enable heavyweight background inference. Those
+/// are live machine/runtime decisions, not historical dataset state.
+fn preserve_live_asr_runtime_controls(restored: &mut AppSettings, live: &AppSettings) {
+    restored.asr_model_size = live.asr_model_size.clone();
+    restored.use_finetuned_asr = live.use_finetuned_asr;
+    restored.multi_engine_hypotheses = live.multi_engine_hypotheses;
+    restored.external_asr_script_path = live.external_asr_script_path.clone();
+    restored.champion_supervision_enabled = live.champion_supervision_enabled;
+}
+
 /// B2: restore the live database from a named auto-snapshot. The name must be a bare
 /// `snapshot_<digits>` component (no separators — cannot traverse), and the snapshot must contain a
 /// DB file. Restore goes through the same SQLite online-backup path as `db_restore`.
@@ -1974,25 +2121,24 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     } else {
         &live_settings_path
     });
-    // PRIVACY: a DB snapshot restore must NEVER silently re-grant cloud consent the user has since revoked.
-    // Consent (cloud_llm / cloud_stt / jury_cloud opt-in) is a LIVE per-session privacy decision, not dataset
-    // state a rollback should change — carry the CURRENT opt-ins across instead of adopting the snapshot's, so
-    // a restore can only NARROW consent, never escalate it. (Guardrail: never send audio/transcript to a
-    // provider without acknowledged consent — a snapshot captured in a cloud-ON era must not flip it back on.)
+    // LIVE CONTROLS: a DB snapshot restore must NEVER silently re-grant cloud consent or change the selected
+    // ASR runtime. Consent, engine routing, the champion client path, and 30 GB server supervision are current
+    // operator decisions, not dataset state. Carry them across instead of adopting the snapshot's values.
     {
         let live = state.lock_settings();
         restored.cloud_llm_opt_in = live.cloud_llm_opt_in;
         restored.cloud_stt_opt_in = live.cloud_stt_opt_in;
         restored.jury_cloud_opt_in = live.jury_cloud_opt_in;
+        preserve_live_asr_runtime_controls(&mut restored, &live);
     }
-    // Persist the consent-narrowed settings as the FIRST and ONLY write of settings.json to disk (the
+    // Persist the live-control-preserving settings as the FIRST and ONLY write of settings.json to disk (the
     // snapshot's file was deliberately NOT copied above). data_dir/settings.json still holds the PRE-restore
     // settings until this write lands, so if it fails or is interrupted (disk full during recovery, or a kill
     // in the window) the on-disk consent stays the user's current REVOKED value — a consent-safe partial
     // restore — never the snapshot's cloud-ON opt-ins. AppSettings::load does NOT reset opt-ins, so this is
     // exactly what the next launch reads. Best-effort: the DB is already restored and consent fails SAFE.
     if let Err(e) = restored.save(&live_settings_path) {
-        tracing::warn!("snapshot restore: could not persist consent-narrowed settings to disk: {e}");
+        tracing::warn!("snapshot restore: could not persist live-control-preserving settings to disk: {e}");
     }
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
@@ -2368,31 +2514,20 @@ fn run_wsl_refinement_loop(
                 } else {
                     None
                 };
-                match db.update_asr_transcript_if_unreviewed(
-                    id,
-                    &raw_transcript,
-                    normalized.as_deref(),
+                let champion = crate::db::SegmentHypothesis {
+                    segment_id: id.to_string(),
+                    model_id: crate::pipeline::CHAMPION_MODEL_ID.to_string(),
+                    transcript: raw_transcript.clone(),
                     confidence,
+                };
+                match db.commit_champion_transcript_if_unreviewed(
+                    &champion,
+                    normalized.as_deref(),
                     Some("external_provider"),
-                    Some("omniasr-wsl-7b"),
                     false,
                 ) {
                     Ok(true) => {
                         transcribed += 1;
-                        // Record the champion's provenance hypothesis like BOTH other 7B paths do
-                        // (import pass + single re-transcribe) — without it the review badge cannot
-                        // name the producing engine for batch-refined segments and the jury lacks
-                        // the champion's highest-weight vote for exactly these clips (true-10 audit
-                        // 2026-07-09). Best-effort: a provenance-write failure must not fail the
-                        // (successful) transcription.
-                        if let Err(e) = db.insert_hypothesis(&crate::db::SegmentHypothesis {
-                            segment_id: id.to_string(),
-                            model_id: "omniasr-wsl-7b".to_string(),
-                            transcript: raw_transcript.clone(),
-                            confidence,
-                        }) {
-                            tracing::warn!("could not record omniasr-wsl-7b provenance for {id}: {e}");
-                        }
                         emit_or_log(
                             app,
                             "wsl-log",
@@ -3233,11 +3368,13 @@ fn reference_selection_evidence(report: &crate::agentic::CandidateSelectionRepor
 
 fn load_hypotheses_for_segment(
     db: &crate::db::Database,
+    settings: &crate::settings::AppSettings,
     seg_id: &str,
     seg: &crate::db::SpeechSegment,
 ) -> Result<Vec<crate::db::SegmentHypothesis>, String> {
-    let mut hyps = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;
-    if hyps.is_empty() {
+    let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;
+    let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted);
+    if hyps.is_empty() && settings.asr_model_size != crate::settings::AsrModelSize::WSL7B {
         hyps.push(crate::db::SegmentHypothesis {
             segment_id: seg_id.to_string(),
             model_id: "asr".into(),
@@ -3381,6 +3518,26 @@ pub fn run_jury_pipeline_core_via(
     segment_ids: Vec<String>,
     data_dir: Option<&std::path::Path>,
 ) -> Result<serde_json::Value, String> {
+    // Champion-only production mode has exactly one ASR by design. Running a multi-ASR jury here
+    // either treats stale auxiliary rows as votes or immediately fails its two-model coverage guard.
+    // Both outcomes violate the owner's sole-champion contract. Leave every fresh draft for the human
+    // review flow and keep the stricter multi-model proof confined to explicit non-champion/export use.
+    if settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+        return Ok(serde_json::json!({
+            "mode": "not_required",
+            "totalInput": segment_ids.len(),
+            "t0AutoAccepted": 0,
+            "t0Escalated": 0,
+            "referenceCommitted": 0,
+            "referenceGuarded": 0,
+            "hypothesisGuarded": 0,
+            "t1Committed": 0,
+            "t2Committed": 0,
+            "humanInbox": segment_ids.len(),
+            "reason": "Champion-only mode sends OmniASR 7B drafts directly to human review; auxiliary-ASR jury is not run"
+        }));
+    }
+
     let t1_threshold = settings.jury_t1_threshold;
     let cloud_opt_in = settings.jury_cloud_opt_in;
     // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
@@ -3437,7 +3594,7 @@ pub fn run_jury_pipeline_core_via(
             continue;
         }
 
-        let hyps = load_hypotheses_for_segment(db, seg_id, seg)?;
+        let hyps = load_hypotheses_for_segment(db, settings, seg_id, seg)?;
         if let Some(report) = hypothesis_coverage_guard(seg, &hyps) {
             reference_reports.insert(seg_id.clone(), report);
             review_ids.push(seg_id.clone());
@@ -3554,7 +3711,7 @@ pub fn run_jury_pipeline_core_via(
         }
 
         // Load hypotheses from database
-        let hyps = load_hypotheses_for_segment(db, seg_id, &seg)?;
+        let hyps = load_hypotheses_for_segment(db, settings, seg_id, &seg)?;
 
         // ── Stage 2: T1 text judge ────────────────────────────────────────────
         let reference_report = match reference_reports.remove(seg_id) {
@@ -3807,6 +3964,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mandatory_pre_restore_snapshot_failure_aborts_before_live_data_can_change() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let segment = test_segment("restore-safety", "restore-safety.wav", "still live");
+        db.insert_segment(&segment).unwrap();
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let invalid_data_dir = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_data_dir, b"blocks snapshot directory creation").unwrap();
+
+        let err = take_mandatory_pre_restore_snapshot(&db, &invalid_data_dir).unwrap_err();
+        assert!(err.contains("mandatory pre-restore safety snapshot failed"), "{err}");
+        assert!(err.contains("has not been overwritten"), "{err}");
+        assert_eq!(
+            db.get_segment_by_id(&segment.id).unwrap().unwrap().raw_transcript,
+            "still live",
+            "a failed safety pin must leave the live library untouched"
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_live_champion_routing_and_gpu_supervision_choice() {
+        let live = AppSettings {
+            asr_model_size: AsrModelSize::WSL7B,
+            use_finetuned_asr: false,
+            multi_engine_hypotheses: false,
+            external_asr_script_path: "C:/cortex/scripts/cortex_7b_client.py".to_string(),
+            champion_supervision_enabled: false,
+            ..AppSettings::default()
+        };
+        let mut restored = AppSettings {
+            asr_model_size: AsrModelSize::CTC300M,
+            use_finetuned_asr: true,
+            multi_engine_hypotheses: true,
+            external_asr_script_path: "old-or-missing-client.py".to_string(),
+            champion_supervision_enabled: true,
+            vad_threshold: 0.77,
+            ..AppSettings::default()
+        };
+
+        preserve_live_asr_runtime_controls(&mut restored, &live);
+
+        assert_eq!(restored.asr_model_size, AsrModelSize::WSL7B);
+        assert!(!restored.use_finetuned_asr);
+        assert!(!restored.multi_engine_hypotheses);
+        assert_eq!(restored.external_asr_script_path, live.external_asr_script_path);
+        assert!(!restored.champion_supervision_enabled, "a restore must not auto-load the 30 GB server");
+        assert_eq!(restored.vad_threshold, 0.77, "ordinary snapshot configuration should still restore");
+    }
+
     fn insert_hypothesis(
         db: &crate::db::Database,
         segment_id: &str,
@@ -3886,6 +4094,9 @@ mod tests {
     /// ActConfirm, the level whose semantics they were written against.
     fn settings_act_confirm() -> crate::settings::AppSettings {
         crate::settings::AppSettings {
+            // These tests intentionally exercise the legacy multi-model jury machinery. Production
+            // defaults to WSL7B and bypasses that machinery entirely.
+            asr_model_size: crate::settings::AsrModelSize::CTC300M,
             jury_autonomy_level: crate::settings::AutonLevel::ActConfirm,
             ..crate::settings::AppSettings::default()
         }
@@ -4094,7 +4305,10 @@ mod tests {
         );
         assert_eq!(readiness.status, "blocked");
         assert!(!readiness.ready);
-        assert!(readiness.checks.iter().any(|check| check.id == "hypothesis_coverage" && check.status == "blocked"));
+        assert!(readiness
+            .checks
+            .iter()
+            .any(|check| check.id == "hypothesis_coverage" && check.status == "not_required"));
         assert!(readiness.available_hypothesis_models.is_empty());
         assert_eq!(readiness.required_hypothesis_models, quality::MIN_HYPOTHESIS_MODELS_FOR_TRAINING_READY_MACHINE);
     }
@@ -4137,7 +4351,7 @@ mod tests {
     }
 
     #[test]
-    fn agentic_readiness_is_ready_with_gemini_wsl_and_local_hypothesis_model() {
+    fn champion_readiness_ignores_installed_optional_ctc_models() {
         let settings = crate::settings::AppSettings {
             jury_cloud_opt_in: true,
             llm_api_key: "session-key".to_string(),
@@ -4161,11 +4375,38 @@ mod tests {
 
         assert_eq!(readiness.status, "ready");
         assert!(readiness.ready);
+        assert_eq!(readiness.available_hypothesis_models, vec!["omniasr-wsl-7b".to_string()]);
+        assert!(readiness.checks.iter().any(|check| {
+            check.id == "hypothesis_coverage"
+                && check.status == "not_required"
+                && check.detail.contains("Optional engines will not run")
+        }));
         assert_eq!(
-            readiness.available_hypothesis_models,
-            vec!["omniasr-wsl-7b".to_string(), "omniasr-ctc-300m".to_string()]
+            readiness.required_hypothesis_models,
+            quality::MIN_HYPOTHESIS_MODELS_FOR_TRAINING_READY_MACHINE,
+            "operational readiness must not weaken the separate training/export proof threshold"
         );
-        assert!(readiness.checks.iter().all(|check| check.status == "ready"));
+    }
+
+    #[test]
+    fn local_readiness_checks_the_exact_explicitly_selected_engine() {
+        let settings = crate::settings::AppSettings {
+            asr_model_size: AsrModelSize::CTC1B,
+            ..crate::settings::AppSettings::default()
+        };
+        let model_status = vec![
+            downloaded_model_status(models::OMNIASR_CTC_1B_MODEL),
+            downloaded_model_status(models::OMNIASR_CTC_1B_TOKENS),
+        ];
+        let readiness = build_agentic_readiness(
+            &settings,
+            &model_status,
+            &serde_json::json!({ "available": false, "message": "WSL is unavailable" }),
+        );
+
+        assert_eq!(readiness.status, "ready");
+        assert_eq!(readiness.available_hypothesis_models, vec!["omniasr-ctc-1b".to_string()]);
+        assert!(readiness.checks.iter().any(|check| check.id == "primary_asr" && check.status == "ready"));
     }
 
     #[test]
@@ -4256,6 +4497,64 @@ mod tests {
     }
 
     #[test]
+    fn champion_review_filters_every_stale_auxiliary_vote() {
+        let mut segment = test_segment("champion-consensus", "/audio/champion.wav", "champion draft");
+        segment.model_version_id = Some(crate::pipeline::CHAMPION_MODEL_ID.to_string());
+        let hypotheses = vec![
+            crate::db::SegmentHypothesis {
+                segment_id: segment.id.clone(),
+                model_id: "omniasr-ctc-300m".to_string(),
+                transcript: "stale 300m draft".to_string(),
+                confidence: Some(0.99),
+            },
+            crate::db::SegmentHypothesis {
+                segment_id: segment.id.clone(),
+                model_id: "finetuned-mms-ckb".to_string(),
+                transcript: "stale mms draft".to_string(),
+                confidence: Some(0.99),
+            },
+            crate::db::SegmentHypothesis {
+                segment_id: segment.id.clone(),
+                model_id: "scribe-v1".to_string(),
+                transcript: "stale cloud draft".to_string(),
+                confidence: Some(0.99),
+            },
+        ];
+
+        let filtered = hypotheses_for_selected_asr(&crate::settings::AsrModelSize::WSL7B, &segment, hypotheses);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].model_id, crate::pipeline::CHAMPION_MODEL_ID);
+        assert_eq!(filtered[0].transcript, "champion draft");
+    }
+
+    #[test]
+    fn champion_mode_jury_is_a_no_write_human_review_handoff() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let mut segment = test_segment("champion-no-jury", "/audio/champion.wav", "champion draft");
+        segment.model_version_id = Some(crate::pipeline::CHAMPION_MODEL_ID.to_string());
+        db.insert_segment(&segment).unwrap();
+        insert_hypothesis(&db, &segment.id, "omniasr-ctc-300m", "stale smaller-model vote", 0.99);
+
+        let settings = crate::settings::AppSettings {
+            asr_model_size: crate::settings::AsrModelSize::WSL7B,
+            multi_engine_hypotheses: true,
+            jury_cloud_opt_in: true,
+            llm_api_key: "must-not-be-used".to_string(),
+            ..crate::settings::AppSettings::default()
+        };
+        let report = run_jury_pipeline_core(&db, &settings, vec![segment.id.clone()]).unwrap();
+        let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+
+        assert_eq!(report["mode"], "not_required");
+        assert_eq!(report["humanInbox"].as_u64(), Some(1));
+        assert_eq!(report["t0AutoAccepted"].as_u64(), Some(0));
+        assert!(fresh.verdict.is_none(), "champion handoff must not manufacture a machine verdict");
+        assert_eq!(fresh.raw_transcript, "champion draft");
+    }
+
+    #[test]
     fn autonomy_dial_governs_every_machine_commit_stage_not_just_t0() {
         // Round-24 hunt #1 (HIGH): under Observe/Propose the dial was enforced only inside
         // run_t0_gate — the SAME pipeline run then machine-committed 'jury_accept' via the
@@ -4301,6 +4600,7 @@ mod tests {
             .unwrap();
 
         let observe = crate::settings::AppSettings {
+            asr_model_size: crate::settings::AsrModelSize::CTC300M,
             jury_autonomy_level: crate::settings::AutonLevel::Observe,
             ..crate::settings::AppSettings::default()
         };
@@ -4311,6 +4611,7 @@ mod tests {
 
         // ── Propose: an already-staged segment keeps its confidence (riskiest-first ordering). ──
         let propose = crate::settings::AppSettings {
+            asr_model_size: crate::settings::AsrModelSize::CTC300M,
             jury_autonomy_level: crate::settings::AutonLevel::Propose,
             ..crate::settings::AppSettings::default()
         };

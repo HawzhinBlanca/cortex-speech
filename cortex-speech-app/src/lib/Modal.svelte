@@ -7,6 +7,7 @@
   let {
     open = false,
     title = '',
+    ariaLabel = '',
     description = '',
     size = 'md',
     testid = '',
@@ -16,6 +17,7 @@
   }: {
     open?: boolean;
     title?: string;
+    ariaLabel?: string;
     description?: string;
     size?: Size;
     testid?: string;
@@ -59,7 +61,7 @@
       role="dialog"
       aria-modal="true"
       data-testid={testid || undefined}
-      aria-label={title || undefined}
+      aria-label={ariaLabel || title || undefined}
       aria-describedby={description ? 'modal-desc' : undefined}
       tabindex="-1"
       use:focusTrap

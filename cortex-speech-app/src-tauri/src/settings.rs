@@ -7,7 +7,6 @@ use std::path::PathBuf;
 pub struct AppSettings {
     pub model_dir: PathBuf,
     pub output_dir: PathBuf,
-    pub asr_provider: AsrProvider,
     pub asr_model_size: AsrModelSize,
     pub vad_threshold: f32,
     pub min_segment_duration_ms: u32,
@@ -29,8 +28,9 @@ pub struct AppSettings {
     /// against roughly 6 for the champion alone. On a 34-hour corpus the difference is 47 hours of
     /// import versus about 6, with the app closed and every reviewer locked out for the duration.
     ///
-    /// Defaults to TRUE so nothing changes for anyone who has not decided otherwise; a corpus that is
-    /// reviewed clip-by-clip by humans gets nothing from auto-accept and should turn it off.
+    /// Defaults to FALSE: the fine-tuned OmniASR-7B champion is the sole normal transcription path.
+    /// Smaller engines are an explicit experiment, never background work that silently changes the
+    /// production workload or evidence mix.
     #[serde(default = "default_multi_engine_hypotheses")]
     pub multi_engine_hypotheses: bool,
     pub language: String,
@@ -89,9 +89,9 @@ pub struct AppSettings {
     pub llm_api_key_configured: bool,
     #[serde(default)]
     pub cloud_llm_opt_in: bool,
-    /// Gate for cloud speech-to-text (ElevenLabs Scribe). When on (and a Scribe key is configured),
-    /// imports transcribe the whole file via Scribe instead of the local ASR. Audio is sent to
-    /// ElevenLabs' API — off by default, like every other cloud gate.
+    /// Consent gate for explicit per-segment ElevenLabs Scribe tools. Imports never consult this
+    /// setting and always use the configured primary ASR. An explicit Scribe action sends only the
+    /// selected clip to ElevenLabs' API. Off by default.
     #[serde(default)]
     pub cloud_stt_opt_in: bool,
     /// App-owned supervision of the champion 7B WSL server (engine_runtime): the app holds the server
@@ -149,10 +149,9 @@ pub struct AppSettings {
     #[serde(default)]
     pub loop0_firing_enabled: bool,
 
-    /// Use the embedded fine-tuned MMS-CTC engine (best local Sorani quality — measured 21.0% CER
-    /// [19.93, 22.04] N=900 vs stock OmniASR 29.4%; see docs/EVAL.md) as the PRIMARY transcription engine, overriding
-    /// `asr_model_size`. Falls back to the configured engine if the fine-tuned model is absent or
-    /// errors, so transcription never breaks. Default OFF (the model is large; opt in per machine).
+    /// Optional embedded MMS-CTC engine (measured 21.0% CER [19.93, 22.04], N=900). It may act as the
+    /// primary only when a non-champion local engine is selected; it can never override WSL7B. Default
+    /// OFF. This is a separate MMS model, not the fine-tuned OmniASR-7B + LoRA champion.
     #[serde(default)]
     pub use_finetuned_asr: bool,
 
@@ -238,18 +237,7 @@ fn default_assign_speaker_from_filename() -> bool {
 }
 
 fn default_multi_engine_hypotheses() -> bool {
-    true
-}
-
-/// ASR backend identifier (OmniASR CTC via sherpa-onnx is the only engine).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub enum AsrProvider {
-    #[default]
-    #[serde(alias = "SherpaOnnxCtc")]
-    SherpaOnnxCtc,
-    /// Legacy settings value; deserialized for compatibility, not used for routing.
-    #[serde(alias = "SherpaOnnxWhisper")]
-    SherpaOnnxWhisper,
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -331,13 +319,10 @@ impl Default for AppSettings {
         Self {
             model_dir: PathBuf::from("models"),
             output_dir: PathBuf::from("exports"),
-            asr_provider: AsrProvider::default(),
-            // The fine-tuned OmniASR-7B Champion (run via the WSL GPU path) is the owner's main model,
-            // so it is the built-in default — a lost/reset settings.json still selects the 7B rather than
-            // silently reverting to the weaker base CTC-300M. The 7B client script is resolved from
-            // external_asr_script_path; NO client is bundled, so when the path is empty (and the embedded
-            // fine-tuned engine is not enabled) the import FAILS HARD with an actionable message
-            // (pipeline::wsl7b_primary_unresolved) rather than silently downgrading to stock CTC.
+            // Accuracy is the product contract: the fine-tuned OmniASR-7B + LoRA champion is the sole
+            // main/default drafter. If its WSL client is not configured or the server is unavailable,
+            // transcription fails closed with an actionable error; it never silently substitutes 300M,
+            // 1B, MMS, or a cloud engine.
             asr_model_size: AsrModelSize::WSL7B,
             vad_threshold: 0.5,
             min_segment_duration_ms: 3000,
@@ -778,10 +763,10 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn default_asr_model_is_the_forced_7b_champion() {
-        // The owner's main model is the fine-tuned OmniASR-7B Champion (WSL GPU path), so it is the
-        // built-in default — a reset/lost settings.json must not silently revert to the weaker base CTC.
-        assert_eq!(AppSettings::default().asr_model_size, AsrModelSize::WSL7B);
+    fn factory_default_is_the_finetuned_7b_champion_only() {
+        let defaults = AppSettings::default();
+        assert_eq!(defaults.asr_model_size, AsrModelSize::WSL7B);
+        assert!(!defaults.multi_engine_hypotheses, "smaller-model hypotheses must be explicit opt-in");
     }
 
     #[test]

@@ -205,5 +205,6 @@ if __name__ == "__main__":
     test_fragments_and_reduplication()
     test_human_gate_is_transcript_source()
     test_every_gate_rejects_with_a_reason()
+    test_alignment_only_review_risk_is_tolerated_but_audio_risk_is_not()
     test_end_to_end_split_dedup_bom_and_loud_failures()
     print("PASS: premium dataset builder policy")

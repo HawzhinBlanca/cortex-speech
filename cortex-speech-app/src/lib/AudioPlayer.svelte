@@ -204,7 +204,7 @@
         if (!audioEl || !playing) return;
         if (loop) {
           audioEl.currentTime = startTime;
-          attemptPlay('Loop playback failed');
+          attemptPlay($t('audio.loopFailed'));
         } else {
           audioEl.pause();
           playing = false;
@@ -232,10 +232,13 @@
     // Re-seek to the clip start when the playhead is outside the clip window. Guard on the clip being
     // bounded (endTime > startTime) rather than startTime > 0 — otherwise the FIRST chunk (startTime 0)
     // is never rewound and can't be replayed once it reaches its end.
-    if (endTime > startTime && (audioEl.currentTime < startTime || audioEl.currentTime >= endTime)) {
+    if (
+      endTime > startTime &&
+      (audioEl.currentTime < startTime || audioEl.currentTime >= endTime)
+    ) {
       audioEl.currentTime = startTime;
     }
-    attemptPlay('Playback blocked or file not found');
+    attemptPlay($t('audio.playbackFailed'));
   }
 
   function pause() {
@@ -264,7 +267,7 @@
       if (loop) {
         // Respect startTime when looping a clip.
         audioEl.currentTime = startTime > 0 ? startTime : 0;
-        attemptPlay('Loop playback failed');
+        attemptPlay($t('audio.loopFailed'));
       } else {
         audioEl.pause();
         playing = false;
@@ -287,7 +290,7 @@
 
   function handleError() {
     loading = false;
-    error = 'Failed to load audio file';
+    error = $t('audio.loadFailed');
   }
 
   function seek(e: Event) {
@@ -319,7 +322,12 @@
   }
 </script>
 
-<div class="flex items-center gap-3 p-3 card" role="toolbar" aria-label="Audio player controls">
+<div
+  class="flex flex-wrap items-center gap-2 p-3 card"
+  role="toolbar"
+  aria-label={$t('audio.controls')}
+  data-testid="audio-player-controls"
+>
   {#if loading}
     <div class="flex items-center gap-3 w-full">
       <div class="w-10 h-10 rounded-full bg-cortex-700 animate-pulse shrink-0"></div>
@@ -327,12 +335,12 @@
       <div class="w-12 h-4 bg-cortex-700 animate-pulse rounded"></div>
     </div>
   {:else if error}
-    <div class="flex items-center gap-2 text-red-300 text-xs w-full">
+    <div class="flex flex-wrap items-center gap-2 text-red-300 text-xs w-full">
       <span class="text-red-400 font-bold" aria-hidden="true">!</span>
-      <span>{error}</span>
+      <span class="min-w-0 flex-1 basis-40 break-words">{error}</span>
       <button
         type="button"
-        class="ms-auto text-xs text-cortex-400 hover:text-cortex-200"
+        class="ms-auto shrink-0 text-xs text-cortex-400 hover:text-cortex-200"
         onclick={() => {
           error = null;
           loading = true;
@@ -341,47 +349,64 @@
       >
     </div>
   {:else}
-    <button
-      type="button"
-      class="btn btn-primary !p-2 !rounded-full"
-      onclick={playing ? pause : play}
-      aria-label={playing ? 'Pause' : 'Play'}
+    <div
+      class="flex min-w-0 flex-1 basis-52 items-center gap-2"
+      data-testid="audio-player-timeline"
     >
-      {#if playing}
-        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"
-          ><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg
-        >
-      {:else}
-        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg
-        >
-      {/if}
-    </button>
+      <button
+        type="button"
+        class="btn btn-primary shrink-0 !p-2 !rounded-full"
+        onclick={playing ? pause : play}
+        aria-label={playing ? $t('audio.pause') : $t('audio.play')}
+      >
+        {#if playing}
+          <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"
+            ><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg
+          >
+        {:else}
+          <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"
+            ><path d="M8 5v14l11-7z" /></svg
+          >
+        {/if}
+      </button>
 
-    <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(clipPosition)}</span>
+      <span class="shrink-0 text-xs font-mono text-cortex-300">{fmt(clipPosition)}</span>
 
-    <input type="range" min="0" max={clipLength || 0} value={clipPosition} oninput={seek} class="flex-1" />
+      <input
+        type="range"
+        min="0"
+        max={clipLength || 0}
+        value={clipPosition}
+        oninput={seek}
+        class="min-w-0 flex-1"
+        aria-label={$t('audio.seek')}
+      />
 
-    <span class="text-xs font-mono text-cortex-300 min-w-12">{fmt(clipLength)}</span>
-    <button
-      type="button"
-      class="btn btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono min-w-10 rounded-lg hover:bg-cortex-700/50 hover:text-default transition-colors border border-cortex-700/50 shadow-sm ms-1"
-      onclick={toggleRate}
-      aria-label="Playback Speed"
-      title="Playback Speed"
-    >
-      {playbackRate}x
-    </button>
-    <button
-      type="button"
-      class="btn btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono rounded-lg hover:bg-cortex-700/50 hover:text-default transition-colors border shadow-sm ms-1 {loop
-        ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/40 hover:bg-indigo-600/40'
-        : 'border-cortex-700/50 text-cortex-300'}"
-      onclick={() => (loop = !loop)}
-      aria-label="Toggle Loop Playback"
-      title="Toggle Loop Playback"
-    >
-      Loop {loop ? 'On' : 'Off'}
-    </button>
+      <span class="shrink-0 text-xs font-mono text-cortex-300">{fmt(clipLength)}</span>
+    </div>
+
+    <div class="ms-auto flex shrink-0 items-center gap-2" data-testid="audio-player-options">
+      <button
+        type="button"
+        class="btn btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono min-w-10 rounded-lg hover:bg-cortex-700/50 hover:text-default transition-colors border border-cortex-700/50 shadow-sm"
+        onclick={toggleRate}
+        aria-label={$t('audio.playbackSpeed')}
+        title={$t('audio.playbackSpeed')}
+      >
+        {playbackRate}x
+      </button>
+      <button
+        type="button"
+        class="btn btn-secondary !p-1.5 !px-2.5 !text-[10px] font-mono rounded-lg hover:bg-cortex-700/50 hover:text-default transition-colors border shadow-sm {loop
+          ? 'bg-indigo-600/30 text-indigo-200 border-indigo-500/40 hover:bg-indigo-600/40'
+          : 'border-cortex-700/50 text-cortex-300'}"
+        onclick={() => (loop = !loop)}
+        aria-label={$t('audio.loopToggle')}
+        title={$t('audio.loopToggle')}
+      >
+        {$t(loop ? 'audio.loopOn' : 'audio.loopOff')}
+      </button>
+    </div>
   {/if}
 
   <audio
@@ -392,7 +417,7 @@
       if (loop) {
         if (audioEl) {
           audioEl.currentTime = startTime;
-          attemptPlay('Loop playback failed');
+          attemptPlay($t('audio.loopFailed'));
         }
       } else {
         playing = false;

@@ -1664,7 +1664,7 @@ mod tests {
             id: "markbad".into(),
             audio_path: wav_str.clone(),
             raw_transcript: "خراپە".into(),
-            alignment_json: Some(r#"{"start_ms":0,"end_ms":400}"#.into()),
+            alignment_json: Some(r#"{"source_start_ms":0,"source_end_ms":400}"#.into()),
             ..Default::default()
         })
         .unwrap();
@@ -1678,7 +1678,7 @@ mod tests {
             id: "clipped".into(),
             audio_path: wav_str.clone(),
             raw_transcript: "قسەیەک".into(),
-            alignment_json: Some(r#"{"start_ms":400,"end_ms":800}"#.into()),
+            alignment_json: Some(r#"{"source_start_ms":400,"source_end_ms":800}"#.into()),
             clipping_ratio: Some(0.5),
             ..Default::default()
         })

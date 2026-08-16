@@ -20,6 +20,7 @@ pub mod couch;
 pub mod crash;
 pub mod db;
 pub mod denoiser;
+pub mod dialect;
 pub mod diarization;
 pub mod diff;
 pub mod dpapi;
@@ -572,9 +573,10 @@ pub fn run() {
 
     let settings_path = data_dir.join("settings.json");
     let mut settings = AppSettings::load(&settings_path);
-    // The headless integration test (real binary in CI) has no WSL 7B server, so the default WSL7B
-    // engine would now fail hard (F2 — no silent downgrade). Force the bundled local CTC-300M engine
-    // there so import→export→validate exercises the real local pipeline. Production paths are untouched.
+    // Test-only override: a release process must never be able to downgrade the champion through an
+    // inherited environment variable. Integration binaries are debug builds and still get their
+    // explicitly requested local fixture engine.
+    #[cfg(debug_assertions)]
     if std::env::var("CORTEX_INTEGRATION_TEST").ok().as_deref() == Some("1") {
         settings.asr_model_size = crate::settings::AsrModelSize::CTC300M;
     }
@@ -630,9 +632,9 @@ pub fn run() {
         tracing::warn!("Could not create models directory: {e}");
     }
 
-    if !model_manager.all_models_present() {
-        let missing = model_manager.missing_required_model_names();
-        tracing::warn!("Essential models missing: {:?}", missing);
+    if !model_manager.all_models_present_for(&settings.asr_model_size) {
+        let missing = model_manager.missing_required_model_names_for(&settings.asr_model_size);
+        tracing::warn!("Models required by the selected ASR engine are missing: {:?}", missing);
     } else {
         tracing::info!("Required models present, warming up...");
         let warmup_start = std::time::Instant::now();
@@ -687,10 +689,10 @@ pub fn run() {
             commands::normalize_text,
             commands::align_segment,
             commands::get_segment_consensus,
-            commands::get_segments,
+            commands::get_segment,
             commands::get_segments_page,
-            commands::get_segments_suspect_first,
-            commands::search_segments,
+            commands::get_segment_ids_for_view,
+            commands::get_signal_anomaly_segments,
             commands::update_segment,
             commands::update_segment_fields,
             commands::restore_segment_snapshot,

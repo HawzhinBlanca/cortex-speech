@@ -65,6 +65,21 @@ describe('alignment helpers', () => {
     expect(parseWordTimestamps('{')).toEqual([]);
   });
 
+  it('fails closed on malformed, non-finite, or out-of-order timing data', () => {
+    expect(parseWordTimestamps('[{"word":"x","start":2,"end":1,"confidence":0.9}]')).toEqual([]);
+    expect(
+      parseWordTimestamps('[{"word":"x","start":0,"end":1,"confidence":2}]'),
+    ).toEqual([]);
+    expect(
+      parseWordTimestamps(
+        '[{"word":"a","start":1,"end":2,"confidence":0.9},{"word":"b","start":0,"end":1,"confidence":0.8}]',
+      ),
+    ).toEqual([]);
+    expect(
+      parseSourceMeta('{"source_start_ms":5000,"source_end_ms":1000,"chunk_index":2,"chunk_count":2}'),
+    ).toBeNull();
+  });
+
   it('mergeWordTimestamps preserves metadata and sets words', () => {
     const base = JSON.stringify({
       source_start_ms: 0,

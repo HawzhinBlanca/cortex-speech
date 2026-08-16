@@ -43,7 +43,9 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
   });
 
-  test('opens in Sorani RTL — a Kurdish-first app must not greet its reviewer in English', async ({ page }) => {
+  test('opens in Sorani RTL — a Kurdish-first app must not greet its reviewer in English', async ({
+    page,
+  }) => {
     await expect(page.locator('html')).toHaveAttribute('lang', 'ckb');
     await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
     await showAClip(page);
@@ -70,7 +72,9 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('ڕاستکراوەی من');
   });
 
-  test('the empty state is actually empty — `hidden` is not defeated by a display rule', async ({ page }) => {
+  test('the empty state is actually empty — `hidden` is not defeated by a display rule', async ({
+    page,
+  }) => {
     // Regression: #card sets display:flex, which beats the hidden attribute's display:none default,
     // so the empty review card rendered next to the "all reviewed" message.
     // `exhausted = true` states what this test is actually about: the TRUE empty state. Without it,
@@ -106,7 +110,10 @@ test.describe('Couch Review phone page', () => {
     // fetch is stubbed rather than routed: page.route cannot intercept a file:// page, and the point
     // here is the PAGE's behaviour when the network fails, not the server's.
     await page.addInitScript(() => {
-      (window as unknown as { __net: { fail: boolean; calls: string[] } }).__net = { fail: false, calls: [] };
+      (window as unknown as { __net: { fail: boolean; calls: string[] } }).__net = {
+        fail: false,
+        calls: [],
+      };
       window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const net = (window as unknown as { __net: { fail: boolean; calls: string[] } }).__net;
         const url = String(input);
@@ -114,7 +121,10 @@ test.describe('Couch Review phone page', () => {
         // A dropped request is a TypeError from fetch — no status — which is exactly how the page
         // tells "never arrived" (retry) from "the server refused" (do not retry).
         if (net.fail) throw new TypeError('Failed to fetch');
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -125,7 +135,9 @@ test.describe('Couch Review phone page', () => {
     await page.locator('#accept').click();
 
     // Their decision is HELD, not lost — and they are moved on rather than stranded on a dead clip.
-    const queued = await page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`);
+    const queued = await page.evaluate(
+      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
+    );
     expect(queued).toHaveLength(1);
     expect((queued as Array<{ id: string }>)[0].id).toBe('s1');
     await expect(page.locator('#text')).toHaveValue('دەقی دووەم', { timeout: 5000 });
@@ -134,9 +146,13 @@ test.describe('Couch Review phone page', () => {
     // identical re-submit as already-recorded (couch.rs is_repeat_of_stored_decision).
     await page.evaluate(`window.__net.fail = false`);
     await page.reload();
-    await page.waitForFunction(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length === 0`, null, {
-      timeout: 5000,
-    });
+    await page.waitForFunction(
+      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length === 0`,
+      null,
+      {
+        timeout: 5000,
+      },
+    );
     const calls = (await page.evaluate(`window.__net.calls`)) as string[];
     expect(calls.some((c) => c.includes('/api/decision') && c.includes('s1'))).toBe(true);
   });
@@ -147,19 +163,27 @@ test.describe('Couch Review phone page', () => {
     // later decision would be stuck behind it.
     await page.addInitScript(() => {
       window.fetch = async (input: RequestInfo | URL) => {
-        if (String(input).includes('/api/decision')) return new Response('another reviewer', { status: 409 });
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        if (String(input).includes('/api/decision'))
+          return new Response('another reviewer', { status: 409 });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
     await showAClip(page);
     await page.locator('#accept').click();
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(0);
   });
 
-  test('draining a batch fetches the next one instead of claiming the corpus is finished', async ({ page }) => {
+  test('draining a batch fetches the next one instead of claiming the corpus is finished', async ({
+    page,
+  }) => {
     // THE THROUGHPUT LIE. The server hands out at most QUEUE_BATCH (25) clips per fetch and says
     // nothing about the backlog behind them, but the page called load() in exactly two places — on
     // open and after an undo — so when the local array ran out it went straight to
@@ -185,7 +209,10 @@ test.describe('Couch Review phone page', () => {
             headers: { 'content-type': 'application/json' },
           });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -208,7 +235,9 @@ test.describe('Couch Review phone page', () => {
     expect(await page.evaluate(`window.__q.fetches`)).toBe(3);
   });
 
-  test('a refused replay keeps the typed correction and says so, instead of deleting it in silence', async ({ page }) => {
+  test('a refused replay keeps the typed correction and says so, instead of deleting it in silence', async ({
+    page,
+  }) => {
     // THE QUIETEST DATA LOSS IN THE SYSTEM. Offline, the page queued the decision and toasted
     // "Saved". Back online, the server answered 409 (someone else got the clip, or the owner decided
     // it at the desktop) — and the page deleted BOTH the queued decision and the reviewer's typed
@@ -234,7 +263,10 @@ test.describe('Couch Review phone page', () => {
           if (net.offline) throw new TypeError('Failed to fetch');
           return new Response('already reviewed by Hemn', { status: 409 });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -244,9 +276,13 @@ test.describe('Couch Review phone page', () => {
     await page.locator('#text').fill('ڕاستکراوەی سارا');
     await page.locator('#save').click();
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(1);
-    await expect(page.locator('#toast')).toHaveText('لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت');
+    await expect(page.locator('#toast')).toHaveText(
+      'لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت',
+    );
     const queued = (await page.evaluate(
       `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')[0]`,
     )) as { reviewer?: string; text: string };
@@ -257,16 +293,22 @@ test.describe('Couch Review phone page', () => {
     // addInitScript re-runs on every navigation and would reset __net.offline back to true.
     await page.evaluate(`window.__net.offline = false; dispatchEvent(new Event('online'))`);
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(0);
 
     // The decision is dropped — correct — but the WORK is kept and the reviewer is told.
-    expect(await page.evaluate(`localStorage.getItem('cortex.couch.draft.x1')`)).toBe('ڕاستکراوەی سارا');
+    expect(await page.evaluate(`sessionStorage.getItem('cortex.couch.draft.x1')`)).toBe(
+      'ڕاستکراوەی سارا',
+    );
     await expect(page.locator('#err')).toBeVisible();
     await expect(page.locator('#err')).toContainText('1');
   });
 
-  test('a decision queued by one reviewer is never flushed under another reviewer name', async ({ page }) => {
+  test('a decision queued by one reviewer is never flushed under another reviewer name', async ({
+    page,
+  }) => {
     // localStorage is per-ORIGIN, not per-reviewer. Two people sharing a phone, or one person opening
     // a colleague's link, share one outbox — so an unstamped decision flushed under whoever's cookie
     // is current would record Sara's judgement of a clip as Hemn's, permanently and invisibly.
@@ -276,7 +318,10 @@ test.describe('Couch Review phone page', () => {
         const url = String(input);
         if (url.includes('/api/decision')) {
           (window as unknown as { __sent: string[] }).__sent.push(String(init?.body ?? ''));
-          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+          return new Response('{"ok":true}', {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
         }
         if (url.includes('/api/queue')) {
           return new Response(JSON.stringify({ reviewer: 'Hemn', items: [], heldByOthers: 0 }), {
@@ -284,7 +329,10 @@ test.describe('Couch Review phone page', () => {
             headers: { 'content-type': 'application/json' },
           });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -311,7 +359,9 @@ test.describe('Couch Review phone page', () => {
     expect(left.map((q) => q.id)).toEqual(['sara1']);
   });
 
-  test('the drained state is honest: undo reachable, audio stopped, count not off by one', async ({ page }) => {
+  test('the drained state is honest: undo reachable, audio stopped, count not off by one', async ({
+    page,
+  }) => {
     // Four separate defects that all only appear once the batch runs out — the moment the reviewer is
     // least likely to be watching closely, and most likely to close the page.
     await page.addInitScript(() => {
@@ -328,7 +378,10 @@ test.describe('Couch Review phone page', () => {
             headers: { 'content-type': 'application/json' },
           });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -345,7 +398,9 @@ test.describe('Couch Review phone page', () => {
     // The <audio> element must not still be playing behind the empty state.
     expect(await page.evaluate(`document.getElementById('player').paused`)).toBe(true);
     // And the progress counter must not have run past the end of the batch.
-    expect(await page.evaluate(`document.getElementById('progress').textContent`)).not.toContain('2');
+    expect(await page.evaluate(`document.getElementById('progress').textContent`)).not.toContain(
+      '2',
+    );
   });
 
   test('"all reviewed" is never shown while decisions are still unsent', async ({ page }) => {
@@ -367,7 +422,10 @@ test.describe('Couch Review phone page', () => {
           });
         }
         if (url.includes('/api/decision')) throw new TypeError('Failed to fetch'); // offline
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -379,7 +437,9 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#done')).toContainText('نەنێردراون'); // "have not been sent"
   });
 
-  test('a clip whose audio will not load offers a skip instead of forcing a false verdict', async ({ page }) => {
+  test('a clip whose audio will not load offers a skip instead of forcing a false verdict', async ({
+    page,
+  }) => {
     // The trap: audio 500s (file moved off disk), #player has no error handler, loadWave swallows the
     // body, and show() hides #warn on every clip — so the reviewer saw a normal card with a dead
     // player and no explanation. The queue only advances on a DECISION, so the two ways out both
@@ -405,7 +465,10 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/decision')) {
           (window as unknown as { __sent: string[] }).__sent.push(String(init?.body ?? ''));
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -457,7 +520,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -492,10 +558,16 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        if (url.includes('/api/decision') && (window as unknown as { __throttle: boolean }).__throttle) {
+        if (
+          url.includes('/api/decision') &&
+          (window as unknown as { __throttle: boolean }).__throttle
+        ) {
           return new Response('rate limit exceeded', { status: 429 });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -504,23 +576,31 @@ test.describe('Couch Review phone page', () => {
     await page.locator('#accept').click();
     // HELD in the outbox, and the reviewer is moved on rather than stranded re-submitting.
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(1);
     await expect(page.locator('#text')).toHaveValue('دووەم');
     // Not reported as saved — it is queued, which is the truth.
-    await expect(page.locator('#toast')).toHaveText('لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت');
+    await expect(page.locator('#toast')).toHaveText(
+      'لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت',
+    );
     // And NOT counted as a refused decision: throttling is not a verdict.
     expect(await page.evaluate(`localStorage.getItem('cortex.couch.refused')`)).toBeNull();
 
     // The limiter refills; the held decision lands on the next flush.
     await page.evaluate(`window.__throttle = false; dispatchEvent(new Event('online'))`);
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(0);
     await expect(page.locator('#err')).toBeHidden();
   });
 
-  test('the refused-decisions banner is retracted once that clip is re-reviewed', async ({ page }) => {
+  test('the refused-decisions banner is retracted once that clip is re-reviewed', async ({
+    page,
+  }) => {
     // The banner had no way down. noteRefused only ever appended, so one 409 pinned it for the life of
     // the browser profile — still insisting work had failed after the reviewer went back and redid it.
     // That is the same lie the banner exists to prevent, aimed the other way.
@@ -541,9 +621,15 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/decision')) {
           return (window as unknown as { __refuse: boolean }).__refuse
             ? new Response('already reviewed by Hemn', { status: 409 })
-            : new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+            : new Response('{"ok":true}', {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+              });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -583,7 +669,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -633,9 +722,15 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/decision')) {
           if (w.__throttle) return new Response('rate limit exceeded', { status: 429 });
           w.__sent.push(String(init?.body ?? ''));
-          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+          return new Response('{"ok":true}', {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -643,7 +738,9 @@ test.describe('Couch Review phone page', () => {
 
     await page.locator('#accept').click();
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(1);
 
     // The throttle clears. NOTHING else happens: no reload, no online event, no batch drain.
@@ -651,7 +748,9 @@ test.describe('Couch Review phone page', () => {
     await page.clock.runFor(31_000);
 
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(0);
     const sent = (await page.evaluate(`window.__sent`)) as string[];
     expect(sent.join(' ')).toContain('k1');
@@ -676,9 +775,15 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/decision')) {
           (window as unknown as { __posts: string[] }).__posts.push(String(init?.body ?? ''));
           await new Promise((r) => setTimeout(r, 300)); // slow enough for a second trigger to land
-          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+          return new Response('{"ok":true}', {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -694,7 +799,9 @@ test.describe('Couch Review phone page', () => {
       void load();
     `);
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(0);
 
     const posts = (await page.evaluate(`window.__posts`)) as string[];
@@ -702,7 +809,9 @@ test.describe('Couch Review phone page', () => {
     expect(forX9).toHaveLength(1);
   });
 
-  test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({ page }) => {
+  test('an expired link KEEPS queued work and says so, instead of discarding it silently', async ({
+    page,
+  }) => {
     // DATA LOSS, and made MORE reachable by fixing Stop/Start: every outstanding token is regenerated
     // when the owner restarts Couch Review or reissues a link. A reviewer who was offline then
     // reconnects to a 401 — and the outbox used to treat ANY status as "the server gave a real
@@ -729,7 +838,9 @@ test.describe('Couch Review phone page', () => {
     await page.evaluate(`localStorage.setItem('__netmode', 'offline')`);
     await page.locator('#accept').click();
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(1);
 
     // Back online, but the owner restarted the server meanwhile — the token is dead.
@@ -755,7 +866,8 @@ test.describe('Couch Review phone page', () => {
     // (accept / reject / edit) was never recorded anywhere and was simply gone.
     await page.addInitScript(() => {
       window.fetch = async (input: RequestInfo | URL) => {
-        if (String(input).includes('/api/decision')) return new Response('unauthorized', { status: 401 });
+        if (String(input).includes('/api/decision'))
+          return new Response('unauthorized', { status: 401 });
         return new Response('{"ok":true,"items":[],"reviewer":"Sara"}', {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -768,7 +880,9 @@ test.describe('Couch Review phone page', () => {
 
     // The verdict is held for the next working link...
     await expect
-      .poll(async () => page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`))
+      .poll(async () =>
+        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
+      )
       .toBe(1);
     const held = (await page.evaluate(
       `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
@@ -782,7 +896,9 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('دەقی دووەم');
   });
 
-  test('coming back to the page renews the lease immediately, not four minutes later', async ({ page }) => {
+  test('coming back to the page renews the lease immediately, not four minutes later', async ({
+    page,
+  }) => {
     // Renewal ticks are skipped while the page is hidden, deliberately: a reviewer who wanders off
     // should release their clips. But on a phone, backgrounding is constant — a call, a notification,
     // the screen locking — and the tick is every 4 minutes against a 15-minute lease. Someone who
@@ -843,7 +959,9 @@ test.describe('Couch Review phone page', () => {
 
     expect(urls.length).toBeGreaterThan(0);
     for (const u of urls) {
-      expect(u, 'a tokenless page must not send an empty t= — it shadows the cookie').not.toMatch(/[?&]t=(&|$)/);
+      expect(u, 'a tokenless page must not send an empty t= — it shadows the cookie').not.toMatch(
+        /[?&]t=(&|$)/,
+      );
     }
   });
 
@@ -861,7 +979,10 @@ test.describe('Couch Review phone page', () => {
         const up = (window as unknown as { __up: boolean }).__up;
         if (url.includes('/api/claim')) {
           if (!up) throw new TypeError('Failed to fetch'); // transient network failure, NOT a verdict
-          return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+          return new Response('{"ok":true}', {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
         }
         if (url.includes('/api/queue')) {
           if (!up) return new Response('unauthorized', { status: 401 }); // no cookie was ever minted
@@ -874,7 +995,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE + '#t=valid-token-99');
@@ -894,13 +1018,18 @@ test.describe('Couch Review phone page', () => {
     // A genuinely revoked token must still be a real verdict: 401 from the claim itself = expired.
   });
 
-  test('a genuinely refused claim still shows link-expired, with no retry offered', async ({ page }) => {
+  test('a genuinely refused claim still shows link-expired, with no retry offered', async ({
+    page,
+  }) => {
     await page.addInitScript(() => {
       window.fetch = async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.includes('/api/claim')) return new Response('unauthorized', { status: 401 }); // real verdict
         if (url.includes('/api/queue')) return new Response('unauthorized', { status: 401 });
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE + '#t=revoked-token');
@@ -910,7 +1039,9 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#retry')).toBeHidden(); // retrying a verdict would be a lie
   });
 
-  test('a fragment token is claimed by POST and stripped, never sent in any request URL', async ({ page }) => {
+  test('a fragment token is claimed by POST and stripped, never sent in any request URL', async ({
+    page,
+  }) => {
     // Phase 2 (docs/REMOTE_PUBLIC_LINKS_PLAN.md): links now carry #t=. A fragment never leaves the
     // browser, so a chat app's preview bot fetching the pasted link gets the empty shell — the page
     // must present the token exactly once, in a POST body, and then remove it from the address bar.
@@ -931,9 +1062,13 @@ test.describe('Couch Review phone page', () => {
     // boot script would not re-run — reload makes it a real load with the fragment present.
     await page.goto(PAGE + '#t=frag-secret-42');
     await page.reload();
-    await page.waitForFunction(`(window.__reqs || []).some((r) => r.url.includes('/api/claim'))`, null, {
-      timeout: 5000,
-    });
+    await page.waitForFunction(
+      `(window.__reqs || []).some((r) => r.url.includes('/api/claim'))`,
+      null,
+      {
+        timeout: 5000,
+      },
+    );
     const reqs = (await page.evaluate(`window.__reqs`)) as Array<{ url: string; body: string }>;
 
     const claim = reqs.find((r) => r.url.includes('/api/claim'));
@@ -975,7 +1110,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -989,7 +1127,9 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#progress')).toContainText('407');
   });
 
-  test('a server that sends no total still counts honestly, against the batch', async ({ page }) => {
+  test('a server that sends no total still counts honestly, against the batch', async ({
+    page,
+  }) => {
     // Belt and braces on the same change: the page is served out of the binary, so page and server
     // always ship together — but a missing/zero total must degrade to the old batch counting rather
     // than render "Clip 1 of 0".
@@ -1006,7 +1146,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -1014,7 +1157,9 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1');
   });
 
-  test('the Retry button shows it is working, and a double tap costs one fetch', async ({ page }) => {
+  test('the Retry button shows it is working, and a double tap costs one fetch', async ({
+    page,
+  }) => {
     // A reviewer on bad signal taps Retry and NOTHING changes on screen — the failure message stays,
     // the button looks identical — so they cannot tell a working retry from a dead button, and tap
     // again. Each tap must be visibly acknowledged, and the extra taps must not multiply requests.
@@ -1045,7 +1190,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -1069,7 +1217,9 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#retry')).toContainText('دووبارە');
   });
 
-  test('deciding a clip starts the next one, so a session is one tap per clip', async ({ page }) => {
+  test('deciding a clip starts the next one, so a session is one tap per clip', async ({
+    page,
+  }) => {
     // TWO TAPS PER CLIP, a hundred times a session: decide, then reach for the player's small native
     // play control. Deciding a clip IS the reviewer saying "next", so the next clip should just start.
     // Not inside a user gesture (decide() awaits a POST first) — it works because the element is
@@ -1101,7 +1251,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -1142,7 +1295,10 @@ test.describe('Couch Review phone page', () => {
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -1195,7 +1351,8 @@ test.describe('Couch Review phone page', () => {
     // and the "Saved" toast — sitting underneath it. They typed the correction and could not see the
     // button that commits it. The page now tracks the covered height in `--kb`.
     await showAClip(page);
-    const kb = () => page.evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--kb').trim()`);
+    const kb = () =>
+      page.evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--kb').trim()`);
     // Nothing covered yet: no phantom padding from ordinary browser chrome.
     expect(['', '0px']).toContain(await kb());
 
@@ -1219,10 +1376,13 @@ test.describe('Couch Review phone page', () => {
     const visibleBottom = await page.evaluate(`window.innerHeight - 320`);
     for (const id of ['save', 'accept', 'bad']) {
       await expect
-        .poll(async () => {
-          const box = await page.locator(`#${id}`).boundingBox();
-          return box ? box.y + box.height : Number.POSITIVE_INFINITY;
-        }, { message: `#${id} must clear the keyboard`, timeout: 5000 })
+        .poll(
+          async () => {
+            const box = await page.locator(`#${id}`).boundingBox();
+            return box ? box.y + box.height : Number.POSITIVE_INFINITY;
+          },
+          { message: `#${id} must clear the keyboard`, timeout: 5000 },
+        )
         .toBeLessThanOrEqual(visibleBottom);
     }
     // Retracting the keyboard puts the padding back, rather than leaving a permanent gap.
@@ -1267,7 +1427,10 @@ test.describe('Couch Review phone page', () => {
         if (String(input).includes('/api/queue')) {
           return new Response('another reviewer is working on this clip', { status: 409 });
         }
-        return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       };
     });
     await page.goto(PAGE);
@@ -1277,7 +1440,9 @@ test.describe('Couch Review phone page', () => {
     expect(text).not.toMatch(/[a-z]{4,}/i); // ...with no English word in it
   });
 
-  test('tapping the refused banner goes to a refused clip, or honestly does nothing', async ({ page }) => {
+  test('tapping the refused banner goes to a refused clip, or honestly does nothing', async ({
+    page,
+  }) => {
     // The banner says "find those clips and review them again" and gave the reviewer no way to find
     // them — ids they were never shown, in a queue they must scan by eye on a phone.
     await showAClip(page);
@@ -1323,7 +1488,9 @@ test.describe('Couch Review phone page', () => {
     expect(await page.locator('#err').getAttribute('role')).toBe('alert');
   });
 
-  test('the swipe shows what it is about to do, and snaps back when it will not', async ({ page }) => {
+  test('the swipe shows what it is about to do, and snaps back when it will not', async ({
+    page,
+  }) => {
     // The gesture worked and was invisible: nothing moved while the finger moved, so a reviewer whose
     // thumb happened to travel 90 px cast a verdict with no warning, and one who wanted to use the
     // gesture had no way to discover it or to see that they had crossed the threshold.
@@ -1400,7 +1567,9 @@ test.describe('Couch Review phone page', () => {
       const results = await new AxeBuilder({ page }).withTags(WCAG_AA).analyze();
       for (const v of results.violations) {
         for (const n of v.nodes) {
-          console.log(`[axe:${scheme}] ${v.id}: ${n.target.join(' ')} — ${n.failureSummary?.split('\n')[1] ?? ''}`);
+          console.log(
+            `[axe:${scheme}] ${v.id}: ${n.target.join(' ')} — ${n.failureSummary?.split('\n')[1] ?? ''}`,
+          );
         }
       }
       expect(results.violations.map((v) => `${v.id} x${v.nodes.length}`)).toEqual([]);

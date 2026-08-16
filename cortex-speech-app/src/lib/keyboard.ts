@@ -4,6 +4,8 @@ export interface Shortcut {
   shift?: boolean;
   alt?: boolean;
   description: string;
+  /** Optional i18n key used by visible shortcut surfaces; description remains a safe fallback. */
+  descriptionKey?: string;
   action: () => void;
   category: string;
   /**
@@ -128,7 +130,6 @@ export class KeyboardManager {
   getAll(): Shortcut[] {
     return [...this.shortcuts];
   }
-
 
   destroy() {
     if (typeof window !== 'undefined') {

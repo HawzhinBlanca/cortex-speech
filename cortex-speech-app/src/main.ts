@@ -59,30 +59,32 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     });
     return JSON.stringify({ words });
   };
-  const sampleSegments = () =>
-    SAMPLE.map(([text, conf, spk, ver, dur], i) => ({
-      id: `seg_${String(i + 1).padStart(3, '0')}`,
-      createdAt: `2026-06-1${i % 9}T0${i % 8}:12:00Z`,
-      audioPath: `fixtures/clip_${i + 1}.wav`,
-      rawTranscript: text,
-      normalizedTranscript: text,
-      annotatedTranscript: ver ? text : null,
-      alignmentJson: makeAlignment(text, dur, conf),
-      durationMs: dur,
-      speakerId: spk,
-      verified: ver,
-      confidence: conf,
-      ctcScore: conf - 0.05,
-      clippingRatio: i === 5 ? 0.08 : 0.0,
-      rmsDb: -18 - i,
-      snrDb: i === 5 ? 6.2 : 22 - i,
-      split: i % 4 === 0 ? 'test' : 'train',
-      signalAnomalyScore: null,
-      verdict: conf < 0.7 ? 'escalate' : 'accept',
-      escalated: conf < 0.7,
-      isGold: i === 0,
-      alignmentQuality: ver ? 'ctc_forced' : null,
-    }));
+  let demoSegments = SAMPLE.map(([text, conf, spk, ver, dur], i) => ({
+    id: `seg_${String(i + 1).padStart(3, '0')}`,
+    createdAt: `2026-06-1${i % 9}T0${i % 8}:12:00Z`,
+    audioPath: `fixtures/clip_${i + 1}.wav`,
+    rawTranscript: text,
+    normalizedTranscript: text,
+    annotatedTranscript: ver ? text : null,
+    alignmentJson: makeAlignment(text, dur, conf),
+    durationMs: dur,
+    speakerId: spk,
+    verified: ver,
+    confidence: conf,
+    ctcScore: conf - 0.05,
+    clippingRatio: i === 5 ? 0.08 : 0.0,
+    rmsDb: -18 - i,
+    snrDb: i === 5 ? 6.2 : 22 - i,
+    split: i % 4 === 0 ? 'test' : 'train',
+    signalAnomalyScore: null,
+    verdict: conf < 0.7 ? 'escalate' : 'accept',
+    escalated: conf < 0.7,
+    isGold: i === 0,
+    alignmentQuality: ver ? 'ctc_forced' : null,
+  }));
+  // Return detached rows just like IPC serialization does. The backing collection remains mutable so
+  // review decisions survive subsequent reads during a browser-preview session.
+  const sampleSegments = () => demoSegments.map((segment) => ({ ...segment }));
   const sampleStats = () => {
     const segs = sampleSegments();
     const totalSec = segs.reduce((a, s) => a + s.durationMs / 1000, 0);
@@ -113,15 +115,42 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     });
 
   const mockInvoke = async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+    // Tauri's event API expects the listener id back and calls the plugin-internal unregister hook on
+    // teardown. Mirroring that tiny lifecycle contract keeps Vite HMR/reloads from leaking callbacks or
+    // throwing while the app is already handling another update.
+    if (cmd === 'plugin:event|listen') return args?.handler ?? 0;
     if (cmd.startsWith('plugin:')) return null;
-    if (cmd === 'get_segments') return sampleSegments();
-    // The library actually reads through get_segments_PAGE; the mock only ever answered the
-    // unpaginated sibling, so this command fell through to the object catch-all below and returned
-    // `{}`. That used to render as a silently EMPTY library in dev preview, and once the read guards
-    // started throwing on a malformed payload it became a hard failure instead. Answer the real shape.
     if (cmd === 'get_segments_page') {
-      const items = sampleSegments();
+      const q = String(args?.query ?? '')
+        .trim()
+        .toLowerCase();
+      const verified = typeof args?.verified === 'boolean' ? args.verified : null;
+      const items = sampleSegments().filter(
+        (s) =>
+          (verified === null || s.verified === verified) &&
+          (!q ||
+            s.rawTranscript.toLowerCase().includes(q) ||
+            s.audioPath.toLowerCase().includes(q) ||
+            (s.speakerId ?? '').toLowerCase().includes(q)),
+      );
       return { items, total: items.length, nextCursor: null };
+    }
+    if (cmd === 'get_segment') {
+      const id = String(args?.segmentId ?? '');
+      const segment = sampleSegments().find((item) => item.id === id);
+      if (!segment) throw new Error(`Segment '${id}' no longer exists`);
+      return segment;
+    }
+    if (cmd === 'update_segment_fields') {
+      const id = String(args?.segmentId ?? '');
+      const fields = args?.fields;
+      if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
+        throw new Error('update_segment_fields requires an object fields payload');
+      }
+      const index = demoSegments.findIndex((segment) => segment.id === id);
+      if (index < 0) return false;
+      demoSegments[index] = { ...demoSegments[index], ...fields };
+      return true;
     }
     // Same class: the readiness verdict and the accuracy card call these, and `{}` / `null` from the
     // catch-alls crashed the Insights panel on `.summary`. Mock the real shapes so dev preview shows
@@ -150,15 +179,6 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       return sampleStats();
     if (cmd === 'count_segments' || cmd === 'get_segment_count') return SAMPLE.length;
     if (cmd === 'get_speakers') return ['SPEAKER_00', 'SPEAKER_01', 'SPEAKER_02'];
-    if (cmd === 'search_segments') {
-      const q = String(args?.query ?? '').toLowerCase();
-      return sampleSegments().filter(
-        (s) =>
-          s.rawTranscript.toLowerCase().includes(q) ||
-          s.audioPath.toLowerCase().includes(q) ||
-          (s.speakerId ?? '').toLowerCase().includes(q),
-      );
-    }
     if (cmd === 'validate_dataset_cmd') {
       const segs = sampleSegments();
       const warnings = segs
@@ -206,6 +226,18 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     metadata: {
       currentWindow: { label: 'main' },
       currentWebview: { windowLabel: 'main', label: 'main' },
+    },
+  };
+  (
+    window as unknown as Record<
+      string,
+      { unregisterListener?: (_event: string, id: number) => void }
+    >
+  ).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+    unregisterListener: (_event, id) => {
+      const callbacks = (window as unknown as { __TAURI_CB__?: Record<number, unknown> })
+        .__TAURI_CB__;
+      if (callbacks) delete callbacks[id];
     },
   };
   // eslint-disable-next-line no-console

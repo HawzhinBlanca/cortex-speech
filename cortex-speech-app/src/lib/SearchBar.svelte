@@ -1,8 +1,12 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import * as api from './commands';
-  import { notifications } from './stores/notificationStore';
-  import { searchQuery, searchResults, filterVerified, sortOrder } from './stores/segmentStore';
+  import {
+    searchQuery,
+    searchResults,
+    filterVerified,
+    sortOrder,
+    segments,
+  } from './stores/segmentStore';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
 
@@ -27,28 +31,14 @@
   // after the component is gone (e.g. sidebar closed within the 250ms debounce).
   onDestroy(() => clearTimeout(debounceTimer));
 
-  async function fetchSearchResults(trimmed: string, gen: number) {
-    if (!trimmed) {
-      searchResults.set(null);
-      loading = false;
-      return;
-    }
-
+  async function reloadView(gen: number) {
     loading = true;
     if (!tauriAvailable) {
-      searchResults.set(null);
       loading = false;
       return;
     }
-
     try {
-      const results = await api.searchSegments(trimmed);
-      if (gen !== searchGeneration) return;
-      searchResults.set(results);
-    } catch (e) {
-      if (gen !== searchGeneration) return;
-      searchResults.set(null);
-      notifications.error($t('searchFailed'), { detail: String(e) });
+      await segments.load();
     } finally {
       if (gen === searchGeneration) loading = false;
     }
@@ -61,12 +51,8 @@
       searchQuery.set(trimmed);
       lastPushed = trimmed;
       const gen = ++searchGeneration;
-      if (!trimmed) {
-        searchResults.set(null);
-        loading = false;
-        return;
-      }
-      fetchSearchResults(trimmed, gen);
+      searchResults.set(null);
+      void reloadView(gen);
     }, 250);
   }
 
@@ -77,11 +63,19 @@
     searchQuery.set('');
     lastPushed = '';
     searchResults.set(null);
-    loading = false;
+    void reloadView(searchGeneration);
   }
 
   function setVerified(value: boolean | null) {
     filterVerified.set(value);
+    void reloadView(++searchGeneration);
+  }
+
+  function setSort(value: string) {
+    sortOrder.set(
+      value as 'newest' | 'oldest' | 'duration' | 'verified' | 'confidence' | 'activeLearning',
+    );
+    void reloadView(++searchGeneration);
   }
 </script>
 
@@ -157,16 +151,7 @@
         class="text-xs bg-cortex-800 border border-cortex-700 rounded px-2 py-1 text-cortex-300"
         aria-label={$t('sortBy')}
         value={$sortOrder}
-        oninput={(e) =>
-          sortOrder.set(
-            (e.target as HTMLSelectElement).value as
-              | 'newest'
-              | 'oldest'
-              | 'duration'
-              | 'verified'
-              | 'confidence'
-              | 'activeLearning',
-          )}
+        oninput={(e) => setSort((e.target as HTMLSelectElement).value)}
       >
         <option value="newest">{$t('sortNewest')}</option>
         <option value="oldest">{$t('sortOldest')}</option>

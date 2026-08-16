@@ -56,7 +56,11 @@
   );
 </script>
 
-<div class="flex items-center gap-1.5 text-[11px]" data-testid="engine-status" title={$t('engine.tooltip')}>
+<div
+  class="flex items-center gap-1.5 text-[11px]"
+  data-testid="engine-status"
+  title={$t('engine.tooltip')}
+>
   <span class="inline-block w-2 h-2 rounded-full {dot}" aria-hidden="true"></span>
   <span class="text-cortex-300">{$t(`engine.${state}`)}</span>
   {#if state === 'offline'}

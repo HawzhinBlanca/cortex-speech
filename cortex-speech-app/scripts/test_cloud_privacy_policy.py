@@ -33,12 +33,7 @@ CONSENT_MARKERS = ("require_cloud_stt_consent", "cloud_stt_opt_in")
 _FN_RE = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(")
 
 
-def _strip_comments(text: str) -> str:
-    """Drop `/* */` block comments AND `//` line comments so a COMMENTED-OUT consent gate (or a marker
-    mentioned only in prose) never counts as enforcement. Over-stripping on a stray `*/`/`//` inside a
-    string literal only makes the marker/caller scan STRICTER — it fails closed, never open."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)  # block comments (non-nested — the norm here)
-    return "\n".join(line.split("//", 1)[0] for line in text.splitlines())  # line comments
+from _policy_util import strip_comments as _strip_comments  # noqa: E402
 
 
 def _parse_functions(text: str) -> tuple[dict[str, str], set[str]]:
@@ -205,9 +200,11 @@ def test_cloud_stt_scribe_egress_requires_opt_in() -> None:
             "(directly or via a helper) uploads audio to ElevenLabs must enforce require_cloud_stt_consent / "
             "cloud_stt_opt_in before the egress — audio must never leave the device without opt-in."
         )
-    # The import path gates the key itself behind the same opt-in (defense in depth).
-    assert_contains(pipeline, "fn scribe_api_key_if_enabled", PIPELINE_RS.name)
-    assert_contains(pipeline, "if !self.settings.cloud_stt_opt_in", PIPELINE_RS.name)
+    # Scribe is no longer an import path at all: cloud STT remains an explicit per-segment command
+    # surface covered by the inventory above. Reintroducing an import helper would let an optional
+    # provider replace the champion for a whole file.
+    if "fn scribe_api_key_if_enabled" in pipeline or "import_single_file_via_scribe" in pipeline:
+        raise AssertionError("pipeline.rs reintroduced automatic Scribe import routing")
 
 
 def test_scribe_egress_surface_is_only_transcribe_fns() -> None:

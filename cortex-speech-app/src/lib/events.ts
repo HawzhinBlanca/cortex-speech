@@ -135,7 +135,10 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
     const keys = batchOps[payload.operation];
     if ((payload.failed ?? 0) > 0) {
       notifications.warning(
-        tr(keys.partial, { ok: String(payload.succeeded ?? 0), failed: String(payload.failed ?? 0) }),
+        tr(keys.partial, {
+          ok: String(payload.succeeded ?? 0),
+          failed: String(payload.failed ?? 0),
+        }),
       );
     } else if ((payload.succeeded ?? 0) > 0) {
       notifications.success(tr(keys.success, { n: String(payload.succeeded) }));

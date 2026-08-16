@@ -156,7 +156,8 @@ pub fn revoke_couch_reviewer(reviewer: String) -> Result<crate::couch::CouchStat
 
 /// Stop Couch Review and invalidate every reviewer's session token.
 #[tauri::command]
-pub fn stop_couch_review() -> Result<crate::couch::CouchStatus, String> {
+pub fn stop_couch_review(state: State<'_, AppState>) -> Result<crate::couch::CouchStatus, String> {
     STRICT_RATE_LIMITER.check("stop_couch_review")?;
-    crate::couch::stop()
+    let data_dir = state.lock_data_dir().clone();
+    crate::couch::stop_with_data_dir(data_dir.as_deref())
 }

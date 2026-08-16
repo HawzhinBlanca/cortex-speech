@@ -1,16 +1,29 @@
 use crate::settings::AsrModelSize;
 use sherpa_onnx::{OfflineOmnilingualAsrCtcModelConfig, OfflineRecognizer, OfflineRecognizerConfig};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{mpsc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 const SAMPLE_RATE: u32 = 16000;
 const CHUNK_SAMPLES: usize = 30 * SAMPLE_RATE as usize;
 const CTC_300M_MIN_MODEL_BYTES: u64 = 50_000_000;
 const CTC_1B_MIN_MODEL_BYTES: u64 = 500_000_000;
 const CTC_MIN_TOKEN_BYTES: u64 = 100;
+const WORKER_ARG: &str = "--cortex-asr-worker";
+const SUPERVISOR_SELF_TEST_ARG: &str = "--cortex-asr-supervisor-self-test";
+const WORKER_MESSAGE_PREFIX: &str = "CORTEX_ASR/1 ";
+const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
+const WORKER_REQUEST_MIN_TIMEOUT: Duration = Duration::from_secs(180);
+const WORKER_REQUEST_MAX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const WORKER_MAX_SAMPLES: usize = 10 * 60 * SAMPLE_RATE as usize;
+const WORKER_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+const WORKER_CIRCUIT_FAILURES: u32 = 3;
+const WORKER_CIRCUIT_OPEN: Duration = Duration::from_secs(30);
 
 /// Runtime options passed when loading the pooled ASR service.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AsrLoadConfig {
     pub model_size: AsrModelSize,
     pub enable_gpu: bool,
@@ -87,27 +100,10 @@ pub fn omniasr_model_present(model_dir: &Path, size: &AsrModelSize) -> bool {
     file_meets_min_size(&model_path, min_model_bytes) && file_meets_min_size(&tokens_path, CTC_MIN_TOKEN_BYTES)
 }
 
-pub fn select_available_model_size(model_dir: &Path, requested: &AsrModelSize) -> AsrModelSize {
-    if *requested == AsrModelSize::WSL7B || omniasr_model_present(model_dir, requested) {
-        return requested.clone();
-    }
-
-    let fallback = match requested {
-        AsrModelSize::CTC1B => AsrModelSize::CTC300M,
-        AsrModelSize::CTC300M => AsrModelSize::CTC1B,
-        AsrModelSize::WSL7B => AsrModelSize::WSL7B,
-    };
-
-    if fallback != *requested && omniasr_model_present(model_dir, &fallback) {
-        tracing::warn!(
-            "Requested ASR model {:?} is not installed under {}; falling back to {:?}",
-            requested,
-            model_dir.display(),
-            fallback
-        );
-        return fallback;
-    }
-
+/// Preserve the operator's exact engine selection. Availability is checked by the selected engine's
+/// load/transcribe path, which returns an actionable error; choosing a different installed model here
+/// would create a plausible-looking transcript with false provenance.
+pub fn select_available_model_size(_model_dir: &Path, requested: &AsrModelSize) -> AsrModelSize {
     requested.clone()
 }
 
@@ -176,6 +172,7 @@ fn confidence_from_asr_result(text: &str, ys_log_probs: &[f64]) -> (Option<f64>,
     }
 }
 
+#[cfg(test)]
 #[derive(serde::Deserialize)]
 struct RawAsrResult {
     text: String,
@@ -196,6 +193,7 @@ struct RawAsrResult {
 /// Parse sherpa-onnx's offline-result JSON into `(text, confidence, source)`. Confidence is
 /// the mean per-token posterior (exp of the acoustic log-probs) when the model exposes them
 /// (source = RealPosterior), otherwise the documented heuristic fallback (source = Heuristic).
+#[cfg(test)]
 fn parse_asr_result_json(json_str: &str) -> Result<(String, Option<f64>, ConfidenceSource), String> {
     let res: RawAsrResult =
         serde_json::from_str(json_str).map_err(|e| format!("Failed to parse ASR stream result JSON: {e}"))?;
@@ -262,16 +260,15 @@ pub fn check_model_integrity() -> Vec<String> {
     warnings
 }
 
-pub struct KurdishAsrService {
+/// The native recognizer lives only in the worker-process entrypoint below. The desktop host never
+/// constructs this type: a C++ exception, access violation, abort, or allocator failure therefore
+/// terminates the disposable child rather than the Tauri process and its unsaved review session.
+struct NativeKurdishAsrEngine {
     recognizer: Option<OfflineRecognizer>,
     language: String,
 }
 
-impl KurdishAsrService {
-    pub fn new(model_dir: &Path, enable_gpu: bool) -> Result<Self, String> {
-        Self::new_with_config(model_dir, &AsrLoadConfig { enable_gpu, ..AsrLoadConfig::default() })
-    }
-
+impl NativeKurdishAsrEngine {
     pub fn new_with_config(model_dir: &Path, config: &AsrLoadConfig) -> Result<Self, String> {
         let (model_path, tokens_path) = omniasr_model_paths(model_dir, &config.model_size);
 
@@ -510,43 +507,525 @@ impl KurdishAsrService {
         stream.accept_waveform(sample_rate as i32, audio);
         recognizer.decode(&stream);
 
-        // We need the per-token acoustic confidences sherpa-onnx emits in its result JSON. The safe
-        // `OfflineStream::get_result()` parses the JSON into `OfflineRecognizerResult`, which keeps
-        // only text/tokens/timestamps/durations and DISCARDS those confidences (they feed
-        // conformal/IRT/autonomy downstream). So we reach the stream's raw C pointer — which
-        // sherpa-onnx keeps `pub(crate)` — and call the JSON API directly. In sherpa-onnx 1.13.2,
-        // `OfflineStream` is a single-field wrapper `{ pub(crate) ptr: *const sys::OfflineStream }`,
-        // so transmuting `&OfflineStream` to a `#[repr(transparent)]` pointer mirror reads exactly it.
-        #[repr(transparent)]
-        struct OfflineStreamMirror {
-            ptr: *const std::ffi::c_void,
+        // Stay on sherpa-onnx's supported API. The previous implementation transmuted the private
+        // OfflineStream layout to call its C pointer directly, which made a dependency layout change
+        // undefined behavior in the host process. The extra `ys_log_probs` field that motivated that
+        // bypass is empty for the shipped OmniASR CTC build (measured and documented above), so it
+        // provided no real posterior. Preserve the honest heuristic classification without the UB.
+        let result = stream.get_result().ok_or_else(|| "OmniASR decode returned no result".to_string())?;
+        let (confidence, source) = confidence_from_asr_result(&result.text, &[]);
+        Ok((result.text, confidence, source))
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WorkerStartup {
+    Native { model_dir: PathBuf, config: AsrLoadConfig },
+    CrashOnceThenEcho { marker: PathBuf },
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WorkerRequest {
+    request_id: u64,
+    sample_rate: u32,
+    sample_count: usize,
+}
+
+fn write_worker_request<W: Write>(output: &mut W, request: &WorkerRequest, audio: &[f32]) -> Result<(), String> {
+    if request.sample_count > WORKER_MAX_SAMPLES {
+        return Err(format!(
+            "ASR worker request contains {} samples; maximum is {WORKER_MAX_SAMPLES}",
+            request.sample_count
+        ));
+    }
+    if request.sample_count != audio.len() {
+        return Err(format!(
+            "ASR worker request header declares {} samples but the payload contains {}",
+            request.sample_count,
+            audio.len()
+        ));
+    }
+    let header = serde_json::to_string(request).map_err(|e| format!("serialize ASR worker request: {e}"))?;
+    // Buffer the wire stream so a 15-second chunk does not issue 240,000 four-byte OS pipe writes.
+    // The fixed 64 KiB buffer keeps memory flat even at the protocol's existing 10-minute limit.
+    let mut buffered = BufWriter::with_capacity(WORKER_WRITE_BUFFER_BYTES, output);
+    buffered
+        .write_all(header.as_bytes())
+        .and_then(|()| buffered.write_all(b"\n"))
+        .map_err(|e| format!("write ASR worker request header: {e}"))?;
+    for sample in audio {
+        buffered.write_all(&sample.to_le_bytes()).map_err(|e| format!("write ASR worker audio payload: {e}"))?;
+    }
+    buffered.flush().map_err(|e| format!("flush ASR worker request: {e}"))
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WorkerResponse {
+    Ready {
+        ok: bool,
+        error: Option<String>,
+    },
+    Transcript {
+        request_id: u64,
+        ok: bool,
+        text: String,
+        confidence: Option<f64>,
+        confidence_source: ConfidenceSource,
+        error: Option<String>,
+    },
+}
+
+fn write_worker_response(response: &WorkerResponse) -> Result<(), String> {
+    let encoded = serde_json::to_string(response).map_err(|e| format!("serialize ASR worker response: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    output
+        .write_all(format!("{WORKER_MESSAGE_PREFIX}{encoded}\n").as_bytes())
+        .map_err(|e| format!("write ASR worker response: {e}"))?;
+    output.flush().map_err(|e| format!("flush ASR worker response: {e}"))
+}
+
+/// Read one small JSON protocol line without allowing a malformed peer to grow memory without bound.
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> Result<Option<String>, String> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    loop {
+        let available = reader.fill_buf().map_err(|e| format!("read ASR worker protocol: {e}"))?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err("ASR worker protocol ended in the middle of a line".to_string())
+            };
         }
-        // Turn any future layout drift (e.g. a sherpa-onnx bump that adds a field to OfflineStream)
-        // into a COMPILE error instead of silent UB: a single-pointer wrapper must stay pointer-sized.
-        const _: () = assert!(
-            std::mem::size_of::<sherpa_onnx::OfflineStream>() == std::mem::size_of::<*const std::ffi::c_void>(),
-            "sherpa-onnx OfflineStream is no longer a single-pointer wrapper; the transmute in \
-             transcribe_chunk would be unsound — re-verify its layout before bumping the dep.",
-        );
-
-        let stream_ptr = unsafe {
-            let mirror: &OfflineStreamMirror = std::mem::transmute(&stream);
-            mirror.ptr
-        };
-
-        unsafe {
-            let json_cstr = sherpa_onnx_sys::SherpaOnnxGetOfflineStreamResultAsJson(stream_ptr as *const _);
-            if json_cstr.is_null() {
-                return Err("OmniASR decode returned no result".to_string());
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if bytes.len().saturating_add(take) > max_bytes {
+            return Err(format!("ASR worker protocol line exceeds {max_bytes} bytes"));
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
             }
-
-            let json_str = std::ffi::CStr::from_ptr(json_cstr).to_string_lossy().into_owned();
-
-            sherpa_onnx_sys::SherpaOnnxDestroyOfflineStreamResultJson(json_cstr);
-
-            let (text, confidence, source) = parse_asr_result_json(&json_str)?;
-            Ok((text, confidence, source))
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            return String::from_utf8(bytes).map(Some).map_err(|_| "ASR worker protocol line is not UTF-8".to_string());
         }
+    }
+}
+
+enum WorkerEngine {
+    Native(NativeKurdishAsrEngine),
+    CrashOnceThenEcho { marker: PathBuf },
+}
+
+fn run_worker(startup_json: &str) -> Result<(), String> {
+    let startup: WorkerStartup =
+        serde_json::from_str(startup_json).map_err(|e| format!("parse ASR worker startup configuration: {e}"))?;
+    let mut engine = match startup {
+        WorkerStartup::Native { model_dir, config } => {
+            let engine = NativeKurdishAsrEngine::new_with_config(&model_dir, &config)?;
+            if !engine.is_available() {
+                let error = "ASR model is unavailable in worker".to_string();
+                let _ = write_worker_response(&WorkerResponse::Ready { ok: false, error: Some(error.clone()) });
+                return Err(error);
+            }
+            WorkerEngine::Native(engine)
+        }
+        WorkerStartup::CrashOnceThenEcho { marker } => WorkerEngine::CrashOnceThenEcho { marker },
+    };
+    write_worker_response(&WorkerResponse::Ready { ok: true, error: None })?;
+
+    let stdin = std::io::stdin();
+    let mut input = BufReader::new(stdin.lock());
+    loop {
+        let Some(line) = read_bounded_line(&mut input, 8 * 1024)? else {
+            return Ok(());
+        };
+        let request: WorkerRequest =
+            serde_json::from_str(&line).map_err(|e| format!("parse ASR worker request: {e}"))?;
+        if request.sample_count > WORKER_MAX_SAMPLES {
+            return Err(format!(
+                "ASR worker request contains {} samples; maximum is {WORKER_MAX_SAMPLES}",
+                request.sample_count
+            ));
+        }
+        let byte_count = request
+            .sample_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "ASR worker sample byte count overflow".to_string())?;
+        let mut encoded_audio = vec![0_u8; byte_count];
+        input.read_exact(&mut encoded_audio).map_err(|e| format!("read ASR worker audio payload: {e}"))?;
+        let mut audio = Vec::with_capacity(request.sample_count);
+        for sample in encoded_audio.chunks_exact(4) {
+            let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+            if !value.is_finite() {
+                return Err("ASR worker audio contains a non-finite sample".to_string());
+            }
+            audio.push(value);
+        }
+
+        let outcome = match &mut engine {
+            WorkerEngine::Native(engine) => engine.transcribe(&audio, request.sample_rate),
+            WorkerEngine::CrashOnceThenEcho { marker } => {
+                if !marker.exists() {
+                    std::fs::write(&*marker, b"crashed")
+                        .map_err(|e| format!("write ASR containment marker {}: {e}", marker.display()))?;
+                    // This deliberately models the uncatchable native failure class. Only the worker
+                    // dies; the supervisor process must observe EOF, remain alive, and restart it.
+                    std::process::abort();
+                }
+                Ok(("worker-restarted".to_string(), Some(1.0), ConfidenceSource::Heuristic))
+            }
+        };
+        let response = match outcome {
+            Ok((text, confidence, confidence_source)) => WorkerResponse::Transcript {
+                request_id: request.request_id,
+                ok: true,
+                text,
+                confidence,
+                confidence_source,
+                error: None,
+            },
+            Err(error) => WorkerResponse::Transcript {
+                request_id: request.request_id,
+                ok: false,
+                text: String::new(),
+                confidence: None,
+                confidence_source: ConfidenceSource::Heuristic,
+                error: Some(error),
+            },
+        };
+        write_worker_response(&response)?;
+    }
+}
+
+fn worker_executable() -> Result<PathBuf, String> {
+    let current = std::env::current_exe().map_err(|e| format!("resolve ASR worker executable: {e}"))?;
+    // A Rust test harness lives under target/{profile}/deps and does not execute this package's main().
+    // Cargo builds the real binary beside that directory for integration tests; use it there. Installed
+    // and normally launched applications simply supervise another instance of their own executable.
+    if current.parent().and_then(Path::file_name).is_some_and(|name| name == "deps") {
+        let profile_dir = current
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "test executable has no Cargo profile directory".to_string())?;
+        let candidate = profile_dir.join(format!("cortex-speech-app{}", std::env::consts::EXE_SUFFIX));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Ok(current)
+}
+
+struct WorkerProcess {
+    child: Child,
+    input: ChildStdin,
+    responses: mpsc::Receiver<Result<WorkerResponse, String>>,
+}
+
+impl WorkerProcess {
+    fn spawn(executable: &Path, startup: &WorkerStartup) -> Result<Self, String> {
+        let startup_json =
+            serde_json::to_string(startup).map_err(|e| format!("serialize ASR worker startup configuration: {e}"))?;
+        let mut child = Command::new(executable)
+            .arg(WORKER_ARG)
+            .arg(startup_json)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("start isolated ASR worker {}: {e}", executable.display()))?;
+        let input = child.stdin.take().ok_or_else(|| "ASR worker stdin was not piped".to_string())?;
+        let stdout = child.stdout.take().ok_or_else(|| "ASR worker stdout was not piped".to_string())?;
+        let (sender, responses) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_bounded_line(&mut reader, 256 * 1024) {
+                    Ok(Some(line)) => {
+                        let Some(payload) = line.strip_prefix(WORKER_MESSAGE_PREFIX) else {
+                            // Native runtimes occasionally write diagnostics to stdout. They are not
+                            // protocol data and must never desynchronize or spoof a response.
+                            continue;
+                        };
+                        let parsed = serde_json::from_str::<WorkerResponse>(payload)
+                            .map_err(|e| format!("parse ASR worker response: {e}"));
+                        if sender.send(parsed).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = sender.send(Err("ASR worker exited before replying".to_string()));
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        let process = Self { child, input, responses };
+        match process.responses.recv_timeout(WORKER_STARTUP_TIMEOUT) {
+            Ok(Ok(WorkerResponse::Ready { ok: true, .. })) => Ok(process),
+            Ok(Ok(WorkerResponse::Ready { error, .. })) => {
+                Err(error.unwrap_or_else(|| "ASR worker refused startup".to_string()))
+            }
+            Ok(Ok(_)) => Err("ASR worker sent a transcript before its ready handshake".to_string()),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(format!("ASR worker did not become ready within {} seconds", WORKER_STARTUP_TIMEOUT.as_secs()))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("ASR worker response channel disconnected".to_string()),
+        }
+    }
+
+    fn transcribe(
+        &mut self,
+        request_id: u64,
+        audio: &[f32],
+        sample_rate: u32,
+        timeout: Duration,
+    ) -> Result<(String, Option<f64>, ConfidenceSource), String> {
+        let request = WorkerRequest { request_id, sample_rate, sample_count: audio.len() };
+        write_worker_request(&mut self.input, &request, audio)?;
+
+        match self.responses.recv_timeout(timeout) {
+            Ok(Ok(WorkerResponse::Transcript {
+                request_id: response_id,
+                ok,
+                text,
+                confidence,
+                confidence_source,
+                error,
+            })) if response_id == request_id => {
+                if ok {
+                    Ok((text, confidence, confidence_source))
+                } else {
+                    Err(error.unwrap_or_else(|| "ASR worker decode failed".to_string()))
+                }
+            }
+            Ok(Ok(WorkerResponse::Transcript { request_id: response_id, .. })) => {
+                Err(format!("ASR worker response id mismatch: expected {request_id}, got {response_id}"))
+            }
+            Ok(Ok(WorkerResponse::Ready { .. })) => Err("ASR worker sent a duplicate ready handshake".to_string()),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(format!("ASR worker request timed out after {} seconds", timeout.as_secs()))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("ASR worker response channel disconnected".to_string()),
+        }
+    }
+}
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+}
+
+struct AsrWorkerSupervisor {
+    executable: PathBuf,
+    startup: WorkerStartup,
+    process: Option<WorkerProcess>,
+    next_request_id: u64,
+    consecutive_failures: u32,
+    retry_after: Option<Instant>,
+    circuit_open_until: Option<Instant>,
+}
+
+impl AsrWorkerSupervisor {
+    fn start(startup: WorkerStartup) -> Result<Self, String> {
+        let executable = worker_executable()?;
+        let process = WorkerProcess::spawn(&executable, &startup)?;
+        Ok(Self {
+            executable,
+            startup,
+            process: Some(process),
+            next_request_id: 1,
+            consecutive_failures: 0,
+            retry_after: None,
+            circuit_open_until: None,
+        })
+    }
+
+    fn ensure_process(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        if self.circuit_open_until.is_some_and(|until| until > now) {
+            let seconds =
+                self.circuit_open_until.map(|until| until.saturating_duration_since(now).as_secs()).unwrap_or_default();
+            return Err(format!("ASR worker circuit is open after repeated crashes; retry in {seconds}s"));
+        }
+        if self.retry_after.is_some_and(|until| until > now) {
+            let millis =
+                self.retry_after.map(|until| until.saturating_duration_since(now).as_millis()).unwrap_or_default();
+            return Err(format!("ASR worker restart backoff is active; retry in {millis}ms"));
+        }
+        if self.process.is_none() {
+            match WorkerProcess::spawn(&self.executable, &self.startup) {
+                Ok(process) => self.process = Some(process),
+                Err(error) => {
+                    self.record_failure();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_failure(&mut self) {
+        self.process.take();
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let now = Instant::now();
+        if self.consecutive_failures >= WORKER_CIRCUIT_FAILURES {
+            self.circuit_open_until = Some(now + WORKER_CIRCUIT_OPEN);
+            self.retry_after = None;
+        } else {
+            let shift = self.consecutive_failures.saturating_sub(1).min(4);
+            let backoff_ms = 250_u64.saturating_mul(1_u64 << shift);
+            self.retry_after = Some(now + Duration::from_millis(backoff_ms));
+        }
+    }
+
+    fn transcribe(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<(String, Option<f64>, ConfidenceSource), String> {
+        if audio.len() > WORKER_MAX_SAMPLES {
+            return Err(format!(
+                "ASR request is {:.1} minutes; isolated worker limit is 10 minutes",
+                audio.len() as f64 / SAMPLE_RATE as f64 / 60.0
+            ));
+        }
+        if audio.iter().any(|sample| !sample.is_finite()) {
+            return Err("ASR audio contains a non-finite sample".to_string());
+        }
+        self.ensure_process()?;
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let audio_seconds = audio.len() as u64 / sample_rate.max(1) as u64;
+        let timeout = Duration::from_secs(60_u64.saturating_add(audio_seconds.saturating_mul(5)))
+            .max(WORKER_REQUEST_MIN_TIMEOUT)
+            .min(WORKER_REQUEST_MAX_TIMEOUT);
+        let outcome = self.process.as_mut().ok_or_else(|| "ASR worker is not running".to_string())?.transcribe(
+            request_id,
+            audio,
+            sample_rate,
+            timeout,
+        );
+        match outcome {
+            Ok(result) => {
+                self.consecutive_failures = 0;
+                self.retry_after = None;
+                self.circuit_open_until = None;
+                Ok(result)
+            }
+            Err(error) => {
+                self.record_failure();
+                Err(format!("isolated ASR worker failed; host remains healthy: {error}"))
+            }
+        }
+    }
+}
+
+/// Host-side ASR facade. It contains only a subprocess supervisor and no native recognizer handle.
+pub struct KurdishAsrService {
+    worker: Option<AsrWorkerSupervisor>,
+}
+
+impl KurdishAsrService {
+    pub fn new(model_dir: &Path, enable_gpu: bool) -> Result<Self, String> {
+        Self::new_with_config(model_dir, &AsrLoadConfig { enable_gpu, ..AsrLoadConfig::default() })
+    }
+
+    pub fn new_with_config(model_dir: &Path, config: &AsrLoadConfig) -> Result<Self, String> {
+        if !omniasr_model_present(model_dir, &config.model_size) {
+            let (model_path, tokens_path) = omniasr_model_paths(model_dir, &config.model_size);
+            tracing::warn!(
+                "OmniASR model files missing or incomplete under {} (expected {} and {}). ASR unavailable.",
+                model_dir.display(),
+                model_path.display(),
+                tokens_path.display()
+            );
+            return Ok(Self::new_unavailable());
+        }
+        let startup = WorkerStartup::Native { model_dir: model_dir.to_path_buf(), config: config.clone() };
+        Ok(Self { worker: Some(AsrWorkerSupervisor::start(startup)?) })
+    }
+
+    pub fn new_unavailable() -> Self {
+        Self { worker: None }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    pub fn transcribe(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+    ) -> Result<(String, Option<f64>, ConfidenceSource), String> {
+        self.worker.as_mut().ok_or_else(|| "ASR model not loaded".to_string())?.transcribe(audio, sample_rate)
+    }
+}
+
+fn run_supervisor_self_test() -> Result<(), String> {
+    let marker = std::env::temp_dir().join(format!("cortex-asr-crash-once-{}", uuid::Uuid::new_v4()));
+    let startup = WorkerStartup::CrashOnceThenEcho { marker: marker.clone() };
+    let mut supervisor = AsrWorkerSupervisor::start(startup)?;
+    let first = supervisor.transcribe(&[0.0; 160], SAMPLE_RATE);
+    if first.is_ok() {
+        return Err("fault-injection worker unexpectedly survived its first request".to_string());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let second = supervisor.transcribe(&[0.0; 160], SAMPLE_RATE)?;
+    let _ = std::fs::remove_file(&marker);
+    if second.0 != "worker-restarted" {
+        return Err(format!("restarted worker returned unexpected transcript: {}", second.0));
+    }
+    Ok(())
+}
+
+/// Called before Tauri initialization. Returning `Some` means this process was intentionally launched
+/// in a non-UI role and the caller must exit with the returned code.
+pub fn run_special_process_mode() -> Option<i32> {
+    let mut args = std::env::args();
+    let _program = args.next();
+    match args.next().as_deref() {
+        Some(WORKER_ARG) => {
+            let result = args
+                .next()
+                .ok_or_else(|| "missing ASR worker startup configuration".to_string())
+                .and_then(|json| run_worker(&json));
+            if let Err(error) = result {
+                eprintln!("ASR worker failed: {error}");
+                Some(2)
+            } else {
+                Some(0)
+            }
+        }
+        Some(SUPERVISOR_SELF_TEST_ARG) => {
+            if let Err(error) = run_supervisor_self_test() {
+                eprintln!("ASR supervisor self-test failed: {error}");
+                Some(3)
+            } else {
+                Some(0)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -718,6 +1197,78 @@ impl AsrPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn worker_request_writer_is_bounded_buffered_and_wire_exact() {
+        let audio = [-1.0_f32, 0.0, 0.25, -0.5];
+        let request = WorkerRequest { request_id: 17, sample_rate: SAMPLE_RATE, sample_count: audio.len() };
+        let mut output = CountingWriter::default();
+
+        write_worker_request(&mut output, &request, &audio).unwrap();
+
+        assert_eq!(output.writes, 1, "a small request must be emitted as one buffered OS write");
+        assert_eq!(output.flushes, 1);
+        let newline = output.bytes.iter().position(|byte| *byte == b'\n').expect("JSON header terminator");
+        let decoded: WorkerRequest = serde_json::from_slice(&output.bytes[..newline]).unwrap();
+        assert_eq!(decoded.request_id, request.request_id);
+        assert_eq!(decoded.sample_rate, request.sample_rate);
+        assert_eq!(decoded.sample_count, request.sample_count);
+        let expected_payload: Vec<u8> = audio.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        assert_eq!(&output.bytes[newline + 1..], expected_payload.as_slice());
+
+        let mismatch = WorkerRequest { request_id: 18, sample_rate: SAMPLE_RATE, sample_count: audio.len() + 1 };
+        let mut rejected = CountingWriter::default();
+        let error = write_worker_request(&mut rejected, &mismatch, &audio).unwrap_err();
+        assert!(error.contains("declares"), "unexpected mismatch error: {error}");
+        assert!(rejected.bytes.is_empty(), "an invalid frame must not be partially written");
+
+        let oversized =
+            WorkerRequest { request_id: 19, sample_rate: SAMPLE_RATE, sample_count: WORKER_MAX_SAMPLES + 1 };
+        let error = write_worker_request(&mut rejected, &oversized, &[]).unwrap_err();
+        assert!(error.contains("maximum"), "unexpected size-limit error: {error}");
+        assert!(rejected.bytes.is_empty(), "an oversized frame must not be partially written");
+    }
+
+    #[test]
+    fn worker_request_writer_bounds_pipe_writes_for_a_full_chunk() {
+        let audio = vec![0.25_f32; 15 * SAMPLE_RATE as usize];
+        let request = WorkerRequest { request_id: 20, sample_rate: SAMPLE_RATE, sample_count: audio.len() };
+        let mut output = CountingWriter::default();
+
+        write_worker_request(&mut output, &request, &audio).unwrap();
+
+        let header_bytes = serde_json::to_string(&request).unwrap().len() + 1;
+        let packet_bytes = header_bytes + audio.len() * std::mem::size_of::<f32>();
+        let maximum_buffer_flushes = packet_bytes.div_ceil(WORKER_WRITE_BUFFER_BYTES);
+        assert!(
+            output.writes <= maximum_buffer_flushes,
+            "{} underlying writes exceeded the {} fixed-buffer bound",
+            output.writes,
+            maximum_buffer_flushes
+        );
+        assert!(output.writes < 20, "15 seconds of PCM regressed to tiny pipe writes");
+        assert_eq!(output.bytes.len(), packet_bytes);
+    }
 
     #[test]
     fn asr_pool_retries_an_unavailable_cached_service_instead_of_pinning_it() {
@@ -972,18 +1523,18 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_installed_300m_when_1b_is_missing() {
+    fn missing_1b_never_silently_selects_installed_300m() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let model_dir = tmp.path();
         let (model, tokens) = omniasr_model_paths(model_dir, &AsrModelSize::CTC300M);
         write_sized_file(&model, CTC_300M_MIN_MODEL_BYTES);
         write_sized_file(&tokens, CTC_MIN_TOKEN_BYTES);
 
-        assert_eq!(select_available_model_size(model_dir, &AsrModelSize::CTC1B), AsrModelSize::CTC300M);
+        assert_eq!(select_available_model_size(model_dir, &AsrModelSize::CTC1B), AsrModelSize::CTC1B);
     }
 
     #[test]
-    fn truncated_requested_model_falls_back_to_complete_300m() {
+    fn truncated_requested_model_never_changes_engine_identity() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let model_dir = tmp.path();
         let (model, tokens) = omniasr_model_paths(model_dir, &AsrModelSize::CTC1B);
@@ -994,7 +1545,7 @@ mod tests {
         write_sized_file(&fallback_model, CTC_300M_MIN_MODEL_BYTES);
         write_sized_file(&fallback_tokens, CTC_MIN_TOKEN_BYTES);
 
-        assert_eq!(select_available_model_size(model_dir, &AsrModelSize::CTC1B), AsrModelSize::CTC300M);
+        assert_eq!(select_available_model_size(model_dir, &AsrModelSize::CTC1B), AsrModelSize::CTC1B);
     }
 
     #[test]
@@ -1130,7 +1681,7 @@ mod tests {
         };
 
         if omniasr_model_present(&model_dir, &AsrModelSize::CTC300M) {
-            let service = KurdishAsrService::new_with_config(&model_dir, &config).unwrap();
+            let service = NativeKurdishAsrEngine::new_with_config(&model_dir, &config).unwrap();
             let recognizer = service.recognizer.as_ref().unwrap();
             let stream = recognizer.create_stream();
             stream.set_option("language", "ckb");
