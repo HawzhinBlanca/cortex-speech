@@ -45,9 +45,10 @@ if a checkable pin drifts from what is written here.
 - `SPEAKER_TURN_REFUSAL_CEILING = 0.43` — the chunk-cut judge's bar; the turn group's measured ceiling.
 - DB backup pacing `4096 pages / 1 ms` — the 5/250ms doc example cost a 20-minute cold start.
 - Watchdog startup grace **10 minutes** (sized to the measured 6.4 s startup, not the old bug).
-- Duplicate-content baseline: **170** (2026-08-17; corrected same day from 70 when the owner's ears
-  exposed the mp4's shifted clock — the audit now matches by content, rules A+B), ratchets DOWN only —
-  `check_dataset_duplicates.py`.
+- Duplicate-content baseline: **0** (2026-08-17: measured 68, corrected to 170 when the owner’s
+  ears exposed the mp4’s shifted clock, then CLEANED — 170 redundant clips removed under
+  BEGIN IMMEDIATE with backup pre-dedupe-20260817-162534). Any duplicate from now on is a
+  fresh import and a RED sweep — `check_dataset_duplicates.py`.
 
 ## Working rules
 - **No fancy features** — reliability only; fix defects, don't add surface area.

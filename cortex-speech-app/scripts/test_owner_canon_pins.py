@@ -78,7 +78,7 @@ def test_the_duplicate_audit_baseline_only_ratchets_down() -> None:
     audit = _read("scripts/check_dataset_duplicates.py")
     line = next(l for l in audit.splitlines() if l.startswith("KNOWN_BASELINE"))
     baseline = int(line.split("=")[1].strip())
-    assert baseline <= 170, f"duplicate baseline rose to {baseline} — it may only ever go DOWN"
+    assert baseline <= 0, f"duplicate baseline rose to {baseline} — it may only ever go DOWN"
 
 
 def main() -> int:

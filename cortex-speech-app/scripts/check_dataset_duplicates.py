@@ -46,7 +46,7 @@ from pathlib import Path
 # library. This number may only ever be lowered (the cleanup) — raising it again requires the
 # owner's `change canon:`, because a higher baseline is indistinguishable from waving through a
 # fresh duplicate import.
-KNOWN_BASELINE = 170
+KNOWN_BASELINE = 0
 MIN_TEXT_CHARS = 25
 OFFSET_BUCKET_MS = 500
 
