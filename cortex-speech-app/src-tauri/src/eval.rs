@@ -332,14 +332,51 @@ pub struct FinetunePackResult {
     pub emitted: usize,
     /// Skipped for an empty transcript, a duplicate, or undecodable audio.
     pub skipped: usize,
+    /// Emitted rows that carry NO live human decision — batch-verified, or a verdict the reviewer
+    /// undid (undo clears the decision but leaves `verified = 1`). The rubric grades these SILVER,
+    /// so they are machine labels, correctly marked; this counter makes the quantity visible.
+    pub emitted_without_human_decision: usize,
+    /// Content id of this selection (the manifest hash). A training run cites this; `dataset_runs`
+    /// holds the sealed record, and the same rows always produce the same id.
+    pub snapshot_id: String,
+    /// False when an identical snapshot was already sealed — the export was reproducible, not new.
+    pub newly_sealed: bool,
 }
 
 /// One JSONL row in the fine-tune pack — the trainer's schema.
+///
+/// The first three fields are what the trainer consumes. Everything after them is PROVENANCE, added
+/// 2026-08-17 after an external audit found the pack emitted "essentially audio, text and duration":
+/// a trainer could not tell which human decision produced a label, which recording it came from, or
+/// whether the audio was a neural separator's output rather than an original recording — and the
+/// pack carried no split at all, so nothing stopped a fine-tune from testing on its own training
+/// voices. Provenance that only lives in the app is provenance the training run cannot check.
 #[derive(Serialize)]
 struct FinetuneRow<'a> {
     audio_path: String,
     sentence: &'a str,
     duration_seconds: f64,
+    /// The library row this label came from — the join key back to every decision on it.
+    segment_id: &'a str,
+    /// Source recording (file name only; the full path is machine-specific and not the trainer's).
+    source_recording: &'a str,
+    /// Leakage-safe split: every clip from one recording lands in the same split, so a fine-tune
+    /// cannot validate on the voice it trained on. Computed by the same `assign_splits` the
+    /// HuggingFace export uses, over exactly the rows this pack emits.
+    split: &'static str,
+    /// Which human action produced this label: `accept`, `edit`, or absent when the row was
+    /// verified without a recorded decision (batch-verify, or pre-v43 history).
+    decision: Option<&'a str>,
+    /// The row revision that decision landed on. "Exactly once, latest" is enforced by the library
+    /// holding one row per clip; this pins WHICH state of it was trained on, so a later edit is
+    /// visibly a different snapshot rather than a silent change.
+    decision_revision: i64,
+    /// GOLD (human-decided) or SILVER (machine, training-ready) — the rubric's own verdict, so the
+    /// trainer can weight or filter without re-deriving it.
+    grade: &'a str,
+    /// True when the SOURCE audio was processed before import (separated from music, non-speech cut,
+    /// re-concatenated). Declared by migration v54; false means unclaimed, never "verified original".
+    audio_processed: bool,
 }
 
 /// M5.1 / P5.1: export a fine-tune training pack from the segments the training-grade rubric
@@ -398,9 +435,27 @@ pub fn export_finetune_pack(
         rows.collect::<Result<_, _>>().map_err(crate::error::AppError::from)?
     };
 
+    // LEAKAGE-SAFE SPLIT over exactly the rows this pack will emit (P2, 2026-08-17). The pack used
+    // to ship unsplit, so nothing stopped a fine-tune from validating on a voice it had trained on —
+    // and with 94.7 % of today's labels from a single recording that is not a theoretical risk. Same
+    // `assign_splits` the HuggingFace export uses: every clip of one recording lands in one split,
+    // groups are seed-shuffled deterministically. Fixed seed so the split is a property of the DATA,
+    // not of when the export ran.
+    const SPLIT_SEED: u64 = 20_260_817;
+    let training_ready: Vec<crate::db::SpeechSegment> =
+        graded.iter().filter(|(_, r)| r.training_ready).map(|(s, _)| (*s).clone()).collect();
+    let splits: std::collections::HashMap<String, &'static str> =
+        crate::export::assign_splits(&training_ready, 0.8, 0.1, 0.1, SPLIT_SEED, true).into_iter().collect();
+
+    // Which source recordings were PROCESSED before import (migration v54) — one query, then a
+    // lookup per row, so the trainer can see that a clip's audio is a separator's output rather
+    // than an original recording.
+    let processed_sources = db.source_audio_provenance_map()?;
+
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut emitted = 0usize;
     let mut skipped = 0usize;
+    let mut emitted_without_human_decision = 0usize;
     for (seg, report) in graded.iter().filter(|(_, report)| report.training_ready) {
         // Canonical Sorani orthography for the SHIPPED sentence — ك/ک, ي/ی, ه/ھ variants unified so
         // the retrain corpus has one label per grapheme (mixed forms inflate the CTC label space).
@@ -435,12 +490,30 @@ pub fn export_finetune_pack(
                 continue;
             }
         };
+        // Counted, never silent: a row can be verified WITHOUT a live human decision — batch-verify
+        // never records one, and `clear_human_decision` (undo) clears the decision while leaving
+        // `verified = 1`. The rubric already grades those SILVER rather than GOLD, so nothing is
+        // mislabeled; what was missing is the NUMBER. An undone verdict quietly becoming machine
+        // training data is exactly the kind of thing that must appear in the pack's own record
+        // instead of being discovered later by an auditor.
+        if seg.human_decision.is_none() {
+            emitted_without_human_decision += 1;
+        }
         let clip_rel = format!("clips/{}.wav", seg.id);
         write_wav_16k_mono(&clips_dir.join(format!("{}.wav", seg.id)), &pcm, crate::audio::TARGET_SAMPLE_RATE)?;
         let row = FinetuneRow {
             audio_path: clip_rel,
             sentence: &sentence,
             duration_seconds: pcm.len() as f64 / crate::audio::TARGET_SAMPLE_RATE as f64,
+            segment_id: &seg.id,
+            source_recording: seg.audio_path.rsplit(['/', '\\']).next().unwrap_or(&seg.audio_path),
+            // A row with no split assignment would be a silent hole in the leakage guarantee, so
+            // fall back to `train` — the split that can never leak INTO evaluation.
+            split: splits.get(&seg.id).copied().unwrap_or("train"),
+            decision: seg.human_decision.as_deref(),
+            decision_revision: db.segment_review_revision(&seg.id)?.unwrap_or(0),
+            grade: report.grade.as_str(),
+            audio_processed: processed_sources.contains_key(&seg.audio_path),
         };
         let line = serde_json::to_string(&row)
             .map_err(|e| crate::error::AppError::Other(format!("finetune manifest serialize: {e}")))?;
@@ -456,18 +529,38 @@ pub fn export_finetune_pack(
     // given. The manifest SHA pins the exact rows a future champion was trained on.
     let manifest_sha256 = crate::models::compute_file_sha256(&manifest_path)
         .map_err(|e| crate::error::AppError::Other(format!("pack manifest sha: {e}")))?;
-    let provenance = serde_json::json!({
-        "schema": 1,
-        "createdAt": chrono::Utc::now().to_rfc3339(),
-        "appGitSha": crate::GIT_SHA,
+    // The SNAPSHOT identity is the manifest hash: same rows in the same order => same snapshot.
+    // Everything below that varies per run (a timestamp, the app SHA) is recorded ALONGSIDE it, never
+    // inside the identity, so "did the data change?" is answerable without diffing two packs.
+    let snapshot_id = manifest_sha256.clone();
+    let selection = serde_json::json!({
+        "schema": 2,
+        "snapshotId": snapshot_id,
         "manifestSha256": manifest_sha256,
         "emitted": emitted,
         "skipped": skipped,
         "excludedUnexportable": excluded_unexportable,
         "excludedNotTrainingReady": excluded_not_training_ready,
+        "emittedWithoutHumanDecision": emitted_without_human_decision,
         "totalVerified": total_verified,
-        "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; canonical Sorani orthography; variant-aware dedup",
+        "splitSeed": SPLIT_SEED,
+        "splitPolicy": "assign_splits 80/10/10, speaker+recording disjoint groups — every clip of one recording lands in one split",
+        "rowSchema": "audio_path, sentence, duration_seconds, segment_id, source_recording, split, decision, decision_revision, grade, audio_processed",
+        "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; canonical Sorani orthography; variant-aware dedup; one row per (recording, span, text) at its LATEST review_revision",
     });
+    // Seal it. INSERT OR IGNORE: re-exporting identical data is a no-op and an existing snapshot is
+    // never rewritten, so a training run can cite `snapshotId` and trust it did not move.
+    let newly_sealed = db.seal_dataset_snapshot(&snapshot_id, "finetune-pack", &selection.to_string())?;
+    if newly_sealed {
+        tracing::info!("sealed dataset snapshot {snapshot_id} ({emitted} rows)");
+    } else {
+        tracing::info!("dataset snapshot {snapshot_id} already sealed — identical selection, no new record");
+    }
+
+    let mut provenance = selection;
+    provenance["createdAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    provenance["appGitSha"] = serde_json::json!(crate::GIT_SHA);
+    provenance["newlySealed"] = serde_json::json!(newly_sealed);
     let provenance_text = serde_json::to_string_pretty(&provenance)
         .map_err(|e| crate::error::AppError::Other(format!("pack provenance serialize: {e}")))?;
     std::fs::write(out_dir.join("pack_provenance.json"), &provenance_text).map_err(crate::error::AppError::Io)?;
@@ -492,6 +585,9 @@ pub fn export_finetune_pack(
         excluded_not_training_ready,
         emitted,
         skipped,
+        emitted_without_human_decision,
+        snapshot_id,
+        newly_sealed,
     })
 }
 
@@ -1556,6 +1652,133 @@ mod tests {
         // The SHA really pins the manifest bytes.
         let recomputed = crate::models::compute_file_sha256(std::path::Path::new(&result.manifest_path)).unwrap();
         assert_eq!(recomputed, result.manifest_sha256);
+    }
+
+    /// Phase 2 (2026-08-17): the pack carries its own provenance, splits leakage-safely, and seals
+    /// an immutable snapshot.
+    ///
+    /// An external audit found the pack emitted "essentially audio, text and duration" — a training
+    /// run could not tell which human decision produced a label, which recording it came from, or
+    /// whether the audio had been rebuilt by the pre-import cleaner. Worse, it was UNSPLIT: nothing
+    /// stopped a fine-tune from validating on a voice it had just trained on, which with 94.7 % of
+    /// today's labels coming from one recording is a certainty, not a risk.
+    #[test]
+    fn finetune_pack_carries_provenance_splits_safely_and_seals_one_snapshot() {
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Two recordings, two clips each, so a split that leaked would be visible.
+        let mut expected_rows = 0;
+        for (recording, clips) in [("rec_a.wav", ["a1", "a2"]), ("rec_b.wav", ["b1", "b2"])] {
+            let wav = tmp.path().join(recording);
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+            for i in 0..48000i32 {
+                w.write_sample(((i % 100) - 50) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+            let path = wav.to_string_lossy().to_string();
+            for (idx, id) in clips.iter().enumerate() {
+                let start = idx as i64 * 1000;
+                db.insert_segment(&crate::db::SpeechSegment {
+                    id: (*id).into(),
+                    audio_path: path.clone(),
+                    raw_transcript: format!("دەقی {id}"),
+                    alignment_json: Some(format!(
+                        r#"{{"source_start_ms":{start},"source_end_ms":{},"chunk_index":{idx},"chunk_count":2}}"#,
+                        start + 1000
+                    )),
+                    ..Default::default()
+                })
+                .unwrap();
+                db.update_verified(id, true).unwrap();
+                db.record_human_decision(id, "accept", None, None).unwrap();
+                expected_rows += 1;
+            }
+        }
+        // One recording declared as PROCESSED before import (migration v54).
+        db.upsert_source_audio_provenance(&crate::db::SourceAudioProvenance {
+            audio_path: tmp.path().join("rec_a.wav").to_string_lossy().to_string(),
+            processing: "separated with melband_roformer_big_beta4.ckpt; non-speech CUT OUT".into(),
+            separator_model: Some("melband_roformer_big_beta4.ckpt".into()),
+            timeline_preserved: false,
+            manifest_path: None,
+        })
+        .unwrap();
+
+        let out = tempfile::TempDir::new().unwrap();
+        let first = export_finetune_pack(&db, out.path(), None).unwrap();
+        assert_eq!(first.emitted, expected_rows);
+        assert!(first.newly_sealed, "the first export of this selection seals a snapshot");
+
+        let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
+        let rows: Vec<serde_json::Value> = manifest.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), expected_rows);
+
+        // 1. Every row states where it came from and what produced it.
+        for row in &rows {
+            assert!(row["segment_id"].as_str().is_some_and(|s| !s.is_empty()));
+            assert_eq!(row["decision"], "accept", "the human action that made this a label");
+            assert!(row["decision_revision"].as_i64().is_some(), "which revision was trained on");
+            assert_eq!(row["grade"], "gold", "human-decided rows grade gold");
+            assert!(["train", "validation", "test"].contains(&row["split"].as_str().unwrap()));
+        }
+
+        // 2. Processed audio is flagged on exactly the declared recording — the trainer must not be
+        //    told a separator's output is an original field recording.
+        let processed: Vec<bool> = rows
+            .iter()
+            .filter(|r| r["source_recording"] == "rec_a.wav")
+            .map(|r| r["audio_processed"].as_bool().unwrap())
+            .collect();
+        assert!(!processed.is_empty() && processed.iter().all(|p| *p), "rec_a is declared processed");
+        assert!(
+            rows.iter()
+                .filter(|r| r["source_recording"] == "rec_b.wav")
+                .all(|r| !r["audio_processed"].as_bool().unwrap()),
+            "rec_b was never declared — it must not claim to be processed"
+        );
+
+        // 3. LEAKAGE: every clip of one recording shares one split. A recording straddling two
+        //    splits is train→test contamination with near-identical acoustics.
+        let mut by_recording: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            by_recording
+                .entry(row["source_recording"].as_str().unwrap())
+                .or_default()
+                .insert(row["split"].as_str().unwrap());
+        }
+        for (recording, splits) in &by_recording {
+            assert_eq!(splits.len(), 1, "{recording} straddles splits {splits:?} — that is a leak");
+        }
+
+        // 4. DETERMINISM + IMMUTABILITY: the same library exports byte-identically, and re-sealing
+        //    an identical selection is a no-op rather than a second, competing snapshot.
+        let out2 = tempfile::TempDir::new().unwrap();
+        let second = export_finetune_pack(&db, out2.path(), None).unwrap();
+        assert_eq!(second.manifest_sha256, first.manifest_sha256, "same data must hash the same");
+        assert_eq!(second.snapshot_id, first.snapshot_id);
+        assert!(!second.newly_sealed, "an identical selection must NOT seal a second snapshot");
+        assert_eq!(
+            std::fs::read_to_string(out2.path().join("finetune_manifest.jsonl")).unwrap(),
+            manifest,
+            "the manifest is a function of the data, not of when it was exported"
+        );
+
+        // 5. The sealed record is queryable and says what it selected.
+        let (name, status, config) = db.dataset_snapshot(&first.snapshot_id).unwrap().expect("sealed");
+        assert_eq!(name, "finetune-pack");
+        assert_eq!(status, "sealed");
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["emitted"], expected_rows);
+        assert_eq!(config["snapshotId"], first.snapshot_id.as_str());
+        assert!(config["splitPolicy"].as_str().unwrap().contains("disjoint"));
     }
 
     #[test]

@@ -3033,6 +3033,35 @@ impl Database {
         Ok(())
     }
 
+    /// Seal a dataset snapshot: an IMMUTABLE record of exactly which rows a training pack contained.
+    ///
+    /// `id` is the manifest's content hash, so the same rows always produce the same snapshot id and
+    /// a different selection can never masquerade as the same one. INSERT OR IGNORE is the
+    /// immutability: re-exporting identical data is a no-op, and an existing snapshot is never
+    /// rewritten — a training run that cites a snapshot id must be able to trust that what it cites
+    /// has not changed underneath it.
+    ///
+    /// Returns true when this call sealed a NEW snapshot, false when the id already existed.
+    pub fn seal_dataset_snapshot(&self, id: &str, name: &str, config_json: &str) -> AppResult<bool> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO dataset_runs (id, name, status, config_json, completed_at)
+             VALUES (?1, ?2, 'sealed', ?3, datetime('now'))",
+            params![id, name, config_json],
+        )?;
+        self.track_write()?;
+        Ok(changed > 0)
+    }
+
+    /// A sealed snapshot's stored record, or `None` if that id was never sealed.
+    pub fn dataset_snapshot(&self, id: &str) -> AppResult<Option<(String, String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT name, status, config_json FROM dataset_runs WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
+            None => Ok(None),
+        }
+    }
+
     /// Record that `record.audio_path` was processed before import (see [`SourceAudioProvenance`]).
     pub fn upsert_source_audio_provenance(&self, record: &SourceAudioProvenance) -> AppResult<()> {
         self.conn.execute(
