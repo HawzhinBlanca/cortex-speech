@@ -551,7 +551,14 @@ pub fn export_dataset_bundle(
         // Per-speaker composition + dominant-speaker flag in the HUMAN-readable card too — it lived
         // only in dataset.json, so the stated skew warning never reached a card reader (true-10
         // audit 2026-07-09).
-        export::composition_markdown(&export::compute_composition(&segments))
+        format!(
+            "{}{}",
+            export::composition_markdown(&export::compute_composition(&segments)),
+            // Same reason, and this is the bundle that actually gets published: any recording whose
+            // audio was rebuilt by the pre-import cleaner says so here, or the card presents
+            // machine-separated audio as an original field recording.
+            export::processed_audio_markdown(&export::processed_audio_notices(db, &segments)?)
+        )
     );
     write_text(&output_dir.join("dataset_card.md"), &card)?;
 

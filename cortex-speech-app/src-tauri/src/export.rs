@@ -28,7 +28,63 @@ pub struct DatasetMetadata {
     /// Per-speaker composition so a skewed corpus (one voice dominating) is visible in the dataset card
     /// itself rather than only in-app — a real fine-tune quality lever for a small single-curator corpus.
     pub composition: DatasetComposition,
+    /// Recordings in this export whose audio was PROCESSED before import — separated from music,
+    /// cut, re-concatenated, level-normalised. Empty means no recording in this export carries such a
+    /// claim, which is NOT the same as "every recording is verified original": a source imported
+    /// before v54 existed, or processed by a tool that left no manifest, makes no claim either way.
+    /// The wording says what is known, never more.
+    pub processed_audio: Vec<ProcessedAudioNotice>,
     pub exported_at: String,
+}
+
+/// One recording's declaration that its audio is not the original, and how many clips it contributed.
+#[derive(serde::Serialize)]
+pub struct ProcessedAudioNotice {
+    pub audio_path: String,
+    pub segments: usize,
+    pub processing: String,
+    pub separator_model: Option<String>,
+    /// False when non-speech was cut out, so a clip's source offsets do NOT map back to the original
+    /// recording. Anyone re-cutting from the source needs this before they trust a timestamp.
+    pub timeline_preserved: bool,
+    pub manifest_path: Option<String>,
+}
+
+/// Collect the processing declarations covering the recordings actually present in this export.
+///
+/// One query for the whole table, then a lookup per segment: a 550 h cleaned corpus is a few
+/// thousand recordings and a quarter-million clips, so per-clip queries would dominate the export.
+pub(crate) fn processed_audio_notices(
+    db: &Database,
+    segments: &[SpeechSegment],
+) -> AppResult<Vec<ProcessedAudioNotice>> {
+    let declared = db.source_audio_provenance_map()?;
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for segment in segments {
+        if declared.contains_key(&segment.audio_path) {
+            *counts.entry(segment.audio_path.as_str()).or_default() += 1;
+        }
+    }
+    let mut notices: Vec<ProcessedAudioNotice> = counts
+        .into_iter()
+        .filter_map(|(path, segments)| {
+            let record = declared.get(path)?;
+            Some(ProcessedAudioNotice {
+                audio_path: record.audio_path.clone(),
+                segments,
+                processing: record.processing.clone(),
+                separator_model: record.separator_model.clone(),
+                timeline_preserved: record.timeline_preserved,
+                manifest_path: record.manifest_path.clone(),
+            })
+        })
+        .collect();
+    // Stable order so two exports of the same library produce the same file.
+    notices.sort_by(|a, b| a.audio_path.cmp(&b.audio_path));
+    Ok(notices)
 }
 
 #[derive(serde::Serialize)]
@@ -88,6 +144,41 @@ pub(crate) fn composition_markdown(comp: &DatasetComposition) -> String {
             ""
         }
     ));
+    md
+}
+
+/// The processed-audio declaration, for the HUMAN-readable dataset card.
+///
+/// The same lesson as `composition_markdown` right above: a fact that lives only in the JSON is a
+/// fact the person reading the card never sees, and this one is the difference between "recordings"
+/// and "recordings a neural model rebuilt". Returns an empty string when no recording in the export
+/// carries a claim — silence is correct there, because an absent record means unclaimed, not
+/// verified-original.
+pub(crate) fn processed_audio_markdown(notices: &[ProcessedAudioNotice]) -> String {
+    if notices.is_empty() {
+        return String::new();
+    }
+    let clips: usize = notices.iter().map(|n| n.segments).sum();
+    let mut md = format!(
+        "\n## Processed Audio\n\n\
+         {clips} clip(s) from {} recording(s) in this dataset are NOT original recordings. \
+         Their audio was processed before it entered the library.\n\n\
+         | Recording | Clips | Processing | Timeline maps to source |\n|---|---|---|---|\n",
+        notices.len()
+    );
+    for n in notices {
+        md.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            n.audio_path.replace('|', "\\|"),
+            n.segments,
+            n.processing.replace('|', "\\|"),
+            if n.timeline_preserved { "yes" } else { "NO — non-speech was cut out" }
+        ));
+    }
+    md.push_str(
+        "\nRecordings absent from this table make no claim either way: nothing recorded that they \
+         were processed, which is not the same as confirming they are original.\n",
+    );
     md
 }
 
@@ -433,6 +524,16 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     }
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
+    // Say which recordings were processed before import. Computed AFTER every exclusion above, so the
+    // counts describe what this file actually contains.
+    let processed_audio = processed_audio_notices(db, &segments)?;
+    if !processed_audio.is_empty() {
+        let clips: usize = processed_audio.iter().map(|n| n.segments).sum();
+        tracing::info!(
+            "dataset export declares {clips} clip(s) from {} recording(s) whose audio was processed before import",
+            processed_audio.len()
+        );
+    }
 
     let metadata = DatasetMetadata {
         name: "cortex-kurdish-speech-dataset".into(),
@@ -444,6 +545,7 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
         verified_segments: verified,
         training_grade_summary: quality::training_grade_summary(&segments),
         composition: compute_composition(&segments),
+        processed_audio,
         exported_at: chrono::Utc::now().to_rfc3339(),
     };
 
