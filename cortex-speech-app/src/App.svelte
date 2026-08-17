@@ -2742,9 +2742,11 @@
                 {/each}
               </div>
             {:else if $filteredSegments.length === 0}
+              <!-- See EmptyState.svelte: h-full + plain centering made this box's top unreachable at
+                   200 % zoom. Same fix, same reason. -->
               <div
                 data-testid="segments-empty-state"
-                class="flex h-full flex-col items-center justify-center gap-3 px-6 text-center animate-fade-in"
+                class="flex min-h-full flex-col items-center [justify-content:safe_center] gap-3 px-6 text-center animate-fade-in"
               >
                 {#if $libraryLoadError}
                   <!-- P2.1: a DB/IPC read failure is NOT an empty library — show it distinctly, with the

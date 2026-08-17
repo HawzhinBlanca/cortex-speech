@@ -1014,12 +1014,12 @@
 <svelte:window onkeydown={onKeydown} />
 
 {#if reviewLoading && reviewInitialTotal === 0}
-  <div class="flex h-full items-center justify-center p-6" aria-busy="true">
+  <div class="flex min-h-full items-center [justify-content:safe_center] p-6" aria-busy="true">
     <div class="text-sm text-subtle">{$t('loading')}</div>
   </div>
 {:else if reviewLoadError && !current}
   <div
-    class="flex h-full items-center justify-center p-6"
+    class="flex min-h-full items-center [justify-content:safe_center] p-6"
     data-testid="review-load-error"
     role="alert"
   >
@@ -1034,11 +1034,14 @@
     </EmptyState>
   </div>
 {:else if !current && reviewTotal > 0}
-  <div class="flex h-full items-center justify-center p-6" aria-busy="true">
+  <div class="flex min-h-full items-center [justify-content:safe_center] p-6" aria-busy="true">
     <div class="text-sm text-subtle">{$t('loading')}</div>
   </div>
 {:else if !current}
-  <div class="flex h-full items-center justify-center p-6" data-testid="review-terminal">
+  <div
+    class="flex min-h-full items-center [justify-content:safe_center] p-6"
+    data-testid="review-terminal"
+  >
     <div class="flex flex-col items-center gap-4 text-center">
       <EmptyState
         variant="empty"
