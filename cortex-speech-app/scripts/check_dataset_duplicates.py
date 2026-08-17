@@ -50,6 +50,24 @@ KNOWN_BASELINE = 0
 MIN_TEXT_CHARS = 25
 OFFSET_BUCKET_MS = 500
 
+# RULE C — THE AUDIO DECIDES (2026-08-18). Rules A and B match TEXT, and text alone cannot tell a
+# duplicated import from a narrator saying the same sentence twice. The audiobook corpus makes that
+# distinction load-bearing: every episode of `bangewazek_bo_behesht` opens by announcing the series
+# title, and a ghazal collection repeats verses across chapters. Measured on the first 5 books
+# imported, ALL THREE flagged groups were legitimate repeats — with 134 books to import, this gate
+# would have gone permanently red and been ignored, which is how a real duplicate gets through.
+#
+# So a text match is now a CANDIDATE, and the clip audio confirms it. Two readings of one sentence
+# differ everywhere; a duplicated import is the same samples. This STRENGTHENS the gate: every true
+# positive still fails it, and the false positives stop.
+#
+# Correlation of the two clips' normalised waveforms, compared at equal length. Identical audio
+# scores ~1.0; two separate readings of the same words score far below this even at the same tempo.
+AUDIO_DUPLICATE_CORRELATION = 0.98
+# Two readings almost never match to the millisecond; a duplicate does. Cheap pre-filter before the
+# decode, and the reason a missing/undecodable clip degrades to "unconfirmed" rather than "clean".
+AUDIO_DURATION_TOLERANCE_MS = 120
+
 
 def _data_dir() -> Path:
     appdata = os.environ.get("APPDATA")
@@ -131,6 +149,90 @@ def duplicate_groups(rows: list[tuple[str, str, str, str, int]]) -> list[list[tu
     return sorted(sorted(g) for g in groups.values() if len(g) > 1 and len({f for _, f in g}) > 1)
 
 
+def _clip_pcm(audio_path: str, alignment_json: str):
+    """The clip's own samples, mono, or None when they cannot be read.
+
+    Reads only the clip's span out of the source file rather than the whole recording — these are
+    audiobook chapters, and decoding every one to compare two sentences would make the gate unusable.
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+    except ImportError:
+        return None
+    try:
+        meta = json.loads(alignment_json or "{}")
+        start_ms = int(meta.get("source_start_ms", -1))
+        end_ms = int(meta.get("source_end_ms", -1))
+    except (ValueError, TypeError):
+        return None
+    if start_ms < 0 or end_ms <= start_ms or not os.path.isfile(audio_path):
+        return None
+    try:
+        info = sf.info(audio_path)
+        start = int(start_ms * info.samplerate / 1000)
+        stop = min(int(end_ms * info.samplerate / 1000), info.frames)
+        if stop <= start:
+            return None
+        data, _ = sf.read(audio_path, start=start, stop=stop, dtype="float32", always_2d=True)
+    except Exception:
+        return None
+    mono = data.mean(axis=1)
+    return mono if mono.size else None
+
+
+def audio_says_duplicate(a, b) -> bool | None:
+    """True/False when the audio can decide, None when it cannot be read.
+
+    None is deliberately NOT False: a clip whose audio is missing must never be silently declared
+    clean — the caller reports it as unconfirmed and keeps failing on it.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if a is None or b is None or a.size == 0 or b.size == 0:
+        return None
+    # Two readings of one sentence differ in length; a duplicated import does not.
+    rate = 16000  # comparison rate; both clips are resampled to a common length below anyway
+    if abs(a.size - b.size) / rate * 1000 > AUDIO_DURATION_TOLERANCE_MS:
+        return False
+    n = min(a.size, b.size)
+    x, y = a[:n].astype("float64"), b[:n].astype("float64")
+    x -= x.mean()
+    y -= y.mean()
+    denom = float(np.linalg.norm(x) * np.linalg.norm(y))
+    if denom == 0.0:
+        return None
+    return bool(float(np.dot(x, y)) / denom >= AUDIO_DUPLICATE_CORRELATION)
+
+
+def confirm_groups_with_audio(groups, rows):
+    """Split text-matched candidates into (confirmed duplicates, unconfirmed, legitimate repeats)."""
+    by_id = {r[0]: r for r in rows}
+    confirmed, unconfirmed, repeats = [], [], []
+    pcm_cache: dict[str, object] = {}
+
+    def pcm_for(seg_id: str):
+        if seg_id not in pcm_cache:
+            _, path, alignment, _, _ = by_id[seg_id]
+            pcm_cache[seg_id] = _clip_pcm(path, alignment)
+        return pcm_cache[seg_id]
+
+    for group in groups:
+        verdicts = []
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                verdicts.append(audio_says_duplicate(pcm_for(group[i][0]), pcm_for(group[j][0])))
+        if any(v is True for v in verdicts):
+            confirmed.append(group)
+        elif all(v is False for v in verdicts) and verdicts:
+            repeats.append(group)
+        else:
+            unconfirmed.append(group)
+    return confirmed, unconfirmed, repeats
+
+
 def main() -> int:
     db = _data_dir() / "cortex-speech.db"
     if not db.is_file():
@@ -144,8 +246,19 @@ def main() -> int:
     finally:
         con.close()
 
-    groups = duplicate_groups(rows)
+    candidates = duplicate_groups(rows)
+    # RULE C: the audio decides. Text-matched groups whose clips are demonstrably DIFFERENT audio are
+    # a narrator repeating a sentence, not a duplicated import.
+    groups, unconfirmed, repeats = confirm_groups_with_audio(candidates, rows)
+    groups = groups + unconfirmed  # unreadable audio keeps failing — never silently cleared
     redundant = sum(len(g) - 1 for g in groups)  # each group needs all but one removed
+
+    if repeats:
+        print(
+            f"  note: {len(repeats)} text-matched group(s) cleared by audio — the same sentence read "
+            f"more than once (series intros, repeated verses), not a duplicated recording",
+            flush=True,
+        )
 
     if redundant > KNOWN_BASELINE:
         print("DATASET DUPLICATES: FAIL", flush=True)
@@ -156,6 +269,13 @@ def main() -> int:
             f"it; this offset+text audit can.",
             flush=True,
         )
+        if unconfirmed:
+            print(
+                f"  {len(unconfirmed)} of those could NOT be confirmed from audio (missing file, "
+                f"unreadable span, or numpy/soundfile absent) — counted as duplicates, because an "
+                f"unreadable clip must never be waved through as clean",
+                flush=True,
+            )
         by_file: dict[frozenset, int] = defaultdict(int)
         for g in groups:
             by_file[frozenset(f for _, f in g)] += 1
