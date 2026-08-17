@@ -9050,3 +9050,83 @@ environmental and owner-gated: `spot-check-pool` needs 3 owner adjudications, an
 disabled only for the open import window.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+---
+
+## 2026-08-18 — Phase 3 closes the challenger loop, and adversarial review breaks Phase 2
+
+**Phases 1-3 of docs/PLAN_TRUE_10.md. The most useful thing that happened was a defect found in
+work I had already reported as done.**
+
+### The split was leaking, and my own test said it was fine
+
+`assign_splits` groups by the path's BASENAME, so "same recording" meant "same filename". Two real
+consequences on this library:
+
+* `A1-0032_PODCAST-001.mp4` is a re-encode of the Lamofull material (check_dataset_duplicates.py
+  documents it). Lamofull is **94.7 %** of labeled duration, so it fills `train` alone and FORCES
+  every other group into validation/test — the re-encode was measured landing in `validation` while
+  the same session trained the model.
+* The audiobook corpus names every chapter `01.wav`, `02.wav` … inside its own book folder, so
+  chapter 4 of three different books collided into one group.
+
+Grouping now keys on `audio_content_hash` (v51). **The regression test took two attempts and the
+first is the lesson**: it PASSED against the broken code, because four equal-sized recordings let the
+greedy fill put the twins together by luck. Rebuilt with the library's real shape (one dominant
+recording), the old grouping fails exactly as predicted:
+`content same-content is spread across splits {"validation", "test"}`.
+
+Also removed a claim I had SEALED into the pack provenance: `"speaker+recording disjoint"`. It is not
+speaker-disjoint — the only automatic labeler emits per-recording `SPEAKER_00…` indices, which
+assign_splits scopes per recording, so the speaker union links nothing. Sealing a guarantee the data
+cannot support is the exact failure that record exists to prevent.
+
+And `relink_audio` moved `speech_segments.audio_path` while leaving `source_audio_provenance` at the
+old key, so relinking silently turned a DECLARED processed recording back into "unclaimed".
+
+### The duplicate gate learned to listen
+
+Text matching alone flagged legitimate repeats: `bangewazek_bo_behesht` announces the series title at
+the top of every episode, and a Mehwi ghazal collection repeats verses. With 134 books to import the
+gate would have gone permanently red — and a gate that is always red is one nobody reads. RULE C: a
+text match is a CANDIDATE, the clip audio confirms it. Baseline stays 0; audio that cannot be READ is
+reported unconfirmed and KEEPS FAILING. Live: 6 groups cleared by audio, 0 duplicates.
+
+### Phase 3 — the chain closes
+
+`sealed snapshot -> verified pack -> run record -> trainer -> scorecards -> slices -> PROMOTE/REJECT`
+
+* `promotion_gate.py` — 10 arms, all failing closed: cross-basis or unpaired comparison is INVALID;
+  no improvement, sub-threshold improvement, or MAPSSWE p > 0.05 is REJECT; **any protected slice
+  regressing is REJECT**.
+* `build_eval_slices.py` — generates those slices (dialect from `dialect.rs`, speaker by RECORDING
+  since diarizer labels are indices not identities, noisy/clean by measured SNR).
+* `train_challenger.py` — refuses a pack whose manifest does not hash to the snapshot id, rows with
+  no `train` split, missing clips, or an unsealed snapshot. With no trainer configured it exits **3**
+  with status `prepared` — never a record implying training that did not happen.
+
+**Measured end to end on the live library:** a challenger with a 32 % relative overall CER win
+(0.2000 -> 0.1350) that regresses Hawleri (0.2000 -> 0.2600) is REJECTED, exit 1.
+
+### Phase 1 — batch 1
+
+5 books / **47 files / 0 failed**. Cleaned corpus in the library: **1,247 clips / 177.6 min / 70
+recordings**, undeclared: **0**. Library total 15,905.
+
+**The honest limit:** importing is not labeling. Gate B still reads **426 clips / 1.08 h labeled,
+top-1 94.7 %, 5 recordings** against a target of 25 h / ≤30 % / ≥25. Only human review moves it;
+15,453 clips / 37.9 h now sit in the queue for that.
+
+### CI, twice
+
+PR #63 went red on Linux and macOS. First diagnosis (numpy: the new audio tests import it, CI's
+policy suite runs on a bare setup-python with no pip install) was REAL but INCOMPLETE — a full
+CI-simulation run with numpy hidden found the ledger gate red as well. Both fixed here. The audio
+assertions now skip without numpy, which loses coverage of an optional confirmation and not of the
+rule: without numpy every text-matched group stays unconfirmed and the gate keeps failing on it.
+
+**State:** 1,219 Rust lib tests, 76 python policy scripts (75 green in a simulated-CI run + this
+ledger entry), clippy + fmt clean. Owner-gated and unchanged: `spot-check-pool` 21/24 needs 3
+adjudications.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
