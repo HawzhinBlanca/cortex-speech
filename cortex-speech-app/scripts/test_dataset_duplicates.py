@@ -41,12 +41,39 @@ def test_a_repeated_short_phrase_in_different_recordings_is_not_flagged() -> Non
     assert duplicate_groups(rows) == []
 
 
-def test_same_text_at_a_different_timeline_position_is_not_flagged() -> None:
-    # A genuinely repeated long sentence in two different recordings does not sit at the same ms.
-    other = '{"source_start_ms": 901000, "source_end_ms": 908000}'
+def test_the_mp4_lesson_exact_text_is_a_duplicate_at_ANY_offset() -> None:
+    # The first version required offset agreement and the owner then heard the same sentence AGAIN:
+    # A1-0032_PODCAST-001.mp4 is a third encode whose clock is shifted by a constant 137.8 s. An
+    # identical >= 25-char decode in two files IS the same recording — real decodes of genuinely
+    # different recordings always drift somewhere in a sentence that long.
+    shifted = '{"source_start_ms": 141725, "source_end_ms": 149640}'
     rows = [
-        ("a", r"D:\x\ep1.wav", ALIGN, TEXT, 0),
-        ("b", r"D:\x\ep2.wav", other, TEXT, 0),
+        ("flac", r"D:\x\Lamofull2_00086400_A01.flac", ALIGN, TEXT, 1),
+        ("mp4", r"D:\x\A1-0032_PODCAST-001.mp4", shifted, TEXT, 1),
+    ]
+    groups = duplicate_groups(rows)
+    assert len(groups) == 1 and len(groups[0]) == 2, groups
+
+
+def test_drifted_text_at_the_same_offset_is_a_duplicate() -> None:
+    # The 783adbcd/ad2cf706 pair: same clock position, decodes one letter apart (بەڵێ/بەلێ).
+    drifted = TEXT.replace("تەواوی", "تەڵاوی")
+    near = '{"source_start_ms": 132958, "source_end_ms": 140753}'
+    rows = [
+        ("a", r"D:\x\one.flac", ALIGN, TEXT, 0),
+        ("b", r"D:\x\two.flac", near, drifted, 0),
+    ]
+    groups = duplicate_groups(rows)
+    assert len(groups) == 1 and len(groups[0]) == 2, groups
+
+
+def test_different_text_at_the_same_offset_is_not_flagged() -> None:
+    # Two recordings can coincidentally place DIFFERENT sentences near the same clock position;
+    # rule B needs >= 90% text similarity, not just the offset.
+    other_text = "ئەمە ڕستەیەکی تەواو جیاوازە و هیچ پەیوەندییەکی بەوی ترەوە نییە"
+    rows = [
+        ("a", r"D:\x\one.flac", ALIGN, TEXT, 0),
+        ("b", r"D:\x\two.flac", ALIGN, other_text, 0),
     ]
     assert duplicate_groups(rows) == []
 

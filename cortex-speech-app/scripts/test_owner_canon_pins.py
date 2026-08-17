@@ -71,10 +71,14 @@ def test_no_banned_model_enters_the_stack() -> None:
 
 
 def test_the_duplicate_audit_baseline_only_ratchets_down() -> None:
+    # 170 = the corrected 2026-08-17 measurement (rules A+B; the first 70 undercounted because the
+    # mp4's shifted clock defeated offset matching — the owner's ears found the difference). The
+    # cleanup lowers this toward 0; RAISING it is indistinguishable from waving a fresh duplicate
+    # import through, so it needs the owner's `change canon:` and a matching edit here.
     audit = _read("scripts/check_dataset_duplicates.py")
     line = next(l for l in audit.splitlines() if l.startswith("KNOWN_BASELINE"))
     baseline = int(line.split("=")[1].strip())
-    assert baseline <= 70, f"duplicate baseline rose to {baseline} — it may only ever go DOWN"
+    assert baseline <= 170, f"duplicate baseline rose to {baseline} — it may only ever go DOWN"
 
 
 def main() -> int:
