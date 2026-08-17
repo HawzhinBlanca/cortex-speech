@@ -8952,3 +8952,101 @@ live gates green. Honest remainder: simultaneous cross-talk is per-clip reviewer
 the type-every-word/REJECT rule), and the QC pool needs 3 owner adjudications to reach 24.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+---
+
+## 2026-08-17 — the external audit closed, provenance for processed audio, and the training pack learns to describe itself
+
+**Three landings, two merged PRs, and one honest failure worth recording.**
+
+### PR #61 — the app-reliability audit's remaining list (629e9f1)
+
+Nine commits. The substantive one: the long-audio import called itself streaming while its decode
+callback was `Send + 'static`, so the only thing it could do was push every window into a Vec and
+process the file afterwards. Measured on the library's longest source (KBHP-EP12.wav, 5,315 s /
+162 MB):
+
+| | before | after |
+|---|---|---|
+| peak PCM held | 170.1 MB | ≤ 11.5 MB |
+| full-file hashes | 60 | 1 |
+| retained chunk f32 (champion config) | 340 MB | 0 |
+
+Windows now arrive over a `sync_channel(1)`; the timeout is per-window and genuinely stops the
+decoder; `decode_to_pcm_with_timeout` gained an abort flag its worker checks per packet. Proven
+faithful on real audio: 60 windows, byte-identical offsets and lengths to the direct decoder,
+`is_last` set exactly once.
+
+Also: 200 % zoom (`h-full` + `justify-center` inside a scroller pushed content above `scrollTop: 0`
+where nothing can reach it — six boxes, measured at 640×400 in the running app); ErrorBoundary made
+a real `<svelte:boundary>` (it listened on window `error`, so one failure painted all ten instances
+red); a refused Settings save no longer sticks; total deadline on cloud calls and a write deadline
+on couch responses; trust-boundary checks on the executed script path and the off-drive backup dir;
+60-day log retention (23 MB, unbounded); the freshness gate now sees stale installers.
+
+### PR #62 — processed audio declares itself (6dc958c)
+
+The pre-import cleaner (`kurdish-audio-cleaner`, separate repo) separates voice from music with
+MelBand-RoFormer, **cuts every non-speech stretch out**, re-concatenates with 150 ms pauses, and
+normalises to −20 LUFS. Its output is an ordinary WAV — indistinguishable from a raw field recording
+by inspection, and until now indistinguishable in this database too. 550 h of it was staged to
+import.
+
+Migration **v54** adds `source_audio_provenance`, keyed by SOURCE PATH (the processing is a property
+of the recording, and keying it this way leaves `speech_segments`' column layout — and
+`SEGMENT_SELECT_COLUMNS`' index-based `map_row` — untouched). `source_provenance::detect` reads the
+cleaner's own manifest; the import records it before decoding anything; `export_dataset` and the
+published `dataset_card.md` print one notice per affected recording.
+
+Detection requires an explicit `audio_is_processed: true` and NEVER infers from a folder name: a
+false positive brands originals as processed, a false negative is the exact lie this prevents. An
+absent record means **unclaimed**, never "verified original".
+
+Verified end to end on the real corpus: the cleaned tree declares its separator model, its removals
+and that its timeline does not map back; `KBHP-EP12.wav` beside it stays unclaimed. The tree's
+manifest predated the provenance block and was backfilled from the cleaner's own constants.
+
+### Phase 1 + 2 of docs/PLAN_TRUE_10.md
+
+The 2026-08-17 flywheel audit was reality-checked line by line against the code and the live DB.
+**Mostly true** — training is external and unwired, the pack was unsplit and minimal, and the labeled
+set really is **426 clips / 64.7 min with 94.7 % from one recording** (measured, not quoted). **Two
+claims refuted:** Inbox decisions are NOT omitted (`record_human_decision` sets `verified=1`), and
+accept-saves-a-different-transcript was fixed on 2026-08-17 by the accept-what-you-SEE snapshot.
+
+*Phase 1* — the 550 h cleaned corpus imports in diversity-ordered batches (smallest books first;
+each book is one narrator). Batch 1 = 5 narrators / 2.69 h.
+
+*Phase 2* — the pack now carries `split` (leakage-safe, from the same `assign_splits` the HF export
+uses, fixed seed, every clip of a recording in one split), plus `segment_id`, `source_recording`,
+`decision`, `decision_revision`, `grade`, and `audio_processed`. The snapshot id IS the manifest
+content hash, sealed into `dataset_runs` with INSERT OR IGNORE — `dataset_runs` existed with zero
+rows and no writer; this is its first.
+
+**Counted, never silent:** `emittedWithoutHumanDecision` reports rows verified with no live human
+decision — batch-verified, or a verdict the reviewer UNDID, since `clear_human_decision` clears the
+decision but leaves `verified=1`. The rubric grades those SILVER so nothing is mislabeled; the
+quantity was simply invisible. Review semantics deliberately unchanged — whether undo should re-open
+a clip is the owner's call.
+
+**Deliberately NOT changed:** the review queue. Round-robin across recordings was considered for
+label diversity and rejected after reading the code — oldest-first FIFO is a documented decision (a
+27 h import once buried 537 clips of the original corpus behind 6,823 newer ones). With FIFO, import
+SELECTION is the diversity lever.
+
+### The honest failure
+
+The first headless import refused all 23 files: **closing the app kills the champion**, because
+supervision lives in the app process (`engine_runtime.rs` holds the `wsl.exe` child). The hard stop
+behaved exactly as designed — 0 clips written, nothing half-transcribed. Two more self-inflicted
+failures followed on the batch runner: the re-enabled watchdog relaunched the app and took the
+instance lock, and Python's CRLF left a carriage return inside every directory name (`Os code 123`)
+while a `grep`-based success check hid the reason. All three are now written into the runner's own
+header so the next run cannot repeat them.
+
+**State:** library 14,894 clips; 34 cleaned recordings imported and declared; 1,218 Rust lib tests,
+72/72 python policies at commit time, 272 frontend tests, clippy + fmt clean. Remaining red gates are
+environmental and owner-gated: `spot-check-pool` needs 3 owner adjudications, and the watchdog is
+disabled only for the open import window.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
