@@ -437,13 +437,44 @@ pub fn export_finetune_pack(
 
     // LEAKAGE-SAFE SPLIT over exactly the rows this pack will emit (P2, 2026-08-17). The pack used
     // to ship unsplit, so nothing stopped a fine-tune from validating on a voice it had trained on —
-    // and with 94.7 % of today's labels from a single recording that is not a theoretical risk. Same
-    // `assign_splits` the HuggingFace export uses: every clip of one recording lands in one split,
-    // groups are seed-shuffled deterministically. Fixed seed so the split is a property of the DATA,
-    // not of when the export ran.
+    // and with 94.7 % of today's labels from a single recording that is not a theoretical risk.
+    //
+    // GROUPED BY AUDIO CONTENT, not by file name. `assign_splits` keys on the path's BASENAME, which
+    // is the right unit for the HuggingFace export's flat library but is wrong twice over here:
+    //
+    //  * the SAME recording re-encoded under a different name is two groups, so it straddles splits.
+    //    This library contains exactly that — `check_dataset_duplicates.py` documents
+    //    `A1-0032_PODCAST-001.mp4` as a third encode of the Lamofull material, and Lamofull is 94.7 %
+    //    of the labeled duration, so once it fills `train` every other group is forced into
+    //    validation/test. Adversarial verification 2026-08-17 measured that exact split.
+    //  * the audiobook corpus names every chapter `01.wav`, `02.wav`, … inside its own book folder,
+    //    so chapter 4 of three different books collides into ONE group.
+    //
+    // `audio_content_hash` (v51) is the identity that survives a re-encode; the full path is the
+    // fallback when a row predates the backfill, and it is at least never a cross-book collision.
     const SPLIT_SEED: u64 = 20_260_817;
-    let training_ready: Vec<crate::db::SpeechSegment> =
-        graded.iter().filter(|(_, r)| r.training_ready).map(|(s, _)| (*s).clone()).collect();
+    // path -> content hash, for every recording whose identity has been computed (v51 + the
+    // backfill). A recording with no hash keeps its full path, which is at least never a cross-book
+    // basename collision.
+    let content_identity: std::collections::HashMap<String, String> = db
+        .load_audio_identities()?
+        .into_iter()
+        .filter_map(|identity| identity.content.filter(|hash| !hash.is_empty()).map(|hash| (identity.audio_path, hash)))
+        .collect();
+    let training_ready: Vec<crate::db::SpeechSegment> = graded
+        .iter()
+        .filter(|(_, r)| r.training_ready)
+        .map(|(s, _)| {
+            let mut grouping_copy = (*s).clone();
+            // This copy exists ONLY to be grouped — `assign_splits` returns (segment_id, split), so
+            // rewriting the path here cannot reach the manifest.
+            grouping_copy.audio_path = match content_identity.get(&s.audio_path) {
+                Some(hash) => format!("content-{hash}"),
+                None => s.audio_path.clone(),
+            };
+            grouping_copy
+        })
+        .collect();
     let splits: std::collections::HashMap<String, &'static str> =
         crate::export::assign_splits(&training_ready, 0.8, 0.1, 0.1, SPLIT_SEED, true).into_iter().collect();
 
@@ -544,7 +575,12 @@ pub fn export_finetune_pack(
         "emittedWithoutHumanDecision": emitted_without_human_decision,
         "totalVerified": total_verified,
         "splitSeed": SPLIT_SEED,
-        "splitPolicy": "assign_splits 80/10/10, speaker+recording disjoint groups — every clip of one recording lands in one split",
+        // Says what the split ACTUALLY guarantees. The first wording claimed "speaker disjoint",
+        // which is not true on this library: the only automatic speaker labeler emits per-recording
+        // `SPEAKER_00…`, which `assign_splits` deliberately scopes per recording, so the
+        // speaker-union step links nothing. Sealing a guarantee the data cannot support is the exact
+        // failure this provenance record exists to prevent.
+        "splitPolicy": "assign_splits 80/10/10 over AUDIO-CONTENT groups (audio_content_hash, else full path) — every clip sharing audio content lands in one split, so a re-encode cannot straddle. NOT speaker-disjoint: diarizer labels are per-recording indices, not identities, so two recordings of one person may land in different splits.",
         "rowSchema": "audio_path, sentence, duration_seconds, segment_id, source_recording, split, decision, decision_revision, grade, audio_processed",
         "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; canonical Sorani orthography; variant-aware dedup; one row per (recording, span, text) at its LATEST review_revision",
     });
@@ -1779,6 +1815,95 @@ mod tests {
         assert_eq!(config["emitted"], expected_rows);
         assert_eq!(config["snapshotId"], first.snapshot_id.as_str());
         assert!(config["splitPolicy"].as_str().unwrap().contains("disjoint"));
+    }
+
+    /// Two files holding the SAME audio must never land in different splits.
+    ///
+    /// Found by adversarial verification 2026-08-17, and it was not theoretical: `assign_splits`
+    /// groups by the path's BASENAME, and this library contains a recording imported under three
+    /// names (`check_dataset_duplicates.py` documents `A1-0032_PODCAST-001.mp4` as a re-encode of
+    /// the Lamofull material). Because Lamofull is 94.7 % of the labeled duration, once it fills
+    /// `train` every other group is FORCED into validation/test — so its own re-encode was measured
+    /// landing in `validation` while the same session trained the model. Basenames also collide
+    /// across the audiobook corpus, where every book folder has its own `01.wav`, `02.wav`, …
+    #[test]
+    fn a_reencoded_recording_cannot_straddle_two_splits() {
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        // The live library's SHAPE, which is what makes this bite: one recording holds the
+        // overwhelming majority of the duration (Lamofull is 94.7 % of today's labels). It fills
+        // `train` on its own, so every remaining group is forced into validation/test — and with
+        // basename grouping the two twins are two groups, so they are forced APART.
+        let mut ids_by_group: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, hash, chunks) in
+            [("dominant.wav", "h-dom", 40), ("twin_a.wav", "same-content", 1), ("twin_b.wav", "same-content", 1)]
+        {
+            let wav = tmp.path().join(name);
+            let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+            // Long enough for every chunk this file will be cut into (16 kHz, 1 s per chunk).
+            for i in 0..(16000 * (chunks + 1)) {
+                w.write_sample(((i % 100) - 50) as i16).unwrap();
+            }
+            w.finalize().unwrap();
+            let path = wav.to_string_lossy().to_string();
+            let mut ids = Vec::new();
+            for chunk in 0..chunks {
+                let id = format!("{name}-{chunk}");
+                let start = chunk * 1000;
+                db.insert_segment(&crate::db::SpeechSegment {
+                    id: id.clone(),
+                    audio_path: path.clone(),
+                    raw_transcript: format!("دەقی {name} {chunk}"),
+                    duration_ms: 1000,
+                    alignment_json: Some(format!(
+                        r#"{{"source_start_ms":{start},"source_end_ms":{},"chunk_index":{chunk},"chunk_count":{chunks}}}"#,
+                        start + 1000
+                    )),
+                    ..Default::default()
+                })
+                .unwrap();
+                db.update_verified(&id, true).unwrap();
+                db.record_human_decision(&id, "accept", None, None).unwrap();
+                ids.push(id);
+            }
+            // The identity that survives a re-encode (v51). The twins share theirs.
+            db.set_audio_identity(&path, &crate::fingerprint::AudioIdentity { spectral: 1, content: hash.to_string() })
+                .unwrap();
+            ids_by_group.push((hash.to_string(), ids));
+        }
+
+        let out = tempfile::TempDir::new().unwrap();
+        export_finetune_pack(&db, out.path(), None).unwrap();
+        let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
+        let rows: Vec<serde_json::Value> = manifest.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+
+        let split_of = |segment_id: &str| -> String {
+            rows.iter()
+                .find(|r| r["segment_id"] == segment_id)
+                .map(|r| r["split"].as_str().unwrap().to_string())
+                .unwrap_or_else(|| panic!("{segment_id} missing from the manifest"))
+        };
+        // Every clip sharing audio CONTENT shares a split, whatever the files are called.
+        for (hash, _) in &ids_by_group {
+            let splits: std::collections::HashSet<String> = ids_by_group
+                .iter()
+                .filter(|(h, _)| h == hash)
+                .flat_map(|(_, ids)| ids.iter())
+                .map(|id| split_of(id))
+                .collect();
+            assert_eq!(
+                splits.len(),
+                1,
+                "content {hash} is spread across splits {splits:?} — a re-encode leaking train->test"
+            );
+        }
     }
 
     #[test]

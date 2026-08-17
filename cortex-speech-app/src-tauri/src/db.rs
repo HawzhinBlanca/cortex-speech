@@ -2542,6 +2542,30 @@ impl Database {
                     "UPDATE speech_segments SET audio_path = ?2, updated_at = datetime('now') WHERE audio_path = ?1",
                     params![old, new_path],
                 )?;
+                // Carry the SOURCE-KEYED tables with the move. Both are joined to segments by
+                // audio_path, so relinking only `speech_segments` orphans them at the old key:
+                //
+                //  * `source_audio_provenance` (v54) then reports the recording as UNCLAIMED, and a
+                //    training pack and dataset card would describe neural-separated, re-concatenated
+                //    audio as an original field recording — precisely the lie that table exists to
+                //    prevent, reintroduced by a file move. Found by adversarial verification
+                //    2026-08-17.
+                //  * `source_transcripts` would silently lose its whole-file reference transcripts,
+                //    forcing a re-fetch that the cache was built to avoid.
+                //
+                // Not fatal: a relink whose provenance carry fails must still relink the audio (the
+                // clips are otherwise unplayable), so the failure warns rather than aborting.
+                for (table, what) in [
+                    ("source_audio_provenance", "processing provenance"),
+                    ("source_transcripts", "reference transcripts"),
+                ] {
+                    if let Err(e) = self.conn.execute(
+                        &format!("UPDATE OR IGNORE {table} SET audio_path = ?2 WHERE audio_path = ?1"),
+                        params![old, new_path],
+                    ) {
+                        tracing::warn!("relink: {what} for '{old}' could not follow the move to '{new_path}': {e}");
+                    }
+                }
                 if n > 0 {
                     relinked += 1;
                 }
