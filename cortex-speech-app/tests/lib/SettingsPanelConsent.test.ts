@@ -83,6 +83,33 @@ describe('SettingsPanel cloud-consent transaction', () => {
     expect(get(settings).cloudSttOptIn).toBe(false);
   });
 
+  it('a REJECTED Save rolls the store back instead of leaving refused values on screen', async () => {
+    mocks.updateSettings.mockRejectedValueOnce(new Error('backend refused'));
+    render(SettingsPanel);
+    const box = sttCheckbox();
+
+    await fireEvent.click(box); // grant, then press the real Save button
+    await fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    expect(mocks.updateSettings).toHaveBeenCalledTimes(1);
+    // The backend refused, so nothing may claim the grant took effect — not the store the rest of
+    // the app reads, and not the checkbox the user is looking at.
+    expect(get(settings).cloudSttOptIn).toBe(false);
+    expect(sttCheckbox().checked).toBe(false);
+    expect(get(showSettings)).toBe(true); // and the panel stays open, showing the failure
+  });
+
+  it('the store never shares the object the inputs mutate', async () => {
+    render(SettingsPanel);
+    await fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+    const published = get(settings);
+
+    // A later edit in the panel must not reach into the value the store already published: that
+    // mutation notifies nobody, so the app would silently run on half-typed settings.
+    await fireEvent.click(sttCheckbox());
+    expect(published.cloudSttOptIn).toBe(false);
+  });
+
   it('WITHDRAWING consent persists immediately — a stop instruction cannot wait for Save', async () => {
     settings.set({ ...defaultSettings, cloudSttOptIn: true });
     render(SettingsPanel);

@@ -264,11 +264,11 @@
   async function saveQuietly() {
     coerceSettingsForRuntime();
     if (!tauriAvailable) {
-      settings.set(localSettings);
+      settings.set(publishable());
       return;
     }
     const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
-    settings.set(localSettings);
+    settings.set(publishable());
     try {
       await api.updateSettings(localSettings);
     } catch (e) {
@@ -277,11 +277,27 @@
       // REJECTED the write. A silent consent mismatch — the user believes cloud STT/LLM is on (or off)
       // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
       // to the last-persisted state and surface the failure instead of only logging it.
-      localSettings = { ...prev };
-      sourceReferenceModelsInput = (prev.sourceReferenceModels ?? []).join(', ');
-      settings.set(prev);
+      rollbackTo(prev);
       notifications.error($t('settingsSaveFailed'), { detail: String(e) });
     }
+  }
+
+  // What the store may hold: a COPY, never the object the panel's inputs are bound to.
+  //
+  // `settings.set(localSettings)` handed the store the very object `bind:` keeps mutating, so after
+  // any save every later keystroke edited the store's value in place — no subscriber notified, the
+  // rest of the app silently running on half-typed settings, and the close-to-save diff below
+  // comparing an object with itself (so it never fired again).
+  function publishable(): AppSettings {
+    return { ...localSettings };
+  }
+
+  // Put the last-persisted state back after the backend REJECTED a write, so the UI and the rest of
+  // the app can never keep running on values that were never saved.
+  function rollbackTo(prev: AppSettings) {
+    localSettings = { ...prev };
+    sourceReferenceModelsInput = (prev.sourceReferenceModels ?? []).join(', ');
+    settings.set({ ...prev });
   }
 
   function parseSourceReferenceModels(value: string): string[] {
@@ -321,10 +337,11 @@
 
   async function save() {
     saving = true;
+    const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
     try {
       applySourceReferenceModelsInput();
       coerceSettingsForRuntime();
-      settings.set(localSettings);
+      settings.set(publishable());
       if (!tauriAvailable) {
         notifications.info($t('settingsPreviewOnly'));
         showSettings.set(false);
@@ -337,6 +354,10 @@
       notifications.success($t('settingsSaved'));
       showSettings.set(false);
     } catch (e) {
+      // The store was set optimistically above and the backend then REFUSED the write. Without this
+      // the panel stayed open showing rejected values while the whole app read them as current —
+      // the same lie `saveQuietly` already rolls back, on the path the user actually presses.
+      rollbackTo(prev);
       notifications.error($t('settingsSaveFailed'), { detail: String(e) });
     } finally {
       saving = false;
@@ -428,7 +449,10 @@
     </div>
 
     <div class="flex gap-0 flex-1 min-h-0">
-      <nav class="w-40 shrink-0 p-2 border-r border-cortex-800/50 space-y-1">
+      <!-- overflow-y-auto: the dialog is capped at 85vh, so at 200 % browser zoom (or on a short
+           window) the eight tabs are taller than the column. Without its own scroller the last tabs
+           — Jury and Diagnostics — were simply CLIPPED, with no way to reach them at all. -->
+      <nav class="w-40 shrink-0 overflow-y-auto p-2 border-r border-cortex-800/50 space-y-1">
         {#each tabs as tab}
           <button
             class="w-full text-start px-3 py-2 rounded-lg text-sm transition-colors {activeTab ===
