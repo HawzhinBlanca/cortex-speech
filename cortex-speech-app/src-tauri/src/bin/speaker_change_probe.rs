@@ -108,10 +108,11 @@ fn main() -> Result<(), String> {
 
     // Only the columns this needs (see `SegRow`), so the probe cannot depend on — or be broken by — the
     // wider schema.
+    // ORDERED BY SOURCE FILE, and that ordering is load-bearing — see the decode cache below.
     let mut stmt = conn
         .prepare(
             "SELECT id, audio_path, duration_ms, alignment_json, COALESCE(speaker_id, ''), verified
-             FROM speech_segments ORDER BY id",
+             FROM speech_segments ORDER BY audio_path, id",
         )
         .map_err(|e| e.to_string())?;
     let segments: Vec<SegRow> = stmt
@@ -128,20 +129,43 @@ fn main() -> Result<(), String> {
     // Keep each half's embedding, not just the within-clip score. The controls below need them.
     let mut halves: Vec<(String, String, Vec<f32>, Vec<f32>)> = Vec::new();
 
-    for (id, audio_path, duration_ms, alignment_json, speaker, _verified) in &segments {
+    // ONE decode per SOURCE FILE, not per clip. The library's clips point at whole episode WAVs —
+    // ~450 clips per ~58-minute file — and decoding the full source for every row meant ~112 MB of
+    // PCM churned 450 times per episode. MEASURED 2026-08-17: the per-clip version died mid-run on
+    // the 14,828-clip library (Windows RADAR_PRE_LEAK_64 fault on this exe, zero scores persisted,
+    // no output past the header) after over an hour of compute. Rows are ordered by audio_path
+    // above, so one cached decode serves every clip cut from that source before it is dropped —
+    // bounded memory, and the decode cost falls by the clips-per-source factor.
+    let mut cached: Option<(String, u32, Vec<i16>)> = None;
+    for (done, (id, audio_path, duration_ms, alignment_json, speaker, _verified)) in segments.iter().enumerate() {
+        // A long silent loop is undiagnosable when it dies — that is exactly how the per-clip
+        // version failed: the log ended at the header and the crash site was anyone's guess.
+        if done % 1000 == 0 && done > 0 {
+            println!("  ...{done} of {} clips", segments.len());
+        }
         if *duration_ms < MIN_HALF_MS * 2 {
             skipped_short += 1;
             continue;
         }
-        let Ok((rate, pcm)) = audio::decode_to_pcm(audio_path) else {
+        if cached.as_ref().is_none_or(|(path, _, _)| path != audio_path) {
+            let Ok((raw_rate, raw_pcm)) = audio::decode_to_pcm(audio_path) else {
+                skipped_audio += 1;
+                cached = None;
+                continue;
+            };
+            let Ok(resampled) = audio::ensure_pcm_16khz(raw_rate, raw_pcm) else {
+                skipped_audio += 1;
+                cached = None;
+                continue;
+            };
+            cached = Some((audio_path.clone(), resampled.0, resampled.1));
+        }
+        let Some((_, rate, pcm)) = cached.as_ref() else {
             skipped_audio += 1;
             continue;
         };
-        let Ok((rate, pcm)) = audio::ensure_pcm_16khz(rate, pcm) else {
-            skipped_audio += 1;
-            continue;
-        };
-        let Ok((clip, _)) = chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref()) else {
+        let (rate, pcm) = (*rate, pcm.as_slice());
+        let Ok((clip, _)) = chunking::slice_pcm_by_alignment(pcm, rate, alignment_json.as_deref()) else {
             skipped_audio += 1;
             continue;
         };
