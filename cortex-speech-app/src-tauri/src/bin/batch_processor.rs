@@ -24,6 +24,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = app_data_dir.join("cortex-speech.db");
     info!("Using Database at: {}", db_path.display());
 
+    // CHAMPION LAW (owner rule 2026-08-11; text-provenance audit #20): this tool drafts with the
+    // bundled offline CTC engine and overwrites raw_transcript on EVERY unverified row. When the
+    // configured primary engine is the WSL 7B champion, running it would silently downgrade the
+    // whole queue to a weaker engine — the exact incident the law exists to prevent. Hard stop.
+    let settings = cortex_speech_app_lib::settings::AppSettings::load(&app_data_dir.join("settings.json"));
+    if settings.asr_model_size == cortex_speech_app_lib::settings::AsrModelSize::WSL7B {
+        return Err("HARD STOP: the configured primary engine is the WSL 7B champion. batch_processor \
+                    drafts with the offline CTC engine and would overwrite champion-quality drafts with \
+                    weaker ones. Use the app's batch_transcribe (champion + hard-stop path) instead."
+            .into());
+    }
+
     // Same single-instance lock as the app and batch_importer (the Week-2 write-path audit found this
     // tool claimed parity but took no lock): never write the live DB concurrently with the running
     // app — WAL would prevent corruption, but the repo's cross-process discipline is the InstanceLock.
@@ -57,14 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = app_data_dir.join("models");
     let asr_pool = AsrPool::new();
     let asr_config = AsrLoadConfig {
-        // This offline batch helper fills UNVERIFIED drafts with the always-present BUNDLED engine
-        // (OmniASR-CTC-300M = AsrModelSize::default()). NOTE: that is NOT the app default — the GUI's
-        // default is the WSL-7B champion (settings.rs) — but the 7B needs the WSL server running and the
-        // fine-tuned CTC-1B isn't on a standard install, either of which would make this headless helper
-        // fail. The drafts it writes are verified=false and flow through the SAME review/agentic gates as
-        // any unreviewed draft (no gold fabrication — see the write below), so this is a deliberate
-        // availability trade-off, not the silent downgrade of the user's SELECTED engine that the GUI's
-        // F2 guard forbids. Expect bundled-engine draft quality (higher CER than the 7B) from a batch run.
+        // The WSL champion hard-stops above because this legacy helper cannot drive it. If the operator
+        // explicitly selected a local engine, preserve that exact choice; never inherit
+        // AsrLoadConfig's 300M library default and silently change provenance/quality.
+        model_size: settings.asr_model_size.clone(),
         num_threads: 8,
         ..AsrLoadConfig::default()
     };

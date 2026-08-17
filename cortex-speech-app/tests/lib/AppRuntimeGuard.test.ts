@@ -24,7 +24,6 @@ function backendSettingsFixture() {
   return {
     model_dir: 'models',
     output_dir: 'exports',
-    asr_provider: 'SherpaOnnxCtc',
     asr_model_size: 'CTC300M',
     vad_threshold: 0.5,
     min_segment_duration_ms: 3000,

@@ -102,49 +102,6 @@ pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<Agent
 }
 
 #[tauri::command]
-pub async fn run_consensus_refinery(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("run_consensus_refinery")?;
-    let normalizer = state.normalizer.clone(); // Arc<SoraniNormalizer> — cheap clone
-    let db = state.db_arc();
-    run_blocking(move || {
-        let hypotheses = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_all_hypotheses().map_err(|e| e.to_string())?
-        };
-
-        if hypotheses.is_empty() {
-            return Ok(serde_json::json!({
-                "status": "ignored",
-                "message": "No segment hypotheses found in database"
-            }));
-        }
-
-        let results = crate::quality::irt::fit_irt_consensus(&hypotheses);
-
-        let mut updates = Vec::new();
-        for (segment_id, consensus_text) in &results.consensus_transcripts {
-            // Missing IRT confidence ⇒ MINIMUM, not maximum: a no-signal segment must not be recorded
-            // as maximally confident (which would suppress its escalation downstream).
-            let confidence = *results.segment_confidences.get(segment_id).unwrap_or(&0.0);
-            let normalized_text = normalizer.normalize(consensus_text);
-            updates.push((segment_id.clone(), consensus_text.clone(), normalized_text, confidence));
-        }
-
-        let segments_updated = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.update_segment_consensus_batch(&updates).map_err(|e| e.to_string())?
-        };
-
-        Ok(serde_json::json!({
-            "status": "success",
-            "segmentsUpdated": segments_updated,
-            "modelAbilities": results.model_abilities,
-        }))
-    })
-    .await
-}
-
-#[tauri::command]
 pub fn get_escalation_queue(state: State<'_, AppState>, limit: usize) -> Result<Vec<crate::db::SpeechSegment>, String> {
     RATE_LIMITER.check("get_escalation_queue")?;
     let db = state.lock_db();

@@ -70,8 +70,10 @@ def main() -> None:
         "has_t2_listener_evidence",
         "has_t2_listener_evidence_for_transcript",
         "evidence_transcript_matches",
-        '"selectedTranscript": "jury selected transcript"',
-        '"t2Transcript": "t2 selected transcript"',
+        # VERBATIM LAW (2026-08-12): the silver fixtures certify the champion's RAW text — the
+        # jury/t2 evidence must agree with the text the export actually ships.
+        '"selectedTranscript": "raw",',
+        '"t2Transcript": "raw transcript"',
         "HypothesisCoverageReport",
         "MIN_HYPOTHESIS_MODELS_FOR_TRAINING_READY_MACHINE",
         "hypothesis_coverage_for_model_outputs",

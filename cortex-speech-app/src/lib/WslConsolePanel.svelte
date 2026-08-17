@@ -251,7 +251,9 @@
               </span>
             {:else if status === 'completed'}
               {#if lastFailed > 0}
-                <span class="text-amber-400 font-semibold">● {lastTranscribed} ✓ · {lastFailed} ✗</span>
+                <span class="text-amber-400 font-semibold"
+                  >● {lastTranscribed} ✓ · {lastFailed} ✗</span
+                >
               {:else}
                 <span class="text-emerald-400 font-semibold">● {$t('wsl.completed')}</span>
               {/if}

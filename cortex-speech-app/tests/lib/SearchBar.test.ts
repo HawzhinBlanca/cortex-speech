@@ -4,15 +4,23 @@ import { get } from 'svelte/store';
 import SearchBar from '../../src/lib/SearchBar.svelte';
 import { filteredSegments, searchQuery, searchResults, filterVerified, sortOrder, segments } from '../../src/lib/stores/segmentStore';
 import { ckb } from '../../src/lib/i18n/ckb';
-import { searchSegments } from '../../src/lib/commands';
+import { getSegmentsPage } from '../../src/lib/commands';
 import type { SpeechSegment } from '../../src/lib/types';
 
 vi.mock('../../src/lib/commands', () => ({
-  searchSegments: vi.fn(() => Promise.resolve([])),
+  getSegmentsPage: vi.fn(() => Promise.resolve({ items: [], total: 0, nextCursor: null })),
+  getDatasetCertificate: vi.fn(() => Promise.resolve({ threshold: 0.35 })),
+  getDatasetStats: vi.fn(() => Promise.resolve({
+    totalSegments: 0,
+    verifiedCount: 0,
+    pendingCount: 0,
+    totalDurationSeconds: 0,
+  })),
+  getSegment: vi.fn(),
 }));
 
 const searchPlaceholder = ckb.searchPlaceholder;
-const searchSegmentsMock = vi.mocked(searchSegments);
+const getSegmentsPageMock = vi.mocked(getSegmentsPage);
 
 function makeSegment(overrides: Partial<SpeechSegment>): SpeechSegment {
   return {
@@ -31,7 +39,7 @@ function makeSegment(overrides: Partial<SpeechSegment>): SpeechSegment {
 
 describe('SearchBar', () => {
   beforeEach(() => {
-    searchSegmentsMock.mockClear();
+    getSegmentsPageMock.mockClear();
     delete window.__TAURI__;
     delete window.__TAURI_INTERNALS__;
     segments.set([]);
@@ -126,10 +134,24 @@ describe('SearchBar', () => {
     await fireEvent.input(input, { target: { value: 'sorani' } });
     await vi.advanceTimersByTimeAsync(250);
 
-    expect(searchSegmentsMock).not.toHaveBeenCalled();
     expect(get(searchQuery)).toBe('sorani');
     expect(get(searchResults)).toBeNull();
     expect(get(filteredSegments).map((segment) => segment.id)).toEqual(['a']);
+    vi.useRealTimers();
+  });
+
+  it('reloads a bounded server-side search window in desktop mode', async () => {
+    vi.useFakeTimers();
+    window.__TAURI_INTERNALS__ = {};
+    render(SearchBar);
+    await fireEvent.input(screen.getByPlaceholderText(searchPlaceholder), {
+      target: { value: 'sorani' },
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    await vi.runAllTimersAsync();
+    expect(getSegmentsPageMock).toHaveBeenCalledWith(
+      expect.objectContaining({ query: 'sorani', limit: 200, cursor: null }),
+    );
     vi.useRealTimers();
   });
 });

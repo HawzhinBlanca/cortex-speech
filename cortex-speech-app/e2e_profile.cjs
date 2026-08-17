@@ -153,12 +153,18 @@ async function provisionEngine(page, engine = 'CTC300M') {
     .evaluate(async (e) => {
       const s = await window.__TAURI_INTERNALS__.invoke('get_settings');
       s.asr_model_size = e;
+      // Refinement OFF, explicitly. The default is llm_mode = Local, which needs an LLM server on
+      // 127.0.0.1 that this machine may or may not be running — and a refinement failure is a HARD
+      // STOP by design, so the whole gate then fails for a reason that has nothing to do with what
+      // it proves (import -> VAD -> ASR). A gate must own every setting its verdict depends on.
+      // Measured 2026-08-17: Ollama answered 404 and three green pipelines reported dead.
+      s.llm_mode = 'None';
       await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
     }, engine)
     .catch((e) => {
       throw new Error('Could not provision the ASR engine in the disposable profile: ' + e.message);
     });
-  console.log(`==> Provisioned ASR engine '${engine}' in the disposable profile`);
+  console.log(`==> Provisioned ASR engine '${engine}' (refinement off) in the disposable profile`);
 }
 
 module.exports = {

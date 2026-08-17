@@ -1497,6 +1497,49 @@ pub static MIGRATIONS: &[Migration] = &[
         up_sql: "ALTER TABLE speech_segments RENAME COLUMN agent_confidence TO agreement_score;",
         down_sql: Some("ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;"),
     },
+    Migration {
+        version: 53,
+        description: "Monotonic speech-segment revision for atomic remote-review compare-and-swap",
+        // `updated_at` has one-second resolution, so two real writes in the same second can carry the
+        // same value. Couch Review used it as a serve/decide/undo fence, which made those writes
+        // invisible and also left a check-then-write TOCTOU window. A database-owned integer revision
+        // changes on EVERY row update, independent of which write path performed it, and can therefore
+        // be used in the UPDATE's own WHERE clause.
+        //
+        // The old FTS update trigger ran for every metadata-only update. The revision trigger performs
+        // one such metadata update itself, so narrow the FTS trigger to the four columns it actually
+        // indexes before installing the revision trigger. This avoids duplicate FTS delete/insert work
+        // while preserving the exact external-content index semantics.
+        up_sql: "ALTER TABLE speech_segments ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 0;
+                 DROP TRIGGER IF EXISTS segments_au;
+                 CREATE TRIGGER segments_au AFTER UPDATE OF
+                     audio_path, raw_transcript, normalized_transcript, annotated_transcript
+                 ON speech_segments BEGIN
+                     INSERT INTO segments_fts(segments_fts, rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                     VALUES ('delete', old.rowid, old.id, old.audio_path, old.raw_transcript, old.normalized_transcript, old.annotated_transcript);
+                     INSERT INTO segments_fts(rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                     VALUES (new.rowid, new.id, new.audio_path, new.raw_transcript, new.normalized_transcript, new.annotated_transcript);
+                 END;
+                 CREATE TRIGGER speech_segments_review_revision
+                 AFTER UPDATE ON speech_segments
+                 WHEN new.review_revision = old.review_revision
+                 BEGIN
+                     UPDATE speech_segments
+                     SET review_revision = old.review_revision + 1
+                     WHERE id = old.id;
+                 END;",
+        down_sql: Some(
+            "DROP TRIGGER IF EXISTS speech_segments_review_revision;
+             DROP TRIGGER IF EXISTS segments_au;
+             CREATE TRIGGER segments_au AFTER UPDATE ON speech_segments BEGIN
+                 INSERT INTO segments_fts(segments_fts, rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                 VALUES ('delete', old.rowid, old.id, old.audio_path, old.raw_transcript, old.normalized_transcript, old.annotated_transcript);
+                 INSERT INTO segments_fts(rowid, id, audio_path, raw_transcript, normalized_transcript, annotated_transcript)
+                 VALUES (new.rowid, new.id, new.audio_path, new.raw_transcript, new.normalized_transcript, new.annotated_transcript);
+             END;
+             ALTER TABLE speech_segments DROP COLUMN review_revision;",
+        ),
+    },
 ];
 
 #[cfg(test)]

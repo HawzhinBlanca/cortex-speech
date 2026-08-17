@@ -56,7 +56,7 @@ const hasLatinLetters = (s) => /[A-Za-z]/.test(s);
   console.log('==> import_audio_file');
   await invoke('import_audio_file', { path: AUDIO });
   let segs = [];
-  for (let i = 0; i < 120; i++) { segs = (await invoke('get_segments', { verified: null }).catch(() => [])) || []; if (segs.length) break; await sleep(2000); }
+  for (let i = 0; i < 120; i++) { segs = (await invoke('get_segments_page', { verified: null, query: null, sort: 'oldest', limit: 300, cursor: null }).then((p) => p.items).catch((e) => { if (String(e).includes('not found')) throw e; return []; })) || []; if (segs.length) break; await sleep(2000); }
   if (!segs.length) throw new Error('VAD produced 0 segments');
   const seg = segs[0];
   console.log(`==> transcribe_segment_finetuned (embedded model) on ${path.basename(seg.audioPath || '')}`);

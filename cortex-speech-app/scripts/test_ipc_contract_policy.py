@@ -25,12 +25,7 @@ FRONTEND_DIR = REPO_ROOT / "src"
 _INVOKE_OPEN = re.compile(r"\binvoke\s*(?:<[^>]*>)?\s*\(\s*")
 
 
-def _strip_comments(text: str) -> str:
-    """Drop /* */ and // and <!-- --> comments so an `invoke(...)` in a doc comment or an example never
-    counts as a real call site (globalErrorTrap.ts documents `invoke(...)` in a JSDoc block, e.g.)."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
-    return "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+from _policy_util import strip_comments as _strip_comments  # noqa: E402
 
 
 def registered_commands() -> set[str]:

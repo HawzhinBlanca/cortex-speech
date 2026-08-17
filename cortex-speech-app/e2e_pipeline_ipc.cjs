@@ -76,14 +76,14 @@ async function run() {
   console.log('==> import_audio_file:', AUDIO);
   await invoke('import_audio_file', { path: AUDIO });
 
-  console.log('==> Polling get_segments for VAD output...');
+  console.log('==> Polling get_segments_page for VAD output...');
   let segs = [];
   for (let i = 0; i < 360; i++) {
-    segs = (await invoke('get_segments', { verified: null }).catch(() => [])) || [];
+    segs = (await invoke('get_segments_page', { verified: null, query: null, sort: 'oldest', limit: 300, cursor: null }).then((p) => p.items).catch((e) => { if (String(e).includes('not found')) throw e; return []; })) || [];
     if (Array.isArray(segs) && segs.length >= 1) break;
     await sleep(2000);
   }
-  if (!segs.length) throw new Error('VAD produced 0 segments (get_segments empty).');
+  if (!segs.length) throw new Error('VAD produced 0 segments (get_segments_page empty).');
   console.log(`==> VAD produced ${segs.length} segment(s).`);
 
   const seg = segs[0];

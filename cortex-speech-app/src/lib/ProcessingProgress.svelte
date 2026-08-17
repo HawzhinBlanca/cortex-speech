@@ -117,15 +117,24 @@
     <div class="flex items-center gap-3">
       <svg class="animate-spin w-4 h-4 shrink-0 text-amber-400" fill="none" viewBox="0 0 24 24">
         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
-        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        <path
+          class="opacity-75"
+          fill="currentColor"
+          d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+        />
       </svg>
       <span class="text-sm font-semibold text-default shrink-0">{phaseLabel}</span>
       {#if $pipelineStatus}
-        <span class="text-xs text-cortex-400 truncate" title={$pipelineStatus}>{$pipelineStatus}</span>
+        <span class="text-xs text-cortex-400 truncate" title={$pipelineStatus}
+          >{$pipelineStatus}</span
+        >
       {/if}
       <span class="flex-1"></span>
       {#if stats.hasPercent}
-        <span data-testid="processing-percent" class="text-sm font-mono font-semibold text-amber-300 tabular-nums">
+        <span
+          data-testid="processing-percent"
+          class="text-sm font-mono font-semibold text-amber-300 tabular-nums"
+        >
           {stats.percent}%
         </span>
       {/if}
@@ -151,19 +160,27 @@
     <!-- Row 3: counts, elapsed, ETA, file, stage chips -->
     <div class="mt-1.5 flex items-center flex-wrap gap-x-4 gap-y-1 text-[11px] text-cortex-400">
       {#if stats.total > 0}
-        <span class="tabular-nums">{$t('pipeline.progressCount', {
-          done: String(stats.done),
-          total: String(stats.total),
-        })}</span>
+        <span class="tabular-nums"
+          >{$t('pipeline.progressCount', {
+            done: String(stats.done),
+            total: String(stats.total),
+          })}</span
+        >
       {/if}
-      <span class="tabular-nums">{$t('pipeline.elapsed', { time: formatDurationShort(elapsedMs) })}</span>
+      <span class="tabular-nums"
+        >{$t('pipeline.elapsed', { time: formatDurationShort(elapsedMs) })}</span
+      >
       {#if stats.etaMs !== null && stats.etaMs > 0}
-        <span class="tabular-nums text-cortex-500">{$t('pipeline.eta', {
-          time: formatDurationShort(stats.etaMs),
-        })}</span>
+        <span class="tabular-nums text-cortex-500"
+          >{$t('pipeline.eta', {
+            time: formatDurationShort(stats.etaMs),
+          })}</span
+        >
       {/if}
       {#if fileName}
-        <span class="truncate max-w-[16rem] text-cortex-500" title={$pipelineCurrentFile}>{fileName}</span>
+        <span class="truncate max-w-[16rem] text-cortex-500" title={$pipelineCurrentFile}
+          >{fileName}</span
+        >
       {/if}
       {#if recentStages.length}
         <span class="flex items-center gap-1 flex-wrap">

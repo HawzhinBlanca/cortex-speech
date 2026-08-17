@@ -16,6 +16,49 @@ pub struct LlmRefiner {
     pub model: String,
 }
 
+/// Is this refinement error worth another attempt?
+///
+/// TRANSIENT = the same request could succeed shortly: rate limiting, provider-side 5xx, a timeout or
+/// dropped connection, and "no message content", which is how an overloaded OpenRouter reply arrives
+/// once the JSON parses but carries no choice.
+///
+/// NOT transient: 401/403 (a bad key stays bad), 404 and "model" errors (an unknown model id will not
+/// appear), and content refusals. Retrying those only delays an honest stop.
+fn is_transient(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    if e.contains("401") || e.contains("403") || e.contains("unauthorized") || e.contains("api key") {
+        return false;
+    }
+    if e.contains("404") || e.contains("not a valid model") || e.contains("no endpoints found") {
+        return false;
+    }
+    // A 429 is USUALLY throttling, but the billing/quota family is permanent for this run: no amount
+    // of backoff refills a depleted balance. MEASURED 2026-08-12 on the real API — "Your prepayment
+    // credits are depleted" arrives as HTTP 429, so the blanket 429 rule below spent 4 attempts and
+    // 7 s of backoff PER CLIP before failing, and reported it as a retry exhaustion rather than as
+    // the billing problem it is. Checked before the 429 rule, like the other permanent classes.
+    if e.contains("credits are depleted")
+        || e.contains("insufficient credit")
+        || e.contains("quota exceeded")
+        || e.contains("exceeded your current quota")
+        || e.contains("billing")
+    {
+        return false;
+    }
+    e.contains("429")
+        || e.contains("rate limit")
+        || e.contains("timed out")
+        || e.contains("timeout")
+        || e.contains("connection")
+        || e.contains("temporarily")
+        || e.contains("overloaded")
+        || e.contains("no message content")
+        || e.contains(" 500")
+        || e.contains(" 502")
+        || e.contains(" 503")
+        || e.contains(" 504")
+}
+
 impl LlmRefiner {
     pub fn new(
         mode: &crate::settings::LlmMode,
@@ -76,11 +119,96 @@ impl LlmRefiner {
         self.call_provider(&user_content)
     }
 
+    /// Attempts per refinement call: the first try plus 3 retries.
+    const MAX_ATTEMPTS: u32 = 4;
+
     fn call_provider(&self, user_content: &str) -> Result<String, String> {
-        match self.provider {
-            LlmProvider::Local => self.call_openai_compatible(user_content),
-            LlmProvider::Gemini => self.call_gemini(user_content),
+        // Retry transient provider failures before giving up, because the caller HARD STOPS on the
+        // error (owner rule 2026-08-11) and halting a 487-clip run on one rate-limit reply would be
+        // brittle, not strict.
+        //
+        // Measured 2026-08-10: 59 of 487 clips failed refinement during a run with 8 concurrent
+        // workers — a ~12% failure rate that appeared only once the batch became concurrent, which is
+        // the signature of provider rate limiting rather than bad input. There was no retry anywhere:
+        // API_AGENT is a bare ureq agent.
+        //
+        // Exponential backoff (1s, 2s, 4s) and only for TRANSIENT classes. A 401, an unknown model or
+        // a refusal is not going to change on the third ask, and retrying it just delays an honest
+        // stop by seven seconds.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = match self.provider {
+                LlmProvider::Local => self.call_openai_compatible(user_content),
+                LlmProvider::Gemini => self.call_gemini(user_content),
+            };
+            match result {
+                Ok(text) => return Ok(text),
+                Err(e) if attempt < Self::MAX_ATTEMPTS && is_transient(&e) => {
+                    let wait = std::time::Duration::from_secs(1 << (attempt - 1));
+                    tracing::warn!(
+                        "LLM refinement attempt {attempt}/{} failed transiently ({e}); retrying in {:?}",
+                        Self::MAX_ATTEMPTS,
+                        wait
+                    );
+                    std::thread::sleep(wait);
+                }
+                Err(e) => return Err(if attempt > 1 { format!("{e} (after {attempt} attempts)") } else { e }),
+            }
         }
+    }
+
+    /// Transcribe audio through the OpenAI-compatible endpoint (OpenRouter), which carries audio to
+    /// Gemini 2.5 Pro via the `input_audio` content part.
+    ///
+    /// Lives HERE, beside `call_openai_compatible`, because this module is what the cloud-privacy
+    /// gate audits: the key goes in the `Authorization` header and every provider error is passed
+    /// through `redact_api_key` before it can reach a log or a UI. A caller assembling its own
+    /// request would sit outside both guarantees.
+    ///
+    /// Measured need (2026-08-12): the DIRECT Gemini key's billing project reports "prepayment
+    /// credits are depleted" (HTTP 429) on every model, while the OpenRouter key works — so this is
+    /// the live path to Gemini-class audio. `temperature: 0` keeps a benchmark reproducible; an
+    /// EMPTY reply is an error, never an empty transcript (scoring "" as a transcription would
+    /// fabricate a CER).
+    pub fn transcribe_audio(&self, audio_bytes: &[u8], format: &str, prompt: &str) -> Result<String, String> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+        let payload = json!({
+            "model": self.model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": prompt },
+                    { "type": "input_audio", "input_audio": { "data": b64, "format": format } }
+                ]
+            }],
+            "temperature": 0
+        });
+
+        let mut req = crate::http::API_AGENT.post(&self.endpoint).set("Content-Type", "application/json");
+        if !self.api_key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", self.api_key));
+        }
+        let resp = req.send_json(payload).map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let detail = r.into_string().unwrap_or_default();
+                let msg = serde_json::from_str::<Value>(&detail)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| detail.chars().take(300).collect());
+                redact_api_key(&format!("audio transcription failed: status {code}: {msg}"), &self.api_key)
+            }
+            other => redact_api_key(&format!("audio transcription failed: {other}"), &self.api_key),
+        })?;
+
+        let body: Value = resp.into_json().map_err(|e| format!("bad json: {e}"))?;
+        let text = body["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string();
+        if text.is_empty() {
+            let reason = body["choices"][0]["finish_reason"].as_str().unwrap_or("no message content");
+            return Err(format!("empty transcript (finish_reason: {reason})"));
+        }
+        Ok(text)
     }
 
     fn call_openai_compatible(&self, user_content: &str) -> Result<String, String> {
@@ -111,7 +239,18 @@ impl LlmRefiner {
         if let Some(content) = body["choices"][0]["message"]["content"].as_str() {
             Ok(content.trim().to_string())
         } else {
-            Err("Invalid response format from Local LLM".to_string())
+            // Say WHAT came back instead of "invalid format". Measured 2026-08-10: 59 clips failed
+            // here and the message named neither the provider nor the reason, so diagnosing it meant
+            // reading pipeline source to discover the request had gone to OpenRouter at all. The
+            // provider's own `error.message` is the useful field; the endpoint host names who
+            // answered. Truncated, and run through redact_api_key, because a provider error body can
+            // echo the request.
+            let provider = self.endpoint.split('/').nth(2).unwrap_or("the LLM endpoint");
+            let detail = body["error"]["message"]
+                .as_str()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| body.to_string().chars().take(300).collect());
+            Err(format!("{provider} returned no message content: {}", redact_api_key(&detail, &self.api_key)))
         }
     }
 
@@ -210,6 +349,45 @@ pub fn build_ger_user_prompt(primary: &str, hypotheses: &[String], few_shot: &[(
 
 #[cfg(test)]
 mod tests {
+
+    /// The retry classifier decides whether a HARD STOP fires. Both directions are real failures:
+    /// treating a permanent error as transient delays an honest stop and burns quota; treating a rate
+    /// limit as permanent halts a 487-clip run on one throttled reply.
+    #[test]
+    fn transient_errors_retry_and_permanent_ones_stop_immediately() {
+        for permanent in [
+            // Billing/quota exhaustion arrives as 429 but no backoff can fix it (measured on the
+            // real Gemini API, 2026-08-12): retrying burns 7 s per clip and hides the real cause.
+            "generativelanguage.googleapis.com status 429: Your prepayment credits are depleted.",
+            "Local LLM request failed: status code 429 - quota exceeded",
+            "openrouter.ai returned no message content: You exceeded your current quota, please check your billing",
+            "openrouter.ai returned no message content: 401 Unauthorized",
+            "Local LLM request failed: status code 403",
+            "openrouter.ai returned no message content: not a valid model id",
+            "request failed: status code 404",
+            "Gemini API Key is missing. Please configure it in settings.",
+        ] {
+            assert!(!super::is_transient(permanent), "must NOT retry: {permanent}");
+        }
+
+        for transient in [
+            "Local LLM request failed: status code 429",
+            "openrouter.ai returned no message content: rate limit exceeded",
+            "request failed: status code 503",
+            "Local LLM request failed: connection closed",
+            "Local LLM request failed: read timed out",
+            "openrouter.ai returned no message content: {}",
+        ] {
+            assert!(super::is_transient(transient), "must retry: {transient}");
+        }
+    }
+
+    /// A 401 that merely mentions a rate limit in prose must still be permanent — the permanent
+    /// checks run FIRST for exactly this reason.
+    #[test]
+    fn a_permanent_error_wins_over_a_transient_sounding_phrase() {
+        assert!(!super::is_transient("401 Unauthorized (you may also be rate limited)"));
+    }
     use super::*;
 
     #[test]

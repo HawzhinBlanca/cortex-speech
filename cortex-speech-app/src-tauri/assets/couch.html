@@ -44,6 +44,7 @@
 {
   "en": {
     "progress": "Clip {n} of {total}",
+    "audioDone": "{t} of audio done",
     "accept": "Looks good",
     "bad": "Reject",
     "save": "Save & next",
@@ -57,6 +58,7 @@
     "retry": "Retry",
     "linkExpired": "This link has expired. Ask for a new one — anything you already saved is safe, and anything still waiting to send will go through on the new link.",
     "allDone": "All clips reviewed!",
+    "noDialectWork": "No clips in your dialect yet. Nothing to do — you will be told when there are.",
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
     "loadingMore": "Loading clips…",
     "queued": "Queued — it will send when you are back online",
@@ -70,6 +72,7 @@
   },
   "ckb": {
     "progress": "پارچەی {n} لە {total}",
+    "audioDone": "{t} دەنگ تەواو بووە",
     "accept": "دروستە",
     "bad": "ڕەتکردنەوە",
     "save": "پاشەکەوت و دواتر",
@@ -83,6 +86,7 @@
     "retry": "دووبارە",
     "linkExpired": "ئەم بەستەرە بەسەرچووە. داوای بەستەرێکی نوێ بکە — هەرچی پاشەکەوتت کردووە پارێزراوە، و هەرچی چاوەڕێی ناردنە بە بەستەرە نوێیەکە دەنێردرێت.",
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
+    "noDialectWork": "هێشتا هیچ پارچەیەک بە زاری تۆ نییە. شتێک نییە بۆ کردن — کاتێک هەبوو پێت دەڵێین.",
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
     "loadingMore": "بارکردنی پارچەکان…",
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
@@ -96,6 +100,7 @@
   },
   "source": {
     "progress": "review.progress",
+    "audioDone": null,
     "accept": "review.acceptAsIs",
     "bad": "inbox.reject",
     "save": "review.saveNext",
@@ -109,6 +114,7 @@
     "retry": "retry",
     "linkExpired": null,
     "allDone": "review.allDone",
+    "noDialectWork": null,
     "heldByOthers": null,
     "loadingMore": null,
     "queued": null,
@@ -210,8 +216,15 @@
   /* Rides on the dim meta line but in the warning colour: it has to survive a glance, because it is
      information the reviewer needs BEFORE they tap, not after. */
   .flag { color: var(--warn); }
+  /* font-family MUST be explicit: a textarea does NOT inherit it, and every browser's UA default is
+     monospace. A monospaced Arabic-script face forces cursive, wildly-varying-width Kurdish letters
+     into identical advance cells, so the joins render stretched and gappy — it reads like tatweel
+     padding that is not in the text (verified 2026-08-10: tatweel count 0 in the data, fontFamily
+     computed to "monospace" on the live page). Reviewers judge these clips by eye; unreadable script
+     is a correctness problem, not a cosmetic one. */
   textarea { width: 100%; min-height: 34dvh; background: var(--bg); color: var(--ink);
              border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+             font-family: inherit;
              font-size: var(--tsize); line-height: 1.9; direction: rtl; }
   .meta { font-size: 11px; color: var(--faint); }
   .row { display: flex; gap: 8px; }
@@ -295,10 +308,13 @@
 <script>
   // The token arrives in the URL FRAGMENT (#t=...), which the browser never sends to any server —
   // so a link pasted into a chat app hands its preview bot the empty shell, never a credential.
-  // ?t= is still read as the legacy transition form for links sent before the fragment change.
+  //
+  // The legacy ?t= form is GONE, on both sides. The server no longer accepts a query token at all
+  // (couch.rs token_from_request), so continuing to read one here would only put a credential back
+  // into URLs, history and proxy logs to buy an authentication that can no longer succeed. Removing
+  // it is the prerequisite for exposing this server publicly; a pre-fragment link now gets the bare
+  // shell, which is the correct answer to a link that leaked the moment it was pasted.
   const fragToken = new URLSearchParams(location.hash.replace(/^#/, '')).get('t') || '';
-  const queryToken = new URLSearchParams(location.search).get('t') || '';
-  const token = queryToken; // only a QUERY token still needs to ride requests (legacy links)
   // A fragment token is presented to the server exactly once, in a POST body, and comes back as the
   // HttpOnly cookie every later request rides on. Fire-and-forget BEFORE load(): claimed is awaited
   // by load() via this promise so the first /api/queue never races the cookie.
@@ -325,7 +341,11 @@
   void ensureClaimed(); // fire early so the cookie usually exists before the first queue fetch
   // Strip the credential from the visible address and this history entry either way: a token on
   // screen is a token anyone glancing at the phone can photograph, and history survives the session.
-  if ((fragToken || queryToken) && window.history?.replaceState) {
+  // Also strip a legacy `?t=` if one is present in the address: the server no longer honours it, but
+  // leaving it on screen is still a token anyone glancing at the device can photograph, and it still
+  // survives in history. `queryToken` used to gate this; that variable is gone with the query-auth
+  // path, and referencing it here threw at load and left the whole page uninitialised.
+  if (window.history?.replaceState && (fragToken || new URLSearchParams(location.search).has('t'))) {
     const clean = new URL(location.href);
     clean.searchParams.delete('t');
     history.replaceState(null, '', clean.pathname + clean.search);
@@ -412,12 +432,11 @@
     $('toast').classList.remove('show', 'sticky');
     if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
   });
-  // The token rides the query only while we HAVE one. After the first load it has been stripped from
-  // the URL (P3.8) and lives in the HttpOnly cookie, so `token` is "" — and sending `?t=` empty made
-  // the server treat the query as a supplied-but-wrong credential, shadowing the very cookie that
-  // would have authenticated the request. A reviewer who closed the tab and came back was locked out
-  // while the browser was faithfully sending everything needed to let them in.
-  const withToken = (path) => (token ? path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(token) : path);
+  // No credential is ever appended to a URL here. The HttpOnly cookie minted by /api/claim carries
+  // every request, including `<audio src>`, which cannot set a header but does send cookies. The old
+  // withToken() helper appended `?t=` when the page happened to hold a query token; both it and the
+  // server's query path are gone, so a token can no longer reach a URL bar, a history entry or a
+  // proxy log by any route.
   async function api(path, opts) {
     // 15s timeout: a stalled cellular fetch otherwise hangs "Loading clips..." forever. An abort
     // throws with NO status, which every caller already treats as "never arrived" — retryable.
@@ -425,7 +444,7 @@
     const timer = setTimeout(() => ctl.abort(), 15000);
     let r;
     try {
-      r = await fetch(withToken(path), { ...opts, signal: ctl.signal });
+      r = await fetch(path, { ...opts, signal: ctl.signal });
     } finally {
       clearTimeout(timer);
     }
@@ -443,6 +462,18 @@
   let doneThisSession = 0;
   // The whole pending backlog as of the last load (R1.5), or 0 from a server that does not send it.
   let pendingTotal = 0;
+  // Total AUDIO this reviewer has completed, from the server (they are paid per hour of audio
+  // reviewed, so this is the number that matters to them). Session counts reset; this does not.
+  let reviewedMs = 0;
+  // Restricted to a dialect that currently has no clips — NOT the same as finishing the corpus.
+  let noDialectWork = false;
+  function fmtDuration(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
   function renderProgress() {
     // Count against the BACKLOG, not the batch. "Clip 7 of 25" was true of the clips in hand and
     // useless as progress: a reviewer working a 400-clip corpus watched that bar fill and reset every
@@ -453,7 +484,8 @@
     const total = pendingTotal || queue.length;
     // Clamped: once the batch drains `i` is one PAST the end, and the header read "Clip 26 of 25".
     const pos = queue.length ? t('progress', { n: Math.min(i + 1, total), total }) : '';
-    $('progress').textContent = doneThisSession ? `${pos} · ✓${doneThisSession}` : pos;
+    const audio = reviewedMs > 0 ? ` · ${t('audioDone', { t: fmtDuration(reviewedMs) })}` : '';
+    $('progress').textContent = (doneThisSession ? `${pos} · ✓${doneThisSession}` : pos) + audio;
     // Something to take back = the button is reachable, whether or not a card is on screen.
     $('after').hidden = doneThisSession === 0;
   }
@@ -469,6 +501,10 @@
     // Nor when the reviewer emptied their own queue by SKIPPING it. Those clips are unjudged and still
     // pending; "🎉 all clips reviewed" over the top of them is the same lie one step further along.
     if (skippedByYou) { $('done').textContent = t('skippedByYou', { n: skippedByYou }); return; }
+    // Nor when this reviewer simply has no clips in their DIALECT. Congratulating someone for
+    // finishing a corpus they were never served any of is the same lie in a third costume — and it
+    // would hide the real state from the owner, who needs to know they are idle for a reason.
+    if (noDialectWork) { $('done').textContent = t('noDialectWork'); return; }
     $('done').textContent = '🎉 ' + t('allDone');
   }
   // The server hands out at most QUEUE_BATCH clips per fetch and says nothing about the backlog behind
@@ -511,10 +547,13 @@
     }
   }
   // ── drafts, so a reload or a crash never costs a typed correction ───────────
+  // Draft transcript text is session-scoped: reloads and same-tab recovery keep it, but closing the
+  // tab clears it from a shared phone. Only decisions that have not reached the server enter the
+  // durable outbox below; successful or merely abandoned transcript text must not persist forever.
   const draftKey = (id) => 'cortex.couch.draft.' + id;
   $('text').addEventListener('input', () => {
     const seg = queue[i];
-    if (seg) localStorage.setItem(draftKey(seg.id), $('text').value);
+    if (seg) sessionStorage.setItem(draftKey(seg.id), $('text').value);
   });
 
   // ── unsent decisions, so a dropped request is not a lost decision ───────────
@@ -626,7 +665,7 @@
       // never told it was saved, the clip is still pending, and their text is the only copy. Clearing
       // the refused banner would be worse than useless — a skip does not make the earlier work land.
       if (item.action !== 'skip') {
-        localStorage.removeItem(draftKey(item.id));
+        sessionStorage.removeItem(draftKey(item.id));
         clearRefused(item.id); // it landed after all
       }
     }
@@ -655,14 +694,14 @@
       renderEmptyState();
       return;
     }
-    const audioUrl = withToken('/api/audio/' + encodeURIComponent(seg.id));
+    const audioUrl = '/api/audio/' + encodeURIComponent(seg.id);
     $('player').src = audioUrl;
     void loadWave(audioUrl);
     $('player').playbackRate = speed;
     $('player').loop = looping;
     pausedByEdit = false; // a new clip owes the reviewer no rewind
     // A saved draft is a correction the reviewer already typed; it must win over the server's copy.
-    $('text').value = localStorage.getItem(draftKey(seg.id)) ?? seg.text;
+    $('text').value = sessionStorage.getItem(draftKey(seg.id)) ?? seg.text;
     $('meta').textContent = (seg.durationMs / 1000).toFixed(1) + 's' + (seg.speakerId ? ' · ' + seg.speakerId : '');
     // A clip that spans a turn between two people carries ONE speaker label like any other — chunks are
     // cut on silence and labelled afterwards — so without this the reviewer meets it as ordinary work
@@ -701,7 +740,7 @@
   function prefetchNext() {
     const next = queue[i + 1];
     if (!next) return;
-    prefetched = new Audio(withToken('/api/audio/' + encodeURIComponent(next.id)));
+    prefetched = new Audio('/api/audio/' + encodeURIComponent(next.id));
     prefetched.preload = 'auto';
     prefetched.load();
   }
@@ -741,6 +780,9 @@
       // The whole pending backlog, not just this batch (R1.5). Absent on an older server, and the
       // progress line falls back to per-batch counting when it is.
       pendingTotal = Number(res.pendingTotal) || 0;
+      noDialectWork = res.noWorkInYourDialect === true;
+      // Absent on an older server -> keep the last known value rather than flashing back to zero.
+      if (res.reviewedMs != null) reviewedMs = Number(res.reviewedMs) || 0;
       // Recomputed on EVERY load: a fetch that brings work back re-arms the refetch, so a reviewer who
       // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.
       exhausted = queue.length === 0;
@@ -778,13 +820,20 @@
     const isSkip = action === 'skip';
     busy = true;
     const btns = ['save','accept','bad','skip','undo'].map($); btns.forEach(b => b.disabled = true);
-    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me };
+    // rowVersion: the row fingerprint this clip was SERVED with — the server refuses the decision
+    // if the draft changed in between, so what gets recorded is always judged-as-seen.
+    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion };
     try {
-      await api('/api/decision', {
+      const saved = await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
+      // The audio total comes back WITH the decision, so the badge moves on every save instead of
+      // only when a batch refills. A reviewer paid per hour of audio watched that number sit still
+      // through twenty clips, which reads as work not being counted. Guarded so an older server that
+      // does not send it leaves the last known value alone rather than flashing back to zero.
+      if (saved && saved.reviewedMs != null) reviewedMs = Number(saved.reviewedMs) || 0;
       if (!isSkip) {
-        localStorage.removeItem(draftKey(submission.id));
+        sessionStorage.removeItem(draftKey(submission.id));
         clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
         toast(action === 'bad' ? t('markedBad') : t('saved'));
         doneThisSession += 1;

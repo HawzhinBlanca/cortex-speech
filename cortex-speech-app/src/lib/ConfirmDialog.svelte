@@ -38,13 +38,14 @@
 
   {#snippet footer()}
     <!-- svelte-ignore a11y_autofocus -->
-    <button class="btn btn-secondary" autofocus onclick={cancel}>{dialog?.cancelLabel ?? $t('cancel')}</button>
+    <button class="btn btn-secondary" autofocus onclick={cancel}
+      >{dialog?.cancelLabel ?? $t('cancel')}</button
+    >
     {#if dialog?.secondary}
       <button class="btn btn-secondary" onclick={runSecondary}>{dialog.secondary.label}</button>
     {/if}
-    <button
-      class="btn {dialog?.danger === false ? 'btn-primary' : 'btn-danger'}"
-      onclick={confirm}>{dialog?.confirmLabel ?? $t('confirm')}</button
+    <button class="btn {dialog?.danger === false ? 'btn-primary' : 'btn-danger'}" onclick={confirm}
+      >{dialog?.confirmLabel ?? $t('confirm')}</button
     >
   {/snippet}
 </Modal>

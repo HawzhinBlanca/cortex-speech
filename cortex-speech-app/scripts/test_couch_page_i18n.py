@@ -42,6 +42,14 @@ UNREVIEWED_SORANI = {
     "stillSending",
     "audioMissing",
     "skip",
+    # Reviewer progress badge: total AUDIO they have completed. New Sorani ("{t} دەنگ تەواو بووە"),
+    # NOT natively reviewed — it goes on the owner's read list with the others. It matters that this
+    # one reads well: reviewers are paid per hour of audio reviewed, so this is the number they will
+    # check against their own count.
+    "audioDone",
+    # Dialect routing (owner instruction 2026-08-16): shown to a reviewer restricted to a dialect
+    # that currently has no clips. New Sorani, NOT natively reviewed — on the owner's read list.
+    "noDialectWork",
     # v47 speaker-change badge. New Sorani, NOT yet natively reviewed — it goes on the owner's list
     # with the other seven.
     "speakerChange",

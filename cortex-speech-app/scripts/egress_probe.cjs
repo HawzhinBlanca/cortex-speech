@@ -269,7 +269,7 @@ async function run() {
   // get_settings, trips the backend's IPC rate limiter and would otherwise reject this leg's own
   // get_settings and make it inconclusive. Run a REAL offline transcription while the SAME sampler
   // (started at t0) watches, so any cloud STT/LLM connection on the ASR path would be caught. The CTC
-  // engine is provisioned in the disposable profile (default WSL7B fail-hards without its server);
+  // engine is provisioned explicitly in the disposable profile;
   // cloud opt-ins are asserted OFF below, so this stays the offline path.
   let transcribeLeg = { ran: false, segments: 0, error: null };
   if (RUN_TRANSCRIBE) {
@@ -289,7 +289,14 @@ async function run() {
           // Poll the backend for segments — proof the ASR path actually ran (up to 120s).
           let segs = [];
           for (let i = 0; i < 120; i++) {
-            segs = await invoke('get_segments', { verified: null }).catch(() => []);
+            const page = await invoke('get_segments_page', {
+              verified: null,
+              query: null,
+              sort: 'newest',
+              limit: 50,
+              cursor: null,
+            }).catch(() => null);
+            segs = page && Array.isArray(page.items) ? page.items : [];
             if (Array.isArray(segs) && segs.length >= 1) break;
             await new Promise((r) => setTimeout(r, 1000));
           }

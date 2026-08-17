@@ -46,7 +46,7 @@ regex = "1"
 thiserror = "2"
 blake3 = "1"
 rayon = "1"
-lru = "0.16"
+lru = "0.18"
 sysinfo = "0.39"
 unicode-normalization = "0.1.23"
 
@@ -74,7 +74,6 @@ ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
 
 # Meta OmniASR CTC via sherpa-onnx
 sherpa-onnx = "1.13.2"
-sherpa-onnx-sys = "1.13.2"
 
 # OmniASR model archive extraction
 tar = "0.4"
@@ -82,9 +81,10 @@ bzip2 = "0.5"
 
 # HTTP client for model downloads and LLM API
 ureq = { version = "2", features = ["tls", "json"] }
-# Couch Review: minimal thread-per-request HTTP server for the LAN-only phone review page.
-# Sync (no tokio-net coupling), matching the codebase's Mutex<Database> patterns.
-tiny_http = "0.12"
+# Couch Review: maintained tiny-http fork with request-smuggling/header-injection fixes. The local
+# alias keeps call sites stable; the exact version is pinned because this is a LAN-facing parser.
+tiny_http = { package = "tiny_http_fork", path = "vendor/tiny_http_fork", version = "=0.12.14", features = ["ssl-rustls"] }
+rcgen = "0.14.8"
 
 # SHA256 verification for downloaded models
 sha2 = "0.11"
@@ -103,6 +103,8 @@ proptest = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 assert_cmd = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 
 [[bench]]
 name = "normalizer"

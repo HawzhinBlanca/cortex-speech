@@ -25,6 +25,12 @@ describe('wordPlayBounds', () => {
     expect(b.end - b.start).toBeGreaterThan(0);
   });
 
+  it('never re-expands a degenerate last word beyond the clip end', () => {
+    const b = wordPlayBounds({ start: 1, end: 1 }, 10, 11, 0);
+    expect(b.end).toBe(11);
+    expect(b.start).toBeCloseTo(10.95);
+  });
+
   it('never starts before the clip even with a large pad', () => {
     const b = wordPlayBounds({ start: 0, end: 0.3 }, 5, 6, 1.0);
     expect(b.start).toBe(5);

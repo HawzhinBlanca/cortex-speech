@@ -131,7 +131,12 @@ export function computeLocalDiff(raw: string, annotated: string): DiffResult {
     // side is still on its common word would consume that common word and cascade wrong ops \u2014 the bug
     // where an insert/delete next to an unchanged word rendered a spurious "x \u2192 y" and undercounted
     // similarity (e.g. "a c" \u2192 "a b c" scored 33% with a bogus c\u2192b replace instead of 67%).
-    if (rawIndex < rawWords.length && annotatedIndex < annotatedWords.length && !rawIsLcs && !annIsLcs) {
+    if (
+      rawIndex < rawWords.length &&
+      annotatedIndex < annotatedWords.length &&
+      !rawIsLcs &&
+      !annIsLcs
+    ) {
       changes.push({
         op: 'Replace',
         value: `${rawWords[rawIndex]} \u2192 ${annotatedWords[annotatedIndex]}`,

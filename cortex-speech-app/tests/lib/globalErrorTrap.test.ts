@@ -16,6 +16,27 @@ describe('globalErrorTrap (P2.2 / audit F3)', () => {
     expect(describeRejection(new TypeError())).toBe('TypeError');
   });
 
+  it('never throws for hostile coercion, circular data, or oversized values', () => {
+    const hostile = {
+      toJSON: () => {
+        throw new Error('no JSON');
+      },
+      toString: () => {
+        throw new Error('no string');
+      },
+      [Symbol.toPrimitive]: () => {
+        throw new Error('no primitive');
+      },
+    };
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+
+    expect(() => describeRejection(hostile)).not.toThrow();
+    expect(describeRejection(hostile)).toBe('Unknown error');
+    expect(() => describeRejection(circular)).not.toThrow();
+    expect(describeRejection('x'.repeat(3_000))).toHaveLength(2_000);
+  });
+
   it('surfaces a fire-and-forget rejection as an error toast so it never vanishes', () => {
     notifyUnhandledRejection(new Error('invoke failed: database is locked'));
     const list = get(notifications);

@@ -7679,3 +7679,1189 @@ anywhere in the file. An untimed job hangs to GitHub's six-hour ceiling. It now 
 only; adding PyYAML would have re-introduced the very portability class fixed above) and asserts every
 job has a timeout under a 180-minute cap, so "just raise it" cannot quietly hide a hang. Fail-before
 confirms it catches both an untimed job and an over-cap one.
+
+## Iteration 265 — a review session that could not be reached, and a key that was being deleted
+
+**The couch server is public, and the credential no longer travels.** Tailscale Funnel is on for
+`<this-pc>.<tailnet>.ts.net`, which is what lets two reviewers on laptops with nothing installed reach
+the queue — the shipped "from anywhere" link is a tailnet CGNAT address and would have needed Tailscale
+on their machines. (Hostname redacted: this repo is public, and test_windows_repo_hygiene is right that
+a device name adds nothing to the evidence. It caught this entry on the first run.)
+
+That was gated on closing the query-token leak FIRST, which is the order REMOTE_PUBLIC_LINKS_PLAN
+prescribes and the reason it was done before flipping Funnel rather than after. `token_from_request`
+now reads the HttpOnly cookie and nothing else; `couch.html` no longer reads or appends a query token
+anywhere. Verified from the public internet, not just locally:
+
+    GET /                      -> 200      (shell is public by design)
+    GET /api/queue             -> 401      (no credential)
+    GET /api/queue?t=<REAL>    -> 401      <- the leak, closed
+    POST /api/claim {token}    -> 200 + Set-Cookie
+    GET /api/queue (cookie)    -> 200, reviewer=Lamo / reviewer=Sewa
+
+35 test call sites authenticated with `?t=` and would have gone on proving a door the product no
+longer has; they present cookies now. Two tests changed SUBJECT rather than syntax and are recorded in
+the code rather than deleted quietly: the empty-vs-wrong query-token unit test (a question that is
+unaskable once the query is unread), and the returning-reviewer test's "a wrong token must not fall
+back to a cookie" assertion — a hazard that is GONE rather than unguarded, with revocation now
+asserted where it actually lives, in the cookie.
+
+**A `couch.html` reference I removed took the whole page down, and only a test caught it.** Deleting
+`queryToken` left one live use of it in the address-stripping branch. The script threw at load, so
+`queue` was never initialised and the page rendered nothing — a total outage of the reviewer UI,
+invisible to typecheck and to eslint, caught by `couch_page_speaker_change_badge.test.ts` failing with
+"Cannot access 'queue' before initialization". Three tests that look like they are about a speaker
+badge were the only thing standing between a security fix and a dead review page.
+
+**The Gemini key was being DELETED by design, and the UI reported it as configured.** Measured
+2026-08-10: an import failed 3/3 with "Gemini API key is required" while Settings showed a key. Two
+independent defects, either one fatal:
+
+  * `AppSettings::load` CLEARS `llm_api_key` and rewrites settings.json (P0.3: a plaintext key must
+    never persist). The Settings field wrote there. So the key was stored, scrubbed on next load, and
+    gone — while `llm_api_key_configured` stayed true, which is the worst possible signal: the UI
+    reporting a credential that no longer exists.
+  * `ensure_source_reference_transcripts` read that same scrubbed field, so even a correctly stored
+    key would not have been used. Every other cloud path (scribe, jury, OpenRouter) already read
+    secrets.env via `ApiKeys`; this was the one caller reading a field guaranteed empty.
+
+Both fixed: the pipeline reads `ApiKeys::load(data_dir).gemini` (falling back to the in-session typed
+value, so "I just entered it" still works), and the UI's two Gemini fields now call `set_api_key`,
+which the backend already accepted for `"gemini"` and which nothing had ever called. The badge reads
+CONFIGURED PROVIDERS rather than the input box — the only honest signal that a key survived.
+Fail-before: with the settings-only read restored the new test fails; file restored byte-identical.
+
+**Two more measurement lessons, both cheap and both mine.** The new key test passed alone and failed in
+the full suite — the Windows write-then-read visibility flake this repo has now hit five times; it
+carries the settle loop the `resolve_file_in` tests already use. And `models_status` reported 4 of 7
+models missing while the pipeline was using them: `target/release/models` held a PARTIAL copy, which
+wins the bundled-root selection and orphans every sibling that exists only in the repo models dir —
+the exact hazard models.rs documents. 494 of 494 segments carrying speaker IDs is what proved CAM++ was
+running while the panel called it missing. Hardlinked; 7/7 now.
+
+Queue for the session: 494 clips, 0 blank, 3-10 s chunks (a 10 s cap reaches for a pause sooner and is
+easier to verify by ear; the chunker splits at the quietest point, so it does not slice words), all
+from the champion 7B with speaker IDs. Gold set 348 and eval results 696 preserved across two queue
+wipes — checked before each, because the first instinct was to move the whole DB aside, which would
+have detached the frozen eval basis behind every measured CER in this repo.
+
+> **CORRECTION (2026-08-11).** "All from the champion 7B" above is FALSE, and it was never checked
+> before it was written. The DB says every one of the 494 rows carried
+> `model_version_id = finetuned-mms-ckb`, `confidence_source = fine_tuned_no_posterior` and
+> `cloud_call = 0`: the drafts came from the fine-tuned MMS-CTC-1B int8, no 7B pass and no LLM
+> refinement ran at all. `use_finetuned_asr = true` overrides `asr_model_size = WSL7B` by design
+> (pipeline.rs), so the 7B server sat up and idle throughout, and the Gemini refiner returned None
+> because the API key had been deleted by the settings-scrub bug fixed the same day. The owner caught
+> it by reading the transcripts and asking what produced them — not by any gate. See Iteration 267.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 266 — the review session went live, and the save button that discarded the key
+
+**Two reviewers are working over the public internet, verified end to end from a browser.** The
+session is up for Lamo and Sewa on the Funnel host; 15 checks pass against the public URL, not
+localhost: shell 200, `/api/queue` and `/api/audio/<id>` 401 without the cookie, a REAL token in
+`?t=` still 401, claim 200 with `HttpOnly; SameSite=Strict`, an unknown token refused identically,
+and a 373 KB clip actually streaming to the reviewer.
+
+Backend checks were not enough on their own — last iteration a dead `queryToken` reference rendered
+the reviewer page blank while every API check passed. So the page was loaded in a real browser this
+time: "Cortex · Lamo", clip 1 of 494, RTL intact, the audio element carrying a real 11.7 s duration,
+zero console errors, and the token gone from the address bar (claimed into the cookie and stripped by
+`history.replaceState`, so a screenshot cannot leak it).
+
+**The Gemini key had a SECOND way to be lost, and it was the obvious one.** With the field rewired to
+the encrypted store behind its own "Save key" button, the panel then had two save buttons — and the
+bottom-right one, bigger and blue and the one anybody reaches for, still routed through
+`update_settings`, whose `load()` scrubs `llm_api_key`. Measured: key pasted, Save pressed,
+`GEMINI_API_KEY` still empty. Same trap on the OpenRouter field.
+
+Fixed at the convergence point rather than by relabelling a button: `flushPendingKeys()` runs from
+`save()` (before `updateSettings`, since that is the scrubbing path) and from `onDestroy` (the
+✕/Escape route), so every exit persists a pending key through `save_key_protected`. Fail-before, all
+four mutations caught: flush deleted from `save()`, flush moved after `updateSettings`, flush deleted
+from `onDestroy`, and flush rewritten to assign into `localSettings`. Panel restored byte-identical.
+
+**The new gate reported success while executing nothing.** `test_settings_key_persistence_policy.py`
+had no `__main__` block, so `run_python_policies` ran it, got exit 0, and counted it among "55 policy
+test scripts passed" — a vacuous gate, which is worse than no gate because it reports a safety it is
+not providing. This is the same class as the i18n reference check that passed having inspected zero
+references. It self-runs now, and its helper no longer overruns into `onDestroy` (which made the
+encrypted-store check fail against correct code).
+
+**An OpenRouter key is sitting in plaintext.** `OPENROUTER_API_KEY` is 73 raw characters in
+`secrets.env`, not a `dpapi:` blob — it never went through `set_api_key`, which encrypts. Reported to
+the owner rather than silently rewritten: a credential store is theirs to change. Gemini is now a
+358-char DPAPI blob, and it was verified by calling `CryptUnprotectData` directly — the exact Win32
+entry point `dpapi.rs` uses — rather than trusting .NET's wrapper to be format-compatible with it.
+
+Gates: typecheck 431 files 0 errors, eslint clean, 236 frontend tests, python policies green. The fix
+is source-only so far — rebuilding restarts the app, and the couch server lives in that process, so it
+was deliberately deferred rather than dropped under two people mid-review. Reviewer page is served by
+Rust from `couch.html` and is unaffected by the frontend bundle either way.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 267 — the review set was drafted by the wrong engine, and nothing said so
+
+**The owner found this by reading the transcripts, not from any gate.** He asked why they looked poor.
+The DB answered: every one of the 494 rows was `model_version_id = finetuned-mms-ckb`,
+`confidence_source = fine_tuned_no_posterior`, `cloud_call = 0`. No 7B pass and no LLM refinement had
+run at all, while the 7B server sat up and idle on both GPUs and `asr_model_size` said `WSL7B`.
+
+`use_finetuned_asr = true` overrides the configured engine by design (pipeline.rs), and the Gemini
+refiner returned None because the API key had been deleted by the settings-scrub bug fixed the same
+day. Two independent silent downgrades stacked on one queue. Iteration 265's claim that the queue was
+"all from the champion 7B" was written without checking and is corrected in place above.
+
+Measured on identical FLEURS ckb clips (docs/MEASUREMENTS.md): 7B champion 7.03% CER [6.53, 7.55]
+N=922 vs fine-tuned MMS-CTC-1B 9.32% — and that 9.32% is the fp32 reference while the app runs the
+int8 build, whose own recorded baseline is 21.00%.
+
+**The champion refused every .mp4, so the fix half-worked and hid it.** Re-running on the 7B left
+462 clips converted and 25 still on the weaker engine:
+
+    Error opening '.../A1-0032_PODCAST-001.mp4': Format not recognised
+
+libsndfile — torchaudio's soundfile backend — handles no MPEG-4/AAC, while the app's own import path
+decodes it fine. So those clips imported, chunked and transcribed locally, then silently could not be
+re-transcribed by the champion. A review set at two different quality levels, with nothing on screen
+saying which clip came from where, is exactly what corrupts a measurement later. ffmpeg fallback
+added (already a hard import-path dependency); 462 -> 487 on the real audio that had failed.
+
+**Serial-by-default cost ~8 hours and left both GPUs idle.** 22.2 s in the 7B and 52.1 s in
+refinement per clip, one clip at a time, with the cards at 18% and 9%. Two fixes, each defaulting to
+the old behaviour and opted into by env:
+
+    serial                       74.0 s/clip   ~8 h     GPUs 18% / 9%
+    + concurrent batch           23.1 s/clip   2.7 h    GPUs 19% / 12%
+    + WSL_7B_GATE given permits  13.7 s/clip   89 min   GPUs 25% / 39%
+
+The second was a STALE COMMENT: the gate admitted one request because "the champion server is a
+single-threaded accept loop", which stopped being true when the server started pre-forking one replica
+per GPU. The bound is still needed (surplus requests queue and burn their client timeouts, which reads
+as "server down" and rolls back a healthy import), so it is a counting semaphore now, not no gate.
+
+**Final queue state, verified:** 487 on `omniasr-wsl-7b`, 482 Gemini-refined, 7 rows left on the old
+engine because a human had already corrected them (`update_asr_transcript_if_unreviewed` refuses those,
+and they were excluded from the batch as well — human text is gold, no model output overwrites it).
+0 blank transcripts, 494/494 speaker IDs, gold 348 and eval 696 preserved.
+
+**Two things measured and NOT fixed, reported instead.** Under `jury_autonomy_level = propose` the
+jury runs but leaves an already-staged row's verdict and IRT confidence untouched by design — so after
+a re-transcription those scores still describe the previous text, and they drive riskiest-first review
+ordering. And 59 of 487 refinements failed with "Invalid response format from Local LLM": with an
+OpenRouter key present, `LlmMode::Gemini` routes through OpenRouter's OpenAI-compatible endpoint, so
+the label is wrong and ~12% of clips kept raw 7B text. Neither is data loss; both are the owner's call.
+
+**`branch-protection` is no longer owner-gated.** It was item 49, "repo-admin clicks", whose only
+evidence was that somebody said they had clicked — and nothing would have noticed protection being
+weakened later. It is an API call: 4 required contexts, strict, enforce_admins, linear history, no
+force pushes, no deletions, all verified against the live remote every sweep. OWNER_GATED 5 -> 4.
+
+**The kappa gate was blocked on tooling, not only on annotators.** `agreement_kappa.py` reads a TSV of
+two rater columns and nothing produced one, so item 44 required hand-assembling a file out of SQLite.
+`spot_checks` already holds one row per (segment, reviewer) because Couch Review serves spot checks
+unleased on purpose. The extractor refuses to emit anything misleading: zero overlap (guarded twice,
+independent of the floor), below --min-items, or more than two raters pooled into two columns.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 268 — the champion is no longer optional, and failure is no longer survivable
+
+**The owner's rule, in code and in law.** After finding the queue drafted 494/494 by the smaller model
+while the champion idled, the owner ruled: use the 7B champion every time, never fall back to a
+smaller model, and HARD STOP on any failure. Written into CLAUDE.md and enforced in three places.
+
+`should_use_wsl_primary_asr` no longer consults `use_finetuned_asr` — selecting WSL7B outranks the
+flag. `batch_transcribe` cancels on the first failure and emits `type: "halted"` with the cause,
+never `"completed"`. And a failed refinement is now a failure: both paths used to log "Falling back to
+raw transcript" and store the unrefined draft as finished, which is exactly how 59 of 487 clips
+silently kept raw text.
+
+**The hard stop proved itself before it was ever tested on purpose.** Its first act was to halt a
+487-clip run at clip 1 because the champion server was down — 0 succeeded, nothing written. Under the
+previous code that run would have produced 487 inferior transcripts and reported success. It also
+exposed that the batch accepted the job before preflighting, so the preflight moved ahead of
+`try_start_batch`.
+
+**Retry, because strict must not mean brittle.** With the hard stop in place, a single throttled reply
+would halt a whole run. There was no retry anywhere — `API_AGENT` is a bare ureq agent — and the 59
+failures were ~12% of a run using 8 concurrent workers, the signature of provider rate limiting
+introduced by our own concurrency change. Now 4 attempts with 1s/2s/4s backoff for TRANSIENT classes
+only; a 401 or an unknown model still stops immediately. The permanent checks run first so a 401 that
+mentions rate limiting in prose stays permanent.
+
+**Re-run under the rules, and it held:** 487/487 champion-drafted, 487/487 Gemini-refined,
+**72 transient failures absorbed and zero silent degradations**. 0 blank, 494/494 speaker IDs, the 7
+human-corrected rows untouched, gold 348 and eval 696 preserved. Jury verdicts refreshed
+(2026-08-11 10:56) so they no longer describe deleted text, then autonomy returned to `propose` so
+every clip stays in the human queue.
+
+**First real dialect measurement — and it is RED.** CORDI (CC BY-SA 4.0, 3.94 GiB, sha256
+`ff0ea0cb…`, 186,126 clips) scored through `scorecard_7b.py`, 60 clips per variety:
+
+    Mehabad  27.63% [22.56, 33.38]    Sine     36.31% [31.00, 43.65]
+    Silemani 29.81% [23.12, 37.79]    Hewler   39.19% [33.50, 46.30]
+    Kalar    31.24% [25.83, 38.17]    Serdest  42.42% [36.71, 48.95]
+
+max-min disparity **14.79 pts** against a 10.00 pt budget. Not noise: Mehabad and Serdest have
+non-overlapping CIs. Two artifacts ruled out rather than assumed — `text == text_original` for all
+12,683 utterances checked (so the references are the dialectal transcriptions), and the absolute CERs
+are NOT comparable to the 7.03% FLEURS headline because CORDI is spontaneous film dialogue with music
+and overlap. The disparity is the within-domain comparison and it is fair. Recorded as a measurement;
+whether it becomes a blocking gate is the owner's call, because raising `budget_pts` to make it pass
+would be weakening a gate to fit the data.
+
+**Two owner-gated legs retired, on evidence.** `branch-protection` became a real gate (4 required
+contexts, admins, linear history, no force-push, verified against the live remote; 9/9 weakenings
+caught). `asosoft-600-licensing` was descoped: neither the site nor the GitHub repo carries a LICENSE
+file, terms text, or a contact address — there was nothing to verify and nobody to ask. OWNER_GATED
+5 → 3.
+
+**Failures found by the sweep, all fixed.** `RUSTSEC-2026-0253` (unsound `LruCache::pop()`) published
+today against our direct `lru 0.16.4`; bumped to 0.18 and `advisories ok`. Two real-model tests
+asserted that `use_finetuned_asr` diverts the champion — the behaviour the owner just banned — so they
+now select a non-champion engine, and a new test pins the refusal itself.
+
+**Mistakes worth recording.** A fail-before harness restored `pipeline.rs` with the wrong line endings
+(content intact, verified byte-wise). A watcher grepped the whole log and re-reported an old
+HARD-STOPPED entry as a fresh alarm — a false alarm is as damaging as a missed one. `2>&1` on cargo
+under PowerShell 5.1 turned build output into a terminating error and left the app stopped mid-session.
+And the CORDI manifest builder emitted RELATIVE paths that resolve to nothing inside WSL: the scorecard
+would have scored an empty set and still printed a per-dialect CER — a fabricated accuracy number
+produced by a path bug. It now refuses any path that did not become `/mnt/...`.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 269 — the reviewers were served text no engine had just produced, and no gate looked
+
+**The owner caught it, again, by reading transcripts.** Words changed, words "corrected," words that
+read like translations. Measured cause: `review_text()` in couch.rs serves `annotated_transcript` —
+the field reserved for a HUMAN's typed correction — before the raw champion draft. An old code path
+(the one `batch_processor.rs:177-182` documents banning, because it graded pure ASR output as
+human-verified GOLD) had left machine text in that field on **348 of 494** rows. The champion re-draft
+of 2026-08-11 wrote `raw_transcript` and `normalized_transcript` — fields the couch page never shows
+when `annotated_transcript` is set. So the fresh champion + refinement work sat invisible while the
+phone served a stale machine paraphrase, and iteration 268's "reviewers get champion quality" claim
+was FALSE at the serving path while true at the write path. Provenance check on the served text of
+the 348 untouched rows: 45 matched the champion draft, 22 the Gemini refinement, **281 matched
+neither** — text from a superseded refinement pass, heh-form fingerprint (747× U+0647, 1× U+06BE)
+matching neither current engine's output.
+
+**Also measured while diagnosing: the Gemini refinement REWRITES, it does not correct.** Against the
+champion on 492 refined clips: median 11.1% of characters changed, p90 30.3%, max 60%. Concrete:
+`مەعاشی سابت` → `مووچەیەکی سابتیان` (the spoken loanword replaced by the "proper" word — a
+translation), digits `2000` spelled out as `دوو ھەزار`, punctuation 9 → 892 marks, every ه → ھ. For
+a VERBATIM ASR corpus that is fabrication with fluent grammar — the most dangerous kind, because a
+skimming reviewer accepts it.
+
+**Fix, executed live with reviewers quiet 44 min (leases 15-min, all expired), no restart, links
+intact.** WAL-safe `sqlite3 .backup` to `cortex-speech.db.bak-annotated-clear-20260812`, then one
+targeted UPDATE clearing `annotated_transcript` on rows with no review event, no human_decision,
+verified=0: **348 rows cleared**. Human work byte-identical before/after: 145 decisions, 145
+verified, 189 review events, 130 corrections. Serving-path re-verification: 349 unverified clips in
+queue → 348 serve champion-verbatim (raw == stored `omniasr-wsl-7b` hypothesis), 1 serves
+human-touched text, 0 unexplained.
+
+**The permanent gate — verified fail-before on the live data.**
+`cortex-speech-app/scripts/check_review_serving_provenance.py`, registered as verify-10 tier-1 leg
+`review-serving-provenance`. Two invariants at the serving path's own precedence: (1)
+`annotated_transcript` non-empty ⇒ human evidence on that row (review event, human_decision, or
+verified); (2) every untouched row's `raw_transcript` byte-matches its stored champion hypothesis —
+a missing hypothesis FAILS (hard-stop law: an undrafted clip may not look drafted). Run BEFORE the
+fix: `FAIL [human-field]: 348 rows`, exit 1. After: both invariants PASS, exit 0. Deliberately named
+`check_*`, not `test_*` — the policy-suite namespace is sandbox-safe static checks, and a live-DB
+gate there would red the suite off-rig (the vacuous-skip alternative is worse).
+
+**Law added to CLAUDE.md honesty section:** verify at the SERVING path, never the write path. Three
+incidents now share this shape (494/494 wrong engine; 25 silently-degraded clips; this). A
+nine-path adversarially-verified audit of every transcript consumer/writer (couch serve, decision
+handlers, desktop UI, Rust + script exports, grading, jury writers, pipeline writers, precedence
+map) is running; findings land next iteration.
+
+**Still open, owner's call:** (a) the 45 `accept` decisions predating the fix approved the stale
+text — re-queue or keep; (b) the refinement-as-rewriter finding argues `normalized_transcript`
+should be jury evidence only, never reviewer-facing or export-facing text for a verbatim corpus —
+that is a policy change beyond this fix.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 270 — the writer was not dead, and iteration 269 said it was
+
+**Correction of the record.** Iteration 269 attributed the 348 poisoned rows to "an old code path …
+never cleaned from the data." A nine-path adversarial audit (42 agents, every claimed defect
+independently verified against the real code; 27 confirmed, 6 refuted —
+docs/TEXT_PROVENANCE_AUDIT_2026-08-12.md) proved the writer was LIVE:
+`db.rs::update_batch_transcription_if_unreviewed` seeded `annotated_transcript` with the machine
+draft via `COALESCE(annotated_transcript, seed)` on every batch run — `db_tests.rs` even pinned the
+seeding as intended ("annotation seeded when empty"). The very next batch_transcribe would have
+re-poisoned all 348 cleaned rows. Five desktop handlers (App.svelte champion/constrained/
+finetuned/Scribe re-transcribe, ReviewMode doRetranscribe) wrote machine `result.text` into the
+same human-only field.
+
+**Fixed, fail-before verified.** New sandbox-safe policy gate
+`scripts/test_machine_never_writes_annotated_policy.py`: function-scoped so the LEGAL human writers
+(submit/draft persisting editText) stay legal — pre-fix it flagged exactly the 6 machine sites with
+0 false positives; post-fix 0 violations. The batch persist path no longer mentions the annotated
+column; the five handlers write raw/normalized only, and NULL `normalized_transcript` unless
+recomputed so stale text cannot outrank the fresh draft at the `annotated ?? normalized ?? raw`
+precedence. The Rust pin flipped and was renamed for what it now proves
+(`…_and_never_writes_annotation`); first run of the renamed filter reported "0 tests ran, 1171
+filtered out" — a vacuous pass caught by reading the count line, per the standing rule.
+
+**Gates actually run:** `test_machine_never_writes_annotated_policy.py` FAIL(6)→PASS,
+`check_review_serving_provenance.py` PASS, full python-policies 60/60, vitest 238/238, typecheck 0
+errors, `cargo test --lib batch_transcription_update` 1 passed (scratch target dir; the running app
+was never stopped). NOT run this iteration: clippy, full cargo test, the full verify-10 sweep — the
+Rust/Svelte fixes are committed but NOT DEPLOYED; the running exe still carries the seeding writer
+until the next rebuild+restart window, so batch_transcribe must not be run before then.
+
+**Audit remainder:** 20 confirmed defects remain open, grouped in
+docs/TEXT_PROVENANCE_AUDIT_2026-08-12.md — the largest cluster is `verified=1` alone fabricating
+human provenance (bulk Verify All Pending exports machine drafts as human gold; Curate ^D can bless
+an unseen jury verdict; the spot-check answer key trusts machine-seeded text). Those are grading
+semantics redesigns and owner decisions, not quick patches.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 271 — gold requires a human decision, and the transcript is verbatim everywhere
+
+**Two owner rules landed together (owner, 2026-08-12: "we wanna be sure we get the exact
+transcription of the audio and not get corrected/translated/changed by other models. this is
+training dataset for ai should be exact audio to text").**
+
+**Rule 1 — gold provenance.** `verified`/`is_gold` alone never mint human provenance again. The
+single source of truth is `training_transcript_with_source`: "human_verified" exists iff a real
+human decision (accept/edit/human_*) produced the text — the text captured at decision time, else
+the typed annotation, else the raw draft the accept was made against. `training_grade_for_segment`
+now derives `human_verified` FROM that source label, so grade and label cannot drift. Kills audit
+defects #7 (^D blessing an unseen jury verdict), #8 (bulk Verify-All exporting machine drafts as
+human gold), #15, #10, #1 (spot-check keys: `human_verified_text` now refuses flag-only rows —
+NOTE: the audit's suggested `reviewed_by`-based SQL fix was WRONG and was reverted after the pin
+test showed desktop decisions legitimately carry `reviewed_by = NULL`; the key tightening lives in
+the quality layer where all callers route). #22 fixed at the shared root: an accept arriving with
+no text now snapshots what the serving law showed (annotated ▸ raw) instead of COALESCE-keeping a
+machine jury proposal as the human's answer. Measured data impact on the live db: exactly 6
+verified-no-decision rows demote to REVIEW; all 139 decided-with-text rows keep gold.
+
+**Rule 2 — the VERBATIM LAW.** The transcript every consumer serves, exports, grades, aligns, or
+displays is: human-decided verdict ▸ annotated ▸ champion raw — never `normalized_transcript` (the
+LLM refinement, measured rewriting a median 11.1% of characters: loanwords translated, digits
+verbalized) and never an undecided machine jury verdict. Changed in one sweep, mirrors kept
+byte-consistent: `quality::training_transcript_with_source`, `stats.rs::EFFECTIVE` (SQL mirror),
+`scripts/retrain_readiness.py` (script mirror), `corrections::loop0_draft_text` (aligner/LOOP-0 —
+timings are no longer computed against words the speaker never said), `jury/learning.rs` LM-corpus
+SQL, frontend `segmentQuality.effectiveTranscript`, ReviewMode `originalText`, App card list,
+DiffView base, and the desktop align-after-transcribe text. SILVER semantics tightened for free:
+machine-consensus rows are training-ready only when the jury/t2 evidence certifies the RAW text
+the export now actually ships (`evidence_transcript_matches` against raw). Refined text remains
+stored as jury EVIDENCE only.
+
+**Gates, all fail-before or count-verified:** new `test_verbatim_training_text_policy.py`
+(11 violations pre-fix → 0; function-scoped, with the `?? ''` labeled-column exemption). Full
+suites after the pin flips: **cargo --lib 1164 passed / 0 failed** (37 → 23 → 4 → 1 → 0 across the
+fixture surgery — the export/eval fixtures minted gold via the bare flag, exactly the fabrication
+the law bans, and `insert_segment` silently DROPS `human_decision`, so fixtures switched to
+`insert_segment_full`), clippy --all-targets clean, vitest 238/238, typecheck 0 errors, python
+policies **61/61** (both mirror scripts re-copied per their own instructions). Two vacuous-pass
+traps caught during the work: a `| tail` pipe masking cargo's exit code (37 failures read as
+EXIT=0), and a renamed test filter matching zero tests ("0 passed" read as green).
+
+**Deployment:** committed and REBUILT this window (reviewers paused by the owner); the running app
+now enforces both laws. The refinement setting stays available but its output can no longer reach
+a reviewer, an export, or an aligner.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 272 — the brutal pass: every reachable audit defect closed before the reviewers return
+
+**Owner ask:** one last brutal reality check for a true 10/10 before recalling the reviewers. A
+10/10 claim cannot stand over open confirmed defects, so this window closes every remaining
+text-provenance-audit finding reachable from the review pipeline:
+
+- **#2/#3 (undo fence):** undo now refuses unless the row still carries the exact `updated_at`
+  fingerprint captured when the decision's final write landed — `reviewed_by` alone let every
+  non-decision writer (batch normalize, refine loop, desktop edit, champion re-draft) be silently
+  reverted. New `UndoEntry` carries the stamp; `db.segment_row_stamp` is the fingerprint reader.
+- **#4 (serve/decide race):** the queue stamps each clip with `rowVersion` (the row's `updated_at`
+  at serve time), couch.html echoes it on every decision, and a decision against a replaced draft
+  is refused 409 — never recorded, never minted into a DPO pair. Replays finishing an
+  already-recorded decision are exempt (their write one legitimately moved the stamp); a page from
+  before this deploy sends nothing and is fenced by the existing verified/lease guards only.
+- **#17/#18 (jury):** `write_verdict` gains the `AND verified = 0` guard its siblings had, and
+  writes `jury_transcript` for parity with `db::write_segment_verdict` — the machine's own proposal
+  now survives a later human decision on both machine-verdict writers.
+- **#24 (consensus):** `update_segment_consensus_batch` gains the missing `AND verified = 0`.
+- **#11/#12 (export):** rejected + placeholder rows are dropped in `exclude_unexportable_segments`
+  — the shared root, per that function's own "a rule enforced per-caller gets missed by the sixth
+  caller" doctrine — so export_audio can no longer ship them. The finetune-pack counter that
+  silently absorbed the new drops was renamed `excluded_unexportable` end to end (Rust field, JSON
+  key, TS type, dashboard) rather than left lying as "holdout".
+- **#20 (champion law in tooling):** `batch_processor` HARD-STOPS at startup when the configured
+  primary engine is the WSL 7B champion — it drafts with the offline CTC engine and would have
+  silently downgraded the whole queue.
+
+**Proof:** mutation fail-before on BOTH couch fences (fences neutered with `if false &&` → both new
+tests FAIL → file restored byte-identical, sha256 2ad04b9624bd1c43 before and after). Five new
+regression tests, each discriminating by construction (0-changed/None-verdict asserts cannot pass
+against the old code). Full suites: **cargo --lib 1169 passed / 0 failed**, clippy --all-targets
+clean (exit captured directly this time, not through a pipe), vitest 238/238, typecheck 0 errors,
+python policies 61/61.
+
+**Remaining open, disclosed:** #21 (desktop `update_segment` whole-row upsert has no freshness
+check — desktop-only, the owner's own surface, same-second granularity caveat applies) and #13/#14
+collapsed to informational (the scripts trust `transcriptSource`, which since iteration 271 is
+minted only under the gold-provenance law). Nothing else from the 27 confirmed findings remains
+reachable.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 273 — the full sweep on the deployed app: 34/34 GREEN
+
+`python scripts/verify_10.py` on the deployed exe (HEAD 965aacb), machine idle, reviewers paused:
+**kept gates run: 34 — 34 PASS, 0 FAIL, 0 skipped.** Includes both new provenance gates
+(review-serving-provenance on the LIVE db, machine-never-writes-annotated + verbatim-training-text
+in the policy suite), the real-exe e2e legs, egress-runtime, fuzz (933.9s), bench-budget (1511.5s),
+and both crash drills. Verdict line verbatim: "GREEN - PERSONAL-USE SHIP-READY. (Not full-charter
+10/10: 9 legs owner-descoped, 3 owner-gated pending.)" The 9 descoped legs are the distribution
+items the owner ruled out of "ship" on 2026-07-10; the 3 owner-gated legs (iaa-kappa-ceiling,
+cordi-dialect-fairness, refinery-lift-in-product) are the ones that need HUMANS reviewing — the
+reviewers returning is itself the path to them. Log:
+%LOCALAPPDATA%\Temp\cortex-verify10\runs.jsonl + the session sweep log.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 274 — blueprint step 1 shipped; step 2 blocked on billing, and the attempt found a live defect
+
+**Step 1 (done): the verbatim conventions.** `docs/SORANI_VERBATIM_CONVENTIONS_v1.md` — a versioned
+Sorani style guide covering the rules reviewers were previously left to guess: repetitions/stutters
+kept, fillers kept, LOANWORDS WRITTEN AS SPOKEN (مەعاش stays مەعاش, never "corrected" to مووچە —
+the exact substitution the Gemini refiner made), numbers as spoken, no invented punctuation, no
+grammar fixes, dialect preserved, reject-don't-guess. Research basis: transcription policy left
+implicit makes up to 60% of measured error style-mismatch noise (arXiv 2607.18934). Includes the
+20-clip calibration protocol and states the guide changes when a reviewer is right.
+
+**Step 2 (BLOCKED, honestly): Gemini-as-ASR benchmark.** Built
+`src-tauri/src/bin/gemini_asr_bench.rs` — transcribes the frozen FLEURS ckb manifest (922 clips,
+sha256 c040242390ba… verified) and writes ONLY a hypothesis TSV; scoring stays in the existing
+scorecard so the champion's 7.03% and Gemini's number share one normalization + seed-42 bootstrap by
+construction, not by hope. Pilot run: **0 of 12 transcribed — HTTP 429 "Your prepayment credits are
+depleted."** The owner's Gemini key has no credits. No number was produced and none is claimed;
+the benchmark is ready to run the moment billing is restored.
+
+**Defect the failed pilot exposed (fixed):** `llm_refiner::is_transient` treated EVERY 429 as
+retryable, including billing/quota exhaustion — which no backoff can fix. In a live batch that is
+4 attempts and 7 s of wasted backoff PER CLIP, and the run then reports a retry exhaustion instead
+of "you are out of credits." Billing/quota 429s are now permanent (checked before the 429 rule, like
+the other permanent classes), mirrored in the bench binary as a hard stop. Fail-before verified: the
+guard removed → `transient_errors_retry_and_permanent_ones_stop_immediately` FAILS on the real
+provider string; restored byte-identical (sha 9ccabe81aff4474b before and after) → passes.
+
+**Privacy gate caught a shortcut, and the fix strengthened it.** The bench binary first reached for
+`gemini_api`'s `pub(crate)` helpers by widening them to `pub`;
+`test_cloud_privacy_policy.py` pins that declaration and went red. Widening lib surface so a
+benchmark could hand-assemble a cloud request was the wrong answer: the audio call now lives INSIDE
+the audited module as `gemini_api::transcribe_audio` (key in the `x-goog-api-key` header, never the
+URL; provider errors redacted), the binary is a thin driver, and the gate gained two assertions
+covering the new audio path. A gate going red is a gate working.
+
+**Verified:** cargo --lib 1169/0, clippy --all-targets clean, python policies 61/61.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 275 — the listening-QC was dead across 283 decisions
+
+**Hunt result (loop iteration 1).** The hidden spot-check mechanism — the ONLY instrument that
+measures whether a reviewer is listening rather than tapping accept — has been structurally
+incapable of firing. Measured on the live corpus: **0 answer keys against 283 human decisions and 4
+active reviewers.**
+
+Cause, and it is by design colliding with practice: `list_spot_check_candidates` mints keys only
+from `is_gold = 1 OR reviewed_by IS NULL`. The `reviewed_by IS NULL` arm exists so a peer's fresh
+correction never becomes the key another reviewer is graded against — correct. But every decision in
+this corpus arrived from the phone, which stamps `reviewed_by` unconditionally, and nothing is
+flagged `is_gold`. So the population is empty by construction. Nothing errored, no counter moved,
+and `spot_checks` still holds 5 rows from an earlier era — the QC LOOKED alive. Same shape as the
+vacuous-gate class this repo keeps finding, and it silently spanned every decision made to date.
+
+NOT caused by the gold-provenance law (iteration 271): the clause predates it. An earlier attempt to
+widen it to `reviewed_by <> requesting_reviewer` was reverted when the pin test showed that would
+promote peer corrections to answer keys — the right call, and it left this defect standing.
+
+**New gate `scripts/check_spot_check_pool.py`** (verify-10 tier-1 leg `spot-check-pool`): mirrors the
+candidate query + `human_verified_text` + the wrong-draft requirement, and FAILS on an empty or
+too-thin pool. Currently RED by design — exit 1, "ZERO answer keys". It is red because the system is
+wrong, not because the gate is.
+
+**The fix is an owner action, not code:** adjudicate a batch at the DESKTOP (which leaves
+`reviewed_by` NULL) or flag adjudicated clips `is_gold = 1`, so keys exist. This is the same
+mechanism the blueprint's double-pass + adjudication stage would replenish continuously.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 276 — MEASURED: the champion drafts alone; Gemini fusion is not a win
+
+The owner's question ("champion + Gemini, then human — true?") now has a number instead of an
+opinion. All engines scored by ONE code path (`scorecard_gemini.py` imports `scorecard_7b`'s `_NORM`,
+`edit_distance` and the seed-42 bootstrap), paired on the IDENTICAL 890 clips.
+
+| draft | CER | 95% CI | WER |
+|---|---|---|---|
+| **champion alone** | **7.02%** | [6.45, 7.65] | 32.70% |
+| Gemini 2.5 Pro alone | 9.58% | [8.83, 10.37] | 33.43% |
+| fusion (Gemini overrides on disagreement) | 7.32% | [6.75, 7.94] | 31.70% |
+| fusion (ROVER, ties keep champion) | 7.02% | — | 32.70% (0 clips changed) |
+
+MAPSSWE matched-pairs, N=890: champion beats Gemini on CER at **p=2.4e-30**. Champion beats the
+fused draft on CER at p=5.4e-4 — while the fused draft beats the champion on WER at p=2.5e-4. Real
+trade, both directions significant: Gemini recovers whole words the champion mangles, but when it is
+wrong it is wrong by more characters.
+
+**Decision: the champion drafts alone.** CER is the metric this project publishes and the basis of
+the 7.03% claim; adopting fusion would move the headline the wrong way for a 3%-relative WER gain,
+while adding a cloud dependency to every clip. Practical seal: gemini-2.5-pro is capped at **1000
+requests/day** (the run hard-stopped at 890/922 on that quota), so it could never draft a corpus of
+this size regardless of quality.
+
+Honest scope: measured on FLEURS = READ speech; the ranking on spontaneous dialectal audio is
+untested. Only two engines voted, so ROVER had no tiebreaker (0 changes by construction). Gemini's
+number is under this project's verbatim prompt, which is the task that matters here.
+
+Three traps the harness caught rather than swallowed: (a) the champion ran in WSL and Gemini on
+Windows, so joining on raw paths gave ZERO overlap — the zero-overlap guard refused instead of
+scoring an empty set; (b) an early 27-clip read showed Gemini at 7.78%, which the full 890 corrected
+to 9.58% — small-n optimism, flagged at the time; (c) the daily-quota 429 hard-stopped instead of
+retrying, per the fix in iteration 274.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 277 — the disagreement display, a real model-resolution bug, and a corrected claim
+
+**Measured, correcting myself.** I had been quoting the local acoustic engines as "3-4x worse" than
+the champion from stale figures (21% / 29.4% — different models). Measured on the frozen gold set
+through the shared scorer: **omniasr-ctc-300m = 11.65% CER [11.07, 12.28]**, n=921. That is 1.66x the
+champion's 7.02%, not 4x — the same order as Gemini's 1.36x, which makes multi-engine fusion a live
+question again rather than a foregone conclusion. CTC-1B is running.
+
+**A real user-facing bug the measurement exposed.** CTC-1B failed on ALL 922 clips with "ASR service
+unavailable (models missing?)" — while its 1 GB copy sat in the bundled models dir. Cause:
+`pipeline.rs` loaded the ASR pool through `model_manager.resolved_dir()`, which flips all-or-nothing
+between the user root and the bundled root. `%APPDATA%/cortex-speech/models/omniasr-ctc-1b/` exists
+but is EMPTY, so the user root won — and the engine offered in the UI could not load. This is the
+round-26 class the denoiser/aligner/campp were already fixed for; the ASR engines were the one place
+still using the all-or-nothing root, and the availability PROBE had it twice over (one root asked
+about several engines silently downgrades a bundled-only engine). Now `root_for_size` /
+`size_present` resolve PER ENGINE. Pinned in `test_rust_runtime_panic_policy.py` beside the existing
+per-file assertions; fail-before verified (reverted one call site -> gate FAILS naming it; restored
+byte-identical, sha cec14701ca5d22ea).
+
+`wsl_without_script_uses_local_asr_fallback` then failed — because it PREDICTED the expectation using
+the buggy `resolved_dir()`. The test had encoded the defect as truth; it now probes per-file like
+production.
+
+**The disagreement display (owner-requested).** The couch queue now carries `unsupportedWords`: the
+served draft's word positions that NO other engine produced anywhere in the clip. The phone lists
+them under the clip ("⚠ بە وردی گوێ بگرە لە: …"). This exists because the champion is an LLM-based
+ASR and was measured writing the standard form where all three acoustic engines agreed on the
+pronounced one (سێری -> سەیری, خۆدە -> خۆت) — fluent, plausible, and therefore invisible to a
+skimming reviewer. It LISTS words and never replaces them; the champion cannot vouch for itself
+(its own hypothesis is excluded from support, mutation-verified: with self-support the flag goes
+silent exactly when it matters); and a clip with no stored hypotheses flags nothing rather than
+everything. New Sorani string acknowledged in the i18n gate — awaiting the owner's native read.
+
+**Concurrency hazard, recorded.** Mid-iteration the lib test count dropped 1177 -> 1161. Not my
+change: ANOTHER session removed two dead modules (`align_text.rs`, `perf/mod.rs`) together with
+their `pub mod` declarations — 16 tests, a coherent refactor. Their deletion is left UNCOMMITTED and
+untouched; this commit stages only its own files by name. `git add -A` here would have shipped
+another session's refactor under this message.
+
+**Verified:** cargo --lib 1154 passed / 0 failed (1161 total, the reduced count explained above),
+python policies 62/62.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 278 — the benchmark lied about the domain; the display was measured and REVERTED
+
+**The FLEURS number does not transfer, and that reverses two conclusions.** Every engine scored
+through the shared scorer on 889 clips both ways — the frozen FLEURS gold set (READ speech) and the
+owner's OWN reviewed clips (spontaneous dialectal, verbatim human answers):
+
+| engine | FLEURS CER | owner's edited clips |
+|---|---|---|
+| champion (7B) | 6.95% | **10.59%** |
+| omniasr-ctc-1b | 8.13% | **39.99%** |
+| omniasr-ctc-300m | 11.59% | 23.42% |
+| finetuned-mms-ckb | — | 19.05% |
+| gemini-2.5-pro | 9.50% | (no stored per-clip hypotheses) |
+
+CTC-1B looks like an 8% engine on read speech and is a **40%** engine on real dialectal audio — a 5x
+collapse. FLEURS references were WRITTEN first and then read aloud, so they are standard orthography
+by construction: a benchmark that rewards standardizing cannot evaluate a verbatim corpus.
+
+Consequence 1: **4-engine ROVER fusion beat the champion on FLEURS** — 6.57% vs 6.95% CER
+(MAPSSWE p=2.7e-28) and 30.32% vs 32.63% WER (p=5.9e-57), closure-verified, a genuine result. On the
+owner's domain the same fusion changed **0 of 135 clips**, because any weight large enough to let a
+20-40% engine outvote a 10% one imports its errors. **The champion drafts alone** — now on
+domain-matched evidence rather than the earlier guess.
+
+Consequence 2: **the disagreement display was built, measured, and reverted.** Against the owner's
+own corrections (179 clips, 4458 champion words, 20.6% base rate of words the human changed):
+
+| flagging rule | words flagged | precision | lift |
+|---|---|---|---|
+| no engine produced it (as built) | 36.6% | 32.1% | 1.56x |
+| no STRONG engine produced it | 40.2% | 31.2% | 1.52x |
+| >=2 others agree on a replacement | 2.6% | 37.6% | 1.83x |
+| ALL others agree on a replacement | 0.6% | 46.2% | 2.24x |
+
+The best rule is a coin flip firing once per seven clips; the shipped rule flags a THIRD of every
+clip and is wrong two times in three. A warning that cries wolf trains reviewers to ignore it,
+including when it is right — so this is worse than nothing and it does not ship. Reverted in full
+(couch.rs, couch.html, the i18n acknowledgement). The champion's standardization tendency is real
+and still unaddressed; these engines are simply too weak on this domain to detect it.
+
+Honest bias note on the owner-domain numbers: the references are the reviewers' corrections, typed
+while looking at the CHAMPION's draft, so the champion is flattered by anchoring — the draft-free
+slice the blueprint calls for is what would remove it. Accept rows were excluded for exactly this
+reason (the champion's own text as its own reference scores 0 by construction).
+
+**Kept from this line of work:** the per-engine model resolution fix (real user-facing bug), the
+`local_asr_dump` harness, and four engines now measured on both domains.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 279 — Review UI: audio against the text box, one section fewer
+
+**Owner feedback while reviewing:** the waveform and play button sat far above the correction area,
+and three text sections competed for the screen.
+
+**Reordered.** The audio is now ONE card (waveform + playback-scope hint + transport) sitting
+directly above the editor, so listening and correcting no longer require scrolling between them.
+New order: audio -> transcript editor -> listen strip -> fix-the-draft tools. Previously the editor
+sat below the waveform, the hint, the player, the listen strip AND the consensus card — roughly
+600px down, on a laptop screen usually out of view while the play button was in view.
+
+**One section removed, on evidence.** Of the three text sections, the CONSENSUS DRAFT card is gone.
+It rendered an ability-weighted vote across this clip's ASR hypotheses — precisely the fusion
+measured in iteration 278 as changing 0 of 135 clips on the owner's own audio, built from engines at
+19-40% CER against a champion at 10.6%. Its "Use draft" button therefore replaced the champion's
+text with a measurably worse blend: not merely clutter, a one-tap downgrade. The now-dead
+`CONTESTED` threshold and `SegmentConsensus` type import went with it; `loadConsensus` is KEPT
+because the same call feeds the honest "drafted by <engine>" provenance badge.
+
+**The listen strip STAYS**, moved below the editor. Tapping a word to hear exactly that word is the
+core verbatim interaction and the reviewer's only tool for the champion-standardization case the
+owner caught by ear (سێری vs سەیری) — the disagreement display that was supposed to help with that
+measured as noise and was reverted, which makes the ear the remaining instrument.
+
+**Verified:** typecheck 0 errors, eslint clean, vitest 232/232. NOT yet visible to anyone: the
+frontend is bundled into the exe, so this lands on the next rebuild — deliberately deferred while
+the owner is mid-review rather than interrupting a session to ship a layout change.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 280 — the 348-row clear left 36 laundered accepts, and the gate could not see them
+
+**The sweep was GREEN and the data was not.** The full 35-gate `verify-10` finished GREEN
+(35/35 PASS, 0 FAIL, VERDICT: GREEN — PERSONAL-USE SHIP-READY) on the same live database that was,
+at that moment, holding 36 rows of LLM-refiner text labeled `human_verified`. Both statements are
+true, which is the finding: no gate covered this class until this iteration.
+
+**Measured, on the live DB (read-only), 2026-08-13.** Of 180 `accept` decisions, **36 freeze text
+that matches NO ASR hypothesis on file** — not the champion `omniasr-wsl-7b`, not
+`finetuned-mms-ckb`, not `omniasr-ctc-300m`, not `omniasr-ctc-1b`. All 36 are pre-fix (before the
+2026-08-12 11:54 clear); 33 by Rubar, 3 by Lamo. Character divergence from the champion's own
+transcript: median 5.2%, max 14.2%. Split by era, the control is clean: **0 of 31 post-fix accepts**
+diverge, which is what proves the accept path copies the served text verbatim — so a diverging
+accept means the text served was never the champion's.
+
+Sample (id `3330566c`, Rubar, 2026-08-11):
+
+* champion RAW: `خێزانەکەمان بێ بە کۆمەڵگاکە بێ بە مامۆستایانی ئاینی بێت کە...`
+* APPROVED:     `خێزانەکەمان، کۆمەڵگاکە، یان مامۆستایانی ئایینی، کە...`
+
+Inserted commas, `بێ بە` → `یان`, `ئاینی` → `ئایینی`. Elsewhere `زیای ناکردووە` → `زیادی نەکردبوو`
+— repaired grammar. This is refiner output, and under the verbatim law it is now the training text.
+
+**Why the existing gate passed it.** Invariant 1 says a populated `annotated_transcript` requires
+human EVIDENCE on the row, and accepts a recorded `human_decision` as that evidence. A decision is
+evidence a human clicked a button. It is not evidence a human authored the words. Pre-fix, the
+machine wrote the paraphrase into the human-only field, the reviewer was shown it, clicked accept —
+and the click retroactively made the row look legitimately human. The 2026-08-12 clear removed the
+machine text only from rows that had NOT yet been decided; every row a reviewer had already accepted
+kept it, permanently, in `verdict_transcript`.
+
+**Fixed: invariant 3 in `check_review_serving_provenance.py` (verify-10 gate
+`review-serving-provenance`).** An accept may only freeze text some ASR engine actually produced —
+the stored text, read at the export's own precedence (`verdict ▸ annotated ▸ raw`, mirroring
+`quality::training_transcript_with_source`), must match one of that segment's own hypotheses.
+Whitespace-normalized so spacing is not a finding. Edits are deliberately exempt: an edit is a human
+typing, and its text is expected to match no engine.
+
+**Fail-before / pass-after, both run:** live DB → `FAIL [accept-provenance]: 36 accepts freeze text
+no ASR engine produced`, exit 1. Same gate against a consistent copy with those 36 requeued →
+`PASS [accept-provenance]`, exit 0, all three invariants hold. The live database was NOT modified;
+the remediation destroys 36 human decisions and is the owner's call. `npm run test:python-policies`:
+62 policy scripts passed.
+
+**Still true and not yet fixed:** those 36 rows export today as `transcript_source =
+human_verified`. Any dataset built before the requeue carries them.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+**Remediated same day, on the owner's go.** Backup first
+(`cortex-speech.db.bak-requeue-laundered-20260813`, 6,279,168 bytes, taken with the sqlite backup API
+because reviewers were deciding clips during the write and a file copy would have torn). The target
+set was recomputed INSIDE a `BEGIN IMMEDIATE` transaction rather than reused from the measurement 20
+minutes earlier — in that gap the reviewers had turned 180 accepts into 196, and acting on the stale
+list would have missed or mis-hit rows. Under the lock: still exactly 36, and all 36 already carried
+the champion's own transcript in `raw_transcript` (asserted before the write, with a rollback on
+mismatch, so clearing a decision could not expose some other engine's leftovers).
+
+Cleared on those rows: `verified`, `is_gold`, `human_decision`, `verdict`, `verdict_transcript`,
+`annotated_transcript`, `reviewed_by`, `corrected_at`. **Kept deliberately:** `review_events` (the
+audit trail of who decided what and when — deleting it would erase the evidence of this incident)
+and `decision_verdicts` (a MACHINE verdict feeding the C4 auto-accept-precision denominator;
+deleting it would silently move a measured number).
+
+**Verified at the serving path, not the write path:** pending 6 → 42 (+36 exactly);
+`review-serving-provenance` all three invariants PASS (exit 0); `check_spot_check_pool` healthy (22
+answer keys, 436 human decisions, 4 active reviewers). On the LIVE couch API with a real reviewer
+token: `pendingTotal 42`, and **25 of the 36 requeued clips are already in a reviewer's batch, all 25
+serving text byte-equal to the champion's own transcript, none blank** (the other 11 sit behind the
+25-clip batch cap).
+
+**Corrected, for the record:** the "122 pending" figure reported earlier today is stale. The
+reviewers have decided all but 42 of the 494 clips — 436 human decisions and climbing during this
+very remediation.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+**Self-inflicted, found and corrected the same session: the requeue wrote LOCAL time into a UTC
+column.** Every app writer stamps `updated_at = datetime('now')`, which SQLite evaluates in **UTC**.
+The remediation script above used Python's `datetime.now()` — local, UTC+3 on this machine — so the
+36 requeued rows carried a timestamp about three hours in the FUTURE relative to every other row in
+the table.
+
+Impact, stated precisely rather than dramatically: `segment_row_stamp` (the rowVersion serve/decide
+fence) compares the stamp for EQUALITY, so the fence was never wrong and no decision could be
+mis-accepted. What it did corrupt is every time-ordered read of those rows — "recently modified"
+ordering, any incremental/backlog pass keyed on `updated_at`, and the displayed last-changed time —
+for as long as it took real time to catch up.
+
+Corrected with the shape of the defect, not the shape of the incident: `UPDATE ... SET updated_at =
+datetime('now') WHERE updated_at > datetime('now')` — a row stamped in the future is the bug, whoever
+wrote it. **16 rows** still carried it; the other 20 had already been re-reviewed, and the app's own
+UTC write had overwritten them. Zero future-stamped rows remain, and all three provenance invariants
+still PASS on the live DB.
+
+The lesson generalizes past this script: any direct write to this database must use
+`datetime('now')`, never a Python-side clock, or it silently disagrees with every row the app wrote.
+
+**Reviewer progress at this point:** 22 clips pending — 16 of the requeued 36, plus the 6 escalated
+clips that were never decided. **20 of the 36 have already been redone** against the champion's own
+text. Last human decision 16:17 local; no activity for ~83 minutes when this was written.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 281 — the listening-QC fired, and one reviewer is an outlier on two instruments
+
+Measured during the evening idle window (reviewers stopped at 16:17 local, 22 clips pending).
+
+**Spot-check scorecard.** `noticed` is the blind-accept signal: the reviewer was served a clip whose
+answer is already known and a draft that differs from it, and `noticed` records whether they changed
+it rather than tapping accept.
+
+| reviewer | checks | noticed | mean CER vs the known answer |
+|---|---:|---:|---:|
+| Sewa | 16 | 14 (88%) | 0.102 |
+| Hawzhin | 5 | 5 (100%) | 0.045 |
+| **Rubar** | **4** | **1 (25%)** | 0.069 |
+| Lamo | 2 | 1 (50%) | 0.080 |
+
+**Second, independent instrument — the real corpus.** Share of each reviewer's decisions where the
+final text is byte-identical to the draft they were handed:
+
+| reviewer | decisions | accept | edit | reject | text unchanged |
+|---|---:|---:|---:|---:|---:|
+| Sewa | 152 | 39 | 106 | 7 | 30% |
+| **Rubar** | **266** | **133** | 130 | 3 | **51%** |
+| Lamo | 27 | 2 | 19 | 6 | 30% |
+
+Rubar hands the draft back untouched on half her clips against 30% for both peers, and on the
+known-answer clips she changed 1 of 4 — leaving 5.2%, 5.8% and 13.7% CER against text a human had
+already established. The 20 requeued clips she redid today came back 19 accepts with ZERO character
+change and 1 edit.
+
+**Held against this, honestly.** Four checks is a small sample and this file's own docstring says to
+interpret nothing from a handful — the finding is a signal, not a verdict. The 33 laundered accepts
+were NOT her fault: the app served her refiner-polished text, and polished text is exactly what a
+careful reviewer would accept. And under the verbatim law, accepting the champion's raw output
+unchanged is often CORRECT, because what the refiner used to "fix" was frequently the speaker's own
+disfluency. None of that explains 1-of-4 on clips where the answer was already known.
+
+**Why it matters more than the numbers suggest:** Rubar has made 266 of the corpus's decisions —
+more than Sewa and Lamo combined. The dataset's quality is dominated by the reviewer with the
+weakest listening signal.
+
+**The instrument is not exhausted:** answer keys are owner-desktop decisions, excluded per reviewer
+only once used, so Rubar can still receive up to 18 more checks. The cheap next measurement is more
+of her own clips, not an argument about these four.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 282 — the queue reached zero: 494/494 decided, and what the finished corpus actually is
+
+**Every clip is decided. 0 pending.** 494 segments: 278 edits, 199 accepts, 17 rejects.
+
+**The export, run through the real `export_dataset` command on the live app** (not a SQL
+approximation of it):
+
+| | |
+|---|---:|
+| rows exported | 477 (the 17 rejects correctly dropped) |
+| `transcriptSource` | **477/477 human_verified**, 0 raw_asr |
+| training grade | 454 gold · 18 review · 5 reject |
+| training-ready | **454 clips = 1.15 hours** |
+| blank transcripts | 0 |
+
+Everything held out of training is held out for AUDIO, not for process: 18 `low_rms_volume`, 5
+`near_silence`. No provenance, blank, or placeholder failures remain.
+
+**All three provenance invariants PASS on the finished corpus**, including the accept-provenance
+invariant added today — so no accept in the shipped dataset freezes text an ASR engine did not
+produce. Spot-check pool healthy (22 keys).
+
+**State the size honestly: 1.15 hours is a small ASR corpus.** It is clean, verbatim and
+human-decided, which is what it was built to be, but nobody should call 454 clips a fine-tuning set
+without saying how small it is.
+
+**The QC signal got STRONGER, not weaker, with more data.** Rubar received 3 more known-answer clips
+after the earlier scorecard and changed none of them:
+
+| reviewer | checks | noticed | decisions owned |
+|---|---:|---:|---:|
+| Sewa | 16 | 14 (88%) | 152 |
+| Hawzhin | 5 | 5 (100%) | 27 (desktop) |
+| **Rubar** | **7** | **1 (14%)** | **288** |
+| Lamo | 2 | 1 (50%) | 27 |
+
+**Do NOT read `mean_cer` as a quality ranking** — Sewa's is HIGHER than Rubar's (0.102 vs 0.049)
+while Sewa notices 88% and Rubar notices 14%. The answer keys are owner-desktop decisions, and a reviewer
+writing true verbatim can legitimately diverge from a key that was standardized. `noticed` is the
+robust signal because it measures engagement, not agreement.
+
+**The exposure, stated plainly:** Rubar decided 288 of 494 clips — 58% of the corpus, more than every
+other reviewer combined — and she is the one reviewer whose listening signal is weak. The cheap next
+measurement is a blind second pass: route a sample of her 153 accepts through Sewa and measure the
+disagreement rate. That also builds the double-pass adjudication tier the charter still lacks.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 283 — the whole original corpus was silently imported a second time
+
+**Found at 02:30 by the pass-1 readiness sweep**, not by a gate — no gate covered this.
+
+**What happened.** The 34-hour Hawleri source folder was deduplicated by decoded-audio hash before
+import — correctly, 3.57 h on disk collapsing to 2.28 h of unique audio. The question never asked was
+whether the LIBRARY already held those recordings. It did. Verified by decoded-audio SHA, three
+sources came back a second time:
+
+| already in the library | re-imported copy |
+|---|---|
+| `Lamofull2_00086400_A01.flac` — 429 clips, **429 reviewed** | `.wav` — 428, none reviewed |
+| `Lamofull00086400_A02.flac` — 40 clips, **40 reviewed** | `Lamofull00086400_A01.wav` — 40, none reviewed |
+| `A1-0032_PODCAST-001.mp4` — 25 clips, **25 reviewed** | `.wav` — 25, none reviewed |
+
+**493 duplicate clips against 494 already-reviewed ones — the entire original corpus, doubled.** Note
+the second row: the names differ (`A01` vs `A02`), so a filename comparison misses it entirely; only
+the decoded audio matches. What it would have cost: the same speech in train AND test, making any
+accuracy measured across that split partly a memory test with nothing in the number to say so, plus
+reviewers judging the same audio twice.
+
+**Removed** under `BEGIN IMMEDIATE` with a pre-flight assertion that none of the 493 carried a human
+decision (rollback if any did — the surviving copy must be the reviewed one). Backup first:
+`cortex-speech.db.bak-dedupe-reimport-20260814`. Cascade clean: 0 orphan hypotheses. Library 1854 →
+**1361 clips, 867 pending**.
+
+**Two candidate gates were built and BOTH rejected on measurement**, which is the part worth keeping:
+
+1. *`(duration_ms, raw_transcript)` collisions.* Caught the incident (188 colliding clips on the true
+   pair) and then FAILED on a clean library — 4 false pairs between recordings proven distinct by
+   hash. Same speaker, VAD durations clamped to the same bounds, short common phrases. A gate that
+   cries wolf gets ignored, so this one was deleted rather than shipped.
+2. *Reusing `audio_fingerprint` / `audio_content_hash`.* Both are per-SOURCE-FILE and computed from
+   the file as stored: a FLAC and its 16 kHz WAV conversion get different values. Measured on the
+   live rows: **0 shared values** between the two copies of the same recording. Neither field can see
+   the format change that caused the incident.
+
+What shipped instead is `scripts/check_import_folder_is_new.py` — decode and compare, run ONCE before
+an import rather than every sweep, which is exactly where that cost is affordable. Fail-before
+verified against the folder that caused this: exit 1, naming `Lamofull00086400_A01.wav` as the same
+audio as `Lamofull00086400_A02.flac` with 40 reviewed clips.
+
+**Also observed:** `[Pending WSL 7B ASR]` placeholder rows are servable to reviewers — the couch queue
+filters on `verified = 0` and nothing else. During a normal import the app is closed so nobody can
+hit them, but an INTERRUPTED import leaves them behind. 36 such rows were left by killing the stalled
+importer and were removed with the duplicates. The `champion-fallback` invariant also reads RED for
+the duration of any import, because placeholders legitimately have no champion hypothesis yet — worth
+knowing before treating a mid-import gate run as a finding.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 284 — the import is latency-bound on the champion, and two speed hypotheses died
+
+**Older non-Hawleri material: READY.** All 471 pending clips pass every readiness condition — audio
+on disk, champion draft, champion hypothesis stored, speaker, duration, real `ctc_forced` alignment,
+nothing machine-written in the human field, zero cloud calls. **0 blocking defects.** 107 measure
+below -35 dB and will be held back from training by the volume gate, reported rather than processed
+until they look acceptable.
+
+**Import throughput, measured rather than assumed — and the first number was wrong.**
+
+The "55 clips/min" reported earlier measured segment CREATION. Segments are created carrying the
+`[Pending WSL 7B ASR]` placeholder and the champion fills them afterwards, so that number described
+an intermediate, not the outcome. **The real rate is 8.5 clips/min**, both before and after the
+concurrency change.
+
+Three hypotheses, each measured, two dead:
+
+1. **Only one GPU works.** TRUE and real: `CORTEX_7B_CONCURRENCY` defaults to 1, and pipeline.rs's
+   own comment records this exact failure from 2026-08-11. Measured 43% / 3% across the two cards.
+   Setting it to 2 changed the rate by nothing — because the gate LIMITS concurrency, it does not
+   CREATE it. The importer's per-clip loop is serial, so the second permit is never filled and the
+   second GPU never receives work.
+2. **A process is spawned per clip.** TRUE (the app runs `wsl` -> a fresh `cortex_7b_client.py` for
+   every clip) but NOT the cost: measured `wsl` spawn 0.11 s, `wsl` + python3 0.11 s, + sqlite/socket
+   imports 0.13 s. Discarded before any code was touched.
+3. **The champion call itself.** Measured: **4.62 s for one round trip** on a ~9 s clip. That is the
+   cost. A 7B decoding a short clip is latency-bound, which is also why both cards read as near-idle
+   while being the bottleneck — nvidia-smi is sampling the gaps.
+
+**The fix is real parallelism in the importer's per-clip loop** — two clips in flight would use both
+cards and roughly halve wall clock. NOT done: it is a change to the champion path, whose client
+failure contract exists specifically to stop a silent blank reaching the DB, and rewriting it
+unattended at 3am is how that contract gets broken. Owner's call, with the number attached.
+
+**Consequence for the 34-hour corpus:** at 8.5 clips/min it is ~27 hours of import, not the ~6 stated
+earlier. About 5-6 episodes land per overnight window. Reviewers are unaffected — 471 clips are
+queued and ready.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 285 — a servable placeholder, and 107 good clips held back by a level defect I introduced
+
+**Fixed: the review queue could serve a clip the champion had not drafted.** `pending_segment_ids`
+filtered on `verified = 0` and nothing else. `api_decision` already refuses to VERIFY `[...]` text, so
+the visible outcome is a 400 — but the path that SUCCEEDS is the damaging one: the reviewer types the
+transcript themselves, the clip is finished without the champion ever drafting it, and it permanently
+has no baseline for any CER measurement. Demonstrated on the live DB mid-import: the old query offers
+**867** clips, the new one **695** — 172 undrafted clips it stops reaching a reviewer right now.
+Matched on the same `[...]` shape the decide guard rejects, so serving and deciding cannot drift
+apart. Test covers all four cases. NOT YET BUILT: any build into `target/release` fails while the
+importer holds `onnxruntime.dll`, so this must be compiled after the import stops and BEFORE the app
+is handed back — stopping an import mid-file is precisely what creates placeholders.
+
+**Found: 107 clips (22.7% of the older pending material) sit below -35 dB, and it is my defect.** The
+quiet clips are not scattered — they concentrate in whole source files: `A1-0037_Sound01` 10/10,
+`A1-0042_Sound01 (2)` 9/9, `A1-0031_PODCAST-001` 6/6, `A1-0049_Sound02` 10/11. That is a per-FILE
+level problem, and the cause is that the first staging pass converted those files with `-ac 1 -ar
+16000` and NO gain correction. The Hawleri batch got proper EBU R128 normalization; this batch did
+not.
+
+**Measured before treating it as damage:** the champion coped. Quiet clips produce **0 empty drafts**
+and a median 12.63 chars/sec against 14.27 for normal-level clips — an 11% gap that is within
+speech-rate variation. A clip at -45.8 dB returned a clean Kurdish sentence. The audio is fine for a
+human to review and fine for training; only the `low_rms_volume` gate holds it back.
+
+**The gate is NOT being relaxed.** Weakening a quality gate to make data pass is the one move this
+project forbids outright. The fix belongs at the cause: re-prep those source files with the same
+static-gain normalization used for the Hawleri episodes and re-import them. They carry no human
+decisions, so nothing is lost — but it costs champion time at 8.5 clips/min and it changes the
+corpus, so it waits for the owner rather than happening overnight.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 286 — 55 under-levelled files re-prepped, and a "fix" that measured as no fix at all
+
+**Measured the cause directly instead of inferring it from clip stats.** Of the 145 older staged
+files, **55 measure below -26 LUFS** — the worst at **-49.2 LUFS with a true peak of -27 dBTP**. That
+is not quiet recording; it is 25-30 dB of headroom left unused, and it is my defect: this batch was
+converted with `-ac 1 -ar 16000` and no gain while the Hawleri episodes got a proper EBU R128 pass.
+
+**Re-levelled all 55** with the same static-gain rule (measure, one volume multiplier, never a
+limiter, never turn a file down for a peak-margin policy). Output -29.0 .. -19.8 LUFS, max true peak
+-1.43 dBTP. **14 remain below -26 LUFS** — high crest factor, no headroom to reach the target without
+dynamics processing, reported rather than forced.
+
+**The part worth recording is the correction.** The first pass applied up to +25 dB to my own 16-bit
+16 kHz intermediates, and a file at -49 dBFS occupies roughly 8 of 16 bits — so amplifying it should
+amplify quantization noise. I redid all 55 from the 48 kHz masters on that reasoning, then MEASURED
+both:
+
+    noise floor from the 16-bit intermediate : -42.11 dBFS
+    noise floor from the 48 kHz master       : -42.11 dBFS
+    difference                               :  -0.00 dB
+
+**No difference at all.** The recording's own noise floor sits about 30 dB above where 16-bit
+quantization noise lives, so quantization was never the limiting factor. The theory was sound and the
+effect was absent. Recorded because a plausible improvement that measurement cannot find is exactly
+the kind of thing that otherwise gets banked as a win.
+
+**Prepared, NOT imported.** `_relevelled_16k/` holds the 55 files. Importing them means deleting their
+existing clips first (all undecided, so nothing human is lost) and spending champion time at 8.5
+clips/min. It changes the corpus, so it waits for the owner.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 287 — the handover, and an "APP IS UP" that was not true
+
+**Final overnight state:** 3,767 clips / 9.20 h in the library, **3,273 reviewable / 7.95 h**, 494
+already decided, 8 of 32 Hawleri episodes imported, 24 prepped and waiting. All five reviewer links
+verified by CLAIMING each one over the live API and checking the server returned that reviewer's own
+name; queue serves 29 clips with 0 blanks and 0 placeholders; audio streams HTTP 200.
+
+**The incident, in order.**
+
+At 07:30 the handover stopped the importer, deleted 99 leftover placeholders, rebuilt, and re-enabled
+the watchdog. The app relaunched at 07:42 and I reported **"APP IS UP"** from a process check. It was
+not up. Its log:
+
+    CORTEX_STARTUP_FAIL: Another instance is already running.
+    Failed to remove stale Windows instance lock file cortex.lock
+
+The app had died into an error dialog — 37 MB resident, 0.14 s CPU, no log output after startup. A
+RUNNING PROCESS IS NOT A WORKING APP, which is the same write-path/serving-path error this project has
+now been bitten by four times. What caught it was refusing to call the links good until one returned a
+reviewer's name; a fingerprint comparison or a process check would both have passed.
+
+**Root cause was mine.** `TaskStop` on the original overnight chain killed its wrapper but left the
+detached shell alive. It waited all night on `while running; do sleep 60; done`, saw the handover kill
+the importer at 07:30:35, and started its own import of `_batch_rest` 22 seconds later — holding
+`cortex.lock` against the app, and re-importing `KBHP-EP08`, already imported. **348 duplicate clips**,
+removed with the usual decision guard (0 carried one). EP08 back to its correct 348.
+
+**Also learned:** the watchdog launches the app WITHOUT the CDP debug port, so the Playwright/IPC
+harness used all week is unavailable on a watchdog-started app. Every verification after a watchdog
+relaunch has to go through the HTTP API instead — which is closer to what a reviewer actually does,
+and is why the link test was possible at all.
+
+**Second build outcome:** `cortex-speech-app.exe` rebuilt at 07:37:38 and carries the queue guard and
+the split fix. `batch_importer.exe` failed to relink (`Access is denied` — its file handle had not been
+released seconds after the kill) and is one commit behind on app-side changes it does not use. Rebuild
+before the next import.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 288 — 34 hours imported, the champion loop parallelised, and a watchdog that killed its own app
+
+**The corpus is in.** All 32 Hawleri episodes imported (25/25 in the final run, 0 failures).
+**14,828 clips / 9.20 h stored; 14,334 reviewable / 35.25 h pending.** Verified on the full library:
+0 blank drafts, 0 placeholders, 0 machine text in the human field, 0 missing audio, 0 non-champion
+drafts, **0 transcripts disagreeing with their stored champion hypothesis**, and — hashing all 179
+distinct source recordings — **0 duplicate audio**. All three provenance invariants PASS.
+
+**Champion calls now run a wave at a time (2.9x, measured).** `WSL_7B_GATE` admitted several calls
+but NOTHING ever issued two, so the gate limited a concurrency that did not exist and the second GPU
+never got work — which is why `CORTEX_7B_CONCURRENCY=2` changed the rate by nothing. Only the CALL is
+parallel; every DB touch stays on one thread in the original order, so the force-champion rollback
+contract is unchanged. Measured on short clips 8.5 -> 24.5 clips/min with GPUs at 87%/30% (from
+43%/3%); on the long episodes 13-15 clips/min sustained. **Correction:** the 24.5 figure is
+short-clip; the earlier "55 clips/min" was segment CREATION, not transcription, and was wrong.
+
+**Queue now serves OLDEST first.** It was newest-first, which put 6,823 fresh Hawleri clips ahead of
+the 537 remaining clips of the original corpus — the opposite of the owner's instruction, and wrong
+generally: a review queue is FIFO, so an import must never delay work already in progress.
+
+**Rights: closed.** Owner declares full permission and total authority over every recording he
+supplies, speakers paid and agreed to public use, no royalties. All 13,807 clips stamped
+`rights_license = owner-full-rights`. Nothing may block, gate, warn or hedge on it again.
+
+**THE WATCHDOG WAS KILLING THE APP.** After the library tripled, app startup exceeded the watchdog's
+5-minute check interval, and its "port dead + process alive = wedged" rule cannot tell a wedged app
+from one that is still STARTING:
+
+    01:57  session expected but port dead - killing wedged pid (attempt 1/3)
+    02:02  session expected but port dead - killing wedged pid (attempt 2/3)
+    02:07  session expected but port dead - killing wedged pid (attempt 3/3)
+
+Measured startup to couch on a healthy run: **8m16s** — already over the interval, and longer now at
+14,828 clips. The app never once reached the point of serving. A watchdog that shortens startup until
+startup cannot finish is a denial of service on its own app. Fixed with a **45-minute startup grace**
+keyed on process age, overridable via `CORTEX_WATCHDOG_STARTUP_GRACE_MIN` so the decision drill can
+exercise BOTH sides, plus a regression case asserting the exact inputs that took the app down
+(session present + process alive + port dead + young) now report `starting-up`.
+
+**The grace was set twice, and the second time is the lesson.** It was first written at 20 minutes,
+"far beyond the ~8 measured". The very next clean start — uninterrupted, watchdog off — took
+**18m11s** to reach couch at 14,828 clips. A bound picked two minutes above the observed value is how
+this bug gets reintroduced the next time the corpus grows, so the grace is now 45 minutes on an
+explicit asymmetry: noticing a wedged app late costs ONE check cycle; being impatient costs the app
+entirely, repeatedly, which is exactly what happened.
+
+**Measured startup to couch: 8m16s at ~500 clips, 18m11s at 14,828 clips.** Startup scales with the
+library. Worth knowing before the next import: the app is unavailable for ~20 minutes after any
+restart, and that window will keep growing.
+
+**Also corrected, twice, in the same shape:** "APP IS UP" was reported from a process check while the
+app was dead in an error dialog, and again while it was wedged with flat CPU and no log output. A
+running process is not a working app. Both were caught by refusing to call the links good until one
+returned a reviewer's name.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 289 — five reviewers had empty queues, and the 20-minute cold start was one line
+
+Overnight reliability session. The brief was "get to a true trustworthy reliable system to start real
+work", so the measurement that mattered was not whether the tree is correct but whether a named
+reviewer opening their link tonight can actually work. Two of the four things found are answers to
+questions earlier iterations asked and got wrong.
+
+**FIVE OF EIGHT REVIEWERS HAD A QUEUE OF ZERO, and two independent bugs hid each other.** The 1,031
+recovered clips were relinked into `D:\Kurdish Corpora\sorani\ZarPodcast`, but `dialect.rs` still
+mapped only their pre-recovery path (`SoraniVoice_PC_`), so all 535 pending Sorani clips were
+UNMAPPED — and the dialect check fails closed, so every Sorani-only reviewer (Alle, Roza, Sabat,
+Lamo, Sewa) was served nothing. Simultaneously the roster file itself was inert: it shipped with a
+`"_comment"` string explaining how to edit it, and a strict `HashMap<String, Vec<String>>` parse
+rejects that outright, whose failure path is "unrestricted" — so the dialect protection was OFF for
+everyone from the moment it was installed, including the three reviewers it was written for. A
+helpful comment turned the safety feature off. Neither bug is visible from the tree: the database
+rows, the JSON and the Rust all read correctly in isolation.
+
+**THE 20-MINUTE COLD START IS `run_to_completion(5, 250ms)`.** Iteration 288 measured startup-to-couch
+at 8m16s at ~500 clips and 18m11s at 14,828, called it "startup scales with the library", and raised
+the watchdog grace to 45 minutes — the second time the grace was raised to accommodate it. The cause
+is one line: `Database::backup` paced the SQLite online backup at 5 pages per 250 ms, the literal
+rusqlite doc example, copied without arithmetic. That is 80 KB/s. `take_snapshot` runs SYNCHRONOUSLY
+on the startup path, so the 84 MB library held the review port shut for ~16 minutes every launch, and
+since the periodic snapshot timer is 10 minutes — SHORTER than one snapshot took — a copy was
+essentially always running against the database reviewers were writing to. Measured fail-before:
+1,371 pages took **68.6 s** at the old pacing, which extrapolates to 18 minutes for the real library
+and matches 18m11s. At 4096 pages/step it is under a second. "Scales with the library" was the true
+observation and the wrong conclusion.
+
+**Spot checks bypassed the dialect filter.** They are injected after the queue's own filter, on a
+separate path, so they were the one remaining way to hand someone a dialect they do not speak — and
+the most damaging one, because a check is SCORED: an honest reviewer fails a test they had no way to
+pass and is recorded looking exactly like someone tapping "looks good" without listening.
+
+**A gate for the class, not the instance.** `reviewer-queues-live` computes, against the LIVE database
+and roster, what each NAMED reviewer would actually be served, and fails when anyone holding a link
+has nothing. `supervision-live` could not see this: the server answers 200 for an empty queue. The
+gate reads the dialect map out of `dialect.rs` rather than restating it, because the drift between
+map and reality IS the bug — and it caught a raw-string parsing error in its own reader that way.
+
+**Sweep at 01:39:** 36 gates, 32 PASS / 4 FAIL. `typecheck` was a real regression (the merged commit
+dropped `asr_provider` from `BackendSettings` and left it in two fixtures); `python-policies` was this
+ledger being 4 commits stale; `ignored-real-model` was the WSL 7B server being down, which red-ed the
+whole leg and took six PASSING real-model tests with it — now split into its own env-probed leg;
+`spot-check-pool` remains genuinely RED at 22 of 24 keys and is owner-gated. `bench-budget` PASSED
+despite a concurrent GPU ingest job, and `test-rust` passed, confirming both earlier failures as
+environmental.
+
+**Still owner-gated:** the answer-key pool needs a few desktop adjudications to reach 24, and the
+Sorani backlog is 535 clips (1.2 h) against 13,777 Hawleri (34.0 h) — five Sorani-only reviewers will
+drain it in a sitting, so more Sorani material needs importing to keep them working.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

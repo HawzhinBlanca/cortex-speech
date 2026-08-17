@@ -140,10 +140,11 @@
              not the jury consensus), so this card cannot be computed as specified. Say only what is
              true and do not send the reviewer to do work that cannot help. -->
         <p class="muted" data-testid="refinery-lift-self-referential">
-          Not measurable — the stored “post-jury” text for a decided clip is the human's own answer, so
-          this compares that answer with itself and can only ever report zero. It is not a statement
-          about the jury's accuracy, and no amount of reviewing changes it: measuring the jury needs its
-          verdict recorded separately from the human's, which this library does not yet do.
+          Not measurable — the stored “post-jury” text for a decided clip is the human's own answer,
+          so this compares that answer with itself and can only ever report zero. It is not a
+          statement about the jury's accuracy, and no amount of reviewing changes it: measuring the
+          jury needs its verdict recorded separately from the human's, which this library does not
+          yet do.
         </p>
       {:else if lift && lift.n > 0}
         <div class="lift-grid">
@@ -157,7 +158,11 @@
           </div>
           <div class="lift-cell">
             <span class="lift-label">CER lift</span>
-            <span class="lift-val" class:lift-pos={lift.cerLift > 0} class:lift-neg={lift.cerLift < 0}>
+            <span
+              class="lift-val"
+              class:lift-pos={lift.cerLift > 0}
+              class:lift-neg={lift.cerLift < 0}
+            >
               {pct(lift.cerLift)}
             </span>
           </div>
@@ -168,8 +173,8 @@
             <!-- The numbers above are real here, but partly diluted: an accepted clip's reference IS
                  the jury verdict, so those rows can only ever contribute zero jury error. Naming the
                  count lets the figure be read for what it is instead of taken at face value. -->
-            · {lift.selfReferentialN} of {lift.n} accepted verbatim, so those rows score the jury
-            against its own output
+            · {lift.selfReferentialN} of {lift.n} accepted verbatim, so those rows score the jury against
+            its own output
           {/if}
         </p>
       {:else}
@@ -273,9 +278,12 @@
             <li class="trend-row">
               <span class="trend-date"><bdi>{point.date}</bdi></span>
               <span class="trend-bar-wrap" aria-hidden="true">
-                <span class="trend-bar" style="width:{Math.min(100, point.escalationRate * 100)}%"></span>
+                <span class="trend-bar" style="width:{Math.min(100, point.escalationRate * 100)}%"
+                ></span>
               </span>
-              <span class="trend-val">{pct(point.escalationRate)} ({point.escalated}/{point.total})</span>
+              <span class="trend-val"
+                >{pct(point.escalationRate)} ({point.escalated}/{point.total})</span
+              >
             </li>
           {/each}
         </ul>

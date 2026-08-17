@@ -13,7 +13,14 @@
   // Import-checkpoint form state.
   let showImport = $state(false);
   let importing = $state(false);
-  let form = $state({ id: '', family: '', source: '', license: '', modelCardName: '', checkpointPath: '' });
+  let form = $state({
+    id: '',
+    family: '',
+    source: '',
+    license: '',
+    modelCardName: '',
+    checkpointPath: '',
+  });
 
   async function load() {
     if (!tauriAvailable) {
@@ -152,7 +159,11 @@
             bind:value={form.modelCardName}
           />
           <div class="flex items-center gap-2">
-            <button class="btn btn-secondary !text-xs" onclick={pickCheckpoint} data-testid="model-import-pick">
+            <button
+              class="btn btn-secondary !text-xs"
+              onclick={pickCheckpoint}
+              data-testid="model-import-pick"
+            >
               Choose file…
             </button>
             <span class="text-[10px] text-muted truncate flex-1" title={form.checkpointPath}>

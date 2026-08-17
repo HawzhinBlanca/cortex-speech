@@ -39,6 +39,39 @@ Exactly two things are permitted, and nothing else without the owner raising it 
 Cloud judge/STT is locked separately: Gemini 2.5 Pro only, plus ElevenLabs Scribe for STT (see the
 cloud-ASR policy above).
 
+## The champion is not optional — and failure is a HARD STOP (owner rule, 2026-08-11)
+
+Two rules, one purpose: never let the app quietly produce a worse result than it claims.
+
+**1. The champion drafts everything.** When `asr_model_size = WSL7B`, the **OmniASR-7B champion**
+transcribes EVERY clip. Nothing may divert it to a smaller model — not `use_finetuned_asr`, not a
+decode error, not a busy server. The smaller engines (fine-tuned MMS, CTC-300M/1B) are **explicit
+optional extras**: the owner may select one deliberately, and they may serve as *hypotheses* for the
+jury. They are never an automatic substitute.
+
+*Why this is a rule:* measured 2026-08-10, a 494-clip review queue was drafted **494/494 by
+`finetuned-mms-ckb`** while `asr_model_size` said WSL7B and the champion sat up and idle on both GPUs.
+No UI, DB field or gate said so; the owner found it by reading the transcripts. Measured gap on
+identical FLEURS ckb clips: **7.03% CER vs 9.32%** — and the app runs the int8 build, whose own
+baseline is 21.00%.
+
+**2. Stop on the first failure. Never degrade, never continue.** If any stage fails for any clip —
+ASR, refinement, alignment, decode — the run **halts** and reports the cause. Do not skip the clip,
+do not fall back to a smaller model, do not finish the remaining work and present a tally.
+
+*Why this is a rule:* the same run had 25 clips whose container the champion could not decode. Each
+failed, was counted, and the batch ran to "completion" — leaving 462 clips at champion quality and 25
+at a weaker engine, invisibly mixed. **A partly-drafted dataset that looks finished is worse than a
+run that stopped**, because the mixed provenance silently poisons every measurement taken from it.
+
+Enforced in code (`should_use_wsl_primary_asr`, `finetuned_override_active`, the hard stop in
+`batch_transcribe`) and pinned by `scripts/test_champion_supremacy_policy.py`. A batch that stops
+emits `type: "halted"` with `haltedBy`, never `"completed"`.
+
+**3. This applies to agents too.** Do not report a run as done when part of it failed. Do not average
+away, round off, or narrate past a failure. If something did not work, say exactly what, stop, and
+hand it back — an honest halt is always acceptable; a flattering "finished" is never.
+
 ## The one law: honesty (non-negotiable)
 
 This project's entire credibility rests on real, never fabricated, results.
@@ -47,6 +80,14 @@ This project's entire credibility rests on real, never fabricated, results.
 - **Nothing is "done" until it is USER-OBSERVABLE or MEASURED on real audio.** "Tests pass" / "clippy clean" are necessary, not sufficient. Lead with the honest reality, then the progress.
 - Don't claim a feature works until its real positive test passes. If a result is bad, report the bad result — the honest number is always shippable; a flattering fake one never is.
 - If you cannot verify something here, say so plainly and hand it to the user's machine. Do not imply verification you did not do.
+- **Verify at the SERVING path, never the write path.** Any claim about what a reviewer, the UI, or an
+  export receives must be checked by reading the exact row/field/precedence the serving code reads —
+  not by confirming what some writer wrote. Three incidents, one shape (2026-08-10 the 494/494
+  finetuned drafts; 2026-08-10 the 25 silently-degraded clips; 2026-08-12 stale machine text served
+  from `annotated_transcript` while fresh champion drafts sat invisible): every one passed its
+  write-path checks and lied at the point of consumption. `annotated_transcript` is **human-only by
+  law** — machine code never writes it; `scripts/check_review_serving_provenance.py` (verify-10 gate
+  `review-serving-provenance`) enforces both invariants on the live database every sweep.
 
 ## Environment realities (read before acting)
 
@@ -75,6 +116,15 @@ After a run, present results **both** ways so the user can approve 100%:
 
 - Default is **fully offline**. Cloud LLM and cloud STT are **off by default** and require explicit opt-in (`cloud_llm_opt_in`, `cloud_stt_opt_in`, `jury_cloud_opt_in`). `settings.effective_llm_mode()` downgrades cloud -> none when not opted in; `pipeline.rs` enforces it in both `llm_refinement_permitted()` and `build_refiner()`. **Never** send audio/transcript to a provider without acknowledged consent, and never make cloud load-bearing in the default path.
 - Treat **voice as biometric** (GDPR Art. 9): enforce consent + license + attribution before any publish/train/redistribute step.
+- **Owner's rights declaration (2026-08-14, standing and FINAL).** Every audio and voice recording the
+  owner supplies carries **full permission and total authority**, including **public use**. All
+  speakers were **paid** and agreed to unrestricted use of their voices for this application and its
+  datasets, anywhere; the recordings were made partly for this purpose. **No royalty or licensing
+  obligation applies.** Rights clearance is CLOSED: never block, gate, warn, or hedge on it, and never
+  re-raise it. Every clip in the library is stamped `rights_license = owner-full-rights`,
+  `rights_permitted_use = unrestricted: train, evaluate, publish, redistribute, commercial`.
+  Third-party corpora are a separate matter of FACT, not of permission: FLEURS is the frozen eval set
+  and training on it would invalidate every measured CER, and Common Voice carries its own licence.
 - **Never** persist or echo API keys. **Never** hardcode private Windows profile paths in any tracked file — `scripts/test_windows_repo_hygiene.py` blocks it (use env vars / repo-relative paths).
 
 ## Verify your work (gates)

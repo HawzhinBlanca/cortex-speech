@@ -216,6 +216,81 @@ def check_repo_integrity():
     return ok
 
 
+def check_branch_protection():
+    """`main` is protected on the REMOTE, verified against GitHub — not taken on trust.
+
+    This was OWNER_GATED as "item 49: repo-admin clicks" — an item whose only evidence was that
+    somebody said they had clicked. Protection can also be silently weakened later (a context renamed,
+    admins exempted, force-push re-allowed) and nothing here would have noticed. It is an API call;
+    there is no reason for it to be a manual claim.
+
+    Anti-vacuity: an empty required-contexts list FAILS. A branch that is "protected" while requiring
+    no checks is not protected, and answering 200 is not the same as being safe. Every required
+    context must also still name a real job in .github/workflows, so a renamed job that quietly stops
+    gating merges is caught rather than sitting there as a permanently-pending phantom.
+    """
+    print("==> Checking branch protection on origin/main (GitHub API)...")
+    ok = True
+    try:
+        raw = subprocess.run(
+            ["gh", "api", "repos/{owner}/{repo}/branches/main/protection"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
+        )
+    except Exception as exc:  # network/gh blew up mid-call
+        print(f"  [ERR] could not query branch protection: {exc}")
+        return False
+    if raw.returncode != 0:
+        print(f"  [ERR] gh api failed: {(raw.stderr or raw.stdout).strip()[:200]}")
+        return False
+    try:
+        data = json.loads(raw.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"  [ERR] branch protection response was not JSON: {exc}")
+        return False
+
+    checks = data.get("required_status_checks") or {}
+    contexts = checks.get("contexts") or []
+    if not contexts:
+        print("  [ERR] main requires ZERO status checks — 'protected' but nothing gates a merge.")
+        ok = False
+    else:
+        print(f"  [OK]  required status checks: {sorted(contexts)}")
+        workflows = "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        )
+        for context in sorted(contexts):
+            if context in workflows:
+                continue
+            print(f"  [ERR] required context {context!r} names no job in .github/workflows — "
+                  "a merge would wait forever on a check nothing can report.")
+            ok = False
+
+    for label, value, want in (
+        ("strict (branch must be up to date)", checks.get("strict"), True),
+        ("enforce_admins", (data.get("enforce_admins") or {}).get("enabled"), True),
+        ("required_linear_history", (data.get("required_linear_history") or {}).get("enabled"), True),
+        ("allow_force_pushes", (data.get("allow_force_pushes") or {}).get("enabled"), False),
+        ("allow_deletions", (data.get("allow_deletions") or {}).get("enabled"), False),
+    ):
+        if value is want:
+            print(f"  [OK]  {label} = {value}")
+        else:
+            print(f"  [ERR] {label} = {value!r}, expected {want!r}")
+            ok = False
+    return ok
+
+
+def _probe_branch_protection():
+    """SKIP honestly without gh or without auth — never a silent pass."""
+    if not shutil.which("gh"):
+        return "gh CLI not installed (branch protection is a REMOTE fact; nothing local can prove it)"
+    status = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    if status.returncode != 0:
+        return "gh is not authenticated (`gh auth login`) - cannot read branch protection"
+    return None
+
+
 def check_required_files():
     print("==> Checking required repository assets...")
     required = [
@@ -457,6 +532,23 @@ def _probe_silero():
     return "models missing - run `cd cortex-speech-app && npm run fetch-models`"
 
 
+def _probe_champion_7b():
+    """The champion server lives in WSL, outside the tree, so its absence is machine state.
+
+    Split out of `ignored-real-model` on 2026-08-17. `wsl_7b_preflight_passes_when_server_up` failed
+    there because the server was down, which turned the whole leg RED — taking six real-model tests
+    that had genuinely PASSED down with it and burying the sweep's actual failures under an
+    environmental one. A leg that cannot run must say SKIP-ENV, and the other six must keep running.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(2.0)
+        if probe.connect_ex(("127.0.0.1", 8799)) != 0:
+            return "OmniASR-7B champion server not up on 127.0.0.1:8799 (`wsl python scripts/cortex_7b_server.py`)"
+    return None
+
+
 def _probe_rtf():
     if (SRC_TAURI / "models" / "omniasr-ctc-300m" / "model.int8.onnx").exists():
         return None
@@ -579,7 +671,11 @@ GATES = [
     ("ledger-schema", 0, "fn", check_provenance_ledger, None, None, "Data governance: ledger schema-valid"),
     ("license-compat", 0, "fn", check_license_compatibility, None, None, "Data governance: contamination gate"),
     # Tier 1 — CI-equivalent code gates (minutes)
+    ("branch-protection", 1, "fn", check_branch_protection, None, _probe_branch_protection, "Git+integrity: main is protected on the remote, admins included (was OWNER_GATED item 49 - clicks done 2026-08-08, now machine-verified every sweep)"),
     ("python-policies", 1, "cmd", "npm run test:python-policies", APP, None, "honesty/privacy/CI/dataset policy tests"),
+    ("spot-check-pool", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_spot_check_pool.py"}"', APP, None, "The listening-QC must be ABLE TO FIRE. MEASURED 2026-08-13: the answer-key pool was ZERO across 283 human decisions — every key must be gold-flagged or desktop-decided (reviewed_by NULL), and every decision had come from the phone, which stamps reviewed_by by design. Nothing errored and spot_checks still showed 5 stale rows, so the QC looked alive while being structurally incapable of firing. A mechanism that cannot fire is indistinguishable from one that finds nothing, which is why this is a gate and not a report."),
+    ("reviewer-queues-live", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_reviewer_queues_live.py"}"', APP, None, "Every reviewer holding a live link has clips they are ALLOWED to review. MEASURED 2026-08-17: two independent bugs made five of eight reviewers' queues empty while the owner was paying them, and each hid the other. The 1,031 recovered clips were relinked into D:\\Kurdish Corpora\\sorani\\ZarPodcast while dialect.rs still mapped only their pre-recovery path, so they were UNMAPPED and the dialect check fails closed; meanwhile the roster file carried a \"_comment\" string, which a strict HashMap<String, Vec<String>> parse rejects outright, and that failure path is \"unrestricted\" — so the protection was simultaneously off for everyone. Every row, every JSON file and every Rust function read correctly in isolation; only computing what each NAMED reviewer would actually be served exposes it. supervision-live cannot: the server answers 200 for an empty queue."),
+    ("review-serving-provenance", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_serving_provenance.py"}"', APP, None, "Honesty at the SERVING path, on the LIVE db: annotated_transcript is human-only, and every untouched clip serves the champion's own transcript. MEASURED 2026-08-12: 348 rows held machine text in the human field, so the phone review page served a stale paraphrase while the fresh champion drafts sat invisible — reviewers corrected words the speaker never said. Write-path checks passed the whole time; only reading the row the server actually serves catches this class."),
     ("typecheck", 1, "cmd", "npm run typecheck", APP, None, "svelte-check + tsc"),
     ("lint-js", 1, "cmd", "npm run lint", APP, None, "eslint"),
     ("clippy", 1, "cmd", f'cargo clippy --manifest-path "{MANIFEST}" --all-targets -- -D warnings', REPO_ROOT, None, "Engineering rigor: clippy -D warnings"),
@@ -592,10 +688,12 @@ GATES = [
     ("test-e2e+a11y", 1, "cmd", "npm run test:e2e", APP, None, "A11y: axe WCAG 2.2 AA en+ckb/RTL (coverage assertion: WS2 follow-up)"),
     # Tier 2 — real binary on this machine (the personal-use core)
     ("exe-freshness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_exe_freshness.py"}"', REPO_ROOT, _probe_exe, "Truth-in-advertising: exe compiled from HEAD"),
+    ("supervision-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_supervision_live.py"}"', REPO_ROOT, None, "Fitness to SERVE, not just to compile: the watchdog is enabled, every live reviewer link answers on 8737, and the data drive has room to write. MEASURED 2026-08-15: all three were false at once — CortexWatchdog left `Disabled` by the rebuild procedure, the app exited so five sent links were dead, and C: at 0 bytes had already broken the 10-minute DB snapshot ('periodic DB snapshot failed'). Every source-level gate was still capable of GREEN, because none of them looks at the machine."),
     ("real-app-e2e", 2, "cmd", f'node "{APP / "e2e_real_app.cjs"}"', APP, _probe_real_e2e, "THE daily-use reliability gate: real exe, real audio, real transcript"),
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)
     ("egress-runtime", 3, "cmd", f'node "{APP / "scripts" / "egress_probe.cjs"}"', APP, _probe_egress, "Privacy: zero outbound sockets at runtime — egress_probe.cjs proves ZERO external TCP from the backend PID across startup + browse + a REAL offline transcription (import->VAD->CTC ASR, the path where cloud STT/LLM would fire if consent leaked), with an in-run POSITIVE CONTROL that fails loud if the sampler is dead (no vacuous pass). Poll-sampled (200ms) + TCP-only; an airtight kernel/ETW socket trace is a further stretch. SKIP-ENV off the Windows rig / without the exe. Static test_cloud_privacy_policy.py is belt-and-braces."),
-    ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments --skip refinery_lift', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded; refinery_lift benchmark+diag excluded — the benchmark has its own dedicated leg)"),
+    ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments --skip refinery_lift --skip wsl_7b_preflight', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded; refinery_lift benchmark+diag excluded — the benchmark has its own dedicated leg; the 7B preflight excluded — it needs an external WSL server and has its own leg, so its absence cannot red the six tests that run on models in this tree)"),
+    ("champion-7b-preflight", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored wsl_7b_preflight', REPO_ROOT, _probe_champion_7b, "The champion's preflight against the REAL OmniASR-7B server. The champion drafts every clip (owner rule 2026-08-11), so the check that it is reachable before an import starts is the difference between a halt and a library half-drafted by a weaker engine."),
     # Deliberately count-agnostic: the gate enumerates targets with `cargo fuzz list` and fails loud on an
     # empty list, so hardcoding a number here only creates a second place to go stale. It said "5" until
     # the `features` target was removed with the dead FbankExtractor module it fuzzed (iteration 231).
@@ -615,6 +713,7 @@ GATES = [
 
 # Charter DoD legs descoped by the owner amendment (2026-07-10) — always printed.
 DESCOPED = [
+    ("asosoft-600-eval-set", "Eval corpus: owner decision 2026-08-11 — AsoSoft publishes NO licence file and NO terms beyond \"research and non-commercial use\", and no contact address; evaluation rests on FLEURS ckb + CORDI (CC BY-SA 4.0) instead"),
     ("signed-installer", "Distribution: signtool verify /pa"),
     ("slsa-provenance", "Distribution: gh attestation verify"),
     ("signed-auto-updater", "Distribution (incl. updater clause of the egress bullet)"),
@@ -630,8 +729,6 @@ OWNER_GATED = [
     ("iaa-kappa-ceiling", "item 44: recruit >=2 independent Sorani annotators"),
     ("cordi-dialect-fairness", "item 53: CORDI corpus agreement"),
     ("refinery-lift-in-product", "item 37: Gold Marathon (>=500 real review decisions)"),
-    ("branch-protection", "item 49: repo-admin clicks"),
-    ("asosoft-600-licensing", "WS1 tail: eval-use license verification"),
 ]
 
 

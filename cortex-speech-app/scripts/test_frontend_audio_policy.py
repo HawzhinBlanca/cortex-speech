@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -17,14 +18,27 @@ def test_audio_player_playback_failures_are_visible() -> None:
     required = [
         "import { notifications } from './stores/notificationStore';",
         "function reportPlaybackFailure(message: string, cause: unknown)",
+        "error = message;",
         "notifications.error(message, { detail: String(cause) });",
-        "attemptPlay('Playback blocked or file not found');",
-        "attemptPlay('Loop playback failed');",
+        "attemptPlay($t('audio.playbackFailed'));",
+        "attemptPlay($t('audio.loopFailed'));",
+        "error = $t('audio.loadFailed');",
     ]
     missing = [pattern for pattern in required if pattern not in audio_player]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"AudioPlayer.svelte must keep playback failures visible:\n{formatted}")
+
+    # A translation call is only as safe as its catalogs. Require every visible audio failure key in
+    # both supported locales, with a non-empty human-facing value (never a raw-key fallback).
+    for catalog_name in ("en", "ckb"):
+        catalog = (REPO_ROOT / f"src/lib/i18n/{catalog_name}.ts").read_text(encoding="utf-8")
+        for key in ("audio.loadFailed", "audio.playbackFailed", "audio.loopFailed"):
+            match = re.search(rf"'{re.escape(key)}'\s*:\s*'([^']+)'", catalog)
+            if not match or not match.group(1).strip() or match.group(1).strip() == key:
+                raise AssertionError(
+                    f"{catalog_name}.ts must define a non-empty localized value for {key!r}"
+                )
 
 
 def test_audio_player_loop_failure_has_unit_coverage() -> None:
@@ -32,8 +46,9 @@ def test_audio_player_loop_failure_has_unit_coverage() -> None:
     required = [
         "reports loop replay failures instead of silently swallowing them",
         "playMock.mockRejectedValueOnce(new Error('autoplay denied'));",
-        "expect(screen.getByText('Loop playback failed')).toBeInTheDocument();",
-        "item.type === 'error' && item.message === 'Loop playback failed'",
+        "locale.set('ckb');",
+        "expect(screen.getByText(ckb['audio.loopFailed'])).toBeInTheDocument();",
+        "item.type === 'error' && item.message === ckb['audio.loopFailed']",
     ]
     missing = [pattern for pattern in required if pattern not in test_file]
     if missing:

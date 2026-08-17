@@ -593,8 +593,14 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     //     is already correct cannot tell a reviewer who listened from one who tapped accept — both
     //     hand back the same text — so including it would quietly dilute every score toward "fine".
     let db = make_db();
+    let audio_dir = tempfile::tempdir().unwrap();
+    let audio_path = |id: &str| {
+        let path = audio_dir.path().join(format!("{id}.wav"));
+        std::fs::write(&path, b"playable fixture").unwrap();
+        path.to_string_lossy().into_owned()
+    };
     let plant = |id: &str, raw: &str, answer: Option<&str>| {
-        let mut s = make_segment(id, &format!("/{id}.wav"));
+        let mut s = make_segment(id, &audio_path(id));
         s.raw_transcript = raw.to_string();
         s.verified = true;
         s.is_gold = true;
@@ -619,7 +625,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // column production actually writes (`record_human_decision_by` sets it unconditionally to the
     // deciding reviewer's name).
     {
-        let mut peer = make_segment("sc-peer-edit", "/peer.wav");
+        let mut peer = make_segment("sc-peer-edit", &audio_path("peer"));
         peer.raw_transcript = "دەقی هەڵە".into();
         peer.verified = true;
         peer.is_gold = false;
@@ -633,7 +639,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // because the desktop path passes no annotator. This is the case that makes the mechanism
     // reachable at all — without it the candidate set is empty in every real installation.
     {
-        let mut owner = make_segment("sc-owner-edit", "/owner.wav");
+        let mut owner = make_segment("sc-owner-edit", &audio_path("owner"));
         owner.raw_transcript = "دەقی هەڵەی سێ".into();
         owner.verified = true;
         owner.is_gold = false;
@@ -645,7 +651,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     }
 
     let ids = |limit: usize| -> Vec<String> {
-        db.list_spot_check_candidates(limit, "Sara", &std::collections::HashSet::new())
+        db.list_spot_check_candidates(limit, "Sara", &std::collections::HashSet::new(), None)
             .unwrap()
             .into_iter()
             .map(|(s, _)| s.id)
@@ -670,7 +676,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // score a blind accept as perfect. Asserted against the row that came back rather than a
     // hardcoded string: the answer key must be right for EVERY candidate, not just whichever one
     // happens to sort first.
-    for (seg, expected) in db.list_spot_check_candidates(10, "Sara", &std::collections::HashSet::new()).unwrap() {
+    for (seg, expected) in db.list_spot_check_candidates(10, "Sara", &std::collections::HashSet::new(), None).unwrap() {
         assert_ne!(expected, seg.raw_transcript, "{} was graded against its own draft", seg.id);
         assert_eq!(
             Some(expected.as_str()),
@@ -693,7 +699,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // Per REVIEWER, not global: two people meeting the same clip independently is the entire basis of
     // the agreement sample, so Sara's answer must not consume Hemn's.
     let hemn: Vec<String> = db
-        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new())
+        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new(), None)
         .unwrap()
         .into_iter()
         .map(|(s, _)| s.id)
@@ -1057,6 +1063,229 @@ fn insert_hypothesis_stores_nfc_so_jury_agreement_is_not_normalization_fragile()
     let hyps = db.get_hypotheses_for_segment("h1").unwrap();
     assert_eq!(hyps.len(), 1, "exactly one hypothesis stored");
     assert_eq!(hyps[0].transcript, composed, "hypothesis vote must be stored NFC-composed, not NFD");
+}
+
+#[test]
+fn replacing_with_champion_removes_stale_votes_and_rolls_back_as_one_unit() {
+    let db = make_db();
+    db.insert_segment(&make_segment("champion-hyp", "/champion.wav")).unwrap();
+    for (model_id, transcript) in
+        [("omniasr-ctc-300m", "old 300m"), ("finetuned-mms-ckb", "old mms"), ("scribe-v1", "old cloud")]
+    {
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: "champion-hyp".to_string(),
+            model_id: model_id.to_string(),
+            transcript: transcript.to_string(),
+            confidence: Some(0.9),
+        })
+        .unwrap();
+    }
+
+    let champion = SegmentHypothesis {
+        segment_id: "champion-hyp".to_string(),
+        model_id: "omniasr-wsl-7b".to_string(),
+        transcript: "champion only".to_string(),
+        confidence: Some(0.98),
+    };
+    db.replace_hypotheses_with(&champion).unwrap();
+    let stored = db.get_hypotheses_for_segment("champion-hyp").unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].model_id, "omniasr-wsl-7b");
+    assert_eq!(stored[0].transcript, "champion only");
+
+    // Force the INSERT half to fail after DELETE. The previous champion must survive, proving the
+    // replacement is atomic and cannot erase provenance on a partial write.
+    db.conn
+        .execute_batch(
+            "CREATE TRIGGER reject_blocked_hypothesis
+             BEFORE INSERT ON segment_hypotheses
+             WHEN NEW.model_id = 'blocked-model'
+             BEGIN SELECT RAISE(ABORT, 'injected hypothesis failure'); END;",
+        )
+        .unwrap();
+    let rejected = SegmentHypothesis { model_id: "blocked-model".to_string(), ..champion };
+    assert!(db.replace_hypotheses_with(&rejected).is_err());
+    let after_failure = db.get_hypotheses_for_segment("champion-hyp").unwrap();
+    assert_eq!(after_failure.len(), 1);
+    assert_eq!(after_failure[0].model_id, "omniasr-wsl-7b");
+    assert_eq!(after_failure[0].transcript, "champion only");
+}
+
+#[test]
+fn champion_commit_atomically_updates_transcript_provenance_and_sole_hypothesis() {
+    let db = make_db();
+    let mut segment = make_segment("champion-commit", "/champion-commit.wav");
+    segment.raw_transcript = "old draft".to_string();
+    segment.normalized_transcript = Some("old normalized".to_string());
+    segment.confidence = Some(0.2);
+    segment.confidence_source = Some("heuristic".to_string());
+    segment.model_version_id = Some("omniasr-ctc-300m".to_string());
+    db.insert_segment(&segment).unwrap();
+    for model_id in ["omniasr-ctc-300m", "finetuned-mms-ckb", "scribe-v1"] {
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: segment.id.clone(),
+            model_id: model_id.to_string(),
+            transcript: format!("stale {model_id}"),
+            confidence: Some(0.2),
+        })
+        .unwrap();
+    }
+
+    let decomposed = "\u{0627}\u{0653}\u{0628}";
+    let composed = "\u{0622}\u{0628}";
+    let champion = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "omniasr-wsl-7b".to_string(),
+        transcript: decomposed.to_string(),
+        confidence: Some(0.98),
+    };
+    assert!(db
+        .commit_champion_transcript_if_unreviewed(&champion, Some(decomposed), Some("external_provider"), true)
+        .unwrap());
+
+    let stored = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+    assert_eq!(stored.raw_transcript, composed);
+    assert_eq!(stored.normalized_transcript.as_deref(), Some(composed));
+    assert_eq!(stored.confidence, Some(0.98));
+    assert_eq!(stored.confidence_source.as_deref(), Some("external_provider"));
+    assert_eq!(stored.model_version_id.as_deref(), Some("omniasr-wsl-7b"));
+    assert!(stored.cloud_call, "cloud refinement provenance must commit with the transcript");
+
+    let hypotheses = db.get_hypotheses_for_segment(&segment.id).unwrap();
+    assert_eq!(hypotheses.len(), 1, "all stale optional-engine votes must be removed");
+    assert_eq!(hypotheses[0].model_id, "omniasr-wsl-7b");
+    assert_eq!(hypotheses[0].transcript, composed);
+    assert_eq!(hypotheses[0].confidence, Some(0.98));
+    let hypothesis_version: String = db
+        .connection()
+        .query_row("SELECT model_version_id FROM segment_hypotheses WHERE segment_id = ?1", [&segment.id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(hypothesis_version, "omniasr-wsl-7b");
+}
+
+#[test]
+fn champion_commit_cas_miss_preserves_human_owned_rows_and_existing_votes() {
+    let db = make_db();
+    for id in ["champion-verified", "champion-decision", "champion-verdict"] {
+        let mut segment = make_segment(id, &format!("/{id}.wav"));
+        segment.raw_transcript = format!("human-owned {id}");
+        segment.normalized_transcript = Some(format!("human-owned {id}"));
+        segment.confidence = Some(0.4);
+        segment.confidence_source = Some("existing_source".to_string());
+        segment.model_version_id = Some("existing-model".to_string());
+        db.insert_segment(&segment).unwrap();
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: id.to_string(),
+            model_id: "existing-model".to_string(),
+            transcript: format!("existing vote {id}"),
+            confidence: Some(0.4),
+        })
+        .unwrap();
+    }
+    db.connection().execute("UPDATE speech_segments SET verified = 1 WHERE id = 'champion-verified'", []).unwrap();
+    db.connection()
+        .execute("UPDATE speech_segments SET human_decision = 'edit' WHERE id = 'champion-decision'", [])
+        .unwrap();
+    db.connection()
+        .execute("UPDATE speech_segments SET verdict = 'human_accept' WHERE id = 'champion-verdict'", [])
+        .unwrap();
+
+    for id in ["champion-verified", "champion-decision", "champion-verdict"] {
+        let champion = SegmentHypothesis {
+            segment_id: id.to_string(),
+            model_id: "omniasr-wsl-7b".to_string(),
+            transcript: "late champion draft".to_string(),
+            confidence: Some(0.99),
+        };
+        assert!(
+            !db.commit_champion_transcript_if_unreviewed(
+                &champion,
+                Some("late normalized draft"),
+                Some("external_provider"),
+                true,
+            )
+            .unwrap(),
+            "{id} must return a CAS miss"
+        );
+
+        let stored = db.get_segment_by_id(id).unwrap().unwrap();
+        assert_eq!(stored.raw_transcript, format!("human-owned {id}"));
+        assert_eq!(stored.normalized_transcript.as_deref(), Some(format!("human-owned {id}").as_str()));
+        assert_eq!(stored.confidence, Some(0.4));
+        assert_eq!(stored.confidence_source.as_deref(), Some("existing_source"));
+        assert_eq!(stored.model_version_id.as_deref(), Some("existing-model"));
+        assert!(!stored.cloud_call);
+        let hypotheses = db.get_hypotheses_for_segment(id).unwrap();
+        assert_eq!(hypotheses.len(), 1, "CAS miss must not clean up votes for {id}");
+        assert_eq!(hypotheses[0].model_id, "existing-model");
+        assert_eq!(hypotheses[0].transcript, format!("existing vote {id}"));
+    }
+}
+
+#[test]
+fn champion_commit_rolls_back_transcript_and_hypotheses_when_hypothesis_insert_fails() {
+    let db = make_db();
+    let mut segment = make_segment("champion-rollback", "/champion-rollback.wav");
+    segment.raw_transcript = "previous transcript".to_string();
+    segment.normalized_transcript = Some("previous normalized".to_string());
+    segment.confidence = Some(0.3);
+    segment.confidence_source = Some("previous_source".to_string());
+    segment.model_version_id = Some("previous-model".to_string());
+    db.insert_segment(&segment).unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "previous-model".to_string(),
+        transcript: "previous vote".to_string(),
+        confidence: Some(0.3),
+    })
+    .unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER reject_champion_commit_hypothesis
+             BEFORE INSERT ON segment_hypotheses
+             WHEN NEW.model_id = 'omniasr-wsl-7b'
+             BEGIN SELECT RAISE(ABORT, 'injected champion hypothesis failure'); END;",
+        )
+        .unwrap();
+
+    let champion = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "omniasr-wsl-7b".to_string(),
+        transcript: "new champion transcript".to_string(),
+        confidence: Some(0.99),
+    };
+    assert!(db
+        .commit_champion_transcript_if_unreviewed(
+            &champion,
+            Some("new champion normalized"),
+            Some("external_provider"),
+            true,
+        )
+        .is_err());
+
+    let stored = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+    assert_eq!(stored.raw_transcript, "previous transcript");
+    assert_eq!(stored.normalized_transcript.as_deref(), Some("previous normalized"));
+    assert_eq!(stored.confidence, Some(0.3));
+    assert_eq!(stored.confidence_source.as_deref(), Some("previous_source"));
+    assert_eq!(stored.model_version_id.as_deref(), Some("previous-model"));
+    assert!(!stored.cloud_call);
+    let hypotheses = db.get_hypotheses_for_segment(&segment.id).unwrap();
+    assert_eq!(hypotheses.len(), 1, "the deleted prior vote must be restored by rollback");
+    assert_eq!(hypotheses[0].model_id, "previous-model");
+    assert_eq!(hypotheses[0].transcript, "previous vote");
+
+    db.connection().execute_batch("DROP TRIGGER reject_champion_commit_hypothesis").unwrap();
+    assert!(db
+        .commit_champion_transcript_if_unreviewed(
+            &champion,
+            Some("new champion normalized"),
+            Some("external_provider"),
+            true,
+        )
+        .unwrap());
 }
 
 #[test]
@@ -1528,7 +1757,7 @@ fn consensus_batch_preserves_human_reviewed_transcripts() {
 }
 
 #[test]
-fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
+fn batch_transcription_update_preserves_human_review_and_never_writes_annotation() {
     // Round-9 audit HIGH (lost update): batch_transcribe wrote the whole STALE snapshot back via
     // insert_segment, reverting a concurrent human verify/edit. The guarded targeted write must
     // (a) refuse to touch a human-verified/reviewed row, (b) never revert `verified`, (c) seed the
@@ -1551,7 +1780,6 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
             Some("heuristic"),
             Some("omniasr-ctc-300m"),
             false,
-            "fresh asr",
         )
         .expect("update verified");
     assert!(!updated, "a verified row must be skipped, not updated");
@@ -1560,7 +1788,10 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
     assert_eq!(after.annotated_transcript.as_deref(), Some("human gold"), "human annotation preserved");
     assert_eq!(after.raw_transcript, "old asr", "human-owned row's raw must not be clobbered");
 
-    // (c): a fresh unreviewed row with no annotation IS updated and seeds the annotation.
+    // (c): a fresh unreviewed row IS updated — and annotated_transcript stays EMPTY. The old
+    // behaviour ("annotation seeded when empty") wrote the machine draft into the human-only field,
+    // where the couch/editor precedence served it forever over every later champion re-draft — the
+    // 348-row 2026-08-12 incident. Machine text lands in raw/normalized ONLY.
     let mut fresh = make_segment("fresh-1", "/b.wav");
     fresh.raw_transcript = "old".to_string();
     fresh.annotated_transcript = None;
@@ -1574,19 +1805,18 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
             Some("heuristic"),
             Some("omniasr-ctc-300m"),
             false,
-            "new asr",
         )
         .expect("update fresh");
     assert!(updated, "an unreviewed row is updated");
     let after = db.get_segment_by_id("fresh-1").unwrap().unwrap();
     assert_eq!(after.raw_transcript, "new asr");
-    assert_eq!(after.annotated_transcript.as_deref(), Some("new asr"), "annotation seeded when empty");
+    assert_eq!(after.annotated_transcript, None, "machine text must NEVER enter the human-only field");
     assert_eq!(after.confidence_source.as_deref(), Some("heuristic"));
     assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-300m"));
     assert!(!after.cloud_call);
 
     // (d): an unverified row the user annotated (without verifying) keeps that annotation; only
-    // the ASR fields refresh — the seed is ignored because COALESCE reads the CURRENT row.
+    // the ASR fields refresh — the batch write never mentions the annotated column at all.
     let mut annotated = make_segment("annot-1", "/c.wav");
     annotated.raw_transcript = "old".to_string();
     annotated.annotated_transcript = Some("user typed".to_string());
@@ -1600,15 +1830,34 @@ fn batch_transcription_update_preserves_human_review_and_seeds_annotation() {
             Some("real_posterior"),
             Some("omniasr-ctc-1b"),
             false,
-            "seed ignored",
         )
         .expect("update annotated");
     assert!(updated, "an unverified annotated row still refreshes ASR");
     let after = db.get_segment_by_id("annot-1").unwrap().unwrap();
-    assert_eq!(after.annotated_transcript.as_deref(), Some("user typed"), "existing annotation preserved (COALESCE)");
+    assert_eq!(after.annotated_transcript.as_deref(), Some("user typed"), "existing annotation preserved");
     assert_eq!(after.raw_transcript, "new asr", "raw ASR refreshed on an unverified row");
     assert_eq!(after.confidence_source.as_deref(), Some("real_posterior"));
     assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-1b"));
+}
+
+#[test]
+fn consensus_batch_never_touches_a_flag_verified_row() {
+    // Audit #24: the guard checked human_decision/verdict but not `verified`, unlike its sibling
+    // update_batch_transcription_if_unreviewed — so a clip the human deliberately closed out with
+    // the verify flag (no decision recorded) still had its transcripts rewritten by machine
+    // consensus.
+    let db = make_db();
+    let mut s = make_segment("cv-1", "/cv.wav");
+    s.raw_transcript = "دەقی داخراو".to_string();
+    db.insert_segment(&s).unwrap();
+    db.update_verified("cv-1", true).unwrap();
+
+    let changed = db
+        .update_segment_consensus_batch(&[("cv-1".to_string(), "دەقی مەکینە".to_string(), "norm".to_string(), 0.9)])
+        .unwrap();
+    assert_eq!(changed, 0, "a verified row must be skipped by machine consensus");
+    let after = db.get_segment_by_id("cv-1").unwrap().unwrap();
+    assert_eq!(after.raw_transcript, "دەقی داخراو", "the closed-out transcript must survive");
 }
 
 #[test]
@@ -2903,6 +3152,54 @@ fn update_segment_alignment_writes_timings_and_quality_together() {
 }
 
 #[test]
+fn every_segment_write_rejects_structurally_invalid_alignment_metadata() {
+    let db = make_db();
+    let mut seg = make_segment("bad-alignment", "/a.wav");
+    seg.alignment_json = Some(r#"{"source_start_ms":1000,"source_end_ms":100}"#.into());
+    assert!(db.insert_segment(&seg).is_err(), "the shared insert boundary must reject reversed bounds");
+    assert!(db.get_segment_by_id("bad-alignment").unwrap().is_none(), "a rejected row must not persist");
+
+    let valid = make_segment("alignment-update", "/a.wav");
+    db.insert_segment(&valid).unwrap();
+    assert!(
+        db.update_segment_alignment(
+            "alignment-update",
+            r#"{"words":[{"word":"x","start":2.0,"end":1.0,"confidence":0.9}]}"#,
+            "ctc_forced",
+        )
+        .is_err(),
+        "the targeted alignment writer must enforce the same schema"
+    );
+    let row = db.get_segment_by_id("alignment-update").unwrap().unwrap();
+    assert!(row.alignment_json.is_none(), "a rejected targeted update must leave the row unchanged");
+}
+
+#[test]
+fn phone_decision_rolls_back_every_side_effect_when_finalization_fails() {
+    let db = make_db();
+    db.insert_segment(&make_segment("phone-atomic", "/a.wav")).unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_phone_finalize BEFORE UPDATE ON speech_segments
+             WHEN NEW.verified = 1 BEGIN SELECT RAISE(ABORT, 'injected finalization failure'); END;",
+        )
+        .unwrap();
+
+    let result = db.record_phone_human_decision_by("phone-atomic", "edit", Some("ڕاستکراوە"), "Sara");
+    assert!(result.is_err(), "the injected finalization failure must propagate");
+
+    let row = db.get_segment_by_id("phone-atomic").unwrap().unwrap();
+    assert!(!row.verified);
+    assert!(row.human_decision.is_none(), "verdict must roll back with finalization");
+    assert!(row.reviewed_by.is_none(), "attribution must roll back with finalization");
+    let examples: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 'phone-atomic'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(examples, 0, "learning side effects must roll back with finalization");
+}
+
+#[test]
 fn relink_refuses_a_candidate_already_owned_by_a_present_segment() {
     // The ambiguity guard counted basename collisions only among the MISSING paths. A missing
     // recording whose basename matches a file that a STILL-PRESENT segment already owns (a different
@@ -3407,4 +3704,411 @@ fn suspect_first_ranks_poor_audio_ahead_of_high_agreement() {
     assert!(pos("clipped") < pos("disputed"), "clipped audio must outrank a disagreement: {order:?}");
     assert!(pos("disputed") < pos("clean"), "within clean audio, low agreement still comes first: {order:?}");
     assert_eq!(order.last().unwrap(), "clean", "the least suspect clip is last: {order:?}");
+}
+
+#[test]
+fn review_queue_never_serves_a_clip_the_champion_has_not_drafted() {
+    // MEASURED 2026-08-14: an interrupted import left 36 rows carrying `[Pending WSL 7B ASR]`, and
+    // the queue's only filter was `verified = 0`, so a reviewer could be handed one. `api_decision`
+    // already refuses to VERIFY `[...]` text, so the reviewer would hit a 400 — but the worse path is
+    // the one that succeeds: they type the transcript themselves, the clip is finished without the
+    // champion ever drafting it, and it has no baseline for any CER measurement, permanently.
+    let db = make_db();
+    // Real files on disk: the queue also refuses a clip whose audio is missing, so a fixture with a
+    // made-up path would be filtered for the WRONG reason and this test would pass vacuously.
+    let audio = tempfile::tempdir().unwrap();
+    let wav = |name: &str| {
+        let p = audio.path().join(name);
+        std::fs::write(&p, b"RIFF").unwrap();
+        p.to_string_lossy().to_string()
+    };
+    let mut drafted = make_segment("drafted", &wav("a.wav"));
+    drafted.raw_transcript = "دەقێکی ڕاستەقینە".to_string();
+    let mut pending = make_segment("pending", &wav("b.wav"));
+    pending.raw_transcript = "[Pending WSL 7B ASR]".to_string();
+    let mut unavailable = make_segment("unavailable", &wav("c.wav"));
+    unavailable.raw_transcript = "[ASR unavailable: server down]".to_string();
+    let mut blank = make_segment("blank", &wav("d.wav"));
+    blank.raw_transcript = "   ".to_string();
+    for seg in [&drafted, &pending, &unavailable, &blank] {
+        db.insert_segment(seg).unwrap();
+    }
+
+    let served = db.pending_segment_ids().unwrap();
+
+    assert!(served.contains(&"drafted".to_string()), "a real draft must still be served: {served:?}");
+    for hidden in ["pending", "unavailable", "blank"] {
+        assert!(!served.contains(&hidden.to_string()), "{hidden} must never reach a reviewer: {served:?}");
+    }
+}
+
+#[test]
+fn review_queue_serves_the_oldest_work_first() {
+    // MEASURED 2026-08-14: importing 27 hours of new podcast audio put 6,823 fresh clips in front of
+    // the 537 remaining clips of the original corpus, because the queue was newest-first. The owner's
+    // instruction was the opposite — finish the old material before starting the new dialect — and a
+    // review queue is FIFO anyway: adding audio must never delay work already in progress.
+    let db = make_db();
+    let audio = tempfile::tempdir().unwrap();
+    for (id, created) in
+        [("old-1", "2026-08-01 10:00:00"), ("mid-1", "2026-08-10 10:00:00"), ("new-1", "2026-08-14 10:00:00")]
+    {
+        let path = audio.path().join(format!("{id}.wav"));
+        std::fs::write(&path, b"RIFF").unwrap();
+        let mut seg = make_segment(id, &path.to_string_lossy());
+        seg.raw_transcript = "دەقی ڕاست".to_string();
+        seg.created_at = Some(created.to_string());
+        db.insert_segment_full(&seg).unwrap();
+    }
+
+    let served = db.pending_segment_ids().unwrap();
+
+    assert_eq!(
+        served,
+        vec!["old-1".to_string(), "mid-1".to_string(), "new-1".to_string()],
+        "the queue must hand out the oldest pending clip first: {served:?}"
+    );
+}
+
+#[test]
+fn a_spot_check_is_never_served_in_a_dialect_the_reviewer_cannot_judge() {
+    // Spot checks are injected on a path of their own, AFTER the queue's dialect filter — so they
+    // were the one remaining way to hand someone a dialect they do not speak, and the most damaging:
+    // a check is SCORED, so an honest reviewer fails a test they could not have passed and is
+    // recorded looking exactly like someone tapping "looks good" without listening.
+    let db = make_db();
+    let audio = tempfile::tempdir().unwrap();
+    let mut ids = Vec::new();
+    for (id, file) in [("haw", "KBHP-EP01.wav"), ("sor", "zar-01.wav")] {
+        // Real files: the candidate list refuses a key whose audio is gone, for its own good reason.
+        let path = if id == "haw" {
+            audio.path().join("sorani-hawleri").join(file)
+        } else {
+            audio.path().join("Kurdish Corpora").join("sorani").join("ZarPodcast").join(file)
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"RIFF").unwrap();
+        let mut seg = make_segment(id, path.to_str().unwrap());
+        seg.raw_transcript = "دەقی هەڵە".into();
+        seg.verified = true;
+        db.insert_segment(&seg).unwrap();
+        // Through the real decision path, so the answer key lands where a human edit leaves it.
+        db.record_human_decision(id, "edit", Some("دەقی ڕاست"), None).unwrap();
+        ids.push(id);
+    }
+    let candidates = |allowed: Option<&[String]>| -> Vec<String> {
+        db.list_spot_check_candidates(10, "Roza", &std::collections::HashSet::new(), allowed)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s.id)
+            .collect()
+    };
+    assert_eq!(candidates(None).len(), 2, "unrestricted: both clips are usable keys");
+    let sorani_only = vec![crate::dialect::SORANI.to_string()];
+    assert_eq!(
+        candidates(Some(&sorani_only)),
+        vec!["sor".to_string()],
+        "a Sorani-only reviewer must be graded on Sorani only"
+    );
+}
+
+#[test]
+fn a_snapshot_of_a_real_sized_library_does_not_take_minutes() {
+    // MEASURED 2026-08-17: `backup` paced itself at 5 pages per 250 ms — the rusqlite doc example,
+    // copied without arithmetic. That is 80 KB/s, so the owner's 84 MB library took ~18 minutes per
+    // snapshot. `take_snapshot` runs synchronously at startup, so EVERY launch held the reviewer
+    // port shut for a quarter of an hour, and the 10-minute snapshot timer meant a copy was almost
+    // always running against the live database.
+    //
+    // The size assertion is the load-bearing half: a handful of pages finishes fast under either
+    // pacing, so without it this test would pass while the bug was fully present.
+    let db = make_db();
+    let mut seg = make_segment("bulk", "/audio/bulk.wav");
+    seg.raw_transcript = "ک".repeat(4000); // ~4 KB of text per row, so page count climbs quickly
+    for i in 0..600 {
+        seg.id = format!("bulk-{i}");
+        db.insert_segment(&seg).unwrap();
+    }
+    let pages: i64 = db.connection().query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+    assert!(pages >= 1000, "the fixture must be big enough for pacing to matter, got {pages} pages");
+
+    // Bound to a name: a temporary TempDir is dropped at the end of the statement that made it, which
+    // deletes the directory out from under the backup.
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("snap.db");
+    let started = std::time::Instant::now();
+    db.backup(&dest).unwrap();
+    let elapsed = started.elapsed();
+
+    // Old pacing needed >= pages/5 * 250 ms — at least 50 s for 1000 pages. New pacing is well under
+    // a second. The budget is deliberately loose so a busy CI box cannot flake it; anything near the
+    // old behaviour misses it by orders of magnitude.
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "backing up {pages} pages took {elapsed:?} — the per-step pacing has regressed"
+    );
+}
+
+#[test]
+fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
+    // This is what the phone shows a reviewer as progress AND what the owner pays on (per hour of
+    // audio reviewed, not per hour at the desk). So a network retry or a re-decision of the same clip
+    // must not inflate it — 40 of Rubar's 355 decisions were re-decisions of a clip she had already
+    // done, and counting rows would have billed those twice.
+    let db = make_db();
+    for (id, ms) in [("a", 9000), ("b", 21000)] {
+        let mut seg = make_segment(id, &format!("/audio/{id}.wav"));
+        seg.duration_ms = ms;
+        db.insert_segment(&seg).unwrap();
+    }
+    let mut ts = 1_700_000_000_000i64;
+    let mut ev = |seg: &str, who: &str, action: &str| {
+        ts += 1000;
+        db.record_review_event(seg, who, action, "phone", ts).unwrap();
+    };
+    ev("a", "Rubar", "accept");
+    ev("a", "Rubar", "edit"); // same clip again — a retry, not new work
+    ev("b", "Rubar", "reject"); // a reject IS reviewed audio: they listened to decide
+    ev("a", "Sewa", "accept"); // another reviewer on the same clip counts for HER
+
+    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "9s + 21s, the retry not double-counted");
+    assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000);
+    assert_eq!(db.reviewed_audio_ms("Nobody").unwrap(), 0, "a reviewer with no work owes no rows");
+}
+
+#[test]
+fn review_queue_never_serves_a_clip_whose_audio_file_is_gone() {
+    // MEASURED 2026-08-15: three staging folders under SoraniVoice_PC_ ceased to exist, taking the
+    // audio for 1,031 clips (7% of the library) with them. 536 were still pending and — because this
+    // queue is oldest-first and that was the OLDEST material — they sat at the head of the queue, so
+    // every reviewer who opened a link was handed unplayable clips first. The rows are perfectly
+    // well-formed, so nothing that reads the database can see it; only the disk can.
+    //
+    // A reviewer who cannot listen can only guess at text they never heard, and this is a VERBATIM
+    // corpus: an unheard "looks good" is worse than no decision at all.
+    let db = make_db();
+    let audio = tempfile::tempdir().unwrap();
+    let present = audio.path().join("present.wav");
+    std::fs::write(&present, b"RIFF").unwrap();
+
+    let mut playable = make_segment("playable", &present.to_string_lossy());
+    playable.raw_transcript = "دەقی ڕاست".to_string();
+    let mut orphaned = make_segment("orphaned", &audio.path().join("deleted.wav").to_string_lossy());
+    orphaned.raw_transcript = "دەقی ڕاست".to_string();
+    for seg in [&playable, &orphaned] {
+        db.insert_segment(seg).unwrap();
+    }
+
+    let served = db.pending_segment_ids().unwrap();
+
+    assert_eq!(served, vec!["playable".to_string()], "only clips a reviewer can actually hear: {served:?}");
+}
+
+#[test]
+fn segment_pages_use_stable_keysets_and_lightweight_rows() {
+    let db = make_db();
+    // PINNED timestamps, newest-first by construction. `insert_segment` stamps created_at = now at
+    // one-second resolution, so five rapid inserts USUALLY share one second and the id tiebreak
+    // yields a,b,c,d,e — but when the wall clock ticks mid-insert the rows split across two seconds
+    // and "newest" reorders them. That is exactly how this test failed twice and passed twice across
+    // four otherwise-identical sweep runs on 2026-08-16. A test about ORDERING must own its clock.
+    for (id, created) in [
+        ("a", "2026-01-01 10:00:05"),
+        ("b", "2026-01-01 10:00:04"),
+        ("c", "2026-01-01 10:00:03"),
+        ("d", "2026-01-01 10:00:02"),
+        ("e", "2026-01-01 10:00:01"),
+    ] {
+        let mut segment = make_segment(id, &format!("/{id}.wav"));
+        segment.alignment_json = Some(r#"{"version":1,"words":[]}"#.into());
+        segment.evidence_json = Some(r#"{"large":"payload"}"#.into());
+        segment.created_at = Some(created.to_string());
+        db.insert_segment_full(&segment).unwrap();
+    }
+
+    let first = db.get_segments_page(None, None, "newest", 2, None).unwrap();
+    assert_eq!(first.items.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(first.total, 5);
+    assert!(first.items.iter().all(|s| s.alignment_json.is_none() && s.evidence_json.is_none()));
+
+    // This id would sort ahead of the continuation point, but was inserted after the frozen anchor.
+    db.insert_segment(&make_segment("00-new", "/new.wav")).unwrap();
+    db.delete_segment("a").unwrap();
+    let second = db.get_segments_page(None, None, "newest", 2, first.next_cursor.as_deref()).unwrap();
+    assert_eq!(second.items.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["c", "d"]);
+    assert_eq!(second.total, 5, "cursor total remains the anchored walk's original membership");
+    let third = db.get_segments_page(None, None, "newest", 2, second.next_cursor.as_deref()).unwrap();
+    assert_eq!(third.items.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["e"]);
+    assert!(third.next_cursor.is_none());
+}
+
+#[test]
+fn segment_page_cursor_is_opaque_versioned_and_scope_bound() {
+    let db = make_db();
+    db.insert_segments_batch(&[make_segment("a", "/a.wav"), make_segment("b", "/b.wav")]).unwrap();
+    let first = db.get_segments_page(None, None, "newest", 1, None).unwrap();
+    let cursor = first.next_cursor.as_deref().unwrap();
+    assert!(!cursor.chars().all(|c| c.is_ascii_digit()));
+    assert!(db.get_segments_page(None, None, "oldest", 1, Some(cursor)).is_err());
+    assert!(db.get_segments_page(Some(true), None, "newest", 1, Some(cursor)).is_err());
+    assert!(db.get_segments_page(None, None, "newest", 1, Some("not_a_cursor")).is_err());
+}
+
+#[test]
+fn every_segment_sort_walks_each_row_exactly_once() {
+    let db = make_db();
+    for (index, id) in ["a", "b", "c", "d", "e"].into_iter().enumerate() {
+        let mut segment = make_segment(id, &format!("/{id}.wav"));
+        segment.created_at = Some(format!("2026-08-{:02}T00:00:00Z", index + 1));
+        segment.duration_ms = 1000 + index as i64 * 100;
+        segment.verified = index % 2 == 0;
+        segment.confidence = Some(0.2 + index as f64 * 0.1);
+        segment.ctc_score = Some(-4.0 + index as f64 * 0.2);
+        segment.escalated = index == 3;
+        segment.agreement_score = Some(0.3 + index as f64 * 0.1);
+        segment.snr_db = Some(if index == 2 { 2.0 } else { 20.0 });
+        db.insert_segment(&segment).unwrap();
+    }
+
+    for sort in ["newest", "oldest", "duration", "verified", "confidence", "activeLearning", "suspectFirst"] {
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = db.get_segments_page(None, None, sort, 2, cursor.as_deref()).unwrap();
+            ids.extend(page.items.into_iter().map(|row| row.id));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), 5, "{sort} must return all rows: {ids:?}");
+        assert_eq!(unique.len(), 5, "{sort} must not duplicate rows: {ids:?}");
+    }
+}
+
+#[test]
+fn review_revision_changes_on_every_update_even_inside_one_second() {
+    let db = make_db();
+    db.insert_segment(&make_segment("revision", "/revision.wav")).unwrap();
+    let first = db.segment_review_revision("revision").unwrap().unwrap();
+
+    // Both writes ordinarily receive the same second-resolution updated_at. The review fence must
+    // still observe each one, including a metadata writer that deliberately does not touch updated_at.
+    db.connection().execute("UPDATE speech_segments SET speaker_id = 'A' WHERE id = 'revision'", []).unwrap();
+    let second = db.segment_review_revision("revision").unwrap().unwrap();
+    db.set_speaker_change_score("revision", 0.42).unwrap();
+    let third = db.segment_review_revision("revision").unwrap().unwrap();
+
+    assert_eq!(second, first + 1);
+    assert_eq!(third, second + 1);
+    let (_, paired) = db.get_segment_by_id_with_revision("revision").unwrap().unwrap();
+    assert_eq!(paired, third, "row and revision are returned from one result row");
+}
+
+#[test]
+fn phone_decision_revision_cas_has_no_side_effects_on_a_stale_row() {
+    let db = make_db();
+    let mut segment = make_segment("decision-cas", "/decision-cas.wav");
+    segment.raw_transcript = "هەڵە".into();
+    db.insert_segment(&segment).unwrap();
+    let served_revision = db.segment_review_revision("decision-cas").unwrap().unwrap();
+
+    db.update_speaker_id("decision-cas", Some("SPEAKER_01")).unwrap();
+    let current_revision = db.segment_review_revision("decision-cas").unwrap().unwrap();
+    assert!(current_revision > served_revision);
+
+    let stale = db
+        .record_phone_human_decision_by_at_revision("decision-cas", "edit", Some("ڕاست"), "Sara", served_revision)
+        .unwrap();
+    assert!(stale.is_none(), "a stale decision is a clean CAS miss");
+    let untouched = db.get_segment_by_id("decision-cas").unwrap().unwrap();
+    assert!(!untouched.verified);
+    assert!(untouched.human_decision.is_none());
+    let examples: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 'decision-cas'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(examples, 0, "a CAS miss must not mint learning data");
+
+    let applied = db
+        .record_phone_human_decision_by_at_revision("decision-cas", "edit", Some("ڕاست"), "Sara", current_revision)
+        .unwrap();
+    assert!(applied.is_some());
+}
+
+#[test]
+fn phone_undo_rolls_back_the_row_if_learning_retraction_fails_then_retries_cleanly() {
+    let db = make_db();
+    let mut previous = make_segment("undo-atomic", "/undo-atomic.wav");
+    previous.raw_transcript = "هەڵە".into();
+    db.insert_segment(&previous).unwrap();
+    let served_revision = db.segment_review_revision("undo-atomic").unwrap().unwrap();
+    let decided_revision = db
+        .record_phone_human_decision_by_at_revision("undo-atomic", "edit", Some("ڕاست"), "Sara", served_revision)
+        .unwrap()
+        .unwrap();
+
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_undo_learning_delete
+             BEFORE DELETE ON agent_examples
+             WHEN old.segment_id = 'undo-atomic'
+             BEGIN SELECT RAISE(ABORT, 'injected undo failure'); END;",
+        )
+        .unwrap();
+    assert!(db.undo_phone_human_decision(&previous, "Sara", decided_revision).is_err());
+
+    let still_decided = db.get_segment_by_id("undo-atomic").unwrap().unwrap();
+    assert!(still_decided.verified, "the row update must roll back with the failed delete");
+    assert_eq!(still_decided.reviewed_by.as_deref(), Some("Sara"));
+    assert_eq!(db.segment_review_revision("undo-atomic").unwrap(), Some(decided_revision));
+    let examples_after_failure: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 'undo-atomic'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(examples_after_failure, 1);
+
+    db.connection().execute_batch("DROP TRIGGER fail_undo_learning_delete;").unwrap();
+    let restored_revision = db
+        .undo_phone_human_decision(&previous, "Sara", decided_revision)
+        .unwrap()
+        .expect("the same undo token remains repairable after rollback");
+    assert!(restored_revision > decided_revision);
+    let restored = db.get_segment_by_id("undo-atomic").unwrap().unwrap();
+    assert!(!restored.verified);
+    assert!(restored.human_decision.is_none());
+    assert!(restored.reviewed_by.is_none());
+    let examples_after_success: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 'undo-atomic'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(examples_after_success, 0);
+}
+
+#[test]
+fn alignment_cas_never_overwrites_concurrent_boundary_metadata() {
+    let db = make_db();
+    let original = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":2,"words":[]}"#;
+    let concurrent = r#"{"source_start_ms":1000,"source_end_ms":2000,"chunk_index":1,"chunk_count":2,"words":[]}"#;
+    let inferred = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":2,"words":[{"word":"x","start":0.0,"end":0.4}]}"#;
+    let mut segment = make_segment("align-cas", "/align-cas.wav");
+    segment.alignment_json = Some(original.into());
+    db.insert_segment(&segment).unwrap();
+
+    // Simulate the boundary editor winning while forced alignment is still running.
+    db.update_segment_alignment("align-cas", concurrent, "energy_heuristic").unwrap();
+    let changed =
+        db.update_segment_alignment_if_unchanged("align-cas", Some(original), inferred, "ctc_forced").unwrap();
+    assert!(!changed, "stale inference must lose the compare-and-swap");
+    let row = db.get_segment_by_id("align-cas").unwrap().unwrap();
+    assert_eq!(row.alignment_json.as_deref(), Some(concurrent));
+    assert_eq!(row.alignment_quality.as_deref(), Some("energy_heuristic"));
+
+    let applied =
+        db.update_segment_alignment_if_unchanged("align-cas", Some(concurrent), inferred, "ctc_forced").unwrap();
+    assert!(applied);
+    let row = db.get_segment_by_id("align-cas").unwrap().unwrap();
+    assert_eq!(row.alignment_json.as_deref(), Some(inferred));
+    assert_eq!(row.alignment_quality.as_deref(), Some("ctc_forced"));
 }

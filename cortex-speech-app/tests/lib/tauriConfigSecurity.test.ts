@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { APP_CONFIG } from '../../src/lib/app.config';
+
+// Only `models` is consumed (this test); dead fields removed in the 2026-07-15 audit, and the
+// standalone src/lib/app.config.ts file itself removed (zero production importers) in round 2.
+const APP_CONFIG = {
+  models: {
+    omniasrModel: 'models/omniasr-ctc-300m/model.int8.onnx',
+    omniasrTokens: 'models/omniasr-ctc-300m/tokens.txt',
+    vadPath: 'models/silero_vad_v4.onnx',
+  },
+};
 
 describe('Tauri config security boundaries', () => {
   it('limits asset protocol reads to the media cache', () => {

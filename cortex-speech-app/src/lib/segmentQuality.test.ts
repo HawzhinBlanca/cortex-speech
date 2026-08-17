@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { hasRealTranscript, isVerifiedGood, isHumanRejected, effectiveTranscript } from './segmentQuality';
+import {
+  hasRealTranscript,
+  isVerifiedGood,
+  isHumanRejected,
+  effectiveTranscript,
+} from './segmentQuality';
 import type { SpeechSegment } from './types';
 
 const seg = (over: Partial<SpeechSegment>): SpeechSegment =>
@@ -26,7 +31,11 @@ describe('hasRealTranscript', () => {
   it('is true when ANY field carries real content (never under-counts a good clip)', () => {
     expect(hasRealTranscript(seg({ rawTranscript: 'کوردی' }))).toBe(true);
     // A placeholder raw but a real human annotation is still real content.
-    expect(hasRealTranscript(seg({ rawTranscript: '[Pending WSL 7B ASR]', annotatedTranscript: 'کوردی' }))).toBe(true);
+    expect(
+      hasRealTranscript(
+        seg({ rawTranscript: '[Pending WSL 7B ASR]', annotatedTranscript: 'کوردی' }),
+      ),
+    ).toBe(true);
     expect(hasRealTranscript(seg({ rawTranscript: '', normalizedTranscript: 'سڵاو' }))).toBe(true);
   });
 
@@ -41,7 +50,6 @@ describe('hasRealTranscript', () => {
 describe('effectiveTranscript', () => {
   const base = {
     rawTranscript: 'raw',
-    normalizedTranscript: 'normalized',
     annotatedTranscript: null,
     verdictTranscript: null,
     humanDecision: null,
@@ -52,9 +60,9 @@ describe('effectiveTranscript', () => {
     // The rule the old stats order missed entirely: a human edit lives in verdictTranscript, and
     // measuring annotated/raw instead reports the text the human REPLACED.
     for (const humanDecision of ['accept', 'edit', 'human_accept', 'human_edit', 'EDIT']) {
-      expect(
-        effectiveTranscript({ ...base, verdictTranscript: 'corrected', humanDecision }),
-      ).toBe('corrected');
+      expect(effectiveTranscript({ ...base, verdictTranscript: 'corrected', humanDecision })).toBe(
+        'corrected',
+      );
     }
     expect(
       effectiveTranscript({ ...base, verdictTranscript: 'corrected', verdict: 'human_accept' }),
@@ -64,23 +72,27 @@ describe('effectiveTranscript', () => {
   it('ignores a verdict transcript that no human decision stands behind', () => {
     // A machine verdict is not a human edit — annotated still wins.
     expect(
-      effectiveTranscript({ ...base, annotatedTranscript: 'annotated', verdictTranscript: 'machine' }),
+      effectiveTranscript({
+        ...base,
+        annotatedTranscript: 'annotated',
+        verdictTranscript: 'machine',
+      }),
     ).toBe('annotated');
   });
 
-  it('falls back through annotated, verdict, normalized, raw in that order', () => {
+  it('falls back through annotated then verbatim raw — machine text never surfaces (VERBATIM LAW)', () => {
     expect(effectiveTranscript({ ...base, annotatedTranscript: 'annotated' })).toBe('annotated');
-    expect(effectiveTranscript({ ...base, verdictTranscript: 'machine' })).toBe('machine');
-    expect(effectiveTranscript(base)).toBe('normalized');
-    expect(effectiveTranscript({ ...base, normalizedTranscript: null })).toBe('raw');
+    // An undecided machine verdict is evidence, not the transcript: the champion's verbatim raw wins.
+    expect(effectiveTranscript({ ...base, verdictTranscript: 'machine' })).toBe('raw');
+    expect(effectiveTranscript(base)).toBe('raw');
   });
 
   it('treats whitespace-only fields as absent rather than selecting them', () => {
-    expect(effectiveTranscript({ ...base, annotatedTranscript: '   ' })).toBe('normalized');
+    expect(effectiveTranscript({ ...base, annotatedTranscript: '   ' })).toBe('raw');
   });
 
   it('returns an empty string when nothing is present', () => {
     // rawTranscript is `string`, not `string | null` — an absent raw transcript is '' by contract.
-    expect(effectiveTranscript({ ...base, rawTranscript: '', normalizedTranscript: null })).toBe('');
+    expect(effectiveTranscript({ ...base, rawTranscript: '' })).toBe('');
   });
 });

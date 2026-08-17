@@ -1,7 +1,12 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { segments, selectedSegmentId, searchScopedSegments, searchQuery } from './stores/segmentStore';
+  import {
+    segments,
+    selectedSegmentId,
+    searchQuery,
+    refreshSegmentStats,
+  } from './stores/segmentStore';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
   import { settings } from './stores/settingsStore';
@@ -18,12 +23,12 @@
     segmentSourceFilename,
     segmentChunkLabel,
   } from './alignment';
-  import { reviewProgress } from './reviewProgress';
   import { wordPlayBounds, replaceWordToken } from './wordEdit';
   import { isPlaceholderTranscript } from './segmentQuality';
+  import { revealReviewCompletion } from './reviewCompletion';
   import { parseEscalationEvidence, reasonLabelKey, reasonTone } from './reasonCodes';
+  import { formatUnknownError } from './errorText';
   import type { SpeechSegment, WordTimestamp } from './types';
-  import type { SegmentConsensus } from './commands';
 
   interface Props {
     // Pro next-steps surfaced when the whole queue is reviewed (wired by App to its export / exit).
@@ -36,24 +41,106 @@
   // suspect ranking (escalated first, then lowest agent confidence, then chronological) so the reviewer
   // lands on the riskiest clips first. Off by default — the plain pending-first order is unchanged.
   let suspectFirst = $state(false);
-  // Cached id→rank from the backend command; new segments (not in the map) sort to the end.
-  let suspectRank = $state<Map<string, number> | null>(null);
+  let reviewRows = $state<SpeechSegment[]>([]);
+  let reviewCursor = $state<string | null>(null);
+  let reviewTotal = $state(0);
+  let reviewInitialTotal = $state(0);
+  let reviewCorpusTotal = $state(0);
+  let reviewInitiallyVerified = $state(0);
+  let reviewLoading = $state(false);
+  let reviewLoadError = $state<string | null>(null);
+  let hydratedReviewIds = $state<Set<string>>(new Set());
+  const hydrationInFlight = new Map<string, Promise<void>>();
+  let reviewLoadKey = '';
+  let reviewGeneration = 0;
+
+  async function hydrateReviewRow(id: string, force = false) {
+    if (!force && hydratedReviewIds.has(id)) return;
+    const existing = hydrationInFlight.get(id);
+    if (existing) return existing;
+
+    const hydration = (async () => {
+      const full = await api.getSegment(id);
+      // The row can disappear while IPC is in flight because a decision completed. Never resurrect it.
+      if (!reviewRows.some((row) => row.id === id)) return;
+      reviewRows = reviewRows.map((row) => (row.id === id ? full : row));
+      segments.update((rows) => rows.map((row) => (row.id === id ? full : row)));
+      hydratedReviewIds = new Set([...hydratedReviewIds, id]);
+    })();
+    hydrationInFlight.set(id, hydration);
+    try {
+      await hydration;
+    } finally {
+      hydrationInFlight.delete(id);
+    }
+  }
+
+  async function loadReviewPage(reset: boolean) {
+    if (!reset && (reviewLoading || !reviewCursor)) return;
+    const generation = reset ? ++reviewGeneration : reviewGeneration;
+    const cursor = reset ? null : reviewCursor;
+    const query = $searchQuery.trim() || null;
+    if (reset) {
+      // A new scope/order must fail closed. Keeping the previous scope actionable while its
+      // replacement loads can record a decision against a clip the reviewer can no longer see in
+      // context, and a failed reset must never masquerade as the successful all-done state.
+      reviewRows = [];
+      reviewCursor = null;
+      reviewTotal = 0;
+      reviewInitialTotal = 0;
+      reviewCorpusTotal = 0;
+      reviewInitiallyVerified = 0;
+      reviewLoadError = null;
+      hydratedReviewIds = new Set();
+      index = 0;
+    }
+    reviewLoading = true;
+    try {
+      const statsPromise =
+        reset && !query ? api.getDatasetStats().catch(() => null) : Promise.resolve(null);
+      const page = await api.getSegmentsPage({
+        verified: false,
+        query,
+        sort: suspectFirst ? 'suspectFirst' : 'oldest',
+        limit: 100,
+        cursor,
+      });
+      const stats = await statsPromise;
+      if (generation !== reviewGeneration) return;
+      reviewLoadError = null;
+      reviewRows = reset ? page.items : [...reviewRows, ...page.items];
+      reviewCursor = page.nextCursor;
+      if (reset) {
+        reviewTotal = page.total;
+        reviewInitialTotal = page.total;
+        reviewCorpusTotal = stats?.totalSegments ?? page.total;
+        reviewInitiallyVerified = stats?.verifiedCount ?? 0;
+        index = 0;
+      }
+    } catch (error) {
+      if (generation !== reviewGeneration) return;
+      reviewLoadError = formatUnknownError(error, $t('notifications.loadSegmentsFailed'));
+      if (reset) {
+        reviewRows = [];
+        reviewCursor = null;
+        reviewTotal = 0;
+        reviewInitialTotal = 0;
+      }
+      notifications.error($t('notifications.loadSegmentsFailed'), { detail: reviewLoadError });
+    } finally {
+      if (generation === reviewGeneration) reviewLoading = false;
+    }
+  }
+
+  $effect(() => {
+    const key = `${$searchQuery.trim()}\0${suspectFirst ? 'suspect' : 'oldest'}`;
+    if (key === reviewLoadKey) return;
+    reviewLoadKey = key;
+    void loadReviewPage(true);
+  });
 
   async function toggleSuspectFirst() {
-    const next = !suspectFirst;
-    if (next) {
-      try {
-        const ordered = await api.getSegmentsSuspectFirst();
-        suspectRank = new Map(ordered.map((s, i) => [s.id, i]));
-      } catch (e) {
-        notifications.error($t('review.suspectFirstFailed'), { detail: String(e) });
-        return; // stay off if the fetch failed
-      }
-    } else {
-      suspectRank = null;
-    }
-    suspectFirst = next;
-    index = 0; // land on the top of the reordered queue
+    suspectFirst = !suspectFirst;
   }
 
   // True-10 audit: a curate-mode SEARCH now scopes the review queue (review one source file, one
@@ -66,16 +153,7 @@
   // then the rest — so a reviewer always lands on work that needs doing.
   // searchScopedSegments (NOT filteredSegments) enforces the search-only contract above: the
   // curate "✓ Verified" chip must never leak in and empty the queue (true-10 audit).
-  const queue = $derived.by<SpeechSegment[]>(() => {
-    const all = searchScoped ? $searchScopedSegments : $segments;
-    const pending = all.filter((s) => !s.verified);
-    const done = all.filter((s) => s.verified);
-    if (suspectFirst && suspectRank) {
-      const rank = suspectRank;
-      pending.sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
-    }
-    return [...pending, ...done];
-  });
+  const queue = $derived(reviewRows);
 
   let index = $state(0);
   // M2.6/P1.5: on first queue availability, resume at the restored session cursor (the last segment
@@ -94,13 +172,63 @@
     }
     cursorRestored = true;
   });
-  const current = $derived(queue[index] ?? null);
+  // Paged rows deliberately omit alignment/evidence payloads. They must never become actionable until
+  // get_segment has restored the full row: alignment_json carries the source chunk boundaries, and
+  // aligning a lightweight row's null value would treat it as a whole-file clip and overwrite those
+  // boundaries. This gate makes hydration part of the review-row state machine, not a best-effort race.
+  const currentCandidate = $derived(queue[index] ?? null);
+  const current = $derived(
+    currentCandidate && hydratedReviewIds.has(currentCandidate.id) ? currentCandidate : null,
+  );
+  $effect(() => {
+    const candidate = currentCandidate;
+    if (!candidate || hydratedReviewIds.has(candidate.id)) return;
+    void hydrateReviewRow(candidate.id).catch((error) => {
+      reviewLoadError = formatUnknownError(error, $t('notifications.loadSegmentsFailed'));
+      notifications.error($t('notifications.loadSegmentsFailed'), { detail: reviewLoadError });
+    });
+  });
   // Audit 2026-08-05: the position counter above counts the QUEUE while the progress text counted the
   // whole CORPUS, so an active search silently split the denominator and the two lines contradicted
   // each other on screen. One call now produces both. `progress.allReviewed` stays corpus-scoped on
   // purpose — a fully-reviewed SEARCH SUBSET must never fire the completion banner. See
   // reviewProgress.ts, where that rule is unit-tested.
-  const progress = $derived(reviewProgress(queue, $segments));
+  const progress = $derived({
+    done: searchScoped
+      ? Math.max(0, reviewInitialTotal - reviewTotal)
+      : Math.min(
+          reviewCorpusTotal,
+          reviewInitiallyVerified + Math.max(0, reviewInitialTotal - reviewTotal),
+        ),
+    total: searchScoped ? reviewInitialTotal : reviewCorpusTotal,
+    percent:
+      (searchScoped ? reviewInitialTotal : reviewCorpusTotal) > 0
+        ? Math.round(
+            ((searchScoped
+              ? reviewInitialTotal - reviewTotal
+              : reviewInitiallyVerified + reviewInitialTotal - reviewTotal) /
+              (searchScoped ? reviewInitialTotal : reviewCorpusTotal)) *
+              100,
+          )
+        : 0,
+    allReviewed: !searchScoped && reviewCorpusTotal > 0 && reviewTotal === 0,
+  });
+
+  $effect(() => {
+    if (reviewCursor && index >= queue.length - 10) void loadReviewPage(false);
+  });
+  let reviewScroller = $state<HTMLDivElement | null>(null);
+  let wasComplete = false;
+  $effect(() => {
+    const completedNow = progress.allReviewed;
+    if (completedNow && !wasComplete) {
+      void tick().then(() => {
+        wasComplete = revealReviewCompletion(reviewScroller, completedNow, wasComplete);
+      });
+    } else {
+      wasComplete = completedNow;
+    }
+  });
   // Null whenever the current clip carries no decision record — never escalated, or decided before the
   // codes existed. The template renders nothing in that case rather than asserting "no reasons".
   const escalationReasons = $derived(parseEscalationEvidence(current?.evidenceJson));
@@ -119,26 +247,25 @@
   let saving = $state(false);
   let lastLoadedId = $state<string | null>(null);
 
-  // Offline best-of-N consensus draft (ability-weighted vote across this clip's ASR hypotheses) + the
-  // per-word agreement that drives the disagreement highlight. Only shown when 2+ models voted.
-  let consensus = $state<SegmentConsensus | null>(null);
-  // Engines that actually produced this clip's draft, recorded (never inferred). Shown as an honest
-  // provenance badge even for a single-engine clip (e.g. only the OmniASR-7B Champion ran), where the
-  // multi-model consensus card below is intentionally hidden.
+  // Engines that actually produced this clip's draft, recorded (never inferred) and shown as an
+  // honest provenance badge.
+  //
+  // The multi-model CONSENSUS card this call also used to feed was removed (2026-08-13): it was an
+  // ability-weighted vote across engines measured at 19-40% CER on this corpus against a champion at
+  // 10.6%, and the same fusion changed 0 of 135 clips when measured on the owner's own reviewed
+  // audio. Its "Use draft" button was therefore a one-tap downgrade of the champion's text. The
+  // per-clip model list it returns is still honest and still shown.
   let draftModels = $state<string[]>([]);
   let consensusSeq = 0;
   async function loadConsensus(seg: SpeechSegment) {
     const seq = ++consensusSeq;
-    consensus = null;
     draftModels = [];
     try {
       const c = await api.getSegmentConsensus(seg.id);
       if (seq !== consensusSeq) return;
       draftModels = c.models ?? [];
-      consensus = c.words.length > 0 && c.modelCount >= 2 ? c : null;
     } catch {
       if (seq === consensusSeq) {
-        consensus = null;
         draftModels = [];
       }
     }
@@ -149,12 +276,9 @@
   // if the user switched the primary away from the default 7B.
   function primaryEngineId(): string {
     const s = get(settings);
-    // useFinetunedAsr is documented as OVERRIDING the model selection: with it on, the backend's
-    // transcribe() drafts with the fine-tuned MMS before any configured-engine code runs — a badge
-    // naming the configured model would be the exact wrong-engine attribution this function exists
-    // to prevent (true-10 audit 2026-07-09). (If the fine-tuned files are missing the backend falls
-    // back to the configured engine; the fully-honest fix is the backend returning the engine id it
-    // used — until then this matches the documented, common case.)
+    // Champion supremacy matches the Rust router: WSL7B always outranks the optional embedded MMS
+    // toggle. Only a non-champion local selection may be overridden by MMS.
+    if (s.asrModel === 'wsl-7b') return 'omniasr-wsl-7b';
     if (s.useFinetuned) return 'finetuned-mms-ckb';
     const map: Record<string, string> = {
       'wsl-7b': 'omniasr-wsl-7b',
@@ -166,8 +290,7 @@
 
   // Re-transcribe THIS clip with a chosen engine when the current draft is wrong. 'champion' routes
   // through the configured primary engine (the OmniASR-7B Champion by default — needs its server up);
-  // 'finetuned' runs the embedded fine-tuned MMS-1B (CPU/ONNX, always available). A re-transcription is
-  // machine output, so verified is reset (it must never be kept as if a human confirmed it).
+  // 'finetuned' runs the embedded fine-tuned MMS-1B only in an explicitly selected non-champion mode.
   let retranscribing = $state(false);
   function retranscribe(engine: 'champion' | 'finetuned') {
     const seg = current;
@@ -176,18 +299,10 @@
     // vs the DB during a batch, so it would revert the batch's writes. Re-transcribe is itself a machine
     // op, so refusing it during another machine run is correct (matches the curate transcribe handlers).
     if (!seg || retranscribing || saving || aligning || $isProcessing) return;
-    // GUARD (2026-07-15, from the live-test incident): re-transcribing a VERIFIED clip replaces the
-    // human-reviewed gold with a machine draft and reopens it — destroying review work must never be
-    // one accidental click. The pre-save snapshot goes on the undo stack either way, so even a
-    // confirmed destructive re-transcribe is reversible via Undo review.
-    if (seg.verified) {
-      showConfirmDialog.set({
-        title: $t('review.retranscribeVerifiedTitle'),
-        message: $t('review.retranscribeVerifiedMessage'),
-        confirmLabel: $t('review.retranscribeVerifiedConfirm'),
-        danger: true,
-        onConfirm: () => void doRetranscribe(engine),
-      });
+    // Human review is authoritative. Reopen/undo it first; an ASR request never doubles as an implicit
+    // destructive undo, even behind a confirmation dialog that could become stale during inference.
+    if (seg.verified || seg.humanDecision) {
+      notifications.info($t('asr.reopenBeforeRetranscribe'));
       return;
     }
     void doRetranscribe(engine);
@@ -206,25 +321,28 @@
           ? await api.transcribeSegmentFinetuned(seg.audioPath, seg.alignmentJson)
           : await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
       const text = result.text;
-      const updated: SpeechSegment = {
-        ...freshRow(seg.id, seg),
-        rawTranscript: result.rawTranscript,
-        annotatedTranscript: text,
-        verified: false,
-      };
-      // Re-transcribing a reviewed clip is destructive (gold replaced, clip reopened): snapshot the
-      // pre-change row so Undo review restores the FULL pre-decision state (lossless, incl. decision
-      // columns). Pushed only here — after the ASR succeeded, immediately before the write — so a
-      // failed attempt + retry can never double-push.
-      if (seg.verified) {
-        undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
+      let updated: SpeechSegment;
+      if (engine === 'champion') {
+        // The champion command commits server-side after all enabled refinement succeeds. Reload that
+        // authoritative row; never spread/upsert the UI snapshot captured before a long GPU call.
+        updated = await api.getSegment(seg.id);
+      } else {
+        // Optional non-champion tools are explicit local experiments and still return a draft for the
+        // existing update path. They are hidden entirely while production champion mode is selected.
+        updated = {
+          ...freshRow(seg.id, seg),
+          rawTranscript: result.rawTranscript,
+          normalizedTranscript: null,
+          verified: false,
+        };
+        await api.updateSegment(updated);
       }
-      await api.updateSegment(updated);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
+      reviewRows = reviewRows.map((s) => (s.id === seg.id ? updated : s));
       notifications.success($t('review.retranscribed'));
       // The DB/store write above targets seg by id and is correct even if the reviewer navigated away
       // during the multi-second ASR await. But everything below mutates the CURRENTLY shown editor
-      // (editText/lastLoadedOriginal/draftModels/consensus/alignment) — if navigation changed `current`
+      // (editText/lastLoadedOriginal/draftModels/alignment) — if navigation changed `current`
       // mid-flight, applying seg's draft here would put seg's MACHINE text into another clip's editor,
       // and a subsequent Save would persist it as THAT clip's human-verified gold: a wrong-segment gold
       // corruption (THE ONE LAW). Bail; seg's clip reloads its fresh draft + re-aligns when reopened.
@@ -237,15 +355,15 @@
       lastLoadedOriginal = text;
       // The owner just produced this draft with the chosen engine, so name it on the provenance badge
       // immediately (honest — it's exactly what was used). A single-engine re-transcribe has no
-      // multi-model consensus, so hide that card. The fine-tuned button always runs the MMS-1B; the
+      // The fine-tuned button always runs the MMS-1B; the
       // champion button runs the CONFIGURED primary engine (pipeline.transcribe), so read it from
       // settings rather than assuming the 7B — otherwise a user who switched the primary would get a
       // badge naming a model that never ran.
       draftModels = [engine === 'finetuned' ? 'finetuned-mms-ckb' : primaryEngineId()];
-      consensus = null;
       await ensureWordTimings(updated);
     } catch (e) {
-      // Champion (7B) down: offer retry-or-offline rather than a dead-end. Never a silent downgrade.
+      // Champion (7B) down: fail closed and retry only the champion. Optional engines require an
+      // explicit non-champion selection in Settings, never an in-flow downgrade prompt.
       if (engine === 'champion' && api.is7bUnavailableError(e)) {
         showConfirmDialog.set({
           title: $t('asr.championUnavailableTitle'),
@@ -253,7 +371,6 @@
           confirmLabel: $t('asr.tryAgain'),
           danger: false,
           onConfirm: () => void doRetranscribe('champion'),
-          secondary: { label: $t('asr.useOfflineModel'), onClick: () => void doRetranscribe('finetuned') },
         });
       } else {
         notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
@@ -281,8 +398,16 @@
       // store row, which would revert a concurrent batch's writes to this segment.
       await api.updateSegmentFields(seg.id, { verified: true });
       segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, verified: true } : s)));
+      const visibleId = current?.id ?? null;
+      reviewRows = reviewRows.filter((s) => s.id !== seg.id);
+      reviewTotal = Math.max(0, reviewTotal - 1);
+      void refreshSegmentStats();
       notifications.success($t('review.markedBad'));
-      advance();
+      if (visibleId === seg.id) advance();
+      else {
+        const visibleIndex = visibleId ? queue.findIndex((row) => row.id === visibleId) : -1;
+        if (visibleIndex >= 0) index = visibleIndex;
+      }
     } catch (e) {
       undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
       notifications.error($t('notifications.saveFailed'), { detail: String(e) });
@@ -309,6 +434,11 @@
       // undo returns the row to its exact pre-decision state in one atomic upsert.
       await api.restoreSegmentSnapshot(last.prev);
       segments.update((list) => list.map((s) => (s.id === last.id ? last.prev : s)));
+      if (!reviewRows.some((s) => s.id === last.id)) reviewRows = [last.prev, ...reviewRows];
+      else reviewRows = reviewRows.map((s) => (s.id === last.id ? last.prev : s));
+      hydratedReviewIds = new Set([...hydratedReviewIds, last.id]);
+      reviewTotal += 1;
+      void refreshSegmentStats();
       editCache.delete(last.id);
       const idx = queue.findIndex((s) => s.id === last.id);
       if (idx >= 0) index = idx;
@@ -341,9 +471,6 @@
       cloudChecking = false;
     }
   }
-
-  // A word is "contested" (worth a second look) when under two-thirds weighted agreement.
-  const CONTESTED = 0.67;
 
   // Word-level alignment for the current clip (forced or heuristic). When present it
   // powers the listen-strip: tap a word to hear it, colour the low-confidence ones so
@@ -390,13 +517,18 @@
   let aligning = $state(false);
   const alignAttempted = new Set<string>();
   async function ensureWordTimings(seg: SpeechSegment) {
+    // Alignment can load a separate CTC/MMS runtime. It is an explicit optional operation, not work
+    // that opening a review clip may launch behind the owner's back (especially while champion GPUs
+    // are occupied). Factory default is off; the existing timings/whole-clip playback remain valid.
+    if (!$settings.autoAlign) return;
     // Re-align when timings are MISSING or still the energy heuristic (evenly spaced words that do
     // not track the voice): imported clips always carry heuristic timings, so gating on "has
     // timestamps" alone froze the entire backlog at heuristic quality even after a real CTC aligner
     // was installed. Idempotent: without an aligner the backend re-persists the same heuristic, and
     // alignAttempted stops per-session repeats either way.
     const hasRealTimings =
-      parseWordTimestamps(seg.alignmentJson).length > 0 && seg.alignmentQuality !== 'energy_heuristic';
+      parseWordTimestamps(seg.alignmentJson).length > 0 &&
+      seg.alignmentQuality !== 'energy_heuristic';
     if (hasRealTimings || alignAttempted.has(seg.id)) return;
     const text = originalText(seg);
     if (!text.trim() || text.includes('[Pending') || text.includes('[ASR unavailable')) return;
@@ -404,16 +536,24 @@
     aligning = true;
     try {
       await api.alignSegment(seg.audioPath, text, seg.alignmentJson ?? null, seg.id);
-      await segments.load(); // align_segment persisted the timings; reload so `words` derives them
+      await hydrateReviewRow(seg.id, true);
     } catch {
-      // best-effort — leave whole-clip playback in place
+      // Best-effort alignment, but still refresh the authoritative row: a CAS refusal means another
+      // writer changed its chunk metadata while inference ran, and the review surface must follow it.
+      try {
+        await hydrateReviewRow(seg.id, true);
+      } catch {
+        // The existing full row remains safe and reviewable if even the refresh is unavailable.
+      }
     } finally {
       aligning = false;
     }
   }
 
   function originalText(seg: SpeechSegment): string {
-    return seg.annotatedTranscript ?? seg.normalizedTranscript ?? seg.rawTranscript ?? '';
+    // VERBATIM LAW (2026-08-12): the reviewer corrects the human draft else the champion's verbatim
+    // output — never the LLM-refined paraphrase column.
+    return seg.annotatedTranscript ?? seg.rawTranscript ?? '';
   }
 
   // Rebuild an upsert payload from the FRESHEST store copy of the row. update_segment writes the
@@ -532,22 +672,31 @@
       // aligner. The backend re-reads the fresh row under the db lock (no TOCTOU).
       await api.updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true });
       segments.update((list) =>
-        list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text, verified: true } : s)),
+        list.map((s) =>
+          s.id === seg.id ? { ...s, annotatedTranscript: text, verified: true } : s,
+        ),
       );
+      // Capture navigation state BEFORE removing the saved row. Once it is filtered out, `current`
+      // necessarily changes (or becomes null while the next lightweight row hydrates), which cannot
+      // distinguish an ordinary successful advance from a real mid-flight user navigation.
+      const visibleId = current?.id ?? null;
+      if (visibleId === seg.id) {
+        lastLoadedOriginal = text;
+        editText = text;
+        editedChips = {};
+      }
+      reviewRows = reviewRows.filter((s) => s.id !== seg.id);
+      reviewTotal = Math.max(0, reviewTotal - 1);
+      void refreshSegmentStats();
       editCache.delete(seg.id); // persisted — drop the in-progress copy
       notifications.success($t('saved'));
-      // The DB/store write above targets seg by id and is correct even if the reviewer navigated away during
-      // the decision await (an 'edit' hashes the whole file — hundreds of ms). But everything below mutates
-      // the CURRENTLY shown editor (editText/lastLoadedOriginal/editedChips) — if navigation changed `current`
-      // mid-flight, applying seg's text here would put it into ANOTHER clip's editor (and submit never resets
-      // lastLoadedId, so the coalesced load effect no-ops that clip and never reloads its own text), and a
-      // subsequent Save would persist seg's text as THAT clip's human-verified gold: a wrong-segment gold
-      // corruption (THE ONE LAW). Bail without advancing; seg is already saved and the current clip keeps its
-      // own draft. Mirrors doRetranscribe's identical guard.
-      if (current?.id !== seg.id) return;
-      lastLoadedOriginal = text; // the saved text is now the baseline for dirty-tracking
-      editText = text;
-      editedChips = {}; // the fixes are now baked into the saved transcript; drop the overlay
+      // If the reviewer really navigated during the slow decision call, keep that clip selected after
+      // the removal shifted array indices and never copy seg's editor state into it.
+      if (visibleId !== seg.id) {
+        const visibleIndex = visibleId ? queue.findIndex((row) => row.id === visibleId) : -1;
+        if (visibleIndex >= 0) index = visibleIndex;
+        return;
+      }
       advance();
     } catch (e) {
       undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
@@ -586,11 +735,25 @@
       saving = true;
       try {
         await api.updateSegmentFields(seg.id, { annotatedTranscript: text });
-        segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)));
+        segments.update((list) =>
+          list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
+        );
+        reviewRows = reviewRows.map((s) =>
+          s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
+        );
       } catch (e) {
         notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       } finally {
         saving = false;
+      }
+    }
+    const targetRow = queue[target];
+    if (targetRow) {
+      try {
+        await hydrateReviewRow(targetRow.id);
+      } catch (error) {
+        notifications.error($t('notifications.loadSegmentsFailed'), { detail: String(error) });
+        return;
       }
     }
     index = target;
@@ -618,7 +781,12 @@
       // whole-row-clobber class). A field update never touches alignmentJson, so it is clobber-safe
       // even mid-align and needs NO `aligning` guard — which would instead LOSE this edit, since
       // editCache dies with the component and teardown cannot re-stash it.
-      segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)));
+      segments.update((list) =>
+        list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
+      );
+      reviewRows = reviewRows.map((s) =>
+        s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
+      );
       // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
       // this component — so a lost draft is never silent.
       api.updateSegmentFields(seg.id, { annotatedTranscript: text }).catch((e) => {
@@ -656,7 +824,9 @@
   // away already moved focus correctly, and yanking it back would fight the reviewer.
   let stripEl = $state<HTMLElement | undefined>();
   function refocusChip(i: number) {
-    void tick().then(() => stripEl?.querySelector<HTMLButtonElement>(`[data-chip="${i}"]`)?.focus());
+    void tick().then(() =>
+      stripEl?.querySelector<HTMLButtonElement>(`[data-chip="${i}"]`)?.focus(),
+    );
   }
 
   // Single tap / Enter / Space on a word chip = hear EXACTLY that word. Listen-only: it never opens
@@ -725,9 +895,11 @@
     const tokens: Array<{ start: number; len: number; word: string }> = [];
     const re = /\S+/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) tokens.push({ start: m.index, len: m[0].length, word: m[0] });
+    while ((m = re.exec(text)) !== null)
+      tokens.push({ start: m.index, len: m[0].length, word: m[0] });
     const wanted = chipText(w, i);
-    const target = tokens[i] && tokens[i].word === wanted ? tokens[i] : tokens.find((t) => t.word === wanted);
+    const target =
+      tokens[i] && tokens[i].word === wanted ? tokens[i] : tokens.find((t) => t.word === wanted);
     if (target) editEl.setSelectionRange(target.start, target.start + target.len);
   }
   function replay() {
@@ -826,29 +998,85 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-{#if !current}
-  <div class="flex h-full items-center justify-center p-6">
+{#if reviewLoading && reviewInitialTotal === 0}
+  <div class="flex h-full items-center justify-center p-6" aria-busy="true">
+    <div class="text-sm text-subtle">{$t('loading')}</div>
+  </div>
+{:else if reviewLoadError && !current}
+  <div
+    class="flex h-full items-center justify-center p-6"
+    data-testid="review-load-error"
+    role="alert"
+  >
     <EmptyState
-      variant="empty"
-      title={$t('review.allDone')}
-      description={searchScoped ? $t('review.searchScopeEmpty') : $t('review.allDoneHint')}
-    />
+      variant="error"
+      title={$t('notifications.loadSegmentsFailed')}
+      description={reviewLoadError}
+    >
+      <button type="button" class="btn btn-primary !text-sm" onclick={() => loadReviewPage(true)}>
+        {$t('retry')}
+      </button>
+    </EmptyState>
+  </div>
+{:else if !current && reviewTotal > 0}
+  <div class="flex h-full items-center justify-center p-6" aria-busy="true">
+    <div class="text-sm text-subtle">{$t('loading')}</div>
+  </div>
+{:else if !current}
+  <div class="flex h-full items-center justify-center p-6" data-testid="review-terminal">
+    <div class="flex flex-col items-center gap-4 text-center">
+      <EmptyState
+        variant="empty"
+        title={$t('review.allDone')}
+        description={searchScoped ? $t('review.searchScopeEmpty') : $t('review.allDoneHint')}
+      />
+      <div class="flex flex-wrap justify-center gap-2">
+        {#if progress.allReviewed && onExport}
+          <button
+            type="button"
+            class="btn btn-primary !text-sm"
+            data-testid="review-terminal-export"
+            onclick={onExport}
+          >
+            {$t('review.exportDataset')}
+          </button>
+        {/if}
+        {#if onDone}
+          <button
+            type="button"
+            class="btn btn-secondary !text-sm"
+            data-testid="review-terminal-done"
+            onclick={onDone}
+          >
+            {$t('review.backToLibrary')}
+          </button>
+        {/if}
+      </div>
+    </div>
   </div>
 {:else}
   {@const isVerified = current.verified}
-  <div class="h-full overflow-y-auto">
+  <div class="h-full overflow-y-auto" bind:this={reviewScroller}>
     <div class="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6">
       <!-- Completion banner: every clip verified → surface the next steps (export / done). The clips
            stay below so the reviewer can still scrub back and re-check any of them. -->
       {#if progress.allReviewed}
-        <div class="card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center" data-testid="review-complete">
+        <div
+          class="card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center"
+          data-testid="review-complete"
+        >
           <div class="text-lg font-semibold text-emerald-300">
-            {$t('review.completeTitle').replace('{n}', String($segments.length))}
+            {$t('review.completeTitle').replace('{n}', String(reviewCorpusTotal))}
           </div>
           <p class="mt-1 text-sm text-subtle">{$t('review.completeHint')}</p>
           <div class="mt-4 flex flex-wrap justify-center gap-2">
             {#if onExport}
-              <button type="button" class="btn btn-primary !text-sm" data-testid="review-complete-export" onclick={onExport}>
+              <button
+                type="button"
+                class="btn btn-primary !text-sm"
+                data-testid="review-complete-export"
+                onclick={onExport}
+              >
                 {$t('review.exportDataset')}
               </button>
             {/if}
@@ -872,7 +1100,7 @@
         >
           {$t('review.searchScope')
             .replace('{n}', String(queue.length))
-            .replace('{m}', String($segments.length))}
+            .replace('{m}', String(reviewCorpusTotal))}
         </div>
       {/if}
 
@@ -942,7 +1170,12 @@
                "67 of 144 reviewed" — three unlabelled fractions sharing a denominator by coincidence.
                dir="ltr" stays on the FILENAME only; the CKB noun must not be forced into an LTR run. -->
           <span class="flex min-w-0 items-center gap-1.5">
-            <span class="truncate" dir="ltr" title={current.audioPath} data-testid="review-source-file">
+            <span
+              class="truncate"
+              dir="ltr"
+              title={current.audioPath}
+              data-testid="review-source-file"
+            >
               {segmentSourceFilename(current.audioPath)}
             </span>
             {#if chunkLabel}
@@ -959,74 +1192,125 @@
         </div>
       </div>
 
-      <!-- Waveform -->
+      <!-- THE AUDIO BLOCK: waveform + scope hint + transport, one card, immediately above the
+           correction box. Owner feedback 2026-08-13 — these were three separate cards with the
+           editor far below, so listening and correcting could not be done without scrolling. -->
       <div class="card overflow-hidden">
-        {#if waveformError}
-          <!-- A flat strip and a failed decode look identical, and the reviewer would read the flat
+        <div class="overflow-hidden">
+          {#if waveformError}
+            <!-- A flat strip and a failed decode look identical, and the reviewer would read the flat
                strip as "quiet audio". Say which one it is, in place, and offer the retry. -->
-          <div
-            class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
-            data-testid="review-waveform-error"
-            role="status"
-          >
-            <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
-            <button
-              type="button"
-              class="btn btn-secondary shrink-0 !text-xs"
-              onclick={() => current && loadWaveform(current)}
+            <div
+              class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
+              data-testid="review-waveform-error"
+              role="status"
             >
-              {$t('retry')}
-            </button>
-          </div>
-        {:else}
-          <Waveform
-            waveform={waveformData}
-            currentTime={clipPosition}
-            duration={clipLength}
-            {playing}
-            wordTimestamps={words}
-            onSeek={(time) => {
-              clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
-              currentTime = range.startTime + time;
-            }}
-          />
-        {/if}
-      </div>
+              <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
+              <button
+                type="button"
+                class="btn btn-secondary shrink-0 !text-xs"
+                onclick={() => current && loadWaveform(current)}
+              >
+                {$t('retry')}
+              </button>
+            </div>
+          {:else}
+            <Waveform
+              waveform={waveformData}
+              currentTime={clipPosition}
+              duration={clipLength}
+              {playing}
+              wordTimestamps={words}
+              onSeek={(time) => {
+                clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
+                currentTime = range.startTime + time;
+              }}
+            />
+          {/if}
+        </div>
 
-      <!-- Honest playback-scope hint: are we playing just the words, or the whole clip? -->
-      <div class="flex items-center gap-2 px-1 text-xs text-subtle" aria-live="polite">
-        {#if aligning}
-          <span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent"
-          ></span>
-          <span>{$t('review.aligningWords')}</span>
-        {:else if hasWords}
-          <span class="text-accent">●</span>
-          <span>{$t('review.playingWordsOnly').replace('{sec}', (playEnd - playStart).toFixed(1))}</span>
-        {:else}
-          <span>{$t('review.playingWholeClip').replace('{sec}', clipLength.toFixed(1))}</span>
-        {/if}
-      </div>
+        <!-- Honest playback-scope hint: are we playing just the words, or the whole clip? -->
+        <div
+          class="flex items-center gap-2 border-t border-subtle px-3 py-2 text-xs text-subtle"
+          aria-live="polite"
+        >
+          {#if aligning}
+            <span
+              class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent"
+            ></span>
+            <span>{$t('review.aligningWords')}</span>
+          {:else if hasWords}
+            <span class="text-accent">●</span>
+            <span
+              >{$t('review.playingWordsOnly').replace(
+                '{sec}',
+                (playEnd - playStart).toFixed(1),
+              )}</span
+            >
+          {:else}
+            <span>{$t('review.playingWholeClip').replace('{sec}', clipLength.toFixed(1))}</span>
+          {/if}
+        </div>
 
-      <!-- Audio player — bounded to the SPOKEN SPAN (first→last word) when word timings exist, so Play
+        <!-- Audio player — bounded to the SPOKEN SPAN (first→last word) when word timings exist, so Play
            hears the exact words and not the silence/music the VAD chunk padded around them; otherwise
            the whole clip. -->
-      <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
+        <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
            curate mode) — with it on, advancing to the next clip auto-plays the bounded spoken span,
            removing one keypress + wait per clip, hundreds of times per review sitting. -->
-      <!-- start/endTime honour the transient tap-a-word override so a tapped word plays (and loops)
+        <!-- start/endTime honour the transient tap-a-word override so a tapped word plays (and loops)
            exactly itself; otherwise the full spoken span. -->
-      <AudioPlayer
-        audioPath={current.audioPath}
-        clipKey={current.id}
-        startTime={wordStartOverride ?? playStart}
-        endTime={wordEndOverride ?? playEnd}
-        displayStart={playStart}
-        displayEnd={playEnd}
-        bind:currentTime
-        bind:duration={playerDuration}
-        bind:playing
-        autoplay={$settings.autoplaySegments}
-      />
+        <AudioPlayer
+          audioPath={current.audioPath}
+          clipKey={current.id}
+          startTime={wordStartOverride ?? playStart}
+          endTime={wordEndOverride ?? playEnd}
+          displayStart={playStart}
+          displayEnd={playEnd}
+          bind:currentTime
+          bind:duration={playerDuration}
+          bind:playing
+          autoplay={$settings.autoplaySegments}
+        />
+      </div>
+
+      <!-- Transcript: big, directly editable -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
+              {$t('transcript')}
+            </div>
+            <p class="mt-0.5 text-xs text-subtle">{$t('review.editHint')}</p>
+            {#if draftModels.length > 0}
+              <p class="mt-1 text-[11px] text-subtle" dir="ltr">
+                {$t('review.draftBy')}
+                <span class="font-medium text-muted"
+                  >{draftModels.map((m) => api.engineLabel(m)).join(', ')}</span
+                >
+                {$t('review.notHumanVerified')}
+              </p>
+            {/if}
+          </div>
+          {#if dirty}
+            <button
+              type="button"
+              class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
+              onclick={resetToOriginal}
+            >
+              {$t('review.reset')}
+            </button>
+          {/if}
+        </div>
+        <textarea
+          bind:value={editText}
+          bind:this={editEl}
+          dir="rtl"
+          spellcheck="false"
+          class="input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"
+          placeholder={$t('editTranscript')}
+        ></textarea>
+      </div>
 
       <!-- Listen-strip: tap a word to hear it; low-confidence words are highlighted -->
       {#if words.length > 0}
@@ -1070,7 +1354,8 @@
                     e.stopPropagation();
                     if (e.key === 'Enter') {
                       e.preventDefault();
-                      if (commitWordEdit(i, w, (e.target as HTMLInputElement).value)) refocusChip(i);
+                      if (commitWordEdit(i, w, (e.target as HTMLInputElement).value))
+                        refocusChip(i);
                     } else if (e.key === 'Escape') {
                       cancelWordEdit(i);
                       refocusChip(i);
@@ -1082,10 +1367,9 @@
                 <button
                   type="button"
                   data-chip={i}
-                  class="review-word {editedChips[i] ? 'word-edited' : confClass(w.confidence)} {i ===
-                  activeWordIndex
-                    ? 'word-active'
-                    : ''}"
+                  class="review-word {editedChips[i]
+                    ? 'word-edited'
+                    : confClass(w.confidence)} {i === activeWordIndex ? 'word-active' : ''}"
                   onclick={() => playWord(w)}
                   ondblclick={() => startWordEdit(w, i)}
                   onkeydown={(e) => {
@@ -1110,86 +1394,12 @@
       <!-- Consensus draft: an offline best-of-N vote across this clip's ASR models. Contested words
            (the models disagreed) are highlighted so the eye lands on likely errors first; "Use draft"
            starts the edit from a transcript better than any single model. -->
-      {#if consensus && consensus.words.length > 0}
-        <div class="card space-y-2 p-4">
-          <div class="flex items-center justify-between gap-3">
-            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
-              {$t('review.consensusDraft')}
-              <span class="ms-1 font-normal normal-case text-subtle">
-                {$t('review.consensusAgree')
-                  .replace('{n}', String(consensus.modelCount))
-                  .replace('{pct}', String(Math.round(consensus.meanAgreement * 100)))}
-              </span>
-            </div>
-            <button
-              type="button"
-              class="btn btn-secondary shrink-0 !text-xs"
-              onclick={() => {
-                if (consensus) {
-                  editText = consensus.draft;
-                  editedChips = {}; // the draft replaces the transcript — drop stale chip fixes
-                }
-              }}
-            >
-              {$t('review.useDraft')}
-            </button>
-          </div>
-          <div class="font-kurdish flex flex-wrap gap-1 text-lg leading-loose" dir="rtl">
-            {#each consensus.words as w, i (i)}
-              <span
-                class="rounded-token px-1.5 {w.agreement < CONTESTED
-                  ? 'bg-amber-500/20 text-amber-200'
-                  : 'text-default'}"
-                title={w.alternatives.length
-                  ? $t('review.modelsAlsoSaid').replace('{alts}', w.alternatives.join('  /  '))
-                  : ''}>{w.text}</span
-              >
-            {/each}
-          </div>
-          <p class="text-[11px] text-subtle">{$t('review.consensusHint')}</p>
-        </div>
-      {/if}
-
-      <!-- Transcript: big, directly editable -->
-      <div class="card p-5">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
-              {$t('transcript')}
-            </div>
-            <p class="mt-0.5 text-xs text-subtle">{$t('review.editHint')}</p>
-            {#if draftModels.length > 0}
-              <p class="mt-1 text-[11px] text-subtle" dir="ltr">
-                {$t('review.draftBy')}
-                <span class="font-medium text-muted">{draftModels.map((m) => api.engineLabel(m)).join(', ')}</span>
-                {$t('review.notHumanVerified')}
-              </p>
-            {/if}
-          </div>
-          {#if dirty}
-            <button
-              type="button"
-              class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
-              onclick={resetToOriginal}
-            >
-              {$t('review.reset')}
-            </button>
-          {/if}
-        </div>
-        <textarea
-          bind:value={editText}
-          bind:this={editEl}
-          dir="rtl"
-          spellcheck="false"
-          class="input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"
-          placeholder={$t('editTranscript')}
-        ></textarea>
-      </div>
-
       <!-- Fix-the-draft tools: the current transcript is wrong -> re-transcribe with a better engine,
            or flag the clip bad (excluded from export, kept + reversible). -->
       <div class="flex flex-wrap items-center gap-2">
-        <span class="text-[11px] uppercase tracking-wider text-subtle">{$t('review.retranscribe')}</span>
+        <span class="text-[11px] uppercase tracking-wider text-subtle"
+          >{$t('review.retranscribe')}</span
+        >
         <button
           type="button"
           class="btn btn-secondary !text-xs"
@@ -1199,15 +1409,17 @@
         >
           {retranscribing ? $t('review.retranscribing') : $t('review.retranscribeChampion')}
         </button>
-        <button
-          type="button"
-          class="btn btn-secondary !text-xs"
-          onclick={() => retranscribe('finetuned')}
-          disabled={retranscribing || saving}
-          title={$t('review.retranscribeFinetunedTitle')}
-        >
-          {$t('review.retranscribeFinetuned')}
-        </button>
+        {#if $settings.asrModel !== 'wsl-7b'}
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs"
+            onclick={() => retranscribe('finetuned')}
+            disabled={retranscribing || saving}
+            title={$t('review.retranscribeFinetunedTitle')}
+          >
+            {$t('review.retranscribeFinetuned')}
+          </button>
+        {/if}
         {#if $settings.juryCloudOptIn}
           <button
             type="button"

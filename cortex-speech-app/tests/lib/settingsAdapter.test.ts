@@ -9,7 +9,6 @@ import {
 const sampleBackend: BackendSettings = {
   model_dir: 'models',
   output_dir: 'exports',
-  asr_provider: 'SherpaOnnxCtc',
   asr_model_size: 'CTC300M',
   vad_threshold: 0.6,
   min_segment_duration_ms: 4000,
@@ -25,7 +24,7 @@ const sampleBackend: BackendSettings = {
   enable_denoising: false,
   max_speakers: 8,
   max_wer_threshold: 0.35,
-  max_cer_threshold: 0.20,
+  max_cer_threshold: 0.2,
   enforce_quality_gates: false,
   theme: 'Dark',
   verbalize_numbers: true,
@@ -85,7 +84,15 @@ describe('settingsAdapter', () => {
   });
 
   it('normalizes unknown backend LLM modes to local-only mode', () => {
-    expect(mapBackendToFrontend({ ...sampleBackend, llm_mode: 'UnexpectedMode' }).llmMode).toBe('Local');
+    expect(mapBackendToFrontend({ ...sampleBackend, llm_mode: 'UnexpectedMode' }).llmMode).toBe(
+      'Local',
+    );
+  });
+
+  it('maps an unknown ASR value to the champion, never silently to a smaller model', () => {
+    expect(
+      mapBackendToFrontend({ ...sampleBackend, asr_model_size: 'UnexpectedEngine' }).asrModel,
+    ).toBe('wsl-7b');
   });
 
   // The 'Autoplay Segments' toggle used to be silently dropped on save (mapFrontendToBackend never
@@ -97,10 +104,14 @@ describe('settingsAdapter', () => {
     expect(backend.autoplay_segments).toBe(true);
     expect(mapBackendToFrontend(backend).autoplaySegments).toBe(true);
     // A stored value is honoured, not overridden.
-    expect(mapBackendToFrontend({ ...sampleBackend, autoplay_segments: true }).autoplaySegments).toBe(true);
-    expect(mapBackendToFrontend({ ...sampleBackend, autoplay_segments: false }).autoplaySegments).toBe(false);
+    expect(
+      mapBackendToFrontend({ ...sampleBackend, autoplay_segments: true }).autoplaySegments,
+    ).toBe(true);
+    expect(
+      mapBackendToFrontend({ ...sampleBackend, autoplay_segments: false }).autoplaySegments,
+    ).toBe(false);
   });
-// juryProvider (T2 judge transport) must survive save -> reload, default safely to 'gemini' on old
+  // juryProvider (T2 judge transport) must survive save -> reload, default safely to 'gemini' on old
   // settings files, and reject junk values (never route cloud audio on a typo'd provider).
   it('round-trips juryProvider and defaults unknown/missing values to gemini', () => {
     const ui = { ...defaultSettings, juryProvider: 'openrouter' as const };
@@ -109,6 +120,8 @@ describe('settingsAdapter', () => {
     expect(mapBackendToFrontend(backend).juryProvider).toBe('openrouter');
     // Missing (pre-upgrade settings.json) and junk values both resolve to the safe default.
     expect(mapBackendToFrontend(sampleBackend).juryProvider).toBe('gemini');
-    expect(mapBackendToFrontend({ ...sampleBackend, jury_provider: 'qwen' }).juryProvider).toBe('gemini');
+    expect(mapBackendToFrontend({ ...sampleBackend, jury_provider: 'qwen' }).juryProvider).toBe(
+      'gemini',
+    );
   });
 });

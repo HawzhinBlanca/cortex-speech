@@ -152,24 +152,6 @@ struct SourceReferenceBundleRecord {
     audio_identity_issue: Option<String>,
 }
 
-pub fn blocking_issues(
-    db: &Database,
-    settings: &AppSettings,
-    warning_threshold: usize,
-) -> AppResult<BlockingValidationIssues> {
-    let report = validation::validate_dataset_with_settings(db, settings)?;
-    let error_count = report.errors.len();
-    let warning_count = report.warnings.len();
-    Ok(BlockingValidationIssues {
-        blocked: error_count > 0 || warning_count > warning_threshold,
-        error_count,
-        warning_count,
-        warning_threshold,
-        errors: report.errors,
-        warnings: report.warnings,
-    })
-}
-
 fn list_stage_events_for_reports(
     db: &Database,
     reports: &[crate::runs::AgentImportReport],

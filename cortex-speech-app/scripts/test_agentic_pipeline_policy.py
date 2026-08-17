@@ -128,30 +128,36 @@ def main() -> None:
         "import must run the WSL 7B primary pass immediately after segment persistence"
     )
     assert "if !self.should_use_wsl_primary_asr() || segments.is_empty()" in pipeline, (
-        "missing WSL script configuration must skip the primary WSL pass after local fallback import"
+        "the WSL pass must be inert after an unconfigured champion has already been refused by preflight"
     )
     assert "populate_wsl_hypothesis_if_configured" in pipeline, (
-        "WSL 7B must participate as an automatic hypothesis model when configured"
+        "explicit non-champion experiments must retain their optional WSL hypothesis helper"
     )
     assert 'insert_hypothesis_checked(db, segment_id, "omniasr-wsl-7b"' in pipeline, (
-        "configured WSL 7B hypothesis pass must preserve a jury candidate"
+        "the explicit optional WSL hypothesis helper must preserve provenance"
     )
     assert "self.run_wsl_segment_transcript(segment_id" in pipeline, (
         # Robust prefix: the call now also takes a cancel arg (None for the hypothesis pass). The
         # invariant is that the pass uses the real external provider, not the exact argument list.
-        "automatic WSL 7B hypothesis pass must use the real external provider"
+        "the explicit optional WSL hypothesis helper must use the real external provider"
     )
     assert "should_use_wsl_primary_asr" in pipeline, (
-        "WSL 7B must only be used as the primary ASR route when its external script is configured"
+        "WSL 7B primary routing must require its configured client"
     )
     assert "external_asr_script_path().is_some()" in pipeline, (
-        "missing WSL script configuration must fall back to local ASR instead of creating placeholder-only output"
+        "configured-client detection is missing from the WSL route"
     )
-    assert "wsl_without_script_uses_local_asr_fallback" in pipeline, (
-        "missing WSL script fallback needs a Rust regression"
+    assert "wsl7b_primary_unresolved" in pipeline, (
+        "an unconfigured champion needs a shared fail-closed guard"
     )
-    assert "wsl_primary_import_pass_skips_missing_script_after_local_fallback" in pipeline, (
-        "missing WSL script import must not mark local fallback transcripts as escalated WSL failures"
+    assert "wsl_without_script_preserves_champion_identity_and_never_falls_back" in pipeline, (
+        "missing WSL script must preserve champion identity and never become a local fallback"
+    )
+    assert "public_preflight_fails_immediately_when_default_champion_is_unconfigured" in pipeline, (
+        "the unconfigured factory champion needs an immediate preflight refusal regression"
+    )
+    assert "wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusal" in pipeline, (
+        "the later WSL pass must not mutate rows after the fail-closed preflight path"
     )
     assert "self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B" in pipeline, (
         "automatic WSL hypothesis pass must avoid duplicating the primary WSL path"
@@ -187,7 +193,11 @@ def main() -> None:
         "required_hypothesis_models",
         "agentic_readiness_offline_source_reference_is_not_required_not_blocked",
         "disabled_cloud_reports_not_required_not_ready_but_keeps_the_overall_verdict_ready",
-        "agentic_readiness_is_ready_with_gemini_wsl_and_local_hypothesis_model",
+        "champion_readiness_ignores_installed_optional_ctc_models",
+        "local_readiness_checks_the_exact_explicitly_selected_engine",
+        "settings.multi_engine_hypotheses && settings.asr_model_size != AsrModelSize::WSL7B",
+        "The selected primary engine is unavailable; refusing to substitute another engine.",
+        "Single-engine mode: {primary_model_id} is the only automatic ASR source. Optional engines will not run.",
     ]:
         assert needle in commands, f"agentic readiness preflight must cover {needle}"
     assert "commands::check_agentic_readiness" in lib_rs, "Tauri handler must register agentic readiness preflight"

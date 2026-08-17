@@ -8,7 +8,6 @@ export interface Notification {
   message: string;
   detail?: string;
   duration?: number;
-  progress?: number;
   action?: { label: string; handler: () => void };
 }
 
@@ -22,14 +21,13 @@ function createNotificationStore() {
     opts?: {
       detail?: string;
       duration?: number;
-      progress?: number;
       action?: { label: string; handler: () => void };
     },
   ) {
     const id = `notif-${++counter}`;
     const notif: Notification = { id, type, message, ...opts };
     update((n) => [...n, notif]);
-    if (!opts?.progress && (opts?.duration ?? 4000) > 0) {
+    if ((opts?.duration ?? 4000) > 0) {
       setTimeout(() => dismiss(id), opts?.duration ?? 4000);
     }
     return id;
@@ -37,10 +35,6 @@ function createNotificationStore() {
 
   function dismiss(id: string) {
     update((n) => n.filter((item) => item.id !== id));
-  }
-
-  function updateProgress(id: string, progress: number) {
-    update((n) => n.map((item) => (item.id === id ? { ...item, progress } : item)));
   }
 
   function clear() {
@@ -57,9 +51,7 @@ function createNotificationStore() {
     info: (msg: string, opts?: { detail?: string }) => add('info', msg, opts),
     warning: (msg: string, opts?: { detail?: string }) =>
       add('warning', msg, { ...opts, duration: 6000 }),
-    progress: (msg: string, progress: number) => add('info', msg, { progress, duration: 0 }),
     dismiss,
-    updateProgress,
     clear,
   };
 }

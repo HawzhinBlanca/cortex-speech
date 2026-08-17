@@ -1,12 +1,7 @@
 import { writable, type Writable } from 'svelte/store';
 
 export type PipelinePhase =
-  | 'idle'
-  | 'importing'
-  | 'reference_transcribing'
-  | 'detecting'
-  | 'transcribing'
-  | 'adjudicating';
+  'idle' | 'importing' | 'reference_transcribing' | 'detecting' | 'transcribing' | 'adjudicating';
 
 export const pipelinePhase = writable<PipelinePhase>('idle');
 export const filesProcessed = writable(0);
@@ -53,12 +48,6 @@ export const batchProgress: Writable<BatchProgress> = writable({
   percent: 0,
 });
 
-export type ViewMode = 'transcribe' | 'curate' | 'align' | 'export';
-export type SidePanel = 'segments' | 'stats' | 'none';
-
-export const viewMode = writable<ViewMode>('transcribe');
-export const leftPanel = writable<SidePanel>('segments');
-export const rightPanel = writable<SidePanel>('none');
 export const showKeyboardHelp = writable(false);
 
 export interface ConfirmDialog {
@@ -82,11 +71,3 @@ export interface ConfirmDialog {
 export const showConfirmDialog = writable<ConfirmDialog | null>(null);
 export const isProcessing = writable(false);
 export const statusMessage = writable('Ready');
-
-export function toggleLeftPanel() {
-  leftPanel.update((v) => (v === 'segments' ? 'stats' : 'segments'));
-}
-
-export function toggleRightPanel() {
-  rightPanel.update((v) => (v === 'none' ? 'segments' : 'none'));
-}

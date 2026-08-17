@@ -101,11 +101,18 @@ struct ExportSegmentRecord {
     training_grade: String,
     training_ready: bool,
     training_reasons: Vec<String>,
+    /// Dialect of the source recording (owner instruction 2026-08-16), from the explicit map in
+    /// `dialect.rs` — e.g. every KBHP episode is Hawleri. `None` for an unmapped source: an absent
+    /// label is honest, a guessed one silently poisons every per-dialect split and fairness number
+    /// computed from the dataset. Derived from the ORIGINAL path (the map keys on the source), then
+    /// the path itself is sanitized to a basename below.
+    dialect: Option<&'static str>,
 }
 
 impl ExportSegmentRecord {
     fn new(segment: &SpeechSegment) -> Self {
         let report = quality::training_grade_for_segment(segment);
+        let dialect = crate::dialect::dialect_of(&segment.audio_path);
         // Privacy: never publish the curator's absolute filesystem path — it embeds the
         // OS username and drive layout. Emit only the basename, like the HF exporter.
         let mut sanitized = segment.clone();
@@ -121,6 +128,7 @@ impl ExportSegmentRecord {
             training_grade: report.grade,
             training_ready: report.training_ready,
             training_reasons: report.reasons,
+            dialect,
         }
     }
 }
@@ -288,6 +296,19 @@ pub(crate) fn exclude_unexportable_segments(
     for seg in segments {
         if db.rights_for_segment(&seg.id)?.is_revoked() {
             tracing::info!(segment_id = %seg.id, "export: dropping segment with withdrawn consent");
+            continue;
+        }
+        // Text-provenance audit #11/#12: enforced HERE, at the shared root, for the same reason as
+        // the withdrawal rule above — export_audio applied neither filter, so a human-REJECTED clip
+        // (bad data the reviewer discarded; `verified` is deliberately true on it) and a
+        // placeholder-only clip both shipped in the audio export while every other exporter dropped
+        // them.
+        if crate::quality::is_human_rejected(&seg) {
+            tracing::info!(segment_id = %seg.id, "export: dropping human-rejected segment");
+            continue;
+        }
+        if crate::quality::is_effective_placeholder(&seg) {
+            tracing::info!(segment_id = %seg.id, "export: dropping placeholder-only segment");
             continue;
         }
         kept.push(seg);
@@ -508,6 +529,26 @@ pub fn assign_splits(
         path.rsplit(['/', '\\']).next().unwrap_or(path)
     }
 
+    /// `SPEAKER_00`, `SPEAKER_01`, ... is a diarizer's PER-RECORDING index, not a person. The
+    /// numbering restarts for every file, so the same label names a different human in every
+    /// recording — and the app has no global speaker identity to say otherwise (that needs CAM++
+    /// embeddings clustered across files, which nothing does yet).
+    ///
+    /// MEASURED 2026-08-13 on the live library: `SPEAKER_00` appeared in 141 of 144 recordings.
+    /// Union-ing on it as if it were an identity chained every recording into ONE connected
+    /// component holding 100% of the audio, so the greedy fill put everything in `train` and
+    /// emitted EMPTY validation and test splits — silently, with `hf_speaker_disjoint = true`
+    /// looking like it was protecting the dataset. Scoping the label to its recording restores
+    /// 145 components with the largest at 46.7%, which an 80/10/10 split can actually satisfy.
+    ///
+    /// A real speaker id (anything not matching this shape) still unions globally: that is where
+    /// speaker-disjointness has meaning, and this must not weaken it.
+    fn is_generic_diarizer_label(label: &str) -> bool {
+        label
+            .strip_prefix("SPEAKER_")
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    }
+
     // Group into leakage-safe units. With speaker_disjoint, a unit is a connected component of the
     // bipartite (recording, speaker) graph (built by union-find): each component keeps every source
     // recording INTACT (no multi-speaker recording straddles two splits) AND is speaker-disjoint (no
@@ -520,7 +561,11 @@ pub fn assign_splits(
             let r = uf.node(&format!("r:{}", source_name(&seg.audio_path)));
             let spk = seg.speaker_id.as_deref().unwrap_or("").trim();
             if !spk.is_empty() {
-                let s = uf.node(&format!("s:{spk}"));
+                let s = if is_generic_diarizer_label(spk) {
+                    uf.node(&format!("s:{}:{spk}", source_name(&seg.audio_path)))
+                } else {
+                    uf.node(&format!("s:{spk}"))
+                };
                 uf.union(r, s);
             }
         }
@@ -572,6 +617,25 @@ pub fn assign_splits(
     let target_val = (total as f64 * vr) as i64;
     let target_test = (total as f64 * te) as i64;
     let (mut d_train, mut d_val, mut d_test) = (0i64, 0i64, 0i64);
+
+    // Largest group first. The rule below picks the split with the biggest ABSOLUTE deficit, and in
+    // shuffled order that sends everything to `train` whenever the groups are FEW and UNEQUAL: train's
+    // deficit (80% of the corpus) exceeds the whole of val's or test's target until train is nearly
+    // full, so every group loses to train no matter how small it is. Pinned by
+    // `three_unequal_recordings_still_fill_all_three_splits` — three recordings at 91.9/7.9/0.2 which
+    // CAN fill three splits and did not.
+    //
+    // Honest scope: this is NOT what produced the owner's all-train export on 2026-08-15. That ran
+    // over 179 recordings (splits are computed across every non-rejected clip, not just the
+    // exportable ones) and correctly put the three recordings holding reviewed clips in train. This
+    // fixes a real weakness for SMALL libraries, and nothing that was observed in production.
+    //
+    // Descending duration is the standard remedy (longest-processing-time first). Determinism is
+    // unchanged: the seed-shuffled order above survives as the tie-break for equal-duration groups.
+    let group_dur_of = |k: &String| -> i64 { groups[k].iter().map(|s| s.duration_ms).sum() };
+    let mut ordered: Vec<&String> = keys.into_iter().collect();
+    ordered.sort_by_key(|k| std::cmp::Reverse(group_dur_of(k)));
+    let keys = ordered;
 
     let mut out: Vec<(String, &'static str)> = Vec::with_capacity(segments.len());
     for key in keys {
@@ -855,6 +919,49 @@ pub fn export_huggingface_dataset(
         }
     }
 
+    // A split the owner ASKED for must not come out empty. Grouping is leakage-safe by design, so a
+    // group too large to fit anywhere but `train` silently starves validation and test — which is
+    // exactly what unstable diarizer labels did (see `is_generic_diarizer_label`): a dataset with no
+    // holdout at all, exported without a word. Fail here instead. An export that stops is
+    // recoverable; a training run against a dataset with no test set is not, because nothing about
+    // the resulting numbers announces that they were measured on training data.
+    // Fire on the COLLAPSE, not on scarcity. An empty split is ordinary arithmetic when there are
+    // fewer clips than splits — a 2-segment fixture asking for 80/10/10 must leave one empty, and the
+    // first version of this guard broke 18 export tests by calling that a failure. The defect it
+    // exists for looks different: with plenty of clips, EVERY one lands in a single split because the
+    // leakage-safe grouping collapsed (measured 2026-08-14: 100% of the corpus in one component when
+    // per-recording diarizer labels were treated as speaker identities).
+    // The denominator is independent RECORDINGS, not segments. Grouping never splits a recording, so
+    // the number of distinct recordings is the ceiling on how many groups can exist — with fewer
+    // recordings than splits, an empty split is arithmetic no matter how well the grouping worked.
+    // (Second correction: `segments.len()` as the denominator still failed a 3-segment/2-recording
+    // fixture, because three clips cut from two recordings can only ever fill two splits.)
+    let requested_splits = 1 + usize::from(settings.hf_val_ratio > 0.0) + usize::from(settings.hf_test_ratio > 0.0);
+    let distinct_recordings = segments
+        .iter()
+        .map(|s| s.audio_path.rsplit(['/', '\\']).next().unwrap_or(s.audio_path.as_str()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let populated_splits =
+        usize::from(!train_segs.is_empty()) + usize::from(!val_segs.is_empty()) + usize::from(!test_segs.is_empty());
+    if requested_splits > 1 && distinct_recordings >= requested_splits && populated_splits == 1 {
+        let (name, ratio) = if val_segs.is_empty() && settings.hf_val_ratio > 0.0 {
+            ("validation", settings.hf_val_ratio)
+        } else {
+            ("test", settings.hf_test_ratio)
+        };
+        {
+            return Err(crate::error::AppError::Other(format!(
+                "Export stopped: every clip landed in ONE split — the {name} split is empty while {:.0}% was requested. \
+                 {} segments fell into leakage-safe groups too large to divide — most often because \
+                 speaker labels are per-recording diarizer indices rather than real identities. \
+                 Check speaker_id values, or set hf_speaker_disjoint = false to group by recording only.",
+                ratio * 100.0,
+                segments.len()
+            )));
+        }
+    }
+
     // Helper closure to process and write a split's files
     let process_split = |split_segs: &[SpeechSegment],
                          _split_name: &str,
@@ -881,6 +988,7 @@ pub fn export_huggingface_dataset(
                     "training_ready",
                     "transcript_source",
                     "training_reasons",
+                    "dialect",
                 ])?;
 
                 let mut total_exported_dur = 0.0;
@@ -1037,6 +1145,7 @@ pub fn export_huggingface_dataset(
                             training_ready_str,
                             grade.transcript_source.as_str(),
                             hf_reasons.as_ref(),
+                            crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
                         ])?;
 
                         total_exported_dur += clip_dur_ms as f64 / 1000.0;
@@ -1236,6 +1345,7 @@ number verbalization), and diacritics are left untouched.
                 "training_grade": {"dtype": "string", "_type": "Value"},
                 "training_ready": {"dtype": "int64", "_type": "Value"},
                 "transcript_source": {"dtype": "string", "_type": "Value"},
+                "dialect": {"dtype": "string", "_type": "Value"},
                 "training_reasons": {"dtype": "string", "_type": "Value"},
             },
             "splits": {
@@ -1349,6 +1459,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 "training_grade",
                 "training_ready",
                 "training_reasons",
+                "dialect",
             ])?;
 
             for seg in segments {
@@ -1384,6 +1495,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                     grade.grade.as_str(),
                     if grade.training_ready { "1" } else { "0" },
                     reasons_cell.as_ref(),
+                    crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
                 ])?;
             }
             wtr.flush()?;
@@ -1466,6 +1578,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
         Field::new("training_grade", DataType::Utf8, false),
         Field::new("training_ready", DataType::Boolean, false),
         Field::new("training_reasons", DataType::Utf8, false),
+        Field::new("dialect", DataType::Utf8, true),
     ]));
 
     let grade_reports: Vec<TrainingGradeReport> = segments.iter().map(quality::training_grade_for_segment).collect();
@@ -1490,6 +1603,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let training_grade: StringArray = grade_reports.iter().map(|report| Some(report.grade.as_str())).collect();
     let training_ready: BooleanArray = grade_reports.iter().map(|report| Some(report.training_ready)).collect();
     let training_reasons: StringArray = grade_reasons.iter().map(|reasons| Some(reasons.as_str())).collect();
+    let dialect: StringArray = segments.iter().map(|s| crate::dialect::dialect_of(&s.audio_path)).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -1509,6 +1623,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
             Arc::new(training_grade),
             Arc::new(training_ready),
             Arc::new(training_reasons),
+            Arc::new(dialect),
         ],
     )
     .map_err(|e| crate::error::AppError::Other(format!("Parquet batch build failed: {e}")))?;

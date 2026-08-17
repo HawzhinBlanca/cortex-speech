@@ -282,6 +282,10 @@ async function run() {
     await page.evaluate(async (engine) => {
       const s = await window.__TAURI_INTERNALS__.invoke('get_settings');
       s.asr_model_size = engine;
+      // Refinement off, same rationale as e2e_profile.cjs::provisionEngine: the default llm_mode
+      // (Local) makes this gate's verdict depend on an LLM server the machine may not be running,
+      // and a refinement failure hard-stops the clip by design.
+      s.llm_mode = 'None';
       await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
     }, ENGINE).catch((e) => { throw new Error('Could not provision the ASR engine: ' + e.message); });
   }
@@ -300,8 +304,11 @@ async function run() {
   let backendSegs = [];
   for (let i = 0; i < 360; i++) {
     backendSegs = await page
-      .evaluate(() => window.__TAURI_INTERNALS__.invoke('get_segments', { verified: null }).catch(() => []))
-      .catch(() => []);
+      .evaluate(() => window.__TAURI_INTERNALS__.invoke('get_segments_page', { verified: null, query: null, sort: 'oldest', limit: 300, cursor: null }).then((p) => p.items))
+      // Transient IPC errors are tolerated while the import churns; a MISSING COMMAND is not — that
+      // is a renamed API, and swallowing it is how this harness spent 12 minutes polling a command
+      // that did not exist and reported the result as "VAD produced 0 segments" (2026-08-16).
+      .catch((e) => { if (String(e).includes('not found')) throw e; return []; });
     if (Array.isArray(backendSegs) && backendSegs.length >= 1) break;
     if (i % 15 === 0) console.log(`   still segmenting... ${i * 2}s`);
     await sleep(2000);
@@ -394,8 +401,14 @@ async function run() {
  * persist nothing.
  */
 async function reviewOverHttp(page, draftText) {
-  console.log('==> Couch Review over real HTTP...');
-  const base = `http://127.0.0.1:${COUCH_PORT}`;
+  console.log('==> Couch Review over real HTTPS...');
+  // The couch server is TLS on every interface with a self-signed rcgen certificate. This is a
+  // LOCALHOST liveness/behaviour probe against a disposable instance, not an authentication
+  // decision, so certificate verification is disabled for THIS PROCESS. Sixth member of the
+  // transport-blind class (2026-08-17): the harness spoke plain http at a TLS listener, the server
+  // logged InvalidContentType, and the gate failed as "fetch failed".
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  const base = `https://127.0.0.1:${COUCH_PORT}`;
   const REVIEWER = 'E2E Harness';
   // EVERY request here is bounded. Measured the hard way on run 2 of the 3x stability check: the
   // post-stop probe below is a fetch whose whole purpose is to find NOBODY listening, and a bare
@@ -406,8 +419,8 @@ async function reviewOverHttp(page, draftText) {
   // Read one row back through the app's OWN IPC, so every assertion below sees what the desktop would
   // show rather than a hand-rolled query that could happen to agree with a broken write.
   const segmentById = (pg, id) => pg.evaluate(
-    (sid) => window.__TAURI_INTERNALS__.invoke('get_segments', { verified: null })
-      .then((all) => all.find((s) => s.id === sid) || null),
+    (sid) => window.__TAURI_INTERNALS__.invoke('get_segments_page', { verified: null, query: null, sort: 'oldest', limit: 300, cursor: null })
+      .then((page) => page.items.find((s) => s.id === sid) || null),
     id,
   );
 

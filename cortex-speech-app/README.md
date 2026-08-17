@@ -1,12 +1,15 @@
 # Cortex Speech
 
-Production-grade desktop app for Kurdish (Sorani) speech transcription, transcript curation, and dataset export. Built with **Tauri v2**, **Svelte 5**, and a **Rust** backend that runs **Meta OmniASR CTC 300M** locally via **sherpa-onnx** for automatic speech recognition.
+Desktop app for Kurdish (Sorani) speech transcription, transcript curation, and dataset export.
+Built with **Tauri v2**, **Svelte 5**, and Rust. The quality-first default is the separately
+provisioned local **OmniASR-7B Champion** server under WSL and fails closed when it is unavailable;
+the bundled **Meta OmniASR CTC 300M** engine via sherpa-onnx is an explicit fallback selection.
 
 ## Production features
 
 | Feature | Details |
 |---------|---------|
-| **ASR pool** | Meta OmniASR CTC 300M loaded once, reused across all transcriptions |
+| **ASR engines** | WSL OmniASR-7B Champion by default; pooled bundled CTC 300M fallback |
 | **Streaming decode** | 90s windows for long files - no full 2hr load into RAM |
 | **Background jobs** | Import, single-file open, batch transcribe - UI stays responsive |
 | **VAD chunking** | Podcasts/audiobooks -> many annotatable segments |
@@ -179,7 +182,9 @@ Review the Meta Omnilingual ASR license in the upstream bundle before shipping i
 
 ## Offline-First Operation
 
-Transcription, normalization, search, and export work entirely on-device once models are present. No cloud API is required.
+Transcription, normalization, search, and export can run entirely on-device. No cloud API is
+required. The default 7B path is not self-provisioning: configure and start the WSL Champion server
+before importing, or explicitly select the bundled CTC engine in Settings.
 
 **Exception:** the app can download **Silero VAD v4** and **Meta OmniASR CTC 300M** over HTTPS on first use (or via the model download UI). Disable network access after those files are cached if you need a fully air-gapped setup.
 

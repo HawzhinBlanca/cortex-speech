@@ -53,8 +53,12 @@
   <div class="flex items-center justify-between">
     <h3 class="text-sm font-medium text-cortex-100">Diagnostics — operation tracing</h3>
     <div class="flex gap-2">
-      <button class="btn-ghost text-xs" onclick={load} data-testid="diagnostics-refresh">Refresh</button>
-      <button class="btn-ghost text-xs" onclick={clear} data-testid="diagnostics-clear">Clear</button>
+      <button class="btn-ghost text-xs" onclick={load} data-testid="diagnostics-refresh"
+        >Refresh</button
+      >
+      <button class="btn-ghost text-xs" onclick={clear} data-testid="diagnostics-clear"
+        >Clear</button
+      >
     </div>
   </div>
 
@@ -70,7 +74,11 @@
           <div class="text-[10px] text-muted">spans recorded</div>
         </div>
         <div class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-2">
-          <div class="text-lg font-semibold {stats.failures > 0 ? 'text-amber-300' : 'text-cortex-100'}">
+          <div
+            class="text-lg font-semibold {stats.failures > 0
+              ? 'text-amber-300'
+              : 'text-cortex-100'}"
+          >
             {stats.failures}
           </div>
           <div class="text-[10px] text-muted">failures</div>
@@ -93,7 +101,9 @@
     {:else}
       <ul class="space-y-1" data-testid="diagnostics-spans">
         {#each spans as s, i (i)}
-          <li class="flex items-center justify-between rounded border border-cortex-700/30 px-2 py-1 text-xs">
+          <li
+            class="flex items-center justify-between rounded border border-cortex-700/30 px-2 py-1 text-xs"
+          >
             <span class="flex items-center gap-2">
               <span aria-hidden="true">{s.success ? '✓' : '✕'}</span>
               <span class="text-cortex-100">{s.operation}</span>

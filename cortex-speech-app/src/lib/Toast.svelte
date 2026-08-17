@@ -57,15 +57,6 @@
             }}>{notif.action.label}</button
           >
         {/if}
-        {#if notif.progress !== undefined}
-          <div class="mt-2 h-1 overflow-hidden rounded-full bg-surface-3">
-            <div
-              class="h-full rounded-full {BAR[notif.type] ??
-                'bg-accent'} transition-[width] duration-300 ease-smooth"
-              style="width: {notif.progress}%"
-            ></div>
-          </div>
-        {/if}
       </div>
 
       <button

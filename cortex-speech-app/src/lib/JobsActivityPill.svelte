@@ -42,7 +42,13 @@
 
   // Show a pill only when there is running work or a recent failure worth flagging.
   const mode = $derived<'running' | 'interrupted' | 'failed' | 'none'>(
-    running.length > 0 ? 'running' : latestFailed ? (interrupted ? 'interrupted' : 'failed') : 'none',
+    running.length > 0
+      ? 'running'
+      : latestFailed
+        ? interrupted
+          ? 'interrupted'
+          : 'failed'
+        : 'none',
   );
 
   const dot = $derived(mode === 'running' ? 'bg-amber-400 animate-pulse' : 'bg-red-400');

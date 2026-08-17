@@ -45,8 +45,17 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def run(data_dir: Path, port: int, exe: Path | None = None) -> str:
-    env = dict(os.environ, CORTEX_WATCHDOG_DATA_DIR=str(data_dir), CORTEX_WATCHDOG_PORT=str(port))
+def run(data_dir: Path, port: int, exe: Path | None = None, grace_min: str = "0") -> str:
+    # grace_min="0" by default so a freshly spawned decoy process is already past the STARTUP GRACE
+    # and the kill path is reachable. Without this every kill case would report "starting-up": the
+    # decoy is seconds old and the real grace is 20 minutes. The grace itself is covered by its own
+    # case below, which runs with the production default.
+    env = dict(
+        os.environ,
+        CORTEX_WATCHDOG_DATA_DIR=str(data_dir),
+        CORTEX_WATCHDOG_PORT=str(port),
+        CORTEX_WATCHDOG_STARTUP_GRACE_MIN=grace_min,
+    )
     if exe is not None:
         env["CORTEX_WATCHDOG_EXE"] = str(exe)
     out = subprocess.run(
@@ -205,6 +214,18 @@ def main() -> int:
             )
             expect("decoy alive but override points elsewhere -> DEAD", run(tmp, dead, no_proc_exe), "relaunch")
             expect("...and the same run against the decoy path -> ALIVE", run(tmp, dead, decoy2_exe), "kill-and-relaunch")
+
+            # STARTUP GRACE (2026-08-15). The same inputs as the kill case above — session file
+            # present, process alive, port dead — must NOT kill when the process is young. This is
+            # the regression that took the app down: after the library tripled to 14,828 clips
+            # startup needed longer than the 5-minute check interval, so the watchdog killed the app
+            # three times running and it never once reached the point of serving. Run with the
+            # PRODUCTION grace (no override) against a decoy that is seconds old.
+            expect(
+                "young process + dead port -> leave it alone to finish starting",
+                run(tmp, dead, decoy2_exe, grace_min=""),
+                "starting-up",
+            )
         finally:
             decoy2.kill()
             decoy2.wait(timeout=30)

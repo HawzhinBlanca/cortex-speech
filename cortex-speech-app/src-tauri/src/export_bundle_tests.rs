@@ -84,7 +84,7 @@ fn insert_machine_silver_segment_with_coverage(db: &Database, tmp: &TempDir, seg
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
+    db.insert_segment_full(&segment).unwrap();
     db.write_segment_verdict(
         &segment.id,
         "jury_accept",
@@ -162,7 +162,7 @@ fn record_ready_agentic_promotion_report(
 fn production_export_blocks_on_validation_errors() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
-    db.insert_segment(&SpeechSegment {
+    db.insert_segment_full(&SpeechSegment {
         id: "missing-audio".into(),
         created_at: None,
         audio_path: "C:\\definitely\\missing\\audio.wav".into(),
@@ -197,7 +197,7 @@ fn production_export_blocks_when_warnings_exceed_threshold() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment(&SpeechSegment {
+    db.insert_segment_full(&SpeechSegment {
         id: "empty-transcript".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -234,7 +234,7 @@ fn production_export_blocks_when_no_segments_are_training_ready() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment(&SpeechSegment {
+    db.insert_segment_full(&SpeechSegment {
         id: "review-only".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -309,7 +309,7 @@ fn production_export_blocks_machine_ready_rows_without_hypothesis_coverage() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
+    db.insert_segment_full(&segment).unwrap();
     let weak_evidence = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -352,7 +352,7 @@ fn production_export_allows_human_gold_without_hypothesis_coverage() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("human-gold.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment(&SpeechSegment {
+    db.insert_segment_full(&SpeechSegment {
         id: "human-gold-seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -363,6 +363,8 @@ fn production_export_allows_human_gold_without_hypothesis_coverage() {
         duration_ms: 1200,
         speaker_id: Some("spk1".into()),
         verified: true,
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        human_decision: Some("accept".into()),
         confidence: Some(0.95),
         ctc_score: None,
         clipping_ratio: Some(0.0),
@@ -477,7 +479,7 @@ fn a_revoked_clip_is_absent_from_the_bundles_data_files_manifest_and_card_alike(
     std::fs::write(&revoked, b"audio").unwrap();
     for (id, path, text) in [("keep-1", &keep, "دەقی مانەوە"), ("revoked-1", &revoked, "دەقی سڕاوە")]
     {
-        db.insert_segment(&SpeechSegment {
+        db.insert_segment_full(&SpeechSegment {
             id: id.into(),
             audio_path: path.to_string_lossy().to_string(),
             raw_transcript: text.into(),
@@ -485,6 +487,8 @@ fn a_revoked_clip_is_absent_from_the_bundles_data_files_manifest_and_card_alike(
             duration_ms: 1200,
             speaker_id: Some("spk1".into()),
             verified: true,
+            // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+            human_decision: Some("accept".into()),
             clipping_ratio: Some(0.0),
             rms_db: Some(-20.0),
             snr_db: Some(20.0),
@@ -728,6 +732,8 @@ fn bundle_excludes_holdout_gold_from_all_artifacts() {
         duration_ms: 1200,
         speaker_id: None,
         verified: true,
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        human_decision: Some("accept".into()),
         confidence: Some(0.95),
         ctc_score: None,
         clipping_ratio: Some(0.0),
@@ -741,14 +747,13 @@ fn bundle_excludes_holdout_gold_from_all_artifacts() {
         evidence_json: None,
         agreement_score: None,
         escalated: false,
-        human_decision: None,
         corrected_at: None,
         is_gold: false,
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&mk("keep-seg", "/data/keep.wav", "KEEPMARKERTEXT")).unwrap();
-    db.insert_segment(&mk("hold-seg", "/data/holdout.wav", "HOLDOUTMARKERTEXT")).unwrap();
+    db.insert_segment_full(&mk("keep-seg", "/data/keep.wav", "KEEPMARKERTEXT")).unwrap();
+    db.insert_segment_full(&mk("hold-seg", "/data/holdout.wav", "HOLDOUTMARKERTEXT")).unwrap();
     db.upsert_source_transcript(&SourceTranscriptRecord {
         audio_path: "/data/holdout.wav".to_string(),
         model_id: "gemini-2.5-pro".to_string(),
@@ -811,8 +816,8 @@ fn bundle_manifest_count_excludes_placeholders_matching_the_shipped_data_files()
         verified,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&mk("real", "/data/real.wav", "دەقی ڕاست", true)).unwrap();
-    db.insert_segment(&mk("pending", "/data/pending.wav", "[Pending WSL 7B ASR]", false)).unwrap();
+    db.insert_segment_full(&mk("real", "/data/real.wav", "دەقی ڕاست", true)).unwrap();
+    db.insert_segment_full(&mk("pending", "/data/pending.wav", "[Pending WSL 7B ASR]", false)).unwrap();
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -910,7 +915,7 @@ fn draft_export_writes_complete_release_bundle() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment(&SpeechSegment {
+    db.insert_segment_full(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -921,6 +926,8 @@ fn draft_export_writes_complete_release_bundle() {
         duration_ms: 1000,
         speaker_id: Some("spk1".into()),
         verified: true,
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        human_decision: Some("accept".into()),
         confidence: Some(0.95),
         ctc_score: None,
         clipping_ratio: Some(0.0),
@@ -1044,7 +1051,7 @@ fn training_grade_details_records_hypothesis_coverage_evidence() {
         signal_anomaly_score: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
+    db.insert_segment_full(&segment).unwrap();
     for (model_id, transcript, confidence) in [
         ("omniasr-ctc-300m", "coverage transcript", Some(0.91)),
         ("omniasr-ctc-1b", "[ASR unavailable: model missing]", Some(0.0)),
@@ -1090,7 +1097,8 @@ fn draft_export_preserves_agent_import_provenance() {
         id: "agent-seg-1".into(),
         created_at: None,
         audio_path: audio_path.clone(),
-        raw_transcript: "raw candidate".into(),
+        // VERBATIM LAW: silver ships raw, so the jury-certified text IS the raw draft.
+        raw_transcript: "reference candidate".into(),
         normalized_transcript: None,
         annotated_transcript: None,
         alignment_json: None,
@@ -1123,7 +1131,7 @@ fn draft_export_preserves_agent_import_provenance() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
+    db.insert_segment_full(&segment).unwrap();
     let evidence_json = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -1323,7 +1331,7 @@ fn draft_export_preserves_agent_import_provenance() {
     assert_eq!(detail["audioPath"].as_str(), Some("agent-source.wav"));
     assert_eq!(detail["grade"].as_str(), Some("silver"));
     assert_eq!(detail["trainingReady"].as_bool(), Some(true));
-    assert_eq!(detail["transcriptSource"].as_str(), Some("jury_verdict"));
+    assert_eq!(detail["transcriptSource"].as_str(), Some("raw_asr")); // VERBATIM LAW: silver ships the champion raw
     assert_eq!(detail["hypothesisModelCounts"]["omniasr-wsl-7b"].as_u64(), Some(1));
     assert_eq!(
         detail["evidence"]["sourceReference"]["referenceModelId"].as_str(),
@@ -1463,7 +1471,7 @@ fn draft_export_includes_self_learning_preference_artifacts() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
+    db.insert_segment_full(&segment).unwrap();
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: segment.id.clone(),
         model_id: "omniasr-wsl-7b".to_string(),
@@ -1571,7 +1579,7 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
+    db.insert_segment_full(&segment).unwrap();
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: segment.id.clone(),
         model_id: "omniasr-wsl-7b".to_string(),
@@ -1630,7 +1638,7 @@ fn draft_export_records_model_metadata_load_errors() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment(&SpeechSegment {
+    db.insert_segment_full(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -1641,6 +1649,8 @@ fn draft_export_records_model_metadata_load_errors() {
         duration_ms: 1000,
         speaker_id: Some("spk1".into()),
         verified: true,
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        human_decision: Some("accept".into()),
         confidence: Some(0.95),
         ctc_score: None,
         clipping_ratio: Some(0.0),
@@ -1675,7 +1685,7 @@ fn draft_export_replaces_bundle_metadata_atomically() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment(&SpeechSegment {
+    db.insert_segment_full(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -1686,6 +1696,8 @@ fn draft_export_replaces_bundle_metadata_atomically() {
         duration_ms: 1000,
         speaker_id: Some("spk1".into()),
         verified: true,
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        human_decision: Some("accept".into()),
         confidence: Some(0.95),
         ctc_score: None,
         clipping_ratio: Some(0.0),

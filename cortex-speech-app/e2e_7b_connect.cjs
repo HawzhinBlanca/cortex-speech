@@ -50,7 +50,7 @@ const dur = (s) => (s && (s.durationMs ?? s.duration_ms)) || 0;
   console.log('polling get_segments until every segment has a 7B transcript (up to 8 min)...');
   let segs = [];
   for (let i = 0; i < 240; i++) {
-    segs = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('get_segments', { verified: null }).catch(() => [])).catch(() => []);
+    segs = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('get_segments_page', { verified: null, query: null, sort: 'oldest', limit: 300, cursor: null }).then((p) => p.items)).catch((e) => { if (String(e).includes('not found')) throw e; return []; });
     const pend = segs.filter((s) => !txt(s).trim() || txt(s).includes('Pending')).length;
     if (segs.length >= 1 && pend === 0) break;
     if (i % 8 === 0) console.log(`  ${segs.length} segs, ${pend} pending/blank... ${i * 2}s`);

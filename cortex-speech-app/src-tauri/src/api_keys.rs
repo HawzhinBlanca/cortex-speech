@@ -102,7 +102,20 @@ impl ApiKeys {
     /// lines. `stored` is written verbatim (already plaintext-validated or a dpapi blob).
     fn write_key_line(data_dir: &Path, name: &str, stored: String) -> Result<(), String> {
         let path = data_dir.join(SECRETS_FILE);
-        let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| Self::template());
+        // ONLY "the file does not exist yet" may fall back to the template. Every other read error —
+        // a sharing violation from an AV scanner or the search indexer, a permission error, a
+        // transient IO fault — must abort the write.
+        //
+        // The template carries BLANK placeholders for all three providers, so treating an unreadable
+        // file as an absent one rewrites secrets.env with every OTHER provider's key erased, and
+        // then returns Ok(()) so the Settings UI reports the save succeeded. Saving the Gemini key
+        // would silently unset ElevenLabs and OpenRouter, which surface later only as
+        // "not configured".
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::template(),
+            Err(e) => return Err(format!("read secrets file (refusing to overwrite it blind): {e}")),
+        };
         let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
         let prefix = format!("{name}=");
         let new_line = format!("{name}={stored}"); // empty -> "NAME=" (a cleared, unset key)
@@ -116,7 +129,10 @@ impl ApiKeys {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
         let tmp = data_dir.join(format!("{SECRETS_FILE}.tmp"));
         std::fs::write(&tmp, &contents).map_err(|e| format!("write secrets temp: {e}"))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("replace secrets file: {e}"))?;
+        // The shared atomic replace, not a bare rename: it fsyncs the staged bytes before the swap
+        // and the directory after it. A bare rename is atomic for the NAME only — a power loss just
+        // after it can expose a zero-length secrets.env, wiping every key at once.
+        crate::atomic_file::replace_file(&tmp, &path).map_err(|e| format!("replace secrets file: {e}"))?;
         Ok(())
     }
 
@@ -197,6 +213,52 @@ fn parse_env_file(path: &Path) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_secrets_file_aborts_the_write_instead_of_erasing_the_other_keys() {
+        // A read failure that is NOT "missing" used to fall back to the blank template, so saving one
+        // provider's key rewrote the file with the other two ERASED — and returned Ok(()), so the UI
+        // said "saved". A directory standing where the file belongs reproduces that class of failure
+        // portably (read_to_string fails, and not with NotFound).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dir.join(SECRETS_FILE)).unwrap();
+
+        let result = ApiKeys::write_key_line(dir, "GEMINI_API_KEY", "value".to_string());
+
+        assert!(result.is_err(), "an unreadable secrets file must FAIL the save, not silently rewrite it");
+        assert!(dir.join(SECRETS_FILE).is_dir(), "the existing entry must be left exactly as it was found");
+    }
+
+    #[test]
+    fn a_missing_secrets_file_is_still_created_from_the_template() {
+        // The other side of the same branch: first-ever save must keep working.
+        let tmp = tempfile::tempdir().unwrap();
+        ApiKeys::write_key_line(tmp.path(), "GEMINI_API_KEY", "abc".to_string()).unwrap();
+        let written = std::fs::read_to_string(tmp.path().join(SECRETS_FILE)).unwrap();
+        assert!(written.contains("GEMINI_API_KEY=abc"));
+        assert!(written.contains("ELEVENLABS_API_KEY="), "the other providers keep their lines");
+        assert!(written.contains("OPENROUTER_API_KEY="));
+    }
+
+    #[test]
+    fn saving_one_key_preserves_the_others() {
+        // The regression the read-error branch exists to protect, stated directly.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join(SECRETS_FILE),
+            "GEMINI_API_KEY=gem\nELEVENLABS_API_KEY=eleven\nOPENROUTER_API_KEY=router\n",
+        )
+        .unwrap();
+
+        ApiKeys::write_key_line(dir, "GEMINI_API_KEY", "newgem".to_string()).unwrap();
+
+        let written = std::fs::read_to_string(dir.join(SECRETS_FILE)).unwrap();
+        assert!(written.contains("GEMINI_API_KEY=newgem"));
+        assert!(written.contains("ELEVENLABS_API_KEY=eleven"), "other keys must survive: {written}");
+        assert!(written.contains("OPENROUTER_API_KEY=router"), "other keys must survive: {written}");
+    }
 
     #[test]
     fn parse_env_file_handles_comments_quotes_and_blanks() {

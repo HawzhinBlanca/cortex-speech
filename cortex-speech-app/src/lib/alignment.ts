@@ -8,15 +8,62 @@ export interface SegmentSourceMeta {
 }
 
 function snakeToCamel(obj: Record<string, unknown>): SegmentSourceMeta | null {
-  if (typeof obj.source_start_ms !== 'number' || typeof obj.source_end_ms !== 'number') {
+  const start = obj.source_start_ms;
+  const end = obj.source_end_ms;
+  const index = obj.chunk_index ?? 0;
+  const count = obj.chunk_count ?? 1;
+  if (
+    typeof start !== 'number' ||
+    !Number.isFinite(start) ||
+    start < 0 ||
+    typeof end !== 'number' ||
+    !Number.isFinite(end) ||
+    end <= start ||
+    typeof index !== 'number' ||
+    !Number.isInteger(index) ||
+    index < 0 ||
+    typeof count !== 'number' ||
+    !Number.isInteger(count) ||
+    count < 1 ||
+    index >= count
+  ) {
     return null;
   }
   return {
-    sourceStartMs: obj.source_start_ms as number,
-    sourceEndMs: obj.source_end_ms as number,
-    chunkIndex: (obj.chunk_index as number) ?? 0,
-    chunkCount: (obj.chunk_count as number) ?? 1,
+    sourceStartMs: start,
+    sourceEndMs: end,
+    chunkIndex: index,
+    chunkCount: count,
   };
+}
+
+function validWords(value: unknown): WordTimestamp[] | null {
+  if (!Array.isArray(value)) return null;
+  let previousStart = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const item = value[index] as Partial<WordTimestamp> | null;
+    if (
+      !item ||
+      typeof item !== 'object' ||
+      typeof item.word !== 'string' ||
+      item.word.trim().length === 0 ||
+      typeof item.start !== 'number' ||
+      !Number.isFinite(item.start) ||
+      item.start < 0 ||
+      typeof item.end !== 'number' ||
+      !Number.isFinite(item.end) ||
+      item.end < item.start ||
+      typeof item.confidence !== 'number' ||
+      !Number.isFinite(item.confidence) ||
+      item.confidence < 0 ||
+      item.confidence > 1 ||
+      (index > 0 && item.start < previousStart)
+    ) {
+      return null;
+    }
+    previousStart = item.start;
+  }
+  return value as WordTimestamp[];
 }
 
 export function parseSourceMeta(json: string | null | undefined): SegmentSourceMeta | null {
@@ -34,8 +81,8 @@ export function parseWordTimestamps(json: string | null | undefined): WordTimest
   if (!json) return [];
   try {
     const parsed = JSON.parse(json);
-    if (Array.isArray(parsed)) return parsed as WordTimestamp[];
-    if (parsed && Array.isArray(parsed.words)) return parsed.words as WordTimestamp[];
+    if (Array.isArray(parsed)) return validWords(parsed) ?? [];
+    if (parsed && typeof parsed === 'object') return validWords(parsed.words) ?? [];
     return [];
   } catch {
     return [];

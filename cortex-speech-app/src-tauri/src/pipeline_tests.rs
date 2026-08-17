@@ -14,6 +14,80 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[test]
+fn champion_selection_disables_auxiliary_models_even_for_legacy_true_setting() {
+    let champion_with_legacy_flag =
+        AppSettings { asr_model_size: AsrModelSize::WSL7B, multi_engine_hypotheses: true, ..AppSettings::default() };
+    assert!(
+        !super::auxiliary_hypotheses_enabled(&champion_with_legacy_flag),
+        "WSL7B must remain the sole engine even when an old settings file carries multi_engine=true"
+    );
+
+    let explicitly_opted_in_local =
+        AppSettings { asr_model_size: AsrModelSize::CTC300M, multi_engine_hypotheses: true, ..AppSettings::default() };
+    assert!(
+        super::auxiliary_hypotheses_enabled(&explicitly_opted_in_local),
+        "auxiliary engines remain available only through an explicit non-champion experiment"
+    );
+}
+
+#[test]
+fn hypothesis_population_reuses_only_completed_exact_primary_model() {
+    use super::{reuse_primary_or_infer, PrimaryHypothesis};
+    use std::cell::Cell;
+
+    let inferred = Cell::new(0usize);
+    let primary =
+        PrimaryHypothesis { model_id: "omniasr-ctc-300m", transcript: "primary draft", confidence: Some(0.73) };
+    let reused = reuse_primary_or_infer(Some(primary), "omniasr-ctc-300m", || {
+        inferred.set(inferred.get() + 1);
+        Some(Ok::<_, &'static str>(("redundant inference".to_string(), None)))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(reused, ("primary draft".to_string(), Some(0.73)));
+    assert_eq!(inferred.get(), 0, "the selected primary model must not decode the same PCM twice");
+
+    let independent = reuse_primary_or_infer(Some(primary), "omniasr-ctc-1b", || {
+        inferred.set(inferred.get() + 1);
+        Some(Ok::<_, &'static str>(("independent voter".to_string(), Some(0.41))))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(independent.0, "independent voter");
+    assert_eq!(inferred.get(), 1, "a different model must still run; reuse must never mislabel evidence");
+
+    for text in ["", "   "] {
+        let segment = SpeechSegment {
+            model_version_id: Some("omniasr-ctc-300m".into()),
+            raw_transcript: text.into(),
+            confidence_source: Some("heuristic".into()),
+            ..SpeechSegment::default()
+        };
+        let blank = PrimaryHypothesis::from_segment(&segment).expect("a completed empty decode retains provenance");
+        let skipped = reuse_primary_or_infer(Some(blank), "omniasr-ctc-300m", || {
+            inferred.set(inferred.get() + 1);
+            Some(Ok::<_, &'static str>(("redundant inference".to_string(), None)))
+        });
+        assert!(skipped.is_none(), "an empty primary must not become jury evidence");
+        assert_eq!(inferred.get(), 1, "a completed empty decode must not run the exact model again");
+    }
+
+    for (text, source) in [
+        ("[Pending WSL 7B ASR]", "not_run"),
+        ("[ASR unavailable: missing model]", "not_available"),
+        ("", "not_available"),
+    ] {
+        let segment = SpeechSegment {
+            model_version_id: Some("omniasr-ctc-300m".into()),
+            raw_transcript: text.into(),
+            confidence_source: Some(source.into()),
+            ..SpeechSegment::default()
+        };
+        assert!(PrimaryHypothesis::from_segment(&segment).is_none(), "failed primary was treated as completed: {text}");
+    }
+}
+
+#[test]
 fn streaming_service_rebuild_is_bounded_to_once_per_file() {
     // P1.4b (audit R4): the streaming loop must build a denoiser/diarization service when unset, and
     // re-attempt a present-but-inactive one AT MOST ONCE PER FILE — never a full GPU-then-CPU ONNX load
@@ -94,12 +168,17 @@ fn segment_id_by_alignment_distinguishes_no_row_from_db_error() {
     let seg = SpeechSegment {
         id: "seg-a".into(),
         audio_path: "/audio/a.wav".into(),
-        alignment_json: Some(r#"{"source_start_ms":0}"#.into()),
+        alignment_json: Some(r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#.into()),
         ..Default::default()
     };
     db.insert_segment(&seg).unwrap();
     assert_eq!(
-        resolve_segment_id_by_alignment(db.connection(), "/audio/a.wav", r#"{"source_start_ms":0}"#).unwrap(),
+        resolve_segment_id_by_alignment(
+            db.connection(),
+            "/audio/a.wav",
+            r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#,
+        )
+        .unwrap(),
         Some("seg-a".to_string())
     );
     // No matching row is a legitimate None (caller falls through to "segment not found"), NOT an error.
@@ -241,153 +320,6 @@ fn build_refiner_respects_cloud_opt_out() {
 }
 
 #[test]
-fn build_scribe_segments_maps_timing_text_and_meta() {
-    use crate::scribe_api::ScribeSegment;
-    let segs = vec![
-        ScribeSegment { text: "ئەمە یەکەمە".into(), source_start_ms: 0, source_end_ms: 1500 },
-        ScribeSegment { text: "دووەم".into(), source_start_ms: 2000, source_end_ms: 3000 },
-    ];
-    let out = super::ProcessingPipeline::build_scribe_speech_segments(
-        &segs,
-        "/a/b.wav",
-        5000,
-        false,
-        false,
-        crate::scribe_api::DEFAULT_MODEL,
-    );
-    assert_eq!(out.len(), 2);
-    assert_eq!(out[0].raw_transcript, "ئەمە یەکەمە");
-    assert_eq!(out[0].audio_path, "/a/b.wav");
-    assert_eq!(out[0].duration_ms, 1500);
-    assert!(!out[0].id.is_empty(), "each segment gets an id");
-    assert!(out[0].normalized_transcript.is_none(), "auto_normalize=false -> no normalized text");
-    let m0 =
-        crate::chunking::SegmentSourceMeta::from_alignment_json(out[0].alignment_json.as_deref().unwrap()).unwrap();
-    assert_eq!((m0.source_start_ms, m0.source_end_ms, m0.chunk_index, m0.chunk_count), (0, 1500, 0, 2));
-    let m1 =
-        crate::chunking::SegmentSourceMeta::from_alignment_json(out[1].alignment_json.as_deref().unwrap()).unwrap();
-    assert_eq!((m1.source_start_ms, m1.source_end_ms), (2000, 3000));
-}
-
-#[test]
-fn build_scribe_segments_fills_open_end_and_normalizes() {
-    use crate::scribe_api::ScribeSegment;
-    // An open end (0) extends to the file duration; auto-normalize folds the Arabic Kaf.
-    let segs = vec![ScribeSegment { text: "كوردی".into(), source_start_ms: 1000, source_end_ms: 0 }];
-    let out = super::ProcessingPipeline::build_scribe_speech_segments(
-        &segs,
-        "/x.wav",
-        4000,
-        true,
-        false,
-        crate::scribe_api::DEFAULT_MODEL,
-    );
-    assert_eq!(out.len(), 1);
-    let m = crate::chunking::SegmentSourceMeta::from_alignment_json(out[0].alignment_json.as_deref().unwrap()).unwrap();
-    assert_eq!((m.source_start_ms, m.source_end_ms), (1000, 4000), "open end clamps to duration");
-    assert_eq!(out[0].duration_ms, 3000);
-    let norm = out[0].normalized_transcript.as_deref().unwrap();
-    assert_ne!(norm, "كوردی", "normalizer should fold the Arabic Kaf to Kurdish Kaf");
-}
-
-#[test]
-fn build_scribe_segments_empty_input() {
-    assert!(super::ProcessingPipeline::build_scribe_speech_segments(
-        &[],
-        "/x.wav",
-        1000,
-        false,
-        false,
-        crate::scribe_api::DEFAULT_MODEL
-    )
-    .is_empty());
-}
-
-#[test]
-fn build_scribe_segments_no_overflow_on_extreme_timestamps() {
-    use crate::scribe_api::ScribeSegment;
-    // Untrusted timestamps (saturated i64) must not overflow-panic the duration math.
-    let segs = vec![ScribeSegment { text: "x".into(), source_start_ms: i64::MIN, source_end_ms: i64::MAX }];
-    let out = super::ProcessingPipeline::build_scribe_speech_segments(
-        &segs,
-        "/x.wav",
-        1000,
-        false,
-        false,
-        crate::scribe_api::DEFAULT_MODEL,
-    );
-    assert_eq!(out.len(), 1);
-    assert!(out[0].duration_ms >= 0, "duration is never negative and never overflows");
-}
-
-#[test]
-fn scribe_segments_round_trip_through_the_database() {
-    // Smoke test: the Scribe import path persists segments AND their playback timing survives a
-    // real DB round-trip (migrate -> insert_segments_batch -> read back). Covers what the pure
-    // build test cannot: serialization of text, duration, and the SegmentSourceMeta alignment.
-    use crate::scribe_api::ScribeSegment;
-    let db = crate::db::Database::open(":memory:").expect("open in-memory db");
-    db.initialize().expect("migrate schema");
-    let scribe = vec![
-        ScribeSegment { text: "ئەمە یەکەمە".into(), source_start_ms: 0, source_end_ms: 1500 },
-        ScribeSegment { text: "دووەمین پارچە".into(), source_start_ms: 2000, source_end_ms: 5000 },
-    ];
-    let built = super::ProcessingPipeline::build_scribe_speech_segments(
-        &scribe,
-        "/audio/x.wav",
-        6000,
-        false,
-        false,
-        crate::scribe_api::DEFAULT_MODEL,
-    );
-    db.insert_segments_batch(&built).expect("insert batch");
-
-    let mut back = db.get_segments(None).expect("read back");
-    assert_eq!(back.len(), 2, "both Scribe segments persisted");
-    let start_of = |s: &crate::db::SpeechSegment| {
-        crate::chunking::SegmentSourceMeta::from_alignment_json(s.alignment_json.as_deref().unwrap_or(""))
-            .map_or(i64::MAX, |m| m.source_start_ms)
-    };
-    back.sort_by_key(start_of);
-    assert_eq!(back[0].raw_transcript, "ئەمە یەکەمە", "text survives the round-trip");
-    assert_eq!(back[0].audio_path, "/audio/x.wav");
-    assert_eq!(back[0].duration_ms, 1500);
-    let m0 =
-        crate::chunking::SegmentSourceMeta::from_alignment_json(back[0].alignment_json.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        (m0.source_start_ms, m0.source_end_ms, m0.chunk_index, m0.chunk_count),
-        (0, 1500, 0, 2),
-        "alignment time-range + chunk indices survive persistence — playback hits the right slice"
-    );
-    let m1 =
-        crate::chunking::SegmentSourceMeta::from_alignment_json(back[1].alignment_json.as_deref().unwrap()).unwrap();
-    assert_eq!((m1.source_start_ms, m1.source_end_ms), (2000, 5000));
-}
-
-#[test]
-fn scribe_key_gate_requires_opt_in() {
-    // Key present but cloud STT NOT opted in -> None (no cloud calls without explicit opt-in).
-    let (pipeline, dir) =
-        test_pipeline_with_settings(AppSettings { cloud_stt_opt_in: false, ..AppSettings::default() });
-    std::fs::write(dir.path().join("secrets.env"), "ELEVENLABS_API_KEY=test-scribe-key\n").unwrap();
-    assert!(pipeline.scribe_api_key_if_enabled().is_none());
-}
-
-#[test]
-fn scribe_key_gate_returns_key_when_opted_in() {
-    let (pipeline, dir) = test_pipeline_with_settings(AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() });
-    std::fs::write(dir.path().join("secrets.env"), "ELEVENLABS_API_KEY=test-scribe-key\n").unwrap();
-    assert_eq!(pipeline.scribe_api_key_if_enabled().as_deref(), Some("test-scribe-key"));
-}
-
-#[test]
-fn scribe_key_gate_none_without_key() {
-    let (pipeline, _dir) =
-        test_pipeline_with_settings(AppSettings { cloud_stt_opt_in: true, ..AppSettings::default() });
-    assert!(pipeline.scribe_api_key_if_enabled().is_none(), "opted in but no key -> None");
-}
-
-#[test]
 fn cancelled_directory_import_clears_running_status() {
     // Round-2 audit MEDIUM: a cancel mid directory-import early-returned (token.check()?) before
     // finish_import_status, so get_import_status().running stayed true forever. The RAII guard now
@@ -440,6 +372,62 @@ fn fire_loop0_if_enabled_method_uses_the_pipelines_own_db() {
     );
 }
 
+#[test]
+fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
+    // REGRESSION, and it made the feature unusable rather than merely awkward.
+    //
+    // `ensure_source_reference_transcripts` read `settings.llm_api_key`. `AppSettings::load` CLEARS
+    // that field and rewrites settings.json, so a plaintext key never survives on disk (P0.3) - which
+    // means the field is empty on every run after the one where it was typed. The whole-file reference
+    // therefore failed with "Gemini API key is required" no matter what the owner entered, while
+    // `llm_api_key_configured` stayed true so the UI reported a key that was gone. Measured 2026-08-10:
+    // an import failed 3/3 on exactly that error, with secrets.env holding an EMPTY GEMINI_API_KEY
+    // because no UI path had ever written one.
+    //
+    // Every other cloud path (scribe, jury, OpenRouter) reads secrets.env via ApiKeys. This pins that
+    // the reference transcript now agrees with them.
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let data_dir = dir.path();
+
+    // Nothing anywhere -> None, so the caller can say so instead of calling Gemini with "".
+    assert_eq!(pipeline.jury_cloud_api_key(), None, "no key anywhere must resolve to None");
+
+    // A key in the ENCRYPTED store is found. Plaintext in secrets.env is a supported form
+    // (parse_env_file reads both), which keeps this test independent of DPAPI availability.
+    //
+    // SETTLE LOOP, not decoration. Writing a file and immediately reading it back through other code
+    // is a known flake on this box: it passes when run alone and fails under the full 1159-test suite,
+    // which is exactly what this test did on its first full run. The repo's resolve_file_in tests carry
+    // the same loop for the same reason. Reading through jury_cloud_api_key (not fs::read) means the
+    // wait ends when the code under test can actually see the key.
+    std::fs::write(data_dir.join("secrets.env"), "GEMINI_API_KEY=AIzaFromTheStore\n").unwrap();
+    let mut seen = None;
+    for _ in 0..500 {
+        seen = pipeline.jury_cloud_api_key();
+        if seen.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(
+        seen.as_deref(),
+        Some("AIzaFromTheStore"),
+        "the store is where every other cloud path looks, and now this one too"
+    );
+
+    // BEFORE THE FIX this whole test is unreachable: the code read settings.llm_api_key, which is
+    // "" on a default AppSettings, so it would have returned None here and failed the import.
+    let typed = AppSettings { llm_api_key: "AIzaJustTyped".to_string(), ..AppSettings::default() };
+    let (typed_pipeline, typed_dir) = test_pipeline_with_settings(typed);
+    assert_eq!(
+        typed_pipeline.jury_cloud_api_key().as_deref(),
+        Some("AIzaJustTyped"),
+        "a key typed in THIS session must still work before any reload scrubs it - refusing it would \
+         be a surprising 'I just entered it' failure"
+    );
+    drop(typed_dir);
+}
+
 fn test_pipeline_with_settings(settings: AppSettings) -> (super::ProcessingPipeline, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db.sqlite").to_string_lossy().to_string();
@@ -460,16 +448,14 @@ fn test_pipeline_for_status() -> (super::ProcessingPipeline, tempfile::TempDir) 
 }
 
 #[test]
-fn wsl_without_script_uses_local_asr_fallback() {
+fn wsl_without_script_preserves_champion_identity_and_never_falls_back() {
     let settings = AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() };
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
 
     assert!(!pipeline.should_use_wsl_primary_asr());
-    let has_1b = crate::models::ModelManager::new(pipeline.model_manager.resolved_dir()).omniasr_ctc_1b_present();
-    let expected_size = if has_1b { AsrModelSize::CTC1B } else { AsrModelSize::CTC300M };
-    let expected_id = if has_1b { "omniasr-ctc-1b" } else { "omniasr-ctc-300m" };
-    assert_eq!(pipeline.active_local_asr_model_size(), expected_size);
-    assert_eq!(pipeline.local_asr_model_id(), expected_id);
+    assert!(pipeline.wsl7b_primary_unresolved());
+    assert_eq!(pipeline.selected_asr_model_size(), AsrModelSize::WSL7B);
+    assert_eq!(pipeline.local_asr_model_id(), "omniasr-wsl-7b");
 }
 
 #[test]
@@ -554,7 +540,8 @@ fn multi_model_hypothesis_stage_reports_verified_coverage() {
     insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "best phrase");
     insert_hypothesis(&db, &segment.id, "omniasr-ctc-300m", "backup phrase");
 
-    let event = super::multi_model_hypothesis_stage(&db, "covered.wav", std::slice::from_ref(&segment));
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
+    let event = super::multi_model_hypothesis_stage(&db, &settings, "covered.wav", std::slice::from_ref(&segment));
 
     match event {
         super::PipelineEvent::AgentStage { stage, status, detail, current, total, .. } => {
@@ -581,7 +568,8 @@ fn multi_model_hypothesis_stage_blocks_incomplete_coverage() {
     insert_hypothesis(&db, &covered.id, "omniasr-ctc-300m", "backup phrase");
     insert_hypothesis(&db, &blocked.id, "omniasr-wsl-7b", "single model phrase");
 
-    let event = super::multi_model_hypothesis_stage(&db, "mixed.wav", &[covered, blocked]);
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
+    let event = super::multi_model_hypothesis_stage(&db, &settings, "mixed.wav", &[covered, blocked]);
 
     match event {
         super::PipelineEvent::AgentStage { stage, status, detail, current, total, .. } => {
@@ -591,6 +579,33 @@ fn multi_model_hypothesis_stage_blocks_incomplete_coverage() {
             assert_eq!(total, 2);
             assert!(detail.contains("Only 1/2"));
             assert!(detail.contains("blocked-seg"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
+fn champion_stage_never_requires_or_counts_auxiliary_hypotheses() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let segment = test_segment("champion-seg");
+    db.insert_segment(&segment).unwrap();
+    // Simulate legacy evidence left by an older build. Champion mode must neither count it nor mark
+    // the import blocked just because it intentionally runs only one ASR.
+    insert_hypothesis(&db, &segment.id, "omniasr-ctc-300m", "stale smaller-model text");
+
+    let settings =
+        AppSettings { asr_model_size: AsrModelSize::WSL7B, multi_engine_hypotheses: true, ..AppSettings::default() };
+    let event = super::multi_model_hypothesis_stage(&db, &settings, "champion.wav", std::slice::from_ref(&segment));
+
+    match event {
+        super::PipelineEvent::AgentStage { stage, status, detail, current, total, .. } => {
+            assert_eq!(stage, "multi_model_hypotheses");
+            assert_eq!(status, "not_required");
+            assert_eq!(current, 1);
+            assert_eq!(total, 1);
+            assert!(detail.contains("Champion-only"));
+            assert!(!detail.contains("300M"));
         }
         other => panic!("unexpected event: {other:?}"),
     }
@@ -656,7 +671,7 @@ fn decoded_window_accumulator_recovers_poisoned_lock() {
 }
 
 #[test]
-fn wsl_primary_import_pass_skips_missing_script_after_local_fallback() {
+fn wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusal() {
     let settings = AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
     let db_path = dir.path().join("db.sqlite");
@@ -664,9 +679,9 @@ fn wsl_primary_import_pass_skips_missing_script_after_local_fallback() {
     db.initialize().unwrap();
 
     let segment = SpeechSegment {
-        id: "local-fallback".to_string(),
+        id: "preflight-refused".to_string(),
         audio_path: "C:\\missing\\audio.wav".to_string(),
-        raw_transcript: "local fallback transcript".to_string(),
+        raw_transcript: "pre-existing transcript".to_string(),
         duration_ms: 1000,
         ..SpeechSegment::default()
     };
@@ -676,13 +691,13 @@ fn wsl_primary_import_pass_skips_missing_script_after_local_fallback() {
     let updated = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None).unwrap();
 
     assert_eq!(updated, 0);
-    assert_eq!(segments[0].raw_transcript, "local fallback transcript");
+    assert_eq!(segments[0].raw_transcript, "pre-existing transcript");
     assert_eq!(segments[0].verdict, None);
     assert!(!segments[0].escalated);
     assert_eq!(segments[0].rationale, None);
 
-    let fresh = db.get_segments_by_ids(&["local-fallback".to_string()]).unwrap().remove(0);
-    assert_eq!(fresh.raw_transcript, "local fallback transcript");
+    let fresh = db.get_segments_by_ids(&["preflight-refused".to_string()]).unwrap().remove(0);
+    assert_eq!(fresh.raw_transcript, "pre-existing transcript");
     assert_eq!(fresh.verdict, None);
     assert!(!fresh.escalated);
     assert_eq!(fresh.rationale, None);
@@ -803,10 +818,16 @@ fn wsl7b_without_script_is_unresolved_not_silently_downgraded() {
 
 #[test]
 fn preflight_is_noop_when_not_wsl_primary() {
-    // Default engine is not the WSL primary (empty script) => preflight returns Ok without ever
-    // spawning wsl, so a machine without WSL is unaffected.
-    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let settings = AppSettings { asr_model_size: AsrModelSize::CTC300M, ..AppSettings::default() };
+    let (pipeline, _dir) = test_pipeline_with_settings(settings);
     assert!(pipeline.wsl_7b_server_preflight().is_ok());
+}
+
+#[test]
+fn public_preflight_fails_immediately_when_default_champion_is_unconfigured() {
+    let (pipeline, _dir) = test_pipeline_with_settings(AppSettings::default());
+    let error = pipeline.preflight_primary_engine().expect_err("unconfigured champion must fail closed");
+    assert!(error.to_string().contains(super::ASR_7B_UNAVAILABLE_TAG));
 }
 
 #[test]
@@ -1142,33 +1163,6 @@ fn win_path_to_wsl_translates_drive_paths() {
     assert_eq!(super::win_path_to_wsl("/mnt/c/already"), "/mnt/c/already");
 }
 
-#[test]
-fn scribe_segments_carry_cloud_call_provenance() {
-    // PROVENANCE (the project's one law): Scribe is the ONE path that uploads raw audio to a cloud
-    // provider, yet its rows were built via `..Default::default()` — persisting cloud_call=false and
-    // model_version_id=NULL for exactly the segments whose audio left the machine. The local-ASR draft
-    // path stamps cloud_call honestly (llm_refinement_uses_cloud()); this path must too.
-    use crate::scribe_api::ScribeSegment;
-
-    let segs = vec![ScribeSegment {
-        text: "ئەمە تاقیکردنەوەیە".into(), source_start_ms: 0, source_end_ms: 1500
-    }];
-    let out = super::ProcessingPipeline::build_scribe_speech_segments(
-        &segs,
-        "/a/b.wav",
-        5000,
-        false,
-        false,
-        crate::scribe_api::DEFAULT_MODEL,
-    );
-    assert!(out[0].cloud_call, "a Scribe row's audio WAS uploaded — cloud_call must be true");
-    assert_eq!(
-        out[0].model_version_id.as_deref(),
-        Some(crate::scribe_api::DEFAULT_MODEL),
-        "the Scribe model must be recorded as the row's model_version_id"
-    );
-}
-
 /// A pipeline as a long import actually holds it: cloned from the stored instance, then run on.
 fn pipeline_with(settings: AppSettings) -> super::ProcessingPipeline {
     super::ProcessingPipeline::new(
@@ -1208,10 +1202,6 @@ fn revoking_cloud_consent_reaches_an_import_already_in_flight() {
     assert!(!in_flight.consent.cloud_stt(), "cloud STT consent must reach the in-flight clone");
     assert!(!in_flight.consent.cloud_llm(), "cloud LLM consent must reach the in-flight clone");
     assert!(!in_flight.consent.jury_cloud(), "jury cloud consent must reach the in-flight clone");
-    assert!(
-        in_flight.scribe_api_key_if_enabled().is_none(),
-        "a withdrawn cloud-STT consent must stop the key ever being read"
-    );
 }
 
 #[test]
@@ -1223,10 +1213,7 @@ fn granting_consent_mid_run_does_not_retroactively_enable_a_run_started_without_
     let in_flight = stored.clone();
     stored.update_settings(all_cloud_on());
 
-    assert!(
-        in_flight.scribe_api_key_if_enabled().is_none(),
-        "a run begun without consent must stay offline even after consent is granted"
-    );
+    assert!(!in_flight.consent.cloud_stt(), "a run begun without consent must stay offline");
 }
 
 #[test]
@@ -1272,10 +1259,6 @@ fn revocation_takes_effect_even_when_the_settings_save_fails() {
     assert!(!in_flight.consent.cloud_stt(), "a withdrawal must not wait for a successful disk write");
     assert!(!in_flight.consent.cloud_llm());
     assert!(!in_flight.consent.jury_cloud());
-    assert!(
-        in_flight.scribe_api_key_if_enabled().is_none(),
-        "egress must already be stopped even though the settings save failed"
-    );
     // The divergence is one-directional: the SNAPSHOT still says opted-in (disk and get_settings
     // report the old value, and the user is shown the save error), while egress is off. Safer than
     // displayed — never the reverse.
@@ -1292,4 +1275,60 @@ fn revoke_consent_now_never_grants() {
     assert!(!stored.consent.cloud_stt(), "revoke_consent_now must never turn consent ON");
     assert!(!stored.consent.cloud_llm());
     assert!(!stored.consent.jury_cloud());
+}
+
+/// The 7B gate must admit EXACTLY its permit count concurrently — no more, no fewer.
+///
+/// Both directions are failures with teeth. Admitting more than the server has replicas puts the
+/// extra requests in the socket queue, where they burn their client timeout waiting and get
+/// misreported as "server not running" — the cumulative-timeout blowout the gate exists to prevent.
+/// Admitting fewer wastes a GPU: measured 2026-08-11, the one-permit version held a 2-replica server
+/// to 23.1 s/clip with both cards under 20%.
+///
+/// Fail-before: reverting `acquire()` to a plain exclusive Mutex drives observed concurrency to 1 and
+/// trips the lower assertion.
+#[test]
+fn the_7b_gate_admits_exactly_its_permit_count_at_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // SAFETY: single-threaded at this point; the worker threads below start after it is set.
+    std::env::set_var("CORTEX_7B_CONCURRENCY", "2");
+    assert_eq!(super::wsl_7b_concurrency(), 2, "the env var must reach the gate");
+
+    let in_flight = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                let _permit = super::WSL_7B_GATE.acquire();
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Long enough that every thread overlaps if the gate lets them.
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+
+    let observed = peak.load(Ordering::SeqCst);
+    assert!(observed <= 2, "gate admitted {observed} at once, above its 2 permits — requests would queue and time out");
+    assert_eq!(observed, 2, "gate never admitted 2 at once, so a second replica would sit idle");
+    assert_eq!(in_flight.load(Ordering::SeqCst), 0, "every permit must be returned on drop");
+
+    std::env::remove_var("CORTEX_7B_CONCURRENCY");
+}
+
+/// An unusable CORTEX_7B_CONCURRENCY must fall back to 1 — the SAFE end. Over-admitting reintroduces
+/// the cumulative-timeout failure; under-admitting is merely slower.
+#[test]
+fn seven_b_concurrency_falls_back_to_one_for_every_unusable_value() {
+    assert_eq!(super::parse_wsl_7b_concurrency(None), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("")), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("0")), 1, "zero would admit nobody and deadlock");
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("-2")), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("two")), 1);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("9")), 1, "above the cap -> 1, never uncapped");
+    assert_eq!(super::parse_wsl_7b_concurrency(Some("2")), 2);
+    assert_eq!(super::parse_wsl_7b_concurrency(Some(" 4 ")), 4);
 }

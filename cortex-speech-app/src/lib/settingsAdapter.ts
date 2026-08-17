@@ -4,7 +4,6 @@ import type { AppSettings } from './stores/settingsStore';
 export interface BackendSettings {
   model_dir: string;
   output_dir: string;
-  asr_provider: string;
   asr_model_size: string;
   use_finetuned_asr?: boolean;
   vad_threshold: number;
@@ -100,15 +99,15 @@ function exportFormatToBackend(value: AppSettings['exportFormat']): string {
 }
 
 function asrModelFromBackend(value: string): AppSettings['asrModel'] {
+  if (value === 'CTC300M') return 'ctc-300m';
   if (value === 'CTC1B') return 'ctc-1b';
-  if (value === 'WSL7B') return 'wsl-7b';
-  return 'ctc-300m';
+  return 'wsl-7b';
 }
 
 function asrModelToBackend(value: AppSettings['asrModel']): string {
+  if (value === 'ctc-300m') return 'CTC300M';
   if (value === 'ctc-1b') return 'CTC1B';
-  if (value === 'wsl-7b') return 'WSL7B';
-  return 'CTC300M';
+  return 'WSL7B';
 }
 
 function llmModeFromBackend(value: string): AppSettings['llmMode'] {
@@ -180,7 +179,8 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
   // settings struct declares these as `u32`/`f64`, and serde rejects a present `null` — so a single
   // emptied field made `update_settings` fail to deserialize and discarded the WHOLE save (every other
   // edit lost). Coerce each numeric field to a finite number, falling back to the last-saved value.
-  const num = (v: number, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+  const num = (v: number, fallback: number): number =>
+    typeof v === 'number' && Number.isFinite(v) ? v : fallback;
   return {
     ...existing,
     theme: themeToBackend(ui.theme),

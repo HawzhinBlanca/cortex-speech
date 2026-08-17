@@ -300,10 +300,9 @@ pub fn write_segment_verdict(
     if let Some(r) = rationale.as_deref() {
         validate::validate_text(r, 100_000, "Verdict rationale")?;
     }
-    // evidence_json is always serialized JSON; validate_alignment_json both confirms it parses as JSON
-    // and bounds it (max 500KB), which is stricter and more apt than a plain length cap.
+    // Evidence is arbitrary structured JSON, not alignment metadata; only parse and size-bound it.
     if let Some(ej) = evidence_json.as_deref() {
-        validate::validate_alignment_json(ej)?;
+        validate::validate_json_blob(ej)?;
     }
     let db = state.lock_db();
     db.write_segment_verdict(
@@ -316,39 +315,4 @@ pub fn write_segment_verdict(
         escalated,
     )
     .map_err(|e| e.to_string())
-}
-
-/// `update_segment_bounds` — updates the start and end timestamps (in milliseconds)
-/// of a speech segment in the database, adjusting duration and alignment metadata.
-#[tauri::command]
-pub fn update_segment_bounds(id: String, start_ms: i64, end_ms: i64, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("update_segment_bounds")?;
-    validate::validate_identifier(&id)?;
-
-    // Upper cap at u32::MAX ms (~49.7 days) matches the export/diarization slicer's offset guard
-    // (chunking.rs) — a bound beyond that is garbage the slicer would reject downstream anyway, so
-    // reject it at the IPC boundary instead of storing an absurd duration/offset from the webview.
-    if start_ms < 0 || end_ms < 0 || start_ms >= end_ms || end_ms > u32::MAX as i64 {
-        return Err("Invalid segment bounds".to_string());
-    }
-
-    let db = state.lock_db();
-    let mut segment =
-        db.get_segment_by_id(&id).map_err(|e| e.to_string())?.ok_or_else(|| format!("Segment not found: {id}"))?;
-
-    // Preserve the forced-alignment word array on a bounds edit: rebound_alignment_json re-merges the
-    // existing `words` back under the `words` key. Round-tripping through SegmentSourceMeta alone (4 meta
-    // fields) would DROP the word timestamps — the flat-overwrite pipeline.rs:2068 forbids — permanently, and
-    // can flip the segment's alignment-based training grade.
-    segment.alignment_json =
-        Some(crate::chunking::rebound_alignment_json(segment.alignment_json.as_deref(), start_ms, end_ms));
-    segment.duration_ms = end_ms - start_ms;
-
-    let history = state.lock_history();
-    crate::history::HistoryManager::persist_segment_update(&db, &history, &segment).map_err(|e| e.to_string())?;
-    drop(history);
-    drop(db);
-
-    state.session_auto_save();
-    Ok(())
 }

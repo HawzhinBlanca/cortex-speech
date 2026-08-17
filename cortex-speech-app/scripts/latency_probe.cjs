@@ -206,7 +206,14 @@ async function run() {
             invoke('get_segments_page', { verified: null, query: null, sort: 'newest', limit: 300, cursor: null }),
           ),
         );
-        record('search', await time(() => invoke('search_segments', { query: 'ه' })));
+        record(
+          'search',
+          await time(() =>
+            invoke('get_segments_page', {
+              verified: null, query: 'ه', sort: 'newest', limit: 300, cursor: null,
+            }),
+          ),
+        );
         if (seg) {
           // REVIEW-SAVE: the targeted field update the editor actually uses on every keystroke pause.
           record(

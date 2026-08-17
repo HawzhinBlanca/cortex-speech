@@ -92,4 +92,14 @@ test.describe('axe-core WCAG 2.2 AA gate (M3.6)', () => {
     await expect(page.getByTestId('diagnostics-panel')).toBeVisible();
     expect(await violations(page)).toEqual([]);
   });
+
+  test('Command palette has zero a11y violations and a named active option', async ({ page }) => {
+    await page.goto('/');
+    await page.keyboard.press('Control+K');
+    const dialog = page.getByRole('dialog', { name: 'Command palette' });
+    await expect(dialog).toBeVisible();
+    const combobox = dialog.getByRole('combobox');
+    await expect(combobox).toHaveAttribute('aria-activedescendant', /cmdk-option-/);
+    expect(await violations(page)).toEqual([]);
+  });
 });

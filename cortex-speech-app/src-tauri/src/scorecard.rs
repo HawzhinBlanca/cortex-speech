@@ -110,39 +110,14 @@ pub struct Scorecard {
     pub seed: u64,
 }
 
-/// Levenshtein edit distance over token slices — the same computation `wer::compute_*`
-/// performs, exposing the raw (distance, ref_len) the bootstrap needs.
-fn edit_distance<T: Eq>(a: &[T], b: &[T]) -> usize {
-    let (n, m) = (a.len(), b.len());
-    if n == 0 {
-        return m;
-    }
-    if m == 0 {
-        return n;
-    }
-    let mut prev: Vec<usize> = (0..=m).collect();
-    let mut curr = vec![0usize; m + 1];
-    for i in 1..=n {
-        curr[0] = i;
-        for j in 1..=m {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[m]
-}
-
 fn word_error(reference: &str, hypothesis: &str) -> SegmentError {
-    let rw = wer::tokenize_words(&wer::normalize_for_metrics(reference));
-    let hw = wer::tokenize_words(&wer::normalize_for_metrics(hypothesis));
-    SegmentError::new(edit_distance(&rw, &hw) as f64, rw.len() as f64)
+    let r = wer::word_edit_distance(reference, hypothesis);
+    SegmentError::new(r.distance as f64, r.ref_len as f64)
 }
 
 fn char_error(reference: &str, hypothesis: &str) -> SegmentError {
-    let rc = wer::tokenize_chars(&wer::normalize_for_metrics(reference));
-    let hc = wer::tokenize_chars(&wer::normalize_for_metrics(hypothesis));
-    SegmentError::new(edit_distance(&rc, &hc) as f64, rc.len() as f64)
+    let r = wer::char_edit_distance(reference, hypothesis);
+    SegmentError::new(r.distance as f64, r.ref_len as f64)
 }
 
 fn word_errors(result: &EvalRunResult) -> Vec<SegmentError> {

@@ -80,6 +80,36 @@ fn a_withdrawn_recording_is_dropped_from_the_local_export() {
     );
 }
 
+#[test]
+fn the_shared_export_filter_drops_rejected_and_placeholder_rows() {
+    // Audit #11/#12: export_audio applied neither filter, so a human-REJECTED clip (verified is
+    // deliberately true on it) and a placeholder-only clip both shipped in the audio export while
+    // every other exporter dropped them. Enforced at the shared root so no caller can miss it.
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    let mut good = sample_segment("keep-good");
+    good.audio_path = "/keep.wav".into();
+    let mut rejected = sample_segment("drop-rejected");
+    rejected.audio_path = "/rej.wav".into();
+    let mut placeholder = sample_segment("drop-placeholder");
+    placeholder.audio_path = "/ph.wav".into();
+    placeholder.raw_transcript = "[Pending WSL 7B ASR]".into();
+    placeholder.normalized_transcript = None;
+    placeholder.annotated_transcript = None;
+    placeholder.human_decision = None;
+    for s in [&good, &rejected, &placeholder] {
+        db.insert_segment_full(s).unwrap();
+    }
+    db.record_human_decision("drop-rejected", "reject", None, None).unwrap();
+    let rejected = db.get_segment_by_id("drop-rejected").unwrap().unwrap();
+    let placeholder = db.get_segment_by_id("drop-placeholder").unwrap().unwrap();
+
+    let kept = exclude_unexportable_segments(&db, vec![good, rejected, placeholder]).unwrap();
+    let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec!["keep-good"], "rejected + placeholder rows must never leave the app: {ids:?}");
+}
+
 fn insert_machine_silver_segment_with_hf_coverage(
     db: &Database,
     wav_path: &std::path::Path,
@@ -89,11 +119,15 @@ fn insert_machine_silver_segment_with_hf_coverage(
     segment.audio_path = wav_path.to_string_lossy().to_string();
     segment.verified = false;
     segment.annotated_transcript = None;
+    // A MACHINE-silver row carries no human decision (sample_segment now models human gold), and
+    // under the VERBATIM LAW silver ships the raw draft — so the jury-certified text IS the raw.
+    segment.human_decision = None;
+    segment.raw_transcript = "reference candidate".to_string();
     segment.confidence = Some(0.95);
     segment.clipping_ratio = Some(0.0);
     segment.rms_db = Some(-20.0);
     segment.snr_db = Some(20.0);
-    db.insert_segment(&segment).unwrap();
+    db.insert_segment_full(&segment).unwrap();
     let evidence_json = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -214,6 +248,9 @@ fn sample_segment(id: &str) -> SpeechSegment {
         duration_ms: 1200,
         speaker_id: Some("speaker_a".to_string()),
         verified: true,
+        // Gold-provenance law (2026-08-12): a human-verified clip carries a real decision — the
+        // bare `verified` flag alone no longer grades human gold, exactly as in production.
+        human_decision: Some("accept".to_string()),
         confidence: None,
         ctc_score: None,
         clipping_ratio: None,
@@ -313,6 +350,66 @@ fn assign_splits_reproducible_and_no_recording_leakage() {
             if let Some(prev) = spk_split.insert(spk, split) {
                 assert_eq!(prev, split, "speaker {spk} leaked across splits");
             }
+        }
+    }
+}
+
+#[test]
+fn diarizer_speaker_indices_do_not_collapse_every_recording_into_one_split() {
+    use std::collections::HashMap;
+    // MEASURED on the live library 2026-08-13, which is the shape this reproduces: a diarizer numbers
+    // speakers PER RECORDING, so `SPEAKER_00` appeared in 141 of 144 recordings while naming a
+    // different human in each. Union-ing on it as an identity chained every recording into ONE
+    // component holding 100% of the audio: everything went to `train` and validation and test came
+    // out EMPTY — with hf_speaker_disjoint = true, i.e. while the setting meant to protect the
+    // dataset was what destroyed the holdout, silently.
+    let mk = |id: &str, src: &str, spk: &str| SpeechSegment {
+        id: id.to_string(),
+        audio_path: format!("/data/{src}"),
+        speaker_id: Some(spk.to_string()),
+        duration_ms: 5000,
+        ..SpeechSegment::default()
+    };
+    let mut segs = Vec::new();
+    for r in 0..20 {
+        let src = format!("episode{r:02}.wav");
+        for i in 0..6 {
+            // Every recording contains a SPEAKER_00 and a SPEAKER_01, as real diarizer output does.
+            segs.push(mk(&format!("{src}-{i}"), &src, if i % 2 == 0 { "SPEAKER_00" } else { "SPEAKER_01" }));
+        }
+    }
+
+    let assigned = assign_splits(&segs, 0.8, 0.1, 0.1, 42, true);
+    let mut per_split: HashMap<&str, usize> = HashMap::new();
+    for (_, split) in &assigned {
+        *per_split.entry(*split).or_default() += 1;
+    }
+    assert_eq!(assigned.len(), segs.len(), "every segment must be assigned");
+    // The point of the test: a requested split must not be starved out of existence.
+    for split in ["train", "validation", "test"] {
+        assert!(
+            per_split.get(split).copied().unwrap_or(0) > 0,
+            "{split} split is EMPTY — per-recording diarizer labels collapsed the corpus into one \
+             group again; splits were {per_split:?}"
+        );
+    }
+
+    // A REAL speaker id must still bind recordings together, or this fix would have bought a working
+    // split by throwing away the disjointness it exists to provide.
+    let mut named: Vec<SpeechSegment> = Vec::new();
+    for (src, spk) in [("a.wav", "Hawzhin"), ("b.wav", "Hawzhin"), ("c.wav", "Sewa"), ("d.wav", "Rubar")] {
+        for i in 0..6 {
+            named.push(mk(&format!("{src}-{i}"), src, spk));
+        }
+    }
+    let d = assign_splits(&named, 0.8, 0.1, 0.1, 42, true);
+    let split_of: HashMap<&str, &str> = d.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+    let mut spk_split: HashMap<&str, &str> = HashMap::new();
+    for s in &named {
+        let spk = s.speaker_id.as_deref().unwrap();
+        let split = split_of[s.id.as_str()];
+        if let Some(prev) = spk_split.insert(spk, split) {
+            assert_eq!(prev, split, "named speaker {spk} leaked across splits");
         }
     }
 }
@@ -616,7 +713,7 @@ fn hf_export_persists_splits_only_after_a_successful_write() {
 
     let mut seg = sample_segment("hf-split-1");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
     assert!(db.get_segment_by_id("hf-split-1").unwrap().unwrap().split.is_none(), "split unset before export");
 
     let out_dir = tempfile::tempdir().unwrap();
@@ -665,10 +762,10 @@ fn hf_export_excludes_holdout_gold_audio_from_training() {
 
     let mut hseg = sample_segment("hold-1");
     hseg.audio_path = holdout_path.clone();
-    db.insert_segment(&hseg).unwrap();
+    db.insert_segment_full(&hseg).unwrap();
     let mut kseg = sample_segment("keep-1");
     kseg.audio_path = keep_path;
-    db.insert_segment(&kseg).unwrap();
+    db.insert_segment_full(&kseg).unwrap();
 
     // Register the holdout clip's source as a holdout gold reference.
     crate::eval::import_gold_segments(
@@ -744,7 +841,7 @@ fn exclude_holdout_excludes_a_missing_audio_segment_fail_closed() {
     // A training segment at a DIFFERENT path whose audio file does NOT exist.
     let mut seg = sample_segment("missing-1");
     seg.audio_path = tmp_dir.path().join("moved_away.wav").to_string_lossy().to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let kept = exclude_unexportable_segments(&db, vec![seg]).unwrap();
     assert!(
@@ -783,11 +880,11 @@ fn dataset_export_excludes_holdout_gold_audio_from_training_tables() {
     let mut hseg = sample_segment("hold-x");
     hseg.audio_path = holdout_path.clone();
     hseg.raw_transcript = "SECRETHOLDOUTREF".into();
-    db.insert_segment(&hseg).unwrap();
+    db.insert_segment_full(&hseg).unwrap();
     let mut kseg = sample_segment("keep-x");
     kseg.audio_path = keep_path;
     kseg.raw_transcript = "KEPTTRAININGTEXT".into();
-    db.insert_segment(&kseg).unwrap();
+    db.insert_segment_full(&kseg).unwrap();
 
     crate::eval::import_gold_segments(
         &db,
@@ -832,10 +929,10 @@ fn plain_export_excludes_holdout_gold_audio() {
     let keep_path = write_wav("keep.wav", 1000);
     let mut hseg = sample_segment("hold-1");
     hseg.audio_path = holdout_path.clone();
-    db.insert_segment(&hseg).unwrap();
+    db.insert_segment_full(&hseg).unwrap();
     let mut kseg = sample_segment("keep-1");
     kseg.audio_path = keep_path;
-    db.insert_segment(&kseg).unwrap();
+    db.insert_segment_full(&kseg).unwrap();
     crate::eval::import_gold_segments(
         &db,
         vec![crate::eval::GoldSegmentInput { audio_path: holdout_path, reference: "ref".into(), is_holdout: true }],
@@ -857,8 +954,8 @@ fn plain_export_excludes_human_rejected_segments() {
     let db_tmp = NamedTempFile::new().unwrap();
     let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
     db.initialize().unwrap();
-    db.insert_segment(&sample_segment("keep-1")).unwrap();
-    db.insert_segment(&sample_segment("bad-1")).unwrap();
+    db.insert_segment_full(&sample_segment("keep-1")).unwrap();
+    db.insert_segment_full(&sample_segment("bad-1")).unwrap();
     // Reviewer marks it bad: a human 'reject' decision (verdict=human_reject) while verified stays true.
     db.record_human_decision("bad-1", "reject", None, None).unwrap();
 
@@ -890,7 +987,7 @@ fn export_parquet_writes_valid_file() {
     let mut seg = sample_segment("pq-1");
     // Approximate (energy-heuristic) per-word timing — the marker Parquet must ship (audit P1 #8).
     seg.alignment_quality = Some("energy_heuristic".to_string());
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let out_tmp = NamedTempFile::new().unwrap();
     let out_path = out_tmp.path().with_extension("parquet");
@@ -922,7 +1019,7 @@ fn export_parquet_replaces_existing_file() {
     let db_tmp = NamedTempFile::new().unwrap();
     let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
     db.initialize().unwrap();
-    db.insert_segment(&sample_segment("pq-replace")).unwrap();
+    db.insert_segment_full(&sample_segment("pq-replace")).unwrap();
 
     let tmp_dir = tempfile::tempdir().unwrap();
     let out_path = tmp_dir.path().join("dataset.parquet");
@@ -1030,7 +1127,7 @@ fn export_huggingface_writes_dataset_files() {
 
     let mut seg = sample_segment("hf-1");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings::default();
@@ -1079,7 +1176,7 @@ fn hf_readme_provenance_lists_stored_model_version_not_export_day_setting() {
     let mut seg = sample_segment("hf-prov"); // gold + HF-exportable, so it is WRITTEN
     seg.audio_path = wav_path.to_string_lossy().to_string();
     seg.model_version_id = Some("omniasr-ctc-300m@sha-test".to_string());
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     // Default settings -> asr_model_size == WSL7B (the export-day value the OLD card printed).
@@ -1106,7 +1203,7 @@ fn export_huggingface_counts_dropped_missing_audio() {
     // A segment whose source audio simply does not exist on disk.
     let mut seg = sample_segment("missing-1");
     seg.audio_path = "/nonexistent/does_not_exist.wav".to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings::default();
@@ -1149,20 +1246,20 @@ fn export_huggingface_dropped_unavailable_counts_only_exportable_rows() {
     writer.finalize().unwrap();
     let mut present = sample_segment("hf-present");
     present.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&present).unwrap();
+    db.insert_segment_full(&present).unwrap();
 
     // One UNAVAILABLE source carrying BOTH a training-ready seg and a non-training-ready REVIEW seg.
     let missing_path = "/nonexistent/does_not_exist.wav".to_string();
     let mut missing_ready = sample_segment("missing-ready");
     missing_ready.audio_path = missing_path.clone();
-    db.insert_segment(&missing_ready).unwrap();
+    db.insert_segment_full(&missing_ready).unwrap();
     let mut missing_review = sample_segment("missing-review");
     missing_review.audio_path = missing_path.clone();
     missing_review.raw_transcript.clear();
     missing_review.normalized_transcript = None;
     missing_review.annotated_transcript = None;
     missing_review.verified = false;
-    db.insert_segment(&missing_review).unwrap();
+    db.insert_segment_full(&missing_review).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1198,7 +1295,7 @@ fn export_huggingface_skips_rows_not_ready_for_training() {
 
     let mut ready = sample_segment("hf-ready");
     ready.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&ready).unwrap();
+    db.insert_segment_full(&ready).unwrap();
 
     let mut reject = sample_segment("hf-reject");
     reject.audio_path = wav_path.to_string_lossy().to_string();
@@ -1206,7 +1303,7 @@ fn export_huggingface_skips_rows_not_ready_for_training() {
     reject.normalized_transcript = None;
     reject.annotated_transcript = None;
     reject.verified = false;
-    db.insert_segment(&reject).unwrap();
+    db.insert_segment_full(&reject).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1254,11 +1351,11 @@ fn hf_export_drops_a_withdrawn_recording_but_keeps_an_undeclared_one() {
 
     let mut kept = sample_segment("hf-kept");
     kept.audio_path = paths[0].to_string_lossy().to_string();
-    db.insert_segment(&kept).unwrap();
+    db.insert_segment_full(&kept).unwrap();
 
     let mut withdrawn = sample_segment("hf-withdrawn");
     withdrawn.audio_path = paths[1].to_string_lossy().to_string();
-    db.insert_segment(&withdrawn).unwrap();
+    db.insert_segment_full(&withdrawn).unwrap();
 
     let settings =
         crate::settings::AppSettings { hf_speaker_disjoint: false, ..crate::settings::AppSettings::default() };
@@ -1307,10 +1404,10 @@ fn hf_metadata_rows_are_ordered_deterministically_by_source_path() {
     // Insert the z-source segment FIRST (non-sorted insertion order).
     let mut sz = sample_segment("seg-from-z");
     sz.audio_path = wav_z.to_string_lossy().to_string();
-    db.insert_segment(&sz).unwrap();
+    db.insert_segment_full(&sz).unwrap();
     let mut sa = sample_segment("seg-from-a");
     sa.audio_path = wav_a.to_string_lossy().to_string();
-    db.insert_segment(&sa).unwrap();
+    db.insert_segment_full(&sa).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings {
@@ -1346,11 +1443,12 @@ fn export_huggingface_skips_machine_ready_rows_without_hypothesis_coverage() {
     weak.audio_path = wav_path.to_string_lossy().to_string();
     weak.verified = false;
     weak.annotated_transcript = None;
+    weak.human_decision = None; // a MACHINE row (sample_segment now models human gold)
     weak.confidence = Some(0.95);
     weak.clipping_ratio = Some(0.0);
     weak.rms_db = Some(-20.0);
     weak.snr_db = Some(20.0);
-    db.insert_segment(&weak).unwrap();
+    db.insert_segment_full(&weak).unwrap();
     let evidence_json = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -1382,7 +1480,7 @@ fn export_huggingface_skips_machine_ready_rows_without_hypothesis_coverage() {
     write_silent_wav(&companion_wav);
     let mut good = sample_segment("hf-good-companion");
     good.audio_path = companion_wav.to_string_lossy().to_string();
-    db.insert_segment(&good).unwrap();
+    db.insert_segment_full(&good).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1421,7 +1519,7 @@ fn export_huggingface_skips_machine_ready_rows_without_ready_agentic_report() {
     write_silent_wav(&companion_wav);
     let mut good = sample_segment("hf-good-companion");
     good.audio_path = companion_wav.to_string_lossy().to_string();
-    db.insert_segment(&good).unwrap();
+    db.insert_segment_full(&good).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1583,7 +1681,10 @@ fn export_huggingface_writes_machine_ready_rows_with_matching_ready_agentic_repo
 
     assert!(all_metadata.contains("hf-ready-agent-report"));
     assert!(all_metadata.contains("silver"));
-    assert!(all_metadata.contains("jury_verdict"));
+    // VERBATIM LAW: machine-ready silver rows ship the champion raw text, so the honest source
+    // label is raw_asr — a "jury_verdict" text source no longer exists anywhere.
+    assert!(all_metadata.contains("raw_asr"));
+    assert!(!all_metadata.contains("jury_verdict"));
 }
 
 #[test]
@@ -1609,7 +1710,7 @@ fn export_huggingface_replaces_metadata_files() {
 
     let mut seg = sample_segment("hf-atomic");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let train_dir = out_dir.path().join("data/train");
@@ -1668,7 +1769,7 @@ fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
     for id in ["orphan-seg", "keep-seg"] {
         let mut seg = sample_segment(id);
         seg.audio_path = wav_path.to_string_lossy().to_string();
-        db.insert_segment(&seg).unwrap();
+        db.insert_segment_full(&seg).unwrap();
     }
 
     let out_dir = tempfile::tempdir().unwrap();
@@ -1725,10 +1826,10 @@ fn hf_partial_reexport_keeps_a_consistent_snapshot_of_the_available_source() {
 
     let mut sa = sample_segment("seg-a");
     sa.audio_path = a_wav.to_string_lossy().to_string();
-    db.insert_segment(&sa).unwrap();
+    db.insert_segment_full(&sa).unwrap();
     let mut sb = sample_segment("seg-b");
     sb.audio_path = b_wav.to_string_lossy().to_string();
-    db.insert_segment(&sb).unwrap();
+    db.insert_segment_full(&sb).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1797,7 +1898,8 @@ fn hf_reexport_with_zero_training_ready_segments_preserves_the_prior_export() {
     let mut seg = sample_segment("not-ready-seg");
     seg.audio_path = wav_path.to_string_lossy().to_string();
     seg.verified = false;
-    db.insert_segment(&seg).unwrap();
+    seg.human_decision = None; // a MACHINE draft (sample_segment now models human gold)
+    db.insert_segment_full(&seg).unwrap();
     let stored = db.get_segment_by_id("not-ready-seg").unwrap().unwrap();
     assert!(
         !quality::training_grade_for_segment(&stored).training_ready,
@@ -1847,7 +1949,7 @@ fn hf_reexport_that_writes_zero_clips_because_all_sources_vanished_preserves_the
 
     let mut seg = sample_segment("vanish-seg");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings::default();
@@ -1932,7 +2034,7 @@ fn hf_metadata_csv_neutralizes_a_formula_lead_in_the_file_name_column() {
     write_silent_wav(&wav_path);
     let mut seg = sample_segment("hfdash");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default()).unwrap();
@@ -1965,7 +2067,7 @@ fn hf_export_failure_midway_preserves_the_prior_dataset() {
     write_silent_wav(&wav_path);
     let mut seg = sample_segment(&"x".repeat(300));
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment(&seg).unwrap();
+    db.insert_segment_full(&seg).unwrap();
 
     // A prior GOOD export already on disk.
     let out_dir = tempfile::tempdir().unwrap();
@@ -1983,4 +2085,198 @@ fn hf_export_failure_midway_preserves_the_prior_dataset() {
         !out_dir.path().join(".data-staging").exists(),
         "a failed export must clean up its staging tree, not litter the user's export directory"
     );
+}
+
+#[test]
+fn export_refuses_a_dataset_where_every_clip_collapsed_into_one_split() {
+    // A guard that has only been shown NOT to false-fire is not yet a guard. This forces the exact
+    // failure it exists for: plenty of independent recordings, but a grouping that merges them all,
+    // so train takes everything and the requested validation/test splits come out EMPTY. Shipping
+    // that is worse than failing, because a model then trains and "evaluates" on the same audio and
+    // nothing in the resulting numbers says so.
+    //
+    // The collapse is forced with a REAL shared speaker name (not a SPEAKER_nn diarizer index, which
+    // is now scoped per recording): six recordings that genuinely share one speaker are one
+    // leakage-safe component, which is correct behaviour — and undividable.
+    let db = crate::db::Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let audio_dir = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        let wav_path = audio_dir.path().join(format!("rec{i}.wav"));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for _ in 0..16000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut seg = sample_segment(&format!("collapse-{i}"));
+        seg.audio_path = wav_path.to_string_lossy().to_string();
+        seg.speaker_id = Some("Hawzhin".to_string()); // one real person across every recording
+        db.insert_segment_full(&seg).unwrap();
+    }
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let settings =
+        crate::settings::AppSettings { hf_speaker_disjoint: true, ..crate::settings::AppSettings::default() };
+    let result = export_huggingface_dataset(&db, out_dir.path(), &settings);
+
+    let err = result.expect_err("an export with empty validation AND test splits must FAIL, not ship");
+    let msg = err.to_string();
+    assert!(msg.contains("ONE split"), "the error must name the collapse: {msg}");
+    assert!(msg.contains("hf_speaker_disjoint"), "the error must tell the owner which setting to look at: {msg}");
+}
+
+/// The HuggingFace export against a REAL corpus, at real scale. `#[ignore]`d and opt-in: it needs a
+/// COPY of a populated library, given as `CORTEX_SCALE_DB`.
+///
+/// Why it exists: every other hf_* test here runs on 2-6 synthetic segments, so the export, the
+/// leakage-safe grouping and the empty-split guard had never met production scale. On 2026-08-15 the
+/// live corpus reached 14,828 clips across 179 recordings — the size at which the grouping either
+/// works or silently collapses everything into `train`. Attempting this through the app was a dead
+/// end: a second GUI instance cannot create a WebView2 (fixed user-data folder), so it must run
+/// headless, here.
+///
+///   set CORTEX_SCALE_DB=<copy of cortex-speech.db>
+///   cargo test --release --lib hf_export_at_real_corpus_scale -- --ignored --nocapture
+/// Distinct source recordings among the rows the export actually assigned a split to.
+fn assigned_recordings(db: &crate::db::Database) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for seg in db.get_segments(None).unwrap_or_default() {
+        if seg.split.is_some() {
+            seen.insert(seg.audio_path.rsplit(['/', '\\']).next().unwrap_or(&seg.audio_path).to_string());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+#[test]
+#[ignore]
+fn hf_export_at_real_corpus_scale() {
+    use std::collections::{HashMap, HashSet};
+    let Ok(db_path) = std::env::var("CORTEX_SCALE_DB") else {
+        eprintln!("CORTEX_SCALE_DB not set — skipping (this test needs a copy of a real library)");
+        return;
+    };
+    let db = crate::db::Database::open(&db_path).expect("open the corpus copy");
+    let segments = db.get_segments(None).expect("read segments");
+    println!("corpus under test: {} segments", segments.len());
+    assert!(segments.len() > 1000, "this is a SCALE test; {} segments is a fixture", segments.len());
+
+    let out = tempfile::tempdir().unwrap();
+    let settings =
+        crate::settings::AppSettings { hf_speaker_disjoint: true, ..crate::settings::AppSettings::default() };
+    let started = std::time::Instant::now();
+    export_huggingface_dataset(&db, out.path(), &settings).expect("export must succeed at scale");
+    println!("export took {:.1}s", started.elapsed().as_secs_f64());
+
+    // Every requested split populated — the collapse this guard exists for leaves val/test empty.
+    let rows = db
+        .connection()
+        .prepare("SELECT split, COUNT(*) FROM speech_segments WHERE split IS NOT NULL GROUP BY split")
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map(|it| it.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .expect("read split assignments");
+    let by_split: HashMap<String, i64> = rows.into_iter().collect();
+    println!("splits: {by_split:?}");
+
+    // WHAT THIS CAN AND CANNOT ASSERT. Splits are computed over every NON-REJECTED clip (see
+    // `exclude_unexportable_segments`), but only rows actually WRITTEN keep their split — and only
+    // human-decided clips are written. So on a corpus that is mostly unreviewed, the written rows can
+    // legitimately all carry one split: MEASURED 2026-08-15, 14,828 clips across 179 recordings, of
+    // which 454 were exportable and all three of their source recordings happened to land in `train`.
+    // That is review coverage, not a collapse, and asserting "all three splits populated" here would
+    // fail honestly-correct behaviour every time. The collapse case is covered by
+    // `export_refuses_a_dataset_where_every_clip_collapsed_into_one_split` and the production guard.
+    //
+    // What IS asserted: the export completes at scale, and no source recording straddles two splits —
+    // the leakage property, which must hold no matter how the material is distributed.
+    let split_count: i64 = by_split.values().sum();
+    assert!(split_count > 0, "the export wrote no splits at all: {by_split:?}");
+    println!(
+        "{} rows carry a split; exportable clips come from {} recording(s)",
+        split_count,
+        assigned_recordings(&db).len()
+    );
+
+    // No source recording may straddle two splits: that is the leak the grouping prevents, and the
+    // property most worth re-checking when the corpus grows.
+    let assigned = db.get_segments(None).expect("re-read");
+    let mut split_of_recording: HashMap<String, String> = HashMap::new();
+    let mut straddlers: HashSet<String> = HashSet::new();
+    for seg in &assigned {
+        let Some(split) = seg.split.as_deref() else { continue };
+        let rec = seg.audio_path.rsplit(['/', '\\']).next().unwrap_or(&seg.audio_path).to_string();
+        match split_of_recording.get(&rec) {
+            Some(prev) if prev != split => {
+                straddlers.insert(rec);
+            }
+            None => {
+                split_of_recording.insert(rec, split.to_string());
+            }
+            _ => {}
+        }
+    }
+    assert!(straddlers.is_empty(), "{} recording(s) leaked across splits: {straddlers:?}", straddlers.len());
+    println!("{} recordings, none straddling a split", split_of_recording.len());
+}
+
+#[test]
+fn three_unequal_recordings_still_fill_all_three_splits() {
+    use std::collections::HashMap;
+    // The exact shape of the owner's exportable corpus on 2026-08-15: three recordings holding
+    // 91.9% / 7.9% / 0.2% of the duration, every clip labelled by a per-recording diarizer index.
+    // The export produced train=454, validation=0, test=0 on this input; 91.9/7.9/0.2 is plainly
+    // achievable, so this test pins the achievable outcome rather than the observed one.
+    let mk = |id: &str, src: &str, spk: &str, dur: i64| SpeechSegment {
+        id: id.to_string(),
+        audio_path: format!("/data/{src}"),
+        speaker_id: Some(spk.to_string()),
+        duration_ms: dur,
+        ..SpeechSegment::default()
+    };
+    let mut segs = Vec::new();
+    for i in 0..415 {
+        segs.push(mk(&format!("big-{i}"), "big.flac", &format!("SPEAKER_0{}", i % 8), 9150));
+    }
+    for i in 0..38 {
+        segs.push(mk(&format!("mid-{i}"), "mid.flac", &format!("SPEAKER_0{}", i % 8), 8680));
+    }
+    segs.push(mk("tiny-0", "tiny.mp4", "SPEAKER_00", 6000));
+
+    let assigned = assign_splits(&segs, 0.8, 0.1, 0.1, 42, true);
+    let mut per: HashMap<&str, usize> = HashMap::new();
+    for (_, s) in &assigned {
+        *per.entry(*s).or_default() += 1;
+    }
+    println!("three-recording split: {per:?}");
+    for name in ["train", "validation", "test"] {
+        assert!(per.get(name).copied().unwrap_or(0) > 0, "{name} is EMPTY: {per:?}");
+    }
+}
+
+#[test]
+fn export_records_carry_the_source_dialect_and_never_guess_one() {
+    // Owner instruction 2026-08-16: KBHP is Hawleri, and the label rides every export format so the
+    // dataset can be split by dialect (the fairness work depends on it). An UNMAPPED source exports
+    // null — an absent label is honest, a guessed one poisons every per-dialect number downstream.
+    let mut kbhp = sample_segment("kbhp-clip");
+    kbhp.audio_path = r"D:\corpora\sorani-hawleri\KBHP\KBHP-EP07.wav".to_string();
+    let mut unmapped = sample_segment("mystery-clip");
+    unmapped.audio_path = r"D:\somewhere\nameless-recording.wav".to_string();
+
+    let records = export_records(&[kbhp, unmapped]);
+    let as_json: Vec<serde_json::Value> = records.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+
+    assert_eq!(as_json[0]["dialect"], "hawleri", "a mapped source must ship its dialect");
+    assert!(as_json[1]["dialect"].is_null(), "an unmapped source must ship null, never a guess");
+    // The label must come from the ORIGINAL path: by the time the record is serialized, audio_path
+    // has been sanitized to a basename for privacy, and folder-keyed corpora would lose their key.
+    assert_eq!(as_json[0]["audioPath"], "KBHP-EP07.wav", "path stays privacy-sanitized");
 }

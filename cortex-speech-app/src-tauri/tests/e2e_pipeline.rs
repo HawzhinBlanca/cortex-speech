@@ -183,7 +183,8 @@ fn test_e2e_health_check() {
     db.initialize().unwrap();
 
     let mgr = ModelManager::new(tmp.path().to_path_buf());
-    let health = health::health_check(&db, &mgr, None).unwrap();
+    let health =
+        health::health_check(&db, &mgr, &cortex_speech_app_lib::settings::AppSettings::default(), None).unwrap();
     assert!(
         health["status"] == "ok" || health["status"] == "models_needed",
         "Health status should be ok or models_needed"

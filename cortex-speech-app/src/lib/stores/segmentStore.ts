@@ -1,21 +1,18 @@
 import { writable, derived, get } from 'svelte/store';
 import type { SpeechSegment, WordTimestamp } from '../types';
 import * as api from '../commands';
-import { isHumanRejected, hasRealTranscript } from '../segmentQuality';
 import { dedupeById } from '../dedupeById';
 import { notifications } from './notificationStore';
 import { t } from '../i18n';
 
-// Fetch the whole library by walking every backend page. Page size is the backend's max (fewest
-// round-trips). MAX_LOAD is a defensive ceiling so a pathological library can't exhaust memory or
-// hang the load — it is far above any realistic personal review set, and when it IS hit we keep the
-// true `total` and flag the view truncated instead of silently hiding rows.
-const PAGE_SIZE = 500;
-const MAX_LOAD = 50_000;
+// A bounded render window. More rows are appended only as the virtual list approaches its end.
+const PAGE_SIZE = 200;
 
 function createSegmentsStore() {
   const { subscribe, set, update } = writable<SpeechSegment[]>([]);
   let loadSeq = 0;
+  let nextCursor: string | null = null;
+  let loadingMore = false;
   return {
     subscribe,
     set,
@@ -25,53 +22,29 @@ function createSegmentsStore() {
     },
     async load() {
       const seq = ++loadSeq;
-      // ALWAYS load the whole library — never bake the view filters (verified chip / search query)
-      // into the backend query. Every consumer treats this store AS the whole library and applies
-      // the filters client-side (filteredSegments, searchScopedSegments, segmentStats, export's
-      // verified filter), and background reloads fire while filters are active (batch/import
-      // completion, wsl-status, ReviewMode.ensureWordTimings) — a filtered reload silently
-      // replaced the library with a stale subset that every consumer then mis-derived from.
+      nextCursor = null;
+      loadingMore = false;
       const sort = get(sortOrder);
+      const verified = get(filterVerified);
+      const query = get(searchQuery).trim() || null;
       try {
-        const acc: SpeechSegment[] = [];
-        let cursor: string | null = null;
-        let total = 0;
-        // Walk EVERY page. The old code took only the first 300 rows, so any larger library silently
-        // dropped everything past 300 from review, lists, and every store-derived stat.
-        do {
-          const page = await api.getSegmentsPage({ verified: null, query: null, sort, limit: PAGE_SIZE, cursor });
-          if (seq !== loadSeq) return; // a newer load or a write superseded this run
-          total = page.total;
-          acc.push(...page.items);
-          cursor = page.nextCursor;
-          if (page.items.length === 0) break; // defensive: never spin on a non-null cursor + empty page
-        } while (cursor && acc.length < MAX_LOAD);
-        // Cross-page dedupe: the backend "cursor" is a plain OFFSET, so a concurrent insert (e.g. the
-        // import worker writing rows between page fetches under the newest-first sort) shifts rows
-        // down and the next page re-serves ones already accumulated. Duplicate ids in this store crash
-        // keyed {#each} consumers (each_key_duplicate) and double-count stats — dedupe is the fix at
-        // the SOURCE (keep-first preserves page order); VirtualList's own dedupe stays as belt-and-braces.
-        set(dedupeById(acc));
-        // A reload replaces every row, so an ACTIVE FTS search's frozen match-id set (computed against the
-        // PRE-reload library) is now stale: applySearchScope would keep filtering the fresh rows by it —
-        // hiding clips whose refined transcript newly matches the query and keeping ones that no longer do,
-        // in BOTH the curate filter and the review queue, until the user retypes. Drop the snapshot so the
-        // scope falls back to applySearchScope's LIVE substring predicate until the next keystroke re-runs
-        // FTS (this is the "reloads fire while filters are active" case documented above).
-        if (get(searchResults) !== null) searchResults.set(null);
-        libraryTotal.set(total);
-        const truncated = acc.length < total;
-        libraryTruncated.set(truncated);
-        if (truncated) {
-          // The store always holds an unfiltered prefix, so search/filter chips cannot pull in the
-          // dropped tail — say so honestly instead of advising a filter that won't change the load.
-          console.warn(
-            `Loaded ${acc.length} of ${total} segments (MAX_LOAD=${MAX_LOAD} reached). ` +
-              'Rows past the ceiling are not shown; libraryTruncated is set.',
-          );
-        }
-        // Refresh threshold after loading segments
-        await refreshConformalThreshold();
+        const page = await api.getSegmentsPage({
+          verified,
+          query,
+          sort,
+          limit: PAGE_SIZE,
+          cursor: null,
+        });
+        if (seq !== loadSeq) return;
+        set(dedupeById(page.items));
+        // Search is part of the server-side page scope now. Never retain a legacy frozen result set
+        // across a reload, because it can hide newly matching rows or retain stale matches.
+        searchResults.set(null);
+        nextCursor = page.nextCursor;
+        libraryTotal.set(page.total);
+        libraryTruncated.set(nextCursor !== null);
+        // Refresh corpus-wide metadata independently of the bounded list window.
+        await Promise.all([refreshConformalThreshold(), refreshSegmentStats()]);
         // A newer load (or a write) may have superseded this run DURING the awaited threshold refresh —
         // mirror the in-loop seq guard so a stale/older run cannot CLEAR a newer FAILED load's error
         // (which would silently drop the failure back to a "looks fine" state — the F1 bug, in a race).
@@ -90,13 +63,40 @@ function createSegmentsStore() {
         notifications.error(get(t)('notifications.loadSegmentsFailed'), { detail: msg });
       }
     },
+    async loadMore() {
+      if (loadingMore || !nextCursor) return;
+      const seq = loadSeq;
+      const cursor = nextCursor;
+      const sort = get(sortOrder);
+      const verified = get(filterVerified);
+      const query = get(searchQuery).trim() || null;
+      loadingMore = true;
+      try {
+        const page = await api.getSegmentsPage({ verified, query, sort, limit: PAGE_SIZE, cursor });
+        if (seq !== loadSeq) return;
+        update((current) => dedupeById([...current, ...page.items]));
+        nextCursor = page.nextCursor;
+        libraryTotal.set(page.total);
+        libraryTruncated.set(nextCursor !== null);
+      } catch (e) {
+        if (seq !== loadSeq) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        notifications.error(get(t)('notifications.loadSegmentsFailed'), { detail: msg });
+      } finally {
+        if (seq === loadSeq) loadingMore = false;
+      }
+    },
+    async hydrate(segmentId: string): Promise<SpeechSegment> {
+      const hydrated = await api.getSegment(segmentId);
+      update((current) => current.map((row) => (row.id === segmentId ? hydrated : row)));
+      return hydrated;
+    },
   };
 }
 
 export const segments = createSegmentsStore();
-// True backend row count for the current filter (may exceed segments.length only when MAX_LOAD is
-// hit). `libraryTruncated` = the loaded view is a prefix of a larger library — surface it, never
-// hide it. For any realistic personal library these are `segments.length` and `false`.
+// True backend row count for the current server-side filter. `libraryTruncated` means another
+// keyset page is available, not that rows were silently abandoned.
 export const libraryTotal = writable(0);
 export const libraryTruncated = writable(false);
 // P2.1: non-null when the LAST library load() failed (the backend error message). Cleared on the next
@@ -108,14 +108,8 @@ export const wordTimestamps = writable<WordTimestamp[]>([]);
 export const filterVerified = writable<boolean | null>(null);
 export const searchQuery = writable('');
 export const searchResults = writable<SpeechSegment[] | null>(null);
-export const searchLoading = writable(false);
 export type SortOrder =
-  | 'newest'
-  | 'oldest'
-  | 'duration'
-  | 'verified'
-  | 'confidence'
-  | 'activeLearning';
+  'newest' | 'oldest' | 'duration' | 'verified' | 'confidence' | 'activeLearning';
 export const sortOrder = writable<SortOrder>('newest');
 export const conformalThreshold = writable<number>(0.35);
 
@@ -220,32 +214,30 @@ export const filteredSegments = derived(
  */
 export const searchScopedSegments = derived(
   [segments, searchQuery, searchResults],
-  ([$segments, $searchQuery, $searchResults]) => applySearchScope($segments, $searchQuery, $searchResults),
+  ([$segments, $searchQuery, $searchResults]) =>
+    applySearchScope($segments, $searchQuery, $searchResults),
 );
 
-export const segmentStats = derived(segments, ($segments) => {
-  let verified = 0,
-    pending = 0,
-    withAnnotations = 0,
-    totalDurationMs = 0;
-  for (const s of $segments) {
-    // A human-rejected clip ("mark bad") carries verified=true only to leave the review queue — it is
-    // neither confirmed-good (verified) nor still-pending, so it counts toward neither bucket.
-    if (isHumanRejected(s)) {
-      // rejected: excluded from both verified and pending, still part of total
-    } else if (s.verified && hasRealTranscript(s)) {
-      verified++;
-    } else if (s.verified) {
-      // verified=true but NO real transcript — e.g. a placeholder clip ("[Pending WSL 7B ASR]") caught by
-      // "Verify all pending" (batch_verify has no content guard). It can't ship (export_dataset drops every
-      // placeholder/empty row via the training grade), and it is not pending-review (already marked verified),
-      // so — like a rejected clip — it counts toward NEITHER bucket, keeping the "verified" tally aligned with
-      // what the exported dataset can actually contain.
-    } else {
-      pending++;
-    }
-    if (s.annotatedTranscript) withAnnotations++;
-    totalDurationMs += s.durationMs;
-  }
-  return { total: $segments.length, verified, pending, withAnnotations, totalDurationMs };
+export const segmentStats = writable({
+  total: 0,
+  verified: 0,
+  pending: 0,
+  withAnnotations: 0,
+  totalDurationMs: 0,
 });
+
+export async function refreshSegmentStats() {
+  try {
+    const stats = await api.getDatasetStats();
+    if (!stats || !Number.isFinite(stats.totalSegments)) return;
+    segmentStats.set({
+      total: stats.totalSegments,
+      verified: stats.verifiedCount,
+      pending: stats.pendingCount,
+      withAnnotations: 0,
+      totalDurationMs: Math.round(stats.totalDurationSeconds * 1000),
+    });
+  } catch (error) {
+    console.error('Failed to load corpus statistics', error);
+  }
+}

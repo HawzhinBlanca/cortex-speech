@@ -42,7 +42,33 @@ $exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } else {
 }
 $dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
 $port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
-$probeUrl = "http://127.0.0.1:$port/"
+# TLS FIRST, then plain HTTP. Couch Review serves TLS on every interface with a self-signed
+# certificate it generates locally, so an http:// probe against it does not fail cleanly — it comes
+# back as "corrupt message of type InvalidContentType", which this script read as a DEAD PORT and
+# answered by force-killing a perfectly healthy app, every five minutes, forever.
+#
+# MEASURED 2026-08-16: exactly that. Three probes 5s apart, then a kill, then a relaunch, in a loop —
+# the watchdog became the outage it exists to prevent. Both schemes are tried because the same script
+# has to supervise an older HTTP build and the current TLS one.
+#
+# Certificate validation is disabled for THIS probe only: the certificate is self-signed by design
+# and this is a localhost liveness check, not an authentication decision. It reads no response body.
+$probeUrls = @("https://127.0.0.1:$port/", "http://127.0.0.1:$port/")
+try {
+    Add-Type -TypeDefinition @'
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public static class CortexProbeCerts {
+    public static void TrustAll() {
+        ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+    }
+}
+'@ -ErrorAction Stop
+    [CortexProbeCerts]::TrustAll()
+} catch {
+    # Already loaded in this session, or the type exists — either way the callback is set.
+}
 $logDir = Join-Path $dataDir 'logs'
 $log = Join-Path $logDir 'watchdog.log'
 
@@ -95,13 +121,19 @@ if ($Register) {
 # 20s clears busy_timeout with margin, and one answer out of three attempts is enough to prove life.
 $alive = $false
 foreach ($attempt in 1..3) {
-    try {
-        Invoke-WebRequest -Uri $probeUrl -UseBasicParsing -TimeoutSec 20 | Out-Null
-        $alive = $true   # 2xx/3xx
-    } catch {
-        # A status-carrying refusal (401 et al.) is the server ANSWERING — alive. Only a transport
-        # failure (refused, timeout, reset) leaves .Response empty and means dead.
-        if ($null -ne $_.Exception.Response) { $alive = $true }
+    foreach ($probeUrl in $probeUrls) {
+        try {
+            Invoke-WebRequest -Uri $probeUrl -UseBasicParsing -TimeoutSec 20 | Out-Null
+            $alive = $true   # 2xx/3xx
+        } catch {
+            # A status-carrying refusal (401 et al.) is the server ANSWERING — alive. Only a transport
+            # failure (refused, timeout, reset) leaves .Response empty and means dead.
+            if ($null -ne $_.Exception.Response) { $alive = $true }
+            # An SSL/content-type mismatch is ALSO the server answering — it spoke, we mis-heard it.
+            # Treating a protocol mismatch as death is what turned this watchdog into a kill loop.
+            elseif ($_.Exception.Message -match 'SSL|TLS|secure channel|corrupt message|InvalidContentType') { $alive = $true }
+        }
+        if ($alive) { break }
     }
     if ($alive) { break }
     if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
@@ -112,6 +144,30 @@ foreach ($attempt in 1..3) {
 # minutes forever. Reset the moment the server answers.
 $killCountFile = Join-Path $logDir 'watchdog-kills.txt'
 $maxConsecutiveKills = 3
+
+# STARTUP GRACE. A freshly launched app that has not opened 8737 YET is indistinguishable from a
+# wedged one by port alone — and the difference is the whole decision. Startup work scales with the
+# library: measured 2026-08-14 it took 8m16s to reach couch, and on 2026-08-15, after the library
+# tripled to 14,828 clips, it exceeded the 5-minute check interval entirely. The watchdog then killed
+# the app at 5 minutes, three times in a row, and the app never once got far enough to serve. A
+# watchdog that shortens startup until startup can never finish is a denial of service on its own app.
+#
+# 10 minutes. THE THING THIS WAS SIZED FOR NO LONGER EXISTS (2026-08-17). The grace was 45 minutes
+# because startup to couch measured 8m16s at ~500 clips and 18m11s at 14,828, and "it scales with the
+# library" was taken as a fact of life. It was one line: Database::backup paced the SQLite online
+# backup at 5 pages per 250 ms — 80 KB/s — and take_snapshot runs SYNCHRONOUSLY on the startup path,
+# so the whole delay was the app copying its own database at dial-up speed before opening the port.
+# Fixed there; MEASURED startup to couch afterwards: 6.4 SECONDS at 14,828 clips.
+#
+# So the generosity now costs what it was buying. At 45 minutes a genuinely wedged app sits unnoticed
+# for three quarters of an hour — and the old comment's claim that being slow "costs ONE extra check
+# cycle" was never true. 10 minutes is ~90x the measured startup, which is ample headroom for a much
+# larger library or a busy disk, while cutting the worst case for a wedged app by more than four
+# times. The kill path still works for anything older than this.
+# Overridable so the decision tests can exercise BOTH sides: 0 makes every process instantly
+# "old enough" to reach the kill path, which is the only way to test the kill path without waiting
+# 20 real minutes.
+$startupGraceMinutes = if ($env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN) { [double]$env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN } else { 10 }
 
 if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
@@ -153,6 +209,14 @@ if (-not (Test-Path $session)) {
     # start failure (something else holding 8737), and load_session refuses a session whose db_path
     # moved — both leave the file on disk with the port dead and the app running, forever. Killing
     # then never helps and the app dies every five minutes, losing in-flight work each time.
+    # Youngest instance decides: if ANY matching process is still inside its startup grace, the port
+    # being closed is expected, not evidence of a wedge.
+    $youngestMin = ($proc | ForEach-Object { ((Get-Date) - $_.StartTime).TotalMinutes } | Measure-Object -Minimum).Minimum
+    if ($youngestMin -lt $startupGraceMinutes) {
+        Report ("starting-up ({0:N1} min old, grace {1} min)" -f $youngestMin, $startupGraceMinutes)
+        Write-Log ("port not open yet but the app is only {0:N1} min old (grace {1} min) - leaving it alone to finish starting" -f $youngestMin, $startupGraceMinutes)
+        exit 0
+    }
     $kills = 0
     if (Test-Path $killCountFile) { $kills = [int]((Get-Content $killCountFile -TotalCount 1).Trim()) }
     if ($kills -ge $maxConsecutiveKills) {

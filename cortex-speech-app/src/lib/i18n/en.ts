@@ -29,6 +29,8 @@ export const en: Record<string, string> = {
   speakers: 'Speakers',
   merge: 'Merge',
   reviewInbox: 'Review Inbox',
+  resizeSegmentsPanel: 'Resize segments panel',
+  resizeStatsPanel: 'Resize statistics panel',
   emptyStateHint: 'Import a folder or open a single file to start transcribing.',
   'nav.curate': 'Curate',
   'nav.insights': 'Insights',
@@ -150,9 +152,11 @@ export const en: Record<string, string> = {
   // down, the app asks the owner instead of silently using a smaller model.
   'asr.championUnavailableTitle': 'OmniASR-7B champion unavailable',
   'asr.championUnavailableMessage':
-    "The OmniASR-7B champion (the best model) isn't responding — its server may be down. Start it and try again, or transcribe this one clip with the offline model. The app never silently uses a smaller model in its place.",
+    "The fine-tuned OmniASR-7B champion isn't responding — its server may be down or busy. Restore the champion service, then try again. This production flow will not substitute a smaller model.",
   'asr.tryAgain': 'Try 7B again',
   'asr.useOfflineModel': 'Use offline model',
+  'asr.reopenBeforeRetranscribe':
+    'This clip already has a human decision. Undo or reopen that review first; ASR will not overwrite reviewed text.',
   'review.markBad': 'Mark bad',
   'review.markBadTitle':
     'Flag this clip as bad — excluded from export, kept so you can re-transcribe later.',
@@ -161,7 +165,8 @@ export const en: Record<string, string> = {
   'review.searchScope':
     'Reviewing a search subset: {n} of {m} clips — clear the search to review everything.',
   'review.searchScopeEmpty': 'No clips match the current search — clear it to review everything.',
-  'review.waveformFailed': "Couldn't read this clip's audio — the waveform is unavailable, not silent.",
+  'review.waveformFailed':
+    "Couldn't read this clip's audio — the waveform is unavailable, not silent.",
   'review.undoFailed': 'Undo failed',
   'review.undoLast': 'Undo review',
   'review.retranscribeVerifiedTitle': 'Replace a verified transcript?',
@@ -205,7 +210,6 @@ export const en: Record<string, string> = {
   'reviewCorrect.ctaOne': '1 clip is ready for you to review and correct.',
   'reviewCorrect.start': 'Start reviewing',
   'reviewCorrect.dismiss': 'Dismiss',
-  'reviewCorrect.allDone': 'All clips reviewed — nice work!',
 
   // ── Review Inbox (escalation adjudication panel) ──
   'inbox.runJury': 'Run Jury',
@@ -217,11 +221,16 @@ export const en: Record<string, string> = {
   'inbox.autonomy.propose': 'Propose',
   'inbox.autonomy.actConfirm': 'Act+Confirm',
   'inbox.autonomy.actAuto': 'Act Auto',
+  'inbox.localOnly': 'Local only',
+  'inbox.localOnlyTitle':
+    'Cloud T2 (Gemini) escalation is off in Settings. This run stays fully local (T0/T1); contested segments go to your inbox and no audio leaves your machine.',
   'inbox.close': 'Close inbox',
   'inbox.loadingQueue': 'Loading escalation queue…',
   'inbox.zero': 'Inbox zero!',
   'inbox.zeroHint': 'No segments need review right now.',
   'inbox.refresh': 'Refresh',
+  'inbox.retry': 'Try again',
+  'inbox.loadErrorTitle': 'Could not load the review queue',
   'inbox.queue': 'Queue ({n})',
   'inbox.segmentQueue': 'Segment queue',
   'inbox.hypotheses': 'Transcription hypotheses',
@@ -284,7 +293,6 @@ export const en: Record<string, string> = {
   localeToggle: 'Switch language',
   models: 'AI Models',
   'models.downloadAll': 'Download All',
-  'models.downloaded': 'Downloaded',
   'models.notDownloaded': 'Not downloaded',
   'pipeline.importing': 'Importing...',
   'pipeline.referenceTranscribing': 'Building reference transcript...',
@@ -298,7 +306,6 @@ export const en: Record<string, string> = {
   'pipeline.progressCount': '{done}/{total} chunks',
   'pipeline.elapsed': 'elapsed {time}',
   'pipeline.eta': '~{time} left',
-  'inference.title': 'Inference Stats',
   'inference.vad': 'VAD',
   'inference.asr': 'ASR',
   'inference.calls': 'calls',
@@ -327,7 +334,8 @@ export const en: Record<string, string> = {
   // Audit 2026-08-05 #6: this used to read "dataset looks good!" while the same corpus had 0
   // exportable rows. Validation checks integrity, NOT export eligibility — the readiness verdict is
   // a different question with a different answer, and this panel must not answer it.
-  'validation.allClear': 'No validation issues found. This is not export readiness — see the readiness verdict in Insights.',
+  'validation.allClear':
+    'No validation issues found. This is not export readiness — see the readiness verdict in Insights.',
   'validation.rerun': 'Re-run validation',
   'validation.failed': 'Validation failed',
   'validation.goToSegment': 'Go to segment',
@@ -392,7 +400,6 @@ export const en: Record<string, string> = {
   'batchVerify.selected': 'Verify Selected',
   'batchVerify.progress': 'Verifying {n}...',
   'batchVerify.status': '{current}/{total}',
-  'batchVerify.success': 'Verified {count} segment(s)',
   'batchVerify.failed': 'Batch verify failed',
   'batchVerify.noSelection': 'Select a segment first',
   'batchVerify.nothingToVerify': 'No pending segments to verify',
@@ -488,7 +495,7 @@ export const en: Record<string, string> = {
   'stats.relinkDone': 'Relinked {n} file(s); {m} still missing.',
   'stats.relinkFailed': 'Relink failed',
   'settings.cloudSttConsent':
-    "Cloud transcription (ElevenLabs Scribe). When on, importing a file sends its audio to ElevenLabs and uses Scribe's transcript instead of the local model — one API call per file. Requires an ElevenLabs key in secrets.env. Keep this off for fully offline dataset work.",
+    'Optional manual ElevenLabs Scribe tools. When on, per-segment Scribe re-transcribe and vote actions are shown; imports still use only the OmniASR-7B champion. Using an action sends only that selected clip to ElevenLabs. Requires an ElevenLabs key in secrets.env. Leave this off if you do not need it.',
   'settings.cloudLlmConsent':
     'I understand Gemini sends transcript text to Google. Keep this disabled for fully offline dataset work.',
   'settings.juryT2ConsentLead': 'I understand',
@@ -633,8 +640,6 @@ export const en: Record<string, string> = {
   'agentReport.loadFailed': 'Failed to load agent report',
   'agentReport.stageLoadFailed': 'Failed to load agent stage log',
   'shortcuts.none': 'No shortcuts registered',
-  'shortcuts.closeHint': 'Press {key} to close',
-  'shortcuts.esc': 'Esc',
   'notifications.loadSegmentsFailed': 'Failed to load segments',
   'notifications.undoInReview': 'Press Backspace to undo the last review decision',
   'notifications.snapshotFailing':
@@ -707,8 +712,23 @@ export const en: Record<string, string> = {
     "Rename '{source}' to '{target}'? '{target}' already exists ({n} segments) — this MERGES both speakers into one and cannot be undone.",
   // Audio player
   'audio.loadFailed': 'Failed to load audio file',
+  'audio.seek': 'Seek audio',
+  'audio.controls': 'Audio player controls',
+  'audio.play': 'Play',
+  'audio.pause': 'Pause',
+  'audio.playbackSpeed': 'Playback Speed',
+  'audio.loopToggle': 'Toggle Loop Playback',
+  'audio.loopOn': 'Loop On',
+  'audio.loopOff': 'Loop Off',
+  'audio.loopFailed': 'Loop playback failed',
+  'audio.playbackFailed': 'Playback was blocked or the file could not be found',
   // Command palette
   'cmdk.noMatches': 'No matching commands',
+  'cmdk.title': 'Command palette',
+  'cmdk.search': 'Search commands…',
+  'cmdk.navigate': 'navigate',
+  'cmdk.run': 'run',
+  'cmdk.count': '{n} commands',
   // History panel
   'history.stack': 'History Stack',
   'history.noEdits': 'No edits in this session',
@@ -742,8 +762,6 @@ export const en: Record<string, string> = {
   'wsl.startFailed': 'Failed to start WSL refinement process',
   'wsl.cancelFailed': 'Failed to cancel WSL refinement',
   'wsl.logsCopied': 'Console logs copied to clipboard',
-  'wsl.batchComplete': 'WSL Local 7B ASR Batch transcription complete!',
-  'wsl.batchCancelled': 'WSL Local 7B ASR transcription was cancelled.',
   'wsl.stillRunning': 'Refinement is still running. Please cancel or wait for it to complete.',
   // Settings panel labels
   'settings.autoplaySegments': 'Autoplay Segments on Selection',
@@ -751,11 +769,14 @@ export const en: Record<string, string> = {
   'settings.couchStart': 'Start',
   'settings.couchWifiUrl': 'Same Wi-Fi:',
   'settings.couchTailscaleUrl': 'From anywhere (Tailscale — your devices only, encrypted):',
+  'settings.couchTlsFingerprint': 'TLS certificate SHA-256 fingerprint',
+  'settings.couchTlsFingerprintHint':
+    'On first connection, verify the certificate fingerprint shown by your phone matches this trusted desktop value before accepting it.',
   'settings.couchStop': 'Stop',
   'settings.couchHint':
-    'Serve a review page to your phone over your home network only. Off by default; a new random access token every session; audio never leaves your network.',
+    'Serve an encrypted, paired review page to your phone. Off by default; every reviewer gets a private pairing link and audio never leaves the selected network path.',
   'settings.couchRunningHint':
-    'Open this URL on your phone (same Wi-Fi). Stop the server when done — the link stops working immediately.',
+    'Open the HTTPS URL and verify its certificate fingerprint during first pairing. Stop revokes every pairing link and active session immediately.',
   'settings.couchFailed': 'Couch Review failed',
   'settings.couchReviewers': 'Reviewer names (comma-separated)',
   'settings.couchReviewersPlaceholder': 'e.g. Sara, Hemn — leave blank to review alone',
@@ -782,4 +803,58 @@ export const en: Record<string, string> = {
   'settings.geminiApiKey': 'Gemini API Key',
   'settings.geminiModel': 'Gemini Model',
   'settings.llmEngine': 'LLM Engine',
+  'settings.aiTab': 'AI Post-Processing',
+  'settings.juryTab': '📬 Listening Jury',
+  'settings.aiTitle': 'Dual-Pass Transcription (LLM Refiner)',
+  'settings.aiDescription':
+    'Use a local LLM by default. Cloud providers are opt-in and send transcript text to the provider.',
+  'settings.externalAsrScriptHint':
+    'Required only for the WSL 7B provider. Use a path visible inside WSL.',
+  'settings.llmDisabledOption': 'Disabled (fastest)',
+  'settings.llmLocalOption': 'Local API (for example, LM Studio or Ollama)',
+  'settings.llmCloudOption': 'Google Gemini 3.1 Pro (cloud)',
+  'settings.localEndpointHint': 'Must be an OpenAI-compatible /v1/chat/completions endpoint.',
+  'settings.quickSelect': 'Quick select:',
+  'settings.apiKeySaved': 'key saved',
+  'settings.apiKeyMissing': 'no key yet',
+  'settings.savingKey': 'Saving…',
+  'settings.saveKey': 'Save key',
+  'settings.apiKeyStorageHint':
+    'Saved to secrets.env with DPAPI encryption. The badge above reflects saved providers, not text currently in this field; it confirms that the key was stored.',
+  'settings.apiKeySavedToast': '{provider} key saved to secrets.env',
+  'settings.apiKeyClearedToast': '{provider} key cleared',
+  'settings.apiKeySaveFailedToast': 'Failed to save {provider} key',
+  'settings.geminiProRecommended': 'Gemini 2.5 Pro (recommended)',
+  'settings.geminiFlash': 'Gemini 2.5 Flash',
+  'settings.systemPromptHint': 'Instructions sent to the LLM to process the transcription.',
+  'settings.juryTitle': '📬 Listening Jury',
+  'settings.juryDescription':
+    'The Jury routes segments from IRT consensus (T0) to text analysis (T1), Gemini audio review (T2), then the human inbox. Cloud tiers send audio to Google and require opt-in.',
+  'settings.autonomyHint':
+    'Observe: the Jury runs, but people make every decision. Act Auto: the Jury commits decisions without review (requires a high T1 threshold).',
+  'settings.juryT1Threshold': 'T1 commit threshold',
+  'settings.juryT1ThresholdHint':
+    'Segments below this combined lexicon and perplexity score escalate to T2. Raise it to reduce cloud calls.',
+  'settings.juryModelLabel': 'Gemini model (T2 audio judge)',
+  'settings.modelProRecommended': '2.5 Pro (recommended)',
+  'settings.modelFlashFaster': '2.5 Flash (faster)',
+  'settings.sourceModelsBoth': '2.5 Pro + Flash',
+  'settings.sourceModelsProOnly': '2.5 Pro only',
+  'settings.selfConsistencyLabel': 'Self-consistency N',
+  'settings.selfConsistencyHint':
+    'Votes per segment. 3 is a majority vote. Higher values improve reliability but use more API calls.',
+  'settings.juryCloudDisabled':
+    'The T2 Gemini audio judge is disabled. Enable cloud opt-in above to configure it.',
+  'settings.jurySharedKeyHint':
+    'Shared with the AI Post-Processing tab. Stored in secrets.env with DPAPI encryption. The previous field wrote to settings.json, which is cleared on load, so keys entered there were silently lost.',
+  'settings.juryConnection': 'Judge connection',
+  'settings.juryConnectionGemini': 'Google direct (Gemini API key)',
+  'settings.juryConnectionOpenRouter': 'OpenRouter (same Gemini 2.5 Pro; OpenRouter key)',
+  'settings.juryPolicyLead': 'Cloud ASR judge policy:',
+  'settings.juryPolicyModel': 'Gemini 2.5 Pro only',
+  'settings.juryPolicyDetail':
+    '— the only cloud model verified usable for Sorani (Qwen and similar models are not). OpenRouter reaches the same model with its own key and quota.',
+  'settings.openRouterApiKey': 'OpenRouter API key',
+  'settings.openRouterKeyHint':
+    'Stored locally in secrets.env (the app data folder), never logged or shown again, and sent only to OpenRouter. Save an empty field to remove the key.',
 };

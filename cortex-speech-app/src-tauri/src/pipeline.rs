@@ -11,6 +11,7 @@ use crate::models::ModelManager;
 use crate::normalizer::SoraniNormalizer;
 use crate::settings::AppSettings;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,51 @@ pub struct TranscriptionDraft {
     pub confidence_source: Option<String>,
     pub model_version_id: Option<String>,
     pub cloud_call: bool,
+}
+
+/// A primary transcript that was already computed for this exact PCM during the current operation.
+/// Multi-engine hypothesis population may reuse it only for the identical model id; every independent
+/// voter still runs normally.
+#[derive(Clone, Copy)]
+struct PrimaryHypothesis<'a> {
+    model_id: &'a str,
+    transcript: &'a str,
+    confidence: Option<f64>,
+}
+
+impl<'a> PrimaryHypothesis<'a> {
+    fn from_segment(segment: &'a SpeechSegment) -> Option<Self> {
+        let model_id = segment.model_version_id.as_deref()?;
+        let transcript = segment.raw_transcript.as_str();
+        // An empty transcript can be a genuine completed decode (for example, non-speech). Keep it
+        // as completion provenance so the same deterministic model is not run again, but do not
+        // insert it as jury evidence below. Explicit unavailable/not-run results remain retryable.
+        if crate::quality::is_placeholder_transcript(transcript)
+            || matches!(segment.confidence_source.as_deref(), Some("not_available" | "not_run"))
+        {
+            return None;
+        }
+        Some(Self { model_id, transcript, confidence: segment.confidence })
+    }
+}
+
+fn reuse_primary_or_infer<E>(
+    primary: Option<PrimaryHypothesis<'_>>,
+    candidate_model_id: &str,
+    infer: impl FnOnce() -> Option<Result<(String, Option<f64>), E>>,
+) -> Option<Result<(String, Option<f64>), E>> {
+    if let Some(primary) = primary.filter(|primary| primary.model_id == candidate_model_id) {
+        return if primary.transcript.trim().is_empty() {
+            None
+        } else {
+            Some(Ok((primary.transcript.to_string(), primary.confidence)))
+        };
+    }
+    infer()
+}
+
+fn auxiliary_hypotheses_enabled(settings: &AppSettings) -> bool {
+    settings.multi_engine_hypotheses && settings.asr_model_size != crate::settings::AsrModelSize::WSL7B
 }
 
 #[derive(Debug, Clone)]
@@ -286,17 +332,96 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
     Ok((raw_transcript, confidence))
 }
 
-/// Serializes ALL WSL-7B client spawns process-wide. The champion server is a single-threaded accept
-/// loop, so concurrent app-side callers (an import's per-segment pass, the batch refinement loop, a UI
-/// re-transcribe) would queue on the socket and blow through their client/app timeouts CUMULATIVELY —
-/// misread as "server not running" and rolling back a HEALTHY import. Serializing here means each
-/// request waits its turn, then gets its FULL fresh timeout budget once it actually runs.
-static WSL_7B_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Bounds concurrent WSL-7B client spawns process-wide.
+///
+/// WHY A BOUND AT ALL: concurrent app-side callers (an import's per-segment pass, the batch loop, a
+/// UI re-transcribe) queue on the server socket and blow through their client/app timeouts
+/// CUMULATIVELY — misread as "server not running" and rolling back a HEALTHY import. Each admitted
+/// request gets its FULL fresh timeout budget once it actually runs.
+///
+/// WHY NOT ONE: this was a plain Mutex, admitting exactly one request, on the premise that "the
+/// champion server is a single-threaded accept loop". That stopped being true — `cortex_7b_server.py`
+/// PRE-FORKS one full replica per GPU, all accept()ing on a shared socket, precisely so two requests
+/// can run at once (it chose processes over threads because two replica THREADS measured only 1.10x
+/// on 2 GPUs, GIL-bound). A one-permit gate meant the second GPU could never receive work: measured
+/// 2026-08-11, a batch with 8 workers still ran 23.1 s/clip — the 7B's own serial time — with both
+/// cards at 19% and 12%.
+///
+/// Default 1 keeps the previous behaviour exactly; set CORTEX_7B_CONCURRENCY to the server's replica
+/// count. Never set it ABOVE that: extra admitted requests just queue on the socket, which is the
+/// cumulative-timeout failure this gate exists to prevent.
+static WSL_7B_GATE: Wsl7bGate = Wsl7bGate::new();
+
+/// What one segment's champion attempts concluded — decided WITHOUT the shared `Database`, so a
+/// whole wave of them can run at once. `transcribe` opens its OWN connection per call, which is
+/// what makes this safe: each thread writes through its own SQLite handle rather than sharing the
+/// caller's.
+enum ChampionAttempt {
+    /// A usable transcript came back and `transcribe` stored it.
+    Drafted,
+    /// Reachable server, no words after every retry — a silent/music chunk. Escalate THIS segment
+    /// only; never roll the file back, or the good transcripts for its other chunks are discarded.
+    Empty(String),
+    /// The client exited non-zero: server down, hung, or errored. Fatal for a force-7B import.
+    Infra(String),
+}
+
+/// Permitted concurrent 7B requests. Clamped to 1..=8; anything unusable falls back to 1, the safe
+/// end — an over-admitting gate reintroduces the timeout blowout, an under-admitting one is merely slow.
+fn wsl_7b_concurrency() -> usize {
+    parse_wsl_7b_concurrency(std::env::var("CORTEX_7B_CONCURRENCY").ok().as_deref())
+}
+
+fn parse_wsl_7b_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok()).filter(|n| (1..=8).contains(n)).unwrap_or(1)
+}
+
+/// A counting semaphore over `wsl_7b_concurrency()` permits (std has none; Mutex + Condvar is the
+/// stdlib spelling). The limit is read on each acquire so the env var takes effect without a restart.
+struct Wsl7bGate {
+    in_flight: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl Wsl7bGate {
+    const fn new() -> Self {
+        Self { in_flight: std::sync::Mutex::new(0), released: std::sync::Condvar::new() }
+    }
+
+    /// Blocks until a permit is free. Poison-tolerant like every other lock in this crate.
+    fn acquire(&self) -> Wsl7bPermit<'_> {
+        let limit = wsl_7b_concurrency();
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *in_flight >= limit {
+            in_flight = self.released.wait(in_flight).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *in_flight += 1;
+        Wsl7bPermit { gate: self }
+    }
+}
+
+/// Releases its permit on drop, so an early return or a panic mid-request cannot leak one and
+/// permanently shrink the gate.
+struct Wsl7bPermit<'a> {
+    gate: &'a Wsl7bGate,
+}
+
+impl Drop for Wsl7bPermit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.gate.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        self.gate.released.notify_one();
+    }
+}
 
 /// The port the OmniASR-7B warm server listens on inside WSL. SINGLE source of truth — shared by the
 /// preflight probe AND passed to the client via `CORTEX_7B_PORT`, so the app, client, and server can't
 /// drift (a mismatch would even green-light the preflight against the wrong service).
 pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+/// Stable provenance id for the owner's sole production ASR. Keep selection, persisted hypotheses,
+/// review filtering, and health/readiness checks tied to one identifier so an auxiliary model can
+/// never be mistaken for the champion by string drift between subsystems.
+pub(crate) const CHAMPION_MODEL_ID: &str = "omniasr-wsl-7b";
 
 /// Stable marker in the Err that `transcribe()` returns for a legit-but-EMPTY 7B result — a REACHABLE
 /// server that produced no words (a silent/music/noise clip), which parse_wsl_segment_result surfaces as
@@ -307,15 +432,14 @@ pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.
 pub(crate) const WSL_7B_EMPTY_RESULT_MARKER: &str = "WSL 7B returned an empty transcript";
 
 /// Machine-readable sentinel embedded in every "the OmniASR-7B champion is the selected primary
-/// engine but it is unavailable / failed" error. The frontend matches on this token to offer the
-/// user an EXPLICIT choice — retry the champion once its server is up, or transcribe this one clip
-/// with the offline model — instead of a dead-end error. The app NEVER silently substitutes a
-/// smaller model on the primary path; a small-model transcript is produced only on a deliberate
-/// user action. Keep the value in sync with `ASR_7B_UNAVAILABLE_TAG` in `src/lib/commands.ts`.
+/// engine but it is unavailable / failed" error. The frontend matches on this token to offer one
+/// safe recovery: restore the champion service and retry. The app NEVER silently substitutes a
+/// smaller model on the primary path. Keep the value in sync with `ASR_7B_UNAVAILABLE_TAG` in
+/// `src/lib/commands.ts`.
 pub(crate) const ASR_7B_UNAVAILABLE_TAG: &str = "E_ASR_7B_UNAVAILABLE";
 
 /// Wrap a primary-7B transcription failure so the UI can classify it (see [`ASR_7B_UNAVAILABLE_TAG`])
-/// and present the retry-or-offline choice. Preserves the original actionable text.
+/// and present the champion-retry recovery. Preserves the original actionable text.
 pub(crate) fn tag_7b_unavailable(err: AppError) -> AppError {
     let msg = err.to_string();
     if msg.contains(ASR_7B_UNAVAILABLE_TAG) {
@@ -400,9 +524,9 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     db_path: &str,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> AppResult<(String, Option<f64>)> {
-    // Hold the process-wide gate for the whole spawn+wait so cross-path 7B calls never collide on the
-    // single-threaded server. Poison-tolerant like every other lock in this crate.
-    let _gate = WSL_7B_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Hold a permit for the whole spawn+wait so no more 7B calls are in flight than the server has
+    // replicas to serve them. Released on drop, including on an early return.
+    let _gate = WSL_7B_GATE.acquire();
 
     let mut cmd = std::process::Command::new("wsl");
     // Pass the DB path + port to the client via `env` (WSL does not propagate Windows env into Linux),
@@ -541,9 +665,29 @@ fn agent_stage(
     }
 }
 
-fn multi_model_hypothesis_stage(db: &Database, file: impl Into<String>, segments: &[SpeechSegment]) -> PipelineEvent {
+fn multi_model_hypothesis_stage(
+    db: &Database,
+    settings: &crate::settings::AppSettings,
+    file: impl Into<String>,
+    segments: &[SpeechSegment],
+) -> PipelineEvent {
     let file = file.into();
     let total = segments.len().max(1);
+
+    // The production champion is intentionally single-engine. Requiring two auxiliary ASRs here made
+    // a healthy 7B import look blocked and encouraged silent 300M/1B/MMS execution solely to satisfy a
+    // metric. Training-grade multi-model proof remains enforced in its dedicated export gates; it is
+    // simply not a requirement of the champion transcription/review flow.
+    if settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+        return agent_stage(
+            "multi_model_hypotheses",
+            "not_required",
+            file,
+            "Champion-only mode: the fine-tuned OmniASR 7B transcript is sent to human review; auxiliary ASR coverage is not required or executed",
+            segments.len(),
+            total,
+        );
+    }
     if segments.is_empty() {
         return agent_stage(
             "multi_model_hypotheses",
@@ -655,7 +799,7 @@ impl LiveConsent {
     fn cloud_llm(&self) -> bool {
         self.cloud_llm.load(Ordering::SeqCst)
     }
-    fn cloud_stt(&self) -> bool {
+    pub fn cloud_stt(&self) -> bool {
         self.cloud_stt.load(Ordering::SeqCst)
     }
     fn jury_cloud(&self) -> bool {
@@ -735,11 +879,26 @@ impl ProcessingPipeline {
         }
     }
 
+    /// The shared live-consent handle, for work that runs on a blocking thread and therefore cannot
+    /// hold `AppState`. A long-running upload loop must re-read consent per item: withdrawing it is a
+    /// STOP instruction, and a batch that checked once at its start keeps uploading after the user
+    /// has switched cloud off (audit 2026-08-06; the same shape recurred in the Scribe vote batch).
+    pub fn consent_handle(&self) -> Arc<LiveConsent> {
+        Arc::clone(&self.consent)
+    }
+
     pub fn update_settings(&mut self, settings: AppSettings) {
-        // Consent FIRST, and through the shared Arc so it reaches clones already running an import.
-        // The snapshot swap below is visible only to this instance; that is fine for preferences and
-        // was the bug for consent.
-        self.consent.apply(&settings);
+        // Fail-safe in BOTH directions, which needs two different mechanisms:
+        //
+        // WITHDRAWAL is a stop instruction, so it is applied to the SHARED handle and reaches every
+        // clone already running an import or an upload batch. That is the 2026-08-06 audit fix.
+        //
+        // GRANTING must NOT reach those clones: a run the user began understanding nothing would
+        // leave the machine must stay offline for its whole length. So instead of raising the shared
+        // flags, this instance is handed a FRESH handle. Clones keep the one they started with —
+        // which `revoke_consent_now` can still lower, but nothing can raise.
+        self.revoke_consent_now(&settings);
+        self.consent = Arc::new(LiveConsent::from_settings(&settings));
         self.settings = Arc::new(settings);
     }
 
@@ -783,61 +942,96 @@ impl ProcessingPipeline {
 
     /// Pre-load the pooled Meta OmniASR CTC recognizer.
     pub fn warmup_asr(&self) -> Result<(), String> {
-        if self.should_use_wsl_primary_asr() {
+        if self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
             tracing::info!("WSL 7B model selected: skipping local ONNX ASR pool warm-up.");
             return Ok(());
         }
-        let model_dir = self.model_manager.resolved_dir();
+        let model_dir = self.asr_model_root();
         self.asr_pool.warmup(&model_dir, &self.asr_config())
+    }
+
+    /// The models ROOT that actually contains the SELECTED OmniASR engine.
+    ///
+    /// Per-file, like the CAMPP/denoiser sites below and for the identical reason (round-26):
+    /// `resolved_dir()` flips all-or-nothing between the user dir and the bundled dir, so a user dir
+    /// holding SOME models orphans every model that lives only in the other root. MEASURED
+    /// 2026-08-13: `%APPDATA%/cortex-speech/models/omniasr-ctc-1b/` existed but was EMPTY while the
+    /// 1 GB bundled copy sat beside the exe — selecting CTC-1B failed with "ASR service unavailable
+    /// (models missing?)" even though the model was present on disk. The engine was offered in the
+    /// UI and could not load.
+    fn asr_model_root(&self) -> std::path::PathBuf {
+        self.root_for_size(&self.selected_asr_model_size())
+    }
+
+    /// The models root that actually contains THIS engine's weights.
+    fn root_for_size(&self, size: &crate::settings::AsrModelSize) -> std::path::PathBuf {
+        // A recognizer needs BOTH its weights and tokens from one root. Resolving only the model
+        // filename can select a partial user download and orphan a complete bundled pair, so prefer
+        // the first root where the whole engine passes the same size-aware presence gate as loading.
+        for root in std::iter::once(self.model_manager.models_dir.clone()).chain(crate::models::model_root_candidates())
+        {
+            if asr::omniasr_model_present(&root, size) {
+                return root;
+            }
+        }
+
+        let (model_path, _) = asr::omniasr_model_paths(std::path::Path::new(""), size);
+        let relative = model_path.to_string_lossy().replace('\\', "/");
+        self.model_manager.resolve_root_for(relative.trim_start_matches('/'))
+    }
+
+    /// Probe this exact engine in the root selected for its complete weights+tokens pair.
+    fn size_present(&self, size: &crate::settings::AsrModelSize) -> bool {
+        asr::omniasr_model_present(&self.root_for_size(size), size)
     }
 
     fn asr_config(&self) -> asr::AsrLoadConfig {
         asr::AsrLoadConfig {
-            model_size: self.active_local_asr_model_size(),
+            model_size: self.selected_asr_model_size(),
             enable_gpu: self.settings.enable_gpu,
             num_threads: self.settings.num_asr_threads,
             language: self.settings.language.clone(),
         }
     }
 
-    fn active_local_asr_model_size(&self) -> crate::settings::AsrModelSize {
-        let model_dir = self.model_manager.resolved_dir();
-        if self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
-            if asr::omniasr_model_present(&model_dir, &crate::settings::AsrModelSize::CTC1B) {
-                return crate::settings::AsrModelSize::CTC1B;
-            }
-            if asr::omniasr_model_present(&model_dir, &crate::settings::AsrModelSize::CTC300M) {
-                return crate::settings::AsrModelSize::CTC300M;
-            }
-            return crate::settings::AsrModelSize::CTC300M;
-        }
-        asr::select_available_model_size(&model_dir, &self.settings.asr_model_size)
+    /// Return exactly the configured engine. Missing assets fail at the selected engine's load path;
+    /// substituting another installed engine would silently trade accuracy and falsify provenance.
+    fn selected_asr_model_size(&self) -> crate::settings::AsrModelSize {
+        self.settings.asr_model_size.clone()
     }
 
+    /// CHAMPION SUPREMACY (owner rule, 2026-08-11 — see AGENT_CHARTER "The champion is not optional").
+    ///
+    /// When the owner selects WSL7B, the OmniASR-7B champion drafts EVERY clip. `use_finetuned_asr`
+    /// no longer diverts it to the smaller embedded model, because that is a silent downgrade of the
+    /// one thing accuracy depends on.
+    ///
+    /// Measured 2026-08-10, which is why this changed: a 494-clip review queue was drafted 494/494 by
+    /// `finetuned-mms-ckb` while `asr_model_size` said WSL7B and the champion sat up and idle on both
+    /// GPUs. Nothing in the UI, the DB or any gate said so — the owner found it by reading the
+    /// transcripts. Measured gap on identical FLEURS ckb clips: 7.03% CER vs 9.32% (and the app runs
+    /// the int8 build, whose own baseline is 21.00%).
+    ///
+    /// The smaller engines remain available as EXPLICIT choices (pick CTC300M/CTC1B, or call
+    /// `transcribe_segment_finetuned`) — they are optional extras, never an automatic substitute.
     fn should_use_wsl_primary_asr(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && self.settings.external_asr_script_path().is_some()
-            // ENGINE TRUTH (true-10 audit 2026-07-09): use_finetuned_asr is documented as
-            // "overriding asr_model_size" — when the override is EFFECTIVE (flag on AND the model
-            // present), the fine-tuned engine is the primary drafter, so the 7B pass must not run:
-            // it re-attributed the fine-tuned text as an "omniasr-wsl-7b" hypothesis (wrong badge,
-            // double vote for one engine in the jury) and hard-required a server that never
-            // transcribes. Mirrors wsl7b_primary_unresolved below: with the flag on but the model
-            // ABSENT, the 7B remains the primary and this stays true (never a silent stock
-            // downgrade — the F2 contract).
-            && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
+    }
+
+    /// True when the fine-tuned engine may act as the PRIMARY drafter: the flag is on and the owner
+    /// has not selected the champion. Selecting WSL7B outranks the flag (champion supremacy).
+    fn finetuned_override_active(&self) -> bool {
+        self.settings.use_finetuned_asr && self.settings.asr_model_size != crate::settings::AsrModelSize::WSL7B
     }
 
     /// F2 — the no-silent-downgrade guard. True when the selected primary engine is WSL 7B but no
-    /// client script is configured AND the fine-tuned engine is not available to serve as the
-    /// primary instead. In that state the only thing left below is stock local CTC — which the owner
-    /// never selected — so every primary-transcription entry point must FAIL LOUDLY here rather than
-    /// silently downgrading (the fail-hard contract documented in settings.rs). Hypothesis
-    /// generation is unaffected: it calls the ASR pool directly, not this primary path.
+    /// client script is configured. In that state every primary-transcription entry point must FAIL
+    /// LOUDLY here rather than silently downgrading (the fail-hard contract documented in
+    /// settings.rs). Auxiliary hypothesis generation is also disabled whenever WSL7B is selected.
     fn wsl7b_primary_unresolved(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && self.settings.external_asr_script_path().is_none()
-            && !(self.settings.use_finetuned_asr && Self::finetuned_model_paths().is_some())
     }
 
     /// F6 — fast preflight before an import that will drive the WSL 7B primary: confirm the warm
@@ -846,6 +1040,19 @@ impl ProcessingPipeline {
     /// `/dev/tcp` open bounded by `timeout`. Without this, a down/hung server is only discovered
     /// per-segment after a 300 s transcription timeout — up to ~5 minutes of spinner before the
     /// fail-hard rollback. This turns that into a ~2-second, actionable failure at import start.
+    /// Public preflight for any caller about to drive the PRIMARY engine over a batch.
+    ///
+    /// `batch_transcribe` accepted a 487-clip job and hard-stopped on clip 1 because the champion
+    /// server was down (measured 2026-08-11). The stop was correct, but the caller had already been
+    /// told "started". Checking here makes an unreachable champion an immediate, actionable refusal
+    /// instead of a halt after the first write. A no-op when the champion is not the primary.
+    pub fn preflight_primary_engine(&self) -> AppResult<()> {
+        if self.wsl7b_primary_unresolved() {
+            return Err(Self::primary_engine_unavailable_error());
+        }
+        self.wsl_7b_server_preflight()
+    }
+
     fn wsl_7b_server_preflight(&self) -> AppResult<()> {
         if !self.should_use_wsl_primary_asr() {
             return Ok(());
@@ -874,9 +1081,8 @@ impl ProcessingPipeline {
                     return Err(AppError::Validation(format!(
                         "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B server is not responding on \
                          127.0.0.1:{WSL_7B_SERVER_PORT} (in WSL). Start it (e.g. wsl python \
-                         cortex_7b_server.py from scripts/) and try again, or transcribe with the \
-                         offline model. The import was not started, so nothing was left \
-                         half-transcribed."
+                         cortex_7b_server.py from scripts/) and retry the champion. The import was \
+                         not started, so nothing was left half-transcribed."
                     )));
                 }
                 Ok(None) => {
@@ -884,8 +1090,8 @@ impl ProcessingPipeline {
                         kill_and_reap_wsl_child(&mut child, "7B preflight probe");
                         return Err(AppError::Validation(format!(
                             "{ASR_7B_UNAVAILABLE_TAG}: Timed out checking the OmniASR-7B server (WSL \
-                             not responding). Ensure WSL and the 7B server are running and try \
-                             again, or transcribe with the offline model."
+                             not responding). Ensure WSL and the 7B server are running, then retry \
+                             the champion."
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -899,25 +1105,26 @@ impl ProcessingPipeline {
     }
 
     /// The actionable, UI-classified error returned whenever [`Self::wsl7b_primary_unresolved`]
-    /// holds. Carries [`ASR_7B_UNAVAILABLE_TAG`] so the frontend presents the two deliberate ways
-    /// forward — start the 7B server (with the client script set) and retry the champion, or
-    /// transcribe this one clip with the offline model — never a silent downgrade.
+    /// holds. Carries [`ASR_7B_UNAVAILABLE_TAG`] so the frontend presents the safe recovery path:
+    /// configure/start the 7B service and retry the champion. No smaller-engine substitution is
+    /// offered from the production flow.
     fn primary_engine_unavailable_error() -> AppError {
-        // Tagged so the UI offers the retry-or-offline choice rather than a dead-end (see
+        // Tagged so the UI can offer a champion retry rather than a dead-end (see
         // ASR_7B_UNAVAILABLE_TAG). The app never silently downgrades to a smaller model.
         AppError::Validation(format!(
             "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B (the champion) is the selected engine but its WSL \
              client script is not configured (Settings → \"External ASR script path\" is empty). \
-             Start the 7B server and set that path to transcribe with the champion, or choose the \
-             offline model for this clip. Refusing to silently downgrade to a smaller model you did \
-             not select."
+             Set that path, start the 7B server, and retry the champion — or choose the offline \
+             model in Settings if you deliberately want the smaller local engine. Refusing to \
+             silently downgrade to a smaller model you did not select."
         ))
     }
 
     fn local_asr_model_id(&self) -> &'static str {
-        match self.active_local_asr_model_size() {
+        match self.selected_asr_model_size() {
             crate::settings::AsrModelSize::CTC1B => "omniasr-ctc-1b",
-            crate::settings::AsrModelSize::CTC300M | crate::settings::AsrModelSize::WSL7B => "omniasr-ctc-300m",
+            crate::settings::AsrModelSize::CTC300M => "omniasr-ctc-300m",
+            crate::settings::AsrModelSize::WSL7B => "omniasr-wsl-7b",
         }
     }
 
@@ -925,7 +1132,7 @@ impl ProcessingPipeline {
     where
         F: FnOnce(&mut asr::KurdishAsrService) -> R,
     {
-        let model_dir = self.model_manager.resolved_dir();
+        let model_dir = self.asr_model_root();
         self.asr_pool.with_service(&model_dir, &self.asr_config(), f)
     }
 
@@ -1025,6 +1232,32 @@ impl ProcessingPipeline {
         Path::new(&self.db_path).parent().map(|dir| dir.join("source_transcripts"))
     }
 
+    /// The Gemini key for the whole-file reference transcript, read from the ENCRYPTED store.
+    ///
+    /// NOT `settings.llm_api_key`, which is where this used to look. `AppSettings::load` deliberately
+    /// CLEARS that field and rewrites settings.json, so a plaintext key never survives on disk (P0.3).
+    /// The consequence was that the field is empty on every run after the one where it was typed, so
+    /// `ensure_source_reference_transcripts` failed with "Gemini API key is required" no matter what the
+    /// owner did — and `llm_api_key_configured` stayed true, so the UI reported a key that was gone.
+    /// Measured 2026-08-10: an import of three files failed 3/3 on exactly that error while
+    /// secrets.env held a working OpenRouter key and an EMPTY GEMINI_API_KEY.
+    ///
+    /// `secrets.env` via ApiKeys is where every other cloud path already looks (scribe_api_key_if_enabled
+    /// above, the jury, OpenRouter), so this makes the reference transcript agree with the rest of the
+    /// crate instead of being the one caller reading a field that is guaranteed empty.
+    ///
+    /// The in-memory settings field is still honoured as a fallback: within the single session where
+    /// the owner has just typed a key, it holds the value before any reload scrubs it, and refusing it
+    /// there would be a surprising "I just entered it" failure.
+    fn jury_cloud_api_key(&self) -> Option<String> {
+        let from_store =
+            Path::new(&self.db_path).parent().and_then(|data_dir| crate::api_keys::ApiKeys::load(data_dir).gemini);
+        from_store.or_else(|| {
+            let typed = self.settings.llm_api_key.trim();
+            (!typed.is_empty()).then(|| typed.to_string())
+        })
+    }
+
     fn reusable_source_reference_record(
         &self,
         db: &Database,
@@ -1112,12 +1345,14 @@ impl ProcessingPipeline {
         if !self.settings.jury_cloud_opt_in || !self.consent.jury_cloud() {
             return Ok(Vec::new());
         }
-        if self.settings.llm_api_key.trim().is_empty() {
+        let Some(api_key) = self.jury_cloud_api_key() else {
             return Err(AppError::Other(
-                "Gemini API key is required for whole-file reference transcript when jury cloud opt-in is enabled"
+                "Gemini API key is required for whole-file reference transcript when jury cloud opt-in \
+                 is enabled. Save it from Settings (it goes to secrets.env, DPAPI-encrypted); note that \
+                 settings.json is NOT a place a key can live - AppSettings::load scrubs it by design."
                     .to_string(),
             ));
-        }
+        };
 
         let audio_path = path.to_string_lossy().to_string();
         let output_dir = self
@@ -1152,12 +1387,7 @@ impl ProcessingPipeline {
                 }
             }
 
-            match crate::agentic::generate_whole_file_reference_transcript(
-                path,
-                &model,
-                &self.settings.llm_api_key,
-                &output_dir,
-            ) {
+            match crate::agentic::generate_whole_file_reference_transcript(path, &model, &api_key, &output_dir) {
                 Ok(artifact) => {
                     let identity =
                         current_identity.as_ref().cloned().or_else(|| source_audio_identity(path).ok()).ok_or_else(
@@ -1384,7 +1614,7 @@ impl ProcessingPipeline {
                         segment_count,
                         segment_count.max(1),
                     ));
-                    callback(multi_model_hypothesis_stage(&db, fname.clone(), &segments));
+                    callback(multi_model_hypothesis_stage(&db, &self.settings, fname.clone(), &segments));
                     succeeded += 1;
                     // P3.2: record this file as done in the resume journal (best-effort).
                     if let Some(ref jid) = job_id {
@@ -1642,9 +1872,18 @@ impl ProcessingPipeline {
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
         self.shadow_log_loop0(db, &persisted);
         self.enqueue_background_alignments(&persisted);
-        for (seg_id, f32_pcm) in pcm_cache {
-            if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
-                log_hypothesis_population_failure(&seg_id, &error);
+        {
+            let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
+                .iter()
+                .filter_map(|segment| {
+                    PrimaryHypothesis::from_segment(segment).map(|primary| (segment.id.as_str(), primary))
+                })
+                .collect();
+            for (seg_id, f32_pcm) in pcm_cache {
+                let primary = primary_by_segment.get(seg_id.as_str()).copied();
+                if let Err(error) = self.populate_hypotheses_reusing_primary(db, &seg_id, &f32_pcm, primary) {
+                    log_hypothesis_population_failure(&seg_id, &error);
+                }
             }
         }
         Ok(persisted)
@@ -1893,9 +2132,18 @@ impl ProcessingPipeline {
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
         self.shadow_log_loop0(db, &persisted);
         self.enqueue_background_alignments(&persisted);
-        for (seg_id, f32_pcm) in all_pcm_cache {
-            if let Err(error) = self.populate_hypotheses(db, &seg_id, &f32_pcm) {
-                log_hypothesis_population_failure(&seg_id, &error);
+        {
+            let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
+                .iter()
+                .filter_map(|segment| {
+                    PrimaryHypothesis::from_segment(segment).map(|primary| (segment.id.as_str(), primary))
+                })
+                .collect();
+            for (seg_id, f32_pcm) in all_pcm_cache {
+                let primary = primary_by_segment.get(seg_id.as_str()).copied();
+                if let Err(error) = self.populate_hypotheses_reusing_primary(db, &seg_id, &f32_pcm, primary) {
+                    log_hypothesis_population_failure(&seg_id, &error);
+                }
             }
         }
         Ok(persisted)
@@ -1921,7 +2169,7 @@ impl ProcessingPipeline {
     ) -> AppResult<(Vec<SpeechSegment>, Vec<(String, Vec<f32>)>)> {
         let chunk_count = chunk_ranges.len() as u32;
         let chunk_total = chunk_ranges.len().max(1);
-        let active_asr_model_size = self.active_local_asr_model_size();
+        let active_asr_model_size = self.selected_asr_model_size();
         let model_id = match active_asr_model_size {
             crate::settings::AsrModelSize::CTC300M => "omniasr-ctc-300m".to_string(),
             crate::settings::AsrModelSize::CTC1B => "omniasr-ctc-1b".to_string(),
@@ -2026,7 +2274,7 @@ impl ProcessingPipeline {
             // below AND whether a fine-tuned miss is a genuine STOCK downgrade (it is NOT when the 7B is the
             // primary drafter — the miss falls to the 7B champion, not stock local CTC).
             let wsl_primary = self.should_use_wsl_primary_asr();
-            let finetuned_text: Option<String> = if self.settings.use_finetuned_asr {
+            let finetuned_text: Option<String> = if self.finetuned_override_active() {
                 // F2: every attempted chunk is counted; a fall-through TO STOCK increments the fallback
                 // counter so the import completion can report the downgrade LOUDLY (a log-only
                 // warn here left a whole import drafted at stock ~29.4% CER instead of the selected
@@ -2256,11 +2504,7 @@ impl ProcessingPipeline {
             }
         };
         for seg in segments {
-            let text = crate::corrections::loop0_draft_text(
-                seg.annotated_transcript.as_deref(),
-                seg.normalized_transcript.as_deref(),
-                &seg.raw_transcript,
-            );
+            let text = crate::corrections::loop0_draft_text(seg.annotated_transcript.as_deref(), &seg.raw_transcript);
             let would_fire = loop0_would_fire(&memories, text);
             if let Err(error) = db.record_loop0_shadow(&seg.id, would_fire) {
                 tracing::warn!("LOOP-0 shadow log write failed for {}: {error}", seg.id);
@@ -2286,16 +2530,13 @@ impl ProcessingPipeline {
         }
         // Group by source file so each recording is decoded ONCE (a VAD-chunked file yields many
         // segments sharing one audio_path). Carry each segment's source-offset alignment_json + its
-        // finalized text (annotated ▸ normalized ▸ raw — the real 7B transcript post-pass).
+        // finalized text (annotated ▸ raw — the VERBATIM 7B transcript; aligning the LLM-refined
+        // paraphrase would time words the speaker never said).
         let mut by_path: std::collections::HashMap<String, Vec<(String, Option<String>, String)>> =
             std::collections::HashMap::new();
         for s in segments {
-            let text = crate::corrections::loop0_draft_text(
-                s.annotated_transcript.as_deref(),
-                s.normalized_transcript.as_deref(),
-                &s.raw_transcript,
-            )
-            .to_string();
+            let text =
+                crate::corrections::loop0_draft_text(s.annotated_transcript.as_deref(), &s.raw_transcript).to_string();
             by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
         }
         let db_path = self.db_path.clone();
@@ -2414,12 +2655,6 @@ impl ProcessingPipeline {
             return Ok(0);
         }
 
-        // The warm 7B server can transiently fail or return an empty result for a clip (e.g. while
-        // still under load right after launch), which would otherwise leave that segment stuck at its
-        // "[Pending WSL 7B ASR]" placeholder for good (observed in stress testing: 1 of 3 segments).
-        // Retry a few times before giving up so an import reliably transcribes every segment; only
-        // escalate after the retries are exhausted, rather than silently shipping a pending segment.
-        const MAX_ATTEMPTS: usize = 3;
         // FORCE-USE the Champion (fail-hard): if the 7B server is unreachable/hung/errored — an
         // INFRASTRUCTURE failure, i.e. the client process exits non-zero (its honest failure contract),
         // as opposed to a REACHABLE server legitimately returning an empty transcript for a silent clip —
@@ -2428,15 +2663,29 @@ impl ProcessingPipeline {
         // "[Pending WSL 7B ASR]" placeholders or silently-downgraded output the owner never asked for.
         let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
         let mut updated = 0usize;
-        for seg in segments.iter_mut() {
-            // Honor cancellation between segments: each WSL transcription can ride a 300s timeout, so
-            // without this a cancelled import of an N-segment file would keep running for up to N*300s.
+
+        // Run the champion calls a WAVE at a time instead of one clip at a time.
+        //
+        // MEASURED 2026-08-14: one round trip is 4.62 s on a ~9 s clip and the whole import sustained
+        // 8.5 clips/min with both GPUs near idle — the cost is latency, not compute. `WSL_7B_GATE` was
+        // built to admit several calls at once and the server pre-forks one replica per GPU, but until
+        // now NOTHING ever issued two calls concurrently, so the gate limited a concurrency that never
+        // existed and the second card never received work. Setting CORTEX_7B_CONCURRENCY=2 changed the
+        // rate by nothing, which is what proved the loop was the bottleneck.
+        //
+        // Only the CALL is parallel. Every database touch — refresh, provenance, escalation, rollback —
+        // stays on this thread, in the original order, so the rollback contract and the "escalate this
+        // segment only" rule behave exactly as before. `transcribe` opens its own connection per call,
+        // so the concurrent phase never shares `db`.
+        let wave_size = wsl_7b_concurrency().max(1);
+        let mut start = 0usize;
+        while start < segments.len() {
+            let end = (start + wave_size).min(segments.len());
+
+            // Cancellation is checked once per WAVE rather than per segment; `transcribe` also polls
+            // the flag inside each in-flight call, so a cancel still lands within ~50 ms.
             if let Some(token) = cancel {
                 if let Err(cancel_err) = token.check() {
-                    // Roll back THIS file's just-created segments (a mix of transcribed + still-placeholder
-                    // rows) before propagating the cancel, so re-importing the same file cannot duplicate
-                    // every segment. Matches the infra-failure rollback and the F6 "nothing half-imported"
-                    // promise. Earlier files in a directory import are already committed and untouched.
                     tracing::info!("WSL 7B import cancelled; rolling back {} segment(s)", import_ids.len());
                     if let Err(e) = db.delete_segments_batch(&import_ids) {
                         tracing::error!("failed to roll back {} segment(s) after cancel: {e}", import_ids.len());
@@ -2444,26 +2693,56 @@ impl ProcessingPipeline {
                     return Err(cancel_err);
                 }
             }
-            let mut last_problem: Option<String> = None;
-            let mut infra_failure = false;
-            for attempt in 1..=MAX_ATTEMPTS {
-                match self.transcribe(
-                    Some(seg.id.as_str()),
-                    &seg.audio_path,
-                    seg.alignment_json.as_deref(),
-                    cancel.map(|t| t.as_atomic()),
-                ) {
-                    Ok(_draft) => {
+
+            // PHASE A — concurrent, no shared DB.
+            let flag = cancel.map(|t| t.as_atomic());
+            let jobs: Vec<(String, String, Option<String>)> = segments[start..end]
+                .iter()
+                .map(|s| (s.id.clone(), s.audio_path.clone(), s.alignment_json.clone()))
+                .collect();
+            let outcomes: Vec<ChampionAttempt> = std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .iter()
+                    .map(|(id, path, aj)| scope.spawn(move || self.attempt_champion(id, path, aj.as_deref(), flag)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        // A panicked worker must not be read as success. Treat it as an infrastructure
+                        // failure so the import halts and rolls back, per the force-champion contract.
+                        h.join().unwrap_or_else(|_| ChampionAttempt::Infra("champion worker panicked".to_string()))
+                    })
+                    .collect()
+            });
+
+            // PHASE B — sequential, in the original segment order.
+            for (offset, outcome) in outcomes.into_iter().enumerate() {
+                let seg = &mut segments[start + offset];
+                let problem: Option<String> = match outcome {
+                    ChampionAttempt::Infra(reason) => {
+                        tracing::error!(
+                            "WSL 7B import cancelled (server unavailable: {reason}); rolling back {} segment(s)",
+                            import_ids.len()
+                        );
+                        if let Err(e) = db.delete_segments_batch(&import_ids) {
+                            tracing::error!(
+                                "failed to roll back {} placeholder segment(s) after 7B cancel: {e}",
+                                import_ids.len()
+                            );
+                        }
+                        return Err(AppError::Validation(format!(
+                            "OmniASR 7B server is not running — start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import. \
+                             The import was cancelled and its {} segment(s) were rolled back. ({reason})",
+                            import_ids.len()
+                        )));
+                    }
+                    ChampionAttempt::Empty(reason) => Some(reason),
+                    ChampionAttempt::Drafted => {
                         if let Err(e) = self.refresh_segment_from_db(db, seg) {
-                            // A DB hiccup mid-pass otherwise left a partial import (some transcribed, some
-                            // still placeholder) with no rollback; a re-import would then duplicate it.
                             tracing::error!(
                                 "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
                                 import_ids.len()
                             );
-                            // A failed rollback must be LOUD (matches the cancel/infra siblings above):
-                            // the log just promised a rollback, and if the delete also fails the
-                            // placeholders survive — re-importing the file then duplicates them.
                             if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
                                 tracing::error!(
                                     "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
@@ -2472,101 +2751,107 @@ impl ProcessingPipeline {
                             }
                             return Err(e);
                         }
-                        let usable = !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
-                        if usable {
-                            // Record the Champion's output as its hypothesis so the review provenance badge
-                            // can honestly name "OmniASR-7B Champion" as the producing engine — the primary
-                            // raw_transcript otherwise carries no model id. Best-effort: a provenance-write
-                            // failure must not fail the (successful) transcription.
-                            if let Err(e) = insert_hypothesis_checked(
-                                db,
-                                &seg.id,
-                                "omniasr-wsl-7b",
-                                seg.raw_transcript.clone(),
-                                None,
-                            ) {
-                                tracing::warn!("could not record omniasr-wsl-7b provenance for {}: {e}", seg.id);
-                            }
+                        // Re-verify against the STORED row. The concurrent phase judged usability from
+                        // the returned draft (it cannot read the DB); if the row disagrees, believe the
+                        // row and escalate rather than count a clip that has no text.
+                        let stored_ok =
+                            !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
+                        if stored_ok {
+                            // `attempt_champion` routes through `transcribe`, whose DB helper commits
+                            // transcript + sole champion hypothesis atomically. Replacing hypotheses
+                            // again here used to create a second, fallible write after success.
                             updated += 1;
-                            last_problem = None;
-                            infra_failure = false;
-                            break;
-                        }
-                        // Reachable server but no words back — could be a genuinely silent clip. NOT an
-                        // infrastructure failure: escalate only this segment after retries, never cancel.
-                        last_problem = Some("7B returned an empty transcript".to_string());
-                        infra_failure = false;
-                    }
-                    Err(error) => {
-                        let msg = error.to_string();
-                        if msg.contains(WSL_7B_EMPTY_RESULT_MARKER) {
-                            // A legit-but-EMPTY 7B result reaches here as an Err ONLY because transcribe()
-                            // converts Ok("") -> Err to stop the re-transcribe IPCs from blank-overwriting a
-                            // stored transcript. For the IMPORT pass that is NOT an infrastructure failure —
-                            // the server is reachable and simply produced no words for a silent/music/noise
-                            // chunk. Treat it EXACTLY like the Ok-arm usable=false path: escalate only THIS
-                            // segment after retries, never roll the whole file back (which would discard the
-                            // good transcripts already computed for the file's other chunks). Two in-code
-                            // contracts (parse_wsl_segment_result + the Ok-arm comment) require this.
-                            last_problem = Some("7B returned an empty transcript".to_string());
-                            infra_failure = false;
+                            None
                         } else {
-                            // The client exited non-zero: server not running / unreachable / hung / errored.
-                            // Fatal for a force-7B import. A 5-minute per-attempt timeout means the server is
-                            // HUNG, not transiently flaky — another full-timeout attempt only triples the
-                            // stall, so stop fast. Quick failures (connection refused) still retry briefly in
-                            // case the server is mid-launch.
-                            let hung = msg.contains("timed out");
-                            last_problem = Some(msg);
-                            infra_failure = true;
-                            if hung {
-                                break;
-                            }
+                            Some("7B reported a draft but the stored row is still empty".to_string())
                         }
                     }
-                }
-                if attempt < MAX_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                }
-            }
-            if infra_failure {
-                let reason = last_problem.unwrap_or_else(|| "7B server unreachable".to_string());
-                tracing::error!(
-                    "WSL 7B import cancelled (server unavailable: {reason}); rolling back {} segment(s)",
-                    import_ids.len()
-                );
-                if let Err(e) = db.delete_segments_batch(&import_ids) {
-                    tracing::error!(
-                        "failed to roll back {} placeholder segment(s) after 7B cancel: {e}",
-                        import_ids.len()
-                    );
-                }
-                return Err(AppError::Validation(format!(
-                    "OmniASR 7B server is not running — start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import. \
-                     The import was cancelled and its {} segment(s) were rolled back. ({reason})",
-                    import_ids.len()
-                )));
-            }
-            if let Some(reason) = last_problem {
-                tracing::warn!("WSL 7B import: segment {} failed after {MAX_ATTEMPTS} attempts: {reason}", seg.id);
-                if let Err(e) = self.mark_wsl_primary_unavailable(db, seg, &reason) {
-                    tracing::error!(
-                        "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
-                        import_ids.len()
-                    );
-                    // Same loud-rollback contract as the sibling sites: a swallowed delete failure
-                    // here leaves placeholder rows the promised rollback never removed.
-                    if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                };
+
+                if let Some(reason) = problem {
+                    tracing::warn!("WSL 7B import: segment {} failed after retries: {reason}", seg.id);
+                    if let Err(e) = self.mark_wsl_primary_unavailable(db, seg, &reason) {
                         tracing::error!(
-                            "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
+                            "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
                             import_ids.len()
                         );
+                        if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                            tracing::error!(
+                                "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
+                                import_ids.len()
+                            );
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
             }
+
+            start = end;
         }
         Ok(updated)
+    }
+
+    /// The retry loop for ONE segment, with no shared-DB access anywhere in it.
+    ///
+    /// Usability is judged from the returned draft rather than by re-reading the row, because the
+    /// re-read needs the shared connection. The caller re-verifies against the DB in its sequential
+    /// phase and downgrades to `Empty` if the stored row disagrees — so this cannot report success
+    /// for a row that did not actually get text.
+    fn attempt_champion(
+        &self,
+        segment_id: &str,
+        audio_path: &str,
+        alignment_json: Option<&str>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> ChampionAttempt {
+        // The warm 7B server can transiently fail or return an empty result for a clip (e.g. while
+        // still under load right after launch), which would otherwise leave that segment stuck at its
+        // "[Pending WSL 7B ASR]" placeholder for good (observed in stress testing: 1 of 3 segments).
+        // Retry a few times before giving up so an import reliably transcribes every segment; only
+        // escalate after the retries are exhausted, rather than silently shipping a pending segment.
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_problem = String::from("7B produced no result");
+        let mut infra = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.transcribe(Some(segment_id), audio_path, alignment_json, cancel) {
+                Ok(draft) => {
+                    let usable = !draft.raw_text.trim().is_empty() && !draft.raw_text.contains("[Pending");
+                    if usable {
+                        return ChampionAttempt::Drafted;
+                    }
+                    last_problem = "7B returned an empty transcript".to_string();
+                    infra = false;
+                }
+                Err(error) => {
+                    let msg = error.to_string();
+                    if msg.contains(WSL_7B_EMPTY_RESULT_MARKER) {
+                        // transcribe() turns Ok("") into Err so the re-transcribe IPCs cannot
+                        // blank-overwrite a stored transcript. For an IMPORT that is not an
+                        // infrastructure failure — the server answered, the clip simply had no words.
+                        last_problem = "7B returned an empty transcript".to_string();
+                        infra = false;
+                    } else {
+                        // A 5-minute per-attempt timeout means the server is HUNG, not flaky: another
+                        // full-timeout attempt only triples the stall. Quick failures (connection
+                        // refused) still retry briefly in case the server is mid-launch.
+                        let hung = msg.contains("timed out");
+                        last_problem = msg;
+                        infra = true;
+                        if hung {
+                            break;
+                        }
+                    }
+                }
+            }
+            if attempt < MAX_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        }
+        if infra {
+            ChampionAttempt::Infra(last_problem)
+        } else {
+            ChampionAttempt::Empty(last_problem)
+        }
     }
 
     fn mark_wsl_primary_unavailable(&self, db: &Database, seg: &mut SpeechSegment, reason: &str) -> AppResult<()> {
@@ -2642,64 +2927,29 @@ impl ProcessingPipeline {
             status: "Building whole-file reference transcript".into(),
         });
         let mut chunks_done = 0usize;
-        // Cloud STT (ElevenLabs Scribe) first when opted in and a key is configured: one API call,
-        // segmented from word timestamps. On ANY error, fall through to the local ASR path below so
-        // an import never fails just because the cloud is unavailable.
-        let result = 'transcribe: {
-            if let Some(scribe_key) = self.scribe_api_key_if_enabled() {
-                if let Some(token) = cancel.as_ref() {
-                    if let Err(e) = token.check() {
-                        break 'transcribe Err(e);
-                    }
-                }
-                on_event(PipelineEvent::Phase { phase: "transcribing".into() });
-                on_event(agent_stage(
-                    "audio_chunking",
-                    "running",
-                    fname.clone(),
-                    "Transcribing whole file with ElevenLabs Scribe (cloud)",
-                    0,
-                    1,
-                ));
-                match self.import_single_file_via_scribe(path, &db, &scribe_key) {
-                    Ok(segs) => {
-                        chunks_done = segs.len();
-                        break 'transcribe Ok(segs);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Scribe import failed ({e}); falling back to local ASR");
-                        on_event(agent_stage(
-                            "audio_chunking",
-                            "running",
-                            fname.clone(),
-                            "Scribe unavailable — using local ASR",
-                            0,
-                            estimated_chunks,
-                        ));
-                    }
-                }
-            }
-            self.process_single_file_with_progress(path, &db, cancel.as_ref(), |current, total| {
-                chunks_done = current;
-                let total = total.max(estimated_chunks);
-                self.set_import_status(current, total, &fname);
-                on_event(PipelineEvent::Phase { phase: "transcribing".into() });
-                on_event(agent_stage(
-                    "audio_chunking",
-                    "running",
-                    fname.clone(),
-                    format!("Preparing chunk {current}/{total}"),
-                    current,
-                    total,
-                ));
-                on_event(PipelineEvent::Progress {
-                    current,
-                    total,
-                    file: fname.clone(),
-                    status: format!("Transcribing chunk {current}/{total}"),
-                });
-            })
-        };
+        // Imports always use the configured primary engine. Optional cloud tools may be invoked only
+        // through their explicit per-segment actions; a consent toggle can never replace the 7B
+        // champion for an entire import or create a mixed-engine dataset after a cloud failure.
+        let result = self.process_single_file_with_progress(path, &db, cancel.as_ref(), |current, total| {
+            chunks_done = current;
+            let total = total.max(estimated_chunks);
+            self.set_import_status(current, total, &fname);
+            on_event(PipelineEvent::Phase { phase: "transcribing".into() });
+            on_event(agent_stage(
+                "audio_chunking",
+                "running",
+                fname.clone(),
+                format!("Preparing chunk {current}/{total}"),
+                current,
+                total,
+            ));
+            on_event(PipelineEvent::Progress {
+                current,
+                total,
+                file: fname.clone(),
+                status: format!("Transcribing chunk {current}/{total}"),
+            });
+        });
 
         match &result {
             Ok(segments) => {
@@ -2721,7 +2971,7 @@ impl ProcessingPipeline {
                     segment_count,
                     segment_count.max(1),
                 ));
-                on_event(multi_model_hypothesis_stage(&db, fname.clone(), segments));
+                on_event(multi_model_hypothesis_stage(&db, &self.settings, fname.clone(), segments));
 
                 // Post-import jury adjudication is intentionally NOT run here. The import COMMAND
                 // (commands.rs `import_audio_file`) runs it on a background thread with its OWN WAL
@@ -2751,113 +3001,6 @@ impl ProcessingPipeline {
         });
         // `running` is cleared by `_status_guard` on scope exit (covers early-return error paths too).
         result
-    }
-
-    /// The ElevenLabs Scribe key to use for cloud STT, or `None` when cloud STT is not opted in or no
-    /// key is configured. Mirrors the cloud-LLM opt-in gate; the key lives in `secrets.env` next to
-    /// the database and is never read unless the user has explicitly opted in (privacy by default).
-    fn scribe_api_key_if_enabled(&self) -> Option<String> {
-        // Snapshot AND live consent — see LiveConsent. Returning None here means the key is never
-        // even read from disk, so a mid-import withdrawal stops the upload at the source.
-        if !self.settings.cloud_stt_opt_in || !self.consent.cloud_stt() {
-            return None;
-        }
-        let data_dir = std::path::Path::new(&self.db_path).parent()?;
-        crate::api_keys::ApiKeys::load(data_dir).elevenlabs
-    }
-
-    /// Import a file using ElevenLabs Scribe as the transcriber: ONE API call for the whole file,
-    /// segmented from Scribe's word timestamps into source-file slices (no local ASR/VAD/diarization).
-    /// Persists and returns the segments. The caller falls back to the local path on error, so this
-    /// surfaces failures rather than masking them. Acoustic-quality/diarization fields are left unset.
-    pub fn import_single_file_via_scribe(
-        &self,
-        path: &Path,
-        db: &Database,
-        api_key: &str,
-    ) -> AppResult<Vec<SpeechSegment>> {
-        let duration_ms = audio::get_duration_ms(path)?;
-        if duration_ms == 0 {
-            return Err(AppError::Validation("Empty audio file".into()));
-        }
-        let audio_path = path.to_string_lossy().to_string();
-        let model_id = crate::scribe_api::DEFAULT_MODEL;
-        let scribe_segs = crate::scribe_api::transcribe_segments(
-            &audio_path,
-            api_key,
-            model_id,
-            crate::scribe_api::SORANI_LANGUAGE_CODE,
-        )?;
-        let segments = Self::build_scribe_speech_segments(
-            &scribe_segs,
-            &audio_path,
-            duration_ms,
-            self.settings.auto_normalize,
-            self.settings.verbalize_numbers,
-            model_id,
-        );
-        if segments.is_empty() {
-            return Err(AppError::Other("Scribe returned no segments".into()));
-        }
-        db.insert_segments_batch(&segments)?;
-        Ok(segments)
-    }
-
-    /// Build persistable [`SpeechSegment`]s from Scribe segments. Each becomes a source-file slice
-    /// (`audio_path` + `SegmentSourceMeta` time range) so it plays back the right region; text is
-    /// stored in logical (reading) order and normalized when auto-normalize is on. A segment with an
-    /// open end (0) extends to the file duration. Acoustic-quality fields stay `None` — Scribe gives
-    /// text and timing, not waveform metrics.
-    fn build_scribe_speech_segments(
-        scribe_segs: &[crate::scribe_api::ScribeSegment],
-        audio_path: &str,
-        total_duration_ms: i64,
-        auto_normalize: bool,
-        verbalize_numbers: bool,
-        model_id: &str,
-    ) -> Vec<SpeechSegment> {
-        let chunk_count = scribe_segs.len() as u32;
-        scribe_segs
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let start = s.source_start_ms.max(0);
-                let end = if s.source_end_ms > start { s.source_end_ms } else { total_duration_ms.max(start) };
-                let meta = crate::chunking::SegmentSourceMeta {
-                    source_start_ms: start,
-                    source_end_ms: end,
-                    chunk_index: i as u32,
-                    chunk_count,
-                };
-                let normalized = if auto_normalize && !s.text.trim().is_empty() {
-                    let cfg = crate::normalizer::NormalizationConfig {
-                        normalize_numbers: auto_normalize,
-                        verbalize_numbers,
-                        normalize_hamza: true,
-                        remove_diacritics: false,
-                    };
-                    Some(crate::normalizer::SoraniNormalizer::with_config(cfg).normalize(&s.text))
-                } else {
-                    None
-                };
-                SpeechSegment {
-                    id: Uuid::new_v4().to_string(),
-                    audio_path: audio_path.to_string(),
-                    raw_transcript: s.text.clone(),
-                    normalized_transcript: normalized,
-                    alignment_json: Some(meta.to_alignment_json()),
-                    duration_ms: end.saturating_sub(start).max(0),
-                    // PROVENANCE: Scribe is the one path that uploads raw audio to a cloud provider, so
-                    // these rows must say so durably. `..Default::default()` here persisted
-                    // cloud_call=false and model_version_id=NULL for exactly the segments whose audio
-                    // left the machine. Scribe returns no per-segment confidence, so `confidence` stays
-                    // None and `confidence_source` honestly stays None with it.
-                    cloud_call: true,
-                    model_version_id: Some(model_id.to_string()),
-                    ..Default::default()
-                }
-            })
-            .collect()
     }
 
     /// Transcribe an audio file, optionally limited to a source-time range from chunk metadata.
@@ -2890,7 +3033,7 @@ impl ProcessingPipeline {
         // fine-tuned MMS-CTC engine (best local Sorani quality) regardless of asr_model_size. Any
         // failure (model absent / inference error / empty output) falls through to the configured
         // engine below, so transcription never breaks.
-        if self.settings.use_finetuned_asr {
+        if self.finetuned_override_active() {
             if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
                 match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_pcm) {
                     Ok(raw_text) if !raw_text.trim().is_empty() => {
@@ -2905,7 +3048,14 @@ impl ProcessingPipeline {
                         if let Some(id) = segment_id {
                             if let Ok(db) = self.open_db() {
                                 let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-                                if let Err(error) = self.populate_hypotheses(&db, id, &f32_pcm) {
+                                let primary = PrimaryHypothesis {
+                                    model_id: "finetuned-mms-ckb",
+                                    transcript: &raw_text,
+                                    confidence: None,
+                                };
+                                if let Err(error) =
+                                    self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary))
+                                {
                                     log_hypothesis_population_failure(id, &error);
                                 }
                             }
@@ -2971,8 +3121,8 @@ impl ProcessingPipeline {
 
                 drop(db);
 
-                // Tag a 7B failure (server down / timeout / empty) so the UI offers retry-or-offline
-                // instead of a dead-end — and NEVER silently falls through to a smaller model here.
+                // Tag a 7B failure (server down / timeout / empty) so the UI can offer a champion retry
+                // — and NEVER silently fall through to a smaller model here.
                 let (raw_transcript, confidence) =
                     self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;
 
@@ -2982,7 +3132,7 @@ impl ProcessingPipeline {
                 // stored transcript with "" (silent data loss). Both re-transcribe entry points route
                 // through here (batch_transcribe + the per-segment transcribe IPC) with no retry, unlike
                 // the import path which retries/escalates for exactly this transient. Surface it as the
-                // retry-or-offline 7B failure the tag above promises, leaving the existing transcript intact.
+                // retryable 7B failure the tag above promises, leaving the existing transcript intact.
                 if raw_transcript.trim().is_empty() {
                     return Err(tag_7b_unavailable(AppError::Other(format!(
                         "{WSL_7B_EMPTY_RESULT_MARKER} (the server is likely under load); the existing transcript is left unchanged"
@@ -2990,48 +3140,6 @@ impl ProcessingPipeline {
                 }
 
                 let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
-
-                let normalized_transcript = if self.settings.auto_normalize && !raw_transcript.is_empty() {
-                    let norm_config = crate::normalizer::NormalizationConfig {
-                        normalize_numbers: self.settings.auto_normalize,
-                        verbalize_numbers: self.settings.verbalize_numbers,
-                        normalize_hamza: true,
-                        remove_diacritics: false,
-                    };
-                    let norm = SoraniNormalizer::with_config(norm_config);
-                    Some(norm.normalize(&raw_transcript))
-                } else {
-                    None
-                };
-
-                // Use the safe update method: human decisions are never overwritten.
-                let updated = db
-                    .update_asr_transcript_if_unreviewed(
-                        &id,
-                        &raw_transcript,
-                        normalized_transcript.as_deref(),
-                        confidence,
-                        Some("external_provider"),
-                        Some("omniasr-wsl-7b"),
-                        false,
-                    )
-                    .map_err(|e| AppError::Other(format!("Failed to update segment in database: {}", e)))?;
-                if !updated {
-                    tracing::info!("WSL 7B: segment {id} has a human decision — transcript not overwritten.");
-                }
-
-                // Insert WSL 7B hypothesis for downstream jury comparison.
-                if let Err(error) =
-                    insert_hypothesis_checked(&db, &id, "omniasr-wsl-7b", raw_transcript.clone(), confidence)
-                {
-                    tracing::error!("{error}");
-                }
-
-                // Populate local hypotheses for comparison
-                let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-                if let Err(error) = self.populate_hypotheses(&db, &id, &f32_pcm) {
-                    log_hypothesis_population_failure(&id, &error);
-                }
 
                 // Stage 2: Dual-Pass LLM Refinement (OpenRouter when configured + key present)
                 let final_text = if let Some(refiner) = self.build_refiner() {
@@ -3043,15 +3151,11 @@ impl ProcessingPipeline {
                         // (no hypotheses recorded is a normal state) — but a DB READ FAILURE must be
                         // logged, not folded into "no context": the old unwrap_or_default() made a
                         // persistent DB problem silently produce unprimed GER forever with no trace.
-                        let hyps: Vec<String> = match db.get_hypotheses_for_segment(&id) {
-                            Ok(hyps) => hyps.into_iter().map(|h| h.transcript).collect(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "GER: could not load N-best hypotheses for {id}: {e}; refining unprimed"
-                                );
-                                Vec::new()
-                            }
-                        };
+                        // Champion mode has exactly one ASR input. Use the in-memory 7B draft rather
+                        // than rereading historical DB hypotheses: an older 300M/1B/MMS/Scribe row can
+                        // never leak into refinement, and no partial provenance write is needed before
+                        // the whole transcription/refinement result is ready to commit.
+                        let hyps = vec![raw_transcript.clone()];
                         let few_shot: Vec<(String, String)> = match crate::jury::get_few_shot_examples(&db, &id, 3) {
                             Ok(examples) => examples.into_iter().map(|e| (e.wrong_transcript, e.human_fix)).collect(),
                             Err(e) => {
@@ -3071,8 +3175,13 @@ impl ProcessingPipeline {
                             accept_refinement(&raw_transcript, &refined)
                         }
                         Err(e) => {
-                            tracing::warn!("LLM Refinement failed: {}. Falling back to raw transcript.", e);
-                            raw_transcript.clone()
+                            // HARD STOP (owner rule 2026-08-11): a configured refiner that FAILS is a
+                            // failure, not an invitation to ship the unrefined draft. Measured
+                            // 2026-08-10: 59 of 487 clips silently kept raw text this way, so the
+                            // dataset was part refined and part not with nothing recording which.
+                            return Err(AppError::Other(format!(
+                                "LLM refinement failed for segment {id}: {e}. Refinement is enabled, so this                                  clip is NOT complete — the run is stopped rather than storing an unrefined                                  draft as if it were finished."
+                            )));
                         }
                     }
                 } else {
@@ -3083,7 +3192,43 @@ impl ProcessingPipeline {
                 // before it is returned/stored (opt-in; default off; best-effort).
                 let final_text = apply_loop0_firing(self.settings.loop0_firing_enabled, &db, &final_text);
 
+                // Commit ONCE, after every enabled refinement succeeds. The former early write stored
+                // raw 7B text before an enabled refiner could fail, then the command returned an error
+                // with a partially changed row. The backend is the sole writer; the frontend reloads
+                // this authoritative row and never whole-row-upserts a stale pre-inference snapshot.
+                let normalized_transcript = if self.settings.auto_normalize && !final_text.is_empty() {
+                    let norm_config = crate::normalizer::NormalizationConfig {
+                        normalize_numbers: self.settings.auto_normalize,
+                        verbalize_numbers: self.settings.verbalize_numbers,
+                        normalize_hamza: true,
+                        remove_diacritics: false,
+                    };
+                    let norm = SoraniNormalizer::with_config(norm_config);
+                    Some(norm.normalize(&final_text))
+                } else {
+                    None
+                };
                 let cloud_call = self.llm_refinement_uses_cloud();
+                let champion = SegmentHypothesis {
+                    segment_id: id.clone(),
+                    model_id: CHAMPION_MODEL_ID.to_string(),
+                    transcript: raw_transcript.clone(),
+                    confidence,
+                };
+                let updated = db
+                    .commit_champion_transcript_if_unreviewed(
+                        &champion,
+                        normalized_transcript.as_deref(),
+                        Some("external_provider"),
+                        cloud_call,
+                    )
+                    .map_err(|e| AppError::Other(format!("Failed to commit champion transcript: {e}")))?;
+                if !updated {
+                    return Err(AppError::Validation(format!(
+                        "Segment {id} gained a human decision while the champion was running; its reviewed transcript was not overwritten"
+                    )));
+                }
+
                 return Ok(TranscriptionDraft {
                     raw_text: raw_transcript,
                     final_text,
@@ -3151,8 +3296,10 @@ impl ProcessingPipeline {
                     accept_refinement(&raw_text, &refined)
                 }
                 Err(e) => {
-                    tracing::warn!("LLM Refinement failed: {}. Falling back to raw transcript.", e);
-                    raw_text.clone()
+                    // HARD STOP (owner rule 2026-08-11), same contract as the champion path above.
+                    return Err(AppError::Other(format!(
+                        "LLM refinement failed: {e}. Refinement is enabled, so this clip is NOT complete —                          the run is stopped rather than storing an unrefined draft as if it were finished."
+                    )));
                 }
             }
         } else {
@@ -3180,7 +3327,8 @@ impl ProcessingPipeline {
 
         if let Some(id) = segment_id {
             if let Ok(db) = self.open_db() {
-                if let Err(error) = self.populate_hypotheses(&db, id, &f32_pcm) {
+                let primary = PrimaryHypothesis { model_id: &model_id, transcript: &raw_text, confidence };
+                if let Err(error) = self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary)) {
                     log_hypothesis_population_failure(id, &error);
                 }
             }
@@ -3345,7 +3493,7 @@ impl ProcessingPipeline {
         let gold_segments = crate::eval::list_gold_segments(&db)?;
         let mut hypotheses = Vec::new();
 
-        let model_dir = self.model_manager.resolved_dir();
+        let model_dir = self.root_for_size(&model_size);
         let config = asr::AsrLoadConfig {
             model_size,
             enable_gpu: self.settings.enable_gpu,
@@ -3392,8 +3540,28 @@ impl ProcessingPipeline {
     }
 
     pub fn populate_hypotheses(&self, db: &Database, segment_id: &str, f32_pcm: &[f32]) -> AppResult<()> {
-        let model_dir = self.model_manager.resolved_dir();
+        self.populate_hypotheses_reusing_primary(db, segment_id, f32_pcm, None)
+    }
 
+    fn populate_hypotheses_reusing_primary(
+        &self,
+        db: &Database,
+        segment_id: &str,
+        f32_pcm: &[f32],
+        primary: Option<PrimaryHypothesis<'_>>,
+    ) -> AppResult<()> {
+        // Guarded HERE rather than at the five call sites: one shared gate cannot be forgotten by a
+        // sixth caller, and every caller wants the same answer. See `multi_engine_hypotheses` for
+        // what these three engines cost when sherpa-onnx has no GPU (measured: 2.5 clips/minute).
+        // The champion's own hypothesis is written by the transcribe path, not here, so turning this
+        // off never leaves a clip without the transcript a reviewer is served.
+        // The champion path stays single-engine even if a legacy settings file still carries the old
+        // `multi_engine_hypotheses=true` default. The user's accuracy contract is explicit: when WSL7B
+        // is selected, 300M/1B/MMS may not run automatically or influence the evidence mix. They remain
+        // available only after selecting a non-champion engine and explicitly enabling this experiment.
+        if !auxiliary_hypotheses_enabled(&self.settings) {
+            return Ok(());
+        }
         // 1. OmniASR 300M
         let model_id_300m = "omniasr-ctc-300m";
         let config_300m = asr::AsrLoadConfig {
@@ -3402,14 +3570,20 @@ impl ProcessingPipeline {
             num_threads: self.settings.num_asr_threads,
             language: self.settings.language.clone(),
         };
-        let res_300m = self.asr_pool.with_service(&model_dir, &config_300m, |asr| {
-            if !asr.is_available() {
+        let model_dir_300m = self.root_for_size(&config_300m.model_size);
+        let res_300m = reuse_primary_or_infer(primary, model_id_300m, || {
+            if !self.size_present(&config_300m.model_size) {
                 return None;
             }
-            Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))
+            self.asr_pool.with_service(&model_dir_300m, &config_300m, |asr| {
+                if !asr.is_available() {
+                    return None;
+                }
+                Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, conf, _source)| (text, conf)))
+            })
         });
         match res_300m {
-            Some(Ok((text, conf, _source))) => insert_hypothesis_checked(db, segment_id, model_id_300m, text, conf)?,
+            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_300m, text, conf)?,
             Some(Err(error)) => {
                 tracing::warn!("{model_id_300m} hypothesis transcription failed for {segment_id}: {error}");
             }
@@ -3424,14 +3598,20 @@ impl ProcessingPipeline {
             num_threads: self.settings.num_asr_threads,
             language: self.settings.language.clone(),
         };
-        let res_1b = self.asr_pool.with_service(&model_dir, &config_1b, |asr| {
-            if !asr.is_available() {
+        let model_dir_1b = self.root_for_size(&config_1b.model_size);
+        let res_1b = reuse_primary_or_infer(primary, model_id_1b, || {
+            if !self.size_present(&config_1b.model_size) {
                 return None;
             }
-            Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE))
+            self.asr_pool.with_service(&model_dir_1b, &config_1b, |asr| {
+                if !asr.is_available() {
+                    return None;
+                }
+                Some(asr.transcribe(f32_pcm, audio::TARGET_SAMPLE_RATE).map(|(text, conf, _source)| (text, conf)))
+            })
         });
         match res_1b {
-            Some(Ok((text, conf, _source))) => insert_hypothesis_checked(db, segment_id, model_id_1b, text, conf)?,
+            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_1b, text, conf)?,
             Some(Err(error)) => {
                 tracing::warn!("{model_id_1b} hypothesis transcription failed for {segment_id}: {error}");
             }
@@ -3443,17 +3623,21 @@ impl ProcessingPipeline {
         // a root cause of "the jury escalates ~everything": two weak kin models rarely agree with the 7B,
         // so IRT confidence stays low and T0 almost never auto-accepts. Only runs when the fine-tuned
         // model is installed (a no-op otherwise); a failure is best-effort and never fails population.
-        if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
+        let model_id_finetuned = "finetuned-mms-ckb";
+        let res_finetuned = reuse_primary_or_infer(primary, model_id_finetuned, || {
+            let (onnx, vocab) = Self::finetuned_model_paths()?;
             let chunk_i16: Vec<i16> = f32_pcm.iter().map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16).collect();
-            match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_i16) {
-                Ok(text) if !text.trim().is_empty() => {
-                    insert_hypothesis_checked(db, segment_id, "finetuned-mms-ckb", text, None)?;
-                }
-                Ok(_) => tracing::debug!("finetuned-mms-ckb hypothesis empty for {segment_id}"),
-                Err(error) => {
-                    tracing::warn!("finetuned-mms-ckb hypothesis transcription failed for {segment_id}: {error}");
-                }
+            Some(Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_i16).map(|text| (text, None)))
+        });
+        match res_finetuned {
+            Some(Ok((text, _))) if !text.trim().is_empty() => {
+                insert_hypothesis_checked(db, segment_id, model_id_finetuned, text, None)?;
             }
+            Some(Ok(_)) => tracing::debug!("{model_id_finetuned} hypothesis empty for {segment_id}"),
+            Some(Err(error)) => {
+                tracing::warn!("{model_id_finetuned} hypothesis transcription failed for {segment_id}: {error}");
+            }
+            None => tracing::debug!("{model_id_finetuned} hypothesis model unavailable for {segment_id}"),
         }
 
         self.populate_wsl_hypothesis_if_configured(db, segment_id)?;

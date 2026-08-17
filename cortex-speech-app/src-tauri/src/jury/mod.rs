@@ -476,15 +476,23 @@ pub fn write_verdict(
     db.connection().execute("SAVEPOINT jury_verdict", [])?;
     let affected_result: AppResult<usize> = (|| {
         let affected = db.connection().execute(
+            // `AND verified = 0` (text-provenance audit #17): a flag-verified row is one the human
+            // deliberately closed out at the desktop — the machine jury must not restamp its verdict
+            // columns any more than the batch/consensus writers may touch its transcripts.
+            // `jury_transcript` (#18): parity with db::write_segment_verdict — the machine's own
+            // committed text is preserved on BOTH machine-verdict writers, so a later human decision
+            // replacing verdict_transcript never erases what the model actually proposed.
             "UPDATE speech_segments
              SET verdict           = ?2,
                  verdict_transcript = ?3,
+                 jury_transcript   = ?3,
                  rationale         = ?4,
                  evidence_json     = ?5,
                  agreement_score  = ?6,
                  escalated         = ?7,
                  updated_at        = datetime('now')
              WHERE id = ?1
+               AND verified = 0
                AND (human_decision IS NULL OR human_decision = '')
                AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
             params![
@@ -1183,6 +1191,31 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's-hv'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(captured, 0, "no model-correction example may be captured when the verdict write no-ops");
+    }
+
+    #[test]
+    fn write_verdict_never_touches_a_flag_verified_row_and_preserves_its_own_proposal() {
+        // Audit #17: the guard checked human_decision/verdict but not `verified` — a clip the human
+        // closed out with the verify flag alone still had its verdict columns restamped by the jury.
+        // Audit #18: parity with db::write_segment_verdict — the machine's own committed text is
+        // preserved in jury_transcript so a later human decision replacing verdict_transcript never
+        // erases what the model actually proposed.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        db.insert_segment(&make_seg("s-flag", "raw text")).unwrap();
+        db.update_verified("s-flag", true).unwrap();
+        write_verdict(&db, "s-flag", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        let seg = db.get_segment_by_id("s-flag").unwrap().unwrap();
+        assert_eq!(seg.verdict, None, "a flag-verified row must not be restamped by the machine jury");
+
+        db.insert_segment(&make_seg("s-open", "raw text")).unwrap();
+        write_verdict(&db, "s-open", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        let jt: Option<String> = db
+            .connection()
+            .query_row("SELECT jury_transcript FROM speech_segments WHERE id = 's-open'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(jt.as_deref(), Some("machine consensus"), "the jury's own proposal is preserved (v48 parity)");
     }
 
     #[test]

@@ -338,10 +338,12 @@ pub fn training_grade_for_segment(seg: &SpeechSegment) -> TrainingGradeReport {
         )
     });
 
-    let human_verified = seg.verified
-        || seg.is_gold
-        || decision_is(seg.human_decision.as_deref(), &["accept", "edit", "human_accept", "human_edit"])
-        || decision_is(seg.verdict.as_deref(), &["human_accept", "human_edit"]);
+    // Owner rule 2026-08-12: `verified`/`is_gold` ALONE never mint human provenance. Bulk "Verify
+    // All Pending" and the ^D toggle set only the flag — no per-clip decision, no text captured —
+    // and grading that flag as human_verified exported machine drafts as human gold (text-provenance
+    // audit, defects #7/#8/#15). The single source of truth is the SOURCE the transcript selection
+    // itself computed: "human_verified" exists iff a real human decision produced the text.
+    let human_verified = source == "human_verified";
 
     if human_verified {
         reasons.push("human_verified".to_string());
@@ -418,31 +420,35 @@ pub fn human_verified_text(seg: &SpeechSegment) -> Option<&str> {
     }
 }
 
+/// VERBATIM LAW (owner rule 2026-08-12, test_verbatim_training_text_policy.py): the corpus is
+/// exact audio→text, so the transcript is human-approved text > human-typed annotation > champion
+/// raw — and NEVER machine paraphrase. The LLM refinement was MEASURED rewriting the champion's
+/// verbatim output (median 11.1% of characters on 492 clips: loanwords translated, digits
+/// verbalized, punctuation invented), so `normalized_transcript` and machine jury verdicts are
+/// EVIDENCE (hypotheses, retrieval), never the transcript. "human_verified" requires a real human
+/// decision — the `verified` flag alone proves a click, not a reading (audit defects #7/#8/#15).
 fn training_transcript_with_source(seg: &SpeechSegment) -> (&str, &'static str) {
-    if let Some(text) = non_empty(seg.verdict_transcript.as_deref()) {
-        if decision_is(seg.human_decision.as_deref(), &["accept", "edit", "human_accept", "human_edit"])
-            || decision_is(seg.verdict.as_deref(), &["human_accept", "human_edit"])
-        {
+    let human_decided = decision_is(seg.human_decision.as_deref(), &["accept", "edit", "human_accept", "human_edit"])
+        || decision_is(seg.verdict.as_deref(), &["human_accept", "human_edit"]);
+
+    if human_decided {
+        // The text captured at decision time, else the human's typed annotation, else the raw draft
+        // the accept was made against — an accept of the displayed draft IS approval of that text
+        // (record_human_decision snapshots it into verdict_transcript going forward; the raw rung
+        // covers historical accepts recorded before that snapshot existed).
+        if let Some(text) = non_empty(seg.verdict_transcript.as_deref()) {
             return (text, "human_verified");
         }
+        if let Some(text) = non_empty(seg.annotated_transcript.as_deref()) {
+            return (text, "human_verified");
+        }
+        return (&seg.raw_transcript, "human_verified");
     }
 
+    // Human-typed draft (the field is machine-write-proof: test_machine_never_writes_annotated_policy)
+    // that no decision has blessed yet — real human text, not yet gold.
     if let Some(text) = non_empty(seg.annotated_transcript.as_deref()) {
-        let source = if seg.verified || seg.is_gold { "human_verified" } else { "annotated" };
-        return (text, source);
-    }
-
-    if let Some(text) = non_empty(seg.verdict_transcript.as_deref()) {
-        let source = if decision_is(seg.verdict.as_deref(), &["auto_accept", "jury_accept", "jury_edit"]) {
-            "jury_verdict"
-        } else {
-            "verdict"
-        };
-        return (text, source);
-    }
-
-    if let Some(text) = non_empty(seg.normalized_transcript.as_deref()) {
-        return (text, "normalized_asr");
+        return (text, "annotated");
     }
 
     (&seg.raw_transcript, "raw_asr")
@@ -452,8 +458,9 @@ fn non_empty(text: Option<&str>) -> Option<&str> {
     text.filter(|value| !value.trim().is_empty())
 }
 
-/// The best available human-facing transcript for a segment (verdict → annotated → jury verdict →
-/// normalized → raw ASR). Shared by training-grade logic and the plain transcript/subtitle export.
+/// The best available human-facing transcript for a segment (human-decided verdict → annotated →
+/// champion raw; VERBATIM LAW — machine paraphrase never surfaces). Shared by training-grade logic
+/// and the plain transcript/subtitle export. SQL mirror: `stats.rs::EFFECTIVE`.
 pub fn effective_transcript(seg: &SpeechSegment) -> &str {
     training_transcript_with_source(seg).0
 }
@@ -1332,7 +1339,7 @@ mod tests {
     fn jury_row_whose_only_confidence_is_the_engines(source: Option<&str>) -> SpeechSegment {
         let mut s = seg("jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
-        s.verdict_transcript = Some("jury selected transcript".to_string());
+        s.verdict_transcript = Some("raw transcript".to_string());
         s.agreement_score = None; // the ONLY confidence is the engine's
         s.confidence = Some(0.90); // exactly what asr.rs stamps on every non-empty transcript
         s.confidence_source = source.map(str::to_string);
@@ -1340,7 +1347,7 @@ mod tests {
             serde_json::json!({
                 "referenceModelId": "gemini-2.5-pro",
                 "selectedModelId": "omniasr-wsl-7b",
-                "selectedTranscript": "jury selected transcript",
+                "selectedTranscript": "raw transcript",
                 "shouldCommit": true
             })
             .to_string(),
@@ -1399,13 +1406,13 @@ mod tests {
     fn training_grade_accepts_high_confidence_reference_jury_rows_as_silver() {
         let mut s = seg("jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
-        s.verdict_transcript = Some("jury selected transcript".to_string());
+        s.verdict_transcript = Some("raw transcript".to_string());
         s.agreement_score = Some(0.92);
         s.evidence_json = Some(
             serde_json::json!({
                 "referenceModelId": "gemini-2.5-pro",
                 "selectedModelId": "omniasr-wsl-7b",
-                "selectedTranscript": "jury selected transcript",
+                "selectedTranscript": "raw transcript",
                 "shouldCommit": true
             })
             .to_string(),
@@ -1416,8 +1423,11 @@ mod tests {
 
         let report = training_grade_for_segment(&s);
 
-        assert_eq!(report.transcript, "jury selected transcript");
-        assert_eq!(report.transcript_source, "jury_verdict");
+        assert_eq!(report.transcript, "raw transcript");
+        assert_eq!(
+            report.transcript_source, "raw_asr",
+            "VERBATIM LAW: machine verdicts are evidence, never the source"
+        );
         assert_eq!(report.grade, TRAINING_GRADE_SILVER);
         assert!(report.training_ready);
         assert!(report.reasons.contains(&"multi_agent_evidence_verified".to_string()));
@@ -1444,7 +1454,7 @@ mod tests {
 
         let report = training_grade_for_segment(&s);
 
-        assert_eq!(report.transcript, "current promoted transcript");
+        assert_eq!(report.transcript, "raw transcript", "VERBATIM LAW: undecided rows ship the champion raw");
         assert_eq!(report.grade, TRAINING_GRADE_REVIEW);
         assert!(!report.training_ready);
         assert!(report.reasons.contains(&"missing_multi_agent_evidence".to_string()));
@@ -1454,7 +1464,7 @@ mod tests {
     fn training_grade_keeps_high_confidence_jury_without_multi_agent_evidence_in_review() {
         let mut s = seg("weak-jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
-        s.verdict_transcript = Some("jury selected transcript".to_string());
+        s.verdict_transcript = Some("raw transcript".to_string());
         s.agreement_score = Some(0.97);
         s.evidence_json = Some(
             serde_json::json!([
@@ -1468,7 +1478,7 @@ mod tests {
 
         let report = training_grade_for_segment(&s);
 
-        assert_eq!(report.transcript, "jury selected transcript");
+        assert_eq!(report.transcript, "raw transcript");
         assert_eq!(report.grade, TRAINING_GRADE_REVIEW);
         assert!(!report.training_ready);
         assert!(report.reasons.contains(&"missing_multi_agent_evidence".to_string()));
@@ -1478,7 +1488,7 @@ mod tests {
     fn training_grade_ignores_individual_reference_votes_without_consensus_commit() {
         let mut s = seg("reference-conflict", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
-        s.verdict_transcript = Some("jury selected transcript".to_string());
+        s.verdict_transcript = Some("raw transcript".to_string());
         s.agreement_score = Some(0.97);
         s.evidence_json = Some(
             serde_json::json!({
@@ -1514,17 +1524,16 @@ mod tests {
     fn training_grade_accepts_t2_audio_listener_evidence_as_silver() {
         let mut s = seg("t2-jury", "raw transcript", 5000);
         s.verdict = Some("jury_accept".to_string());
-        s.verdict_transcript = Some("t2 selected transcript".to_string());
+        s.verdict_transcript = Some("raw transcript".to_string());
         s.agreement_score = Some(0.9);
-        s.evidence_json =
-            Some(serde_json::json!({"t2Transcript": "t2 selected transcript", "t2Evidence": []}).to_string());
+        s.evidence_json = Some(serde_json::json!({"t2Transcript": "raw transcript", "t2Evidence": []}).to_string());
         s.clipping_ratio = Some(0.0);
         s.rms_db = Some(-18.0);
         s.snr_db = Some(30.0);
 
         let report = training_grade_for_segment(&s);
 
-        assert_eq!(report.transcript, "t2 selected transcript");
+        assert_eq!(report.transcript, "raw transcript");
         assert_eq!(report.grade, TRAINING_GRADE_SILVER);
         assert!(report.training_ready);
     }
@@ -1543,7 +1552,7 @@ mod tests {
 
         let report = training_grade_for_segment(&s);
 
-        assert_eq!(report.transcript, "current t2 transcript");
+        assert_eq!(report.transcript, "raw transcript", "VERBATIM LAW: undecided rows ship the champion raw");
         assert_eq!(report.grade, TRAINING_GRADE_REVIEW);
         assert!(!report.training_ready);
         assert!(report.reasons.contains(&"missing_multi_agent_evidence".to_string()));
@@ -1600,15 +1609,17 @@ mod tests {
     fn training_grade_summary_counts_ready_tiers() {
         let mut gold = seg("gold", "trusted", 5000);
         gold.verified = true;
+        // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
+        gold.human_decision = Some("accept".to_string());
         let mut silver = seg("silver", "raw", 5000);
         silver.verdict = Some("jury_accept".to_string());
-        silver.verdict_transcript = Some("jury trusted".to_string());
+        silver.verdict_transcript = Some("raw".to_string()); // jury confirming the VERBATIM draft
         silver.agreement_score = Some(0.9);
         silver.evidence_json = Some(
             serde_json::json!({
                 "referenceModelId": "gemini-2.5-pro",
                 "selectedModelId": "omniasr-wsl-7b",
-                "selectedTranscript": "jury trusted",
+                "selectedTranscript": "raw",
                 "shouldCommit": true
             })
             .to_string(),

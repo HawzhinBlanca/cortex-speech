@@ -6,7 +6,9 @@ test.describe('App smoke tests', () => {
 
     await expect(page.getByTestId('top-bar')).toBeVisible();
     await expect(page.getByTestId('top-bar').locator('h1')).toContainText('CORTEX');
-    await expect(page.getByTestId('top-bar').locator('h1')).toContainText('Kurdish Speech Processor');
+    await expect(page.getByTestId('top-bar').locator('h1')).toContainText(
+      'Kurdish Speech Processor',
+    );
 
     await expect(page.getByTestId('left-panel')).toBeVisible();
     await expect(page.getByTestId('center-panel')).toBeVisible();
@@ -19,7 +21,7 @@ test.describe('App smoke tests', () => {
     await expect(topBar.locator('h1')).toBeVisible();
     await expect(topBar.getByText(/CORTEX/)).toBeVisible();
     await expect(topBar.getByText(/Kurdish Speech Processor/)).toBeVisible();
-    await expect(topBar.getByText('v2.0')).toBeVisible();
+    await expect(topBar.getByText('v2.1.0')).toBeVisible();
   });
 
   test('keyboard shortcuts modal opens with ? key', async ({ page }) => {
@@ -46,28 +48,22 @@ test.describe('App smoke tests', () => {
     await expect(settings).not.toBeVisible();
   });
 
-  test('cloud STT opt-in surfaces ElevenLabs key status', async ({ page }) => {
+  test('champion settings do not expose ElevenLabs Scribe in the production flow', async ({
+    page,
+  }) => {
     await page.goto('/');
 
     await page.getByTestId('settings-btn').click();
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
 
-    // The cloud-transcription opt-in lives on the Audio tab.
+    // Scribe is not part of the champion flow. Its former opt-in and key-status surfaces must stay
+    // absent so a reviewer cannot accidentally switch transcript providers from ordinary Settings.
     await settings.getByRole('button', { name: 'Audio', exact: true }).click();
-
-    // No status until the opt-in is on (it only matters when cloud STT is enabled).
     await expect(settings.getByTestId('elevenlabs-key-status')).toHaveCount(0);
-
-    // Enable the ElevenLabs Scribe opt-in; the mock reports its key as present.
-    await settings
-      .locator('label', { hasText: 'Cloud transcription (ElevenLabs Scribe)' })
-      .getByRole('checkbox')
-      .check();
-
-    const status = settings.getByTestId('elevenlabs-key-status');
-    await expect(status).toBeVisible();
-    await expect(status).toContainText('ElevenLabs key detected');
+    await expect(
+      settings.locator('label', { hasText: 'Cloud transcription (ElevenLabs Scribe)' }),
+    ).toHaveCount(0);
   });
 
   test('model registry lists registered models with a champion badge', async ({ page }) => {
@@ -155,7 +151,7 @@ test.describe('App smoke tests', () => {
     await expect(spans.first()).toContainText('diff.compute');
   });
 
-  test('Scribe actions are consent-gated and invoke the cloud STT commands', async ({ page }) => {
+  test('champion segment actions expose no smaller or cloud ASR controls', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByTestId('segments-empty-state')).not.toBeVisible({ timeout: 15_000 });
 
@@ -163,29 +159,11 @@ test.describe('App smoke tests', () => {
     // the span inside the list-item button; clicking it bubbles to the button's select handler.
     await page.locator('[title="sample.wav"]').first().click();
 
-    // Scribe buttons are hidden until cloud-STT opt-in is enabled.
+    await expect(page.getByTestId('transcribe-btn')).toBeVisible();
+    await expect(page.getByTestId('transcribe-constrained-btn')).toHaveCount(0);
+    await expect(page.getByTestId('transcribe-finetuned-btn')).toHaveCount(0);
     await expect(page.getByTestId('transcribe-scribe-btn')).toHaveCount(0);
-
-    // Enable cloud STT via Settings → Audio.
-    await page.getByTestId('settings-btn').click();
-    const settings = page.getByTestId('settings-panel');
-    await expect(settings).toBeVisible();
-    await settings.getByRole('button', { name: 'Audio', exact: true }).click();
-    await settings
-      .locator('label', { hasText: 'Cloud transcription (ElevenLabs Scribe)' })
-      .getByRole('checkbox')
-      .check();
-    await settings.getByTestId('settings-close-btn').click();
-    await expect(settings).not.toBeVisible();
-
-    // Now the consent-gated Scribe actions appear; clicking each runs its command's happy path.
-    const scribe = page.getByTestId('transcribe-scribe-btn');
-    await expect(scribe).toBeVisible();
-    await scribe.click();
-    await expect(page.getByRole('alert').filter({ hasText: 'Transcription complete' })).toBeVisible();
-
-    await page.getByTestId('add-scribe-vote-btn').click();
-    await expect(page.getByRole('alert').filter({ hasText: 'Scribe vote added' })).toBeVisible();
+    await expect(page.getByTestId('add-scribe-vote-btn')).toHaveCount(0);
   });
 
   test('settings panel opens via Ctrl+, shortcut', async ({ page }) => {

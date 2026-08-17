@@ -22,7 +22,9 @@ describe('KeyboardManager modal gate', () => {
   });
 
   const pressCtrlD = () =>
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true }));
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true }),
+    );
 
   it('fires a global shortcut when no modal is open', () => {
     const km = new KeyboardManager();

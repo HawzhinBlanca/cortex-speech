@@ -404,8 +404,41 @@ impl ModelManager {
             .collect()
     }
 
+    /// Operational model requirements for the selected primary ASR engine.
+    ///
+    /// The WSL 7B champion is not a native ONNX model in this directory, so it requires only the
+    /// VAD used to create its clips. Local CTC engines require their exact selected model+tokens
+    /// pair. Optional jury/alignment engines are deliberately excluded; training/export proof gates
+    /// validate their stored evidence separately and must not turn an otherwise runnable champion
+    /// installation into `models_needed`.
+    pub fn missing_required_model_names_for(&self, model_size: &AsrModelSize) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        let vad_root = self.resolve_root_for("silero_vad_v4.onnx");
+        if !model_file_meets_min_size(&vad_root, "silero_vad_v4.onnx", 1_000_000) {
+            missing.push("Silero VAD v4");
+        }
+
+        match model_size {
+            AsrModelSize::WSL7B => {}
+            AsrModelSize::CTC300M => {
+                let root = self.resolve_root_for(OMNIASR_CTC_300M_MODEL);
+                if !omniasr_ctc_300m_present_in(&root) {
+                    missing.push("Meta OmniASR CTC 300M model and tokens");
+                }
+            }
+            AsrModelSize::CTC1B => {
+                let root = self.resolve_root_for(OMNIASR_CTC_1B_MODEL);
+                if !omniasr_ctc_1b_present_in(&root) {
+                    missing.push("Meta OmniASR CTC 1B model and tokens");
+                }
+            }
+        }
+        missing
+    }
+
+    /// Factory/default operational requirements follow the champion, not an implicit CTC engine.
     pub fn missing_required_model_names(&self) -> Vec<&'static str> {
-        missing_required_model_names_in(&self.resolved_dir())
+        self.missing_required_model_names_for(&AsrModelSize::WSL7B)
     }
 
     pub fn missing_optional_model_names(&self) -> Vec<&'static str> {
@@ -428,8 +461,12 @@ impl ModelManager {
             .collect()
     }
 
+    pub fn all_models_present_for(&self, model_size: &AsrModelSize) -> bool {
+        self.missing_required_model_names_for(model_size).is_empty()
+    }
+
     pub fn all_models_present(&self) -> bool {
-        self.missing_required_model_names().is_empty()
+        self.all_models_present_for(&AsrModelSize::WSL7B)
     }
 
     pub fn model_path(&self, filename: &str) -> PathBuf {
@@ -1008,13 +1045,21 @@ fn model_download_supported(model: &ModelInfo) -> bool {
     !model.url.is_empty() && !model.sha256.is_empty()
 }
 
-fn missing_required_model_names_in(model_dir: &Path) -> Vec<&'static str> {
+#[cfg(test)]
+fn missing_required_model_names_in(model_dir: &Path, model_size: &AsrModelSize) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !model_file_meets_min_size(model_dir, "silero_vad_v4.onnx", 1_000_000) {
         missing.push("Silero VAD v4");
     }
-    if !omniasr_ctc_300m_present_in(model_dir) && !omniasr_ctc_1b_present_in(model_dir) {
-        missing.push("Meta OmniASR CTC model and tokens");
+    match model_size {
+        AsrModelSize::WSL7B => {}
+        AsrModelSize::CTC300M if !omniasr_ctc_300m_present_in(model_dir) => {
+            missing.push("Meta OmniASR CTC 300M model and tokens");
+        }
+        AsrModelSize::CTC1B if !omniasr_ctc_1b_present_in(model_dir) => {
+            missing.push("Meta OmniASR CTC 1B model and tokens");
+        }
+        AsrModelSize::CTC300M | AsrModelSize::CTC1B => {}
     }
     missing
 }
@@ -1309,6 +1354,28 @@ mod tests {
     use std::cell::Cell;
     use std::fs::File;
     use std::io;
+
+    #[test]
+    fn champion_operational_requirements_never_include_optional_ctc_models() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let missing = missing_required_model_names_in(empty.path(), &AsrModelSize::WSL7B);
+
+        assert_eq!(missing, vec!["Silero VAD v4"]);
+        assert!(!missing.iter().any(|name| name.contains("CTC")), "champion health must not require CTC: {missing:?}");
+    }
+
+    #[test]
+    fn local_operational_requirements_name_the_exact_selected_engine() {
+        let empty = tempfile::tempdir().expect("tempdir");
+
+        let missing_300m = missing_required_model_names_in(empty.path(), &AsrModelSize::CTC300M);
+        assert!(missing_300m.contains(&"Meta OmniASR CTC 300M model and tokens"));
+        assert!(!missing_300m.iter().any(|name| name.contains("1B")));
+
+        let missing_1b = missing_required_model_names_in(empty.path(), &AsrModelSize::CTC1B);
+        assert!(missing_1b.contains(&"Meta OmniASR CTC 1B model and tokens"));
+        assert!(!missing_1b.iter().any(|name| name.contains("300M")));
+    }
 
     #[test]
     fn runtime_integrity_rejects_tampered_model() {

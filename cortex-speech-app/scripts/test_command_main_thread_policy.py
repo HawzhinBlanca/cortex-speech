@@ -14,11 +14,18 @@ one exists and is async. Deleting such a command either fails this gate or, wors
 trimming the list — which silently shrinks a ratchet that exists precisely to never shrink.
 
 So "no frontend caller" does NOT mean "dead" in this repo. A command can be load-bearing for a gate, for
-`test_ui_thread_blocking_audit.py`'s freezer worklist, or as the sole caller of real logic
-(`get_blocking_validation_issues` is the only caller of `export_bundle::blocking_issues`). Before cutting
+`test_ui_thread_blocking_audit.py`'s freezer worklist, or as the sole caller of real logic. Before cutting
 any command, search the WHOLE repo with no path filter — scripts/, src-tauri/fuzz/, .github/, docs/ —
 and let the compiler and these gates, not a grep over src/, decide what is reachable. A grep proves
 presence, never absence.
+
+(ponytail-audit round 2, 2026-08-13: `run_consensus_refinery` and `compute_annotation_drift_scorecard`
+were removed from ASYNC_SLOW_COMMANDS below after full-repo verification found zero callers anywhere —
+frontend, scripts, fuzz, CI, docs — beyond this ratchet list itself and their own `generate_handler!`
+registration. `get_blocking_validation_issues` (a sync command, never in this async list) was cut the
+same way; its sole callee `export_bundle::blocking_issues` was dead code once the wrapper went, so it
+was cut too — the struct it returned, `BlockingValidationIssues`, is still built inline by the live
+`export_dataset_bundle` and was NOT touched.)
 """
 from pathlib import Path
 
@@ -55,7 +62,6 @@ ASYNC_SLOW_COMMANDS = [
     # Eval / quality / calibration compute over the whole dataset + a model-integrity hash.
     "get_dataset_certificate",
     "run_gold_eval",
-    "compute_annotation_drift_scorecard",
     "get_label_quality_lift",
     "validate_dataset_cmd",
     "get_dataset_quality",
@@ -81,7 +87,6 @@ ASYNC_SLOW_COMMANDS = [
     # Per-segment acoustic/OOD scoring loops + IRT consensus refinery (decode + ONNX per segment).
     "compute_acoustic_scores",
     "compute_signal_anomaly_scores",
-    "run_consensus_refinery",
     # DB backup/restore — the heavy file-copy + integrity-check runs in run_blocking.
     "db_backup",
     "db_restore",

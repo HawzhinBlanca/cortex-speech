@@ -15,10 +15,17 @@ export function wordPlayBounds(
   pad = 0.12,
 ): { start: number; end: number } {
   const MIN_WINDOW = 0.05;
-  const start = Math.max(clipStart, clipStart + w.start - pad);
+  const bounded = clipEnd > clipStart;
+  let start = Math.max(clipStart, clipStart + w.start - pad);
   let end = clipStart + w.end + pad;
-  if (clipEnd > clipStart) end = Math.min(clipEnd, end);
-  return { start, end: Math.max(end, start + MIN_WINDOW) };
+  if (!bounded) return { start, end: Math.max(end, start + MIN_WINDOW) };
+
+  start = Math.min(clipEnd, start);
+  end = Math.min(clipEnd, Math.max(start, end));
+  // Preserve the minimum audible window by moving the start backward; never re-expand the end past
+  // clipEnd after clamping it (the previous Math.max did exactly that for a last/degenerate word).
+  if (end - start < MIN_WINDOW) start = Math.max(clipStart, end - MIN_WINDOW);
+  return { start, end };
 }
 
 /**
@@ -45,7 +52,8 @@ export function replaceWordToken(
   const tokens: Array<{ start: number; len: number; word: string }> = [];
   const re = /\S+/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) tokens.push({ start: m.index, len: m[0].length, word: m[0] });
+  while ((m = re.exec(text)) !== null)
+    tokens.push({ start: m.index, len: m[0].length, word: m[0] });
 
   const splice = (t: { start: number; len: number }) =>
     text.slice(0, t.start) + replacement + text.slice(t.start + t.len);

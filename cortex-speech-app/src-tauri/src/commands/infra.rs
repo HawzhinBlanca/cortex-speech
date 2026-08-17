@@ -60,19 +60,6 @@ pub fn get_media_asset_url(id: String, state: State<'_, AppState>) -> Result<Str
 }
 
 #[tauri::command]
-pub fn get_cache_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("get_cache_info")?;
-    Ok(serde_json::json!({ "entries": state.cache.size(), "maxEntries": 1000 }))
-}
-
-#[tauri::command]
-pub fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("clear_cache")?;
-    state.cache.clear();
-    Ok(())
-}
-
-#[tauri::command]
 pub fn get_fingerprint_count(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("get_fingerprint_count")?;
     Ok(state.fingerprint.count())
@@ -169,7 +156,8 @@ pub fn revoke_couch_reviewer(reviewer: String) -> Result<crate::couch::CouchStat
 
 /// Stop Couch Review and invalidate every reviewer's session token.
 #[tauri::command]
-pub fn stop_couch_review() -> Result<crate::couch::CouchStatus, String> {
+pub fn stop_couch_review(state: State<'_, AppState>) -> Result<crate::couch::CouchStatus, String> {
     STRICT_RATE_LIMITER.check("stop_couch_review")?;
-    crate::couch::stop()
+    let data_dir = state.lock_data_dir().clone();
+    crate::couch::stop_with_data_dir(data_dir.as_deref())
 }

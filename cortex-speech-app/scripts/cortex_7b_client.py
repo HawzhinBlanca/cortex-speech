@@ -29,6 +29,7 @@ import subprocess
 
 HOST = os.environ.get("CORTEX_7B_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORTEX_7B_PORT", "8799"))
+MAX_RESPONSE_BYTES = 1024 * 1024
 
 # Exit codes for the app's stderr preview (any non-zero => marked unavailable / import cancelled).
 EX_DB = 4        # could not locate or read the app DB
@@ -183,10 +184,12 @@ def main():
         s.sendall((json.dumps(req) + "\n").encode("utf-8"))
         buf = b""
         while not buf.endswith(b"\n"):
-            d = s.recv(65536)
+            d = s.recv(min(65536, MAX_RESPONSE_BYTES + 1 - len(buf)))
             if not d:
                 break
             buf += d
+            if len(buf) > MAX_RESPONSE_BYTES:
+                fail(EX_SERVER, f"7B engine reply exceeded {MAX_RESPONSE_BYTES} bytes")
         s.close()
     except socket.timeout:
         # Distinct from "not running": the server ACCEPTED the connection but did not answer in time
