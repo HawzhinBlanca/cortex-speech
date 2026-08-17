@@ -99,7 +99,45 @@ pub fn take_offsite_snapshot(
     quarantine_dir: &Path,
     keep: usize,
 ) -> AppResult<Option<PathBuf>> {
+    validate_offsite_dir(data_dir, quarantine_dir)?;
     take_snapshot_at_from(db, data_dir, quarantine_dir, keep, now_secs())
+}
+
+/// Refuse an off-drive backup target that would not actually be off-drive.
+///
+/// `backup_second_dir` is free text typed into Settings and re-read every interval, and until now it
+/// was handed straight to the snapshot writer. Two typos it could not survive:
+///
+/// * a RELATIVE path, which resolves against the process's working directory — not a place the owner
+///   chose, and not the same place across launches;
+/// * the primary data dir, or anything inside it, which puts the "off-drive" copy on the very disk
+///   whose loss it exists to survive — and, when it lands inside `snapshots/`, makes each backup
+///   copy the previous backups until the disk fills.
+///
+/// Wrong is fine and fixable; wrong while REPORTING a healthy second copy is the failure that costs
+/// a corpus, so this fails loudly instead.
+pub(crate) fn validate_offsite_dir(target: &Path, primary_data_dir: &Path) -> AppResult<()> {
+    if !target.is_absolute() {
+        return Err(crate::error::AppError::Validation(format!(
+            "second-directory backup path must be absolute (got {}); a relative path follows the \
+             process's working directory, not a drive you chose",
+            target.display()
+        )));
+    }
+    // Compare what we can: canonicalize resolves symlinks/8.3 names, but only for paths that already
+    // exist. A target that does not exist yet is created by the snapshot itself, so fall back to the
+    // literal path — the containment check is what matters either way.
+    let resolved = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (target_abs, primary_abs) = (resolved(target), resolved(primary_data_dir));
+    if target_abs == primary_abs || target_abs.starts_with(&primary_abs) {
+        return Err(crate::error::AppError::Validation(format!(
+            "second-directory backup path {} is inside the primary data directory {} — that is the \
+             same disk it exists to survive, and it makes every backup copy the previous ones",
+            target.display(),
+            primary_data_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Take a PINNED, rotation-exempt snapshot into `<data_dir>/snapshots/pinned/<label>_<ts>/`,
@@ -621,6 +659,30 @@ mod tests {
         take_snapshot_at(&db, data_dir, 2, 500).unwrap().expect("snapshots");
         let kept_after = std::fs::read_dir(&root).unwrap().flatten().filter(|e| e.path().is_dir()).count();
         assert_eq!(kept_after, 2, "once the quarantine is cleared, keep=2 prunes back to two");
+    }
+
+    /// The off-drive target is free text from Settings, and a wrong one is dangerous precisely
+    /// because it still LOOKS like a working second copy.
+    #[test]
+    fn offsite_backup_refuses_a_target_that_is_not_actually_off_drive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let primary = tmp.path().join("cortex-speech");
+        std::fs::create_dir_all(primary.join("snapshots")).unwrap();
+
+        // The owner's real configuration: a separate drive, outside the data dir.
+        let elsewhere = tmp.path().join("offsite");
+        validate_offsite_dir(&elsewhere, &primary).expect("a sibling directory is a valid off-drive target");
+
+        // A relative path lands wherever the process happens to be running from.
+        assert!(validate_offsite_dir(Path::new("backups"), &primary).is_err(), "relative paths must be refused");
+
+        // The data dir itself, and anything under it — same disk, and inside `snapshots/` each
+        // backup would start copying the previous ones.
+        assert!(validate_offsite_dir(&primary, &primary).is_err(), "the primary data dir is not a backup");
+        assert!(
+            validate_offsite_dir(&primary.join("snapshots"), &primary).is_err(),
+            "a path inside the data dir is not off-drive"
+        );
     }
 
     #[test]
