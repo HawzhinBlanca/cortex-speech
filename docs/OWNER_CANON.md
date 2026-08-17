@@ -34,10 +34,11 @@ if a checkable pin drifts from what is written here.
   `the_phone_never_serves_a_spot_check_its_own_answer_key`). `verdict_transcript` is the answer key.
 - Reviewers are paid on DISTINCT clips' audio duration (`reviewed_audio_ms`), never on event rows.
 - Max 8 named reviewers; per-reviewer tokens; Stop revokes durably.
-- Dialect routing: **KBHP = Hawleri** (all 32 episodes, owner-confirmed). The organized tree
-  `D:\Kurdish Corpora\<dialect>\` declares dialect by folder. Unmapped sources FAIL CLOSED for
-  restricted reviewers. Roster: Hawzhin/Rubar/Pavel = hawleri+sorani; Roza/Alle/Sabat/Lamo/Sewa =
-  sorani only. Enforced: `check_reviewer_queues_live.py`, `dialect.rs` tests.
+- Dialect routing: **KBHP = Hawleri** (all 32 episodes, owner-confirmed). The organized corpus tree
+  declares dialect by folder (`Kurdish Corpora\<dialect>\`). Unmapped sources FAIL CLOSED for
+  restricted reviewers. WHO may judge WHAT lives in `<data_dir>/reviewer_dialects.json` — names stay
+  out of this public document by the repo's own hygiene law. Enforced:
+  `check_reviewer_queues_live.py`, `dialect.rs` tests.
 
 ## Calibrated numbers (measured, not chosen — recalibrate only with a new measurement)
 - `SPEAKER_CHANGE_THRESHOLD = 0.59` — within-clip half-vs-half; owner's blind 15-clip pass, 15/15.
