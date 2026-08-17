@@ -1758,6 +1758,19 @@ impl ProcessingPipeline {
             return Err(AppError::Validation("Empty audio file".into()));
         }
 
+        // Before anything is decoded: if this recording was PROCESSED before it reached the app (the
+        // pre-import cleaner separates voice from music, cuts the non-speech out, and normalises the
+        // level), record that now, keyed by source path. Its clips are about to become
+        // indistinguishable from raw field recordings in every export unless the library says
+        // otherwise. Best-effort and never fatal — a failed stamp must not fail an import whose
+        // audio is fine — but it WARNs, because what is lost is a provenance claim, not audio.
+        if let Some(provenance) = crate::source_provenance::detect(path) {
+            tracing::info!("source audio declared as processed before import: {}", provenance.processing);
+            if let Err(e) = db.upsert_source_audio_provenance(&provenance) {
+                tracing::warn!("could not record source audio provenance for {}: {e}", path.display());
+            }
+        }
+
         // F2: fail fast BEFORE any decode/VAD/diarization work if the selected primary engine can't
         // actually run — never silently transcribe the whole import with the stock model.
         if self.wsl7b_primary_unresolved() {

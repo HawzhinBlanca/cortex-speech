@@ -18,6 +18,7 @@ use base64::Engine as _;
 use rusqlite::{backup, params, types::Value, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
@@ -300,6 +301,26 @@ pub struct SegmentHypothesis {
     pub model_id: String,
     pub transcript: String,
     pub confidence: Option<f64>,
+}
+
+/// A declaration that a source recording was PROCESSED before it was ever imported.
+///
+/// The absence of a record means one thing only: nothing has claimed this recording was processed.
+/// It never means "verified original" — see `Database::source_audio_provenance`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceAudioProvenance {
+    pub audio_path: String,
+    /// Human-readable statement of what was done to the audio, carried into every export.
+    pub processing: String,
+    /// The separation/enhancement model, when one was used.
+    pub separator_model: Option<String>,
+    /// False when the processing CUT audio out, so timestamps no longer map to the original. That is
+    /// the property a downstream consumer must not get wrong: it decides whether an offset means
+    /// anything at all.
+    pub timeline_preserved: bool,
+    /// Where the full parameter set lives (the cleaner's own manifest.json).
+    pub manifest_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -3010,6 +3031,77 @@ impl Database {
     pub fn delete_hypotheses_for_segment(&self, segment_id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM segment_hypotheses WHERE segment_id = ?1", params![segment_id])?;
         Ok(())
+    }
+
+    /// Record that `record.audio_path` was processed before import (see [`SourceAudioProvenance`]).
+    pub fn upsert_source_audio_provenance(&self, record: &SourceAudioProvenance) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO source_audio_provenance
+                (audio_path, processing, separator_model, timeline_preserved, manifest_path)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(audio_path) DO UPDATE SET
+                processing=excluded.processing,
+                separator_model=excluded.separator_model,
+                timeline_preserved=excluded.timeline_preserved,
+                manifest_path=excluded.manifest_path,
+                recorded_at=datetime('now')",
+            params![
+                record.audio_path,
+                record.processing,
+                record.separator_model,
+                record.timeline_preserved as i32,
+                record.manifest_path
+            ],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// What was done to this recording before import, or `None` if nothing ever said.
+    ///
+    /// `None` is NOT a certificate of originality. It means unclaimed — a recording imported before
+    /// this table existed reads the same as one that was never processed, which is why the export
+    /// wording below states what is known rather than asserting the audio is raw.
+    pub fn source_audio_provenance(&self, audio_path: &str) -> AppResult<Option<SourceAudioProvenance>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT audio_path, processing, separator_model, timeline_preserved, manifest_path
+             FROM source_audio_provenance WHERE audio_path = ?1",
+        )?;
+        let mut rows = stmt.query(params![audio_path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(SourceAudioProvenance {
+                audio_path: row.get(0)?,
+                processing: row.get(1)?,
+                separator_model: row.get(2)?,
+                timeline_preserved: row.get::<_, i32>(3)? != 0,
+                manifest_path: row.get(4)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Every declaration at once, keyed by source path — one query for a whole export instead of one
+    /// per clip (a 550 h corpus is ~250k clips over a few thousand recordings).
+    pub fn source_audio_provenance_map(&self) -> AppResult<HashMap<String, SourceAudioProvenance>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT audio_path, processing, separator_model, timeline_preserved, manifest_path
+             FROM source_audio_provenance",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SourceAudioProvenance {
+                audio_path: row.get(0)?,
+                processing: row.get(1)?,
+                separator_model: row.get(2)?,
+                timeline_preserved: row.get::<_, i32>(3)? != 0,
+                manifest_path: row.get(4)?,
+            })
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let record = row?;
+            map.insert(record.audio_path.clone(), record);
+        }
+        Ok(map)
     }
 
     pub fn upsert_source_transcript(&self, record: &SourceTranscriptRecord) -> AppResult<()> {

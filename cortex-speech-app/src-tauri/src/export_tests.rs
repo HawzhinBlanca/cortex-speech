@@ -80,6 +80,69 @@ fn a_withdrawn_recording_is_dropped_from_the_local_export() {
     );
 }
 
+/// Processed audio must announce itself in the dataset card, and only where it applies.
+///
+/// The pre-import cleaner outputs an ordinary WAV: music separated out, non-speech CUT, level
+/// normalised. Nothing in the file or the clip row says any of that, so before this the export
+/// described machine-separated audio in exactly the words used for a raw field recording.
+#[test]
+fn an_export_declares_which_recordings_were_processed_before_import() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+
+    let cleaned = SpeechSegment {
+        id: "cleaned-1".to_string(),
+        audio_path: "/cleaned/01.wav".to_string(),
+        raw_transcript: "دەقی پاککراوە".to_string(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    };
+    let original = SpeechSegment {
+        id: "original-1".to_string(),
+        audio_path: "/raw/KBHP-EP01.wav".to_string(),
+        raw_transcript: "دەقی ڕەسەن".to_string(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    };
+    db.insert_segments_batch(&[cleaned, original]).unwrap();
+
+    // Fail-before shape: with nothing declared, the card claims nothing either way.
+    let before = NamedTempFile::new().unwrap();
+    export_dataset(&db, before.path(), &ExportFormat::Json).unwrap();
+    let card: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(before.path()).unwrap()).unwrap();
+    assert_eq!(
+        card["metadata"]["processed_audio"].as_array().map(Vec::len),
+        Some(0),
+        "an undeclared library must not claim anything about processing"
+    );
+
+    db.upsert_source_audio_provenance(&crate::db::SourceAudioProvenance {
+        audio_path: "/cleaned/01.wav".to_string(),
+        processing: "separated with melband_roformer_big_beta4.ckpt (vocals stem kept); non-speech CUT OUT".to_string(),
+        separator_model: Some("melband_roformer_big_beta4.ckpt".to_string()),
+        timeline_preserved: false,
+        manifest_path: Some("/cleaned/manifest.json".to_string()),
+    })
+    .unwrap();
+
+    let after = NamedTempFile::new().unwrap();
+    export_dataset(&db, after.path(), &ExportFormat::Json).unwrap();
+    let card: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(after.path()).unwrap()).unwrap();
+    let notices = card["metadata"]["processed_audio"].as_array().expect("processed_audio array");
+
+    assert_eq!(notices.len(), 1, "only the processed recording is declared, not the original beside it");
+    assert_eq!(notices[0]["audio_path"], "/cleaned/01.wav");
+    assert_eq!(notices[0]["segments"], 1, "the notice counts the clips this export actually contains");
+    assert_eq!(notices[0]["separator_model"], "melband_roformer_big_beta4.ckpt");
+    assert_eq!(
+        notices[0]["timeline_preserved"], false,
+        "the cleaner CUTS audio out, so a consumer must be told the offsets do not map back"
+    );
+    // Both recordings still export — this declares, it does not exclude.
+    let text = std::fs::read_to_string(after.path()).unwrap();
+    assert!(text.contains("دەقی پاککراوە") && text.contains("دەقی ڕەسەن"));
+}
+
 #[test]
 fn the_shared_export_filter_drops_rejected_and_placeholder_rows() {
     // Audit #11/#12: export_audio applied neither filter, so a human-REJECTED clip (verified is
@@ -284,6 +347,7 @@ fn sample_metadata() -> DatasetMetadata {
             dominant_speaker_share: 0.0,
             dominant_speaker_over_50pct: false,
         },
+        processed_audio: Vec::new(),
         exported_at: "2026-06-16T00:00:00Z".to_string(),
     }
 }

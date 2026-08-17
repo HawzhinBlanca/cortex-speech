@@ -62,6 +62,7 @@ pub mod session;
 pub mod settings;
 pub mod significance;
 pub mod snapshot;
+pub mod source_provenance;
 pub mod stats;
 pub mod telemetry;
 pub mod throttle;

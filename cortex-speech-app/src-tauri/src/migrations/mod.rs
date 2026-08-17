@@ -1540,6 +1540,35 @@ pub static MIGRATIONS: &[Migration] = &[
              ALTER TABLE speech_segments DROP COLUMN review_revision;",
         ),
     },
+    Migration {
+        version: 54,
+        description: "Declare source audio that was PROCESSED before import, so an export can never call it original",
+        // 2026-08-17. The owner's pre-import cleaner (kurdish-audio-cleaner) runs a neural separator
+        // over a recording, CUTS OUT every non-speech stretch, re-concatenates what survives with
+        // 150 ms pauses, and normalises the level. The result is a WAV — indistinguishable by
+        // inspection from an original recording, and until now indistinguishable in this database
+        // too. Importing that corpus would have described machine-separated audio in exactly the
+        // words used for a raw field recording, which is the one thing this project's honesty law
+        // does not permit.
+        //
+        // Keyed by SOURCE PATH, not per segment, for three reasons: the processing is a property of
+        // the recording (all ~500 clips cut from one file share it), it keeps `speech_segments`'
+        // column layout — and therefore SEGMENT_SELECT_COLUMNS' index-based map_row — untouched, and
+        // a source can be declared before or after its clips exist.
+        //
+        // `processing` is a human-readable declaration of what was done; `manifest_path` points at
+        // the cleaner's own manifest.json, which holds the full parameter set. NULL/absent row means
+        // exactly one thing: nothing has claimed this recording was processed.
+        up_sql: "CREATE TABLE IF NOT EXISTS source_audio_provenance (
+                     audio_path TEXT PRIMARY KEY,
+                     processing TEXT NOT NULL,
+                     separator_model TEXT,
+                     timeline_preserved INTEGER NOT NULL DEFAULT 0,
+                     manifest_path TEXT,
+                     recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+        down_sql: Some("DROP TABLE IF EXISTS source_audio_provenance;"),
+    },
 ];
 
 #[cfg(test)]
