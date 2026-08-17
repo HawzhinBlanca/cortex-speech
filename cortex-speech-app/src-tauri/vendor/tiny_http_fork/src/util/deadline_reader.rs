@@ -8,6 +8,18 @@ use std::time::{Duration, Instant};
 /// must not hold a server worker forever.
 pub(crate) const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Maximum time one response write may make NO progress before the connection is dropped.
+///
+/// The read side was bounded first; the write side was not, and it is the half a phone can stall
+/// most easily: request a 500 KB clip, then stop reading. The socket buffer fills, `write` blocks,
+/// and — with one server thread per reviewer — a handful of stalled phones takes the whole review
+/// server down with nothing in the UI to say why.
+///
+/// This is `SO_SNDTIMEO`, so it fires only when the peer has acknowledged NOTHING for the whole
+/// window; a genuinely slow cellular download keeps making progress and never trips it. Longer than
+/// the read deadline because bytes-in-flight legitimately take longer than parsing a request head.
+pub(crate) const RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// A reader with an absolute wall-clock deadline.
 pub(crate) struct DeadlineReader<R> {
     inner: R,
