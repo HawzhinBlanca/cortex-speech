@@ -26,7 +26,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-MODELS_DIR = Path(__file__).resolve().parent.parent / "src-tauri" / "models"
+APP_DIR = Path(__file__).resolve().parent.parent
+MODELS_DIR = APP_DIR / "src-tauri" / "models"
 
 OMNIASR_300M_ARCHIVE = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
@@ -70,6 +71,12 @@ ITEMS = [
     {
         "dest": "silero_vad_v4.onnx",
         "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+        # VENDORED (2026-08-17): upstream replaced the file at SILERO_URL — master 404'd all three CI
+        # build smokes, and the bytes now published there hash 6850b0e5…, not our pin. An unpinned
+        # third-party URL for a 2.3 MB file the whole build depends on was a time bomb; the exact
+        # pinned bytes now live in the repo (vendor/) and the URL is only a fallback if the vendored
+        # copy is ever missing. sha256 verification applies to BOTH sources identically.
+        "vendor": "vendor/silero_vad_v4.onnx",
         "url": SILERO_URL,
     },
     {
@@ -190,7 +197,14 @@ def download() -> int:
             print(f"  SKIP     {item['dest']} (present + verified)")
             continue
         try:
-            if "url" in item:
+            vendored = APP_DIR / item["vendor"] if "vendor" in item else None
+            if vendored is not None and vendored.is_file():
+                # In-repo copy first: deterministic, offline, immune to upstream renames/replacements.
+                # The sha256 check below still gates it — a tampered vendor file is rejected the same
+                # way a tampered download is.
+                print(f"  vendored {item['vendor']}")
+                data = vendored.read_bytes()
+            elif "url" in item:
                 data = _download(item["url"])
             else:
                 if item["archive"] not in archive_cache:

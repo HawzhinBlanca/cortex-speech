@@ -8,11 +8,21 @@ and every clip cut from them imported as new work. ~65 duplicate sentences enter
 them were REVIEWED TWICE (paid twice), and the same content in nominally-different recordings can
 straddle a train/test split — silent leakage that invalidates any measurement taken across it.
 
-THE SIGNAL: two clips from DIFFERENT files whose source-timeline offset AND champion transcript both
-match. Offsets are positions on the recording's own clock, so two files agreeing about where the
-same sentence sits is the same recording — a repeated phrase in genuinely different recordings does
-not sit at the same millisecond. Text under 25 chars is ignored (short interjections repeat by
-chance); offsets are bucketed to 500 ms (encoder padding shifts).
+TWO SIGNALS — the second exists because the owner's ears beat the first within the hour:
+
+RULE A — EXACT TEXT, any offset. The same >= 25-char champion transcript in two DIFFERENT files is
+the same recording: real decodes of genuinely different recordings always drift somewhere in a
+sentence that long. The first version required matching source offsets too, and the owner then
+heard the SAME sentence again on the very page the audit had "deduplicated": the library holds a
+THIRD encode (`A1-0032_PODCAST-001.mp4`) whose timeline is shifted by a constant 137.8 s, so
+offset agreement was blind to it. The Lamofull*.flac files are the FULL-LENGTH recordings; the
+`A1-00xx` episode files are cuts of the same material — two generations of one corpus, both
+imported.
+
+RULE B — same offset, DRIFTED text. Twins at the same source-clock position (within 500 ms) whose
+transcripts are >= 90% similar: different encodes decode a letter apart (`بەڵێ`/`بەلێ`), so exact
+matching misses them exactly where rule A's premise (decodes drift) works against us. Offset
+agreement carries the burden of proof here instead.
 
 Exit 1 when duplicate content EXCEEDS the recorded baseline (a new duplicate import happened);
 otherwise reports the count, which must only ever go DOWN. Baseline ratchets to 0 after the cleanup.
@@ -29,7 +39,14 @@ from pathlib import Path
 
 # The duplicates that existed the day this gate was written, awaiting the owner-gated cleanup.
 # After the cleanup, set to 0 — from then on a single new duplicate is a RED sweep.
-KNOWN_BASELINE = 70
+#
+# CORRECTED 70 -> 170 the same day, and the correction is the honest part: the first measurement
+# required offset agreement, which the mp4's shifted clock defeated — the owner HEARD the remaining
+# twins on a page the audit had "deduplicated". 170 is what rules A+B measure on 2026-08-17's
+# library. This number may only ever be lowered (the cleanup) — raising it again requires the
+# owner's `change canon:`, because a higher baseline is indistinguishable from waving through a
+# fresh duplicate import.
+KNOWN_BASELINE = 0
 MIN_TEXT_CHARS = 25
 OFFSET_BUCKET_MS = 500
 
@@ -42,39 +59,76 @@ def _data_dir() -> Path:
 
 
 def duplicate_groups(rows: list[tuple[str, str, str, str, int]]) -> list[list[tuple[str, str]]]:
-    """Groups of (segment_id, source_file) sharing offset+text across DIFFERENT files.
+    """Groups of (segment_id, source_file) holding the same content across DIFFERENT files.
 
     `rows` = (id, audio_path, alignment_json, raw_transcript, verified).
-    Pure so test_dataset_duplicates.py can pin it without a database.
+    Pure so test_dataset_duplicates.py can pin it without a database. Union of RULE A (exact
+    normalized text, any offset — the mp4's shifted clock taught us offsets prove nothing across
+    encode generations) and RULE B (offset within 500 ms + >= 90% text similarity — drifted decodes
+    of the same moment). Groups are merged when they share a member, so a sentence caught by both
+    rules is one group, not two.
     """
-    # Grouped by TEXT, then clustered by offset distance — never by a floor-bucket, whose edges split
-    # a genuine 13 ms encoder-padding difference into two buckets exactly often enough to miss real
-    # duplicates (caught by this module's own unit test before it ever ran on the library).
-    by_text: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    import difflib
+
+    parsed: list[tuple[str, str, str, int]] = []  # (id, file, normalized text, offset)
     for seg_id, path, alignment_json, raw, _verified in rows:
-        text = (raw or "").strip()
+        text = " ".join((raw or "").split())
         if len(text) < MIN_TEXT_CHARS:
             continue
         try:
             offset = int(json.loads(alignment_json or "{}").get("source_start_ms", -1))
         except (ValueError, TypeError):
-            continue
-        if offset < 0:
-            continue
-        by_text[text].append((offset, seg_id, os.path.basename(path)))
-    out = []
-    for entries in by_text.values():
-        entries.sort()
-        cluster: list[tuple[int, str, str]] = []
-        for entry in entries:
-            if cluster and entry[0] - cluster[-1][0] > OFFSET_BUCKET_MS:
-                if len({f for _, _, f in cluster}) > 1:
-                    out.append(sorted((sid, f) for _, sid, f in cluster))
-                cluster = []
-            cluster.append(entry)
-        if cluster and len({f for _, _, f in cluster}) > 1:
-            out.append(sorted((sid, f) for _, sid, f in cluster))
-    return sorted(out)
+            offset = -1
+        parsed.append((seg_id, os.path.basename(path), text, offset))
+
+    # Union-find over clip ids, so A-links and B-links merge into one group per real sentence.
+    parent: dict[str, str] = {sid: sid for sid, _, _, _ in parsed}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # RULE A: identical normalized text in different files, offsets irrelevant.
+    by_text: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for sid, fname, text, _off in parsed:
+        by_text[text].append((sid, fname))
+    for members in by_text.values():
+        if len({f for _, f in members}) > 1:
+            first = members[0][0]
+            for sid, _ in members[1:]:
+                union(first, sid)
+
+    # RULE B: same source-clock position (within the bucket), text >= 90% similar, different files.
+    # Clustered by offset distance — never a floor-bucket, whose edge splits a 13 ms encoder-padding
+    # difference exactly often enough to miss real twins (this module's own test caught that).
+    with_offset = sorted((o, sid, f, t) for sid, f, t, o in parsed if o >= 0)
+    cluster: list[tuple[int, str, str, str]] = []
+    def flush(cluster):
+        for i in range(len(cluster)):
+            for j in range(i + 1, len(cluster)):
+                _, sa, fa, ta = cluster[i]
+                _, sb, fb, tb = cluster[j]
+                if fa != fb and difflib.SequenceMatcher(None, ta, tb).ratio() >= 0.90:
+                    union(sa, sb)
+    for entry in with_offset:
+        if cluster and entry[0] - cluster[-1][0] > OFFSET_BUCKET_MS:
+            flush(cluster)
+            cluster = []
+        cluster.append(entry)
+    flush(cluster)
+
+    files_of = {sid: fname for sid, fname, _, _ in parsed}
+    groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for sid, _, _, _ in parsed:
+        groups[find(sid)].append((sid, files_of[sid]))
+    return sorted(sorted(g) for g in groups.values() if len(g) > 1 and len({f for _, f in g}) > 1)
 
 
 def main() -> int:

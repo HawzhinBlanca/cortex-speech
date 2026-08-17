@@ -8916,3 +8916,39 @@ Gates: 1211 lib tests (28 chunking, 65 export), clippy -D warnings, fmt, 69 pyth
 typecheck 443 files — all green before commit.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 291 — the owner's ears audited the dataset, and the dataset is now clean
+
+The owner reviewed clips by ear and caught, in one sitting, what no gate had: the same sentence
+served three times. The chain from there: one recording lived in the library under THREE encodes
+(Lamofull full-recordings + A1-00xx episode cuts + an mp4 with a constant 137.8s clock shift), all
+invisible to the byte fingerprint. First audit (offset+text) measured 68 redundant clips; the owner
+heard twins on a page that audit had "deduplicated", which exposed the mp4's shifted clock and a
+letter-drifted pair — audit v2 (content rules A+B, union-find) measured the honest number: **170
+redundant clips across 113 groups, 117 of them carrying redundant human decisions** (reviewer time
+paid twice).
+
+**CLEANED, e6aaf93's discipline.** Backup `pre-dedupe-20260817-162534`, keep-rule preferring the
+verified+decided copy (106 groups) then decided (6) then the canonical fuller file (1), children
+deleted in the same BEGIN IMMEDIATE transaction, `review_events` kept as append-only history.
+Library 14,828 → 14,658. Post-conditions, all measured on the live DB: 0 duplicate groups, 0 orphan
+child rows (plus 5 PRE-EXISTING stale spot_checks rows from the 08-13 incident found and removed),
+FTS in sync, integrity_check ok. Payment totals honestly adjusted (Sewa 25.0 → 17.8 min — her
+double-reviewed twins were the bulk of the 117).
+
+**The 37 defective verified clips went back to the paid reviewers**, not to the owner: 27 two-voice
++ 12 wrong-dialect cleared via clear_human_decision's exact semantics (backup
+`pre-requeue-20260817-160349`), re-queued with the ⚠ badge showing and dialect routing enforcing who
+may judge them. The owner types nothing. The spot-check pool dropped 22 → 21 keys because one
+answer key was itself a two-voice clip — a BAD key, correctly retired.
+
+**Standing protections born today:** `docs/OWNER_CANON.md` (+ 8 machine pins, python-policies leg) —
+approved-FINAL decisions changeable only by the owner's literal `change canon:`; the
+`dataset-duplicates` sweep gate at baseline **0** — any duplicate import from now on is a RED sweep.
+
+**Cleanliness, measured after everything:** 0 missing audio files, 0 empty/placeholder drafts, 0
+verified clips with empty transcripts, 0 verified two-voice clips, 0 orphans, integrity ok, all
+live gates green. Honest remainder: simultaneous cross-talk is per-clip reviewer judgment (badge +
+the type-every-word/REJECT rule), and the QC pool needs 3 owner adjudications to reach 24.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
