@@ -18,11 +18,14 @@ def test_audio_player_playback_failures_are_visible() -> None:
     required = [
         "import { notifications } from './stores/notificationStore';",
         "function reportPlaybackFailure(message: string, cause: unknown)",
-        "error = message;",
+        # `audioError` is the $bindable prop the decision guards read (2026-08-17): a failure is not
+        # just shown, it also blocks Accept/Reject on audio nobody could hear. The pin follows the
+        # rename — the requirement is unchanged, every failure still lands in visible state.
+        "audioError = message;",
         "notifications.error(message, { detail: String(cause) });",
         "attemptPlay($t('audio.playbackFailed'));",
         "attemptPlay($t('audio.loopFailed'));",
-        "error = $t('audio.loadFailed');",
+        "audioError = $t('audio.loadFailed');",
     ]
     missing = [pattern for pattern in required if pattern not in audio_player]
     if missing:
