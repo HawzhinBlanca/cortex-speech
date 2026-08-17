@@ -648,27 +648,9 @@ fn service_locks_recover_poisoned_state() {
     assert!(pipeline.lock_denoiser_service().is_none());
 }
 
-#[test]
-fn decoded_window_accumulator_recovers_poisoned_lock() {
-    let windows =
-        std::sync::Mutex::new(vec![crate::audio::PcmWindow { offset_ms: 0, sample_rate: 16_000, pcm: vec![1, 2, 3] }]);
-
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = windows.lock().expect("lock decoded windows");
-        panic!("poison decoded windows");
-    }));
-
-    super::lock_decoded_windows(&windows).push(crate::audio::PcmWindow {
-        offset_ms: 1000,
-        sample_rate: 16_000,
-        pcm: vec![4, 5, 6],
-    });
-
-    let recovered = super::lock_decoded_windows(&windows).clone();
-    assert_eq!(recovered.len(), 2);
-    assert_eq!(recovered[1].offset_ms, 1000);
-    assert_eq!(recovered[1].pcm, vec![4, 5, 6]);
-}
+// `decoded_window_accumulator_recovers_poisoned_lock` was deleted with the accumulator it guarded
+// (2026-08-17): the streaming import no longer collects every decoded window into a shared Vec, so
+// there is no cross-thread window buffer and no lock left to poison.
 
 #[test]
 fn wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusal() {

@@ -1071,7 +1071,9 @@ def test_audio_decode_worker_send_failures_are_reported() -> None:
 
     required = [
         "fn send_decode_worker_result<T>(",
-        'send_decode_worker_result(tx, result, "decode_pcm_windows");',
+        # The windowed decoder's worker reports through `done_tx` since the 2026-08-17 rewrite (its
+        # other channel carries the windows themselves). Same requirement, current spelling.
+        'send_decode_worker_result(done_tx, result, "decode_pcm_windows");',
         'send_decode_worker_result(tx, result, "decode_to_pcm");',
         'tracing::warn!("Audio decode worker could not send {operation} result; receiver was dropped or timed out");',
     ]
@@ -1871,21 +1873,35 @@ def test_pipeline_cached_services_recover_poisoned_locks() -> None:
         raise AssertionError("pipeline.rs must keep a unit test for poisoned service-lock recovery")
 
 
-def test_pipeline_decoded_window_accumulator_recovers_poisoned_lock() -> None:
+def test_streaming_import_does_not_buffer_the_whole_recording() -> None:
+    """Replaces `test_pipeline_decoded_window_accumulator_recovers_poisoned_lock` (2026-08-17).
+
+    That policy guarded a shared `Mutex<Vec<PcmWindow>>` the streaming import used to fill with EVERY
+    decoded window before planning a single chunk — poison-safe, and holding the entire recording in
+    RAM (170 MB measured on KBHP-EP12.wav, unbounded in the file's length). The accumulator is gone,
+    so the lock it needed is gone with it; what has to be pinned now is that nothing puts it back.
+    """
     pipeline = pipeline_surface()
-    if "fn lock_decoded_windows(windows: &Mutex<Vec<audio::PcmWindow>>) -> MutexGuard<'_, Vec<audio::PcmWindow>>" not in pipeline:
-        raise AssertionError("pipeline.rs must centralize decoded-window accumulator locking")
-    if "Recovering poisoned decoded PCM window accumulator" not in pipeline:
-        raise AssertionError("Decoded-window accumulator locking must warn when recovering a poisoned lock")
-    if "poisoned.into_inner()" not in pipeline:
-        raise AssertionError("Decoded-window accumulator locking must recover poisoned locks with poisoned.into_inner()")
-    if "lock_decoded_windows(&acc).push(window)" not in pipeline:
-        raise AssertionError("Streaming decode callback must push windows through lock_decoded_windows()")
-    if "lock_decoded_windows(&windows)" not in pipeline:
-        # The outer access to the accumulator must still go through the poison-safe helper. (It now MOVEs
-        # the Vec out via std::mem::take instead of cloning it — the safety invariant is the guarded
-        # access, not the copy.)
-        raise AssertionError("Streaming decode must access accumulated windows through lock_decoded_windows()")
+    if "lock_decoded_windows" in pipeline:
+        raise AssertionError(
+            "the decoded-window accumulator is deliberately gone — the streaming import must consume "
+            "each window as it arrives, not collect them all first"
+        )
+    if "decode_pcm_windows_streaming(" not in pipeline:
+        raise AssertionError("the streaming import must drive audio::decode_pcm_windows_streaming")
+    if "Vec<audio::PcmWindow>" in pipeline:
+        raise AssertionError(
+            "the streaming import must not accumulate PcmWindows in a Vec: peak memory has to stay "
+            "bounded by a couple of windows, whatever the recording's length"
+        )
+
+    audio = (REPO_ROOT / "src-tauri/src/audio.rs").read_text(encoding="utf-8")
+    if "sync_channel" not in audio:
+        raise AssertionError(
+            "decode_pcm_windows_streaming must hand windows over a BOUNDED channel — an unbounded one "
+            "lets the decoder run the whole file ahead of the consumer, which is the buffering this "
+            "rewrite removed"
+        )
     if "decoded_window_accumulator_recovers_poisoned_lock" not in pipeline:
         raise AssertionError("pipeline.rs must keep a unit test for poisoned decoded-window recovery")
 
@@ -2379,7 +2395,7 @@ def main() -> None:
     test_health_system_recovers_poisoned_lock()
     test_pipeline_import_status_recovers_poisoned_lock()
     test_pipeline_cached_services_recover_poisoned_locks()
-    test_pipeline_decoded_window_accumulator_recovers_poisoned_lock()
+    test_streaming_import_does_not_buffer_the_whole_recording()
     test_telemetry_tracer_recovers_poisoned_span_buffer()
     print("rust runtime panic policy regression passed")
 

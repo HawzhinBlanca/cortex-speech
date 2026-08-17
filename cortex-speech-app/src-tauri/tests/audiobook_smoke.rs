@@ -71,6 +71,50 @@ fn audiobook_mp3_decode_and_chunk_plan() {
     assert!(chunk_count >= 10, "expected many VAD chunks for audiobook, got {chunk_count}");
 }
 
+/// The bounded streaming decoder must deliver EXACTLY what the direct one does, on real long audio.
+///
+/// `process_single_file_streaming` was rewritten on 2026-08-17 to consume windows as they decode
+/// instead of collecting the whole recording first. Everything downstream — chunk offsets, the
+/// carried-over tail, the whole-file fingerprint — assumes the window sequence is unchanged, so this
+/// compares the two decoders window for window on a real file rather than a synthetic tone.
+#[test]
+#[ignore]
+fn streaming_decoder_matches_the_direct_decoder_on_real_long_audio() {
+    let path = match audiobook_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("[audiobook_smoke] skip: set CORTEX_AUDIOBOOK_MP3 to a long audio fixture");
+            return;
+        }
+    };
+
+    let mut direct: Vec<(i64, usize)> = Vec::new();
+    audio::decode_pcm_windows(&path, audio::DECODE_WINDOW_MS, |w| {
+        direct.push((w.offset_ms, w.pcm.len()));
+        Ok(())
+    })
+    .expect("direct decode");
+
+    let mut streamed: Vec<(i64, usize)> = Vec::new();
+    let mut last_flags: Vec<bool> = Vec::new();
+    audio::decode_pcm_windows_streaming(
+        path.clone(),
+        audio::DECODE_WINDOW_MS,
+        std::time::Duration::from_secs(120),
+        |w, is_last| {
+            streamed.push((w.offset_ms, w.pcm.len()));
+            last_flags.push(is_last);
+            Ok(())
+        },
+    )
+    .expect("streaming decode");
+
+    eprintln!("[audiobook_smoke] windows: direct={} streamed={}", direct.len(), streamed.len());
+    assert_eq!(streamed, direct, "the streaming decoder must deliver identical windows, in order");
+    assert_eq!(last_flags.iter().filter(|f| **f).count(), 1, "exactly one window ends the file");
+    assert!(*last_flags.last().expect("a window"), "and it is the last one delivered");
+}
+
 #[test]
 #[ignore]
 fn audiobook_mp3_fingerprint_reimport_not_duplicate() {

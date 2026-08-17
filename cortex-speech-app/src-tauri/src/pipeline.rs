@@ -22,6 +22,13 @@ use uuid::Uuid;
 const SUBPROCESS_ERROR_PREVIEW_CHARS: usize = 4096;
 const SOURCE_AUDIO_HASH_BUFFER_BYTES: usize = 128 * 1024;
 const NORMALIZER_VERSION: &str = "sorani-normalizer-v1";
+/// Longest we will wait for ONE 90 s decode window in the streaming import.
+///
+/// The old whole-file budget (`duration × 2`, up to an hour) cannot be reused as-is: decode and ASR
+/// now interleave, so a file-length budget would be timing the transcription too. 90 s of audio
+/// decodes in well under a second on any supported machine, so a two-minute ceiling is generous for
+/// a stalled disk while still being an actual bound.
+const MAX_WINDOW_DECODE_WAIT: Duration = Duration::from_secs(120);
 
 /// P1.4b: whether the streaming loop should (re)build a cached denoiser/diarization service this window.
 /// Build if the service is UNSET (`!present`); otherwise re-attempt a present-but-INACTIVE service only
@@ -232,13 +239,6 @@ fn join_wsl_pipe_reader(thread: std::thread::JoinHandle<Vec<u8>>, stream: &str) 
             Vec::new()
         }
     }
-}
-
-fn lock_decoded_windows(windows: &Mutex<Vec<audio::PcmWindow>>) -> MutexGuard<'_, Vec<audio::PcmWindow>> {
-    windows.lock().unwrap_or_else(|poisoned| {
-        tracing::warn!("Recovering poisoned decoded PCM window accumulator");
-        poisoned.into_inner()
-    })
 }
 
 fn log_hypothesis_population_failure(segment_id: &str, error: &AppError) {
@@ -1852,6 +1852,8 @@ impl ProcessingPipeline {
         let denoiser_service =
             denoiser_guard.as_ref().ok_or_else(|| AppError::Other("Failed to initialize denoiser service".into()))?;
 
+        // Once per file — see the parameter's doc on build_segments_from_pcm.
+        let file_hash = crate::cache::TranscriptCache::compute_hash(path).ok();
         let (segments, pcm_cache) = self.build_segments_from_pcm(
             path,
             &pcm,
@@ -1864,6 +1866,7 @@ impl ProcessingPipeline {
             denoiser_service,
             &mut on_chunk,
             None, // non-streaming: the whole file is one call, so diarization clusters in-place
+            file_hash.as_deref(),
         )?;
         let mut persisted = self.persist_segments(db, segments)?;
         // v50: persist the fingerprint now that the rows exist, so the NEXT session rehydrates it and
@@ -1906,34 +1909,13 @@ impl ProcessingPipeline {
         cancel: Option<&CancellationToken>,
         mut on_chunk: impl FnMut(usize, usize),
     ) -> AppResult<Vec<SpeechSegment>> {
-        let windows: Arc<Mutex<Vec<audio::PcmWindow>>> = Arc::new(Mutex::new(Vec::new()));
-        let acc = Arc::clone(&windows);
-        let path_buf = path.to_path_buf();
-        audio::decode_pcm_windows_with_timeout(path_buf, audio::DECODE_WINDOW_MS, decode_timeout, move |window| {
-            lock_decoded_windows(&acc).push(window);
-            Ok(())
-        })?;
-
-        let windows = {
-            // MOVE the decoded windows out of the mutex instead of cloning them. The decode callback has
-            // already finished (decode_pcm_windows_with_timeout returned), so nothing else touches the
-            // Vec; cloning here held the ENTIRE file's PCM twice — exactly what the streaming path exists
-            // to avoid. std::mem::take leaves an empty Vec behind and releases the lock without the copy.
-            let mut guard = lock_decoded_windows(&windows);
-            std::mem::take(&mut *guard)
-        };
-
-        if windows.is_empty() {
-            return Err(AppError::Validation("Empty audio buffer".into()));
-        }
-
         let estimated_total =
             ((duration_ms as f64 / self.settings.max_segment_duration_ms.max(1) as f64).ceil() as usize).max(1);
         let mut global_chunk = 0usize;
 
         let mut segments = Vec::new();
         let mut all_pcm_cache = Vec::new();
-        let num_windows = windows.len();
+        let mut windows_seen = 0usize;
         // Carry the final chunk of each 90 s decode window into the next one. That chunk touches the
         // hard window edge, so re-chunking it together with the following audio lets the silence-aware
         // splitter cut on a pause instead of guillotining a word across the boundary (which made the 7B
@@ -1958,11 +1940,23 @@ impl ProcessingPipeline {
         // at all. blake3 streams, so this costs no extra memory and yields exactly the digest the
         // non-streaming path would have computed for the same canonical PCM.
         let mut recording_identity = crate::fingerprint::StreamingIdentity::new();
-        for (w_idx, window) in windows.into_iter().enumerate() {
+        // Round-23 #5, corrected 2026-08-17: hash the source ONCE PER FILE. This used to live inside
+        // build_segments_from_pcm, which the streaming path calls once per 90 s window — so a long
+        // import re-read and re-hashed the entire source file for every window. Measured on the
+        // library's longest source (KBHP-EP12.wav, 5,315 s / 162 MB): 60 full-file hashes instead of
+        // one. The old comment claiming "once for the whole run" was only ever true of the
+        // non-streaming sibling. `None` means "no cache for this run", exactly as before.
+        let file_hash = crate::cache::TranscriptCache::compute_hash(path).ok();
+
+        // Consume each decode window as it arrives instead of collecting them all first. Peak PCM
+        // held is now bounded by a handful of windows (≤ 4 × 90 s ≈ 11.5 MB) instead of the whole
+        // recording — 170 MB for that same KBHP-EP12, and unbounded in the file's length.
+        let window_timeout = decode_timeout.min(MAX_WINDOW_DECODE_WAIT);
+        let process_window = |window: audio::PcmWindow, is_last: bool| -> AppResult<()> {
+            windows_seen += 1;
             if let Some(token) = cancel {
                 token.check()?;
             }
-            let is_last = w_idx + 1 == num_windows;
 
             let (sample_rate, win_pcm) = if window.pcm.is_empty() {
                 (sample_rate_seen, Vec::new())
@@ -1992,7 +1986,7 @@ impl ProcessingPipeline {
                 (v, base)
             };
             if effective_pcm.is_empty() {
-                continue;
+                return Ok(());
             }
             let pcm = effective_pcm;
 
@@ -2042,7 +2036,7 @@ impl ProcessingPipeline {
                 }
             }
             if chunk_ranges.is_empty() {
-                continue;
+                return Ok(());
             }
 
             let global_ranges: Vec<(usize, usize)> =
@@ -2083,11 +2077,23 @@ impl ProcessingPipeline {
                 denoiser_service,
                 &mut window_progress,
                 Some(&mut all_embeddings), // streaming: defer clustering to the whole-file pass below
+                file_hash.as_deref(),
             )?;
             segments.extend(window_segs);
             all_pcm_cache.extend(window_pcm_cache);
-        }
+            Ok(())
+        };
 
+        audio::decode_pcm_windows_streaming(
+            path.to_path_buf(),
+            audio::DECODE_WINDOW_MS,
+            window_timeout,
+            process_window,
+        )?;
+
+        if windows_seen == 0 {
+            return Err(AppError::Validation("Empty audio buffer".into()));
+        }
         if segments.is_empty() {
             return Err(AppError::Validation("No speech chunks produced".into()));
         }
@@ -2179,6 +2185,11 @@ impl ProcessingPipeline {
         // per retained segment is appended here (in segment order) so the caller can cluster the WHOLE
         // file once. When `None`, clustering happens per-call (the non-streaming whole-file path).
         mut embedding_sink: Option<&mut Vec<Vec<f32>>>,
+        // The source file's content hash, computed ONCE PER FILE by the caller and used to key the
+        // per-chunk transcript cache. It used to be computed here, which the streaming path re-ran for
+        // every 90 s window — O(windows × filesize) of redundant reads on exactly the long recordings
+        // that path exists for. `None` = unhashable file = no cache for this run.
+        file_hash: Option<&str>,
     ) -> AppResult<(Vec<SpeechSegment>, Vec<(String, Vec<f32>)>)> {
         let chunk_count = chunk_ranges.len() as u32;
         let chunk_total = chunk_ranges.len().max(1);
@@ -2234,11 +2245,11 @@ impl ProcessingPipeline {
             );
         }
 
-        // Round-23 #5: hash the audio file ONCE for the whole run (its content is invariant), then key
-        // every per-chunk cache get/set on that hash — instead of re-reading + re-hashing the entire
-        // file on each of the N chunks (O(N·filesize) of redundant I/O on long recordings). `None` when
-        // the file is unhashable, which simply means "no cache for this run" (same effect as before).
-        let file_hash = crate::cache::TranscriptCache::compute_hash(path).ok();
+        // The retained chunk PCM below is consumed by exactly one thing: the auxiliary-hypothesis pass,
+        // which this same gate turns off. Under the champion (WSL7B) config it is always off, so a long
+        // import used to accumulate every chunk's f32 audio for the whole file — ~270 MB for 1.5 h —
+        // and then drop all of it untouched. Keep it only when something will actually read it.
+        let retain_chunk_pcm = auxiliary_hypotheses_enabled(&self.settings);
 
         for (chunk_index, &(global_start, global_end)) in chunk_ranges.iter().enumerate() {
             if let Some(token) = cancel {
@@ -2336,7 +2347,7 @@ impl ProcessingPipeline {
                     Some("omniasr-wsl-7b".to_string()),
                 )
             } else if let Some(cached) =
-                file_hash.as_deref().and_then(|h| self.cache.get_chunk_by_hash(h, &model_id, Some(&chunk_suffix)))
+                file_hash.and_then(|h| self.cache.get_chunk_by_hash(h, &model_id, Some(&chunk_suffix)))
             {
                 (cached.raw_transcript, None, Some("cache_replay".to_string()), Some(model_id.clone()))
             } else {
@@ -2366,7 +2377,7 @@ impl ProcessingPipeline {
                 // unavailable → empty, or a transcribe error → "[ASR unavailable: …]") into the
                 // cache, or every later retry would just replay the failure forever.
                 if !text.trim().is_empty() && !crate::quality::is_placeholder_transcript(&text) {
-                    if let Some(h) = file_hash.as_deref() {
+                    if let Some(h) = file_hash {
                         let entry = crate::cache::CacheEntry {
                             audio_hash: String::new(),
                             raw_transcript: text.clone(),
@@ -2397,7 +2408,9 @@ impl ProcessingPipeline {
             let speaker_id = diarization_labels.get(chunk_index).and_then(|l| l.clone()).or(speaker_hint.clone());
 
             let seg_id = Uuid::new_v4().to_string();
-            pcm_cache.push((seg_id.clone(), f32_pcm));
+            if retain_chunk_pcm {
+                pcm_cache.push((seg_id.clone(), f32_pcm));
+            }
 
             // Streaming defer: accumulate this segment's embedding (in segment order) so the caller can
             // cluster the whole file once. The push stays in lockstep with `segments` — both happen only
