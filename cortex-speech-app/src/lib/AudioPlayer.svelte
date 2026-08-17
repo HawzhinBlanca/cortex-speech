@@ -22,6 +22,14 @@
     duration?: number;
     autoplay?: boolean;
     playing?: boolean;
+    // The load/playback failure, surfaced to the PARENT so a decision surface can refuse to record a
+    // human verdict on audio nobody could hear. Internal-only until 2026-08-17, when an external
+    // audit found Accept/Save still enabled behind the player's own error banner: a missing-permission,
+    // corrupt-container or decode-failed clip could be marked human-verified by someone who never
+    // heard it. `speech_segments` has no way to distinguish that from a real listen, and this is a
+    // VERBATIM corpus — the queue already refuses clips whose FILE is gone (2026-08-15); this closes
+    // the same disease coming through every other failure mode.
+    audioError?: string | null;
   }
   let {
     audioPath,
@@ -34,10 +42,10 @@
     duration = $bindable(0),
     autoplay = false,
     playing = $bindable(false),
+    audioError = $bindable<string | null>(null),
   }: Props = $props();
   let audioEl: HTMLAudioElement | undefined = $state();
   let loading = $state(true);
-  let error = $state<string | null>(null);
   let playbackRate = $state(1.0);
   let loop = $state(false);
   const RATES = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
@@ -102,7 +110,7 @@
         // Keep the technical detail in the console; show the user a clean,
         // consistent message instead of a raw "TypeError: …".
         console.error('[AudioPlayer] could not resolve audio:', e);
-        error = $t('audio.loadFailed');
+        audioError = $t('audio.loadFailed');
         loading = false;
       }
     }
@@ -118,7 +126,7 @@
   $effect(() => {
     if (audioPath) {
       loading = true;
-      error = null;
+      audioError = null;
       currentTime = 0;
       resolveAudioUrl(audioPath);
     }
@@ -171,7 +179,7 @@
   });
 
   function reportPlaybackFailure(message: string, cause: unknown) {
-    error = message;
+    audioError = message;
     playing = false;
     notifications.error(message, { detail: String(cause) });
   }
@@ -290,7 +298,7 @@
 
   function handleError() {
     loading = false;
-    error = $t('audio.loadFailed');
+    audioError = $t('audio.loadFailed');
   }
 
   function seek(e: Event) {
@@ -334,15 +342,15 @@
       <div class="flex-1 h-2 bg-cortex-700 animate-pulse rounded"></div>
       <div class="w-12 h-4 bg-cortex-700 animate-pulse rounded"></div>
     </div>
-  {:else if error}
+  {:else if audioError}
     <div class="flex flex-wrap items-center gap-2 text-red-300 text-xs w-full">
       <span class="text-red-400 font-bold" aria-hidden="true">!</span>
-      <span class="min-w-0 flex-1 basis-40 break-words">{error}</span>
+      <span class="min-w-0 flex-1 basis-40 break-words">{audioError}</span>
       <button
         type="button"
         class="ms-auto shrink-0 text-xs text-cortex-400 hover:text-cortex-200"
         onclick={() => {
-          error = null;
+          audioError = null;
           loading = true;
           resolveAudioUrl(audioPath);
         }}>{$t('retry')}</button

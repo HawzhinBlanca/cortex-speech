@@ -245,6 +245,9 @@
   let playerDuration = $state(0);
   let playing = $state(false);
   let saving = $state(false);
+  // Bound from AudioPlayer: non-null means this clip's audio could not load/play, so no decision
+  // surface may record a human verdict on it (audit find 2026-08-17).
+  let audioError = $state<string | null>(null);
   let lastLoadedId = $state<string | null>(null);
 
   // Engines that actually produced this clip's draft, recorded (never inferred) and shown as an
@@ -386,6 +389,12 @@
   async function markBad() {
     const seg = current;
     if (!seg || saving || retranscribing || aligning) return;
+    // A verdict on audio nobody could hear is indistinguishable downstream from a real listen, and
+    // this is a VERBATIM corpus. Refuse rather than record it (audit find 2026-08-17).
+    if (audioError) {
+      notifications.error($t('review.cannotDecideWithoutAudio'));
+      return;
+    }
     // No blocking confirm (true-10 audit): 'x' is undoable via Backspace now, so a native
     // window.confirm per press only broke the keyboard flow.
     saving = true;
@@ -629,6 +638,12 @@
     // pre-retranscribe draft that the in-flight run is about to overwrite — the human "accept" would
     // land on text the reviewer no longer sees.
     if (!seg || saving || retranscribing || aligning) return;
+    // Same refusal as markBad: an unheard verdict is worse than no verdict in a VERBATIM corpus.
+    // Same refusal as markBad: an unheard verdict is worse than no verdict in a VERBATIM corpus.
+    if (audioError) {
+      notifications.error($t('review.cannotDecideWithoutAudio'));
+      return;
+    }
     const original = originalText(seg).trim();
     const text = acceptAsIs ? original : editText.trim();
     // Never save an empty edit (mirrors the Save button's disabled guard — the Ctrl+Enter shortcut
@@ -1270,6 +1285,7 @@
           bind:currentTime
           bind:duration={playerDuration}
           bind:playing
+          bind:audioError
           autoplay={$settings.autoplaySegments}
         />
       </div>

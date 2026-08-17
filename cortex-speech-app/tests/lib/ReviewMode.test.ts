@@ -286,4 +286,31 @@ describe('ReviewMode windowed queue', () => {
     );
     await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledTimes(2));
   });
+  it('refuses to record a verdict when the clip audio could not be played', async () => {
+    // AUDIT FIND 2026-08-17: the player showed its error banner while Accept/Save stayed live, so a
+    // clip whose audio failed (missing permission, corrupt container, decode failure) could be marked
+    // human-verified by someone who never heard it. `speech_segments` cannot tell that apart from a
+    // real listen, and this is a VERBATIM corpus — the queue already refuses clips whose FILE is gone
+    // (2026-08-15); this covers every other failure mode. Fail-before: without the guard,
+    // recordHumanDecision IS called here.
+    const seg: SpeechSegment = {
+      ...segment(),
+      id: 'unplayable-1',
+      audioPath: 'C:\audio\gone.wav',
+    };
+    mocks.getSegmentsPage.mockResolvedValue({ items: [seg], total: 1, nextCursor: null });
+    mocks.getSegment.mockResolvedValue(seg);
+    // The real failure path: resolving the playable URL throws, so AudioPlayer sets its error state.
+    mocks.getMediaAssetUrl.mockRejectedValue(new Error('audio unavailable'));
+    mocks.registerMediaAsset.mockRejectedValue(new Error('audio unavailable'));
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+
+    const accept = await screen.findByText(new RegExp(ckb['review.acceptAsIs']));
+    await fireEvent.click(accept);
+    // The refusal is the assertion: nothing was written.
+    await waitFor(() => expect(mocks.recordHumanDecision).not.toHaveBeenCalled());
+    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+  });
 });

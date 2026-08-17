@@ -43,6 +43,10 @@
   // Keyboard play/pause state for the current clip (Space); reset on queue navigation so a new
   // clip never inherits the previous clip's playing flag.
   let inboxPlaying = false;
+  // Non-null = this clip's audio failed to load. No verdict may be recorded on audio nobody could
+  // hear: in a VERBATIM corpus an unheard "looks good" is indistinguishable from a real listen
+  // downstream, and worse than no decision at all (audit find 2026-08-17).
+  let audioError: string | null = null;
   // True-10 audit MAJOR: edit state must also reset on rail navigation — isEditing/editText used to
   // survive a rail click, so "E on segment A → click B → Save" recorded A's transcript as B's human
   // 'edit' decision (a permanent wrong gold label). editingForId is the second lock: commitEdit
@@ -192,6 +196,8 @@
 
   // ── Actions ──────────────────────────────────────────────────────────────────
   async function accept() {
+    if (audioError) return; // unplayable audio: refuse the verdict (see audioError)
+
     // Already-decided guard: advance() does NOT move past the LAST queue item, so without this a
     // second keypress on the final clip would record a DUPLICATE human decision (a biometric label).
     if (!current || isSubmitting || current.humanDecision) return;
@@ -264,6 +270,8 @@
   }
 
   async function reject() {
+    if (audioError) return; // unplayable audio: refuse the verdict (see audioError)
+
     if (!current || isSubmitting || current.humanDecision) return;
     const cur = current;
     const idx = currentIndex;
@@ -615,6 +623,7 @@
                   endTime={inboxRange.endTime}
                   autoplay={settings?.autoplaySegments ?? false}
                   bind:playing={inboxPlaying}
+                  bind:audioError
                 />
               {/key}
               <div class="waveform-stub">
