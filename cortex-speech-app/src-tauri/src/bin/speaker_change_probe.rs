@@ -147,7 +147,9 @@ fn main() -> Result<(), String> {
             skipped_short += 1;
             continue;
         }
-        if cached.as_ref().is_none_or(|(path, _, _)| path != audio_path) {
+        // `is_some_and` rather than `is_none_or`: the latter is stable since 1.82 and the project's
+        // MSRV is 1.81 — CI clippy enforces it even though the local toolchain happily compiles it.
+        if !cached.as_ref().is_some_and(|(path, _, _)| path == audio_path) {
             let Ok((raw_rate, raw_pcm)) = audio::decode_to_pcm(audio_path) else {
                 skipped_audio += 1;
                 cached = None;
