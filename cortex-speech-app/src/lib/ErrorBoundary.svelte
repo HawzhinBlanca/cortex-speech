@@ -14,22 +14,14 @@
   let hasError = $state(false);
   let actionableError = $state<ActionableError>({ message: 'Unknown error' });
 
-  function handleError(e: ErrorEvent) {
-    // Resource-load failures (an <img>/<audio>/<link>/<script> that 404s or is CSP-blocked) also
-    // surface as window 'error' events in the capture phase, but they are NOT app crashes: their
-    // target is the failing DOM element and they carry no Error object. Treating them as fatal
-    // blanked every panel at once — e.g. the CSP-blocked Google-Fonts <link> took the whole UI
-    // down. A genuine uncaught script error targets the window (never an Element), so ignore any
-    // 'error' whose target is a DOM element.
-    if (e.target instanceof Element) {
-      return;
-    }
-    const message = e.message || '';
-    if (message.includes('ResizeObserver') || message.includes('Resize observer')) {
-      return;
-    }
-    e.preventDefault();
-    actionableError = parseActionableError(e.error ?? e.message ?? 'Unknown error');
+  // Scoped, not global (2026-08-17). This used to listen for window 'error' events, which every
+  // mounted instance received — so ONE uncaught error blanked all ten boundaries in App.svelte at
+  // once, nine of them wrapping panels that were working fine. `<svelte:boundary>` catches errors
+  // thrown while rendering or in effects BELOW THIS POINT and nowhere else, so a failure is shown
+  // exactly where it happened. Uncaught async errors, which belong to no subtree, are surfaced as a
+  // toast by installGlobalErrorTrap instead of by blanking a panel that did not fail.
+  function fail(cause: unknown) {
+    actionableError = parseActionableError(cause ?? 'Unknown error');
     hasError = true;
   }
 
@@ -37,13 +29,6 @@
     hasError = false;
     actionableError = { message: '' };
   }
-
-  $effect(() => {
-    if (typeof window !== 'undefined') {
-      window.addEventListener('error', handleError, true);
-      return () => window.removeEventListener('error', handleError, true);
-    }
-  });
 </script>
 
 {#if hasError}
@@ -69,5 +54,7 @@
     </div>
   {/if}
 {:else}
-  {@render children()}
+  <svelte:boundary onerror={fail}>
+    {@render children()}
+  </svelte:boundary>
 {/if}
