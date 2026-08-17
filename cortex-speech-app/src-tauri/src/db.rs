@@ -2542,6 +2542,30 @@ impl Database {
                     "UPDATE speech_segments SET audio_path = ?2, updated_at = datetime('now') WHERE audio_path = ?1",
                     params![old, new_path],
                 )?;
+                // Carry the SOURCE-KEYED tables with the move. Both are joined to segments by
+                // audio_path, so relinking only `speech_segments` orphans them at the old key:
+                //
+                //  * `source_audio_provenance` (v54) then reports the recording as UNCLAIMED, and a
+                //    training pack and dataset card would describe neural-separated, re-concatenated
+                //    audio as an original field recording — precisely the lie that table exists to
+                //    prevent, reintroduced by a file move. Found by adversarial verification
+                //    2026-08-17.
+                //  * `source_transcripts` would silently lose its whole-file reference transcripts,
+                //    forcing a re-fetch that the cache was built to avoid.
+                //
+                // Not fatal: a relink whose provenance carry fails must still relink the audio (the
+                // clips are otherwise unplayable), so the failure warns rather than aborting.
+                for (table, what) in [
+                    ("source_audio_provenance", "processing provenance"),
+                    ("source_transcripts", "reference transcripts"),
+                ] {
+                    if let Err(e) = self.conn.execute(
+                        &format!("UPDATE OR IGNORE {table} SET audio_path = ?2 WHERE audio_path = ?1"),
+                        params![old, new_path],
+                    ) {
+                        tracing::warn!("relink: {what} for '{old}' could not follow the move to '{new_path}': {e}");
+                    }
+                }
                 if n > 0 {
                     relinked += 1;
                 }
@@ -3031,6 +3055,35 @@ impl Database {
     pub fn delete_hypotheses_for_segment(&self, segment_id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM segment_hypotheses WHERE segment_id = ?1", params![segment_id])?;
         Ok(())
+    }
+
+    /// Seal a dataset snapshot: an IMMUTABLE record of exactly which rows a training pack contained.
+    ///
+    /// `id` is the manifest's content hash, so the same rows always produce the same snapshot id and
+    /// a different selection can never masquerade as the same one. INSERT OR IGNORE is the
+    /// immutability: re-exporting identical data is a no-op, and an existing snapshot is never
+    /// rewritten — a training run that cites a snapshot id must be able to trust that what it cites
+    /// has not changed underneath it.
+    ///
+    /// Returns true when this call sealed a NEW snapshot, false when the id already existed.
+    pub fn seal_dataset_snapshot(&self, id: &str, name: &str, config_json: &str) -> AppResult<bool> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO dataset_runs (id, name, status, config_json, completed_at)
+             VALUES (?1, ?2, 'sealed', ?3, datetime('now'))",
+            params![id, name, config_json],
+        )?;
+        self.track_write()?;
+        Ok(changed > 0)
+    }
+
+    /// A sealed snapshot's stored record, or `None` if that id was never sealed.
+    pub fn dataset_snapshot(&self, id: &str) -> AppResult<Option<(String, String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT name, status, config_json FROM dataset_runs WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
+            None => Ok(None),
+        }
     }
 
     /// Record that `record.audio_path` was processed before import (see [`SourceAudioProvenance`]).

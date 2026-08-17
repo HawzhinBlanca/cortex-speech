@@ -8,7 +8,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_dataset_duplicates import duplicate_groups  # noqa: E402
+from check_dataset_duplicates import (  # noqa: E402
+    audio_says_duplicate,
+    confirm_groups_with_audio,
+    duplicate_groups,
+)
 
 TEXT = "ئەم ڕستەیە بەشێکی تەواوی گفتوگۆکەیە و درێژییەکەی بەسە"
 ALIGN = '{"source_start_ms": 132945, "source_end_ms": 140740}'
@@ -86,6 +90,100 @@ def test_offsets_within_the_encoder_padding_bucket_still_match() -> None:
         ("b", r"D:\x\two.flac", near, TEXT, 0),
     ]
     assert len(duplicate_groups(rows)) == 1
+
+
+# ── RULE C: the audio decides (2026-08-18) ──────────────────────────────────────────────────────
+#
+# Text alone cannot tell a duplicated import from a narrator saying the same sentence twice. Measured
+# on the first 5 audiobooks imported, ALL flagged groups were legitimate repeats — every episode of
+# `bangewazek_bo_behesht` announces the series title, and a ghazal collection repeats verses. With
+# 134 books to import the gate would have gone permanently red and been ignored.
+#
+# The danger of that fix is BLINDING the gate, so these pin both directions: the owner's real find
+# must still fail, and unreadable audio must never be waved through.
+
+
+def _numpy_or_skip():
+    """numpy, or None when it is absent.
+
+    CI runs the policy suite on a bare `setup-python` with NO pip install, so numpy and soundfile are
+    not there. The audio confirmation degrades correctly without them — `audio_says_duplicate`
+    returns None, every text-matched group stays UNCONFIRMED, and the gate keeps failing on it — so
+    the pure-python rules are still fully pinned below. These audio-only assertions skip rather than
+    error, which is the difference between "not measured here" and a red build for a missing
+    optional dependency.
+    """
+    try:
+        import numpy  # noqa: F401
+
+        return numpy
+    except ImportError:
+        return None
+
+
+def _reading(seconds: float, freq: float, seed: int = 0, phase: float = 0.0):
+    """A stand-in for one spoken take.
+
+    Deliberately NOT a bare sine: two phase-aligned pure tones are genuinely near-identical signals,
+    so a fixture built from them would test nothing. A take carries its own phase, a wobbling pitch
+    contour, and its own noise — which is exactly what makes two readings of one sentence
+    decorrelate while a duplicated import stays identical.
+    """
+    import numpy as np
+
+    t = np.linspace(0.0, seconds, int(16000 * seconds), endpoint=False)
+    rng = np.random.default_rng(seed)
+    contour = freq * (1.0 + 0.03 * np.sin(2 * np.pi * (0.7 + 0.3 * seed) * t + seed))
+    return (np.sin(2 * np.pi * contour * t + phase) + 0.15 * rng.standard_normal(t.size)).astype("float32")
+
+
+def test_identical_audio_is_still_a_duplicate() -> None:
+    """The owner's actual find: the same recording under two names. This MUST keep failing."""
+    if _numpy_or_skip() is None:
+        print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
+        return
+    clip = _reading(1.5, 220.0, seed=1)
+    assert audio_says_duplicate(clip, clip.copy()) is True
+
+
+def test_two_readings_of_one_sentence_are_not_a_duplicate() -> None:
+    """A series intro read in episode 4 and again in episode 8 — same words, different audio."""
+    if _numpy_or_skip() is None:
+        print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
+        return
+    assert audio_says_duplicate(_reading(1.5, 220.0, seed=1), _reading(1.5, 231.0, seed=2)) is False
+    # Same speaker, same words, same nominal pitch — a second take still decorrelates, because its
+    # phase and contour are its own. This is the case the audiobook intros actually produce.
+    assert (
+        audio_says_duplicate(_reading(1.5, 220.0, seed=1), _reading(1.5, 220.0, seed=9, phase=1.1))
+        is False
+    )
+
+
+def test_a_different_length_reading_is_not_a_duplicate() -> None:
+    """Two readings of one sentence never match to the millisecond; a duplicate does."""
+    if _numpy_or_skip() is None:
+        print("    (skipped: numpy absent — audio confirmation is optional, the text rules above are not)")
+        return
+    assert audio_says_duplicate(_reading(1.5, 220.0, seed=1), _reading(1.9, 220.0, seed=1)) is False
+
+
+def test_unreadable_audio_is_never_declared_clean() -> None:
+    """None, not False. A clip whose audio cannot be read keeps FAILING the gate."""
+    if _numpy_or_skip() is not None:
+        assert audio_says_duplicate(None, _reading(1.0, 220.0)) is None
+        assert audio_says_duplicate(_reading(1.0, 220.0), None) is None
+
+    # And the group-level wiring keeps it in the failing set rather than the cleared one.
+    rows = [
+        ("a", r"D:\gone\missing_a.wav", ALIGN, TEXT, 0),
+        ("b", r"D:\gone\missing_b.wav", ALIGN, TEXT, 1),
+    ]
+    groups = duplicate_groups(rows)
+    assert len(groups) == 1, groups
+    confirmed, unconfirmed, repeats = confirm_groups_with_audio(groups, rows)
+    assert not confirmed and not repeats, (confirmed, repeats)
+    assert len(unconfirmed) == 1, unconfirmed
 
 
 def main() -> int:
