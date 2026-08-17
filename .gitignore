@@ -142,3 +142,6 @@ datasets/**
 # can never match: "it is not possible to re-include a file if a parent directory is excluded".
 !datasets/**/
 !datasets/**/*.md
+
+# Vendored pinned model (see cortex-speech-app/scripts/fetch_models.py) — the sole *.onnx exception.
+!cortex-speech-app/vendor/silero_vad_v4.onnx

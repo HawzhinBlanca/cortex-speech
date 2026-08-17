@@ -61,3 +61,7 @@ secrets.env
 
 # Generated e2e/CDP run manifests
 run*.jsonl
+
+# The ONE vendored model exception: CI's silero download broke when upstream replaced the file
+# (2026-08-17); the pinned bytes live in-repo so the build never depends on a live third-party URL.
+!vendor/silero_vad_v4.onnx
