@@ -95,9 +95,21 @@ def evaluate_freshness(
     head_sha: str | None,
     newest_src_mtime: float,
     newest_src_file: str | None,
+    stale_installers: list[tuple[str, float]] | None = None,
 ) -> list[str]:
     """Pure decision core. Returns a list of problems; empty list means fresh + HEAD-matched."""
     problems: list[str] = []
+
+    # Bundled installers older than the exe are the same lie one directory over: an MSI/NSIS built
+    # from a previous commit still sits in `target/release/bundle/` looking finished, and it is the
+    # artifact anyone would actually double-click. Found 2026-08-17: both installers were four days
+    # behind the exe. Reported as a problem, not silently deleted — half a gigabyte each is the
+    # owner's to keep or discard.
+    for name, mtime in stale_installers or []:
+        problems.append(
+            f"STALE INSTALLER: {name} (mtime {mtime:.0f}) predates the built exe (mtime {exe_mtime:.0f}). "
+            f"Rebuild with `npm run tauri build`, or delete it so nothing can install an old version."
+        )
 
     if not exe_exists:
         problems.append("release exe not found — run `make build-app` (or `npm run tauri build`) first")
@@ -215,6 +227,21 @@ def _source_changed_since(app_root: Path, baked_sha: str, source_dirs: list[str]
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
+BUNDLE_DIR = EXE_PATH.parent / "bundle"
+INSTALLER_GLOBS = ("msi/*.msi", "nsis/*-setup.exe")
+
+
+def find_stale_installers(exe_mtime: float) -> list[tuple[str, float]]:
+    """Bundled installers that predate the exe — i.e. would install an older app than this build."""
+    stale: list[tuple[str, float]] = []
+    for pattern in INSTALLER_GLOBS:
+        for path in sorted(BUNDLE_DIR.glob(pattern)):
+            mtime = path.stat().st_mtime
+            if mtime < exe_mtime:
+                stale.append((path.name, mtime))
+    return stale
+
+
 def main() -> int:
     exe_exists = EXE_PATH.is_file()
     exe_mtime = EXE_PATH.stat().st_mtime if exe_exists else 0.0
@@ -246,6 +273,7 @@ def main() -> int:
         head_sha=effective_head,
         newest_src_mtime=newest_src_mtime,
         newest_src_file=str(newest_src_file.relative_to(APP_ROOT)) if newest_src_file else None,
+        stale_installers=find_stale_installers(exe_mtime) if exe_exists else [],
     )
     if note and not problems:
         print(f"note: {note}", flush=True)
