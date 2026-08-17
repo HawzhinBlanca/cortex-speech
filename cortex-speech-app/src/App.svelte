@@ -1990,7 +1990,15 @@
     }
   }
 
+  // Request-sequence guard for waveform loads. Selecting clip A then B raced: A's slower response
+  // resolved last and overwrote B's waveform (or B's error state) — the reviewer then annotated text
+  // against the WRONG clip's visual evidence. Only the newest request may write (external audit
+  // 2026-08-17). A counter, not an AbortController: getWaveform is a Tauri IPC call with no abort
+  // signal, so the response cannot be cancelled — only ignored.
+  let waveformRequest = 0;
+
   async function loadWaveform(path: string, alignmentJson?: string | null) {
+    const seq = ++waveformRequest;
     if (!tauriAvailable) {
       // Browser preview, not a failure — no waveform backend exists to fail.
       waveformData = [];
@@ -1998,9 +2006,12 @@
       return;
     }
     try {
-      waveformData = await api.getWaveform(path, 200, alignmentJson);
+      const data = await api.getWaveform(path, 200, alignmentJson);
+      if (seq !== waveformRequest) return; // a newer selection superseded this one
+      waveformData = data;
       waveformError = null;
     } catch (e) {
+      if (seq !== waveformRequest) return; // stale failure must not clobber the current clip
       // Sibling of the ReviewMode fix (audit 2026-08-05 #5, commit b554515). An empty array renders
       // identically to genuinely quiet audio, so a FAILED decode read as "this clip is silent" with
       // nothing said. Found by grepping for the class after fixing the review-mode instance — fixing

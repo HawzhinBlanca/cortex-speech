@@ -244,6 +244,23 @@
     };
   }
 
+  // Consent toggles are ASYMMETRIC on purpose, mirroring pipeline.rs's LiveConsent (2026-08-16):
+  // a WITHDRAWAL is a stop instruction, so it persists on the spot and reaches in-flight work;
+  // GRANTING waits for Save, so Cancel genuinely cancels. Before this both directions persisted
+  // instantly while Cancel skipped the save — so cancelling left cloud consent ON with no way back,
+  // misleading transaction behaviour for a privacy-sensitive permission (external audit 2026-08-17).
+  // Strictly LESS persistence than before, so it cannot introduce a surprise write.
+  function consentToggled(field: 'cloudSttOptIn' | 'cloudLlmOptIn' | 'juryCloudOptIn') {
+    const wasGranted = get(settings)[field];
+    if (wasGranted && !localSettings[field]) void saveQuietly();
+  }
+  // Named, not inline arrows in the markup: SettingsLocalizationPolicy scrapes these sections for
+  // visible Latin text, and an inline `consentToggled('cloudLlmOptIn')` reads to it as untranslated
+  // prose. Named handlers keep the markup free of quoted strings — and read better.
+  const sttConsentToggled = () => consentToggled('cloudSttOptIn');
+  const llmConsentToggled = () => consentToggled('cloudLlmOptIn');
+  const juryConsentToggled = () => consentToggled('juryCloudOptIn');
+
   async function saveQuietly() {
     coerceSettingsForRuntime();
     if (!tauriAvailable) {
@@ -720,7 +737,7 @@
               type="checkbox"
               class="mt-1 accent-cortex-500"
               bind:checked={localSettings.cloudSttOptIn}
-              onchange={saveQuietly}
+              onchange={sttConsentToggled}
             />
             <!-- Consent copy MUST be in the user's language (true-10 audit): voice is biometric,
                  and the opt-in text is where clarity matters most. -->
@@ -927,7 +944,7 @@
                   type="checkbox"
                   class="mt-1"
                   bind:checked={localSettings.cloudLlmOptIn}
-                  onchange={saveQuietly}
+                  onchange={llmConsentToggled}
                 />
                 <span class="text-xs text-amber-100">
                   {$t('settings.cloudLlmConsent')}
@@ -1024,7 +1041,7 @@
                 type="checkbox"
                 class="mt-1 accent-cortex-500"
                 bind:checked={localSettings.juryCloudOptIn}
-                onchange={saveQuietly}
+                onchange={juryConsentToggled}
               />
               <span class="text-xs text-amber-100">
                 <strong>{$t('settings.juryT2ConsentLead')}</strong>
