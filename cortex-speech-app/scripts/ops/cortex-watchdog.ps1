@@ -152,17 +152,22 @@ $maxConsecutiveKills = 3
 # the app at 5 minutes, three times in a row, and the app never once got far enough to serve. A
 # watchdog that shortens startup until startup can never finish is a denial of service on its own app.
 #
-# 45 minutes, and the number is deliberately generous. MEASURED startup to couch: 8m16s at ~500 clips
-# (2026-08-14) and 18m11s at 14,828 clips (2026-08-15) — it scales with the library and the library
-# only grows. A first draft of this fix used 20 minutes, which the very next measurement nearly
-# invalidated; picking a bound two minutes above the observed value is how this bug gets reintroduced.
-# The asymmetry decides it: being slow to notice a genuinely wedged app costs ONE extra check cycle of
-# downtime, while being too impatient costs the app entirely and repeatedly. The kill path still works
-# for anything older than this.
+# 10 minutes. THE THING THIS WAS SIZED FOR NO LONGER EXISTS (2026-08-17). The grace was 45 minutes
+# because startup to couch measured 8m16s at ~500 clips and 18m11s at 14,828, and "it scales with the
+# library" was taken as a fact of life. It was one line: Database::backup paced the SQLite online
+# backup at 5 pages per 250 ms — 80 KB/s — and take_snapshot runs SYNCHRONOUSLY on the startup path,
+# so the whole delay was the app copying its own database at dial-up speed before opening the port.
+# Fixed there; MEASURED startup to couch afterwards: 6.4 SECONDS at 14,828 clips.
+#
+# So the generosity now costs what it was buying. At 45 minutes a genuinely wedged app sits unnoticed
+# for three quarters of an hour — and the old comment's claim that being slow "costs ONE extra check
+# cycle" was never true. 10 minutes is ~90x the measured startup, which is ample headroom for a much
+# larger library or a busy disk, while cutting the worst case for a wedged app by more than four
+# times. The kill path still works for anything older than this.
 # Overridable so the decision tests can exercise BOTH sides: 0 makes every process instantly
 # "old enough" to reach the kill path, which is the only way to test the kill path without waiting
 # 20 real minutes.
-$startupGraceMinutes = if ($env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN) { [double]$env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN } else { 45 }
+$startupGraceMinutes = if ($env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN) { [double]$env:CORTEX_WATCHDOG_STARTUP_GRACE_MIN } else { 10 }
 
 if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }

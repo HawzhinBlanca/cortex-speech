@@ -32,7 +32,9 @@ TABLE = [
     ("Kurdish Corpora\\badini\\", "badini"),
 ]
 
-HAWLERI_CLIP = (r"D:\Hawzhin Kurdish Datasets 2026\_batch_remaining\KBHP-EP01_0007.wav", 9000)
+# Drive-letter path with no profile name in it: a tracked file may not carry a private local path
+# (test_windows_repo_hygiene), and the matcher looks at the KBHP fragment, not the prefix.
+HAWLERI_CLIP = (r"D:\corpora\_batch_remaining\KBHP-EP01_0007.wav", 9000)
 SORANI_CLIP = (r"D:\Kurdish Corpora\sorani\ZarPodcast\2\A1-0050.wav", 7000)
 
 

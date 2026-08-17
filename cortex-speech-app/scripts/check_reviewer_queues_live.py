@@ -154,6 +154,30 @@ def servable_clips(db_path: Path, table: list[tuple[str, str]]) -> list[tuple[st
     return out
 
 
+def wrong_dialect_decisions(db_path: Path, roster: dict[str, list[str]], table: list[tuple[str, str]]) -> dict[str, int]:
+    """Verified decisions made by a reviewer on a dialect they are not allowed to judge.
+
+    Reported, never failed: the 12 that exist predate the roster, and a gate that stays RED on
+    unfixable history buries the signal it was written to carry. It is here because the count should
+    only ever go DOWN — a NEW one means the routing broke again, and this is where that shows up.
+    """
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT DISTINCT e.reviewer, e.segment_id, s.audio_path FROM review_events e "
+            "  JOIN speech_segments s ON s.id = e.segment_id "
+            " WHERE e.action IN ('accept','edit','reject') AND s.verified = 1"
+        ).fetchall()
+    finally:
+        con.close()
+    offenders: dict[str, int] = {}
+    for reviewer, _segment_id, path in rows:
+        allowed = roster.get(reviewer)
+        if allowed is not None and not may_judge(allowed, path, table):
+            offenders[reviewer] = offenders.get(reviewer, 0) + 1
+    return offenders
+
+
 def evaluate_queues(
     *,
     reviewers: list[str],
@@ -197,6 +221,16 @@ def main() -> int:
     clips = servable_clips(db_path, table)
 
     problems, warnings = evaluate_queues(reviewers=reviewers, roster=roster, clips=clips, table=table)
+
+    offenders = wrong_dialect_decisions(db_path, roster, table)
+    if offenders:
+        total = sum(offenders.values())
+        detail = ", ".join(f"{who} {n}" for who, n in sorted(offenders.items()))
+        warnings.append(
+            f"{total} verified decision(s) were made on a dialect the reviewer may not judge ({detail}). "
+            f"These predate the roster; they are still verified and carry weight downstream, so they "
+            f"need re-reviewing. This count must only ever go DOWN."
+        )
 
     for w in warnings:
         print(f"  ! {w}", flush=True)
