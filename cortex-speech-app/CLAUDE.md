@@ -4,6 +4,12 @@ These are the standing instructions for any Claude/Cowork session in this repo. 
 first, every session. It governs **how to work here**; the repo-root `../AGENT_CHARTER.md` governs the
 deeper *why/when-to-stop*, and `docs/REAL_READINESS_PLAN.md` defines the honest bar.
 
+**BEFORE ANY CHANGE, read `../docs/OWNER_CANON.md`** — the owner's approved-and-FINAL decisions.
+Canon items may not be altered, weakened, or "improved" without the owner writing
+`change canon: <item>` himself; `scripts/test_owner_canon_pins.py` reds the sweep when a checkable
+pin drifts. Added 2026-08-17 after months of approved behaviours being re-broken by well-meaning
+changes: if it is in the canon, the discussion is over.
+
 ## What this project is
 
 Cortex Speech is an **offline-first desktop app** (Tauri v2 + Svelte 5 + Rust) for
