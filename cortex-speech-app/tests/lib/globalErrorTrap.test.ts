@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { get } from 'svelte/store';
-import { describeRejection, notifyUnhandledRejection } from '../../src/lib/globalErrorTrap';
+import {
+  describeRejection,
+  isUncaughtScriptError,
+  notifyUnhandledRejection,
+} from '../../src/lib/globalErrorTrap';
 import { notifications } from '../../src/lib/stores/notificationStore';
 
 describe('globalErrorTrap (P2.2 / audit F3)', () => {
@@ -44,5 +48,32 @@ describe('globalErrorTrap (P2.2 / audit F3)', () => {
     expect(list[0].type).toBe('error');
     // The real backend message is carried in the detail so the failure is diagnosable, not silent.
     expect(list[0].detail).toBe('invoke failed: database is locked');
+  });
+
+  /**
+   * Uncaught SYNCHRONOUS errors moved here from ErrorBoundary on 2026-08-17, because a per-instance
+   * window listener made every boundary in the tree fire at once. The two exclusions below are the
+   * incidents that shaped it and must keep holding.
+   */
+  it('classifies window errors: real script errors yes, resource + ResizeObserver noise no', () => {
+    const scriptError = new ErrorEvent('error', { message: 'x is not a function' });
+    expect(isUncaughtScriptError(scriptError)).toBe(true);
+
+    // A CSP-blocked <link>/<img>/<audio> fires 'error' at the ELEMENT. Once blanked the whole UI.
+    const link = document.createElement('link');
+    document.body.appendChild(link);
+    const resourceError = new ErrorEvent('error', { message: '' });
+    link.dispatchEvent(resourceError);
+    expect(isUncaughtScriptError(resourceError)).toBe(false);
+    link.remove();
+
+    // Browser layout bookkeeping, not a failure.
+    expect(
+      isUncaughtScriptError(
+        new ErrorEvent('error', {
+          message: 'ResizeObserver loop completed with undelivered notifications.',
+        }),
+      ),
+    ).toBe(false);
   });
 });

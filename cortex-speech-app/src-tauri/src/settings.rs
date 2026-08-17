@@ -728,13 +728,31 @@ impl AppSettings {
         self.llm_mode.clone()
     }
 
+    /// The configured external ASR client script, or `None` when it is unset **or unusable**.
+    ///
+    /// This string is executed — `wsl … python3 <script> …` — so it is a trust boundary, and it used
+    /// to be passed through with nothing but a trim. It is not a shell command line (every argument
+    /// is a separate argv entry, so nothing here can inject one), but it can absolutely be the wrong
+    /// thing: a directory, an editor backup, a half-typed path, or a WSL path with a stray quote. The
+    /// two cheap invariants below — it is a `.py` file, and it carries no argument-shaped junk —
+    /// convert those into "external script not configured" rather than a confusing subprocess error
+    /// several layers down. Existence is deliberately NOT checked: the path is a LINUX path inside
+    /// WSL, which Windows cannot stat.
     pub fn external_asr_script_path(&self) -> Option<String> {
         let trimmed = self.external_asr_script_path.trim();
         if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+            return None;
         }
+        let looks_like_a_script = trimmed.to_ascii_lowercase().ends_with(".py");
+        let carries_junk = trimmed.contains(['"', '\'', '\n', '\r', '\0']);
+        if !looks_like_a_script || carries_junk {
+            tracing::warn!(
+                "external_asr_script_path is not a usable .py script path ({trimmed:?}); treating the \
+                 external ASR client as unconfigured"
+            );
+            return None;
+        }
+        Some(trimmed.to_string())
     }
 
     pub fn source_reference_models(&self) -> Vec<String> {
@@ -761,6 +779,38 @@ impl AppSettings {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The external script string is EXECUTED, so it is a trust boundary — and the owner's real
+    /// configured client must keep working, which is the half a validation most easily breaks.
+    #[test]
+    fn external_script_path_accepts_a_real_client_and_refuses_junk() {
+        let with = |value: &str| {
+            AppSettings { external_asr_script_path: value.to_string(), ..AppSettings::default() }
+                .external_asr_script_path()
+        };
+
+        // The shipped WSL client, in the shape it is really configured in (a /mnt/... Windows mount
+        // seen from inside WSL). No profile path here — repo hygiene forbids one in a tracked file.
+        let live = "/mnt/d/cortex-speech/cortex-speech-app/scripts/cortex_7b_client.py";
+        assert_eq!(with(live).as_deref(), Some(live), "a real .py client path must survive validation");
+        assert_eq!(
+            with("  C:/cortex/scripts/cortex_7b_client.py  ").as_deref(),
+            Some("C:/cortex/scripts/cortex_7b_client.py")
+        );
+
+        // Unset stays unset.
+        assert_eq!(with(""), None);
+        assert_eq!(with("   "), None);
+
+        // Not a script: a directory, a shell command, an editor backup. Each becomes "unconfigured"
+        // instead of something the app tries to execute inside WSL.
+        assert_eq!(with("/root/cortex_env"), None);
+        assert_eq!(with("rm -rf /"), None);
+        assert_eq!(with("/root/client.py.bak"), None);
+        // Argument-shaped junk in a path that otherwise looks right.
+        assert_eq!(with("/root/client.py\"; echo hi"), None);
+        assert_eq!(with("/root/client.py\nmalice.py"), None);
+    }
 
     #[test]
     fn factory_default_is_the_finetuned_7b_champion_only() {

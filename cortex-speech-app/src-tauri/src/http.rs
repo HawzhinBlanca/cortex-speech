@@ -19,11 +19,25 @@ pub static API_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(120))
         .timeout_write(Duration::from_secs(60))
+        // TOTAL deadline for the whole call, added 2026-08-17. The three timeouts above bound each
+        // STALL, not the call: an endpoint that answers with one byte every 119 s never trips any of
+        // them and holds the worker (and, on the import path, the run) indefinitely. Ten minutes is
+        // far beyond any real Gemini/refiner reply and still an actual bound.
+        .timeout(API_CALL_DEADLINE)
         .build()
 });
 
+/// Ceiling on ONE cloud API call, start to finish. Cloud work here is a single request/response —
+/// no streaming, no long polls — so a call still running after this has failed, whatever the socket
+/// thinks.
+pub const API_CALL_DEADLINE: Duration = Duration::from_secs(600);
+
 /// Large model-archive downloads. A more generous read timeout for slow CDNs, but still
 /// bounded so a dead connection can't hang a download thread indefinitely.
+///
+/// Deliberately NO total deadline, unlike `API_AGENT`: a multi-GB model on a slow link legitimately
+/// takes an hour, and any fixed ceiling would abort a download that was making steady progress. The
+/// per-stall timeouts are the right bound for a transfer whose honest duration is unknown.
 pub static DOWNLOAD_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))

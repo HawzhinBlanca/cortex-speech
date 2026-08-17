@@ -50,6 +50,39 @@ def test_fresh_and_head_matched_passes() -> None:
     assert problems == [], problems
 
 
+def test_stale_installer_is_flagged_even_when_the_exe_is_fresh() -> None:
+    """An MSI/NSIS from an older build is the artifact people actually double-click.
+
+    Found 2026-08-17: both installers under target/release/bundle/ were four days behind the exe,
+    and nothing said so — a "finished" installer that ships last week's app.
+    """
+    problems = evaluate_freshness(
+        exe_exists=True,
+        exe_mtime=2000.0,
+        baked_sha=HEAD,
+        head_sha=HEAD,
+        newest_src_mtime=1000.0,
+        newest_src_file="src/App.svelte",
+        stale_installers=[("Cortex_2.1.0_x64_en-US.msi", 1500.0)],
+    )
+    assert len(problems) == 1, problems
+    assert "STALE INSTALLER" in problems[0], problems
+
+    # A rebuilt installer (nothing passed in) leaves the gate green.
+    assert (
+        evaluate_freshness(
+            exe_exists=True,
+            exe_mtime=2000.0,
+            baked_sha=HEAD,
+            head_sha=HEAD,
+            newest_src_mtime=1000.0,
+            newest_src_file="src/App.svelte",
+            stale_installers=[],
+        )
+        == []
+    )
+
+
 def test_stale_exe_is_flagged() -> None:
     problems = evaluate_freshness(
         exe_exists=True,

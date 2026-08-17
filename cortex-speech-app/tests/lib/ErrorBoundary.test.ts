@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
 import { createRawSnippet, flushSync } from 'svelte';
 import ErrorBoundary from '../../src/lib/ErrorBoundary.svelte';
+import BoundaryHarness from './fixtures/BoundaryHarness.svelte';
 import { locale } from '../../src/lib/i18n';
 
 const child = createRawSnippet(() => ({
@@ -16,27 +17,44 @@ describe('ErrorBoundary', () => {
     expect(screen.getByTestId('boundary-child')).toBeInTheDocument();
   });
 
-  it('IGNORES resource-load errors (e.g. a CSP-blocked font link) and keeps the panel', () => {
-    render(ErrorBoundary, { props: { children: child } });
-    flushSync(); // run the $effect that attaches the window 'error' listener
-    // A failed <link>/<img>/<audio> dispatches 'error' on the element; the window capture-phase
-    // listener sees it with target = the element, NOT window. The boundary must ignore it.
-    const link = document.createElement('link');
-    document.body.appendChild(link);
-    link.dispatchEvent(new Event('error', { bubbles: false, cancelable: true }));
+  /**
+   * The whole point of the 2026-08-17 rewrite. App.svelte mounts TEN of these; when each one
+   * listened for window 'error' itself, a single uncaught error made all ten render their fallback
+   * — the user saw the entire app replaced by red boxes because one panel failed. A boundary must
+   * only ever catch what is below it.
+   */
+  it('catches a render failure in its OWN subtree and leaves siblings untouched', () => {
+    // Svelte logs the caught error; that is correct behaviour, not test noise.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(BoundaryHarness, { props: { explode: true } });
     flushSync();
-    expect(screen.getByTestId('boundary-child')).toBeInTheDocument();
+
+    // The failing panel shows the fallback...
+    expect(screen.getByText('Retry')).toBeInTheDocument();
+    expect(screen.queryByTestId('exploding-panel')).not.toBeInTheDocument();
+    // ...and the panel next to it is still on screen, still working.
+    expect(screen.getByTestId('healthy-panel')).toBeInTheDocument();
+    // Exactly one fallback, not one per boundary.
+    expect(screen.getAllByText('Retry')).toHaveLength(1);
     expect(screen.queryByText('undefined')).not.toBeInTheDocument();
-    expect(screen.queryByText('Retry')).not.toBeInTheDocument();
+    consoleError.mockRestore();
   });
 
-  it('still catches a real uncaught script error (target === window)', () => {
+  it('does NOT blank a panel for an uncaught window error it cannot attribute', () => {
     render(ErrorBoundary, { props: { children: child } });
-    flushSync(); // run the $effect that attaches the window 'error' listener
-    window.dispatchEvent(new ErrorEvent('error', { message: 'kaboom', error: new Error('kaboom') }));
     flushSync();
-    expect(screen.getByText('Retry')).toBeInTheDocument();
-    // and it shows a readable message, never the literal "undefined"
-    expect(screen.queryByText('undefined')).not.toBeInTheDocument();
+    // A global uncaught error is surfaced as a toast by installGlobalErrorTrap — see
+    // globalErrorTrap.test.ts. It must NOT tear down an unrelated panel that is rendering fine.
+    // The swallow listener is test plumbing only: without it jsdom runs its default action and
+    // reports this deliberate event as an unhandled exception, failing the run for the wrong reason.
+    const swallow = (e: Event) => e.preventDefault();
+    window.addEventListener('error', swallow);
+    window.dispatchEvent(
+      new ErrorEvent('error', { message: 'kaboom', error: new Error('kaboom'), cancelable: true }),
+    );
+    flushSync();
+    window.removeEventListener('error', swallow);
+    expect(screen.getByTestId('boundary-child')).toBeInTheDocument();
+    expect(screen.queryByText('Retry')).not.toBeInTheDocument();
   });
 });

@@ -21,7 +21,7 @@ mod task_pool_legacy;
 mod task_pool_channel;
 
 pub use self::custom_stream::CustomStream;
-pub(crate) use self::deadline_reader::{DeadlineReader, REQUEST_READ_DEADLINE};
+pub(crate) use self::deadline_reader::{DeadlineReader, REQUEST_READ_DEADLINE, RESPONSE_WRITE_DEADLINE};
 pub use self::equal_reader::EqualReader;
 pub use self::fused_reader::FusedReader;
 

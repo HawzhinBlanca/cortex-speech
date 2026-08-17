@@ -375,6 +375,9 @@ impl AppState {
 /// Where panic crash dumps are written — set once the app data dir exists (see `run`).
 static CRASH_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// How many daily log files to keep under `<data_dir>/logs`. See the appender below.
+const LOG_RETENTION_DAYS: usize = 60;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::panic::set_hook(Box::new(|info| {
@@ -422,7 +425,22 @@ pub fn run() {
     // the last week) could not be read as either "the owner closed it" or "it crashed".
     let exit_marker = log_dir.join("last-exit.txt");
     let _ = std::fs::remove_file(&exit_marker);
-    let (file_writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(&log_dir, "cortex.log"));
+    // Daily rotation WITH retention. `rolling::daily` rotates but never deletes, so the log
+    // directory grew without any bound at all — 23 MB across 30+ files by 2026-08-17, on a machine
+    // whose C: drive already runs close to full. Sixty days is far longer than any incident
+    // investigation here has needed and still bounds the directory. Falls back to the unbounded
+    // appender if the builder ever rejects the config, because losing logs entirely would be worse
+    // than keeping too many.
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("cortex.log")
+        .max_log_files(LOG_RETENTION_DAYS)
+        .build(&log_dir)
+        .unwrap_or_else(|e| {
+            eprintln!("log retention could not be configured ({e}); falling back to unbounded daily logs");
+            tracing_appender::rolling::daily(&log_dir, "cortex.log")
+        });
+    let (file_writer, guard) = tracing_appender::non_blocking(appender);
     let _ = Box::leak(Box::new(guard));
     {
         use tracing_subscriber::layer::SubscriberExt;

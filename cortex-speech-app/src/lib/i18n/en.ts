@@ -167,6 +167,10 @@ export const en: Record<string, string> = {
   'review.searchScopeEmpty': 'No clips match the current search — clear it to review everything.',
   'review.waveformFailed':
     "Couldn't read this clip's audio — the waveform is unavailable, not silent.",
+  // Refusal, not a warning: the decision was NOT recorded. A verdict on audio nobody could hear is
+  // indistinguishable from a real listen once it is in the corpus (audit find 2026-08-17).
+  'review.cannotDecideWithoutAudio':
+    "This clip's audio could not be played, so no decision can be saved for it. Skip it, or fix the audio and reload.",
   'review.undoFailed': 'Undo failed',
   'review.undoLast': 'Undo review',
   'review.retranscribeVerifiedTitle': 'Replace a verified transcript?',

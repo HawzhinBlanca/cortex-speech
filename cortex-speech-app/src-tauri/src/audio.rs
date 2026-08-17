@@ -5,6 +5,8 @@ use ort::value::Tensor;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -193,6 +195,17 @@ pub fn check_audio_file<P: AsRef<Path>>(path: P) -> AppResult<AudioInfo> {
 /// Decode any audio file to 16kHz mono 16-bit PCM using symphonia.
 /// Results are cached in a small LRU to avoid re-decoding the same file.
 pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
+    // A caller with no way to stop waiting also has no way to abort: a flag that is never set.
+    decode_to_pcm_abortable(path, &AtomicBool::new(false))
+}
+
+/// [`decode_to_pcm`] that gives up when `abort` is set.
+///
+/// A Rust thread cannot be killed from outside, so [`decode_to_pcm_with_timeout`] used to leave its
+/// worker decoding a file nobody was waiting for any more — holding a core and up to ~1 GiB of
+/// interleaved f32 while the caller had already failed and perhaps started another import. The
+/// per-packet check below is what turns that timeout into a real stop.
+fn decode_to_pcm_abortable<P: AsRef<Path>>(path: P, abort: &AtomicBool) -> AppResult<(u32, Vec<i16>)> {
     let path_str = path.as_ref().to_string_lossy().to_string();
     let cache_key = pcm_cache_key(path.as_ref())?;
 
@@ -255,6 +268,11 @@ pub fn decode_to_pcm<P: AsRef<Path>>(path: P) -> AppResult<(u32, Vec<i16>)> {
 
     let mut sample_buf: Vec<f32> = Vec::new();
     loop {
+        if abort.load(Ordering::Relaxed) {
+            return Err(AppError::Audio(AudioError::Decode(
+                "audio decode cancelled (the caller stopped waiting)".into(),
+            )));
+        }
         let packet = match format.next_packet() {
             Ok(Some(pkt)) => pkt,
             Ok(None) => break, // clean end of stream (0.6 signals EOF with None, not an UnexpectedEof err)
@@ -394,9 +412,11 @@ where
         if pcm.is_empty() {
             return Ok(());
         }
-        let window = PcmWindow { offset_ms: output_offset_ms, sample_rate: TARGET_SAMPLE_RATE, pcm: pcm.clone() };
+        // Advance the clock BEFORE moving `pcm` into the window — cloning it just to read its length
+        // afterwards doubled the peak memory of every window for nothing.
+        let window_offset_ms = output_offset_ms;
         output_offset_ms += (pcm.len() as i64 * 1000) / TARGET_SAMPLE_RATE as i64;
-        on_window(window)?;
+        on_window(PcmWindow { offset_ms: window_offset_ms, sample_rate: TARGET_SAMPLE_RATE, pcm })?;
         Ok(())
     };
 
@@ -464,29 +484,77 @@ where
     Ok(())
 }
 
-/// Like [`decode_pcm_windows`] but fails if decoding exceeds `timeout`.
-pub fn decode_pcm_windows_with_timeout<P, F>(path: P, window_ms: u32, timeout: Duration, on_window: F) -> AppResult<()>
+/// Decode `path` in windows on a worker thread and hand each one to `on_window` **on the caller's
+/// thread**, with at most a couple of windows alive at once.
+///
+/// This replaces the old `decode_pcm_windows_with_timeout`, whose callback had to be
+/// `Send + 'static`. That bound forced its one caller (the long-audio import) to do the only thing
+/// such a callback can do — push every window into a Vec and process the file afterwards — so the
+/// "streaming" path still held the ENTIRE recording in RAM before it planned a single chunk
+/// (~170 MB of PCM for a 1.5 h source, and it grows without limit with the file). Handing windows
+/// back on the caller's thread lets the import consume each one with borrowed state instead.
+///
+/// Two bounds, both real:
+/// - the `sync_channel(1)` back-pressures the decoder, so it can run at most one window ahead;
+/// - `window_timeout` bounds the wait for EACH window. It is per-window on purpose: decode and ASR
+///   now interleave, so a whole-file budget would be timing the ASR too.
+///
+/// On any early return the receiver drops, the worker's next `send` fails, and its decode loop exits
+/// — the timeout genuinely stops the decoder instead of leaving it running unobserved.
+///
+/// `on_window`'s second argument is `is_last`: the consumer holds one window back so it can say
+/// which window ends the file, which the caller needs and a plain stream cannot know in advance. A
+/// held-back window is only ever released as `is_last` after the decoder reports success, so a
+/// mid-file decode failure can never be mistaken for a clean end of file.
+pub fn decode_pcm_windows_streaming<F>(
+    path: std::path::PathBuf,
+    window_ms: u32,
+    window_timeout: Duration,
+    mut on_window: F,
+) -> AppResult<()>
 where
-    P: AsRef<Path> + Send + 'static,
-    F: FnMut(PcmWindow) -> AppResult<()> + Send + 'static,
+    F: FnMut(PcmWindow, bool) -> AppResult<()>,
 {
-    let path_buf = path.as_ref().to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let (window_tx, window_rx) = std::sync::mpsc::sync_channel::<PcmWindow>(1);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = decode_pcm_windows(&path_buf, window_ms, on_window);
-        send_decode_worker_result(tx, result, "decode_pcm_windows");
+        let result = decode_pcm_windows(&path, window_ms, |window| {
+            window_tx.send(window).map_err(|_| {
+                AppError::Audio(AudioError::Decode("audio decode cancelled (the consumer stopped)".into()))
+            })
+        });
+        send_decode_worker_result(done_tx, result, "decode_pcm_windows");
     });
 
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(AppError::Audio(AudioError::Decode(format!("Audio decode timed out after {:?}", timeout))))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(AppError::Audio(AudioError::Decode("Audio decode worker thread disconnected".into())))
+    let mut pending: Option<PcmWindow> = None;
+    loop {
+        match window_rx.recv_timeout(window_timeout) {
+            Ok(window) => {
+                if let Some(previous) = pending.replace(window) {
+                    on_window(previous, false)?;
+                }
+            }
+            // The sender is gone: the decode finished (or died). Its own result decides which.
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(AppError::Audio(AudioError::Decode(format!(
+                    "Audio decode timed out after {window_timeout:?} waiting for the next window"
+                ))));
+            }
         }
     }
+
+    done_rx.recv().unwrap_or_else(|_| {
+        Err(AppError::Audio(AudioError::Decode("Audio decode worker thread disconnected".into())))
+    })?;
+
+    if let Some(last) = pending {
+        on_window(last, true)?;
+    }
+    Ok(())
 }
 
 /// Decode audio to PCM with a configurable timeout for the symphonia decoder.
@@ -494,15 +562,21 @@ where
 pub fn decode_to_pcm_with_timeout<P: AsRef<Path>>(path: P, timeout: Duration) -> AppResult<(u32, Vec<i16>)> {
     let path = path.as_ref().to_string_lossy().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
+    // The worker outlives the timeout — a thread cannot be killed from outside — so give it something
+    // to notice with. Without this, a timed-out decode kept a core and up to ~1 GiB of interleaved f32
+    // busy for the full length of a decode whose caller had already given up and moved on.
+    let abort = Arc::new(AtomicBool::new(false));
+    let worker_abort = Arc::clone(&abort);
 
     std::thread::spawn(move || {
-        let result = decode_to_pcm(&path);
+        let result = decode_to_pcm_abortable(&path, &worker_abort);
         send_decode_worker_result(tx, result, "decode_to_pcm");
     });
 
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            abort.store(true, Ordering::Relaxed);
             Err(AppError::Audio(AudioError::Decode(format!("Audio decode timed out after {:?}", timeout))))
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1406,15 +1480,15 @@ mod tests {
         assert_eq!(rate, TARGET_SAMPLE_RATE);
         assert!((pcm.len() as i64 - 16_000).abs() <= 2);
 
-        // Shared counter: the callback is moved into the worker thread, so the assertion needs a
-        // handle that outlives it (a plain `mut` local would be moved and silently never read).
-        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen_cb = seen.clone();
-        decode_pcm_windows_with_timeout(p.clone(), 500, Duration::from_secs(30), move |_w| {
-            seen_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The windowed decoder hands windows back on THIS thread, so a plain local counter is enough
+        // (and is the point of the API: no Send + 'static bound on the callback).
+        let mut seen_count = 0usize;
+        decode_pcm_windows_streaming(p.clone(), 500, Duration::from_secs(30), |_w, _last| {
+            seen_count += 1;
             Ok(())
         })
         .expect("windowed decode within budget");
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(seen_count));
         assert!(
             seen.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "the timeout wrapper must actually deliver windows, not just return Ok"
@@ -1434,6 +1508,69 @@ mod tests {
         // Not asserted as always-Err: a 1 ns budget races a fast local decode, and demanding the
         // timeout would be a flaky test. The classification above is the part that matters, and it
         // is checked whenever the race lands on the timeout side.
+    }
+
+    /// The streaming decoder's four contracts, all of which a long import depends on.
+    ///
+    /// Before 2026-08-17 its predecessor's `Send + 'static` callback left the import no choice but to
+    /// buffer every window and process the file afterwards, so a 1.5 h recording held ~170 MB of PCM
+    /// before planning a single chunk — the "streaming" path was streaming in name only.
+    #[test]
+    fn streaming_decode_is_bounded_flags_the_last_window_and_never_fakes_an_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("s.wav");
+        write_tone_wav(&p, 16_000, 2.0, 1); // 2 s at 500 ms per window => 4 windows
+
+        // 1. Every window is delivered, in order, exactly once, and only the FINAL one is is_last.
+        let mut offsets = Vec::new();
+        let mut last_flags = Vec::new();
+        decode_pcm_windows_streaming(p.clone(), 500, Duration::from_secs(30), |w, is_last| {
+            offsets.push(w.offset_ms);
+            last_flags.push(is_last);
+            Ok(())
+        })
+        .expect("streaming decode");
+        assert!(offsets.len() >= 2, "a 2 s file at 500 ms windows must yield several windows: {offsets:?}");
+        assert!(offsets.windows(2).all(|w| w[1] > w[0]), "offsets must increase: {offsets:?}");
+        assert_eq!(offsets[0], 0, "the first window starts at the beginning of the file");
+        assert_eq!(
+            last_flags.iter().filter(|f| **f).count(),
+            1,
+            "exactly one window ends the file, got {last_flags:?}"
+        );
+        assert!(*last_flags.last().expect("a window"), "the LAST delivered window is the one flagged");
+
+        // 2. A SLOW consumer (the real one does ASR per window) must still receive the whole file.
+        //    The bound itself is structural — `sync_channel(1)` back-pressures the decoder — and the
+        //    risk that buys is a stall, so that is what is worth a test: the decoder waits for a
+        //    consumer slower than it, and neither side deadlocks.
+        let mut slow_offsets = Vec::new();
+        decode_pcm_windows_streaming(p.clone(), 500, Duration::from_secs(30), |w, _| {
+            std::thread::sleep(Duration::from_millis(20));
+            slow_offsets.push(w.offset_ms);
+            Ok(())
+        })
+        .expect("streaming decode with a slow consumer");
+        assert_eq!(slow_offsets, offsets, "back-pressure must not drop, duplicate, or reorder a window");
+
+        // 3. A consumer error stops the decode instead of being swallowed mid-stream — and because
+        //    the receiver drops with it, the worker's next send fails and its decode loop exits too.
+        let mut delivered = 0usize;
+        let stopped = decode_pcm_windows_streaming(p.clone(), 500, Duration::from_secs(30), |_w, _| {
+            delivered += 1;
+            Err(crate::error::AppError::Validation("stop".into()))
+        });
+        assert!(stopped.is_err(), "a failing consumer must abort the decode");
+        assert_eq!(delivered, 1, "the decode must stop at the first refusal, not run the file out");
+
+        // 4. A decode that never starts is an error, not a silent zero-window success.
+        assert!(decode_pcm_windows_streaming(
+            dir.path().join("missing.wav"),
+            500,
+            Duration::from_secs(30),
+            |_w, _| Ok(())
+        )
+        .is_err());
     }
 
     /// `ensure_pcm_16khz` is the rate-normalisation seam every decode path funnels through.

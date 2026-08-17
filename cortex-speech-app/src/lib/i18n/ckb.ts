@@ -172,6 +172,10 @@ export const ckb: Record<string, string> = {
   // vocabulary already in this file; flagged for owner review.
   'review.waveformFailed':
     'نەتوانرا دەنگی ئەم پارچەیە بخوێنرێتەوە — شەپۆل بەردەست نییە، بێدەنگ نییە.',
+  // See en.ts: this is a REFUSAL — nothing was saved. Composed from vocabulary already in this
+  // file; flagged for owner review.
+  'review.cannotDecideWithoutAudio':
+    'دەنگی ئەم پارچەیە لێ نەدرا، بۆیە هیچ بڕیارێک بۆی پاشەکەوت نەکرا. بازی بدە، یان دەنگەکە ڕاست بکەرەوە و دووبارە باری بکە.',
   'review.undoFailed': 'گەڕاندنەوە سەرکەوتوو نەبوو',
   'review.undoLast': 'گەڕاندنەوەی پێداچوونەوە',
   'review.retranscribeVerifiedTitle': 'دەقی پشتڕاستکراو بگۆڕدرێت؟',

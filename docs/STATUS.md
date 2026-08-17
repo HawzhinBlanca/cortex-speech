@@ -4,9 +4,9 @@
 
 # Gate status — generated
 
-**Commit:** `ab79597` · **Mode:** full
+**Commit:** `5d4a722` · **Mode:** full
 
-**Verdict:** **GREEN — PERSONAL-USE SHIP-READY.** (Not full-charter 10/10: 9 legs owner-descoped, 3 owner-gated pending.)
+**Verdict:** **RED** — 1 kept gate(s) failed (spot-check-pool). NOT ship-ready.
 
 ## Kept gates
 
@@ -19,6 +19,10 @@
 | `license-compat` | PASS |
 | `branch-protection` | PASS |
 | `python-policies` | PASS |
+| `spot-check-pool` | FAIL |
+| `dataset-duplicates` | PASS |
+| `reviewer-queues-live` | PASS |
+| `review-serving-provenance` | PASS |
 | `typecheck` | PASS |
 | `lint-js` | PASS |
 | `clippy` | PASS |
@@ -30,9 +34,11 @@
 | `deny` | PASS |
 | `test-e2e+a11y` | PASS |
 | `exe-freshness` | PASS |
+| `supervision-live` | PASS |
 | `real-app-e2e` | PASS |
 | `egress-runtime` | PASS |
 | `ignored-real-model` | PASS |
+| `champion-7b-preflight` | PASS |
 | `fuzz-smoke` | PASS |
 | `rtf-bench` | PASS |
 | `refinery-lift` | PASS |

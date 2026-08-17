@@ -273,6 +273,9 @@ impl Server {
         // DeadlineReader adds an absolute per-request deadline so a byte-at-a-time peer cannot
         // retain a worker forever either.
         sock.set_read_timeout(Some(util::REQUEST_READ_DEADLINE))?;
+        // …and bound the write side too: a peer that requests a clip and then stops reading fills the
+        // socket buffer and parks this worker inside `write` forever. See RESPONSE_WRITE_DEADLINE.
+        sock.set_write_timeout(Some(util::RESPONSE_WRITE_DEADLINE))?;
 
         use util::RefinedTcpStream;
         let (read_closable, write_closable) = match ssl.0 {
