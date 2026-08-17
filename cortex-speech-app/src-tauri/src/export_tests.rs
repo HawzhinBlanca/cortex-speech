@@ -2280,3 +2280,23 @@ fn export_records_carry_the_source_dialect_and_never_guess_one() {
     // has been sanitized to a basename for privacy, and folder-keyed corpora would lose their key.
     assert_eq!(as_json[0]["audioPath"], "KBHP-EP07.wav", "path stays privacy-sanitized");
 }
+
+#[test]
+fn a_measured_speaker_turn_rides_every_export_and_unmeasured_is_never_exported_as_single() {
+    // A clip spanning two voices has no single correct speaker label, so a downstream consumer must
+    // be able to filter it. The tri-state is the honesty rule: true = measured turn, false = measured
+    // single voice, null = NOT MEASURED — and unmeasured must never serialize as "single", because
+    // 14,828 clips sat unmeasured for weeks while every one carried a confident SPEAKER_0x.
+    let mut turn = sample_segment("two-voices");
+    turn.speaker_change_score = Some(0.31); // below 0.59 = a measured speaker turn
+    let mut single = sample_segment("one-voice");
+    single.speaker_change_score = Some(0.81);
+    let unmeasured = sample_segment("never-probed"); // score None
+
+    let records = export_records(&[turn, single, unmeasured]);
+    let as_json: Vec<serde_json::Value> = records.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+
+    assert_eq!(as_json[0]["speakerTurn"], true, "a measured turn must ship as true");
+    assert_eq!(as_json[1]["speakerTurn"], false, "a measured single voice ships as false");
+    assert!(as_json[2]["speakerTurn"].is_null(), "unmeasured ships null — absence of proof is not proof of one voice");
+}

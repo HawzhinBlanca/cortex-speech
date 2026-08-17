@@ -68,6 +68,12 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let export_dir = args.iter().position(|a| a == "--export").and_then(|i| args.get(i + 1).cloned());
     let persist = args.iter().any(|a| a == "--persist");
+    // `--replan <wav>`: the measurement iteration 225 demands before speaker-aware cutting may ship.
+    // Plans the SAME real recording silence-only and judge-aware and reports exactly what the judge
+    // changed, so the wiring in pipeline.rs is kept or cut on numbers, not on the design sounding right.
+    if let Some(wav) = args.iter().position(|a| a == "--replan").and_then(|i| args.get(i + 1).cloned()) {
+        return replan_comparison(&wav);
+    }
     let db_path = args
         .iter()
         .enumerate()
@@ -296,6 +302,79 @@ const GROUND_TRUTH: &[(&str, &str, f32)] = &[
 ///
 /// ponytail: 144 individual UPDATEs, no transaction. An interruption leaves fewer rows flagged, never
 /// a wrong one — and the fix is to run it again.
+/// Plan one real recording both ways and report the difference. The verdict discipline is iteration
+/// 225's: the judge-aware plan ships only if what it changes is small, targeted and audible — so
+/// alongside the counts, every refused boundary's timestamp is printed for the owner to listen to.
+/// Uses the app's own settings defaults (0.5 / 3s / 15s) so the plan is the plan production would make.
+fn replan_comparison(wav: &str) -> Result<(), String> {
+    let campp = models::resolve_model_file(models::CAMPP_MODEL);
+    let models_dir = campp
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| format!("cannot derive a models root from {}", campp.display()))?;
+    let embed = SpeakerEmbeddingService::new(models_dir);
+    if !embed.is_available() {
+        return Err("CAM++ is not present — nothing to measure".into());
+    }
+    let (rate, pcm) = audio::decode_to_pcm(wav).map_err(|e| format!("decode {wav}: {e}"))?;
+    let (rate, pcm) = audio::ensure_pcm_16khz(rate, pcm).map_err(|e| format!("resample: {e}"))?;
+    println!("replan: {wav}\n  {:.1} min of audio at {rate} Hz", pcm.len() as f64 / rate as f64 / 60.0);
+
+    let (vad_th, min_ms, max_ms) = (0.5f32, 3_000u32, 15_000u32);
+    let (silence_only, _) = chunking::plan_speech_chunks(&pcm, rate, vad_th, min_ms, max_ms)
+        .map_err(|e| format!("silence-only plan: {e}"))?;
+    // The production judge, instrumented: every consulted boundary's similarity is recorded, because
+    // "0 boundaries added" is ambiguous — no candidates at all, or candidates that all scored same-
+    // speaker — and those two readings call for opposite next steps.
+    let consulted = std::cell::RefCell::new(Vec::<f32>::new());
+    let judge = |a: &[i16], b: &[i16]| -> Option<bool> {
+        let to_f32 = |s: &[i16]| s.iter().map(|&v| v as f32 / 32768.0).collect::<Vec<f32>>();
+        let ea = embed.compute_embedding(&to_f32(a), rate);
+        let eb = embed.compute_embedding(&to_f32(b), rate);
+        let sim = cortex_speech_app_lib::diarization::cosine_similarity(&ea, &eb)?;
+        consulted.borrow_mut().push(sim);
+        Some(sim >= cortex_speech_app_lib::diarization::SPEAKER_TURN_REFUSAL_CEILING)
+    };
+    let (judged, _) = chunking::plan_speech_chunks_with_judge(&pcm, rate, vad_th, min_ms, max_ms, Some(&judge))
+        .map_err(|e| format!("judge-aware plan: {e}"))?;
+
+    let ms = |samples: usize| chunking::samples_to_ms(samples, rate);
+    let stats = |label: &str, plan: &[(usize, usize)]| {
+        let durs: Vec<i64> = plan.iter().map(|&(s, e)| ms(e - s)).collect();
+        let min = durs.iter().min().copied().unwrap_or(0);
+        let sub_floor = durs.iter().filter(|&&d| d < min_ms as i64).count();
+        println!("  {label:13} {:4} chunks   min {min} ms   {sub_floor} under the {min_ms} ms floor", plan.len());
+    };
+    stats("silence-only:", &silence_only);
+    stats("judge-aware:", &judged);
+
+    // The boundaries the judge ADDED — each one a claim that two voices meet there. Listed as
+    // timestamps into the source so the owner can seek to each and listen; that listening IS the
+    // ground truth this feature ships or dies on.
+    let mut sims = consulted.into_inner();
+    sims.sort_by(|a, b| a.total_cmp(b));
+    println!("  boundaries the judge was CONSULTED on: {}", sims.len());
+    if !sims.is_empty() {
+        let show = |v: &[f32]| v.iter().map(|s| format!("{s:.3}")).collect::<Vec<_>>().join(" ");
+        println!("    lowest 10 sims:  {}", show(&sims[..sims.len().min(10)]));
+        println!("    highest 5 sims:  {}", show(&sims[sims.len().saturating_sub(5)..]));
+        let below_059 = sims.iter().filter(|&&s| s < 0.59).count();
+        println!("    below the 0.59 within-clip threshold: {below_059} (refusal bar is 0.43)");
+    }
+    let old: std::collections::HashSet<usize> = silence_only.iter().map(|&(s, _)| s).collect();
+    let added: Vec<usize> = judged.iter().map(|&(s, _)| s).filter(|s| !old.contains(s)).collect();
+    println!("  cut positions changed by the judge: {}", added.len());
+    for s in &added {
+        let t = ms(*s) as f64 / 1000.0;
+        println!(
+            "    now cuts at {:02}:{:05.2}  ({t:.2}s)  — listen here: is this a voice change?",
+            (t as i64) / 60,
+            t % 60.0
+        );
+    }
+    Ok(())
+}
+
 fn persist_scores(db_path: &str, sims: &[(String, f32, i64)]) -> Result<(), String> {
     let db = Database::open(db_path).map_err(|e| format!("open {db_path} read-write: {e}"))?;
     let mut written = 0usize;

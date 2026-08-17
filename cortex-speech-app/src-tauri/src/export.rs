@@ -107,12 +107,19 @@ struct ExportSegmentRecord {
     /// computed from the dataset. Derived from the ORIGINAL path (the map keys on the source), then
     /// the path itself is sanitized to a basename below.
     dialect: Option<&'static str>,
+    /// Was this clip MEASURED to span a speaker turn? (CAM++ half-vs-half, the couch badge's exact
+    /// predicate.) `Some(true)` = two voices — its `speaker_id` label is unreliable and a downstream
+    /// consumer building speaker-attributed data should filter it. `None` = NOT MEASURED, which must
+    /// never be exported as "single speaker": absence of a measurement is not evidence of one voice.
+    speaker_turn: Option<bool>,
 }
 
 impl ExportSegmentRecord {
     fn new(segment: &SpeechSegment) -> Self {
         let report = quality::training_grade_for_segment(segment);
         let dialect = crate::dialect::dialect_of(&segment.audio_path);
+        let speaker_turn =
+            segment.speaker_change_score.map(|s| (s as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD);
         // Privacy: never publish the curator's absolute filesystem path — it embeds the
         // OS username and drive layout. Emit only the basename, like the HF exporter.
         let mut sanitized = segment.clone();
@@ -129,7 +136,18 @@ impl ExportSegmentRecord {
             training_ready: report.training_ready,
             training_reasons: report.reasons,
             dialect,
+            speaker_turn,
         }
+    }
+}
+
+/// The CSV/metadata spelling of the tri-state: "true" / "false" / "" (unmeasured). One function so
+/// the plain CSV, the HF metadata.csv and any future flat exporter cannot drift apart on it.
+fn speaker_turn_csv(segment: &SpeechSegment) -> &'static str {
+    match segment.speaker_change_score.map(|s| (s as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD) {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "",
     }
 }
 
@@ -989,6 +1007,7 @@ pub fn export_huggingface_dataset(
                     "transcript_source",
                     "training_reasons",
                     "dialect",
+                    "speaker_turn",
                 ])?;
 
                 let mut total_exported_dur = 0.0;
@@ -1146,6 +1165,7 @@ pub fn export_huggingface_dataset(
                             grade.transcript_source.as_str(),
                             hf_reasons.as_ref(),
                             crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
+                            speaker_turn_csv(seg),
                         ])?;
 
                         total_exported_dur += clip_dur_ms as f64 / 1000.0;
@@ -1346,6 +1366,7 @@ number verbalization), and diacritics are left untouched.
                 "training_ready": {"dtype": "int64", "_type": "Value"},
                 "transcript_source": {"dtype": "string", "_type": "Value"},
                 "dialect": {"dtype": "string", "_type": "Value"},
+                "speaker_turn": {"dtype": "string", "_type": "Value"},
                 "training_reasons": {"dtype": "string", "_type": "Value"},
             },
             "splits": {
@@ -1460,6 +1481,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 "training_ready",
                 "training_reasons",
                 "dialect",
+                "speaker_turn",
             ])?;
 
             for seg in segments {
@@ -1496,6 +1518,7 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                     if grade.training_ready { "1" } else { "0" },
                     reasons_cell.as_ref(),
                     crate::dialect::dialect_of(&seg.audio_path).unwrap_or(""),
+                    speaker_turn_csv(seg),
                 ])?;
             }
             wtr.flush()?;
@@ -1579,6 +1602,9 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
         Field::new("training_ready", DataType::Boolean, false),
         Field::new("training_reasons", DataType::Utf8, false),
         Field::new("dialect", DataType::Utf8, true),
+        // Nullable on purpose: an unmeasured clip is NULL, never false — absence of a measurement is
+        // not evidence of a single speaker (same honesty rule as the couch badge and the CSV column).
+        Field::new("speaker_turn", DataType::Boolean, true),
     ]));
 
     let grade_reports: Vec<TrainingGradeReport> = segments.iter().map(quality::training_grade_for_segment).collect();
@@ -1604,6 +1630,10 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let training_ready: BooleanArray = grade_reports.iter().map(|report| Some(report.training_ready)).collect();
     let training_reasons: StringArray = grade_reasons.iter().map(|reasons| Some(reasons.as_str())).collect();
     let dialect: StringArray = segments.iter().map(|s| crate::dialect::dialect_of(&s.audio_path)).collect();
+    let speaker_turn: BooleanArray = segments
+        .iter()
+        .map(|s| s.speaker_change_score.map(|v| (v as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD))
+        .collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -1624,6 +1654,7 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
             Arc::new(training_ready),
             Arc::new(training_reasons),
             Arc::new(dialect),
+            Arc::new(speaker_turn),
         ],
     )
     .map_err(|e| crate::error::AppError::Other(format!("Parquet batch build failed: {e}")))?;

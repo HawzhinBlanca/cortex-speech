@@ -263,6 +263,42 @@ fn l2_normalize(v: &mut [f32]) {
 /// speaker. Using 0.85 here flagged 100% of the corpus.
 pub const SPEAKER_CHANGE_THRESHOLD: f32 = 0.59;
 
+/// Refusal bar for the CHUNK-MERGE judge — deliberately NOT [`SPEAKER_CHANGE_THRESHOLD`].
+///
+/// Iteration 225 wired this signal into chunking at 0.59 and measured it on real audio: no variant
+/// clearly helped, and the local-window one was worse. Its post-mortem names the reason — 0.59 is the
+/// MIDPOINT of a gap calibrated on ~7 s halves, and shorter windows score systematically lower, so at
+/// short windows the midpoint over-fires on single-speaker speech. This bar is instead the CEILING of
+/// the turn-taking group in the owner's blind listening pass (every clip he heard as two people
+/// scored <= 0.428; every single-speaker clip >= 0.753): a merge is refused only on evidence stronger
+/// than every turn ever measured, so the length confound pushes borderline windows toward MERGING —
+/// the historical behaviour — never toward shredding one voice into fragments.
+///
+/// Wired into the import path ONLY behind a real-audio measurement (`speaker_change_probe --replan`),
+/// per the standing rule from iteration 225: an unproven change to how the corpus is cut does not ship.
+pub const SPEAKER_TURN_REFUSAL_CEILING: f32 = 0.43;
+
+/// The chunk planner's speaker judge: same voice on both sides of a candidate merge?
+///
+/// Windowing (length floors/caps) is the PLANNER's job; this just embeds what it is handed and
+/// answers. `None` — no model, embedding failed, degenerate audio — tells the planner to merge
+/// exactly as silence-only chunking always has; only a confident "different voice" refuses.
+pub fn speaker_turn_judge<'a>(
+    service: &'a SpeakerEmbeddingService,
+    sample_rate: u32,
+) -> impl Fn(&[i16], &[i16]) -> Option<bool> + 'a {
+    move |a: &[i16], b: &[i16]| {
+        if !service.is_available() {
+            return None;
+        }
+        let to_f32 = |s: &[i16]| s.iter().map(|&v| v as f32 / 32768.0).collect::<Vec<f32>>();
+        let ea = service.compute_embedding(&to_f32(a), sample_rate);
+        let eb = service.compute_embedding(&to_f32(b), sample_rate);
+        let sim = cosine_similarity(&ea, &eb)?;
+        Some(sim >= SPEAKER_TURN_REFUSAL_CEILING)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8865,3 +8865,54 @@ Sorani backlog is 535 clips (1.2 h) against 13,777 Hawleri (34.0 h) — five Sor
 drain it in a sitting, so more Sorani material needs importing to keep them working.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## Iteration 290 — the knife is speaker-aware where it measurably matters, and nowhere else
+
+The owner hit two-voice clips while reviewing — the same complaint that created iteration 225 — and
+asked for the cut itself to be fixed. 225's post-mortem was the mandatory reading: it built speaker-
+aware splitting, measured it on real audio, could not show it helped (12→10/11/14 mixed under a
+length-confounded metric), and reverted with a warning to read the numbers before repeating them. So
+this iteration's rule was: every wiring decision comes from a fresh measurement on real audio, and
+anything unmeasured does not ship.
+
+**MEASURED FIRST: the merge step is the wrong organ for this corpus.** The first design judged
+speaker identity where VAD regions MERGE. Instrumented and run on KBHP-EP01 (58.5 real minutes of the
+two-host podcast): the judge was consulted **ZERO times** — dense podcast speech produces long
+continuous VAD regions, so the planner's work is SPLITTING oversized regions, not merging. The
+gluing of two voices happens at `silence_aware_split`, which chose the widest pause with no idea who
+was speaking. The merge-time judge stays (pure-tested, fail-open, structurally inert here but live
+protection for sparse-speech corpora), and the real fix moved to the split.
+
+**THE FIX THAT SHIPPED: relocate mandatory cuts to the pause where the voice changes.** When an
+over-cap region must be cut anyway, `speaker_turn_cut` auditions the band's widest pauses (top 6)
+with CAM++ windows either side and takes the first where the two sides are DIFFERENT voices;
+otherwise behaviour is byte-identical to silence-only. Refusal bar is 0.43 — the ceiling of the
+turn-taking group in the owner's blind listening pass, NOT the 0.59 midpoint that 225 used — so the
+length confound pushes borderline windows toward the historical behaviour, never toward shredding
+one voice. Because the cut happens either way, chunk count and length distribution are untouched,
+which is exactly the property that makes 225's confound inapplicable.
+
+**MEASURED ON KBHP-EP01: 265 chunks → 265 chunks, min duration unchanged, 0 floor violations, 62
+boundaries judged (sims spanning −0.06 to 0.83 — real signal), 4 cuts relocated**, all in one
+turn-dense passage (41:19–41:55), each printed with a timestamp for the owner to listen to. The
+verification unit is one audible claim per relocation, not a statistical metric.
+
+**THE EXISTING 14,828 CLIPS get the validated protection**, not the new knife: the probe is running
+`--persist`, after which every measured clip carries `speaker_change_score`, the phone badge ("⚠ more
+than one speaker" / "⚠ زیاتر لە یەک قسەکەر") fires at the calibrated within-clip scale, and a new
+tri-state `speaker_turn` column (true/false/NULL) rides every export format — with NULL meaning NOT
+MEASURED, never "single speaker", because those clips sat unmeasured for weeks while every one wore a
+confident SPEAKER_0x.
+
+**Honest ceilings, unchanged from the probe's own doc:** a sub-1.5s interjection cannot be judged by
+any embedding (the stable-embedding floor), and simultaneous cross-talk blends into one embedding
+CAM++ cannot report as "both" — that class needs an overlap-aware model and stays out of scope. The
+reviewer instruction that covers both: type every word you hear, whoever says it.
+
+Also: the reviewer page now shows each clip's own length beside the position ("Clip 7 of 535 (9s)"),
+per the owner's ask, next to the running paid-audio total.
+
+Gates: 1211 lib tests (28 chunking, 65 export), clippy -D warnings, fmt, 69 python policy scripts,
+typecheck 443 files — all green before commit.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

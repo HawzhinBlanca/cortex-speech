@@ -482,8 +482,16 @@
     // a batch and re-bases when the next one arrives. Falls back to batch counting when the server
     // sends no total. (✓ beside it is the true completed count — this is a position, not a tally.)
     const total = pendingTotal || queue.length;
+    // THIS clip's own length, beside the position. A reviewer is paid per hour of audio, and the
+    // running total further along only says where they have got to — this says what the sentence in
+    // front of them is worth, before they spend the effort on it. No new i18n string: a bare duration
+    // next to "Clip 7 of 535" reads as that clip's length in both locales, and `fmtDuration` is
+    // already what the audio total is rendered with. Guarded because once the batch drains `i` is one
+    // past the end, so there is no current clip to describe.
+    const clipMs = queue[i] && queue[i].durationMs;
+    const thisClip = clipMs ? ` (${fmtDuration(clipMs)})` : '';
     // Clamped: once the batch drains `i` is one PAST the end, and the header read "Clip 26 of 25".
-    const pos = queue.length ? t('progress', { n: Math.min(i + 1, total), total }) : '';
+    const pos = queue.length ? t('progress', { n: Math.min(i + 1, total), total }) + thisClip : '';
     const audio = reviewedMs > 0 ? ` · ${t('audioDone', { t: fmtDuration(reviewedMs) })}` : '';
     $('progress').textContent = (doneThisSession ? `${pos} · ✓${doneThisSession}` : pos) + audio;
     // Something to take back = the button is reachable, whether or not a card is on screen.
