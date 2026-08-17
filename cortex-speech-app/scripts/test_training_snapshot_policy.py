@@ -59,6 +59,26 @@ def test_the_split_cannot_leak_a_voice_across_splits() -> None:
     if "SPLIT_SEED, true)" not in eval_rs:
         raise AssertionError("assign_splits must be called with speaker_disjoint = true")
 
+    # The 2026-08-18 leak fix. `assign_splits` groups by the path's BASENAME, which is wrong twice
+    # over here: a recording imported under a second name straddles two splits (measured — the
+    # Lamofull re-encode landed in `validation` while the same session trained), and the audiobook
+    # corpus gives every book its own 01.wav/02.wav so chapters collide across books. Grouping must
+    # key on audio CONTENT.
+    if "content_identity" not in eval_rs or 'format!("content-{hash}")' not in eval_rs:
+        raise AssertionError(
+            "the pack must group splits by audio_content_hash, not by file name — basename grouping "
+            "put a re-encode of the training material into validation"
+        )
+    if "a_reencoded_recording_cannot_straddle_two_splits" not in eval_rs:
+        raise AssertionError("eval.rs must keep the re-encode leak regression test")
+
+    # And the sealed record must not claim a guarantee the data cannot support.
+    if "NOT speaker-disjoint" not in eval_rs:
+        raise AssertionError(
+            "splitPolicy must state plainly that the split is not speaker-disjoint: diarizer labels "
+            "are per-recording indices, not identities, so the speaker union links nothing"
+        )
+
 
 def test_the_snapshot_is_sealed_and_immutable() -> None:
     db_rs = _read("src-tauri/src/db.rs")
