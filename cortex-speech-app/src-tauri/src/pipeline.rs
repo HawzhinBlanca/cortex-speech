@@ -1808,14 +1808,12 @@ impl ProcessingPipeline {
         // once they exist — see the set_audio_identity call there. v51: BOTH tiers travel together, so
         // the rejection rule after a restart is the same cryptographic one it is during this run.
 
-        let (chunk_ranges, vad_backend) = chunking::plan_speech_chunks(
-            &pcm,
-            sample_rate,
-            self.settings.vad_threshold,
-            self.settings.min_segment_duration_ms,
-            self.settings.max_segment_duration_ms,
-        )?;
-
+        // The embedding service is acquired BEFORE chunk planning (it used to come after), because the
+        // planner now asks it who is speaking at every candidate merge: boundaries were planned by
+        // silence alone and labels attached to whole chunks afterwards, so a two-host podcast glued
+        // both voices into one chunk under one confident SPEAKER_0x (owner hit this twice reviewing,
+        // 2026-08-17). The judge can only REFUSE a merge — with CAM++ absent it returns None and the
+        // plan is exactly the historical silence-only one.
         let mut diarization_guard = self.lock_diarization_service();
         // Rebuild when unset OR cached-INACTIVE (see the denoiser site below): caching an inactive
         // service ignored a CAM++ model downloaded mid-session until an app restart. Cheap while absent.
@@ -1828,6 +1826,16 @@ impl ProcessingPipeline {
         let embedding_service = diarization_guard
             .as_ref()
             .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
+
+        let judge = crate::diarization::speaker_turn_judge(embedding_service, sample_rate);
+        let (chunk_ranges, vad_backend) = chunking::plan_speech_chunks_with_judge(
+            &pcm,
+            sample_rate,
+            self.settings.vad_threshold,
+            self.settings.min_segment_duration_ms,
+            self.settings.max_segment_duration_ms,
+            Some(&judge),
+        )?;
 
         let mut denoiser_guard = self.lock_denoiser_service();
         // Rebuild when unset OR cached-INACTIVE: an inactive service means the model was absent when it
@@ -1988,12 +1996,35 @@ impl ProcessingPipeline {
             }
             let pcm = effective_pcm;
 
-            let (mut chunk_ranges, vad_backend) = chunking::plan_speech_chunks(
+            // Service before planning, same reorder and same reason as the non-streaming sibling: the
+            // planner asks who is speaking before agreeing to a silence-approved merge. The rebuild
+            // policy (at most one attempt per file) is unchanged — the block simply moved up.
+            let mut diarization_guard = self.lock_diarization_service();
+            // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
+            // don't re-attempt an unloadable CAM++ every window — at most once per file). See the
+            // non-streaming sibling site.
+            if should_rebuild_streaming_service(
+                diarization_guard.is_some(),
+                diarization_guard.as_ref().is_some_and(|s| s.is_available()),
+                diarization_rebuild_tried,
+            ) {
+                diarization_rebuild_tried = true;
+                // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
+                let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
+                *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
+            }
+            let embedding_service = diarization_guard
+                .as_ref()
+                .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
+
+            let judge = crate::diarization::speaker_turn_judge(embedding_service, sample_rate);
+            let (mut chunk_ranges, vad_backend) = chunking::plan_speech_chunks_with_judge(
                 &pcm,
                 sample_rate,
                 self.settings.vad_threshold,
                 self.settings.min_segment_duration_ms,
                 self.settings.max_segment_duration_ms,
+                Some(&judge),
             )?;
 
             // Hold back the boundary-touching tail of every non-final window for the next round so the
@@ -2021,24 +2052,6 @@ impl ProcessingPipeline {
                 global_chunk += 1;
                 on_chunk(global_chunk, estimated_total.max(global_chunk));
             };
-
-            let mut diarization_guard = self.lock_diarization_service();
-            // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
-            // don't re-attempt an unloadable CAM++ every window — at most once per file). See the
-            // non-streaming sibling site.
-            if should_rebuild_streaming_service(
-                diarization_guard.is_some(),
-                diarization_guard.as_ref().is_some_and(|s| s.is_available()),
-                diarization_rebuild_tried,
-            ) {
-                diarization_rebuild_tried = true;
-                // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
-                let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
-                *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
-            }
-            let embedding_service = diarization_guard
-                .as_ref()
-                .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
 
             let mut denoiser_guard = self.lock_denoiser_service();
             // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:

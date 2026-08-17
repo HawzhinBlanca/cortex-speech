@@ -10,6 +10,27 @@ use serde::{Deserialize, Serialize};
 /// Maximum decoded PCM samples kept in memory (~16.6 min at 16 kHz).
 pub const MAX_PCM_SAMPLES: usize = 16_000_000;
 
+/// Judges whether the speech on the two sides of a candidate merge boundary is the SAME voice.
+///
+/// `Some(true)` = same speaker (merge as always), `Some(false)` = a speaker turn (refuse the merge —
+/// this is where the knife becomes speaker-aware), `None` = cannot judge (no model, embedding
+/// failed), in which case the planner behaves exactly as it did before this existed. The judge can
+/// therefore only ever REFUSE a merge silence alone would have made; it can never invent one, so a
+/// missing CAM++ model degrades to the historical silence-only behaviour instead of breaking import.
+///
+/// A closure rather than the embedding service itself, so this module stays model-free and the pure
+/// merge logic is testable with a fake judge and no ONNX runtime.
+pub type SpeakerJudge<'a> = &'a dyn Fn(&[i16], &[i16]) -> Option<bool>;
+
+/// Sides shorter than this are not judged (the boundary merges, as before). CAM++ needs enough audio
+/// for a stable embedding; this is `speaker_change_probe`'s own MIN_HALF_MS, the floor its validation
+/// was measured at — judging below it would split clips on noise, which is worse than the disease.
+const SPEAKER_JUDGE_MIN_MS: u32 = 1500;
+/// How much audio adjacent to the boundary each side contributes, at most. Boundary-local windows,
+/// not whole regions: what is being asked is "who is speaking just before and just after this pause",
+/// and a long region's full embedding blends material far from the boundary into that answer.
+const SPEAKER_JUDGE_WINDOW_MS: u32 = 4000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentSourceMeta {
     pub source_start_ms: i64,
@@ -124,13 +145,43 @@ pub fn should_stream_decode(duration_ms: i64, max_segment_ms: u32) -> bool {
     estimated_samples > MAX_PCM_SAMPLES || duration_ms > (max_segment_ms as i64 * 2)
 }
 
-/// Plan sample-index ranges `[start, end)` for transcription/annotation.
+/// Plan sample-index ranges `[start, end)` for transcription/annotation. Silence-only: no speaker
+/// judge, exactly the historical behaviour. Kept as the plain entry point for callers (and tests)
+/// that have no embedding model in hand.
 pub fn plan_speech_chunks(
     pcm: &[i16],
     sample_rate: u32,
     vad_threshold: f32,
     min_segment_ms: u32,
     max_segment_ms: u32,
+) -> AppResult<(Vec<(usize, usize)>, audio::VadBackend)> {
+    plan_speech_chunks_with_judge(pcm, sample_rate, vad_threshold, min_segment_ms, max_segment_ms, None)
+}
+
+/// `plan_speech_chunks`, but the knife is speaker-aware.
+///
+/// WHY. Boundaries were planned by silence alone and speaker labels attached to whole chunks
+/// afterwards, so a two-host podcast — where turns follow each other inside the 2s merge gap — glued
+/// both voices into one chunk wearing one confident `SPEAKER_0x`. The owner hit this twice while
+/// reviewing (2026-08-17: "full of overlapping speech"). The fix belongs HERE, at the merge decision,
+/// because this is the only moment the boundary between two voices still exists; every later stage
+/// only sees the already-glued chunk.
+///
+/// The judge is consulted only where a merge would otherwise happen, on up to
+/// [`SPEAKER_JUDGE_WINDOW_MS`] of audio either side of the boundary, and a refused merge becomes a
+/// HARD boundary that `absorb_short_regions` may not re-glue a short reply across. Sides shorter than
+/// [`SPEAKER_JUDGE_MIN_MS`] are not judged (merged, as always): the embedding is not stable below
+/// that, and a knife that cuts on noise shreds single-speaker clips — worse than the disease. That
+/// floor is also the honest ceiling of this fix: a sub-1.5s interjection with no pause around it
+/// still glues, and simultaneous cross-talk is invisible to embeddings entirely (both documented in
+/// `speaker_change_probe`).
+pub fn plan_speech_chunks_with_judge(
+    pcm: &[i16],
+    sample_rate: u32,
+    vad_threshold: f32,
+    min_segment_ms: u32,
+    max_segment_ms: u32,
+    speaker_judge: Option<SpeakerJudge>,
 ) -> AppResult<(Vec<(usize, usize)>, audio::VadBackend)> {
     if pcm.is_empty() {
         return Ok((Vec::new(), audio::VadBackend::None));
@@ -156,12 +207,14 @@ pub fn plan_speech_chunks(
     // (intra-sentence pauses are shorter; a 2s+ gap is a real break worth a chunk boundary).
     const MAX_MERGE_GAP_MS: u32 = 2000;
     let max_gap_samples = ms_to_samples(MAX_MERGE_GAP_MS, sample_rate);
-    regions = merge_adjacent_regions(regions, max_samples, max_gap_samples);
-    regions = split_oversized_regions(pcm, sample_rate, regions, max_samples, min_samples, pcm.len());
-    regions = absorb_short_regions(regions, min_samples, max_samples, max_gap_samples, pcm.len());
+    let hard_boundaries;
+    (regions, hard_boundaries) =
+        merge_adjacent_regions(pcm, sample_rate, regions, max_samples, max_gap_samples, speaker_judge);
+    regions = split_oversized_regions(pcm, sample_rate, regions, max_samples, min_samples, pcm.len(), speaker_judge);
+    regions = absorb_short_regions(regions, min_samples, max_samples, max_gap_samples, pcm.len(), &hard_boundaries);
 
     if regions.is_empty() {
-        regions = silence_aware_split(pcm, sample_rate, 0, pcm.len(), max_samples, min_samples);
+        regions = silence_aware_split(pcm, sample_rate, 0, pcm.len(), max_samples, min_samples, speaker_judge);
     }
 
     // Safety: enforce the max-duration cap. A last-resort split still cuts on the quietest
@@ -181,7 +234,7 @@ pub fn plan_speech_chunks(
         if e - s <= cap {
             final_regions.push((s, e));
         } else {
-            final_regions.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples));
+            final_regions.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples, speaker_judge));
         }
     }
 
@@ -197,35 +250,68 @@ pub fn plan_speech_chunks(
 /// long pause between them (e.g. 2s speech + 8s silence + 3s speech) merged into one ~13s clip that is
 /// mostly silence — the "clip far longer than the words" complaint. Splitting on a long pause keeps each
 /// clip tight around contiguous speech while still merging across natural intra-sentence pauses.
+/// Also returns the HARD boundaries: sample positions where a merge was refused because the judge
+/// heard two different voices. `absorb_short_regions` must not re-glue across these — without that,
+/// a short second-speaker reply (under `min_samples`) would be absorbed straight back into the first
+/// speaker's chunk and the refusal would have changed nothing.
 fn merge_adjacent_regions(
+    pcm: &[i16],
+    sample_rate: u32,
     regions: Vec<(usize, usize)>,
     max_samples: usize,
     max_gap_samples: usize,
-) -> Vec<(usize, usize)> {
+    speaker_judge: Option<SpeakerJudge>,
+) -> (Vec<(usize, usize)>, Vec<usize>) {
     if regions.is_empty() {
-        return regions;
+        return (regions, Vec::new());
     }
+    let judge_min = ms_to_samples(SPEAKER_JUDGE_MIN_MS, sample_rate).max(1);
+    let judge_window = ms_to_samples(SPEAKER_JUDGE_WINDOW_MS, sample_rate).max(judge_min);
     let mut merged = Vec::new();
+    let mut hard = Vec::new();
     let mut cur_start = regions[0].0;
     let mut cur_end = regions[0].1;
+    // The most recent CONSTITUENT region of the accumulating chunk — the judge compares boundary-
+    // adjacent speech, and after a few merges `cur_start..cur_end` spans material minutes from the
+    // boundary being decided. Every constituent already in the chunk was approved (or unjudgeable),
+    // so the last one stands for the chunk's current voice.
+    let mut last_constituent = regions[0];
 
     for &(start, end) in regions.iter().skip(1) {
         let combined_len = end.saturating_sub(cur_start);
         let gap = start.saturating_sub(cur_end);
         if combined_len <= max_samples && gap <= max_gap_samples {
-            cur_end = end;
-        } else {
-            if cur_end > cur_start {
-                merged.push((cur_start, cur_end));
+            // Silence says merge. Ask WHO IS SPEAKING before agreeing: the tail of the last region
+            // against the head of this one, both clamped to pcm and to the judge window. Only a
+            // confident "different voice" refuses — None (too short, no model) merges as always.
+            let turn_detected = speaker_judge.is_some_and(|judge| {
+                let (ls, le) = (last_constituent.0.min(pcm.len()), last_constituent.1.min(pcm.len()));
+                let (ns, ne) = (start.min(pcm.len()), end.min(pcm.len()));
+                if le - ls < judge_min || ne - ns < judge_min {
+                    return false;
+                }
+                let tail = &pcm[le.saturating_sub(judge_window).max(ls)..le];
+                let head = &pcm[ns..(ns + judge_window).min(ne)];
+                judge(tail, head) == Some(false)
+            });
+            if !turn_detected {
+                cur_end = end;
+                last_constituent = (start, end);
+                continue;
             }
-            cur_start = cur_end.max(start);
-            cur_end = end;
+            hard.push(start);
         }
+        if cur_end > cur_start {
+            merged.push((cur_start, cur_end));
+        }
+        cur_start = cur_end.max(start);
+        cur_end = end;
+        last_constituent = (start, end);
     }
     if cur_end > cur_start {
         merged.push((cur_start, cur_end));
     }
-    merged
+    (merged, hard)
 }
 
 /// Split any region longer than `max_samples` into sub-ranges, cutting on the quietest
@@ -237,6 +323,7 @@ fn split_oversized_regions(
     max_samples: usize,
     min_samples: usize,
     total_len: usize,
+    speaker_judge: Option<SpeakerJudge>,
 ) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (start, end) in regions {
@@ -250,7 +337,7 @@ fn split_oversized_regions(
         if e - s <= cap_with_overrun(max_samples, sample_rate) {
             out.push((s, e));
         } else {
-            out.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples));
+            out.extend(silence_aware_split(pcm, sample_rate, s, e, max_samples, min_samples, speaker_judge));
         }
     }
     out
@@ -266,6 +353,7 @@ fn silence_aware_split(
     end: usize,
     max_samples: usize,
     min_samples: usize,
+    speaker_judge: Option<SpeakerJudge>,
 ) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut s = start;
@@ -282,7 +370,15 @@ fn silence_aware_split(
             hi = end.saturating_sub(min_samples);
         }
         let hi = hi.clamp(lo + 1, end);
-        let cut = find_pause_cut(pcm, lo, hi, sample_rate, ref_rms)
+        // This cut is MANDATORY (the region is over the cap) — the only question is where it lands.
+        // A pause where the judge hears the VOICE change beats the merely-widest pause: MEASURED
+        // 2026-08-17, a two-host podcast produces long continuous VAD regions, so this split — not
+        // region merging, which the judge was consulted on ZERO times in 58.5 real minutes — is where
+        // two voices end up in one clip. Relocating a cut that must happen anyway leaves the chunk
+        // count and the length distribution alone, which is exactly what iteration 225's variants
+        // (which added/changed chunks) could not achieve, and what made their evaluation unreadable.
+        let cut = speaker_turn_cut(pcm, sample_rate, lo, hi, ref_rms, speaker_judge)
+            .or_else(|| find_pause_cut(pcm, lo, hi, sample_rate, ref_rms))
             // No real pause inside the cap. Look a bounded distance FURTHER rather than cutting between
             // two syllables purely because the clock ran out — a slightly long clip is reviewable, a clip
             // that starts 20 ms into a word is not. Still bounded, and still leaves min_samples behind.
@@ -300,6 +396,44 @@ fn silence_aware_split(
         out.push((s, end));
     }
     out
+}
+
+/// How many of the band's widest pauses are auditioned for a speaker turn. Each costs two CAM++
+/// embeddings; a genuine turn pause is wide, so it is found in the first few. Bounded so a noisy band
+/// full of narrow dips cannot turn one cut into dozens of model calls.
+const SPEAKER_CUT_CANDIDATES: usize = 6;
+
+/// The centre of the widest pause in `[lo, hi)` at which the judge hears TWO DIFFERENT voices — or
+/// `None`, which leaves the cut exactly where silence-only logic puts it.
+///
+/// The windows handed to the judge sit immediately OUTSIDE the pause (speech before it vs speech
+/// after it) and may extend past the band: the question is who is speaking around this pause, and the
+/// band only bounds where the cut may land, not what may be listened to. Sides shorter than
+/// [`SPEAKER_JUDGE_MIN_MS`] are not judged — same floor, same reason as the merge judge.
+fn speaker_turn_cut(
+    pcm: &[i16],
+    sample_rate: u32,
+    lo: usize,
+    hi: usize,
+    ref_rms: f64,
+    speaker_judge: Option<SpeakerJudge>,
+) -> Option<usize> {
+    let judge = speaker_judge?;
+    let judge_min = ms_to_samples(SPEAKER_JUDGE_MIN_MS, sample_rate).max(1);
+    let judge_window = ms_to_samples(SPEAKER_JUDGE_WINDOW_MS, sample_rate).max(judge_min);
+    for &(centre, width) in find_pauses(pcm, lo, hi, sample_rate, ref_rms).iter().take(SPEAKER_CUT_CANDIDATES) {
+        let gap_lo = centre.saturating_sub(width / 2);
+        let gap_hi = (centre + width / 2).min(pcm.len());
+        let tail_start = gap_lo.saturating_sub(judge_window);
+        let head_end = (gap_hi + judge_window).min(pcm.len());
+        if gap_lo - tail_start < judge_min || head_end - gap_hi < judge_min {
+            continue;
+        }
+        if judge(&pcm[tail_start..gap_lo], &pcm[gap_hi..head_end]) == Some(false) {
+            return Some(centre);
+        }
+    }
+    None
 }
 
 /// How far past `max_samples` a chunk may run when its band contains no real pause.
@@ -462,10 +596,17 @@ fn absorb_short_regions(
     max_samples: usize,
     max_gap_samples: usize,
     total_len: usize,
+    hard_boundaries: &[usize],
 ) -> Vec<(usize, usize)> {
     if regions.is_empty() {
         return regions;
     }
+
+    // A merge across a refused speaker turn would hand the absorbed reply back to the wrong voice —
+    // undoing the judge's one decision precisely for the SHORT replies it matters most for. A short
+    // clip of the right speaker beats a full-length clip of two.
+    let crosses_turn =
+        |left_end: usize, right_start: usize| hard_boundaries.iter().any(|&b| left_end <= b && b <= right_start);
 
     let mut working: Vec<(usize, usize)> =
         regions.into_iter().map(|(s, e)| (s.min(total_len), e.min(total_len))).filter(|(s, e)| e > s).collect();
@@ -481,7 +622,10 @@ fn absorb_short_regions(
             if len < min_samples {
                 if i + 1 < working.len() {
                     let (ns, ne) = working[i + 1];
-                    if ns.saturating_sub(e) <= max_gap_samples && ne.saturating_sub(s) <= max_samples {
+                    if ns.saturating_sub(e) <= max_gap_samples
+                        && ne.saturating_sub(s) <= max_samples
+                        && !crosses_turn(e, ns)
+                    {
                         working[i + 1] = (s, ne);
                         changed = true;
                         i += 1;
@@ -490,7 +634,10 @@ fn absorb_short_regions(
                 }
                 if let Some(last) = next.last_mut() {
                     let (ps, pe) = *last;
-                    if s.saturating_sub(pe) <= max_gap_samples && e.saturating_sub(ps) <= max_samples {
+                    if s.saturating_sub(pe) <= max_gap_samples
+                        && e.saturating_sub(ps) <= max_samples
+                        && !crosses_turn(pe, s)
+                    {
                         *last = (ps, e);
                         changed = true;
                         i += 1;
@@ -766,7 +913,7 @@ mod tests {
         let max_samples = ms_to_samples(10_000, sr);
         let min_samples = ms_to_samples(2_000, sr);
         let pcm = vec![4000i16; sr as usize * 50]; // 50 s flat tone
-        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples, None);
         assert_eq!(parts.first().map(|c| c.0), Some(0));
         assert_eq!(parts.last().map(|c| c.1), Some(pcm.len()));
         for w in parts.windows(2) {
@@ -790,10 +937,52 @@ mod tests {
         for s in pcm.iter_mut().take(gap + gap_half).skip(gap - gap_half) {
             *s = 0;
         }
-        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples, None);
         assert!(parts.len() >= 2);
         let cut_ms = samples_to_ms(parts[0].1, sr);
         assert!((cut_ms - 13_000).abs() < 300, "expected the cut at the ~13 s pause, got {cut_ms}ms");
+    }
+
+    #[test]
+    fn a_mandatory_cut_prefers_the_pause_where_the_voice_changes() {
+        // A 20s continuous region (over the 15s cap) with TWO real pauses in the cut band: a WIDE one
+        // at ~12s and a narrower one at ~13.5s. Silence-only logic must take the widest (existing
+        // behaviour); with a judge that hears a speaker turn at the NARROWER pause, the cut must land
+        // there instead — the cut happens either way, only its position is at stake. Consultation is
+        // widest-first, so the fake judge approves the first pause it is asked about and refuses the
+        // second, without needing to recognise audio content.
+        let sr = 16000u32;
+        let max_samples = ms_to_samples(15_000, sr);
+        let min_samples = ms_to_samples(3_000, sr);
+        let mut pcm = vec![6000i16; ms_to_samples(20_000, sr)];
+        let silence = |pcm: &mut [i16], at_ms: u32, width_ms: u32| {
+            let c = ms_to_samples(at_ms, sr);
+            let h = ms_to_samples(width_ms / 2, sr);
+            for s in pcm.iter_mut().take(c + h).skip(c - h) {
+                *s = 0;
+            }
+        };
+        silence(&mut pcm, 12_000, 400); // widest — silence-only cuts here
+        silence(&mut pcm, 13_500, 200); // narrower — the judge hears the turn here
+
+        let baseline = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples, None);
+        let base_cut = samples_to_ms(baseline[0].1, sr);
+        assert!((base_cut - 12_000).abs() < 300, "precondition: silence-only takes the widest pause, got {base_cut}ms");
+
+        // Some(true)=same voice for the first (widest) pause consulted, Some(false)=turn for the next.
+        let consulted = std::cell::Cell::new(0usize);
+        let judge_turn_on_second: SpeakerJudge = &|_, _| {
+            consulted.set(consulted.get() + 1);
+            Some(consulted.get() == 1)
+        };
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples, Some(judge_turn_on_second));
+        let cut = samples_to_ms(parts[0].1, sr);
+        assert!((cut - 13_500).abs() < 300, "the cut must move to the pause where the voice changes, got {cut}ms");
+
+        // And a judge that hears one voice everywhere must leave the silence-only choice untouched.
+        let same: SpeakerJudge = &|_, _| Some(true);
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples, Some(same));
+        assert_eq!(samples_to_ms(parts[0].1, sr), base_cut, "no turn heard = the historical cut, exactly");
     }
 
     /// `len_ms` of tone at `level`, 16 kHz.
@@ -826,7 +1015,7 @@ mod tests {
 
         let max_samples = ms_to_samples(15_000, sr);
         let min_samples = ms_to_samples(3_000, sr);
-        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples, None);
 
         let cut_ms = samples_to_ms(parts[0].1, sr);
         assert!(
@@ -852,7 +1041,7 @@ mod tests {
 
         let max_samples = ms_to_samples(15_000, sr);
         let min_samples = ms_to_samples(3_000, sr);
-        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples);
+        let parts = silence_aware_split(&pcm, sr, 0, pcm.len(), max_samples, min_samples, None);
 
         let cut_ms = samples_to_ms(parts[0].1, sr);
         assert!((cut_ms - 16_600).abs() < 250, "it must reach past the cap to the real pause, got {cut_ms}ms");
@@ -973,15 +1162,21 @@ mod tests {
         assert_eq!(parsed, meta);
     }
 
+    /// The silence-only form every pre-judge test was written against.
+    fn merge_silence_only(regions: Vec<(usize, usize)>, max: usize, max_gap: usize) -> Vec<(usize, usize)> {
+        let total = regions.last().map(|&(_, e)| e).unwrap_or(0);
+        merge_adjacent_regions(&vec![0i16; total], 16_000, regions, max, max_gap, None).0
+    }
+
     #[test]
     fn merge_adjacent_respects_max() {
         // Contiguous regions (no gap) still merge up to max_samples.
         let regions = vec![(0, 5000), (5000, 10_000), (10_000, 15_000)];
-        let merged = merge_adjacent_regions(regions, 20_000, usize::MAX);
+        let merged = merge_silence_only(regions, 20_000, usize::MAX);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0], (0, 15_000));
 
-        let merged2 = merge_adjacent_regions(vec![(0, 12_000), (12_000, 25_000)], 20_000, usize::MAX);
+        let merged2 = merge_silence_only(vec![(0, 12_000), (12_000, 25_000)], 20_000, usize::MAX);
         assert_eq!(merged2.len(), 2);
     }
 
@@ -993,14 +1188,90 @@ mod tests {
         let speech_a = (0, 2 * sr);
         let speech_b = (10 * sr, 13 * sr); // 8s gap before it
         let max_gap = ms_to_samples(2000, sr as u32); // 2s
-        let merged = merge_adjacent_regions(vec![speech_a, speech_b], 20 * sr, max_gap);
+        let merged = merge_silence_only(vec![speech_a, speech_b], 20 * sr, max_gap);
         assert_eq!(merged.len(), 2, "a long silence gap must split, not merge into one mostly-silent clip");
         assert_eq!(merged[0], speech_a);
         assert_eq!(merged[1], speech_b);
         // A short (sub-gap) pause still merges into one clip.
         let close_b = (2 * sr + sr / 2, 5 * sr); // 0.5s gap
-        let merged_close = merge_adjacent_regions(vec![speech_a, close_b], 20 * sr, max_gap);
+        let merged_close = merge_silence_only(vec![speech_a, close_b], 20 * sr, max_gap);
         assert_eq!(merged_close.len(), 1, "a short intra-sentence pause stays merged");
+    }
+
+    #[test]
+    fn a_speaker_turn_refuses_a_merge_silence_would_have_made() {
+        // Two 4s utterances with a 1s pause: silence-only chunking glues them (the two-host podcast
+        // failure the owner hit twice). A judge that hears two voices must keep them apart, and the
+        // refused boundary must be reported so absorb cannot quietly re-glue it.
+        let sr = 16_000usize;
+        let regions = vec![(0, 4 * sr), (5 * sr, 9 * sr)];
+        let pcm = vec![0i16; 9 * sr];
+        let max_gap = ms_to_samples(2000, sr as u32);
+
+        let refuse: SpeakerJudge = &|_, _| Some(false);
+        let (chunks, hard) = merge_adjacent_regions(&pcm, sr as u32, regions.clone(), 20 * sr, max_gap, Some(refuse));
+        assert_eq!(chunks.len(), 2, "a heard speaker turn must refuse the merge");
+        assert_eq!(hard, vec![5 * sr], "the refused boundary is recorded for absorb");
+
+        let same: SpeakerJudge = &|_, _| Some(true);
+        let (chunks, hard) = merge_adjacent_regions(&pcm, sr as u32, regions.clone(), 20 * sr, max_gap, Some(same));
+        assert_eq!(chunks.len(), 1, "same voice on both sides merges exactly as before");
+        assert!(hard.is_empty());
+
+        let unsure: SpeakerJudge = &|_, _| None;
+        let (chunks, _) = merge_adjacent_regions(&pcm, sr as u32, regions, 20 * sr, max_gap, Some(unsure));
+        assert_eq!(chunks.len(), 1, "an unjudgeable boundary merges — the judge only ever REFUSES");
+    }
+
+    #[test]
+    fn the_judge_sees_boundary_local_windows_not_whole_regions() {
+        // 12s + 12s regions: each side handed to the judge must be the 4s adjacent to the boundary,
+        // not the full region — a long region's whole embedding blends material far from the
+        // boundary into an answer about the boundary.
+        let sr = 16_000usize;
+        let regions = vec![(0, 12 * sr), (13 * sr, 25 * sr)];
+        let pcm = vec![0i16; 25 * sr];
+        let seen = std::cell::RefCell::new(Vec::new());
+        let spy: SpeakerJudge = &|a, b| {
+            seen.borrow_mut().push((a.len(), b.len()));
+            Some(false)
+        };
+        let _ = merge_adjacent_regions(&pcm, sr as u32, regions, 30 * sr, ms_to_samples(2000, sr as u32), Some(spy));
+        assert_eq!(*seen.borrow(), vec![(4 * sr, 4 * sr)], "up to 4s per side, adjacent to the boundary");
+    }
+
+    #[test]
+    fn a_side_too_short_to_judge_merges_without_asking() {
+        // A 0.8s interjection: below SPEAKER_JUDGE_MIN_MS the embedding is noise, so the judge must
+        // not even be consulted — cutting on noise shreds single-speaker audio, worse than gluing.
+        // This is the documented ceiling of the fix, pinned so it stays a decision and not a drift.
+        let sr = 16_000usize;
+        let regions = vec![(0, 4 * sr), (4 * sr + sr / 2, 4 * sr + sr / 2 + (8 * sr / 10))];
+        let total = 4 * sr + sr / 2 + sr;
+        let pcm = vec![0i16; total];
+        let calls = std::cell::Cell::new(0usize);
+        let spy: SpeakerJudge = &|_, _| {
+            calls.set(calls.get() + 1);
+            Some(false)
+        };
+        let (chunks, _) =
+            merge_adjacent_regions(&pcm, sr as u32, regions, 20 * sr, ms_to_samples(2000, sr as u32), Some(spy));
+        assert_eq!(calls.get(), 0, "sub-1.5s sides are never judged");
+        assert_eq!(chunks.len(), 1, "and the boundary merges exactly as silence-only chunking would");
+    }
+
+    #[test]
+    fn absorb_never_undoes_a_refused_speaker_turn() {
+        // The reply after a refused merge is often SHORT (under min_samples) — precisely the region
+        // absorb_short_regions exists to glue back into a neighbour. Without the hard-boundary guard
+        // the refusal changes nothing: the short second-speaker reply is absorbed straight back into
+        // the first speaker's chunk. A short clip of the right voice beats a full-length clip of two.
+        let (min, max, max_gap) = (48_000usize, 240_000usize, 32_000usize); // 3s / 15s / 2s at 16k
+        let regions = vec![(0, 64_000), (80_000, 110_000)]; // 4s speech, 1s gap, 1.9s reply
+        let glued = absorb_short_regions(regions.clone(), min, max, max_gap, 110_000, &[]);
+        assert_eq!(glued.len(), 1, "precondition: without the guard, absorb re-glues the reply");
+        let kept = absorb_short_regions(regions, min, max, max_gap, 110_000, &[80_000]);
+        assert_eq!(kept.len(), 2, "a hard boundary from a refused turn survives absorption");
     }
 
     #[test]
@@ -1009,10 +1280,10 @@ mod tests {
         // Without the gap guard, absorb_short_regions re-merged across the 8s silence (undoing the
         // merge_adjacent_regions split) and recreated a mostly-silent 13s clip. It must stay split.
         let (min, max, max_gap) = (48_000usize, 240_000usize, 32_000usize); // 3s / 15s / 2s
-        let split = absorb_short_regions(vec![(0, 32_000), (160_000, 208_000)], min, max, max_gap, 208_000);
+        let split = absorb_short_regions(vec![(0, 32_000), (160_000, 208_000)], min, max, max_gap, 208_000, &[]);
         assert_eq!(split.len(), 2, "must NOT absorb a short region across an 8s silence");
         // A short region with only a short (sub-gap) pause to its neighbor is still absorbed.
-        let absorbed = absorb_short_regions(vec![(0, 32_000), (40_000, 88_000)], min, max, max_gap, 88_000);
+        let absorbed = absorb_short_regions(vec![(0, 32_000), (40_000, 88_000)], min, max, max_gap, 88_000, &[]);
         assert_eq!(absorbed.len(), 1, "a short region with a sub-gap neighbor is still absorbed");
     }
 }

@@ -387,7 +387,9 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('تاکە پارچە', { timeout: 5000 });
     // Header must never read "Clip 2 of 1".
-    await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1');
+    // The clip's own length rides beside the position (owner ask 2026-08-17), from the same
+    // durationMs the fixture serves — so the exact-match keeps guarding the count against off-by-one.
+    await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1 (1s)');
 
     await page.locator('#accept').click();
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
@@ -1154,7 +1156,9 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
-    await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1');
+    // The clip's own length rides beside the position (owner ask 2026-08-17), from the same
+    // durationMs the fixture serves — so the exact-match keeps guarding the count against off-by-one.
+    await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1 (1s)');
   });
 
   test('the Retry button shows it is working, and a double tap costs one fetch', async ({
