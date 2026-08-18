@@ -26,6 +26,8 @@ const DB_FILE: &str = "cortex-speech.db";
 /// Rotation-exempt snapshots live under `<data_dir>/snapshots/pinned/` — the rolling prune only
 /// touches `snapshot_*` dirs at the root, so nothing here is ever auto-evicted.
 const PINNED_DIR: &str = "pinned";
+/// Canonical per-snapshot inventory: size + SHA-256 of every file in the tree.
+pub(crate) const MANIFEST_FILE: &str = "SNAPSHOT_MANIFEST.json";
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -298,6 +300,11 @@ pub(crate) fn take_snapshot_at_from(
         }
     }
 
+    if let Err(e) = write_snapshot_manifest(&staging, ts) {
+        remove_staging_dir(&staging);
+        return Err(e);
+    }
+
     let snap_dir = root.join(format!("{SNAPSHOT_PREFIX}{ts:010}"));
     if let Err(e) = fs::rename(&staging, &snap_dir) {
         remove_staging_dir(&staging);
@@ -306,6 +313,60 @@ pub(crate) fn take_snapshot_at_from(
 
     prune_snapshots_from(&root, primary_data_dir, keep)?;
     Ok(Some(snap_dir))
+}
+
+/// Write the canonical inventory of a finished snapshot: size and SHA-256 of every file in it.
+///
+/// Without this, "the off-drive copy exists" is the strongest claim available — and that claim was
+/// true while the off-drive tree silently held the database alone (2026-08-19). A manifest makes the
+/// two copies COMPARABLE: identical required hashes, or a restore that must not be trusted.
+///
+/// Written into staging BEFORE the promoting rename, so a promoted snapshot always has one and a
+/// crashed one is discarded whole.
+fn write_snapshot_manifest(staging: &Path, ts: u64) -> AppResult<()> {
+    let mut files: Vec<(String, u64, String)> = Vec::new();
+    let mut entries: Vec<PathBuf> =
+        fs::read_dir(staging).map_err(AppError::Io)?.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+    entries.sort();
+    for path in entries {
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) if name != MANIFEST_FILE => name.to_string(),
+            _ => continue,
+        };
+        let size = path.metadata().map_err(AppError::Io)?.len();
+        let digest = crate::models::compute_file_sha256(&path)
+            .map_err(|e| AppError::Other(format!("snapshot manifest hash for {name}: {e}")))?;
+        files.push((name, size, digest));
+    }
+    let payload = serde_json::json!({
+        "schema": 1,
+        "createdAtEpochSecs": ts,
+        "appGitSha": crate::GIT_SHA,
+        "files": files
+            .iter()
+            .map(|(name, size, digest)| serde_json::json!({"path": name, "sizeBytes": size, "sha256": digest}))
+            .collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|e| AppError::Other(format!("snapshot manifest serialize: {e}")))?;
+    fs::write(staging.join(MANIFEST_FILE), text.as_bytes()).map_err(AppError::Io)?;
+    Ok(())
+}
+
+/// Required state a restore cannot come back without.
+pub(crate) fn manifest_missing_required(manifest: &serde_json::Value) -> Vec<String> {
+    let present: Vec<&str> = manifest
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|rows| rows.iter().filter_map(|r| r.get("path").and_then(|p| p.as_str())).collect())
+        .unwrap_or_default();
+    let mut missing = Vec::new();
+    for required in std::iter::once(&DB_FILE).chain(EXTRA_STATE.iter()) {
+        if !present.contains(required) {
+            missing.push((*required).to_string());
+        }
+    }
+    missing
 }
 
 /// Staging dirs start with '.', so no `snapshot_`/`<label>_` scan ever counts one.
@@ -1013,6 +1074,50 @@ mod offsite_state_tests {
             "the copied champion pointer must be the LIVE one, byte for byte"
         );
         assert!(snap.join(DB_FILE).is_file(), "the database itself must still be there");
+    }
+
+    /// A snapshot must be able to PROVE what it contains, and the two copies must be comparable.
+    #[test]
+    fn every_snapshot_carries_a_manifest_that_matches_its_bytes() {
+        let primary = tempfile::TempDir::new().unwrap();
+        let offsite = tempfile::TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        std::fs::write(primary.path().join("settings.json"), b"{\"a\":1}").unwrap();
+        std::fs::write(primary.path().join("champion.json"), b"{\"schema\":2}").unwrap();
+
+        let snap = take_offsite_snapshot(&db, offsite.path(), primary.path(), 3).unwrap().unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
+
+        assert!(
+            manifest_missing_required(&manifest).is_empty(),
+            "manifest omits required recovery state: {:?}",
+            manifest_missing_required(&manifest)
+        );
+        for row in manifest["files"].as_array().unwrap() {
+            let name = row["path"].as_str().unwrap();
+            let path = snap.join(name);
+            assert_eq!(
+                row["sizeBytes"].as_u64().unwrap(),
+                path.metadata().unwrap().len(),
+                "{name}: manifest size disagrees with the file on disk"
+            );
+            assert_eq!(
+                row["sha256"].as_str().unwrap(),
+                crate::models::compute_file_sha256(&path).unwrap(),
+                "{name}: manifest hash disagrees with the file on disk"
+            );
+        }
+    }
+
+    /// The point of the manifest: an incomplete tree is DETECTABLE rather than merely present.
+    #[test]
+    fn a_snapshot_missing_required_state_is_reported_as_missing() {
+        let manifest = serde_json::json!({"schema": 1, "files": [{"path": "cortex-speech.db"}]});
+        let missing = manifest_missing_required(&manifest);
+        assert!(missing.contains(&"settings.json".to_string()), "{missing:?}");
+        assert!(missing.contains(&"champion.json".to_string()), "{missing:?}");
     }
 
     /// The local snapshot path is unchanged by the fix: destination and primary are one directory.

@@ -10058,3 +10058,75 @@ incumbent row, `champion.json` is now a valid schema-2 pointer (previous content
 was created, and the app exe was rebuilt from PR head.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 — the accept that lied, and the backup that was a database and nothing else
+
+Two defects found by taking the certification brief's Phase 1 and Phase 4 literally. Both were
+invisible to every existing gate, and both were found by reading the LIVE system rather than the code.
+
+### An accept that claimed the champion wrote a human's words
+
+`check_review_serving_provenance` reds on segment `82681df2-5ec9-4ef3-8ef0-e3ec968159c9`. Its
+append-only history:
+
+```
+Lamo skip -> Rubar edit -> Lamo edit -> Sewa edit -> Rubar edit -> Roza edit -> Hawzhin ACCEPT
+```
+
+Five humans corrected the clip; the sixth pressed Accept on what they saw. `accept` asserts something
+checkable — an ASR engine produced this exact text and a human approved it unchanged — and the
+accepted text carries a name and punctuation present in NONE of the segment's four hypotheses.
+
+Classification now happens in the backend at the one choke point every path converges on, from the
+stored bytes rather than the renderer's word: matches a hypothesis -> `accept`; matches none ->
+`edit` (human-authored); **no hypotheses on file at all -> unchanged.** That last case was a bug in
+the first draft — absence of recorded provenance is not evidence of human authorship, and
+reclassifying there launders in the opposite direction. It broke an existing pack-provenance test,
+and the test was right.
+
+### The off-drive backup held the database alone
+
+`take_snapshot_at_from` read `EXTRA_STATE` (settings.json, champion.json) from the DESTINATION. For a
+local snapshot destination == primary, so it worked and every test passed. Off-drive they are
+different disks. Measured on the live system:
+
+```
+F:\cortex-backups\snapshots\snapshot_1787091336: ['cortex-speech.db']          <- 11 of 11 trees
+%APPDATA%\cortex-speech\snapshots\snapshot_1787091336: ['champion.json', 'cortex-speech.db', 'settings.json']
+```
+
+Worse than missing metadata: a restore from that tree returns **no champion pointer**, and the 7B
+server refuses to start without one — the disaster backup would resurrect a library that cannot
+transcribe. Fail-before, with only the fixed line reverted:
+
+```
+panicked: settings.json is missing from the off-drive snapshot — a restore from it could not
+recover the champion pointer or the owner's settings
+```
+
+Added alongside: a canonical `SNAPSHOT_MANIFEST.json` (size + SHA-256 per file, written into staging
+before the promoting rename, so a promoted snapshot always has one), and `scripts/restore_drill.py`,
+which restores into a DISPOSABLE profile and checks quick_check, foreign keys, migration version, row
+counts and champion identity. It carries its own negative control:
+
+```
+PRIMARY  : schema 54, {'speech_segments': 15905, 'review_events': 646, 'spot_checks': 31,
+           'model_versions': 1}, champion omniasr-7b-legacy-c348ade8a816 — 1 problem (no manifest;
+           these trees predate the manifest code)
+OFFSITE  : correctly REFUSED (4 problems, incl. both missing state files) -- --expect-fail
+```
+
+### Two of my own checks that proved nothing
+
+* `PRAGMA user_version` reported 0 and read as "migrations did not travel". The app tracks migrations
+  in `schema_migrations`; the snapshot was fine and the drill was wrong. Corrected to read what the
+  app reads — version 54.
+* `PRAGMA synchronous` read 2 (FULL) from a fresh Python connection. The pragma is PER-CONNECTION, so
+  that measured my own default, not the app's. `db.rs` sets NORMAL; the audit's durability finding
+  stands and is NOT yet fixed.
+
+Rust 1260 passed / 0 failed, clippy 0 diagnostics, 85/85 python policies. No live data was modified:
+the violating row's repair is deliberately deferred until the offsite fix is in the running binary
+and a validated restore exists, per the brief's own ordering.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
