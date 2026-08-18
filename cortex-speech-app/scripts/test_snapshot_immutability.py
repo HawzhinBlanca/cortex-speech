@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_snapshot_immutability import check  # noqa: E402
+from check_snapshot_immutability import check, discover_bindings  # noqa: E402
 from train_challenger import inspect_pack  # noqa: E402
 
 GOOD_ID = hashlib.sha256(b"rows").hexdigest()
@@ -109,6 +109,43 @@ def test_a_snapshot_without_recorded_pack_binding_fails_closed() -> None:
     with tempfile.TemporaryDirectory() as raw:
         problems = check([(GOOD_ID, "sealed", _config(GOOD_ID))], Path(raw))
         assert any("no challenger_run.json" in problem for problem in problems), problems
+
+
+
+def test_an_invalidation_without_a_reason_is_still_a_failure() -> None:
+    """Historical evidence may be marked explicitly invalid — but only WITH a reason.
+
+    Otherwise the marker becomes a way to silence any inconvenient run, which is exactly the
+    "don't weaken a failing gate" line. A reasoned declaration is auditable; a bare flag is a
+    delete with extra steps. Regression guard: 2026-08-19.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        run = Path(raw) / "run_x"
+        run.mkdir()
+        (run / "challenger_run.json").write_text(
+            json.dumps({"evidence_status": "invalid"}), encoding="utf-8"
+        )
+        _, problems = discover_bindings(Path(raw))
+        assert any("no superseded_reason" in p for p in problems), problems
+
+
+def test_a_reasoned_supersession_is_honoured_and_not_a_binding() -> None:
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        run = Path(raw) / "run_y"
+        run.mkdir()
+        (run / "challenger_run.json").write_text(
+            json.dumps({"evidence_status": "superseded", "superseded_reason": "prepared-only, never trained"}),
+            encoding="utf-8",
+        )
+        bindings, problems = discover_bindings(Path(raw))
+        assert problems == [], problems
+        assert bindings == {}, "a superseded run must not contribute a binding"
 
 
 def main() -> int:

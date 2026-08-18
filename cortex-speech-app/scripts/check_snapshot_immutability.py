@@ -23,6 +23,7 @@ def discover_bindings(run_root: Path) -> tuple[dict[str, list[dict[str, Any]]], 
     """Read pack roots from run records; directory-name guesses are not provenance."""
     bindings: dict[str, list[dict[str, Any]]] = {}
     problems: list[str] = []
+    superseded: list[str] = []
     if not run_root.is_dir():
         return bindings, problems
     for record_path in sorted(run_root.rglob("challenger_run.json")):
@@ -35,6 +36,20 @@ def discover_bindings(run_root: Path) -> tuple[dict[str, list[dict[str, Any]]], 
         if not isinstance(record, dict):
             problems.append(f"{label} is not a JSON object")
             continue
+        # Historical evidence that predates the current contract may be marked EXPLICITLY invalid,
+        # with a machine-readable reason and a pointer to what superseded it. That is not the same as
+        # excluding it from checking: the record still exists, still says what it was, and is reported
+        # here every run so it can never quietly become "fine". A record that merely LACKS the hash is
+        # still a failure — only a deliberate, reasoned declaration is honoured.
+        evidence_status = record.get("evidence_status")
+        if evidence_status in {"invalid", "superseded"}:
+            reason = record.get("superseded_reason")
+            if not isinstance(reason, str) or not reason.strip():
+                problems.append(f"{label} is marked {evidence_status!r} with no superseded_reason")
+                continue
+            superseded.append(f"{label}: {evidence_status} — {reason.strip()}")
+            continue
+
         snapshot_id = record.get("snapshot_id")
         pack_dir = record.get("pack_dir")
         if not is_sha256(snapshot_id):
@@ -61,6 +76,8 @@ def discover_bindings(run_root: Path) -> tuple[dict[str, list[dict[str, Any]]], 
                 "record_path": label,
             }
         )
+    for line in superseded:
+        print(f"  EXPLICITLY INVALID (reported, never silently skipped): {line}", flush=True)
     return bindings, problems
 
 
