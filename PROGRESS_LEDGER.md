@@ -9130,3 +9130,149 @@ ledger entry), clippy + fmt clean. Owner-gated and unchanged: `spot-check-pool` 
 adjudications.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (overnight) — the pack export was quadratic, and the playback error was never the audio
+
+**Two defects, both found by measuring instead of assuming, both landed with a gate proven to fail
+first. Gates C and D moved off SKIP-ENV onto real data. Gate D's own definition is NOT met, and that
+is stated plainly below rather than rounded up.**
+
+### The canary export was going to take all night (PR #64)
+
+The gate-D canary was launched at 02:08 and had produced **87 rows in 56 minutes (~36 s/row)**. It
+was still running an hour later. The cause was not slow audio decoding:
+
+`decode_finetuned_clip_16k` walks a source from byte zero to the clip's end — right for one clip,
+**quadratic for a pack**. This library keeps **416 of its 447 verified clips inside one podcast
+FLAC**, so exporting it re-decoded that FLAC 416 times, each walk longer than the last.
+
+The export now runs in three passes: choose the rows (no audio touched, so dedup settles before
+anything is decoded) → decode **grouped by source recording**, one streaming walk each, handing each
+clip over as its window passes → write the manifest in the original order. Peak memory stays bounded
+to the clips overlapping the current 30 s window.
+
+| | old (per-clip walk) | new (per-source walk) |
+|---|---|---|
+| rows produced | 132 in **78 min** | **414 in 50 s** |
+| per row | ~35 s | ~0.12 s |
+| decode walks for 12 clips of one file (test) | 12 | 1 |
+
+**The byte-identical claim was verified against the old code's real output, not just asserted.** The
+slow run was left alive to the end for exactly this: its 132 rows and 135 clips were compared against
+the new exporter's.
+
+```
+slow rows (old per-clip code): 132
+MANIFEST PREFIX: byte-identical over all 132 rows
+clips byte-identical: 135 | differing: 0 | missing from fast pack: 0
+```
+
+So the snapshot id does not move because of this change.
+
+The regression gate counts **decode walks** through a thread-local counter, because the bug is
+invisible to output equality and a wall-clock assertion on this box is a flake generator. Against the
+old walk:
+
+```
+assertion `left == right` failed: 12 clips out of ONE recording must cost ONE decode walk,
+not 12 — this is the quadratic export that made a pack take hours
+  left: 12
+ right: 1
+```
+
+The same run's slice assertions passed under BOTH implementations — that is the evidence for
+byte-identity at unit scale. The fixture covers overlapping clips, a clip straddling the decoder's
+30 s window boundary, and a clip whose span runs past the end of the file.
+
+Also in that PR: `export_pack`, a headless exporter (gate D forbids clicking through the desktop app
+to seal a snapshot; it deliberately does not take the instance lock, so producing a snapshot never
+costs reviewers their links), and a failed WAV **write** is now fatal rather than skipping a source —
+a full disk must not read as "some clips skipped".
+
+### The playback error the owner hit was not a codec (PR #65)
+
+Reported: **"Playback was blocked or the file could not be found"** while reviewing.
+
+The obvious suspects were the containers. The review queue holds 361 `.mov` (`pcm_s24le` in
+QuickTime) and 51 `.mp4` (FLAC-in-MP4) — both plausible WebView codec gaps. **I probed them with a
+real `<audio>` element against the actual library files instead of trusting codec lore, and the
+theory was wrong:**
+
+```json
+{"src": "sample.mov", "verdict": "PLAYS", "duration": 21.625}
+{"src": "sample.mp4", "verdict": "PLAYS", "duration": 4.1}
+```
+
+The real cause is in `AudioPlayer.svelte`. Per the WHATWG spec a pending `play()` is **rejected with
+AbortError** as soon as anything supersedes it, and `resolveAudioUrl` supersedes it on every source
+switch: it pauses the element and reloads it. Advancing to the next clip while the current one was
+still starting rejected the play, and that rejection was reported as a playback failure.
+
+**This was not a cosmetic toast.** `audioError` is bound to the parent, where it disables Accept/Save
+so a verdict cannot be recorded on audio nobody could hear (2026-08-17 — a correct guard). A spurious
+AbortError therefore **locked the reviewer out of accepting a clip that plays perfectly**. And it is
+the common case, not a corner: those 412 `.mov`/`.mp4` files are one clip each, so advancing almost
+always switches source mid-start.
+
+Fixed with a generation counter — a rejection from a superseded attempt is discarded, only the newest
+attempt may set `playing` — plus an explicit AbortError discard. Nothing real is hidden: undecodable
+audio rejects `NotSupportedError`, blocked autoplay `NotAllowedError`, and the second test pins that
+an undecodable clip is STILL reported. Failing first:
+
+```
+× advancing to the next clip does not raise a playback error or block the decision
+AssertionError: advancing mid-start must not report a playback failure:
+  expected [ Array(1) ] to deeply equal []
+```
+
+### Gates C and D, measured
+
+A real pack was exported and its snapshot sealed, then the chain was run against it.
+
+```
+verified candidates            : 447
+excluded (holdout leak)        : 18
+excluded (not training-ready)  : 15
+skipped (empty/dup/undecodable): 0
+emitted                        : 414
+of those, no human decision    : 0
+snapshot id                    : 23db46a0b66c1c064c870a3c9afaf6d393aa5686f61f506b56e4fd86203e3ebe
+newly sealed                   : true
+
+CHALLENGER: snapshot 23db46a0... verified against the pack
+  train 403 rows | validation 7 rows | test 4 rows
+CHALLENGER: PREPARED (not trained)          exit 3
+
+SNAPSHOT IMMUTABILITY: OK (1 sealed snapshot(s), every id a content hash of what it sealed)   exit 0
+CHALLENGER LOOP: OK (1 run(s), 0 trained, 0 verdict(s), all internally consistent)            exit 0
+```
+
+**Gate D is NOT met, and the passing script does not mean it is.** Gate D's definition in
+`docs/LOOP_TO_10.md` §2 is *"a canary completes snapshot → train → eval → verdict with zero manual
+steps."* What ran is `snapshot ✓ → train ✗ → eval ✗ → verdict ✗`. `check_challenger_loop.py` passes
+because its job is to catch a run record that claims more than it did, and this one claims exactly
+what happened: `status: "prepared"`, `trainer_command: null`. **The loop is blocked because no
+trainer exists** — `train_challenger.py --trainer` expects an external fine-tune command, and writing
+a real LoRA trainer for the 7B champion is a compute and model-handling decision that belongs to the
+owner, not to an overnight run.
+
+The 403/7/4 split is not a bug either: content-grouping puts the whole dominant FLAC in one group, so
+80/10/10 cannot be honoured when 97 % of the clips are one recording. That is the same skew gate B
+measures, showing up in a second place.
+
+### Corpus, measured tonight
+
+```
+verified rows      : 447        distinct sources : 8
+labeled (gate B)   : 429 clips / 1.086 h        dataset_runs : 1 (was 0)
+```
+
+Gate B targets 25 h / top-1 ≤ 30 % / ≥ 25 recordings. Unchanged by tonight's work, and only human
+review moves it — which is exactly why the Accept-lockout bug above mattered.
+
+### Owner-gated, unchanged
+
+3 spot-check adjudications (21/24), 12 wrong-dialect re-reviews, and now: **whether to build a real
+challenger trainer**, which is the only thing standing between the wired loop and gate D.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
