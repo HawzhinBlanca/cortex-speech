@@ -219,14 +219,24 @@ pub(crate) fn take_snapshot_at(db: &Database, data_dir: &Path, keep: usize, ts: 
     take_snapshot_at_from(db, data_dir, data_dir, keep, ts)
 }
 
+/// `dest_dir` is where the snapshot TREE is written; `primary_data_dir` is the live library the
+/// state files are read from. For a local snapshot they are the same directory. For the off-drive
+/// copy they are NOT: the destination is the owner's second disk, which holds no `settings.json` or
+/// `champion.json` of its own.
+///
+/// Measured 2026-08-19: this function read `EXTRA_STATE` from the DESTINATION, so every off-drive
+/// snapshot silently contained the database and nothing else — the copy is best-effort, so the two
+/// missing files only produced a debug-level warning. A restore from that tree would come back with
+/// no champion pointer (the app then serves NO champion at all) and no settings, which is precisely
+/// the disaster the off-drive copy exists to survive.
 pub(crate) fn take_snapshot_at_from(
     db: &Database,
-    data_dir: &Path,
-    quarantine_dir: &Path,
+    dest_dir: &Path,
+    primary_data_dir: &Path,
     keep: usize,
     ts: u64,
 ) -> AppResult<Option<PathBuf>> {
-    let root = data_dir.join("snapshots");
+    let root = dest_dir.join("snapshots");
 
     // THE EMPTY-DB GUARD (B2, true-10 audit blocker): after a corruption quarantine the app opens a
     // FRESH EMPTY database. Snapshotting that empty DB every cycle would rotate out (keep=N) every
@@ -246,7 +256,7 @@ pub(crate) fn take_snapshot_at_from(
     // below is correct, but with snapshots resuming after a re-import (segment_count > 0) it meant a
     // full DB copy every cycle, unbounded (~144/day), until disk pressure. History is already frozen
     // by the pin — additional copies beyond 2×keep add no protection, so stop taking new ones.
-    if has_unacknowledged_quarantine(quarantine_dir) {
+    if has_unacknowledged_quarantine(primary_data_dir) {
         let existing = fs::read_dir(&root)
             .ok()
             .into_iter()
@@ -280,7 +290,7 @@ pub(crate) fn take_snapshot_at_from(
 
     // Config/state files are best-effort — a missing or unreadable one must not lose the DB snapshot.
     for name in EXTRA_STATE {
-        let src = data_dir.join(name);
+        let src = primary_data_dir.join(name);
         if src.is_file() {
             if let Err(e) = fs::copy(&src, staging.join(name)) {
                 tracing::warn!("snapshot: could not copy {name}: {e}");
@@ -294,7 +304,7 @@ pub(crate) fn take_snapshot_at_from(
         return Err(AppError::Io(e));
     }
 
-    prune_snapshots_from(&root, quarantine_dir, keep)?;
+    prune_snapshots_from(&root, primary_data_dir, keep)?;
     Ok(Some(snap_dir))
 }
 
@@ -959,5 +969,64 @@ mod tests {
         assert_eq!(listed[0].segment_count, Some(1), "segment count read from the snapshot DB");
         assert!(listed[0].db_size_bytes > 0);
         assert_eq!(listed[0].name, "snapshot_0000000200");
+    }
+}
+
+#[cfg(test)]
+mod offsite_state_tests {
+    use super::*;
+    use crate::db::Database;
+
+    /// The off-drive copy must carry the state files needed to actually RECOVER, not just the DB.
+    ///
+    /// Measured 2026-08-19: `take_snapshot_at_from` read `EXTRA_STATE` from the DESTINATION
+    /// directory. For a local snapshot destination == primary, so it worked and every test passed;
+    /// for the off-drive copy the destination is the owner's second disk, which holds no
+    /// `settings.json` or `champion.json` of its own. The copy is best-effort, so both files were
+    /// skipped with only a warning and every off-drive snapshot silently contained the database
+    /// alone. Restoring from it would come back with no champion pointer — and the server refuses to
+    /// start without one, so the "backup" would resurrect a library that cannot transcribe.
+    #[test]
+    fn an_offsite_snapshot_carries_settings_and_champion_from_the_live_library() {
+        let primary = tempfile::TempDir::new().unwrap();
+        let offsite = tempfile::TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        std::fs::write(primary.path().join("settings.json"), br#"{"backup_second_dir":"x"}"#).unwrap();
+        std::fs::write(primary.path().join("champion.json"), br#"{"schema":2,"champions":{}}"#).unwrap();
+
+        let snap = take_offsite_snapshot(&db, offsite.path(), primary.path(), 3).unwrap().expect("snapshot");
+
+        assert!(snap.starts_with(offsite.path()), "the tree must be written to the off-drive target");
+        for name in EXTRA_STATE {
+            let copied = snap.join(name);
+            assert!(
+                copied.is_file(),
+                "{name} is missing from the off-drive snapshot — a restore from it could not recover \
+                 the champion pointer or the owner's settings"
+            );
+        }
+        assert_eq!(
+            std::fs::read(snap.join("champion.json")).unwrap(),
+            std::fs::read(primary.path().join("champion.json")).unwrap(),
+            "the copied champion pointer must be the LIVE one, byte for byte"
+        );
+        assert!(snap.join(DB_FILE).is_file(), "the database itself must still be there");
+    }
+
+    /// The local snapshot path is unchanged by the fix: destination and primary are one directory.
+    #[test]
+    fn a_local_snapshot_still_carries_its_own_state_files() {
+        let data = tempfile::TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        std::fs::write(data.path().join("settings.json"), b"{}").unwrap();
+        std::fs::write(data.path().join("champion.json"), b"{}").unwrap();
+
+        let snap = take_snapshot(&db, data.path(), 3).unwrap().expect("snapshot");
+        for name in EXTRA_STATE {
+            assert!(snap.join(name).is_file(), "local snapshot lost {name}");
+        }
     }
 }
