@@ -70,15 +70,54 @@ pub(crate) fn launch_bash_line(
     )
 }
 
-/// Where `cortex_7b_server.py` lives on Windows: `CORTEX_7B_SERVER_SCRIPT` override first, else next
-/// to the start script the desktop launcher already points at (`CORTEX_7B_START_SCRIPT`).
-fn server_script_path() -> Option<String> {
-    if let Ok(p) = std::env::var("CORTEX_7B_SERVER_SCRIPT") {
+/// The layouts `cortex_7b_server.py` can sit in, relative to the running exe: beside it (a bundled
+/// install), and the dev/personal-use tree `cortex-speech-app/scripts/` reached from
+/// `src-tauri/target/{release,debug}/`. Personal use IS the ship target (CLAUDE.md, owner 2026-07-10),
+/// so the repo layout is a first-class case, not a developer convenience.
+const SERVER_SCRIPT_RELATIVE_TO_EXE: [&str; 3] =
+    ["cortex_7b_server.py", "../../../scripts/cortex_7b_server.py", "../../scripts/cortex_7b_server.py"];
+
+/// Pure resolution (unit-tested): first the explicit override, then beside the launcher's start
+/// script, then the known layouts under `exe_dir`.
+///
+/// The last group exists because BOTH env vars are process-inherited, and the champion is started by
+/// whatever launched the app. `CORTEX_7B_SERVER_SCRIPT` is set at USER scope on this machine, so a
+/// launcher that does not inherit it — a shell, a service, a scheduler — silently produced an app
+/// that could never start its champion. Measured 2026-08-18: supervision failed every ~8 minutes for
+/// two hours after the app was relaunched from a shell without it, while the models sat on disk the
+/// whole time. A file the app can simply FIND should never depend on an environment variable being
+/// carried through, which is the same lesson `resolve_model_file` already encodes for models.
+fn resolve_server_script(
+    env_override: Option<String>,
+    start_script: Option<String>,
+    exe_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    if let Some(p) = env_override.filter(|p| !p.trim().is_empty()) {
         return Some(p);
     }
-    let start = std::env::var("CORTEX_7B_START_SCRIPT").ok()?;
-    let candidate = std::path::Path::new(&start).parent()?.join("cortex_7b_server.py");
-    candidate.is_file().then(|| candidate.to_string_lossy().into_owned())
+    if let Some(start) = start_script {
+        if let Some(candidate) = std::path::Path::new(&start).parent().map(|d| d.join("cortex_7b_server.py")) {
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let exe_dir = exe_dir?;
+    SERVER_SCRIPT_RELATIVE_TO_EXE.iter().find_map(|rel| {
+        let candidate = exe_dir.join(rel);
+        // `canonicalize` collapses the `..` hops so the logged path is the real one, and fails
+        // closed when the file is absent.
+        candidate.canonicalize().ok().filter(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
+/// Where `cortex_7b_server.py` lives on Windows. See [`resolve_server_script`].
+fn server_script_path() -> Option<String> {
+    resolve_server_script(
+        std::env::var("CORTEX_7B_SERVER_SCRIPT").ok(),
+        std::env::var("CORTEX_7B_START_SCRIPT").ok(),
+        std::env::current_exe().ok().as_deref().and_then(|p| p.parent()).map(std::path::Path::to_path_buf).as_deref(),
+    )
 }
 
 fn start_child() -> Result<(), String> {
@@ -87,7 +126,9 @@ fn start_child() -> Result<(), String> {
     }
     kill_owned_child(); // never leak a previous child
     let script = server_script_path()
-        .ok_or("cortex_7b_server.py not found — set CORTEX_7B_SERVER_SCRIPT or CORTEX_7B_START_SCRIPT")?;
+        .ok_or(
+        "cortex_7b_server.py not found beside the app, in the repo layout, or via \n         CORTEX_7B_SERVER_SCRIPT / CORTEX_7B_START_SCRIPT",
+    )?;
     let model_dir = std::env::var("CORTEX_7B_MODEL_DIR").unwrap_or_else(|_| "/home/ai/cortex_champion_model".into());
     let python = std::env::var("CORTEX_7B_PYTHON").unwrap_or_else(|_| "/home/ai/.venv-wsl-whisper/bin/python".into());
     let port = std::env::var("CORTEX_7B_PORT").unwrap_or_else(|_| "8799".into());
@@ -221,5 +262,45 @@ mod tests {
         assert!(err.contains("shutting down"), "{err}");
         // Restore for any other test in this process (statics are process-global).
         SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_champion_script_is_found_without_any_env_var() {
+        // REGRESSION 2026-08-18. Both env vars are process-inherited, so an app launched by anything
+        // that does not carry `CORTEX_7B_SERVER_SCRIPT` (set at USER scope on this machine) could
+        // never start its champion — measured failing every ~8 minutes for two hours, with the models
+        // sitting on disk the whole time. A file the app can FIND must not depend on an env var
+        // surviving the launcher.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The dev/personal-use layout: exe at src-tauri/target/release, script at scripts/.
+        let exe_dir = tmp.path().join("src-tauri/target/release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let scripts = tmp.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script = scripts.join("cortex_7b_server.py");
+        std::fs::write(&script, b"# champion server").unwrap();
+
+        let found = resolve_server_script(None, None, Some(&exe_dir))
+            .expect("with no env at all, the script beside the app tree must still be found");
+        assert!(std::path::Path::new(&found).is_file(), "resolution must return a real file, got {found}");
+        assert!(found.ends_with("cortex_7b_server.py"), "resolved the wrong file: {found}");
+    }
+
+    #[test]
+    fn an_explicit_override_still_wins_and_a_missing_script_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exe_dir = tmp.path().join("src-tauri/target/release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        // Override beats everything, and is returned verbatim — an operator pointing at a specific
+        // build must never be silently redirected to a file that happens to be lying around.
+        assert_eq!(
+            resolve_server_script(Some("D:/pinned/server.py".into()), None, Some(&exe_dir)).as_deref(),
+            Some("D:/pinned/server.py")
+        );
+        // An empty override is not an override.
+        assert_eq!(resolve_server_script(Some("   ".into()), None, Some(&exe_dir)), None);
+        // Nothing anywhere: fail closed rather than invent a path the launcher would then fail on.
+        assert_eq!(resolve_server_script(None, None, Some(&exe_dir)), None);
     }
 }
