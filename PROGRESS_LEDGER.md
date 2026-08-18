@@ -9311,9 +9311,29 @@ labeled (gate B)   : 429 clips / 1.086 h        dataset_runs : 1 (was 0)
 Gate B targets 25 h / top-1 ≤ 30 % / ≥ 25 recordings. Unchanged by tonight's work, and only human
 review moves it — which is exactly why the Accept-lockout bug above mattered.
 
-### Owner-gated, unchanged
+### Owner-gated — one item cleared itself
 
-3 spot-check adjudications (21/24), 12 wrong-dialect re-reviews, and now: **whether to build a real
-challenger trainer**, which is the only thing standing between the wired loop and gate D.
+Every cheap gate was re-run tonight and the **spot-check pool is no longer blocking**:
+
+```
+SPOT-CHECK POOL: healthy - the QC that proves reviewers are listening can fire
+  human decisions        : 429
+  active reviewers       : 8
+  spot-check answer keys : 24   (need >= 24)
+REVIEWER QUEUES: OK (8 live link(s), every one has clips to review; 15458 servable pending)
+DATASET DUPLICATES: OK (no cross-file duplicate content)
+REVIEW SERVING PROVENANCE: all invariants hold
+SUPERVISION GATE: OK (watchdog enabled, 8 reviewer link(s) answering on 8737, 564.4 GB free)
+```
+
+So the standing "3 spot-check adjudications (21/24)" is STALE and is retired here. Still owner-gated:
+the 12 wrong-dialect re-reviews, and now **whether to build a real challenger trainer** — the only
+thing standing between the wired loop and gate D.
+
+A `verify_10.py --quick` sweep read `22 PASS, 1 FAIL (test-e2e+a11y), 18 skipped (env/not-built)`.
+That FAIL was **mine, not the code's**: I switched branches while the sweep was running, so it read a
+tree that changed underneath it. Re-run in isolation on a stable tree, the gate passes **95/95**.
+Recorded rather than quietly dropped, because a red gate nobody explains is how a real one gets
+ignored.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

@@ -59,7 +59,7 @@ that a particular model won.
 
 | Phase | State | Exit gate |
 |---|---|---|
-| 0 — land in flight | **OWNER-BLOCKED** | 3 spot-check adjudications (21/24) + 12 wrong-dialect re-reviews |
+| 0 — land in flight | **OWNER-BLOCKED (partly cleared)** | spot-check pool measured healthy 24/24 on 2026-08-18; 12 wrong-dialect re-reviews remain |
 | 1 — break the data skew | **STARTED** | gate B above. Importing is not labeling — only reviewers move it |
 | 2 — snapshots + pack provenance | **DONE** 2026-08-18 | gate C — **MEASURED GREEN**, 1 sealed snapshot |
 | 3 — challenger loop | **WIRED; BLOCKED on a trainer** | gate D — snapshot ✓ train ✗ eval ✗ verdict ✗ |
