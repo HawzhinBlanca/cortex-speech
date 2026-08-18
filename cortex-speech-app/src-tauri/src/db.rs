@@ -4317,6 +4317,83 @@ impl Database {
         Ok(Some(revision))
     }
 
+    /// Collapse runs of whitespace, exactly as `check_review_serving_provenance._norm` does.
+    /// A differing space is not a differing transcript, and the two sides of this invariant must
+    /// agree byte-for-byte or the gate fails on rows the backend believed it had classified.
+    fn provenance_norm(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// What a human decision REALLY is, decided from the stored bytes rather than the client's word.
+    ///
+    /// `accept` asserts a specific, checkable thing: an ASR engine produced this exact text and a
+    /// human approved it unchanged. That is true on a first review and routinely FALSE on a
+    /// re-review, where the displayed text is a previous human's correction. Recording the latter as
+    /// `accept` launders human authorship into machine provenance — the row then claims an engine
+    /// wrote words no engine ever emitted, and `check_review_serving_provenance` rejects it.
+    ///
+    /// So: an accept whose approved text matches one of the segment's own hypotheses stays an
+    /// accept; one that matches none is reclassified `edit`, which is what it actually is — a human
+    /// affirming human-authored text. The text is never invented, only carried forward.
+    ///
+    /// Returns the effective decision and, when it had to resolve the approved text itself, that text.
+    fn authoritative_decision(
+        &self,
+        segment_id: &str,
+        requested: &str,
+        approved: Option<&str>,
+    ) -> AppResult<(String, Option<String>)> {
+        use rusqlite::OptionalExtension;
+        if requested != "accept" {
+            return Ok((requested.to_string(), None));
+        }
+        // Accept-what-you-SEE passes the displayed text; when it does not, the approved text is
+        // whatever the export would ship for this row today.
+        let (approved_text, resolved): (String, Option<String>) = match approved {
+            Some(text) if !text.trim().is_empty() => (text.to_string(), None),
+            _ => {
+                let shipped: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT COALESCE(NULLIF(TRIM(verdict_transcript), ''),                                  NULLIF(TRIM(annotated_transcript), ''),                                  raw_transcript)                          FROM speech_segments WHERE id = ?1",
+                        [segment_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match shipped.map(|text| to_nfc(text.trim())).filter(|text| !text.is_empty()) {
+                    Some(text) => (text.clone(), Some(text)),
+                    // Nothing to verify against; leave the caller's decision untouched rather than
+                    // invent a classification.
+                    None => return Ok((requested.to_string(), None)),
+                }
+            }
+        };
+
+        let wanted = Self::provenance_norm(&approved_text);
+        let mut stmt = self.conn.prepare("SELECT transcript FROM segment_hypotheses WHERE segment_id = ?1")?;
+        let mut rows = stmt.query([segment_id])?;
+        let mut saw_any_hypothesis = false;
+        while let Some(row) = rows.next()? {
+            let hypothesis: String = row.get(0)?;
+            saw_any_hypothesis = true;
+            if Self::provenance_norm(&hypothesis) == wanted {
+                return Ok(("accept".to_string(), resolved));
+            }
+        }
+        // Only a CONTRADICTION justifies reclassifying. With no hypotheses on file there is nothing
+        // to contradict, and calling the decision an "edit" would launder in the other direction —
+        // dressing a genuine ASR accept as human authorship because provenance was never recorded.
+        // That is a data-completeness problem, and `check_review_serving_provenance` reports it as
+        // one ("no ASR hypothesis on file to justify the accept"); it is not this function's to hide.
+        if !saw_any_hypothesis {
+            return Ok((requested.to_string(), resolved));
+        }
+        tracing::info!(
+            "segment {segment_id}: accept reclassified as edit — the approved text matches none of              this segment's ASR hypotheses, so it is human-authored, not an engine transcript"
+        );
+        Ok(("edit".to_string(), Some(approved_text)))
+    }
+
     fn record_human_decision_by_with_finalize(
         &self,
         segment_id: &str,
@@ -4329,7 +4406,6 @@ impl Database {
         // A revision is supplied only by the phone path, whose adjudication and finalization share
         // one transaction. Desktop decisions intentionally have no optimistic CAS token here.
         let finalize = expected_revision.is_some();
-        let human_verdict = human_verdict_for_decision(decision)?;
         // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
         // update_*). Without it a decomposed (NFD) paste / IME input becomes the lone non-NFC label in an
         // otherwise-NFC corpus (verdict_transcript is the COALESCE-preferred gold source) and defeats the
@@ -4338,6 +4414,19 @@ impl Database {
         let corrected_owned: Option<String> =
             corrected_transcript.map(|t| to_nfc(t.trim())).filter(|value| !value.is_empty());
         let corrected_transcript = corrected_owned.as_deref();
+        // AUTHORITATIVE CLASSIFICATION — the backend decides what this decision IS, never the
+        // renderer's word for it. A reviewer pressing "Accept" is approving the text in front of
+        // them; on a RE-review that text is a previous human's correction, and recording it as
+        // `accept` would state that an ASR engine produced it. Measured 2026-08-18 on segment
+        // 82681df2: five humans edited it (Rubar, Lamo, Sewa, Rubar, Roza), the sixth pressed
+        // Accept, and the row then claimed the champion had written a name and punctuation that
+        // appear in none of its four hypotheses.
+        let (decision_owned, resolved_text) =
+            self.authoritative_decision(segment_id, decision, corrected_transcript)?;
+        let decision = decision_owned.as_str();
+        let corrected_owned = resolved_text.or(corrected_owned);
+        let corrected_transcript = corrected_owned.as_deref();
+        let human_verdict = human_verdict_for_decision(decision)?;
         if decision == "edit" && corrected_transcript.is_none() {
             return Err(AppError::Validation("Human edit decisions require a corrected transcript".into()));
         }

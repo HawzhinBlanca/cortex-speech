@@ -4287,3 +4287,113 @@ fn alignment_cas_never_overwrites_concurrent_boundary_metadata() {
     assert_eq!(row.alignment_json.as_deref(), Some(inferred));
     assert_eq!(row.alignment_quality.as_deref(), Some("ctc_forced"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Authoritative decision classification (accept-provenance).
+//
+// `accept` asserts something checkable: an ASR engine produced this exact text and a human approved
+// it unchanged. On a RE-review the displayed text is a previous human's correction, so honouring the
+// renderer's word would launder human authorship into machine provenance.
+// ---------------------------------------------------------------------------------------------
+
+fn seed_for_provenance(db: &Database, id: &str, champion_text: &str) {
+    let mut seg = make_segment(id, "/a/clip.wav");
+    seg.raw_transcript = champion_text.to_string();
+    db.insert_segment(&seg).unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: id.to_string(),
+        model_id: "omniasr-wsl-7b".into(),
+        transcript: champion_text.to_string(),
+        confidence: None,
+    })
+    .unwrap();
+}
+
+#[test]
+fn accepting_the_champions_own_text_stays_an_accept() {
+    let db = make_db();
+    seed_for_provenance(&db, "acc-1", "کاک لە ئەمە شتێکی تر");
+    db.record_human_decision_by("acc-1", "accept", Some("کاک لە ئەمە شتێکی تر"), None, Some("Sara")).unwrap();
+    let seg = db.get_segment_by_id("acc-1").unwrap().unwrap();
+    assert_eq!(seg.human_decision.as_deref(), Some("accept"), "a genuine ASR accept must stay an accept");
+}
+
+#[test]
+fn whitespace_alone_never_demotes_a_real_accept() {
+    // The gate compares on words, not spacing; the backend must agree or it reclassifies honest accepts.
+    let db = make_db();
+    seed_for_provenance(&db, "acc-2", "کاک لە ئەمە شتێکی تر");
+    db.record_human_decision_by("acc-2", "accept", Some("  کاک   لە ئەمە\tشتێکی تر  "), None, Some("Sara")).unwrap();
+    assert_eq!(db.get_segment_by_id("acc-2").unwrap().unwrap().human_decision.as_deref(), Some("accept"));
+}
+
+#[test]
+fn confirming_a_previous_humans_correction_is_recorded_as_human_authored() {
+    // The exact 2026-08-18 regression on segment 82681df2: five humans edited the clip, the sixth
+    // pressed Accept, and the row then claimed the champion had produced a name and punctuation that
+    // appear in none of its hypotheses.
+    let db = make_db();
+    seed_for_provenance(&db, "reg-82681df2", "کاک لە ئەمە شتێکی تر یەعنی");
+    db.record_human_decision_by("reg-82681df2", "edit", Some("کاک لامۆ، شتێکی تر، یەعنی"), None, Some("Rubar")).unwrap();
+
+    // A later reviewer approves what they see — which is Rubar's text, not the engine's.
+    db.record_human_decision_by("reg-82681df2", "accept", Some("کاک لامۆ، شتێکی تر، یەعنی"), None, Some("Hawzhin"))
+        .unwrap();
+
+    let seg = db.get_segment_by_id("reg-82681df2").unwrap().unwrap();
+    assert_eq!(
+        seg.human_decision.as_deref(),
+        Some("edit"),
+        "approving a previous human's text is human-authored confirmation, never an ASR accept"
+    );
+    assert_eq!(
+        seg.verdict.as_deref(),
+        Some("human_edit"),
+        "the verdict must carry the same human authorship as the decision"
+    );
+    // `annotated_transcript` is human-only and written by the UI's separate field update; the
+    // decision path owns `verdict_transcript`, which is the COALESCE-preferred gold source.
+    assert_eq!(
+        seg.verdict_transcript.as_deref(),
+        Some("کاک لامۆ، شتێکی تر، یەعنی"),
+        "the human text is carried forward verbatim, never invented or reverted"
+    );
+}
+
+#[test]
+fn an_accept_of_text_no_engine_produced_is_never_an_accept() {
+    let db = make_db();
+    seed_for_provenance(&db, "acc-3", "کاک لە ئەمە شتێکی تر");
+    db.record_human_decision_by("acc-3", "accept", Some("تەواو جیاواز و دەستکاریکراو"), None, Some("Sara")).unwrap();
+    let seg = db.get_segment_by_id("acc-3").unwrap().unwrap();
+    assert_eq!(
+        seg.human_decision.as_deref(),
+        Some("edit"),
+        "a renderer claiming 'accept' for text no engine emitted must not be taken at its word"
+    );
+}
+
+#[test]
+fn an_auxiliary_engines_output_still_counts_as_an_accept() {
+    // The champion is not the only traceable hypothesis: accepting the fine-tuned engine's output is
+    // still accepting an ASR transcript, and must not be demoted to a human edit.
+    let db = make_db();
+    seed_for_provenance(&db, "acc-4", "دەقی چامپیۆن");
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: "acc-4".into(),
+        model_id: "finetuned-mms-ckb".into(),
+        transcript: "دەقی مۆدێلی تر".into(),
+        confidence: None,
+    })
+    .unwrap();
+    db.record_human_decision_by("acc-4", "accept", Some("دەقی مۆدێلی تر"), None, Some("Sara")).unwrap();
+    assert_eq!(db.get_segment_by_id("acc-4").unwrap().unwrap().human_decision.as_deref(), Some("accept"));
+}
+
+#[test]
+fn a_reject_is_never_reclassified() {
+    let db = make_db();
+    seed_for_provenance(&db, "rej-1", "دەقی چامپیۆن");
+    db.record_human_decision_by("rej-1", "reject", None, None, Some("Sara")).unwrap();
+    assert_eq!(db.get_segment_by_id("rej-1").unwrap().unwrap().human_decision.as_deref(), Some("reject"));
+}
