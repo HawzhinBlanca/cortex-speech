@@ -299,7 +299,8 @@ pub async fn run_t2_for_segment(
 
         // Build a single hypothesis from raw transcript (T2 will hear the audio and judge)
         let persisted = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
-        let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, &seg, persisted);
+        let recorded_is_champion = super::segment_recorded_model_is_champion(&db, &seg);
+        let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, &seg, persisted, recorded_is_champion);
         if hyps.is_empty() {
             if settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
                 return Err(format!(

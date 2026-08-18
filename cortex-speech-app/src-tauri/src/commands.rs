@@ -1611,10 +1611,34 @@ pub struct SegmentConsensus {
 /// older builds (300M/1B/MMS/Scribe) are historical artifacts, not voters. If a pre-provenance 7B row
 /// has no hypothesis record, synthesize the one honest vote from the segment's persisted champion
 /// transcript so review still works without allowing stale engines back into the decision.
+/// The provenance id written by the PRE-REGISTRY champion.
+///
+/// Production no longer names the champion by string — identity is content-addressed, and
+/// `pipeline::CHAMPION_MODEL_ID` is `#[cfg(test)]` for exactly that reason. But rows drafted before
+/// the registry existed still carry this id on disk, and champion review must keep recognising them
+/// as champion-produced or it would hide the evidence for most of the existing corpus. This is
+/// historical RECOGNITION only; nothing selects or serves a model by this string.
+const LEGACY_CHAMPION_MODEL_ID: &str = "omniasr-wsl-7b";
+
+/// Was this segment drafted by a champion-family model? Answers the DB question
+/// [`hypotheses_for_selected_asr`] deliberately does not ask itself, so that filter stays pure.
+/// The legacy constant covers rows written before the registry existed; the registry covers the rest.
+/// Unknown provenance is NOT champion — fail closed.
+fn segment_recorded_model_is_champion(db: &crate::db::Database, segment: &crate::db::SpeechSegment) -> bool {
+    let Some(recorded) = segment.model_version_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if recorded == LEGACY_CHAMPION_MODEL_ID {
+        return true;
+    }
+    crate::registry::is_family_model(db, recorded, crate::deployment::OMNIASR_7B_FAMILY).unwrap_or(false)
+}
+
 fn hypotheses_for_selected_asr(
     selected: &crate::settings::AsrModelSize,
     segment: &crate::db::SpeechSegment,
     mut hypotheses: Vec<crate::db::SegmentHypothesis>,
+    recorded_model_is_champion: bool,
 ) -> Vec<crate::db::SegmentHypothesis> {
     if *selected != crate::settings::AsrModelSize::WSL7B {
         return hypotheses;
@@ -1625,6 +1649,15 @@ fn hypotheses_for_selected_asr(
         // history after promotion. Return no attributable vote instead of inventing provenance.
         return Vec::new();
     };
+    // CHAMPION SUPREMACY (canon). Matching the row's own producing model is the right unit of
+    // provenance, but on its own it re-admits the very thing the fixed-string filter excluded: a clip
+    // drafted by a weaker engine BEFORE WSL7B was selected carries that engine's id, so a per-row
+    // match would surface its hypotheses during champion review. This library contains exactly such
+    // rows — 494/494 clips were once silently drafted by `finetuned-mms-ckb` while WSL7B was selected.
+    // A non-champion producer contributes NO auxiliary vote, as before.
+    if !recorded_model_is_champion {
+        return Vec::new();
+    }
     hypotheses.retain(|hypothesis| {
         hypothesis.model_id == recorded_model_id
             && !hypothesis.transcript.trim().is_empty()
@@ -1652,16 +1685,18 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
     RATE_LIMITER.check("get_segment_consensus")?;
     validate::validate_identifier(&segment_id)?;
     let selected = state.lock_settings().asr_model_size.clone();
-    let (segment, hyps) = {
+    let (segment, hyps, recorded_is_champion) = {
         let db = state.lock_db();
         let segment = db
             .get_segment_by_id(&segment_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))?;
         let hypotheses = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
-        (segment, hypotheses)
+        // Answered while the lock is held; the filter itself stays pure and DB-free.
+        let is_champion = segment_recorded_model_is_champion(&db, &segment);
+        (segment, hypotheses, is_champion)
     };
-    let hyps = hypotheses_for_selected_asr(&selected, &segment, hyps);
+    let hyps = hypotheses_for_selected_asr(&selected, &segment, hyps, recorded_is_champion);
     // Distinct producing engines, in first-seen order, straight from the recorded hypotheses (never
     // inferred) so the review badge can honestly say which model(s) made the draft.
     let mut models: Vec<String> = Vec::new();
@@ -3606,7 +3641,8 @@ fn load_hypotheses_for_segment(
     seg: &crate::db::SpeechSegment,
 ) -> Result<Vec<crate::db::SegmentHypothesis>, String> {
     let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;
-    let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted);
+    let recorded_is_champion = segment_recorded_model_is_champion(db, seg);
+    let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted, recorded_is_champion);
     if hyps.is_empty() && settings.asr_model_size != crate::settings::AsrModelSize::WSL7B {
         hyps.push(crate::db::SegmentHypothesis {
             segment_id: seg_id.to_string(),
@@ -4754,7 +4790,7 @@ mod tests {
             },
         ];
 
-        let filtered = hypotheses_for_selected_asr(&crate::settings::AsrModelSize::WSL7B, &segment, hypotheses);
+        let filtered = hypotheses_for_selected_asr(&crate::settings::AsrModelSize::WSL7B, &segment, hypotheses, true);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].model_id, crate::pipeline::CHAMPION_MODEL_ID);

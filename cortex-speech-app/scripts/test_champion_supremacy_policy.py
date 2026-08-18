@@ -103,8 +103,18 @@ def test_champion_review_cannot_consume_stale_auxiliary_votes() -> None:
     commands = COMMANDS.read_text(encoding="utf-8")
     filter_body = _fn_body(commands, "fn hypotheses_for_selected_asr(")
     assert "AsrModelSize::WSL7B" in filter_body, "review hypothesis filtering is not selected-mode aware"
-    assert "CHAMPION_MODEL_ID" in filter_body and ".retain(" in filter_body, (
+    # Pins the BEHAVIOUR, not a symbol name. The champion is content-addressed now, so the filter no
+    # longer matches a fixed string — it matches the row's OWN producing model. That is the right unit
+    # of provenance but re-admits what the fixed string excluded: a clip drafted by a weaker engine
+    # BEFORE WSL7B was selected carries that engine's id. `recorded_model_is_champion` is the guard
+    # that keeps such a row contributing NO auxiliary vote, and dropping it would silently restore the
+    # 494/494 failure. Both halves are required.
+    assert "recorded_model_is_champion" in filter_body and ".retain(" in filter_body, (
         "champion review does not discard historical 300M/1B/MMS/Scribe hypotheses"
+    )
+    assert "if !recorded_model_is_champion" in filter_body, (
+        "the non-champion producer guard is gone — a weaker engine's stored draft would surface as an "
+        "auxiliary vote during champion review"
     )
 
     jury_body = _fn_body(commands, "pub fn run_jury_pipeline_core_via(")

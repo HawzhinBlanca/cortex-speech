@@ -309,6 +309,21 @@ fn verify_registry_deployment(version: &ModelVersion) -> AppResult<VerifiedDeplo
     Ok(verified)
 }
 
+/// Is `model_id` a model of `family` in the registry?
+///
+/// Champion supremacy asks a question the per-row provenance filter cannot answer on its own: a row
+/// drafted BEFORE the owner selected WSL7B carries the weaker engine's id, and matching it per-row
+/// would surface that engine's hypotheses during champion review. This is the membership test that
+/// keeps such a row contributing NO auxiliary vote, exactly as the fixed-string filter used to.
+pub(crate) fn is_family_model(db: &Database, model_id: &str, family: &str) -> AppResult<bool> {
+    let found: i64 = db.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM model_versions WHERE id = ?1 AND family = ?2)",
+        rusqlite::params![model_id, family],
+        |row| row.get(0),
+    )?;
+    Ok(found != 0)
+}
+
 pub fn champion_identity(db: &Database, family: &str) -> AppResult<Option<DeploymentIdentity>> {
     Ok(get_champion(db, family)?.map(|version| DeploymentIdentity {
         model_version_id: version.id,
