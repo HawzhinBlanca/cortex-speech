@@ -13,6 +13,7 @@ pub mod audio_quality;
 pub mod cache;
 pub mod cancel;
 pub mod champion_promotion;
+pub mod champion_promotion_runtime;
 pub mod chunking;
 pub mod commands;
 pub mod constrained_decode;
@@ -518,13 +519,6 @@ pub fn run() {
         fatal_app_error(format!("Failed to initialize database schema: {e}"));
     }
 
-    // P5.2: mirror the registry's champions to <data_dir>/champion.json at startup so external
-    // consumers (the WSL 7B server) resolve the CURRENT champion — promotion is no longer a no-op
-    // at its final step. Best-effort: a pointer-write failure never blocks startup.
-    if let Err(e) = crate::registry::sync_champion_pointer(&db, &data_dir) {
-        tracing::warn!("champion pointer sync failed: {e}");
-    }
-
     // P0 #3 Job Supervisor: any durable job still `running` at startup is a crash residue (a clean run
     // always reaches a terminal state) — reap it to failed/INTERRUPTED so the activity surface shows the
     // honest "interrupted", never a ghost that spins forever. Best-effort: never blocks startup.
@@ -847,6 +841,69 @@ pub fn run() {
                         tracing::info!("Asset protocol scope authorized for media cache: {}", media_cache.display())
                     }
                     Err(e) => tracing::warn!("Failed to authorize media cache dir in asset scope: {e}"),
+                }
+            }
+
+            // Promotion recovery MUST precede ordinary pointer publication and supervision. The job's
+            // durable saga payload is the only source that can say whether a crash left the candidate
+            // or incumbent authoritative. Publishing the current DB row first could overwrite that
+            // evidence boundary and start a half-promoted model. Recovery uses independent DB
+            // connections and never holds AppState's mutex across restart/warm-up/canary work.
+            {
+                let state = app.state::<AppState>();
+                let data_dir = state.lock_data_dir().clone();
+                let db_path = state.lock_db().path().to_string();
+                let running = {
+                    let db = state.lock_db();
+                    crate::champion_promotion::running_promotions(&db)
+                };
+                match (data_dir, running) {
+                    (Some(dir), Ok(jobs)) if jobs.is_empty() => {
+                        let db = state.lock_db();
+                        match crate::registry::sync_champion_pointer(&db, &dir) {
+                            Ok(_) => crate::engine_runtime::set_promotion_recovery_blocked(false),
+                            Err(error) => {
+                                crate::engine_runtime::set_promotion_recovery_blocked(true);
+                                tracing::error!("champion pointer publication failed at startup: {error}");
+                            }
+                        }
+                    }
+                    (Some(dir), Ok(_)) => {
+                        // A 30-GB worker can need minutes to restart. Keep setup responsive, but fence
+                        // every engine start until the background recovery and final pointer sync pass.
+                        crate::engine_runtime::set_promotion_recovery_blocked(true);
+                        let recovery_app = app.handle().clone();
+                        std::thread::spawn(move || {
+                            match crate::champion_promotion_runtime::recover_running_promotions(
+                                &recovery_app,
+                                db_path.clone(),
+                                dir.clone(),
+                            ) {
+                                Ok(recovered) => match Database::open(&db_path)
+                                    .and_then(|db| crate::registry::sync_champion_pointer(&db, &dir))
+                                {
+                                    Ok(_) => {
+                                        tracing::info!("recovered {recovered} interrupted champion promotion");
+                                        crate::engine_runtime::set_promotion_recovery_blocked(false);
+                                    }
+                                    Err(error) => tracing::error!(
+                                        "champion pointer publication failed after recovery; engine remains blocked: {error}"
+                                    ),
+                                },
+                                Err(error) => tracing::error!(
+                                    "champion promotion recovery is unverified; engine remains blocked: {error}"
+                                ),
+                            }
+                        });
+                    }
+                    (None, _) => {
+                        crate::engine_runtime::set_promotion_recovery_blocked(true);
+                        tracing::error!("champion promotion recovery cannot run: application data directory is missing");
+                    }
+                    (_, Err(error)) => {
+                        crate::engine_runtime::set_promotion_recovery_blocked(true);
+                        tracing::error!("champion promotion inventory failed; engine remains blocked: {error}");
+                    }
                 }
             }
 

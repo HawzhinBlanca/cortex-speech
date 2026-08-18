@@ -448,12 +448,12 @@ fn test_pipeline_for_status() -> (super::ProcessingPipeline, tempfile::TempDir) 
 }
 
 #[test]
-fn wsl_without_script_preserves_champion_identity_and_never_falls_back() {
+fn wsl_without_explicit_script_uses_bundled_champion_and_never_falls_back() {
     let settings = AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() };
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
 
-    assert!(!pipeline.should_use_wsl_primary_asr());
-    assert!(pipeline.wsl7b_primary_unresolved());
+    assert!(pipeline.should_use_wsl_primary_asr());
+    assert!(!pipeline.wsl7b_primary_unresolved());
     assert_eq!(pipeline.selected_asr_model_size(), AsrModelSize::WSL7B);
     assert_eq!(pipeline.local_asr_model_id(), "omniasr-wsl-7b");
 }
@@ -653,7 +653,7 @@ fn service_locks_recover_poisoned_state() {
 // there is no cross-thread window buffer and no lock left to poison.
 
 #[test]
-fn wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusal() {
+fn wsl_primary_import_pass_never_silently_skips_the_bundled_champion() {
     let settings = AppSettings { asr_model_size: AsrModelSize::WSL7B, ..AppSettings::default() };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
     let db_path = dir.path().join("db.sqlite");
@@ -670,19 +670,11 @@ fn wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusa
     db.insert_segment(&segment).unwrap();
 
     let mut segments = vec![segment];
-    let updated = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None).unwrap();
-
-    assert_eq!(updated, 0);
-    assert_eq!(segments[0].raw_transcript, "pre-existing transcript");
-    assert_eq!(segments[0].verdict, None);
-    assert!(!segments[0].escalated);
-    assert_eq!(segments[0].rationale, None);
-
-    let fresh = db.get_segments_by_ids(&["preflight-refused".to_string()]).unwrap().remove(0);
-    assert_eq!(fresh.raw_transcript, "pre-existing transcript");
-    assert_eq!(fresh.verdict, None);
-    assert!(!fresh.escalated);
-    assert_eq!(fresh.rationale, None);
+    let error = pipeline
+        .run_primary_wsl_pass_for_import(&db, &mut segments, None)
+        .expect_err("a clean default must run the bundled champion path and fail hard on infrastructure errors");
+    assert!(error.to_string().contains("rolled back"));
+    assert!(db.get_segment_by_id("preflight-refused").unwrap().is_none());
 }
 
 #[test]

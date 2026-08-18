@@ -37,6 +37,18 @@ pub async fn get_champion_engine_status(
             reason: Some("No OmniASR-7B champion is registered; bootstrap the measured incumbent first.".into()),
         });
     };
+    if let Some(reason) = crate::engine_runtime::champion_operational_block_reason() {
+        return Ok(EngineStatus {
+            ready: false,
+            port,
+            identity_matches: false,
+            expected_model_version_id: Some(expected.model_version_id),
+            expected_deployment_sha256: Some(expected.deployment_sha256),
+            loaded_model_version_id: None,
+            loaded_deployment_sha256: None,
+            reason: Some(reason.to_string()),
+        });
+    }
     let expected_for_probe = expected.clone();
     let result =
         run_blocking(move || crate::engine_runtime::query_loaded_champion(&app, std::time::Duration::from_secs(3)))

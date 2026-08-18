@@ -501,6 +501,7 @@ fn resolve_wsl_7b_client(configured: Option<String>) -> Option<String> {
         "cortex_7b_client.py",
         "scripts/cortex_7b_client.py",
         "_up_/scripts/cortex_7b_client.py",
+        "../../../../scripts/cortex_7b_client.py",
         "../../../scripts/cortex_7b_client.py",
         "../../scripts/cortex_7b_client.py",
     ]
@@ -533,6 +534,10 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     // replicas to serve them. Released on drop, including on an early return.
     let _gate = WSL_7B_GATE.acquire();
 
+    let external_script =
+        if external_script.starts_with('/') { external_script.to_string() } else { win_path_to_wsl(external_script) };
+    let python =
+        std::env::var("CORTEX_7B_PYTHON").unwrap_or_else(|_| "/home/ai/.venv-wsl-whisper/bin/python".to_string());
     let mut cmd = std::process::Command::new("wsl");
     // Pass the DB path + port to the client via `env` (WSL does not propagate Windows env into Linux),
     // so the client follows a MOVED data dir / non-default port instead of its hardcoded fallbacks — the
@@ -540,7 +545,7 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     cmd.arg("env")
         .arg(format!("CORTEX_7B_DB={}", win_path_to_wsl(db_path)))
         .arg(format!("CORTEX_7B_PORT={WSL_7B_SERVER_PORT}"))
-        .arg("/root/cortex_env/bin/python3")
+        .arg(python)
         .arg(external_script)
         .arg("--segment-id")
         .arg(segment_id)
@@ -1063,11 +1068,17 @@ impl ProcessingPipeline {
         let client = resolve_wsl_7b_client(self.settings.external_asr_script_path())
             .ok_or_else(Self::primary_engine_unavailable_error)?;
         let db = Database::open(&self.db_path)?;
-        let expected = crate::registry::champion_identity(&db, crate::deployment::OMNIASR_7B_FAMILY)?.ok_or_else(|| {
-            AppError::Validation(format!(
-                "{ASR_7B_UNAVAILABLE_TAG}: no content-addressed OmniASR-7B champion is registered; refusing an identity-free server"
-            ))
-        })?;
+        let expected = crate::registry::champion_identity(&db, crate::deployment::OMNIASR_7B_FAMILY)
+            .map_err(|error| {
+                AppError::Validation(format!(
+                    "{ASR_7B_UNAVAILABLE_TAG}: champion registry identity could not be read: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                AppError::Validation(format!(
+                    "{ASR_7B_UNAVAILABLE_TAG}: no content-addressed OmniASR-7B champion is registered; refusing an identity-free server"
+                ))
+            })?;
         let loaded = crate::engine_runtime::query_loaded_champion_with_client(&client, Duration::from_secs(10))
             .map_err(|error| {
                 AppError::Validation(format!(

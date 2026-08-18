@@ -658,10 +658,10 @@ pub fn decide_promotion(challenger: &Scorecard, policy: &PromotionPolicy) -> Pro
     PromotionDecision { promote, reasons }
 }
 
-/// Evaluate the promotion gate for a challenger and, if it passes, atomically promote it over the
-/// current champion. `challenger_scorecard` must compare the challenger against the CURRENT champion
-/// (its `vs_baseline`), as produced by the gold-eval harness. Returns the explainable decision in
-/// both the promote and block cases.
+/// Evaluate the legacy in-process scorecard gate without mutating registry state.
+/// `challenger_scorecard` must compare the challenger against the CURRENT champion. Production
+/// promotion is a multi-system operation and may run only through the durable saga; keeping this
+/// helper decision-only prevents bypassing pointer, process identity, canary and rollback checks.
 ///
 /// There is deliberately NO implicit first-champion shortcut. The measured incumbent is admitted
 /// once through [`bootstrap_verified_legacy_deployment`]; every flywheel challenger is then evaluated against
@@ -728,9 +728,6 @@ pub fn gate_and_promote(
         }
     };
 
-    if decision.promote {
-        promote_to_champion(db, challenger_id)?;
-    }
     Ok(decision)
 }
 
@@ -1181,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_and_promote_swaps_in_a_qualified_challenger() {
+    fn gate_and_promote_is_decision_only_for_a_qualified_challenger() {
         let db = open();
         // Incumbent champion with a recorded gold CER.
         let _champ = register_test_flywheel(&db, "champ");
@@ -1191,9 +1188,9 @@ mod tests {
         let _chall = register_test_flywheel(&db, "chall");
         let card = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), "chall", "champ");
         let decision = gate_and_promote(&db, "chall", &card, &PromotionPolicy::default()).unwrap();
-        assert!(decision.promote, "a qualified challenger must promote: {:?}", decision.reasons);
-        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "chall");
-        assert_eq!(get_model_version(&db, "champ").unwrap().unwrap().status, "rolled_back");
+        assert!(decision.promote, "a qualified challenger must pass the gate: {:?}", decision.reasons);
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "champ");
+        assert_eq!(get_model_version(&db, "chall").unwrap().unwrap().status, "candidate");
     }
 
     #[test]
@@ -1256,10 +1253,12 @@ mod tests {
         record_eval_result(&db, "A", 0.20, 0.10, 0.08, 0.12, None, "{}", None).unwrap();
         promote_to_champion(&db, "A").unwrap();
 
-        // B beats A and is promoted; A is rolled back, B is champion.
+        // B beats A. The decision is then handed to the saga; this test manually applies only the DB
+        // phase so it can exercise the stale-baseline precondition in isolation.
         let _b = register_test_flywheel(&db, "B");
         let card_b = ided(challenger_card(0.10, 0.06, 0.20, 0.10, true, 0.01), "B", "A");
         assert!(gate_and_promote(&db, "B", &card_b, &PromotionPolicy::default()).unwrap().promote);
+        promote_to_champion(&db, "B").unwrap();
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B");
 
         // C's scorecard is still paired against the now-STALE baseline A — must be REFUSED, and B stays.
@@ -1269,10 +1268,12 @@ mod tests {
         assert!(err.is_err(), "a scorecard paired against a rolled-back baseline must be refused, not gated");
         assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B", "the real champion is unchanged");
 
-        // Re-scored against the CURRENT champion B, C promotes normally.
+        // Re-scored against the CURRENT champion B, C passes the decision gate but remains a candidate
+        // until the durable saga performs all external side effects.
         let card_c_fresh = ided(challenger_card(0.09, 0.05, 0.10, 0.06, true, 0.01), "C", "B");
         assert!(gate_and_promote(&db, "C", &card_c_fresh, &PromotionPolicy::default()).unwrap().promote);
-        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "C");
+        assert_eq!(get_champion(&db, "omniasr-7b").unwrap().unwrap().id, "B");
+        assert_eq!(get_model_version(&db, "C").unwrap().unwrap().status, "candidate");
     }
 
     #[test]

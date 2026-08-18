@@ -248,6 +248,44 @@ static CHILD: Mutex<Option<OwnedChampionProcess>> = Mutex::new(None);
 /// child, spawning a server nothing kills.
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Promotion is a cross-system saga. While it owns this lease, neither the periodic supervisor nor
+/// the renderer-facing Start command may restart whichever pointer happens to be visible midway
+/// through the saga. The production promotion runtime has a dedicated restart entry point below.
+static PROMOTION_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set when startup found a promotion that could not be safely resumed/rolled back. Starting a model
+/// in that state would turn an explicitly unverified rollback into a silently serving deployment.
+static PROMOTION_RECOVERY_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) struct PromotionLease;
+
+impl Drop for PromotionLease {
+    fn drop(&mut self) {
+        PROMOTION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn acquire_promotion_lease() -> Result<PromotionLease, String> {
+    PROMOTION_ACTIVE
+        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .map_err(|_| "another champion promotion/recovery is already active".to_string())?;
+    Ok(PromotionLease)
+}
+
+pub(crate) fn set_promotion_recovery_blocked(blocked: bool) {
+    PROMOTION_RECOVERY_BLOCKED.store(blocked, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn champion_operational_block_reason() -> Option<&'static str> {
+    if PROMOTION_RECOVERY_BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+        Some("Champion promotion recovery/rollback is not yet verified; serving readiness is blocked.")
+    } else if PROMOTION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        Some("Champion promotion or rollback is in progress; serving readiness is temporarily blocked.")
+    } else {
+        None
+    }
+}
+
 fn lock_child() -> std::sync::MutexGuard<'static, Option<OwnedChampionProcess>> {
     CHILD.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("Recovering poisoned champion-child lock");
@@ -283,8 +321,12 @@ pub(crate) fn champion_wsl_args(
 /// install), and the dev/personal-use tree `cortex-speech-app/scripts/` reached from
 /// `src-tauri/target/{release,debug}/`. Personal use IS the ship target (CLAUDE.md, owner 2026-07-10),
 /// so the repo layout is a first-class case, not a developer convenience.
-const SERVER_SCRIPT_RELATIVE_TO_EXE: [&str; 3] =
-    ["cortex_7b_server.py", "../../../scripts/cortex_7b_server.py", "../../scripts/cortex_7b_server.py"];
+const SERVER_SCRIPT_RELATIVE_TO_EXE: [&str; 4] = [
+    "cortex_7b_server.py",
+    "../../../../scripts/cortex_7b_server.py",
+    "../../../scripts/cortex_7b_server.py",
+    "../../scripts/cortex_7b_server.py",
+];
 
 /// Pure resolution (unit-tested): first the explicit override, then beside the launcher's start
 /// script, then the known layouts under `exe_dir`.
@@ -346,7 +388,7 @@ pub(crate) fn server_script_path(app: &tauri::AppHandle) -> Option<String> {
     )
 }
 
-fn resolve_client_script(app: &tauri::AppHandle) -> Option<String> {
+pub(crate) fn resolve_client_script(app: &tauri::AppHandle) -> Option<String> {
     if let Some(path) = std::env::var("CORTEX_7B_CLIENT_SCRIPT").ok().filter(|path| !path.trim().is_empty()) {
         return Some(path);
     }
@@ -354,6 +396,7 @@ fn resolve_client_script(app: &tauri::AppHandle) -> Option<String> {
     let resource_dir = app.path().resource_dir().ok();
     let candidates = [
         exe_dir.as_ref().map(|root| root.join("cortex_7b_client.py")),
+        exe_dir.as_ref().map(|root| root.join("../../../../scripts/cortex_7b_client.py")),
         exe_dir.as_ref().map(|root| root.join("../../../scripts/cortex_7b_client.py")),
         exe_dir.as_ref().map(|root| root.join("../../scripts/cortex_7b_client.py")),
         resource_dir.as_ref().map(|root| root.join("cortex_7b_client.py")),
@@ -528,21 +571,27 @@ pub(crate) fn query_loaded_champion_with_client(
 }
 
 pub fn exact_champion_ready(app: &tauri::AppHandle, timeout: Duration) -> bool {
+    if champion_operational_block_reason().is_some() {
+        return false;
+    }
     let expected = app.try_state::<crate::AppState>().and_then(|state| {
         crate::registry::champion_identity(&state.lock_db(), crate::deployment::OMNIASR_7B_FAMILY).ok().flatten()
     });
     expected.is_some_and(|expected| query_loaded_champion(app, timeout).is_ok_and(|loaded| loaded.matches(&expected)))
 }
 
-fn ensure_start_allowed() -> Result<(), String> {
+fn ensure_start_allowed(during_promotion: bool) -> Result<(), String> {
     if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("app is shutting down — not starting the champion server".to_string());
+    }
+    if !during_promotion && PROMOTION_RECOVERY_BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("champion start is blocked because promotion recovery is unverified".to_string());
     }
     Ok(())
 }
 
-fn start_child(app: &tauri::AppHandle) -> Result<(), String> {
-    ensure_start_allowed()?;
+fn start_child(app: &tauri::AppHandle, during_promotion: bool) -> Result<(), String> {
+    ensure_start_allowed(during_promotion)?;
     kill_owned_child(); // never leak a previous child
     let script = server_script_path(app)
         .ok_or(
@@ -587,7 +636,18 @@ fn start_child(app: &tauri::AppHandle) -> Result<(), String> {
 /// Restart the exact registry-selected deployment. Used by owner-approved promotion/rollback and
 /// by the Start button; no detached PowerShell process or model-dir environment is involved.
 pub fn restart_current_champion(app: &tauri::AppHandle) -> Result<(), String> {
-    start_child(app)
+    if PROMOTION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("champion restart is owned by an active promotion/recovery".to_string());
+    }
+    start_child(app, false)
+}
+
+/// Only the production promotion runtime may restart while it holds [`PromotionLease`].
+pub(crate) fn restart_current_champion_for_promotion(app: &tauri::AppHandle) -> Result<(), String> {
+    if !PROMOTION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("promotion restart requires the active promotion lease".to_string());
+    }
+    start_child(app, true)
 }
 
 /// App-exit hook: refuse any further starts (closing the Exit-vs-tick race), then kill the child.
@@ -617,6 +677,11 @@ pub fn spawn_supervision_loop(app: tauri::AppHandle) {
         let mut gave_up_logged = false;
         loop {
             tokio::time::sleep(TICK).await;
+            if PROMOTION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+                || PROMOTION_RECOVERY_BLOCKED.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                continue;
+            }
             let enabled = app
                 .try_state::<crate::AppState>()
                 .map(|s| s.lock_settings().champion_supervision_enabled)
@@ -639,7 +704,7 @@ pub fn spawn_supervision_loop(app: tauri::AppHandle) {
                     .unwrap_or(false);
             match state.tick(healthy, t0.elapsed()) {
                 Decision::Restart => {
-                    if let Err(e) = start_child(&app) {
+                    if let Err(e) = start_child(&app, false) {
                         tracing::warn!("Champion supervision: start failed: {e}");
                     }
                 }
@@ -662,6 +727,8 @@ pub fn spawn_supervision_loop(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn champion_launch_is_an_argument_vector_not_shell_source() {
@@ -692,11 +759,35 @@ mod tests {
     }
 
     #[test]
+    fn promotion_lease_is_exclusive_and_releases_on_drop() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        PROMOTION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let lease = acquire_promotion_lease().expect("first promotion owns the process-wide lease");
+        assert!(acquire_promotion_lease().is_err(), "a concurrent promotion must fail before any mutation");
+        drop(lease);
+        let replacement = acquire_promotion_lease().expect("dropping the lease permits the next promotion");
+        drop(replacement);
+    }
+
+    #[test]
+    fn recovery_fence_blocks_ordinary_start_but_not_saga_restart() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        PROMOTION_RECOVERY_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(champion_operational_block_reason().is_some());
+        assert!(ensure_start_allowed(false).is_err());
+        assert!(ensure_start_allowed(true).is_ok(), "the saga must be able to restart candidate or incumbent");
+        PROMOTION_RECOVERY_BLOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(champion_operational_block_reason().is_none());
+    }
+
+    #[test]
     fn start_is_refused_after_begin_shutdown() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
         // Closes the Exit-vs-tick race: a tick deciding Restart after the Exit handler ran must not
         // spawn a server nothing kills.
         begin_shutdown();
-        let err = ensure_start_allowed().expect_err("start_child must refuse during shutdown");
+        let err = ensure_start_allowed(false).expect_err("start_child must refuse during shutdown");
         assert!(err.contains("shutting down"), "{err}");
         // Restore for any other test in this process (statics are process-global).
         SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
