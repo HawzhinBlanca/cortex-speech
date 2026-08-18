@@ -43,6 +43,7 @@ DEFAULT_FLOOR_GB = 20.0
 def evaluate_supervision(
     *,
     watchdog_state: str | None,
+    watchdog_starts_when_available: bool | None = None,
     session_expected: bool,
     reviewer_count: int,
     couch_status: int | None,
@@ -61,6 +62,24 @@ def evaluate_supervision(
         problems.append(
             f"{WATCHDOG_TASK} is DISABLED — the app is unsupervised. Re-enable with "
             f"`schtasks /change /tn {WATCHDOG_TASK} /enable`. (A rebuild disables it; something has to turn it back on.)"
+        )
+    elif watchdog_starts_when_available is False:
+        # REGISTERED, ENABLED, AND STILL USELESS AFTER A SLEEP. Windows DROPS a repetition occurrence
+        # that comes due while the machine is asleep or off unless StartWhenAvailable is set; it does
+        # not run it late. cortex-watchdog.ps1 registers the task WITH -StartWhenAvailable, so a live
+        # task without it has drifted from its own definition and nothing was watching for that.
+        #
+        # Measured 2026-08-18 from watchdog.log: 19 clean-exit relaunches, median ~8 min of downtime,
+        # and one that took 9 h 18 m (exit 2026-08-13 19:23 UTC, detected 2026-08-14 07:42 local).
+        # The couch server lives inside the app, so every one of those windows is every reviewer link
+        # DEAD, not merely an import that fails.
+        problems.append(
+            f"{WATCHDOG_TASK} is registered and enabled but StartWhenAvailable is FALSE, so Windows "
+            f"silently DROPS every check that comes due while the machine sleeps instead of running it "
+            f"late — measured cost: one 9 h 18 m outage with every reviewer link dead. The live task has "
+            f"drifted from scripts/ops/cortex-watchdog.ps1, which registers it WITH -StartWhenAvailable. "
+            f"Re-register: powershell -ExecutionPolicy Bypass -File "
+            f"cortex-speech-app/scripts/ops/cortex-watchdog.ps1 -Register"
         )
 
     if session_expected:
@@ -83,6 +102,34 @@ def evaluate_supervision(
         )
 
     return problems
+
+
+def _watchdog_starts_when_available() -> bool | None:
+    """The live task's StartWhenAvailable flag, or None when it cannot be read.
+
+    Deliberately a SEPARATE probe from the State query: a task can be perfectly `Ready` and still be
+    unable to heal anything after the machine wakes, which is the failure this arm exists to catch.
+    """
+    try:
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-ScheduledTask -TaskName '{WATCHDOG_TASK}' -ErrorAction SilentlyContinue)"
+                ".Settings.StartWhenAvailable",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, FileNotFoundError):
+        return None
+    if out.returncode != 0:
+        return None
+    answer = out.stdout.strip().lower()
+    if answer in {"true", "false"}:
+        return answer == "true"
+    return None
 
 
 def _watchdog_state() -> str | None:
@@ -165,6 +212,7 @@ def main() -> int:
 
     problems = evaluate_supervision(
         watchdog_state=_watchdog_state(),
+        watchdog_starts_when_available=_watchdog_starts_when_available(),
         session_expected=reviewer_count > 0,
         reviewer_count=reviewer_count,
         couch_status=_couch_status() if reviewer_count > 0 else None,

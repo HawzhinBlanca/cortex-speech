@@ -42,6 +42,35 @@ def test_unregistered_watchdog_fails():
     assert "not registered" in problems[0]
 
 
+def test_a_watchdog_that_cannot_wake_the_machine_fails():
+    """REGISTERED, ENABLED, AND STILL USELESS AFTER A SLEEP (2026-08-18).
+
+    Windows DROPS a repetition occurrence that comes due while the machine is asleep unless
+    StartWhenAvailable is set — it does not run it late. cortex-watchdog.ps1 registers the task WITH
+    that flag, but the LIVE task on the owner's machine had drifted to False and nothing looked.
+    Measured from watchdog.log: 19 clean-exit relaunches, median ~8 min down, worst 9 h 18 m — and the
+    couch server lives inside the app, so each window is every reviewer link dead.
+    """
+    problems = evaluate_supervision(**{**HEALTHY, "watchdog_starts_when_available": False})
+    assert len(problems) == 1, problems
+    assert "StartWhenAvailable" in problems[0]
+    assert "9 h 18 m" in problems[0], "the message must carry the measured cost, not just the flag name"
+
+
+def test_an_unreadable_start_when_available_is_not_a_failure():
+    """None means the probe could not ask (no PowerShell, not Windows). Degrade, never false-alarm."""
+    assert evaluate_supervision(**{**HEALTHY, "watchdog_starts_when_available": None}) == []
+
+
+def test_a_disabled_watchdog_outranks_the_drift_check():
+    """Disabled is the worse problem and must be the one reported — not two confusing messages."""
+    problems = evaluate_supervision(
+        **{**HEALTHY, "watchdog_state": "Disabled", "watchdog_starts_when_available": False}
+    )
+    assert len(problems) == 1, problems
+    assert "DISABLED" in problems[0]
+
+
 def test_live_links_with_a_dead_server_fails():
     """The 2026-08-15 case: five links sent, app exited, nothing listening."""
     problems = evaluate_supervision(**{**HEALTHY, "couch_status": None})
