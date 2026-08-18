@@ -9301,6 +9301,31 @@ The 403/7/4 split is not a bug either: content-grouping puts the whole dominant 
 80/10/10 cannot be honoured when 97 % of the clips are one recording. That is the same skew gate B
 measures, showing up in a second place.
 
+### Measured, NOT fixed: every export re-hashes the whole source once per clip
+
+Chasing the quadratic export turned up a second cost in a different function, so it was measured
+rather than assumed. `decode_to_pcm` (the path the CSV/HuggingFace/WAV exports use, one call per
+segment) computes its LRU key by blake3-hashing the ENTIRE source file before it can look the entry
+up — so a cache HIT still reads and hashes the whole file, then clones the decoded PCM.
+
+Release build, on the dominant recording:
+
+```
+MEASURED file=326.8 MB decoded=120.0 MB | cold decode 44.37s | cached hit avg 0.162s (5 runs)
+        | 414 clips would pay 66.9s of cache-hit overhead
+```
+
+So a full dataset export burns about **67 seconds doing nothing but re-hashing a file it has already
+decoded**, and that grows with both corpus size and file size. (The same probe in a debug build reads
+0.222 s/hit — quoted here only to note that the debug number is NOT the real one.)
+
+**Deliberately not fixed tonight, and this is the reason.** The obvious fix — memoise
+`path -> content hash` on `(path, len, mtime)` — trades a *correctness* property for speed: content
+addressing is what makes the cache immune to a file being edited in place. The exposure is small
+(same length AND same 100 ns mtime) but it is a real weakening of a deliberate design, on a machine
+whose whole point is a verbatim corpus. That is an owner call, not an overnight one. The export is
+slow, not wrong; the quadratic one was blocking a gate, this one is not.
+
 ### Corpus, measured tonight
 
 ```
