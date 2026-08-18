@@ -9878,3 +9878,106 @@ four checks green" carry more weight than it earns. The live champion, database 
 untouched throughout.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (evening) — gate D turns for the first time, and stops where the corpus stops
+
+The flywheel's train step had **no compatible trainer at all**. `train_challenger.py` hands an
+external trainer `--manifest --out --base --contract` and refuses to say "trained" without hashed
+consumption evidence; the real trainer (`train_omni_7b.py`, fairseq2 + PEFT LoRA, DDP under WSL)
+speaks `--train_jsonl`/`--output_dir` and emits none of it. `scripts/omni7b_trainer_adapter.py` is
+the bridge. It attests only what it can prove: rows consumed parsed from the TRAINER'S OWN stdout,
+a recipe hash over the trainer file plus hyperparameters, an environment hash over the measured
+toolchain, and a seed applied by a launcher shim (the trainer has no `--seed`, and a number that
+steers nothing is decoration).
+
+### The measured result
+
+**A challenger trained on 403 of the owner's corrected labels beats the champion.** Same 348 frozen
+FLEURS ckb clips, same manifest bytes (`ed7130755aaf14e1`), same normalization basis:
+
+```
+                     CER                          WER
+champion    7.91%  [6.83, 9.15]        33.97%  [32.23, 35.78]
+challenger  7.56%  [6.32, 9.01]        28.22%  [26.35, 30.18]
+
+MAPSSWE word: z = +7.81   p = 5.887e-15   N=348  -> challenger better  (SIGNIFICANT)
+MAPSSWE char: z = +0.88   p = 3.769e-01   N=348  -> challenger better  (NOT significant)
+```
+
+**The WER gain is significant; the CER gain is not.** Both are reported because reporting only the
+significant one would be a lie by selection. Honest limits: one epoch, 403 clips, ~94 % of the
+labeled duration from a single recording, evaluated out of domain on FLEURS. This proves the
+machinery and the direction — not a promotable model.
+
+The training set was 403 rows of which **235 were `edit` rows** — the human corrections the P0
+validator was rejecting outright. Those corrections are what produced the gain. Before this
+morning's fix the run could not have happened: the real pack went from **241 preflight problems to
+0** once `edit` was admitted, the 241 − 6 difference being exactly the 235 edits.
+
+### Gate D, step by step
+
+| step | state | evidence |
+|---|---|---|
+| snapshot | **PASS** | sealed `23db46a0…`, pack verified 0 problems |
+| train | **PASS** | `CHALLENGER: TRAINED + VERIFIED`; `check_challenger_loop.audit_run` -> **NONE, fully bound** |
+| eval | **PASS** | both scorecards above, paired MAPSSWE |
+| verdict | **BLOCKED** | see below — not a tooling gap |
+
+Challenger identity, served through the real production path on GPU 1:
+
+```
+model_id  omniasr-7b-challenger-eb0105fdb6a57fdcc5b568ff
+adapter   79,768,688 B  6f938f78…   (incumbent: same size, c348ade8… — same LoRA shape, new weights)
+[gpu1] LoRA applied. Pipeline ready. serving on 127.0.0.1:8798
+```
+
+### Why the verdict is corpus-blocked, measured not inferred
+
+```
+EVAL SLICES: REFUSED - 348 manifest row(s) did not resolve to exactly one library segment
+(first: [0, 1, 2, 3, 4]); zero protected slices were produced
+```
+
+`promotion_gate.py` mandates manifest-bound protected slices; `build_eval_slices.py` builds them only
+from eval rows resolvable to live library segments. FLEURS is external and deliberately never
+imported — and importing it is **not** a legitimate workaround, because the pack selects training
+rows from the library, so it would risk exactly the train/test leak the split policy prevents. The
+library-resident alternative is **11 held-out clips across 4 recordings (7/2/1/1)** against a
+>= 5-per-group floor.
+
+**Gate D's verdict is therefore gated on gate B.** Labels are not merely the largest workload; they
+are the prerequisite that makes the promotion machinery exercisable at all.
+
+Also missing and now written: nothing generated the scorecard provenance sidecar the gate requires —
+only the gate that consumes it. `scripts/emit_scorecard_provenance.py` derives the challenger's
+fields through the gate's OWN `load_challenger_run`, so the sidecar cannot disagree with what the
+gate re-verifies.
+
+### The champion cannot currently survive a restart
+
+Found while restoring the GPUs, and more serious than the thing it interrupted. The on-disk
+`cortex_7b_server.py` refuses to start without a schema-2 champion pointer:
+
+```
+FATAL: refusing to serve an unverified champion deployment:
+no champion pointer configured / unsupported champion pointer schema
+```
+
+The live `champion.json` is `{"champions": {}, "schema": 1}`, and the RUNNING server was started
+from an older code path (`CORTEX_7B_MODEL_DIR=/home/ai/cortex_champion_model`, no pointer). So the
+champion serves fine while it lives, but **a reboot, a watchdog relaunch, or any restart would not
+bring it back**. This is pre-existing and independent of this work; it is Codex's finding #2
+confirmed empirically. All five hashes `bootstrap_legacy_champion.py` pins verify against the files
+on disk, so the incumbent IS reconstructible — installing that pointer is an owner-gated deployment
+and was not done.
+
+### Operating discipline
+
+The canary ran beside a live champion with **zero reviewer downtime**. GPU 1 was freed by stopping
+only its worker: the parent deliberately does not respawn (`SERVING DEGRADED on 1 of 2 replica(s)`),
+so no app restart and no couch interruption. Verified mid-operation, not merely by port — the
+champion transcribed real clips at 7.49 % CER while the challenger trained on the other card. WSL
+reports GPU memory through `vmwp`; `nvidia-smi` per-GPU figures do not track WSL allocations at all
+(holding 14 GiB moved it by 0 MiB), so the split was confirmed with a deliberate allocation probe.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
