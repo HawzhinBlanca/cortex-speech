@@ -1140,7 +1140,7 @@ fn champion_commit_atomically_updates_transcript_provenance_and_sole_hypothesis(
         confidence: Some(0.98),
     };
     assert!(db
-        .commit_champion_transcript_if_unreviewed(&champion, Some(decomposed), Some("external_provider"), true)
+        .commit_champion_transcript_if_unreviewed(&champion, None, Some(decomposed), Some("external_provider"), true,)
         .unwrap());
 
     let stored = db.get_segment_by_id(&segment.id).unwrap().unwrap();
@@ -1163,6 +1163,178 @@ fn champion_commit_atomically_updates_transcript_provenance_and_sole_hypothesis(
         })
         .unwrap();
     assert_eq!(hypothesis_version, "omniasr-wsl-7b");
+}
+
+#[test]
+fn champion_commit_persists_the_exact_returned_registry_identity() {
+    let db = make_db();
+    let deployment_sha256 = "a".repeat(64);
+    crate::registry::register_candidate(
+        &db,
+        &crate::registry::NewModelVersion {
+            id: "omniasr-7b-returned-a".to_string(),
+            family: "omniasr-7b".to_string(),
+            model_card_name: Some("facebook/omniasr-llm-7b".to_string()),
+            checkpoint_sha256: deployment_sha256.clone(),
+            checkpoint_path: "/test/deployment-a.json".to_string(),
+            source: "cortex-finetuned".to_string(),
+            license: "test-only".to_string(),
+        },
+    )
+    .unwrap();
+    crate::registry::promote_to_champion(&db, "omniasr-7b-returned-a").unwrap();
+
+    let mut segment = make_segment("identity-persist", "/identity-persist.wav");
+    segment.raw_transcript = "incumbent draft".to_string();
+    segment.model_version_id = Some("incumbent-model".to_string());
+    db.insert_segment(&segment).unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "incumbent-model".to_string(),
+        transcript: "incumbent vote".to_string(),
+        confidence: Some(0.2),
+    })
+    .unwrap();
+
+    // These are the exact identity fields returned by the out-of-process ASR reply. The commit
+    // must bind the model id to the current registry row carrying the same deployment digest before
+    // either transcript table is changed.
+    let returned = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "omniasr-7b-returned-a".to_string(),
+        transcript: "returned champion transcript".to_string(),
+        confidence: Some(0.97),
+    };
+    assert!(db
+        .commit_champion_transcript_if_unreviewed(
+            &returned,
+            Some(&deployment_sha256),
+            Some("returned normalized transcript"),
+            Some("external_provider"),
+            false,
+        )
+        .unwrap());
+
+    let stored = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+    assert_eq!(stored.model_version_id.as_deref(), Some(returned.model_id.as_str()));
+    assert_eq!(stored.raw_transcript, returned.transcript);
+    let hypotheses = db.get_hypotheses_for_segment(&segment.id).unwrap();
+    assert_eq!(hypotheses.len(), 1);
+    assert_eq!(hypotheses[0].model_id, returned.model_id);
+
+    // `speech_segments.model_version_id` is the durable link to the immutable registry identity;
+    // prove the stored transcript resolves to the exact deployment SHA supplied by the ASR reply.
+    let persisted_identity: (String, String, String) = db
+        .connection()
+        .query_row(
+            "SELECT s.model_version_id, h.model_version_id, mv.checkpoint_sha256
+             FROM speech_segments s
+             JOIN segment_hypotheses h ON h.segment_id = s.id
+             JOIN model_versions mv ON mv.id = s.model_version_id
+             WHERE s.id = ?1",
+            [&segment.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted_identity,
+        (returned.model_id.clone(), returned.model_id, deployment_sha256),
+        "both transcript records must resolve to the exact returned deployment identity"
+    );
+}
+
+#[test]
+fn champion_commit_refuses_without_writes_if_champion_rotated_after_asr_reply() {
+    let db = make_db();
+    let deployment_a_sha256 = "a".repeat(64);
+    let deployment_b_sha256 = "b".repeat(64);
+    for (id, sha, path) in [
+        ("omniasr-7b-race-a", deployment_a_sha256.as_str(), "/test/deployment-race-a.json"),
+        ("omniasr-7b-race-b", deployment_b_sha256.as_str(), "/test/deployment-race-b.json"),
+    ] {
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: id.to_string(),
+                family: "omniasr-7b".to_string(),
+                model_card_name: Some("facebook/omniasr-llm-7b".to_string()),
+                checkpoint_sha256: sha.to_string(),
+                checkpoint_path: path.to_string(),
+                source: "cortex-finetuned".to_string(),
+                license: "test-only".to_string(),
+            },
+        )
+        .unwrap();
+    }
+    crate::registry::promote_to_champion(&db, "omniasr-7b-race-a").unwrap();
+
+    let mut segment = make_segment("identity-race", "/identity-race.wav");
+    segment.raw_transcript = "untouched transcript".to_string();
+    segment.normalized_transcript = Some("untouched normalized".to_string());
+    segment.confidence = Some(0.31);
+    segment.confidence_source = Some("incumbent_source".to_string());
+    segment.model_version_id = Some("incumbent-model".to_string());
+    db.insert_segment(&segment).unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "incumbent-model".to_string(),
+        transcript: "untouched vote".to_string(),
+        confidence: Some(0.31),
+    })
+    .unwrap();
+
+    // Inference returned while A was champion. Before its reply reaches the commit boundary, a
+    // promotion atomically rotates the registry to B.
+    let stale_reply = SegmentHypothesis {
+        segment_id: segment.id.clone(),
+        model_id: "omniasr-7b-race-a".to_string(),
+        transcript: "stale in-flight transcript".to_string(),
+        confidence: Some(0.99),
+    };
+    crate::registry::promote_to_champion(&db, "omniasr-7b-race-b").unwrap();
+    let changes_before: i64 = db.connection().query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+
+    let error = db
+        .commit_champion_transcript_if_unreviewed(
+            &stale_reply,
+            Some(&deployment_a_sha256),
+            Some("stale normalized transcript"),
+            Some("external_provider"),
+            true,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("MODEL_IDENTITY_CHANGED"),
+        "a champion rotation must fail closed with a stable identity error: {error}"
+    );
+    let changes_after: i64 = db.connection().query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        changes_after, changes_before,
+        "the rejected stale reply must execute zero INSERT/UPDATE/DELETE statements"
+    );
+
+    let stored = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+    assert_eq!(stored.raw_transcript, "untouched transcript");
+    assert_eq!(stored.normalized_transcript.as_deref(), Some("untouched normalized"));
+    assert_eq!(stored.confidence, Some(0.31));
+    assert_eq!(stored.confidence_source.as_deref(), Some("incumbent_source"));
+    assert_eq!(stored.model_version_id.as_deref(), Some("incumbent-model"));
+    assert!(!stored.cloud_call);
+    let hypotheses = db.get_hypotheses_for_segment(&segment.id).unwrap();
+    assert_eq!(hypotheses.len(), 1);
+    assert_eq!(hypotheses[0].model_id, "incumbent-model");
+    assert_eq!(hypotheses[0].transcript, "untouched vote");
+
+    let current_champion: (String, String) = db
+        .connection()
+        .query_row(
+            "SELECT id, checkpoint_sha256 FROM model_versions
+             WHERE family = 'omniasr-7b' AND status = 'champion'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(current_champion, ("omniasr-7b-race-b".to_string(), deployment_b_sha256));
 }
 
 #[test]
@@ -1202,6 +1374,7 @@ fn champion_commit_cas_miss_preserves_human_owned_rows_and_existing_votes() {
         assert!(
             !db.commit_champion_transcript_if_unreviewed(
                 &champion,
+                None,
                 Some("late normalized draft"),
                 Some("external_provider"),
                 true,
@@ -1259,6 +1432,7 @@ fn champion_commit_rolls_back_transcript_and_hypotheses_when_hypothesis_insert_f
     assert!(db
         .commit_champion_transcript_if_unreviewed(
             &champion,
+            None,
             Some("new champion normalized"),
             Some("external_provider"),
             true,
@@ -1281,6 +1455,7 @@ fn champion_commit_rolls_back_transcript_and_hypotheses_when_hypothesis_insert_f
     assert!(db
         .commit_champion_transcript_if_unreviewed(
             &champion,
+            None,
             Some("new champion normalized"),
             Some("external_provider"),
             true,

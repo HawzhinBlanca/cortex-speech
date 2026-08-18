@@ -743,10 +743,11 @@ fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
 
 #[test]
 fn parses_wsl_segment_result_from_stdout_marker() {
-    let stdout = "loading model\n__RESULT__={\"raw_transcript\":\"دەقی دروست\",\"confidence\":0.94}\ndone\n";
-    let (text, confidence) = super::parse_wsl_segment_result(stdout).unwrap();
-    assert_eq!(text, "دەقی دروست");
-    assert_eq!(confidence, Some(0.94));
+    let stdout = "loading model\n__RESULT__={\"raw_transcript\":\"دەقی دروست\",\"confidence\":0.94,\"model_version_id\":\"challenger-1\",\"deployment_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\ndone\n";
+    let result = super::parse_wsl_segment_result(stdout).unwrap();
+    assert_eq!(result.raw_transcript, "دەقی دروست");
+    assert_eq!(result.confidence, Some(0.94));
+    assert_eq!(result.model_version_id, "challenger-1");
 }
 
 #[test]
@@ -773,10 +774,9 @@ fn refinement_guard_keeps_small_edits_and_rejects_hallucinations() {
 }
 
 #[test]
-fn wsl7b_without_script_is_unresolved_not_silently_downgraded() {
-    // F2: WSL 7B selected + empty script + fine-tuned engine off => the ONLY thing left is stock
-    // local CTC, which the owner never chose. The primary path must report "unresolved" so it
-    // fails loudly instead of silently transcribing with 300M.
+fn clean_default_resolves_the_bundled_wsl_client_without_manual_configuration() {
+    // The selected factory-default champion and its client must be a self-contained configuration.
+    // An explicit path remains an override, not a prerequisite for the app's own selected engine.
     let settings = AppSettings {
         asr_model_size: AsrModelSize::WSL7B,
         external_asr_script_path: String::new(),
@@ -784,18 +784,8 @@ fn wsl7b_without_script_is_unresolved_not_silently_downgraded() {
         ..AppSettings::default()
     };
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
-    assert!(pipeline.wsl7b_primary_unresolved(), "WSL7B + no script + no finetuned must be unresolved");
-    assert!(!pipeline.should_use_wsl_primary_asr(), "no script => not the WSL primary path");
-    let msg = super::ProcessingPipeline::primary_engine_unavailable_error().to_string();
-    assert!(
-        msg.contains(super::ASR_7B_UNAVAILABLE_TAG),
-        "error must carry the UI sentinel so the app offers retry-or-offline, not a dead-end: {msg}"
-    );
-    assert!(
-        msg.contains("offline model"),
-        "error must name the offline-model choice the owner can deliberately pick: {msg}"
-    );
-    assert!(msg.contains("silently downgrade"), "error must state the no-downgrade contract: {msg}");
+    assert!(!pipeline.wsl7b_primary_unresolved(), "the bundled client must resolve on a clean checkout/install");
+    assert!(pipeline.should_use_wsl_primary_asr(), "the clean default must enter the exact WSL champion path");
 }
 
 #[test]
@@ -1118,15 +1108,20 @@ fn empty_7b_result_is_legitimate_not_infra_failure() {
     // A reachable 7B server emitting a __RESULT__ line with an empty transcript (a silent/music
     // clip) must parse Ok(("", ..)) so the caller escalates only THAT segment — never Err, which
     // would roll back the whole import and leave the file permanently unimportable via the 7B.
-    let (text, conf) = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"\", \"confidence\": null}")
+    let result = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\":\"\",\"confidence\":null,\"model_version_id\":\"challenger-1\",\"deployment_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}")
         .expect("an empty-but-present result is a legitimate outcome, not an infra failure");
-    assert_eq!(text, "");
-    assert_eq!(conf, None);
+    assert_eq!(result.raw_transcript, "");
+    assert_eq!(result.confidence, None);
 
     // A real transcript still parses.
-    let (text, _) = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\": \"ئەمە\", \"confidence\": 0.9}")
+    let result = super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\":\"ئەمە\",\"confidence\":0.9,\"model_version_id\":\"challenger-1\",\"deployment_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}")
         .expect("a real transcript parses");
-    assert_eq!(text, "ئەمە");
+    assert_eq!(result.raw_transcript, "ئەمە");
+
+    assert!(
+        super::parse_wsl_segment_result("__RESULT__={\"raw_transcript\":\"ئەمە\",\"confidence\":0.9}").is_err(),
+        "a transcript without exact model/deployment identity is uncommittable"
+    );
 
     // NO __RESULT__ line at all is the real infrastructure failure -> Err.
     assert!(

@@ -1620,19 +1620,23 @@ fn hypotheses_for_selected_asr(
         return hypotheses;
     }
 
+    let Some(recorded_model_id) = segment.model_version_id.as_deref().filter(|id| !id.trim().is_empty()) else {
+        // Without a persisted producing-version id, choosing the *current* champion would rewrite
+        // history after promotion. Return no attributable vote instead of inventing provenance.
+        return Vec::new();
+    };
     hypotheses.retain(|hypothesis| {
-        hypothesis.model_id == crate::pipeline::CHAMPION_MODEL_ID
+        hypothesis.model_id == recorded_model_id
             && !hypothesis.transcript.trim().is_empty()
             && !crate::quality::is_placeholder_transcript(&hypothesis.transcript)
     });
     if hypotheses.is_empty()
-        && segment.model_version_id.as_deref() == Some(crate::pipeline::CHAMPION_MODEL_ID)
         && !segment.raw_transcript.trim().is_empty()
         && !crate::quality::is_placeholder_transcript(&segment.raw_transcript)
     {
         hypotheses.push(crate::db::SegmentHypothesis {
             segment_id: segment.id.clone(),
-            model_id: crate::pipeline::CHAMPION_MODEL_ID.to_string(),
+            model_id: recorded_model_id.to_string(),
             transcript: segment.raw_transcript.clone(),
             confidence: segment.confidence,
         });
@@ -1849,9 +1853,15 @@ pub async fn get_jobs(state: State<'_, AppState>) -> Result<Vec<crate::jobs::Job
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
-    /// The champion (OmniASR-7B) warm server is answering on its WSL loopback port.
+    /// True only when the warm server reports the exact id + deployment SHA selected by registry.
     pub ready: bool,
     pub port: u16,
+    pub identity_matches: bool,
+    pub expected_model_version_id: Option<String>,
+    pub expected_deployment_sha256: Option<String>,
+    pub loaded_model_version_id: Option<String>,
+    pub loaded_deployment_sha256: Option<String>,
+    pub reason: Option<String>,
 }
 
 /// The model registry, newest-first within each family — what a registry panel lists.
@@ -1902,6 +1912,125 @@ pub async fn import_model_checkpoint(
             sha,
         )
         .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Import a content-addressed OmniASR-7B deployment. Identity comes from the verified manifest,
+/// never from renderer-supplied model/card fields, and all four behavior-determining components are
+/// hashed before the DB lock is acquired.
+#[tauri::command]
+pub async fn import_model_deployment(
+    manifest_path: String,
+    expected_deployment_sha256: String,
+    expected_model_id: String,
+    source: String,
+    license: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::registry::ModelVersion, String> {
+    STRICT_RATE_LIMITER.check("import_model_deployment")?;
+    validate::validate_identifier(&source)?;
+    validate::validate_identifier(&license)?;
+    validate::validate_identifier(&expected_model_id)?;
+    if expected_deployment_sha256.len() != 64
+        || !expected_deployment_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("expectedDeploymentSha256 must be a canonical lowercase SHA-256".into());
+    }
+    if manifest_path.trim().is_empty() || manifest_path.len() > 4096 || manifest_path.chars().any(char::is_control) {
+        return Err("manifestPath is empty, too long, or contains control characters".into());
+    }
+    let db = state.db_arc();
+    run_blocking(move || {
+        let verified = if manifest_path.starts_with('/') {
+            let server = crate::engine_runtime::server_script_path(&app)
+                .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
+            crate::deployment::verify_deployment_manifest_wsl(
+                &server,
+                &manifest_path,
+                &expected_deployment_sha256,
+                &expected_model_id,
+                std::time::Duration::from_secs(10 * 60),
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            let local = validate::validate_file_path(&manifest_path)?;
+            let local = crate::deployment::verify_deployment_manifest(
+                std::path::Path::new(&local),
+                Some(&expected_deployment_sha256),
+            )
+            .map_err(|error| error.to_string())?;
+            if local.manifest.model_id != expected_model_id {
+                return Err(format!(
+                    "deployment manifest model id '{}' does not match expectedModelId '{}'",
+                    local.manifest.model_id, expected_model_id
+                ));
+            }
+            local.record()
+        };
+        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::registry::register_verified_deployment_record(&db, &verified, &source, &license)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+/// One-time admission of the historically measured incumbent. This is deliberately a different
+/// command from challenger import: the registry family must be completely empty and the verified
+/// composite must match every owner-measured legacy pin. It cannot be reused for a future model.
+#[tauri::command]
+pub async fn bootstrap_legacy_champion(
+    manifest_path: String,
+    expected_deployment_sha256: String,
+    expected_model_id: String,
+    license: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::registry::ModelVersion, String> {
+    STRICT_RATE_LIMITER.check("bootstrap_legacy_champion")?;
+    validate::validate_identifier(&expected_model_id)?;
+    validate::validate_identifier(&license)?;
+    if expected_deployment_sha256.len() != 64
+        || !expected_deployment_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("expectedDeploymentSha256 must be a canonical lowercase SHA-256".into());
+    }
+    if manifest_path.trim().is_empty() || manifest_path.len() > 4096 || manifest_path.chars().any(char::is_control) {
+        return Err("manifestPath is empty, too long, or contains control characters".into());
+    }
+    let db = state.db_arc();
+    let data_dir =
+        state.lock_data_dir().clone().ok_or_else(|| "application data directory is unavailable".to_string())?;
+    run_blocking(move || {
+        let verified = if manifest_path.starts_with('/') {
+            let server = crate::engine_runtime::server_script_path(&app)
+                .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
+            crate::deployment::verify_deployment_manifest_wsl(
+                &server,
+                &manifest_path,
+                &expected_deployment_sha256,
+                &expected_model_id,
+                std::time::Duration::from_secs(10 * 60),
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            let local = validate::validate_file_path(&manifest_path)?;
+            let local = crate::deployment::verify_deployment_manifest(
+                std::path::Path::new(&local),
+                Some(&expected_deployment_sha256),
+            )
+            .map_err(|error| error.to_string())?;
+            if local.manifest.model_id != expected_model_id {
+                return Err("legacy deployment model id does not match expectedModelId".into());
+            }
+            local.record()
+        };
+        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let model = crate::registry::bootstrap_verified_legacy_deployment(&db, &verified, &license)
+            .map_err(|error| error.to_string())?;
+        crate::registry::sync_champion_pointer(&db, &data_dir).map_err(|error| error.to_string())?;
+        Ok(model)
     })
     .await
 }
@@ -2593,7 +2722,7 @@ fn run_wsl_refinement_loop(
             db_path,
             Some(&WSL_REFINE_CANCEL),
         ) {
-            Ok((raw_transcript, _)) if raw_transcript.trim().is_empty() => {
+            Ok(result) if result.raw_transcript.trim().is_empty() => {
                 // A blank 7B result (silent/music/noise clip — parse_wsl_segment_result returns Ok(""))
                 // must NOT overwrite an existing good transcript: update_asr_transcript_if_unreviewed
                 // writes raw_transcript unconditionally (guarding only human-reviewed rows). Skip; keep the
@@ -2609,7 +2738,9 @@ fn run_wsl_refinement_loop(
                     ),
                 );
             }
-            Ok((raw_transcript, confidence)) => {
+            Ok(result) => {
+                let raw_transcript = result.raw_transcript;
+                let confidence = result.confidence;
                 let normalized = if auto_normalize && !raw_transcript.is_empty() {
                     Some(normalizer.normalize(&raw_transcript))
                 } else {
@@ -2617,12 +2748,13 @@ fn run_wsl_refinement_loop(
                 };
                 let champion = crate::db::SegmentHypothesis {
                     segment_id: id.to_string(),
-                    model_id: crate::pipeline::CHAMPION_MODEL_ID.to_string(),
+                    model_id: result.model_version_id,
                     transcript: raw_transcript.clone(),
                     confidence,
                 };
                 match db.commit_champion_transcript_if_unreviewed(
                     &champion,
+                    Some(&result.deployment_sha256),
                     normalized.as_deref(),
                     Some("external_provider"),
                     false,

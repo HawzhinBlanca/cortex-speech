@@ -9,7 +9,9 @@
       "models/onnxruntime.dll/onnxruntime.dll",
       "models/onnxruntime.dll/onnxruntime_providers_shared.dll",
       "models/finetuned-mms-ckb/model.onnx",
-      "models/finetuned-mms-ckb/vocab.json"
+      "models/finetuned-mms-ckb/vocab.json",
+      "../scripts/cortex_7b_server.py",
+      "../scripts/cortex_7b_client.py"
     ]
   }
 }

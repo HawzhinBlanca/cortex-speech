@@ -13,21 +13,61 @@ use super::{
     STRICT_RATE_LIMITER,
 };
 use crate::AppState;
-use std::path::Path;
 use tauri::State;
 
 /// Bounded (~5s) health check of the champion 7B engine, for the UI status pill. Cheap + side-effect
 /// free (a TCP probe), so the frontend can poll it.
 #[tauri::command]
-pub async fn get_champion_engine_status() -> EngineStatus {
-    // The TCP probe blocks up to ~3s; run it on the blocking pool so the frontend's status-pill poll
-    // never freezes the UI. A JoinError (panic in the probe) is unreachable here — degrade to
-    // not-ready, which is the correct default for a health pill.
-    run_blocking(move || {
-        Ok(EngineStatus { ready: crate::pipeline::probe_wsl_7b_server(3), port: crate::pipeline::WSL_7B_SERVER_PORT })
+pub async fn get_champion_engine_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<EngineStatus, String> {
+    let port = crate::pipeline::WSL_7B_SERVER_PORT;
+    let expected =
+        crate::registry::champion_identity(&state.lock_db(), crate::deployment::OMNIASR_7B_FAMILY).ok().flatten();
+    let Some(expected) = expected else {
+        return Ok(EngineStatus {
+            ready: false,
+            port,
+            identity_matches: false,
+            expected_model_version_id: None,
+            expected_deployment_sha256: None,
+            loaded_model_version_id: None,
+            loaded_deployment_sha256: None,
+            reason: Some("No OmniASR-7B champion is registered; bootstrap the measured incumbent first.".into()),
+        });
+    };
+    let expected_for_probe = expected.clone();
+    let result =
+        run_blocking(move || crate::engine_runtime::query_loaded_champion(&app, std::time::Duration::from_secs(3)))
+            .await;
+    Ok(match result {
+        Ok(loaded) => {
+            let identity_matches = loaded.matches(&expected_for_probe);
+            EngineStatus {
+                ready: identity_matches,
+                port,
+                identity_matches,
+                expected_model_version_id: Some(expected.model_version_id),
+                expected_deployment_sha256: Some(expected.deployment_sha256),
+                loaded_model_version_id: Some(loaded.model_version_id),
+                loaded_deployment_sha256: Some(loaded.deployment_sha256),
+                reason: (!identity_matches).then_some(
+                    "The port answers, but the loaded model identity does not match the registry champion.".into(),
+                ),
+            }
+        }
+        Err(error) => EngineStatus {
+            ready: false,
+            port,
+            identity_matches: false,
+            expected_model_version_id: Some(expected.model_version_id),
+            expected_deployment_sha256: Some(expected.deployment_sha256),
+            loaded_model_version_id: None,
+            loaded_deployment_sha256: None,
+            reason: Some(error),
+        },
     })
-    .await
-    .unwrap_or(EngineStatus { ready: false, port: crate::pipeline::WSL_7B_SERVER_PORT })
 }
 
 /// Start the champion 7B server (WSL) FROM THE APP so the owner never hand-runs a terminal. Spawns
@@ -36,29 +76,9 @@ pub async fn get_champion_engine_status() -> EngineStatus {
 /// CORTEX_7B_START_SCRIPT (the desktop launcher sets it); without it we return an actionable error
 /// rather than guess a path.
 #[tauri::command]
-pub fn start_champion_engine() -> Result<(), String> {
+pub fn start_champion_engine(app: tauri::AppHandle) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("start_champion_engine")?;
-    let script = std::env::var("CORTEX_7B_START_SCRIPT").map_err(|_| {
-        "Set CORTEX_7B_START_SCRIPT to the full path of scripts/start_7b_server.ps1 (the desktop \
-         launcher sets it), or run that script once from a terminal."
-            .to_string()
-    })?;
-    if !Path::new(&script).is_file() {
-        return Err(format!("CORTEX_7B_START_SCRIPT does not point at a file: {script}"));
-    }
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.arg("-NoProfile").arg("-ExecutionPolicy").arg("Bypass").arg("-File").arg(&script);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    // Detach: the start script waits up to 8 min for warm-up; do NOT block the command on it.
-    cmd.spawn().map(|_child| ()).map_err(|e| format!("could not launch the engine start script: {e}"))
+    crate::engine_runtime::restart_current_champion(&app)
 }
 
 #[tauri::command]

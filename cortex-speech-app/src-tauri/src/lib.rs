@@ -12,6 +12,7 @@ pub mod audio;
 pub mod audio_quality;
 pub mod cache;
 pub mod cancel;
+pub mod champion_promotion;
 pub mod chunking;
 pub mod commands;
 pub mod constrained_decode;
@@ -20,6 +21,7 @@ pub mod couch;
 pub mod crash;
 pub mod db;
 pub mod denoiser;
+pub mod deployment;
 pub mod dialect;
 pub mod diarization;
 pub mod diff;
@@ -729,6 +731,8 @@ pub fn run() {
             commands::list_agent_stage_events,
             commands::list_model_versions,
             commands::import_model_checkpoint,
+            commands::import_model_deployment,
+            commands::bootstrap_legacy_champion,
             commands::create_gold_from_file,
             commands::import_verified_segments_as_gold,
             commands::export_gold_eval_set,

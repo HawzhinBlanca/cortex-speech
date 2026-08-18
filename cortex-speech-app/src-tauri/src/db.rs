@@ -1182,6 +1182,7 @@ impl Database {
     pub fn commit_champion_transcript_if_unreviewed(
         &self,
         champion: &SegmentHypothesis,
+        expected_deployment_sha256: Option<&str>,
         normalized_transcript: Option<&str>,
         confidence_source: Option<&str>,
         cloud_call: bool,
@@ -1190,6 +1191,13 @@ impl Database {
         crate::validation::input::validate_identifier(&champion.model_id).map_err(AppError::Validation)?;
         crate::validation::input::validate_text(&champion.transcript, 100_000, "Champion transcript")
             .map_err(AppError::Validation)?;
+        if let Some(sha) = expected_deployment_sha256 {
+            if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                return Err(AppError::Validation(
+                    "Champion deployment identity must be a canonical lowercase SHA-256".into(),
+                ));
+            }
+        }
         if let Some(normalized) = normalized_transcript {
             crate::validation::input::validate_text(normalized, 100_000, "Normalized transcript")
                 .map_err(AppError::Validation)?;
@@ -1199,6 +1207,23 @@ impl Database {
         let normalized_nfc = normalized_transcript.map(to_nfc);
         self.conn.execute("SAVEPOINT champion_commit", [])?;
         let result = (|| -> AppResult<bool> {
+            if let Some(expected_sha) = expected_deployment_sha256 {
+                let identity_is_current: bool = self.conn.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM model_versions
+                        WHERE id = ?1 AND family = 'omniasr-7b' AND status = 'champion'
+                          AND checkpoint_sha256 = ?2
+                    )",
+                    params![champion.model_id, expected_sha],
+                    |row| row.get(0),
+                )?;
+                if !identity_is_current {
+                    return Err(AppError::Validation(format!(
+                        "MODEL_IDENTITY_CHANGED: refusing transcript from model '{}' deployment '{}' because it is not the current registry champion",
+                        champion.model_id, expected_sha
+                    )));
+                }
+            }
             let rows_changed = self.conn.execute(
                 "UPDATE speech_segments
                  SET raw_transcript        = ?2,
@@ -2701,6 +2726,28 @@ impl Database {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
     }
 
+    fn read_payload_job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::jobs::PayloadJob> {
+        let state_token: String = r.get(2)?;
+        let id: String = r.get(0)?;
+        let state = crate::jobs::JobState::parse(&state_token).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                format!("job {id} has unknown state {state_token:?}").into(),
+            )
+        })?;
+        Ok(crate::jobs::PayloadJob {
+            id,
+            kind: r.get(1)?,
+            state,
+            idempotency_key: r.get(3)?,
+            error_code: r.get(4)?,
+            payload_json: r.get(5)?,
+        })
+    }
+
+    const PAYLOAD_JOB_COLS: &str = "id, kind, state, idempotency_key, error_code, payload_json";
+
     /// Fetch a job by id, or `None` if it doesn't exist.
     pub fn get_job(&self, id: &str) -> AppResult<Option<crate::jobs::Job>> {
         let sql = format!("SELECT {} FROM jobs WHERE id = ?1", Self::JOB_COLS);
@@ -2739,6 +2786,129 @@ impl Database {
             params![id, kind, idempotency_key, total],
         )?;
         self.get_job(id)?.ok_or_else(|| AppError::Other(format!("job {id} vanished immediately after insert")))
+    }
+
+    /// Fetch the durable payload for a payload-owning job kind. A NULL payload is an integrity error:
+    /// callers of this API have declared that their recovery contract depends on the journal bytes.
+    pub fn get_payload_job(&self, id: &str) -> AppResult<Option<crate::jobs::PayloadJob>> {
+        let sql = format!("SELECT {} FROM jobs WHERE id = ?1", Self::PAYLOAD_JOB_COLS);
+        match self.conn.query_row(&sql, params![id], Self::read_payload_job_row) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Atomically publish a job as `running` with its recovery payload before any external mutation.
+    /// An idempotent retry returns the existing row; the owning coordinator must compare its exact
+    /// contract bytes before resuming. No queued-without-payload crash window exists.
+    pub fn begin_running_payload_job(
+        &self,
+        id: &str,
+        kind: &str,
+        idempotency_key: &str,
+        payload_json: &str,
+    ) -> AppResult<crate::jobs::BegunPayloadJob> {
+        self.conn.execute("SAVEPOINT begin_running_payload_job", [])?;
+        let result: AppResult<crate::jobs::BegunPayloadJob> = (|| {
+            let by_key_sql = format!("SELECT {} FROM jobs WHERE idempotency_key = ?1", Self::PAYLOAD_JOB_COLS);
+            let existing = match self.conn.query_row(&by_key_sql, params![idempotency_key], Self::read_payload_job_row)
+            {
+                Ok(row) => Some(row),
+                Err(rusqlite::Error::QueryReturnedNoRows) => self.get_payload_job(id)?,
+                Err(e) => return Err(e.into()),
+            };
+            if let Some(job) = existing {
+                return Ok(crate::jobs::BegunPayloadJob { job, created: false });
+            }
+
+            self.conn.execute(
+                "INSERT INTO jobs
+                    (id, kind, state, idempotency_key, payload_json, started_at)
+                 VALUES (?1, ?2, 'running', ?3, ?4, datetime('now'))",
+                params![id, kind, idempotency_key, payload_json],
+            )?;
+            let job = self
+                .get_payload_job(id)?
+                .ok_or_else(|| AppError::Other(format!("payload job {id} vanished immediately after insert")))?;
+            Ok(crate::jobs::BegunPayloadJob { job, created: true })
+        })();
+        match result {
+            Ok(value) => {
+                self.release_savepoint("begin_running_payload_job")?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("begin_running_payload_job");
+                Err(error)
+            }
+        }
+    }
+
+    /// Compare-and-swap a running job's recovery payload. Re-running an external side effect after a
+    /// crash is safe only when phase advancement cannot silently overwrite another recovery worker.
+    pub fn compare_and_swap_running_job_payload(
+        &self,
+        id: &str,
+        kind: &str,
+        expected_payload_json: &str,
+        next_payload_json: &str,
+    ) -> AppResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE jobs SET payload_json = ?4, updated_at = datetime('now')
+             WHERE id = ?1 AND kind = ?2 AND state = 'running' AND payload_json = ?3",
+            params![id, kind, expected_payload_json, next_payload_json],
+        )?;
+        if changed != 1 {
+            return Err(AppError::Validation(format!(
+                "running payload job {id} changed concurrently or is no longer resumable"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Atomically persist a final payload and terminal state. The expected payload comparison makes a
+    /// stale recovery worker unable to claim success (or failure) over a newer phase.
+    pub fn finish_running_payload_job(
+        &self,
+        id: &str,
+        kind: &str,
+        expected_payload_json: &str,
+        final_payload_json: &str,
+        state: crate::jobs::JobState,
+        error_code: Option<&str>,
+    ) -> AppResult<()> {
+        if !matches!(state, crate::jobs::JobState::Succeeded | crate::jobs::JobState::Failed) {
+            return Err(AppError::Validation(format!(
+                "payload job {id} can only finish succeeded or failed, not {state}"
+            )));
+        }
+        let changed = self.conn.execute(
+            "UPDATE jobs SET state = ?5, error_code = ?6, payload_json = ?4,
+                 progress = CASE WHEN ?5 = 'succeeded' THEN 1.0 ELSE progress END,
+                 finished_at = datetime('now'), updated_at = datetime('now')
+             WHERE id = ?1 AND kind = ?2 AND state = 'running' AND payload_json = ?3",
+            params![id, kind, expected_payload_json, final_payload_json, state.as_str(), error_code],
+        )?;
+        if changed != 1 {
+            return Err(AppError::Validation(format!(
+                "running payload job {id} changed concurrently or is no longer finishable"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Startup recovery inventory for one durable kind. Unlike the generic orphan reaper, this
+    /// exposes the exact payloads so the owner can complete or roll back each state machine.
+    pub fn list_running_payload_jobs(&self, kind: &str) -> AppResult<Vec<crate::jobs::PayloadJob>> {
+        let sql = format!(
+            "SELECT {} FROM jobs WHERE kind = ?1 AND state = 'running'
+             ORDER BY datetime(created_at), id",
+            Self::PAYLOAD_JOB_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![kind], Self::read_payload_job_row)?.collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Move a job to `to`, enforcing the `JobState` lifecycle (an illegal edge — e.g. completing twice,
@@ -2797,7 +2967,7 @@ impl Database {
         let n = self.conn.execute(
             "UPDATE jobs SET state = 'failed', error_code = COALESCE(error_code, 'INTERRUPTED'),
                  finished_at = datetime('now'), updated_at = datetime('now')
-             WHERE state = 'running'",
+             WHERE state = 'running' AND kind <> 'model_promotion'",
             [],
         )?;
         Ok(n)

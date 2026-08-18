@@ -287,6 +287,12 @@ export async function exportTranscript(path: string, format: 'txt' | 'srt' | 'vt
 export interface EngineStatus {
   ready: boolean;
   port: number;
+  identityMatches: boolean;
+  expectedModelVersionId: string | null;
+  expectedDeploymentSha256: string | null;
+  loadedModelVersionId: string | null;
+  loadedDeploymentSha256: string | null;
+  reason: string | null;
 }
 
 /** Health of the champion (OmniASR-7B) warm server, for the engine-status pill. */
@@ -594,6 +600,45 @@ export async function importModelCheckpoint(args: {
     source: args.source,
     license: args.license,
     modelCardName: args.modelCardName ?? null,
+  });
+}
+
+/**
+ * Register a complete OmniASR-7B deployment manifest as a candidate. The backend derives model,
+ * family and component identities from the verified file; renderer input cannot override them.
+ */
+export async function importModelDeployment(args: {
+  manifestPath: string;
+  expectedDeploymentSha256: string;
+  expectedModelId: string;
+  source: string;
+  license: string;
+}): Promise<ModelVersion> {
+  return invoke<ModelVersion>('import_model_deployment', {
+    manifestPath: args.manifestPath,
+    expectedDeploymentSha256: args.expectedDeploymentSha256,
+    expectedModelId: args.expectedModelId,
+    source: args.source,
+    license: args.license,
+  });
+}
+
+/**
+ * One-time registration of the measured pre-flywheel OmniASR-7B incumbent. The backend accepts only
+ * the exact pinned legacy composite and only while the family has no rows; this is not a general
+ * promotion shortcut.
+ */
+export async function bootstrapLegacyChampion(args: {
+  manifestPath: string;
+  expectedDeploymentSha256: string;
+  expectedModelId: string;
+  license: string;
+}): Promise<ModelVersion> {
+  return invoke<ModelVersion>('bootstrap_legacy_champion', {
+    manifestPath: args.manifestPath,
+    expectedDeploymentSha256: args.expectedDeploymentSha256,
+    expectedModelId: args.expectedModelId,
+    license: args.license,
   });
 }
 

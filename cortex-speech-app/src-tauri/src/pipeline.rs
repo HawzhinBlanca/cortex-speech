@@ -222,7 +222,7 @@ fn subprocess_error_preview(output: &str) -> String {
     preview
 }
 
-fn kill_and_reap_wsl_child(child: &mut std::process::Child, context: &str) {
+pub(crate) fn kill_and_reap_wsl_child(child: &mut std::process::Child, context: &str) {
     if let Err(error) = child.kill() {
         tracing::warn!("Failed to kill {context}: {error}");
     }
@@ -231,7 +231,7 @@ fn kill_and_reap_wsl_child(child: &mut std::process::Child, context: &str) {
     }
 }
 
-fn join_wsl_pipe_reader(thread: std::thread::JoinHandle<Vec<u8>>, stream: &str) -> Vec<u8> {
+pub(crate) fn join_wsl_pipe_reader(thread: std::thread::JoinHandle<Vec<u8>>, stream: &str) -> Vec<u8> {
     match thread.join() {
         Ok(buffer) => buffer,
         Err(_) => {
@@ -295,26 +295,35 @@ fn insert_hypothesis_checked(
     .map_err(|error| AppError::Other(format!("Failed to insert {model_id} hypothesis for {segment_id}: {error}")))
 }
 
-fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Wsl7bResult {
+    pub raw_transcript: String,
+    pub confidence: Option<f64>,
+    pub model_version_id: String,
+    pub deployment_sha256: String,
+}
+
+fn parse_wsl_segment_result(stdout: &str) -> AppResult<Wsl7bResult> {
     #[derive(serde::Deserialize)]
-    struct WslResult {
+    #[serde(deny_unknown_fields)]
+    struct WireResult {
         raw_transcript: String,
         confidence: Option<f64>,
+        model_version_id: String,
+        deployment_sha256: String,
     }
 
-    let mut raw_transcript = String::new();
-    let mut confidence: Option<f64> = None;
-    let mut saw_result = false;
+    let mut parsed: Option<WireResult> = None;
     for line in stdout.lines() {
         if let Some(stripped) = line.strip_prefix("__RESULT__=") {
-            if let Ok(res) = serde_json::from_str::<WslResult>(stripped) {
-                saw_result = true;
-                raw_transcript = res.raw_transcript;
-                // Sanitize the external script's confidence to a valid posterior: drop non-finite and
-                // clamp into [0,1]. A homegrown script emitting a percentage (e.g. 92.0) must not flow
-                // unbounded into the conformal certificate, where it would read as MAXIMAL certainty.
-                confidence = res.confidence.filter(|c| c.is_finite()).map(|c| c.clamp(0.0, 1.0));
+            if parsed.is_some() {
+                return Err(AppError::Validation(
+                    "WSL 7B ASR process returned multiple __RESULT__ lines; model identity is ambiguous".into(),
+                ));
             }
+            parsed = Some(serde_json::from_str::<WireResult>(stripped).map_err(|error| {
+                AppError::Validation(format!("WSL 7B ASR returned an invalid identity-bound result: {error}"))
+            })?);
         }
     }
 
@@ -325,11 +334,25 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<(String, Option<f64>)> {
     // silent chunk roll back the ENTIRE import and left the file permanently unimportable via the 7B.
     // So Err ONLY when no `__RESULT__` line was seen at all; an empty transcript returns Ok and the
     // caller escalates just that one segment.
-    if !saw_result {
-        return Err(AppError::Other("WSL 7B ASR process did not return a __RESULT__ line.".into()));
+    let result =
+        parsed.ok_or_else(|| AppError::Other("WSL 7B ASR process did not return a __RESULT__ line.".into()))?;
+    crate::validation::input::validate_identifier(&result.model_version_id).map_err(AppError::Validation)?;
+    if result.deployment_sha256.len() != 64
+        || !result.deployment_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(AppError::Validation("WSL 7B ASR result has no canonical deployment SHA-256 identity".into()));
     }
-
-    Ok((raw_transcript, confidence))
+    if result.raw_transcript.len() > 100_000 {
+        return Err(AppError::Validation(
+            "WSL 7B ASR result transcript exceeds the 100,000-byte persistence bound".into(),
+        ));
+    }
+    Ok(Wsl7bResult {
+        raw_transcript: result.raw_transcript,
+        confidence: result.confidence.filter(|value| value.is_finite()).map(|value| value.clamp(0.0, 1.0)),
+        model_version_id: result.model_version_id,
+        deployment_sha256: result.deployment_sha256,
+    })
 }
 
 /// Bounds concurrent WSL-7B client spawns process-wide.
@@ -421,6 +444,7 @@ pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.
 /// Stable provenance id for the owner's sole production ASR. Keep selection, persisted hypotheses,
 /// review filtering, and health/readiness checks tied to one identifier so an auxiliary model can
 /// never be mistaken for the champion by string drift between subsystems.
+#[cfg(test)]
 pub(crate) const CHAMPION_MODEL_ID: &str = "omniasr-wsl-7b";
 
 /// Stable marker in the Err that `transcribe()` returns for a legit-but-EMPTY 7B result — a REACHABLE
@@ -448,51 +472,6 @@ pub(crate) fn tag_7b_unavailable(err: AppError) -> AppError {
     AppError::Validation(format!("{ASR_7B_UNAVAILABLE_TAG}: {msg}"))
 }
 
-/// Lean, side-effect-free health probe of the OmniASR-7B warm server: TCP-connect 127.0.0.1:PORT
-/// inside WSL's network namespace (the loopback port is NOT reachable from Windows). Returns a bare
-/// bool for the engine-status surface — unlike `wsl_7b_server_preflight`, which fails hard with a
-/// user-facing message on the import path. `timeout_secs` bounds both the in-WSL probe and the child.
-pub(crate) fn probe_wsl_7b_server(timeout_secs: u64) -> bool {
-    let probe = format!("timeout {timeout_secs} bash -c 'exec 3<>/dev/tcp/127.0.0.1/{WSL_7B_SERVER_PORT}'");
-    let mut cmd = std::process::Command::new("wsl");
-    cmd.arg("bash").arg("-lc").arg(&probe);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    let Ok(mut child) = cmd.spawn() else {
-        return false; // no WSL / launch failure → engine is not reachable
-    };
-    // Bound the wait a hair past the in-WSL timeout so a wedged WSL can't hang the status poll.
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs + 2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    kill_and_reap_wsl_child(&mut child, "engine-status probe");
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => {
-                // A wait-status error may leave the probe child running; reap it before bailing,
-                // exactly like the sibling try_wait loops (run_wsl_segment_transcript, the 7B
-                // preflight probe). std::process::Child does NOT kill/reap on drop, so a bare
-                // `return false` here leaks a WSL process on every failed status poll — and this
-                // probe is called on a poll.
-                kill_and_reap_wsl_child(&mut child, "engine-status probe");
-                return false;
-            }
-        }
-    }
-}
-
 /// Translate a Windows path to its WSL `/mnt` view (mirrors `cortex_7b_client.py`'s `win_to_wsl`), so
 /// the app can hand the client a `CORTEX_7B_DB` that follows a moved data dir instead of the client's
 /// hardcoded default. `C:\a\b` -> `/mnt/c/a/b`; a `\\?\` extended-length prefix is stripped; a
@@ -510,6 +489,32 @@ pub(crate) fn win_path_to_wsl(p: &str) -> String {
     s
 }
 
+fn resolve_wsl_7b_client(configured: Option<String>) -> Option<String> {
+    for candidate in [configured, std::env::var("CORTEX_7B_CLIENT_SCRIPT").ok()].into_iter().flatten() {
+        let value = candidate.trim();
+        if value.starts_with('/') || std::path::Path::new(value).is_file() {
+            return Some(value.to_string());
+        }
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf))?;
+    [
+        "cortex_7b_client.py",
+        "scripts/cortex_7b_client.py",
+        "_up_/scripts/cortex_7b_client.py",
+        "../../../scripts/cortex_7b_client.py",
+        "../../scripts/cortex_7b_client.py",
+    ]
+    .into_iter()
+    .find_map(|relative| {
+        exe_dir
+            .join(relative)
+            .canonicalize()
+            .ok()
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+}
+
 /// Spawn the configured external WSL ASR client for ONE segment and return its parsed transcript.
 ///
 /// Shared by the per-segment pipeline path (`cancel = None`) and the batch refinement command. The
@@ -523,7 +528,7 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     segment_id: &str,
     db_path: &str,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> AppResult<(String, Option<f64>)> {
+) -> AppResult<Wsl7bResult> {
     // Hold a permit for the whole spawn+wait so no more 7B calls are in flight than the server has
     // replicas to serve them. Released on drop, including on an early return.
     let _gate = WSL_7B_GATE.acquire();
@@ -1016,7 +1021,7 @@ impl ProcessingPipeline {
     /// `transcribe_segment_finetuned`) — they are optional extras, never an automatic substitute.
     fn should_use_wsl_primary_asr(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
-            && self.settings.external_asr_script_path().is_some()
+            && resolve_wsl_7b_client(self.settings.external_asr_script_path()).is_some()
     }
 
     /// True when the fine-tuned engine may act as the PRIMARY drafter: the flag is on and the owner
@@ -1031,15 +1036,13 @@ impl ProcessingPipeline {
     /// settings.rs). Auxiliary hypothesis generation is also disabled whenever WSL7B is selected.
     fn wsl7b_primary_unresolved(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
-            && self.settings.external_asr_script_path().is_none()
+            && resolve_wsl_7b_client(self.settings.external_asr_script_path()).is_none()
     }
 
-    /// F6 — fast preflight before an import that will drive the WSL 7B primary: confirm the warm
-    /// server is actually accepting connections. The server binds 127.0.0.1:8799 INSIDE WSL's network
-    /// namespace (not reachable from Windows directly), so probe from within WSL with a bash
-    /// `/dev/tcp` open bounded by `timeout`. Without this, a down/hung server is only discovered
-    /// per-segment after a 300 s transcription timeout — up to ~5 minutes of spinner before the
-    /// fail-hard rollback. This turns that into a ~2-second, actionable failure at import start.
+    /// F6 — exact preflight before an import that will drive the WSL 7B primary. A TCP-open probe is
+    /// insufficient: an old deployment or unrelated process can own the port. The bundled client asks
+    /// for the loaded content identity and this method requires it to equal the registry champion's
+    /// `{model id, deployment SHA}` before any decode or transcript write begins.
     /// Public preflight for any caller about to drive the PRIMARY engine over a batch.
     ///
     /// `batch_transcribe` accepted a 487-clip job and hard-stopped on clip 1 because the champion
@@ -1057,51 +1060,30 @@ impl ProcessingPipeline {
         if !self.should_use_wsl_primary_asr() {
             return Ok(());
         }
-        // Uses the module-level WSL_7B_SERVER_PORT (same value handed to the client) — one source of truth.
-        let probe = format!("timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{WSL_7B_SERVER_PORT}'");
-        let mut cmd = std::process::Command::new("wsl");
-        cmd.arg("bash").arg("-lc").arg(&probe);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+        let client = resolve_wsl_7b_client(self.settings.external_asr_script_path())
+            .ok_or_else(Self::primary_engine_unavailable_error)?;
+        let db = Database::open(&self.db_path)?;
+        let expected = crate::registry::champion_identity(&db, crate::deployment::OMNIASR_7B_FAMILY)?.ok_or_else(|| {
+            AppError::Validation(format!(
+                "{ASR_7B_UNAVAILABLE_TAG}: no content-addressed OmniASR-7B champion is registered; refusing an identity-free server"
+            ))
+        })?;
+        let loaded = crate::engine_runtime::query_loaded_champion_with_client(&client, Duration::from_secs(10))
+            .map_err(|error| {
+                AppError::Validation(format!(
+                    "{ASR_7B_UNAVAILABLE_TAG}: exact champion health check failed: {error}. The import was not started."
+                ))
+            })?;
+        if !loaded.matches(&expected) {
+            return Err(AppError::Validation(format!(
+                "{ASR_7B_UNAVAILABLE_TAG}: server identity {}/{} does not match registry champion {}/{}; refusing to write transcripts",
+                loaded.model_version_id,
+                loaded.deployment_sha256,
+                expected.model_version_id,
+                expected.deployment_sha256
+            )));
         }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-
-        let mut child =
-            cmd.spawn().map_err(|e| AppError::Other(format!("could not launch WSL to check the 7B server: {e}")))?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(_)) => {
-                    return Err(AppError::Validation(format!(
-                        "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B server is not responding on \
-                         127.0.0.1:{WSL_7B_SERVER_PORT} (in WSL). Start it (e.g. wsl python \
-                         cortex_7b_server.py from scripts/) and retry the champion. The import was \
-                         not started, so nothing was left half-transcribed."
-                    )));
-                }
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        kill_and_reap_wsl_child(&mut child, "7B preflight probe");
-                        return Err(AppError::Validation(format!(
-                            "{ASR_7B_UNAVAILABLE_TAG}: Timed out checking the OmniASR-7B server (WSL \
-                             not responding). Ensure WSL and the 7B server are running, then retry \
-                             the champion."
-                        )));
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => {
-                    kill_and_reap_wsl_child(&mut child, "7B preflight probe");
-                    return Err(AppError::Other(format!("WSL 7B preflight wait failed: {e}")));
-                }
-            }
-        }
+        Ok(())
     }
 
     /// The actionable, UI-classified error returned whenever [`Self::wsl7b_primary_unresolved`]
@@ -1112,10 +1094,9 @@ impl ProcessingPipeline {
         // Tagged so the UI can offer a champion retry rather than a dead-end (see
         // ASR_7B_UNAVAILABLE_TAG). The app never silently downgrades to a smaller model.
         AppError::Validation(format!(
-            "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B (the champion) is the selected engine but its WSL \
-             client script is not configured (Settings → \"External ASR script path\" is empty). \
-             Set that path, start the 7B server, and retry the champion — or choose the offline \
-             model in Settings if you deliberately want the smaller local engine. Refusing to \
+            "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B is selected but the bundled WSL client could not be \
+             resolved. Repair/reinstall the app resources (or configure an explicit verified client \
+             path), then retry — or deliberately choose an offline model in Settings. Refusing to \
              silently downgrade to a smaller model you did not select."
         ))
     }
@@ -3162,8 +3143,9 @@ impl ProcessingPipeline {
 
                 // Tag a 7B failure (server down / timeout / empty) so the UI can offer a champion retry
                 // — and NEVER silently fall through to a smaller model here.
-                let (raw_transcript, confidence) =
-                    self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;
+                let wsl_result = self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;
+                let raw_transcript = wsl_result.raw_transcript.clone();
+                let confidence = wsl_result.confidence;
 
                 // A TRANSIENT empty 7B result (server up but under load) comes back as Ok("") — NOT an Err
                 // — so the map_err(tag_7b_unavailable) above does not catch it. Do not let it fall through
@@ -3250,13 +3232,14 @@ impl ProcessingPipeline {
                 let cloud_call = self.llm_refinement_uses_cloud();
                 let champion = SegmentHypothesis {
                     segment_id: id.clone(),
-                    model_id: CHAMPION_MODEL_ID.to_string(),
+                    model_id: wsl_result.model_version_id.clone(),
                     transcript: raw_transcript.clone(),
                     confidence,
                 };
                 let updated = db
                     .commit_champion_transcript_if_unreviewed(
                         &champion,
+                        Some(&wsl_result.deployment_sha256),
                         normalized_transcript.as_deref(),
                         Some("external_provider"),
                         cloud_call,
@@ -3273,7 +3256,7 @@ impl ProcessingPipeline {
                     final_text,
                     confidence,
                     confidence_source: Some("external_provider".to_string()),
-                    model_version_id: Some("omniasr-wsl-7b".to_string()),
+                    model_version_id: Some(wsl_result.model_version_id),
                     cloud_call,
                 });
             } else {
@@ -3688,20 +3671,37 @@ impl ProcessingPipeline {
         if self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
             return Ok(());
         }
-        if self.settings.external_asr_script_path().is_none() {
+        if resolve_wsl_7b_client(self.settings.external_asr_script_path()).is_none() {
             return Ok(());
         }
+        let Some(expected) = crate::registry::champion_identity(db, crate::deployment::OMNIASR_7B_FAMILY)? else {
+            tracing::warn!("WSL 7B auxiliary hypothesis skipped: no registry champion identity is available");
+            return Ok(());
+        };
         if db
             .get_hypotheses_for_segment(segment_id)?
             .iter()
-            .any(|hyp| hyp.model_id == "omniasr-wsl-7b" && !hyp.transcript.trim().is_empty())
+            .any(|hyp| hyp.model_id == expected.model_version_id && !hyp.transcript.trim().is_empty())
         {
             return Ok(());
         }
 
         match self.run_wsl_segment_transcript(segment_id, None) {
-            Ok((raw_transcript, confidence)) => {
-                insert_hypothesis_checked(db, segment_id, "omniasr-wsl-7b", raw_transcript, confidence)?;
+            Ok(result) => {
+                if result.model_version_id != expected.model_version_id
+                    || result.deployment_sha256 != expected.deployment_sha256
+                {
+                    return Err(AppError::Validation(
+                        "MODEL_IDENTITY_CHANGED: WSL 7B auxiliary reply does not match the registry champion".into(),
+                    ));
+                }
+                insert_hypothesis_checked(
+                    db,
+                    segment_id,
+                    &result.model_version_id,
+                    result.raw_transcript,
+                    result.confidence,
+                )?;
             }
             Err(error) => {
                 tracing::warn!("omniasr-wsl-7b hypothesis transcription failed for {segment_id}: {error}");
@@ -3714,8 +3714,8 @@ impl ProcessingPipeline {
         &self,
         segment_id: &str,
         cancel: Option<&std::sync::atomic::AtomicBool>,
-    ) -> AppResult<(String, Option<f64>)> {
-        let Some(external_script) = self.settings.external_asr_script_path() else {
+    ) -> AppResult<Wsl7bResult> {
+        let Some(external_script) = resolve_wsl_7b_client(self.settings.external_asr_script_path()) else {
             return Err(AppError::Validation(
                 "External ASR provider is not configured. Set the WSL script path in Settings before using the 7B provider.".into(),
             ));

@@ -356,7 +356,11 @@ impl Default for AppSettings {
             llm_api_key_configured: false,
             cloud_llm_opt_in: false,
             cloud_stt_opt_in: false,
-            champion_supervision_enabled: false,
+            // The default engine is the held WSL champion, so a clean install must also supervise it
+            // by default. Turning supervision off remains an explicit owner choice (for training or
+            // maintenance); shipping WSL7B + supervision-off made the factory configuration unable to
+            // start its own selected engine.
+            champion_supervision_enabled: true,
             backup_second_dir: String::new(),
             llm_system_prompt: default_llm_system_prompt(),
             llm_model: default_llm_model(),

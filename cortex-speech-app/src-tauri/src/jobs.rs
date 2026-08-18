@@ -101,6 +101,26 @@ pub struct Job {
     pub error_code: Option<String>,
 }
 
+/// The small, durable subset needed by crash-recoverable job coordinators.  The opaque JSON is
+/// interpreted by the owning job kind; the generic supervisor must never guess at its schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadJob {
+    pub id: String,
+    pub kind: String,
+    pub state: JobState,
+    pub idempotency_key: Option<String>,
+    pub error_code: Option<String>,
+    pub payload_json: String,
+}
+
+/// Result of atomically opening a running durable job.  `created == false` means an idempotent retry
+/// found the already-persisted operation and must resume its payload instead of repeating admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BegunPayloadJob {
+    pub job: PayloadJob,
+    pub created: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
