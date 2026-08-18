@@ -69,6 +69,11 @@ describe('Tauri config security boundaries', () => {
       { path: 'models/onnxruntime.dll/onnxruntime_providers_shared.dll', minBytes: 1_000 },
     ];
     const finetunedPaths = ['models/finetuned-mms-ckb/model.onnx', 'models/finetuned-mms-ckb/vocab.json'];
+    // The champion's WSL server/client scripts ship BESIDE the exe so an installed build satisfies
+    // `SERVER_SCRIPT_RELATIVE_TO_EXE[0]` in engine_runtime.rs without any environment variable — the
+    // outage that fallback exists for. Unlike the models these are repo-tracked, so they never break
+    // the fresh-checkout build this list is otherwise careful about; that is asserted below.
+    const scriptPaths = ['../scripts/cortex_7b_server.py', '../scripts/cortex_7b_client.py'];
     const basePaths = requiredResources.map((resource) => resource.path);
     const resources = config.bundle?.resources ?? [];
 
@@ -78,11 +83,11 @@ describe('Tauri config security boundaries', () => {
     // absent here and added only via the local-build override (asserted below). tauri.windows.conf.json
     // must stay in lock-step with the default, or a Windows build would demand a resource the default
     // omits.
-    expect(resources).toEqual(basePaths);
+    expect(resources).toEqual([...basePaths, ...scriptPaths]);
     const windowsConfig = JSON.parse(
       readFileSync(resolve(process.cwd(), 'src-tauri', 'tauri.windows.conf.json'), 'utf-8'),
     ) as TauriConfig;
-    expect(windowsConfig.bundle?.resources ?? []).toEqual(basePaths);
+    expect(windowsConfig.bundle?.resources ?? []).toEqual([...basePaths, ...scriptPaths]);
     expect(resources).not.toContain('models/*');
     expect(resources).not.toContain('models/**');
     expect(resources).toContain(APP_CONFIG.models.vadPath);
@@ -103,7 +108,15 @@ describe('Tauri config security boundaries', () => {
       readFileSync(resolve(process.cwd(), 'src-tauri', 'tauri.finetuned.conf.json'), 'utf-8'),
     ) as TauriConfig;
     const finetunedResources = finetunedConfig.bundle?.resources ?? [];
-    expect(finetunedResources).toEqual([...basePaths, ...finetunedPaths]);
+    expect(finetunedResources).toEqual([...basePaths, ...finetunedPaths, ...scriptPaths]);
+
+    // STRICTER than before, not looser: every NON-model bundled resource must actually exist in the
+    // checkout. The models are gitignored and only size-checked when present, but a script declared
+    // in the bundle and missing from git would fail the hosted build with nothing to download —
+    // exactly the failure this list's design note warns about.
+    for (const script of scriptPaths) {
+      expect(existsSync(resolve(process.cwd(), 'src-tauri', script))).toBe(true);
+    }
 
     // The base ONNX models (silero/omniasr/onnxruntime DLLs) are large and gitignored; hosted CI
     // runners deliberately don't carry them until `npm run fetch-models` runs — same design as the
