@@ -14,6 +14,14 @@ SCOPE / KNOWN DIVERGENCES from the full Rust normalizer (verified 2026-07-07):
     or grouped numbers, Python(text) ≠ Rust(text).
   * DIACRITICS: harakat/tashkeel are KEPT here by default (Step 7 is opt-in), whereas the Rust
     metrics config removes them. So this matches a `remove_diacritics: false` Rust config only.
+  * COMBINING HAMZA (added 2026-08-18): the Rust normalizer now runs its hamza fold AFTER a final
+    NFC, strips a combining hamza (U+0654/U+0655) out of the mark run attached to ا or ە, and folds
+    ۀ (U+06C0) back to ە. This file has no final NFC step and does none of that, so on text carrying a
+    decomposed hamza the two disagree — and this file is NOT idempotent there (its own Step 0 NFC
+    re-composes on the second pass, which is the defect the Rust side was fixed for; the nightly
+    fuzz campaign found it). Nothing imports `norm()` today, which is why the fix was not mirrored
+    blind: doing it properly means adopting the Rust final-NFC step, a real behaviour change to this
+    CLI. Use the Rust normalizer for anything that must agree with the app.
 Do not rely on this for exact metric parity with the app; the Rust normalizer is the source of truth.
 
 Usage: python scripts/sorani_normalize.py <text>   [outputs normalized text to stdout]

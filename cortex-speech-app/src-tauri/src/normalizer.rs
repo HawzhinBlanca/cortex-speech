@@ -48,6 +48,21 @@ static ZERO_WIDTH_FORMAT: LazyLock<Regex> =
     LazyLock::new(|| static_regex(r"[\u061C\u200B\u200D\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]"));
 static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\s+"));
 static ARABIC_HAMZA: LazyLock<Regex> = LazyLock::new(|| static_regex(r"[\u0623\u0625]"));
+/// A Sorani alef ا or ae ە whose attached combining-mark run contains a hamza (U+0654 above, U+0655
+/// below) — the two bases a stray hamza can COMPOSE onto here (ا+U+0654 = أ, ا+U+0655 = إ,
+/// ە+U+0654 = ۀ), i.e. the decomposed spelling of letters this module folds away.
+///
+/// It matches the WHOLE run, because the mark need not be adjacent to the base: canonical ordering
+/// sorts a combining run by combining class, so a fatha (ccc 30) sits between the alef and a hamza
+/// below (ccc 220). The run is then rebuilt without its hamza marks (see step 10.5).
+///
+/// Anything less was measured to be not enough. `ARABIC_HAMZA` alone sees only the composed
+/// codepoints, and step 10's own NFC composes ا + U+0655 straight back into the إ the fold had just
+/// removed — the nightly fuzz campaign caught that on 2026-08-18 (`normalize` returned "إ", and
+/// normalizing THAT returned "ا"). Matching only marks ADJACENT to the alef then fixed that input and
+/// left `أ` + fatha + U+0655, which the property test found within the hour.
+static ALEF_HAMZA_MARK_RUN: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r"[\u0627\u06D5][\u064B-\u065F\u0670]*[\u0654\u0655][\u064B-\u065F\u0670]*"));
 static ARABIC_DIACTIRICS: LazyLock<Regex> = LazyLock::new(|| static_regex(r"[\u064B-\u065F\u0670]"));
 
 const PERSIAN_TO_LATIN: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
@@ -184,11 +199,6 @@ impl SoraniNormalizer {
         // Step 4.5: Contextual Word-Final Heh Translation (ه U+0647, ة U+0629)
         result = normalize_heh_contextual(&result);
 
-        // Step 5: Normalize Hamza forms (only أ/إ -> ا, preserve ء and آ)
-        if self.config.normalize_hamza {
-            result = ARABIC_HAMZA.replace_all(&result, "ا").to_string();
-        }
-
         // Step 7: Remove Arabic diacritics (tashkeel)
         if self.config.remove_diacritics {
             result = ARABIC_DIACTIRICS.replace_all(&result, "").to_string();
@@ -208,7 +218,45 @@ impl SoraniNormalizer {
         // no longer canonically ordered (e.g. `ّ ـ َ` → tatweel removed → `ّ َ`, shadda-before-fatha).
         // Without re-NFC the output is non-NFC and NON-IDEMPOTENT: re-normalizing reorders the marks,
         // so the same text yields two byte strings and defeats dedup / FTS / WER-CER equality.
-        let result: String = result.nfc().collect();
+        let mut result: String = result.nfc().collect();
+
+        // Step 10.5: Normalize Hamza forms (only أ/إ -> ا; ء and آ are preserved) — LAST, and after
+        // the final NFC, which is the whole point.
+        //
+        // This ran at step 5 for most of the module's life and could not be correct there, because the
+        // NFC above does not merely preserve hamza forms — it CREATES them. Deleting a base character
+        // between two combining runs (tatweel at step 3, ZWNJ/ZWSP at steps 4/4b) merges those runs, so
+        // `آ` + ZWSP + U+0655 arrives at step 10 as آ next to a hamza below and leaves it as `إ` — a
+        // letter no earlier fold ever saw. Measured, all three shapes:
+        //   `إ` + U+0655            -> step 5 folded, step 10 re-composed  -> "إ", then "ا"   (fuzz, 2026-08-18)
+        //   `أ` + fatha + U+0654    -> the mark is not adjacent to the alef -> "أ\u{64e}", then "ا\u{64e}"
+        //   `آ` + ZWSP + U+0655     -> the NFC itself built the hamza form  -> "إ\u{653}", then "آ"
+        // Every one is the same defect: two passes, two answers. That is not cosmetic —
+        // `canonical_training_text` (SHIPPED training text) and `learning_text_key` (the "is this a
+        // real correction" key) both compare normalized text to normalized text, so a row normalized a
+        // second time silently stops matching itself.
+        //
+        // The trailing NFC is required in turn: folding `إ` + madda leaves ا + U+0653, which is not
+        // canonically composed — and `آ` is a letter this fold deliberately keeps.
+        if self.config.normalize_hamza {
+            result = ARABIC_HAMZA.replace_all(&result, "ا").to_string();
+        }
+        // ۀ (U+06C0) is ە + a hamza above, composed — an Arabic/Persian letter, not a Sorani one, and
+        // NOT something the writer typed: the zero-width strip at step 4b deletes the base character
+        // between ە and a stray hamza, and the NFC above then welds them together. Unconditional, like
+        // the ة/ه folds at step 4.5 that it belongs with: `normalize_hamza` governs أ/إ -> ا, never
+        // whether the Sorani ە survives this module. (Found by `normalization_preserves_kurdish_chars`
+        // at 50k cases on "ە" + ZWSP + U+0654 — the letter simply vanished from the output.)
+        result = result.replace('\u{06C0}', "\u{06D5}");
+        result = ALEF_HAMZA_MARK_RUN
+            .replace_all(&result, |caps: &regex::Captures| {
+                // Keep the harakat, drop the hamzas: a fatha on an alef is the writer's, a leftover
+                // hamza is only what the composed letter decomposed into — and left in place, the NFC
+                // below would compose it straight back into the letter just folded away.
+                caps[0].chars().filter(|c| !matches!(c, '\u{0654}' | '\u{0655}')).collect::<String>()
+            })
+            .to_string();
+        result = result.nfc().collect();
 
         // Step 11: Trim
         result.trim().to_string()
@@ -581,6 +629,51 @@ mod tests {
         let result2 = n.normalize("ئەو کەسە");
         assert!(result2.contains("ە"), "Should preserve standard Kurdish Heh");
         assert!(result2.contains("ئ"), "Should preserve ء hamza");
+    }
+
+    #[test]
+    fn a_combining_hamza_cannot_recompose_the_letter_the_fold_just_removed() {
+        // FOUND BY THE NIGHTLY FUZZ CAMPAIGN, 2026-08-18 (target `normalizer`, artifact
+        // crash-46a13e0a3b28d6c2b3d84ec026ff9a5cb83e5ff1, Base64 `2KXZlQ==`): the two bytes below are
+        // إ (U+0625) followed by a COMBINING HAMZA BELOW (U+0655) — the decomposed spelling of the same
+        // hamza the fold exists to remove.
+        //
+        // The fold ran at step 5 and the canonical re-composition at step 10 put the letter straight
+        // back: `normalize` returned "إ", and normalizing THAT returned "ا". Two passes, two answers.
+        // The default config (normalize_hamza on, remove_diacritics OFF) is the one the import
+        // pipeline and the IPC commands use, so this is the shipped path — and a non-idempotent
+        // normalizer breaks every consumer that compares normalized text to normalized text:
+        // transcript hashing, duplicate detection, FTS, and any row normalized a second time.
+        let n = SoraniNormalizer::new();
+        let once = n.normalize("\u{0625}\u{0655}");
+        assert_eq!(once, n.normalize(&once), "normalize must be idempotent: {once:?}");
+        assert_eq!(once, "ا", "a decomposed hamza-below alef folds to bare alef like its composed twin");
+
+        // The same shape one layer harder: a doubled mark (only one can ever re-compose, so a fold
+        // that strips a single mark leaves the second behind for the next pass to act on) and the
+        // hamza ABOVE, which is the other half of the same regex.
+        for input in ["\u{0627}\u{0655}\u{0655}", "\u{0627}\u{0654}", "\u{0623}\u{0654}"] {
+            let once = n.normalize(input);
+            assert_eq!(once, n.normalize(&once), "normalize must be idempotent for {input:?}");
+            assert_eq!(once, "ا", "{input:?} must fold to bare alef");
+        }
+
+        // The mark does not have to touch the alef. Canonical ordering sorts a combining run by
+        // combining class, so a fatha (ccc 30) lands BETWEEN the alef and a hamza below (ccc 220) —
+        // found by `normalization_idempotent` once its alphabet learned these two marks, on
+        // `أ` + fatha + U+0654, which the adjacent-only fold left as "أ\u{64e}" for the next pass to
+        // turn into "ا\u{64e}". The writer's fatha stays; only the hamza goes.
+        let blocked = n.normalize("\u{0623}\u{064E}\u{0654}");
+        assert_eq!(blocked, n.normalize(&blocked), "normalize must be idempotent for a blocked mark");
+        assert_eq!(blocked, "ا\u{064E}", "the harakat survives, the decomposed hamza does not");
+
+        // And the shape that proves the fold has to come AFTER the final NFC rather than before it:
+        // آ + ZWSP + U+0655. The zero-width strip at step 4b deletes the base character BETWEEN the
+        // letter and the mark, so the final NFC composes a hamza form that no earlier fold could have
+        // seen. Found by `normalization_idempotent` at 4096 cases.
+        let built_by_nfc = n.normalize("\u{0622}\u{200B}\u{0655}");
+        assert_eq!(built_by_nfc, n.normalize(&built_by_nfc), "normalize must be idempotent for {built_by_nfc:?}");
+        assert_eq!(built_by_nfc, "آ", "the madda is preserved; only the hamza the NFC introduced goes");
     }
 
     #[test]
@@ -962,6 +1055,10 @@ mod proptests {
             ',', '.', '?', ';',        // ASCII punctuation the pipeline unifies
             '\u{0629}', // ة teh marbuta (heh-contextual path)
             '\u{0623}', '\u{0625}', '\u{0621}', '\u{0622}', // hamza forms أ إ ء آ
+            // The DECOMPOSED half of the same letters (combining hamza above/below). Absent from this
+            // alphabet, the idempotence property could not reach the 2026-08-18 fuzz crash: the fold
+            // removed the composed letter and step 10's NFC put it back from the surviving mark.
+            '\u{0654}', '\u{0655}', // combining hamza above / below
             '\u{064E}', '\u{0651}', // harakat: fatha, shadda (combining, alphabetic)
             '\u{200B}', '\u{200D}', '\u{FEFF}', // ZWSP / ZWJ / BOM (deleted, not spaced)
             '\u{202B}', '\u{2066}', // RLE bidi embed + LRI isolate (deleted)
@@ -992,7 +1089,14 @@ mod proptests {
         fn normalization_preserves_kurdish_chars(s in kurdish_string()) {
             let n = SoraniNormalizer::new();
             let result = n.normalize(&s);
-            for ch in s.chars() {
+            // Against the NFC of the input, not its raw codepoints. Step 0 applies NFC, and Unicode —
+            // not this module — decides that ە + a combining hamza above IS the single letter ۀ
+            // (U+06C0): the Kurdish letter is gone before any rule of ours runs. Asserting on the raw
+            // string would blame the normalizer for a canonical composition it is required to perform.
+            // (Whether ۀ should then FOLD BACK to ە is a real orthographic question — it is an
+            // Arabic/Persian-only form, so it likely has no place in shipped Sorani training text — but
+            // that is the owner's call, not a proptest's: see PROGRESS_LEDGER 2026-08-18.)
+            for ch in s.nfc().collect::<String>().chars() {
                 match ch {
                     '\u{06CE}' | '\u{06C6}' | '\u{06D5}' | '\u{0695}' | '\u{0698}' |
                     '\u{06A4}' | '\u{06AF}' | '\u{0686}' | '\u{067E}' => {
