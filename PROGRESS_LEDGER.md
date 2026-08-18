@@ -9645,3 +9645,166 @@ challenger trainer that gate D is blocked on, and gate B's ~10,000 human labels.
 would be motion without progress, which §8 says to stop rather than dress up.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+
+## 2026-08-18 (evening) — both nightly reds, and neither was what the summary said
+
+The nightly has been red for four of the last five nights (`Nightly Real Audio`: 2026-08-15, -16, -17,
+-18 fail; -14 pass) while `Release Gate` stayed green on every merge. Two independent jobs, two
+defects, and each one had been invisible for a different reason.
+
+### 1. The mutation gate had not tested a single mutant
+
+`Mutation gate (core modules, --in-diff)` exited **4** — cargo-mutants' code for *the tests failed in
+an unmutated tree*, i.e. it stopped before mutant one. Verbatim, from the job log:
+
+```
+thread '...a_link_survives_closing_the_app_but_not_pressing_stop' panicked at src/couch.rs:4142:14:
+first start: "DPAPI protection is only available on Windows"
+...
+test result: FAILED. 238 passed; 6 failed; 1 ignored; 0 measured; 979 filtered out
+*** result: Failure(101)          ##[error]Process completed with exit code 4
+```
+
+All six failures are session persistence. `save_session` DPAPI-protects every reviewer token before it
+writes, and `dpapi::protect` is `Err("DPAPI protection is only available on Windows")` off Windows —
+by design; the app ships Windows-only. **Reproduced verbatim on a Linux checkout** (`238 passed; 6
+failed; 1 ignored; 979 filtered out`), so this is structural, not a runner accident.
+
+**Why nothing saw it.** `ci.yml` runs `cargo test` on **windows-latest** (the Linux/macOS jobs only
+`cargo build`), so the nightly mutation gate is the ONLY place `--lib` runs on Linux. And on the nights
+it passed, it passed *idle*: 2026-08-17's run finished its mutate step in **0 seconds** — no
+core-module diff — which the workflow's own message already calls out as "not a pass". So the
+charter's "0 surviving mutants" leg has been either vacuous or red, never enforced.
+
+Fixed by gating the six on the platform whose API they need — `#[cfg_attr(not(windows), ignore =
+"persists a Couch session: DPAPI-protected at rest, Windows-only")]`, `ignore` rather than
+`#[cfg(windows)]` so libtest still PRINTS them with the reason instead of silently not having them.
+The Windows Release Gate runs all six for real on every PR, as it always has.
+
+**Stated, not papered over:** mutants inside the DPAPI-gated session paths can no longer be killed on
+the Linux gate and will be reported there as survivors. Closing that needs either the mutation gate on
+windows-latest or a test-only non-Windows protector — both touch how a security mechanism is tested,
+so they are the owner's call, not this run's.
+
+### 2. Fixing that exposed a second defect the schedule had been hiding
+
+With the six gone, `reloading_mid_batch_returns_the_remainder_and_never_a_decided_clip` began failing
+**every run** (`m002 must land before the reload: left 0, right 200`).
+
+`COUCH_RATE_LIMITER` is a process-wide bucket **keyed by reviewer NAME**. The solo-drain soak
+(`one_reviewer_can_drain_a_backlog_larger_than_a_batch_to_genuine_zero`, 130 clips) calls itself
+"Hawzhin" and deliberately drains that bucket — it backs off on 429 by design. Three other HTTP tests
+also call themselves "Hawzhin" and do not: `ureq` reports any non-2xx as `Err`, so the victim's
+`.map(|r| r.status()).unwrap_or(0)` recorded **0** and the test blamed its own server. Latent for as
+long as the scheduler kept them apart. The soak now has a reviewer name of its own.
+
+The exact filtered `--lib` run cargo-mutants performs as its baseline, on this Linux checkout:
+
+```
+before                   : 238 passed; 6 failed; 1 ignored   (the six DPAPI tests — CI verbatim)
+after the ignore alone   : 238 passed; 1 failed; 7 ignored   (x4 runs — the rate-limit victim)
+after the reviewer split : 239 passed; 0 failed; 7 ignored   (x4 runs; +1 is the new normalizer test)
+```
+
+The whole Linux `cargo test --lib`, same tree, before and after:
+
+```
+before : 1207 passed; 9 failed; 8 ignored
+after  : 1208 passed; 3 failed; 14 ignored
+```
+
+The three that remain are pre-existing and NOT this work — proven by running them on the unmodified
+tree: `pipeline::tests::speaker_hint_from_filename_stem_when_multi_chunk_enabled` and
+`jury::learning::tests::build_dpo_dataset_sanitizes_prompt_audio_path` assert Windows path semantics
+(`Some("C:\\recordings\\interview_guest")` where Linux has no `\\` separator), and
+`db::tests::recover_database_at_quarantines_sqlite_sidecars` ("wal" vs "main") is directory-order
+dependent — it passes alone and fails in the full suite, on modified and unmodified code alike. They
+are outside the mutation gate's filter, so they do not block it. Left alone, and named here so the
+next run does not re-chase them.
+
+### 3. The fuzz campaign: a normalizer that gave two different answers
+
+`Fuzz campaign (5 targets)` failed on 2026-08-17 and 2026-08-18. The crash, target **normalizer**:
+
+```
+thread '<unnamed>' panicked at fuzz_targets/normalizer.rs:26:9:
+assertion `left == right` failed: Normalizer must be idempotent
+  left: "إ"     right: "ا"
+artifact_prefix=.../fuzz/artifacts/normalizer/crash-46a13e0a3b28d6c2b3d84ec026ff9a5cb83e5ff1
+Base64: 2KXZlQ==        (U+0625 إ  followed by U+0655 COMBINING HAMZA BELOW)
+```
+
+The hamza fold ran at step 5; the **final NFC at step 10 put the letter straight back** from the
+surviving combining mark. `normalize` returned "إ", and normalizing THAT returned "ا".
+
+This is the shipped path: the default config (`normalize_hamza` on, `remove_diacritics` **off**) is
+what `pipeline.rs`, the IPC commands, `canonical_training_text` (SHIPPED training text) and
+`learning_text_key` use — and all of those compare normalized text to normalized text, so a row
+normalized a second time silently stops matching itself.
+
+Two more shapes surfaced while fixing it, each after the previous fix looked complete:
+
+```
+إ + U+0655           -> "إ"          then "ا"          (the CI crash)
+أ + fatha + U+0654   -> "أ\u{64e}"   then "ا\u{64e}"   (mark not adjacent: canonical order puts the fatha between)
+آ + ZWSP + U+0655    -> "إ\u{653}"   then "آ"          (step 4b deletes the base char; the NFC BUILDS the hamza form)
+ە + ZWSP + U+0654    -> "ۀ"                            (the Kurdish letter vanishes: ە + hamza composes to U+06C0)
+```
+
+Fix: the hamza fold now runs **after** the final NFC, strips hamza marks out of the whole combining
+run attached to ا or ە (not just an adjacent one), folds ۀ (U+06C0 — an Arabic/Persian letter this
+module has no business emitting) back to ە, and re-composes once, because folding إ + madda leaves
+ا + U+0653 which is not canonical and whose composed form آ this fold deliberately keeps.
+
+Gates, each proven to FAIL on the defect before the fix landed:
+
+```
+normalizer::tests::a_combining_hamza_cannot_recompose_the_letter_the_fold_just_removed  (all four shapes)
+normalizer::proptests::normalization_idempotent      minimal failing input: s = "أ\u{654}"
+normalizer::proptests::normalization_preserves_kurdish_chars  ... = "ە\u{200b}\u{654}"
+```
+
+The proptest alphabet gained U+0654/U+0655 — every one of these lived outside it, which is why the
+property had been green while the fuzzer had not. After the fix, on the finished code:
+
+```
+cargo test --lib -- normalizer::                     39 passed; 0 failed          (256 cases)
+PROPTEST_CASES=50000  same                           39 passed; 0 failed          (24.75s)
+cargo +nightly fuzz run normalizer <the CI artifact> Executed crash-46a13e0a in 46 ms, exit 0
+cargo +nightly fuzz run normalizer -max_total_time=420
+                                                     Done 826775 runs in 421 second(s)
+                                                     cov: 7528 ft: 17761 corp: 1517/139Kb, no crash, exit 0
+```
+
+That last one is a FRESH corpus, not the CI one (the campaign corpus lives in the Actions cache), so
+it is evidence that nothing shallow was introduced — not that the target is now unbreakable. The
+nightly, with its accumulated corpus, remains the real test.
+
+`normalization_preserves_kurdish_chars` now judges against the NFC of its input: whether ۀ should fold
+back to ە is this module's business (it now does), but a letter Unicode composed away before step 0
+even ran is not the normalizer dropping it.
+
+### Not done, and not claimed
+
+- `scripts/sorani_normalize.py` calls itself "byte-identical to normalizer.rs" and is NOT — it has no
+  final NFC step, so it carries the same non-idempotence. Nothing imports it (standalone CLI), and
+  mirroring properly means adopting the Rust final-NFC step, a real behaviour change. **Documented in
+  its own KNOWN DIVERGENCES block, not fixed.**
+- The other four fuzz targets were not run for their full 15 minutes locally; only `normalizer` was
+  rebuilt and replayed against the CI artifact.
+- `cargo mutants` itself was not re-run end to end here; what is proven is that its baseline — the
+  exact filtered `--lib` run it performs first — is now green on Linux.
+- `cargo clippy --all-targets -- -D warnings` cannot pass on LINUX, for two pre-existing reasons in
+  files this work did not touch: `dpapi.rs:12` `unused import: base64::Engine as _` (the real
+  `protect`/`unprotect` are `#[cfg(windows)]`) and `flock.rs:29` `file opened with create, but
+  truncate behavior not defined` inside the `#[cfg(unix)]` branch. CI runs clippy on windows-latest,
+  where neither is compiled, so the gate is honestly green there — but it does mean a Linux checkout
+  cannot self-check that gate. Reported, not fixed: both are outside this work, and `flock.rs` is
+  single-instance locking. Everything this run touched is clippy-clean at `-D warnings` (the lint
+  pass compiled the whole lib and reported only those two).
+- The idle mutation gate still exits 0. `2026-08-17` shows the shape: no core-module diff, mutate step
+  0 s, an annotation that says "This is not a pass", and a GREEN job. Making idle a failure is a
+  policy change on the owner's own gate, so it is raised here rather than made.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
