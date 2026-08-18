@@ -9445,3 +9445,89 @@ miss is the lesson: I was one step from writing off a working gate using evidenc
 been hardened against.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (morning) — the rebuild landed, and Phase 4 turned out to be mostly built already
+
+**Loop iteration after all four overnight PRs merged. The headline is a plan correction, not a fix:
+the work this document called "NOT STARTED" has existed since July.**
+
+### The rebuild, verified at the serving path
+
+```
+EXE FRESHNESS GATE: OK (exe at HEAD 04647f6...)
+[gpu0] Pipeline ready.  serving on 127.0.0.1:8799 (lang=ckb_Arab)
+[gpu1] Pipeline ready.  serving on 127.0.0.1:8799 (lang=ckb_Arab)
+test pipeline::tests::wsl_7b_preflight_passes_when_server_up ... ok      (exit 0, read from a file)
+verify_10 --quick: 41 kept gates, 23 PASS, 0 FAIL, 18 skipped (env/not-built)
+```
+
+**PR #67 verified live, not just in a unit test.** The app was relaunched with
+`CORTEX_7B_SERVER_SCRIPT` deliberately EMPTY — the exact condition that made supervision fail every
+~8 minutes for two hours — and it resolved the script itself, from the repo layout beside the exe.
+Champion up in **101 seconds**, both GPUs, `ckb_Arab`.
+
+### A preflight failure that was NOT a defect
+
+`champion-7b-preflight` first returned `E_ASR_7B_UNAVAILABLE` even though port 8799 had been probed
+open minutes earlier. Chased rather than re-run until green. Two hypotheses died on contact with
+evidence:
+
+* *"the test suite stomped live settings"* — **wrong**: `settings.json` untouched since 2026-08-17
+  17:04, `champion_supervision_enabled` still true.
+* *"the champion crashed"* — **wrong**: no traceback anywhere in the server log.
+
+The watchdog log had it: `session expected but app not running - relaunching [clean exit (orderly
+exit 2026-08-18T08:23:54.390Z)]`. The APP exited cleanly; supervision then killed the child it owned
+(the standalone kill in the `!enabled && was_enabled` branch), and the watchdog relaunched 3.5 minutes
+later. The preflight ran inside that window and measured an app that was not there. Re-run against the
+live server: **PASS**.
+
+**What I still do not know, and will not invent: why the app exited cleanly at 08:23:54.** No crash,
+no panic — an orderly exit means something asked it to close. Recorded as unexplained. Also a number
+worth keeping: the watchdog took **3.5 minutes** to notice, and every import in that window would have
+failed the champion preflight.
+
+### Phase 4 was already built — verified in code and on the live DB
+
+This document said "Phase 4 — registry + rollback: NOT STARTED". False, and a run that believed it
+would have rebuilt 53 KB of working code.
+
+`src-tauri/src/registry.rs` has existed since 2026-07-22 with `register_candidate`,
+`promote_to_champion`, `gate_and_promote`, `decide_promotion`, `record_eval_result`,
+`hash_checkpoint`, `import_checkpoint`, `sync_champion_pointer`. Promotion is already ONE transaction
+demoting the incumbent to `rolled_back` (registry.rs:101-128); migration v23 pins the status
+vocabulary and a partial unique index for one champion per family; `sync_champion_pointer` already
+runs at startup (lib.rs:519-522).
+
+**The real remainder is three things, and only these:**
+
+```
+model_versions   0 row(s)
+adapters         0 row(s)
+champion.json    {"champions": {}}
+engine_runtime.rs:132  model_dir = env("CORTEX_7B_MODEL_DIR")
+                         .unwrap_or("/home/ai/cortex_champion_model")
+verify_10.py     grep promotion-drill -> zero hits
+```
+
+a. The registry is **empty and the serving path ignores it** — the champion serving right now is not a
+   registry row, so promoting would change `champion.json` without changing what serves.
+b. No rollback **drill**: `rolled_back` is a status the code writes; nothing proves a rollback restores
+   byte-identical serving.
+c. No `promotion-drill` gate in `verify_10.py`.
+
+Because the registry is empty, wiring `start_child` to read it is a NO-OP today — which makes it the
+safe first step. It still changes what CAN serve, and champion supremacy is canon precisely because a
+weaker engine once silently drafted 494/494 clips, so it goes to the owner with its design first
+rather than landing unasked.
+
+### Operational
+
+GitHub **GraphQL** hit its rate limit (0 remaining; REST still had 4,935) because the overnight PR
+monitors used `gh pr view` / `gh pr checks`, which are GraphQL. Polling loops must use `gh api`.
+
+The exe bakes `04647f6` and the docs PR merged after it, so `check_exe_freshness` reads
+`EXE IS NOT HEAD` from `main`. The binary is correct — docs do not enter it — but that is stated
+rather than left looking like a stale build.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
