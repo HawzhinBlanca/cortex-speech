@@ -56,6 +56,22 @@ pub struct PcmWindow {
     pub pcm: Vec<i16>,
 }
 
+thread_local! {
+    /// How many times this thread has walked a source file through `decode_pcm_windows`.
+    ///
+    /// Exists because the worst bug in this path is INVISIBLE to output equality: decoding one
+    /// source once PER CLIP instead of once per recording produces byte-identical clips and takes
+    /// hours instead of seconds. Wall-clock is the other way to catch it, and a timing assertion on
+    /// this box is a flake generator. Thread-local, so a parallel `cargo test` run cannot see another
+    /// test's decodes.
+    static DECODE_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of `decode_pcm_windows` walks on the CURRENT thread. Test observability; see `DECODE_PASSES`.
+pub fn decode_passes_on_this_thread() -> usize {
+    DECODE_PASSES.with(|passes| passes.get())
+}
+
 /// Small LRU cache for decoded PCM data keyed by file content hash.
 #[allow(clippy::type_complexity)]
 static PCM_CACHE: LazyLock<Mutex<LruCache<String, (u32, Vec<i16>)>>> =
@@ -356,6 +372,7 @@ where
     F: FnMut(PcmWindow) -> AppResult<()>,
 {
     let path = path.as_ref();
+    DECODE_PASSES.with(|passes| passes.set(passes.get() + 1));
     let _span = crate::telemetry::TRACER.start_span(
         "audio.decode_pcm_windows",
         crate::telemetry::Tracer::metadata(vec![("path", path.to_string_lossy().to_string())]),

@@ -487,6 +487,11 @@ pub fn export_finetune_pack(
     let mut emitted = 0usize;
     let mut skipped = 0usize;
     let mut emitted_without_human_decision = 0usize;
+
+    // PASS 1 — decide WHICH rows this pack emits, in manifest order, WITHOUT touching audio. Text
+    // only, and it settles dedup before anything is decoded, so no clip is ever decoded to be thrown
+    // away.
+    let mut planned: Vec<(&crate::db::SpeechSegment, &crate::quality::TrainingGradeReport, String)> = Vec::new();
     for (seg, report) in graded.iter().filter(|(_, report)| report.training_ready) {
         // Canonical Sorani orthography for the SHIPPED sentence — ك/ک, ي/ی, ه/ھ variants unified so
         // the retrain corpus has one label per grapheme (mixed forms inflate the CTC label space).
@@ -503,23 +508,91 @@ pub fn export_finetune_pack(
             skipped += 1;
             continue;
         }
-        let single_segment_source = sibling_counts.get(&seg.audio_path).copied().unwrap_or(1) <= 1;
-        let pcm = match crate::commands::decode_finetuned_clip_16k(
-            &seg.audio_path,
-            seg.alignment_json.as_deref(),
-            single_segment_source,
-        ) {
-            Ok(pcm) if !pcm.is_empty() => pcm,
-            Err(reason) => {
-                tracing::warn!("finetune pack: skipping {} ({reason})", seg.id);
-                skipped += 1;
-                continue;
+        planned.push((seg, report, sentence));
+    }
+
+    // PASS 2 — decode, GROUPED BY SOURCE RECORDING (2026-08-18). One walk per recording, not one per
+    // clip: see `commands::decode_finetuned_clips_16k` for the measurement that forced this. The
+    // clips written here are byte-identical to the per-clip decoder's, so the manifest hash — the
+    // snapshot id — is unchanged by the grouping.
+    let mut by_source: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    for (index, (seg, _, _)) in planned.iter().enumerate() {
+        by_source.entry(seg.audio_path.as_str()).or_default().push(index);
+    }
+    let mut clip_durations: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for (source, rows) in &by_source {
+        let single_segment_source = sibling_counts.get(*source).copied().unwrap_or(1) <= 1;
+        let mut spans: Vec<crate::commands::ClipSpan> = Vec::with_capacity(rows.len());
+        for &index in rows {
+            let seg = planned[index].0;
+            let alignment = seg.alignment_json.as_deref().map(str::trim).filter(|a| !a.is_empty());
+            let window = match alignment {
+                // Truly absent alignment: a single-segment import — the whole file is the clip.
+                None => Some((0, i64::MAX)),
+                Some(json) => match crate::chunking::SegmentSourceMeta::from_alignment_json(json) {
+                    Some(meta) => {
+                        let start = meta.source_start_ms.max(0);
+                        Some((start, meta.source_end_ms.max(start)))
+                    }
+                    // ALIGNMENT PRESENT BUT OFFSET-LESS: whole-file is correct for a legitimately
+                    // aligned single-segment file and CORRUPTING for a clobbered chunk of a
+                    // multi-segment source (it would ship the entire recording as one "clip").
+                    None if single_segment_source => Some((0, i64::MAX)),
+                    None => None,
+                },
+            };
+            match window {
+                Some((start_ms, end_ms)) => {
+                    spans.push(crate::commands::ClipSpan { segment_id: seg.id.clone(), start_ms, end_ms })
+                }
+                None => tracing::warn!(
+                    "finetune pack: skipping {} (alignment_json carries no source offsets on a \
+                     multi-segment source — refusing the whole-file fallback; re-import the file \
+                     through the current build to regenerate its slice offsets)",
+                    seg.id
+                ),
             }
-            _ => {
-                tracing::warn!("finetune pack: skipping {} (clip undecodable)", seg.id);
-                skipped += 1;
-                continue;
+        }
+
+        // A failed WRITE is fatal to the export (a full disk must not read as "some clips skipped"),
+        // while a failed DECODE skips that source's rows and says so.
+        let mut write_failure: Option<crate::error::AppError> = None;
+        let decoded = crate::commands::decode_finetuned_clips_16k(source, &spans, |segment_id, pcm| {
+            if pcm.is_empty() {
+                tracing::warn!("finetune pack: skipping {segment_id} (clip undecodable)");
+                return Ok(());
             }
+            let duration = pcm.len() as f64 / crate::audio::TARGET_SAMPLE_RATE as f64;
+            match write_wav_16k_mono(
+                &clips_dir.join(format!("{segment_id}.wav")),
+                &pcm,
+                crate::audio::TARGET_SAMPLE_RATE,
+            ) {
+                Ok(()) => {
+                    clip_durations.insert(segment_id.to_string(), duration);
+                    Ok(())
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    write_failure = Some(error);
+                    Err(message)
+                }
+            }
+        });
+        if let Some(error) = write_failure {
+            return Err(error);
+        }
+        if let Err(reason) = decoded {
+            tracing::warn!("finetune pack: source {source} failed to decode ({reason}) — its rows are skipped");
+        }
+    }
+
+    // PASS 3 — write the manifest in PASS 1's order. A planned row with no clip on disk was skipped
+    // above (undecodable, offset-less, or a dead source) and is counted here exactly once.
+    for (seg, report, sentence) in planned.iter() {
+        let Some(duration_seconds) = clip_durations.get(seg.id.as_str()).copied() else {
+            skipped += 1;
+            continue;
         };
         // Counted, never silent: a row can be verified WITHOUT a live human decision — batch-verify
         // never records one, and `clear_human_decision` (undo) clears the decision while leaving
@@ -530,12 +603,10 @@ pub fn export_finetune_pack(
         if seg.human_decision.is_none() {
             emitted_without_human_decision += 1;
         }
-        let clip_rel = format!("clips/{}.wav", seg.id);
-        write_wav_16k_mono(&clips_dir.join(format!("{}.wav", seg.id)), &pcm, crate::audio::TARGET_SAMPLE_RATE)?;
         let row = FinetuneRow {
-            audio_path: clip_rel,
-            sentence: &sentence,
-            duration_seconds: pcm.len() as f64 / crate::audio::TARGET_SAMPLE_RATE as f64,
+            audio_path: format!("clips/{}.wav", seg.id),
+            sentence,
+            duration_seconds,
             segment_id: &seg.id,
             source_recording: seg.audio_path.rsplit(['/', '\\']).next().unwrap_or(&seg.audio_path),
             // A row with no split assignment would be a silent hole in the leakage guarantee, so
@@ -1607,6 +1678,98 @@ mod tests {
         assert_eq!(export.skipped, 1);
         let manifest = std::fs::read_to_string(out.path().join("manifest.jsonl")).unwrap();
         assert!(manifest.trim().is_empty(), "no row for a skipped clip");
+    }
+
+    #[test]
+    fn finetune_pack_walks_each_source_once_not_once_per_clip() {
+        // REGRESSION (2026-08-18). `decode_finetuned_clip_16k` decodes from byte zero to the clip's
+        // end, so exporting N clips out of ONE recording decoded that recording N times, each walk
+        // longer than the last. Measured on the live library — where 416 of 447 verified clips sit
+        // inside a single podcast FLAC — the pack export ran at ~36 s per row: 87 rows in 56 minutes.
+        // That is hours for one pack, and gate D asks the challenger loop to produce one on demand.
+        //
+        // This is invisible to output equality (the clips are byte-identical either way), so the
+        // assertion is on DECODE PASSES, not on wall-clock, which on this box only produces flakes.
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("one-long-podcast.wav");
+        const SECONDS: usize = 60;
+        const RATE: usize = 16_000;
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: RATE as u32,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+            // A ramp, so every sample position carries a DIFFERENT value: a clip sliced from the
+            // wrong offset cannot accidentally look right.
+            for index in 0..(SECONDS * RATE) {
+                writer.write_sample((index / 100) as i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        // 12 clips at 5 s intervals, each 6 s long: they overlap, one straddles the decoder's 30 s
+        // window boundary, and the last one runs past the end of the file. All three are cases the
+        // grouped walk has to get right that a per-clip walk got for free.
+        const CLIPS: i64 = 12;
+        for index in 0..CLIPS {
+            let start_ms = index * 5_000;
+            let meta = crate::chunking::SegmentSourceMeta {
+                source_start_ms: start_ms,
+                source_end_ms: start_ms + 6_000,
+                chunk_index: index as u32,
+                chunk_count: CLIPS as u32,
+            };
+            let id = format!("clip{index:02}");
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: id.clone(),
+                audio_path: source.to_string_lossy().to_string(),
+                raw_transcript: format!("دەقی ژمارە {index}"),
+                alignment_json: Some(meta.to_alignment_json()),
+                ..Default::default()
+            })
+            .unwrap();
+            db.update_verified(&id, true).unwrap();
+            db.record_human_decision(&id, "accept", None, None).unwrap();
+        }
+
+        let out = tempfile::TempDir::new().unwrap();
+        let before = crate::audio::decode_passes_on_this_thread();
+        let result = export_finetune_pack(&db, out.path(), None).unwrap();
+        let passes = crate::audio::decode_passes_on_this_thread() - before;
+
+        assert_eq!(result.emitted, CLIPS as usize, "every clip is in the pack");
+        assert_eq!(
+            passes, 1,
+            "{CLIPS} clips out of ONE recording must cost ONE decode walk, not {passes} — this is the \
+             quadratic export that made a pack take hours"
+        );
+
+        // The clips are still sliced from the right place: clip k starts at k*5 s, and the ramp puts
+        // sample value (k * 5 * 16000)/100 = k*800 there. Tolerance ±2 because decoding round-trips
+        // i16 -> f32 -> i16 on a 32767 scale, so 800 comes back 799 — pre-existing and harmless, and
+        // far tighter than the 800 that separates one clip's offset from the next.
+        for index in 0..CLIPS {
+            let path = out.path().join(format!("clips/clip{index:02}.wav"));
+            let mut reader = hound::WavReader::open(&path).unwrap();
+            let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+            let expected = (index * 800) as i16;
+            assert!(
+                (samples[0] - expected).abs() <= 2,
+                "clip {index} was sliced from the wrong offset: first sample {}, expected ~{expected}",
+                samples[0]
+            );
+            let expected_ms = if index == CLIPS - 1 { 5_000 } else { 6_000 };
+            let actual_ms = (samples.len() as i64 * 1000) / RATE as i64;
+            assert!(
+                (actual_ms - expected_ms).abs() <= 100,
+                "clip {index}: expected ~{expected_ms} ms, got {actual_ms} ms (the last clip runs past \
+                 EOF and is truncated to what the file actually holds)"
+            );
+        }
     }
 
     #[test]

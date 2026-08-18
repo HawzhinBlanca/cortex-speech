@@ -1125,6 +1125,107 @@ pub(crate) fn decode_finetuned_clip_16k(
     Ok(pcm16)
 }
 
+/// One clip to slice out of a source recording during a grouped decode. `end_ms == i64::MAX` means
+/// "to the end of the file" — the whole-file case expressed as a span, so one walk covers both kinds.
+pub(crate) struct ClipSpan {
+    pub segment_id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// Decode MANY clips out of ONE source recording in a SINGLE streaming pass.
+///
+/// `decode_finetuned_clip_16k` walks the file from byte zero to the clip's end. That is right for one
+/// clip and QUADRATIC for a pack: this library keeps 416 verified clips inside a single podcast FLAC,
+/// so exporting it re-decoded that FLAC 416 times, each walk longer than the last. Measured
+/// 2026-08-18 on the live library: **87 rows in 56 minutes (~36 s/row)**, which puts a full pack in
+/// the hours and makes the challenger loop's "zero manual steps" unreachable in practice.
+///
+/// This walks the source once and hands each clip over the moment its window has passed, so peak
+/// memory is the clips overlapping the current 30 s window rather than the whole file — the same
+/// bound the streaming import already holds itself to. The PCM handed to `on_clip` is
+/// byte-for-byte what the per-clip decoder produced: same decoder, same window size, same slice
+/// arithmetic, so a pack's manifest hash (its snapshot id) does not move because of this change.
+pub(crate) fn decode_finetuned_clips_16k<F>(audio_path: &str, spans: &[ClipSpan], mut on_clip: F) -> Result<(), String>
+where
+    F: FnMut(&str, Vec<i16>) -> Result<(), String>,
+{
+    if spans.is_empty() {
+        return Ok(());
+    }
+    // Opened in start order so a clip can be closed and its buffer freed as soon as the walk passes it.
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by_key(|&i| (spans[i].start_ms, i));
+    let last_end = spans.iter().map(|s| s.end_ms).max().unwrap_or(0);
+
+    let mut next = 0_usize;
+    let mut open: Vec<(usize, Vec<i16>)> = Vec::new();
+    let mut rate = crate::audio::TARGET_SAMPLE_RATE;
+    const CLIPS_DONE: &str = "__clip_windows_done__";
+
+    let finish = |idx: usize, acc: Vec<i16>, rate: u32, on_clip: &mut F| -> Result<(), String> {
+        let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, acc).map_err(|e| e.to_string())?;
+        on_clip(&spans[idx].segment_id, pcm16)
+    };
+
+    let res = crate::audio::decode_pcm_windows(audio_path, 30_000, |win| {
+        rate = win.sample_rate.max(1);
+        let win_start = win.offset_ms;
+        let dur_ms = (win.pcm.len() as i64 * 1000) / rate as i64;
+        let win_end = win_start + dur_ms;
+
+        while next < order.len() && spans[order[next]].start_ms < win_end {
+            open.push((order[next], Vec::new()));
+            next += 1;
+        }
+        for (idx, acc) in open.iter_mut() {
+            let span = &spans[*idx];
+            if win_end > span.start_ms && win_start < span.end_ms {
+                let a_ms = (span.start_ms.max(win_start) - win_start).max(0);
+                let b_ms = (span.end_ms.min(win_end) - win_start).max(0);
+                let a = ((a_ms * rate as i64) / 1000) as usize;
+                let b = (((b_ms * rate as i64) / 1000) as usize).min(win.pcm.len());
+                if b > a {
+                    acc.extend_from_slice(&win.pcm[a..b]);
+                }
+            }
+        }
+        // Hand over every clip the walk has now passed, so its buffer does not outlive its window.
+        let mut still_open = Vec::with_capacity(open.len());
+        for (idx, acc) in open.drain(..) {
+            if spans[idx].end_ms <= win_end {
+                finish(idx, acc, rate, &mut on_clip).map_err(crate::error::AppError::Other)?;
+            } else {
+                still_open.push((idx, acc));
+            }
+        }
+        open = still_open;
+
+        // Everything asked for has been delivered — stop rather than decode the rest of a long file.
+        if next >= order.len() && open.is_empty() && win_start >= last_end {
+            return Err(crate::error::AppError::Other(CLIPS_DONE.to_string()));
+        }
+        Ok(())
+    });
+    match res {
+        Ok(()) => {}
+        Err(crate::error::AppError::Other(m)) if m == CLIPS_DONE => return Ok(()),
+        // An `on_clip` failure travels back out as itself, not as a decode error.
+        Err(crate::error::AppError::Other(m)) => return Err(m),
+        Err(e) => return Err(e.to_string()),
+    }
+    // EOF with clips still open (a span running past the end of the file) or never opened at all:
+    // hand over what was actually decoded. An empty buffer reaches the caller as an empty clip, which
+    // is the same "undecodable, skip it" signal the per-clip decoder gives.
+    for (idx, acc) in std::mem::take(&mut open) {
+        finish(idx, acc, rate, &mut on_clip)?;
+    }
+    for &idx in &order[next..] {
+        finish(idx, Vec::new(), rate, &mut on_clip)?;
+    }
+    Ok(())
+}
+
 /// Resolve the fine-tuned model + vocab paths: `CORTEX_FINETUNED_ONNX`/`CORTEX_FINETUNED_VOCAB`
 /// (dev/testing) or `finetuned-mms-ckb/{model.onnx,vocab.json}` in the active then bundled models dir.
 fn resolve_finetuned_paths() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
