@@ -146,3 +146,6 @@ datasets/**
 
 # Vendored pinned model (see cortex-speech-app/scripts/fetch_models.py) — the sole *.onnx exception.
 !cortex-speech-app/vendor/silero_vad_v4.onnx
+
+# Challenger/canary run artifacts: packs, clips, run records and verdicts are OUTPUT, not source.
+runs/
