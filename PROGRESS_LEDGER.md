@@ -9611,3 +9611,37 @@ reviewer Accept-lockout, the sticky audio error, the champion's env-var dependen
 drift) all came from measuring the live machine rather than from the plan.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (afternoon) — durability verified end to end, and no defect found
+
+A sweep that found NOTHING is recorded here on purpose: the next run should not re-verify this from
+scratch, and "we assume the backups are fine" is exactly the belief this project does not get to hold.
+
+The corpus's last line of defence, measured rather than assumed — a plain file copy once lost the WAL
+tail on this repo (74/22 instead of 77/23), so both copies were opened and queried, not just listed:
+
+```
+                       primary (C:)                    off-drive (F:\cortex-backups)
+cadence                every 10 min, exact              written the same minute
+integrity_check        ok                               ok
+segments/verified/labeled  15905 / 447 / 429            15905 / 447 / 429
+rotation               20 dirs, 1.4 GB (+ pinned/)      11 dirs, 969 MB
+```
+
+Both match the LIVE database exactly, so the WAL tail is captured (`VACUUM INTO`, not a file copy) and
+the off-drive copy is genuinely restorable rather than merely present. `backup_second_dir` =
+`F:\cortex-backups`, and F: has 2.4 TB free, so the second copy is not about to stop silently.
+
+**No defect found in this sweep.** Areas now measured and healthy: the export path, both review paths
+(desktop and couch), champion supervision and its script resolution, the watchdog task's live
+settings, corpus counts, and durability. The five defects this loop DID find all came from measuring
+the live machine, and that well is dry for now.
+
+### The loop stopped here, per §8
+
+Every remaining item in §5 needs the owner rather than another agent iteration — Phase 4's serving-path
+wiring and registering the live champion (both touch the model lock and champion supremacy), the
+challenger trainer that gate D is blocked on, and gate B's ~10,000 human labels. Continuing to iterate
+would be motion without progress, which §8 says to stop rather than dress up.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
