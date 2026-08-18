@@ -354,6 +354,12 @@ fn write_snapshot_manifest(staging: &Path, ts: u64) -> AppResult<()> {
 }
 
 /// Required state a restore cannot come back without.
+///
+/// The PRODUCTION consumer of this contract is `scripts/restore_drill.py`, which reads a snapshot
+/// from outside the app (the app may not be installable on the machine doing the recovery). This
+/// Rust copy exists so the writer's own test asserts the same required set the drill enforces — if
+/// the two ever disagree, a snapshot could satisfy one and fail the other.
+#[cfg(test)]
 pub(crate) fn manifest_missing_required(manifest: &serde_json::Value) -> Vec<String> {
     let present: Vec<&str> = manifest
         .get("files")
