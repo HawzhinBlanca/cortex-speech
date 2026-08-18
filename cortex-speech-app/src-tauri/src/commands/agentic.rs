@@ -88,9 +88,13 @@ pub async fn get_champion_engine_status(
 /// CORTEX_7B_START_SCRIPT (the desktop launcher sets it); without it we return an actionable error
 /// rather than guess a path.
 #[tauri::command]
-pub fn start_champion_engine(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn start_champion_engine(app: tauri::AppHandle) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("start_champion_engine")?;
-    crate::engine_runtime::restart_current_champion(&app)
+    // `restart_current_champion` tree-kills the held child and spawns a new wsl.exe that loads ~30 GB.
+    // As a SYNC command that ran inline, that whole body executed on the UI thread and froze the
+    // window (test_ui_thread_blocking_audit.py). Same async + run_blocking shape as
+    // `get_champion_engine_status` above.
+    run_blocking(move || crate::engine_runtime::restart_current_champion(&app)).await
 }
 
 #[tauri::command]

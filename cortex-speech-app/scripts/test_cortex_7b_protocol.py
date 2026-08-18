@@ -182,7 +182,10 @@ def test_full_composite_and_pointer_identity_are_verified() -> None:
 
 
 def test_windows_registry_manifest_paths_translate_to_the_same_wsl_filesystem() -> None:
-    pointer_dir = Path("/mnt/c/Users/owner/AppData/Roaming/cortex-speech")
+    # An arbitrary base for a PURE translation assertion — deliberately NOT a user-profile path.
+    # A WSL-mounted per-user profile root is forbidden in tracked files of this public repo
+    # (test_windows_repo_hygiene.py); the value here is never inspected, only joined.
+    pointer_dir = Path("/mnt/c/ProgramData/cortex-speech")
     assert _mod._pointer_manifest_path(
         "C:\\models\\deployment_manifest.json", pointer_dir, running_on_windows=False
     ) == Path("/mnt/c/models/deployment_manifest.json")
