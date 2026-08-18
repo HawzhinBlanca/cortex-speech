@@ -273,9 +273,16 @@ class LegacyBootstrapTests(unittest.TestCase):
             out = root / "deployment.json"
             out.write_bytes(b"old-complete-file")
 
+            # `_atomic_publish` resolves the parent (strict=True) on purpose, so `destination` is the
+            # REAL path. Comparing it to the unresolved `out` fails wherever the temp dir is an alias —
+            # macOS `/var` -> `/private/var`, Windows `RUNNER~1` -> long name — and the resulting
+            # AssertionError masks the injected OSError, so the test fails for an environmental reason
+            # instead of the behaviour it means to pin. Compare resolved to resolved.
+            resolved_out = out.parent.resolve(strict=True) / out.name
+
             def fail_replace(source, destination):
                 self.assertTrue(Path(source).is_file())
-                self.assertEqual(Path(destination), out)
+                self.assertEqual(Path(destination), resolved_out)
                 raise OSError("injected replace failure")
 
             with self.assertRaisesRegex(bootstrap.BootstrapError, "injected replace failure"):
