@@ -9355,6 +9355,44 @@ labeled (gate B)   : 429 clips / 1.086 h        dataset_runs : 1 (was 0)
 Gate B targets 25 h / top-1 ≤ 30 % / ≥ 25 recordings. Unchanged by tonight's work, and only human
 review moves it — which is exactly why the Accept-lockout bug above mattered.
 
+### Gate B is reachable on review throughput alone — and my "fix" for it was unnecessary
+
+I suspected the couch queue's strict FIFO (`ORDER BY created_at ASC, id ASC` in
+`pending_segment_ids_for`) was hurting gate B: with ~147 clips per `.wav`, reviewers should be walking
+long single-narrator runs, which is the worst possible shape for a "top-1 recording <= 30 %" target.
+Before changing anything, I replayed the REAL pending queue in the exact order the couch page serves
+it, starting from today's 429 labels:
+
+```
+FIFO (what the queue serves today):
+  after N more labels |  hours | top-1 % | recordings | gate B?
+                1000 |    3.5 |    28.8 |         91 | no
+                5000 |   13.4 |    10.6 |        155 | no
+               10000 |   25.7 |     5.5 |        167 | PASS
+               15458 |   39.0 |     3.6 |        245 | PASS
+
+Round-robin by recording (NOT implemented — comparison only):
+               10000 |   25.5 |     4.0 |        245 | PASS
+```
+
+**The hypothesis was wrong and no change was made.** FIFO already reaches 91 distinct recordings
+inside the first 1,000 clips, because the importer interleaves files as it processes them — the long
+single-narrator runs I assumed simply are not there. Round-robin buys 1.5 points of top-1 share at
+the moment gate B passes, which is not worth touching what 8 paid reviewers see.
+
+**The number that matters:** gate B needs roughly **10,000 more human LABELS** — at which point it
+reads 25.7 h, top-1 5.5 %, 167 recordings, and PASSES all three arms.
+
+Labels, not clips reviewed. Measured conversion on the work done so far:
+
+```
+edit 241 + accept 188 = 429 labels        reject 18        -> 429 of 447 decided = 96 %
+```
+
+so ~10,400 clips have to be REVIEWED to yield those ~10,000 labels. Either way: no code change, no
+import, and no design decision stands in the way. Gate B is review throughput and nothing else —
+which is exactly why the Accept-lockout fixed above was worth the night.
+
 ### Owner-gated — one item cleared itself
 
 Every cheap gate was re-run tonight and the **spot-check pool is no longer blocking**:
