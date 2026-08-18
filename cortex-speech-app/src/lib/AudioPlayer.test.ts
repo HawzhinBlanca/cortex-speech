@@ -8,8 +8,9 @@
  * through the queue was shown "Playback was blocked or the file could not be found" and then LOCKED
  * OUT of accepting a clip that plays perfectly.
  *
- * Not a corner case: the review queue holds 361 `.mov` and 51 `.mp4` files that are one clip each, so
- * advancing nearly always switches source while the previous play() is still starting.
+ * Not a corner case: the queue's 412 `.mov`/`.mp4` clips are spread over 140 distinct FILES (~3 clips
+ * each), so advancing switches source every few clips, often while the previous play() is still
+ * starting.
  */
 import { render, cleanup } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -146,8 +147,8 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     // `audioError` is bound to the parent, where it refuses Accept/Save/Mark-bad. It cleared only
     // when `audioPath` CHANGED (or if the reviewer spotted the Retry link) — but consecutive review
     // clips from one recording SHARE an audioPath, and while the banner is up there is no play button
-    // to press. The dominant recording holds 403 of the 414 exportable clips, so one failure left
-    // the reviewer refused for the rest of that recording.
+    // to press. The dominant recording holds 403 of the 414 exportable clips (and 147 queue clips per
+    // .wav file on average), so one failure left the reviewer refused for the rest of that recording.
     const { container, rerender } = render(AudioPlayerHost, {
       props: { path: 'D:/queue/one-recording.flac', clipKey: 'clip-1' },
     });

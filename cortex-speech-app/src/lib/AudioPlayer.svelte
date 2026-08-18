@@ -230,8 +230,8 @@
   // Reporting it was not merely noisy. `audioError` is bound to the PARENT, which disables Accept/Save
   // so a verdict cannot be recorded on a clip that could not be played (2026-08-17). So a spurious
   // AbortError LOCKED THE REVIEWER OUT of a perfectly good clip. And it is not a corner case: the
-  // review queue holds 361 `.mov` and 51 `.mp4` files that are one clip each, so advancing almost
-  // always switches source while the previous play() is still starting.
+  // review queue's 412 `.mov`/`.mp4` clips are spread over 140 distinct FILES (~3 clips each), so
+  // advancing switches source every few clips, often while the previous play() is still starting.
   //
   // `playAttempt` is the generation counter — a rejection from a superseded attempt is discarded
   // rather than reported, and only the newest attempt may set `playing`.
