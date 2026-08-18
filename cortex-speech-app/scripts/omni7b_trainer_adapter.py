@@ -287,11 +287,22 @@ def main() -> int:
         "--batch_size", batch,
         "--max_duration", "30.0",
     ]
+    # Pinning the canary to specific cards lets the champion keep SERVING on the others: the 7B server
+    # honours CORTEX_7B_DEVICES, so a one-GPU canary alongside a one-GPU champion costs reviewers a
+    # brief restart instead of an outage.
+    visible = os.environ.get("CORTEX_OMNI7B_CUDA_DEVICES", "").strip()
+    launcher = ["wsl", "-e"]
+    if visible:
+        launcher += ["env", f"CUDA_VISIBLE_DEVICES={visible}"]
     printable = " ".join(json.dumps(token) if " " in token else token for token in command)
-    print(f"ADAPTER: launching real trainer under WSL\n  {printable[:400]}", flush=True)
+    print(
+        f"ADAPTER: launching real trainer under WSL"
+        f"{f' (CUDA_VISIBLE_DEVICES={visible})' if visible else ''}\n  {printable[:400]}",
+        flush=True,
+    )
 
     process = subprocess.Popen(
-        ["wsl", "-e", *command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        [*launcher, *command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
     transcript: list[str] = []
     assert process.stdout is not None
