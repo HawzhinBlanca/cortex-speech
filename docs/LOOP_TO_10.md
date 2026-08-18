@@ -63,7 +63,7 @@ that a particular model won.
 | 1 — break the data skew | **STARTED** | gate B above. Importing is not labeling — only reviewers move it |
 | 2 — snapshots + pack provenance | **DONE** 2026-08-18 | gate C — **MEASURED GREEN**, 1 sealed snapshot |
 | 3 — challenger loop | **WIRED; BLOCKED on a trainer** | gate D — snapshot ✓ train ✗ eval ✗ verdict ✗ |
-| 4 — registry + rollback | **NOT STARTED** | gate E |
+| 4 — registry + rollback | **MOSTLY BUILT, NEVER WIRED** (verified 2026-08-18) | gate E — see §5.2 for the real remainder |
 | 5 — redefine done | **NOT STARTED** | gates C/D/E wired into `verify_10.py` |
 
 ## 4. Per-run protocol
@@ -94,11 +94,33 @@ that a particular model won.
 1. **Phase 5 first, not last.** Wire gates C, D and E into `verify_10.py` as `snapshot-immutability`,
    `challenger-loop` and `promotion-drill`. Doing this early means every later run is measured by the
    finish line instead of by opinion. C and D can be wired now; E lands with Phase 4.
-2. **Phase 4 — the registry.** `adapters` becomes the single source of truth (adapter path, snapshot
-   id, eval report hash, status). Promotion is ONE transaction: registry flip → adapter reload →
-   health check → automatic rollback to the prior adapter if the health check fails. The champion
-   server must read its adapter path FROM the registry, not from `CORTEX_7B_MODEL_DIR`. Drill it like
-   the backups were drilled, and make the drill gate E.
+2. **Phase 4 — the registry EXISTS. Do not rebuild it.** Verified 2026-08-18 by reading the code and
+   the live DB, because this document said "NOT STARTED" and that was wrong:
+
+   * `src-tauri/src/registry.rs` (53 KB, since 2026-07-22) already has `register_candidate`,
+     `promote_to_champion`, `gate_and_promote`, `decide_promotion`, `record_eval_result`,
+     `hash_checkpoint`, `import_checkpoint`, `sync_champion_pointer`.
+   * Promotion is ALREADY one transaction that demotes the incumbent to `rolled_back`
+     (registry.rs:101-128), and migration v23 pins the vocabularies plus a partial unique index
+     enforcing one champion per family.
+   * `sync_champion_pointer` already runs at startup (lib.rs:519-522) and writes `champion.json`.
+
+   **What is actually missing, and it is only these three things:**
+
+   a. **The registry is EMPTY and the serving path ignores it.** Measured on the live DB:
+      `model_versions 0 rows`, `adapters 0 rows`, `champion.json = {"champions": {}}`. Meanwhile
+      `engine_runtime.rs:132` still takes the model dir from `CORTEX_7B_MODEL_DIR`, defaulting to
+      `/home/ai/cortex_champion_model`. So the champion that is serving right now is NOT a registry
+      row, and promoting in the registry would change `champion.json` **without changing what serves**.
+      Registering the live champion is an OWNER decision (it declares what the champion officially is)
+      and touches the model lock — surface it, never do it unasked.
+   b. **No rollback DRILL.** `rolled_back` is a status the code writes; nothing proves a rollback
+      restores byte-identical serving.
+   c. **No `promotion-drill` gate.** `verify_10.py` has no such entry — grepped, zero hits.
+
+   Because of (a), wiring `start_child` to read the registry is a NO-OP today (empty registry → same
+   default), which makes it the safe first step — but it still changes what CAN serve, so it goes to
+   the owner with its design before it lands.
 3. **The canary run (gate D) — RAN 2026-08-18, and stopped at `train`.** The first two links are
    done on real data: `export_pack` sealed snapshot `23db46a0…` (414 rows) and `train_challenger.py`
    verified the pack against it, exit 3 / `status: "prepared"`. `export_pack` does NOT need the app
