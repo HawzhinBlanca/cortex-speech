@@ -601,7 +601,7 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
         'tracing::error!("Batch speaker assignment DB update failed for {id}: {error}")',
         '.get_segments_by_ids(&segment_ids)\n        .map_err(|e| e.to_string())?',
         'let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',
-        'let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted);',
+        'let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted, recorded_is_champion);',
         'let few_shots = crate::jury::get_few_shot_examples(db, seg_id, 5).map_err(|e| e.to_string())?;',
         'let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;',
     ]

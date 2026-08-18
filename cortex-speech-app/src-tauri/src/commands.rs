@@ -1631,7 +1631,15 @@ fn segment_recorded_model_is_champion(db: &crate::db::Database, segment: &crate:
     if recorded == LEGACY_CHAMPION_MODEL_ID {
         return true;
     }
-    crate::registry::is_family_model(db, recorded, crate::deployment::OMNIASR_7B_FAMILY).unwrap_or(false)
+    match crate::registry::is_family_model(db, recorded, crate::deployment::OMNIASR_7B_FAMILY) {
+        Ok(is_champion) => is_champion,
+        Err(error) => {
+            // Fail CLOSED (hide the votes) but never silently: a registry read that fails here would
+            // otherwise look identical to "this row was drafted by a weaker engine".
+            tracing::error!("champion-family lookup failed for model {recorded}: {error}");
+            false
+        }
+    }
 }
 
 fn hypotheses_for_selected_asr(
