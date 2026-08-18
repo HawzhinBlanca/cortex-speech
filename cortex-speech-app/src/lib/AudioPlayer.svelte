@@ -77,6 +77,7 @@
     //    too — otherwise a pending timer from the PREVIOUS clip could fire after the source switched and
     //    (with Loop on) auto-play the newly-selected clip the user never pressed Play on.
     clearClipStop();
+    supersedePlay();
     if (audioEl && !audioEl.paused) {
       audioEl.pause();
       playing = false;
@@ -222,15 +223,42 @@
     );
   }
 
+  // A pending play() promise is REJECTED with AbortError whenever something supersedes it: advancing
+  // to the next clip (resolveAudioUrl pauses the element and reloads it), pressing pause, or any
+  // source switch. That is the app doing exactly what it was told — not audio nobody could hear.
+  //
+  // Reporting it was not merely noisy. `audioError` is bound to the PARENT, which disables Accept/Save
+  // so a verdict cannot be recorded on a clip that could not be played (2026-08-17). So a spurious
+  // AbortError LOCKED THE REVIEWER OUT of a perfectly good clip. And it is not a corner case: the
+  // review queue holds 361 `.mov` and 51 `.mp4` files that are one clip each, so advancing almost
+  // always switches source while the previous play() is still starting.
+  //
+  // `playAttempt` is the generation counter — a rejection from a superseded attempt is discarded
+  // rather than reported, and only the newest attempt may set `playing`.
+  let playAttempt = 0;
+  function supersedePlay() {
+    playAttempt += 1;
+  }
+
   function attemptPlay(failureMessage: string) {
     if (!audioEl) return;
+    const attempt = ++playAttempt;
     audioEl
       .play()
       .then(() => {
+        if (attempt !== playAttempt) return; // a newer attempt owns the element now
         playing = true;
         scheduleClipStop();
       })
       .catch((e: unknown) => {
+        if (attempt !== playAttempt) return;
+        // Belt and braces for an abort the element raised without going through supersedePlay (a
+        // `load()` from elsewhere). AbortError never means undecodable (NotSupportedError) or blocked
+        // (NotAllowedError), so discarding it hides no real failure.
+        if ((e as { name?: string } | null)?.name === 'AbortError') {
+          playing = false;
+          return;
+        }
         reportPlaybackFailure(failureMessage, e);
       });
   }
@@ -251,6 +279,7 @@
 
   function pause() {
     clearClipStop();
+    supersedePlay();
     audioEl?.pause();
     playing = false;
   }
