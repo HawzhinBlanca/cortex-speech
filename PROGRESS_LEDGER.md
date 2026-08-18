@@ -9210,9 +9210,20 @@ still starting rejected the play, and that rejection was reported as a playback 
 
 **This was not a cosmetic toast.** `audioError` is bound to the parent, where it disables Accept/Save
 so a verdict cannot be recorded on audio nobody could hear (2026-08-17 — a correct guard). A spurious
-AbortError therefore **locked the reviewer out of accepting a clip that plays perfectly**. And it is
-the common case, not a corner: those 412 `.mov`/`.mp4` files are one clip each, so advancing almost
-always switches source mid-start.
+AbortError therefore **locked the reviewer out of accepting a clip that plays perfectly**.
+
+*Correction, made before this entry landed:* I first wrote that those 412 `.mov`/`.mp4` clips were
+"one file each". The rows were measured; the FILES were not. Measured:
+
+```
+.mov   rows=361  distinct files=108  clips/file=3.34
+.mp4   rows=51   distinct files=32   clips/file=1.59
+.wav   rows=15034 distinct files=102 clips/file=147.39
+```
+
+412 clips over **140** files, ~3 each — so a source change every few clips rather than every clip.
+The defect and the fix are unchanged; only the frequency claim was overstated, and this project does
+not get to state a number it did not measure.
 
 Fixed with a generation counter — a rejection from a superseded attempt is discarded, only the newest
 attempt may set `playing` — plus an explicit AbortError discard. Nothing real is hidden: undecodable
