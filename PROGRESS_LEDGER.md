@@ -9531,3 +9531,83 @@ The exe bakes `04647f6` and the docs PR merged after it, so `check_exe_freshness
 rather than left looking like a stale build.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (midday) — the watchdog was Ready and doing nothing, and §5 is now fully owner-gated
+
+### The defect every existing gate called healthy
+
+`CortexWatchdog` reported `Ready`, and both `test_watchdog_enabled.py` and `check_supervision_live.py`
+only ever read that State. Meanwhile the LIVE scheduled task had drifted from the script that defines
+it:
+
+```
+StartWhenAvailable = False        (cortex-watchdog.ps1 registers it True)
+ExecutionTimeLimit = PT72H        (the script registers unlimited)
+trigger            = TimeTrigger  (the script registers AtLogOn + repetition)
+```
+
+Windows DROPS a repetition occurrence that comes due while the machine is asleep unless
+`StartWhenAvailable` is set — it does not run it late. So the one thing that restarts the app was
+silently inert across every sleep.
+
+**Measured from `watchdog.log`, which is what turned a hunch into a defect:**
+
+```
+clean-exit relaunches : 19
+median downtime       : ~8 min
+worst                 : 9 h 18 m   (exit 2026-08-13 19:23 UTC, detected 2026-08-14 07:42 local)
+```
+
+That is not merely failed imports. **The couch review server lives inside the app**, so each of those
+windows is every reviewer link DEAD — and gate B moves on human labels and nothing else. A 9-hour
+reviewer outage is the most expensive thing found in two days of this loop.
+
+Proven against real machine state, both directions:
+
+```
+before:  SUPERVISION GATE: FAIL   (exit 1) — StartWhenAvailable is FALSE ...
+after :  SUPERVISION GATE: OK (watchdog enabled, 8 reviewer link(s) answering on 8737)   (exit 0)
+```
+
+Three pins added to the pure core so CI covers the decision on Linux: the drift fails, an UNREADABLE
+flag (`None` — no PowerShell, not Windows) is NOT a failure so the gate degrades rather than
+false-alarms, and a Disabled watchdog still outranks the drift so the worse problem is the one
+reported. With the arm disabled all three fail (`AssertionError: []`).
+
+The live task was repaired with `Set-ScheduledTask`. **`-Register` needs elevation** (`Access is
+denied`), so the gate message names the re-register command rather than pretending an agent can do it.
+
+### Chased and cleared: the 446 / 447 verified count
+
+The startup log reads `Restored session: 15905 segments, 446 verified` while the DB reads 447.
+Chased because this repo has a documented history of count bugs (6x fixed). It is NOT one:
+
+```
+distinct (typeof, value) of `verified`:  integer 0 -> 15458 ,  integer 1 -> 447
+app query SUM(CASE WHEN verified ...) : 447
+my query  COUNT(*) WHERE verified=1   : 447          <- the two predicates AGREE
+446 is stable across every restart since 2026-08-17 22:58 — nothing decreased
+```
+
+The line comes from `serde_json::from_str::<SessionState>(&json)` in `session/mod.rs:225` — a
+persisted session file replayed verbatim, not a DB read. So it is a startup breadcrumb that can lag,
+and `session/mod.rs:62-64` already says compute_stats owns the figure the UI shows. **No corpus
+problem, no data loss, no fix made** — recorded so the next run does not re-chase it.
+
+### §5 is now fully owner-gated — the honest stopping condition
+
+Per §8, every remaining item in the work queue needs the owner, not another agent iteration:
+
+| §5 item | State |
+|---|---|
+| 1. wire gates C/D/E | C and D done; **E needs Phase 4** |
+| 2. Phase 4 registry | registry EXISTS (see the 2026-08-18 morning entry); wiring the serving path and registering the live champion are **owner decisions** — they touch the model lock and champion supremacy |
+| 3. canary run (gate D) | **blocked: no trainer exists**; building one is a compute + model-handling call |
+| 4. Phase 1 throughput | the doctrine's own answer is STOP importing — more audio cannot move gate B |
+| 5. speaker-disjoint holdout | needs newly REVIEWED recordings, i.e. human review |
+
+What moved the needle in this loop was never the queue: five real defects (quadratic export, the
+reviewer Accept-lockout, the sticky audio error, the champion's env-var dependency, and this watchdog
+drift) all came from measuring the live machine rather than from the plan.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
