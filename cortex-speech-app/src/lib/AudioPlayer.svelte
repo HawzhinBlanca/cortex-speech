@@ -247,6 +247,12 @@
       .play()
       .then(() => {
         if (attempt !== playAttempt) return; // a newer attempt owns the element now
+        // Playback STARTED, so the audio is audible — clear any earlier failure. Without this the
+        // error is sticky: `audioError` otherwise only clears when `audioPath` changes or the user
+        // notices the Retry link, and consecutive review clips from one recording SHARE an audioPath.
+        // The dominant recording holds 403 of the 414 exportable clips, so one transient failure kept
+        // the reviewer's Accept/Save/Mark-bad refused for the rest of that recording.
+        audioError = null;
         playing = true;
         scheduleClipStop();
       })

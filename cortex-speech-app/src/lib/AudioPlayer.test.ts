@@ -15,6 +15,7 @@ import { render, cleanup } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import AudioPlayer from './AudioPlayer.svelte';
+import AudioPlayerHost from '../../tests/fixtures/AudioPlayerHost.svelte';
 import { notifications, type Notification } from './stores/notificationStore';
 
 vi.mock('./commands', () => ({
@@ -22,8 +23,15 @@ vi.mock('./commands', () => ({
   getMediaAssetUrl: vi.fn(async (id: string) => `C:/cache/${id}.wav`),
 }));
 
-/** Pending play() rejecters, so pause() can abort them the way a real media element does. */
+/** Pending play() settlers, so pause() can abort them the way a real media element does. */
 let pendingPlays: Array<(reason: unknown) => void> = [];
+let pendingPlayResolvers: Array<() => void> = [];
+
+/** Let the newest pending play() succeed, the way a real element does once it starts. */
+function resolveNewestPlay() {
+  pendingPlays.pop();
+  pendingPlayResolvers.pop()?.();
+}
 
 function installMediaElementStub() {
   // jsdom implements none of these; without them every play() throws "Not implemented".
@@ -37,8 +45,9 @@ function installMediaElementStub() {
     this.__paused = false;
     // Deliberately never resolves on its own: this test is about what happens to a play() that is
     // STILL STARTING when the user advances, which is the whole race.
-    return new Promise<void>((_resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       pendingPlays.push(reject);
+      pendingPlayResolvers.push(resolve);
     });
   };
   HTMLMediaElement.prototype.pause = function (this: HTMLMediaElement & { __paused?: boolean }) {
@@ -46,6 +55,7 @@ function installMediaElementStub() {
     // WHATWG: pausing rejects every pending play promise with AbortError.
     const rejecters = pendingPlays;
     pendingPlays = [];
+    pendingPlayResolvers = [];
     for (const reject of rejecters) {
       reject(
         new DOMException('The play() request was interrupted by a call to pause().', 'AbortError'),
@@ -70,6 +80,7 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
   beforeEach(() => {
     installMediaElementStub();
     pendingPlays = [];
+    pendingPlayResolvers = [];
     notifications.clear();
     errors = [];
     unsubscribe = notifications.subscribe((list) => {
@@ -129,5 +140,39 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     expect(errors.length, 'an undecodable clip is still an error the reviewer sees').toBeGreaterThan(
       0,
     );
+  });
+
+  it('the next clip of the SAME recording is not still blocked by the previous failure', async () => {
+    // `audioError` is bound to the parent, where it refuses Accept/Save/Mark-bad. It cleared only
+    // when `audioPath` CHANGED (or if the reviewer spotted the Retry link) — but consecutive review
+    // clips from one recording SHARE an audioPath, and while the banner is up there is no play button
+    // to press. The dominant recording holds 403 of the 414 exportable clips, so one failure left
+    // the reviewer refused for the rest of that recording.
+    const { container, rerender } = render(AudioPlayerHost, {
+      props: { path: 'D:/queue/one-recording.flac', clipKey: 'clip-1' },
+    });
+    await settle();
+    container.querySelector('audio')!.dispatchEvent(new Event('loadedmetadata'));
+    await settle();
+
+    pendingPlays.pop()!(new DOMException('transient', 'NotSupportedError'));
+    pendingPlayResolvers.pop();
+    await settle();
+    expect(
+      container.querySelector('[data-testid="audio-player-timeline"]'),
+      'the error banner replaces the transport, and there is no play button behind it',
+    ).toBeNull();
+
+    // Advance to the NEXT clip of the same recording: audioPath is unchanged, so nothing reloads —
+    // only autoplay fires, and this time playback starts.
+    await rerender({ clipKey: 'clip-2' });
+    await settle();
+    resolveNewestPlay();
+    await settle();
+
+    expect(
+      container.querySelector('[data-testid="audio-player-timeline"]'),
+      'playback started on the next clip, so the audio is audible and the decision must unblock',
+    ).not.toBeNull();
   });
 });
