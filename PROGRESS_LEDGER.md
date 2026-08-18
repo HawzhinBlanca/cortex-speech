@@ -9981,3 +9981,80 @@ reports GPU memory through `vmwp`; `nvidia-smi` per-GPU figures do not track WSL
 (holding 14 GiB moved it by 0 MiB), so the split was confirmed with a deliberate allocation probe.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (night) — the champion restore, and the outage it took to find the real cause
+
+The canary had left the champion on one GPU (its second worker was stopped to free GPU 1). Restoring
+it surfaced a latent fault far more serious than the missing card: **the champion could not restart
+at all.**
+
+```
+FATAL: refusing to serve an unverified champion deployment:
+       no champion pointer configured / champion pointer omniasr-7b must be an object
+```
+
+The running server had been started by an older exe through the retired `CORTEX_7B_MODEL_DIR` path
+(read directly from `/proc/<pid>/environ`), while the working-tree `cortex_7b_server.py` now requires
+a schema-2 champion pointer — and the live `champion.json` was `{"champions": {}, "schema": 1}`. So
+the champion served fine while it lived, but a reboot, a watchdog relaunch, or any restart would not
+have brought it back. Pre-existing, and independent of the canary.
+
+### What actually fixed it — registration, not a pointer file
+
+Writing a correct `champion.json` by hand was **not** enough: the app regenerates that file from its
+registry on startup (`registry::sync_champion_pointer` selects `model_versions WHERE status =
+'champion'`), and the registry held **0 rows**, so it promptly overwrote the hand-written pointer
+with an empty one. This is Codex's finding #2 confirmed exactly: the legacy deployment had to be
+manifest-generated, verified **and registered**.
+
+The full sequence that worked:
+
+1. `bootstrap_legacy_champion.py` run **inside WSL** — over the 9P share `os.replace` fails with
+   `WinError 50 (The request is not supported)`, so the atomic publish cannot happen from Windows.
+   All five pinned hashes verified against the files on disk.
+   -> `omniasr-7b-legacy-c348ade8a816`, deployment `ae33143ec8b25f45`
+2. Pointer resolution proven through the server's OWN `load_champion_pointer` before any restart —
+   no 31 GB model load needed to de-risk it.
+3. The incumbent registered in `model_versions` (status `champion`).
+4. Frontend + `cargo build --release` from PR head (7m 42s), then restart.
+
+Result — both cards, with a verified deployment identity the champion never had before:
+
+```
+Devices: GPUs [0, 1] — pre-forking one worker process per GPU
+[gpu0] LoRA applied. Pipeline ready. serving on 127.0.0.1:8799
+[gpu1] LoRA applied. Pipeline ready. serving on 127.0.0.1:8799
+       model=omniasr-7b-legacy-c348ade8a816  deployment=ae33143ec8b25f45
+16,424 MB phys_0 | 16,410 MB phys_1 | ports 8737 + 8799 LISTENING | watchdog Ready
+```
+
+Verified by real transcription, not by a listening socket.
+
+### The outage, stated plainly
+
+Restarting the app before registering the incumbent took the champion **down for roughly ten
+minutes** (18:53 to 19:04). No reviewer was active (0 decisions in the preceding 3 h), and the couch
+server returned with the app, but it was a real outage and it was mine: I had proven the pointer
+loaded and did not anticipate that the app would rewrite it from an empty registry. The correct
+order — register first, restart second — is now recorded above.
+
+### A check that proved nothing
+
+An earlier claim that the old exe "contains CORTEX_7B_CHAMPION_POINTER -> 0 occurrences" used
+`strings`, which returns 0 for **every** string in this environment, including ones certainly present
+(`cortex_7b_server.py`, `CORTEX_7B_PORT`). Re-done with `grep -a`, the rebuilt exe carries
+`CORTEX_7B_CHAMPION_POINTER` (1) and no longer carries `CORTEX_7B_MODEL_DIR` (0). The original
+conclusion held only because it rested on `/proc/<pid>/environ`, which was direct evidence; the
+`strings` line was decoration that could have been wrong in either direction.
+
+A second near-miss: `tail -f` on the append-only champion log replayed the FATAL from the FIRST
+failed restart, which read as a fresh failure of the fix. Timestamps (log mtime 18:53:49, well before
+the current start) showed it was stale — the same "check the timestamp before chasing it" lesson as
+the CI event on 2026-08-18.
+
+Live state changed by this work, deliberately and with owner approval: `model_versions` gained the
+incumbent row, `champion.json` is now a valid schema-2 pointer (previous contents backed up to
+`champion.json.bak-before-restore-2026-08-18`), `/home/ai/cortex_champion_model/deployment_manifest.json`
+was created, and the app exe was rebuilt from PR head.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
