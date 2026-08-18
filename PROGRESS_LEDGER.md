@@ -9645,3 +9645,86 @@ challenger trainer that gate D is blocked on, and gate B's ~10,000 human labels.
 would be motion without progress, which §8 says to stop rather than dress up.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (afternoon) — integrating the Codex flywheel range
+
+Cherry-picked `0fbb85f` + `4b496d1` from `cortex-speech-codex-flywheel` onto `origin/main` as
+`integrate/codex-flywheel` (PR #71). **36 files, +10,715 / −1,150.** Not merged.
+
+### The merge is mechanically clean, and the handoff's premise was wrong
+
+The handoff said the primary repo "remains unchanged at 282250d, with no Claude process or integration
+commits detected". `282250d` IS a Claude commit (the watchdog ledger), and primary was at `040d8ae`
+with #64–#69 merged. More usefully: the Codex base `4b0d597` is PR #66, which lands AFTER #64, #65 and
+#67 — so the range already CONTAINS the pack-export rewrite, the review fixes and the champion-script
+fallback rather than conflicting with them.
+
+```
+codex range files: 37      primary-since-base files: 4
+OVERLAP: (empty)
+git diff 4b0d597..4b496d1 -- '*/migrations/*'  ->  0 lines
+```
+
+Zero conflicts, zero migration collision. `cargo fmt`, `svelte-check` (448 files), `eslint` clean;
+275 frontend tests pass.
+
+### A false red I raised and withdrew
+
+I first reported **5 Rust failures in champion-supremacy territory**. That was my own artifact:
+`CARGO_TARGET_DIR` pointed at a scratch dir under `AppData/Local/Temp`, and `resolve_wsl_7b_client`
+finds the bundled client by walking exe-relative hops (`../../../../scripts/cortex_7b_client.py`)
+that reach the repo from `target/debug/deps` and reach nothing from a temp dir. Re-run in the repo's
+own target dir: **1250 passed, 0 failed**. Champion supremacy is not broken by the range. Withdrawn on
+the PR rather than left standing.
+
+### Three real defects found and fixed
+
+1. **UI freeze** — `start_champion_engine` had become a sync `#[tauri::command]` running
+   `restart_current_champion` inline: tree-kill the held child and spawn a wsl.exe loading ~30 GB, all
+   on the UI thread, while its own doc comment still said "returns immediately". Now `async` +
+   `run_blocking`, matching the sibling command.
+2. **Hygiene** — a WSL-mounted per-user profile path hardcoded in a tracked file of a public repo.
+   (The gate then caught my explanatory comment for containing the forbidden pattern. Correct of it.)
+3. **An aliased-temp-dir test failure** on macOS AND Windows CI that passed locally.
+   `test_atomic_replace_failure_leaves_no_partial_output` compared `_atomic_publish`'s RESOLVED
+   `destination` against the UNRESOLVED `out`; wherever the temp dir is an alias the inner
+   AssertionError masks the injected OSError. Reproduced locally with a Windows 8.3 short path:
+
+   ```
+   alias: C:\...\Temp\CO968B~1
+   OLD  destination == out          -> False   <- the CI failure
+   NEW  destination == resolved_out -> True
+   ```
+
+   **I first called this an ordering bug** (`temporary = None` after a call that can throw). Wrong —
+   the `finally` unlinks the temp file correctly and no partial output was ever left behind. Recorded
+   because the wrong diagnosis was published on the PR before the right one.
+
+### Three stale pins left RED on purpose
+
+| pin | pins on | replaced by |
+|---|---|---|
+| `test_agentic_pipeline_policy` | literal `"omniasr-wsl-7b"` | dynamic deployment identity |
+| `test_rust_runtime_panic_policy` | `probe_wsl_7b_server` | exact-identity health check |
+| `test_champion_supremacy_policy` | `CHAMPION_MODEL_ID` in the filter | per-row `model_version_id` |
+
+One architectural change, three greppable pins — the documented failure mode here (a changed symbol
+breaks a pin, and the pin must be fixed in the same commit). Editing a pin to match new code is how a
+guarantee gets silently dropped, so they stay red.
+
+**The owner ruling they wait on:** the new filter keeps hypotheses matching the segment's own
+persisted `model_version_id` and returns NONE when provenance is absent. Stale 300M/1B/MMS/Scribe
+votes are still discarded, and votes from a *different champion deployment* now are too — stronger
+than a fixed string. But a row drafted by a weaker engine BEFORE WSL7B was selected now surfaces that
+engine's hypothesis, where the old code showed none. Honest provenance, but it relaxes "in champion
+mode you only ever see champion output" — the rule that exists because 494/494 clips were once
+silently drafted by a weaker engine.
+
+### Not done, not claimed
+
+No release-profile clippy run by me, no e2e, no fresh EXE/MSI, no exact-HEAD sweep. The live champion,
+database and registry were not touched. The WebView2 verification of the desktop review fix remains
+UNFINISHED: the harness runs, reaches Review & Correct, and correctly refuses to pass without a
+working positive control — but the component's own `play()` path never fired, so it proves nothing yet.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
