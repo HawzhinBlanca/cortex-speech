@@ -9728,3 +9728,65 @@ UNFINISHED: the harness runs, reaches Review & Correct, and correctly refuses to
 working positive control — but the component's own `play()` path never fired, so it proves nothing yet.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (late afternoon) — the pin chain, and the one that was not a pin
+
+PR #71 completed: **82/82 python policies, Rust 1250 passed / 0 failed, frontend 275 passed**, fmt /
+typecheck / lint clean. Six stale assertions across two files, every one from a SINGLE architectural
+change (fixed champion string -> content-addressed identity).
+
+### Each guarantee traced to its new home BEFORE its assertion was touched
+
+| stale assertion | where the guarantee actually moved |
+|---|---|
+| `probe_wsl_7b_server` reaping | BOTH surviving loops: `pipeline.rs` still reaps via `kill_and_reap_wsl_child` (>=3 sites — cancel, timeout, failure), and `engine_runtime::terminate_and_reap` closes the Job Object then BREAKS every not-yet-exited arm into an unconditional `kill` + `wait` |
+| `Ok((raw, _))` blank guard | INTACT — `parse_wsl_segment_result` merely returns a struct now |
+| `"omniasr-wsl-7b"` literal | `registry::champion_identity` binding, PLUS a new assertion that a mismatched `result.model_version_id` is refused |
+| `external_asr_script_path()` | `resolve_wsl_7b_client(...)` — the configured path is one INPUT to resolution; a bundled client also counts |
+| 2 renamed regression tests | their current names, each confirmed to cover the same scenario (`pipeline_tests.rs:451`, `:656` with segment id `"preflight-refused"`) |
+
+**Not one was relaxed.** The reap gate now guards two loops where it guarded one; the provenance gate
+gained an assertion it did not have.
+
+### The find that justified refusing to batch-update
+
+`test_wsl_refinement_loop_refuses_blank_draft` looked like another renamed-symbol pin. It is the
+**blank-transcript-never-overwrites-good** guard — the data-loss bug already fixed twice in this repo.
+A batch update of "obviously stale" pins had a one-in-six chance of blessing its removal. It survived
+the range; that was established by READING THE CODE, not by trusting the pin.
+
+Both critical pins were then proven non-vacuous by deleting the guarantee and watching them fail:
+
+```
+terminate_and_reap must end in an unconditional kill + wait; without it a launcher that
+never reports exit is leaked
+
+the WSL-7B refinement loop does not guard a blank draft before the atomic champion commit
+— an empty 7B result would overwrite a good transcript with ""
+```
+
+### Seven defects found in the incoming range
+
+UI freeze (`start_champion_engine` running a ~30 GB server start inline on the UI thread), a hardcoded
+per-user profile path in a tracked file of a public repo, an aliased-temp-dir test failure (reproduced
+locally with a Windows 8.3 short path), a stale bundle pin, **the champion-supremacy relaxation**, and
+two of my own (a swallowed registry-read error, and a pin my 4-arg signature broke).
+
+### Two false alarms I raised and withdrew
+
+* **"5 Rust failures in champion-supremacy territory"** — my `CARGO_TARGET_DIR` pointed at a scratch
+  dir, where `resolve_wsl_7b_client`'s exe-relative hops reach nothing. In the repo's target dir:
+  1250/0.
+* **"an ordering bug in `_atomic_publish`"** — the `finally` unlinks correctly; the real cause was a
+  resolved-vs-unresolved path comparison in its TEST.
+
+A third was avoided by checking timestamps: a "Windows Release Gate failed" event fired 26 seconds
+AFTER the new run started — a stale signal for the previous head, not a failure of this work.
+
+### Standing assessment, unchanged
+
+This is infrastructure for a flywheel that cannot turn yet: no trainer exists, the registry holds 0
+rows, and the last snapshot's test split was 4 clips. Gate B needs **~10,000 human labels** and nothing
+technical is in the way. The live champion, database and registry were untouched throughout.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
