@@ -2274,6 +2274,29 @@ mod tests {
     /// lock from one failed test must not cascade every later one into a meaningless panic.
     static GLOBAL_SESSION_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Why six tests below carry `#[cfg_attr(not(windows), ignore = ...)]`.
+    ///
+    /// `save_session` DPAPI-protects every reviewer token before it writes (`couch.rs`, step
+    /// "protected at rest"), and `dpapi::protect` is `Err("DPAPI protection is only available on
+    /// Windows")` off Windows — by design; the app ships Windows-only. So every test that persists or
+    /// resumes a session FAILS on Linux, and it failed loudly in the one place that runs `--lib` there:
+    /// the nightly MUTATION GATE. MEASURED 2026-08-18 on GitHub Actions and reproduced verbatim on a
+    /// Linux checkout — `238 passed; 6 failed` — and cargo-mutants exits 4 ("clean tests failed") on
+    /// that, so it tested ZERO mutants. The charter's "0 surviving mutants" leg was not passing; it was
+    /// not running. The Windows Release Gate runs `cargo test` on windows-latest and has exercised
+    /// these six on every PR the whole time, which is why nothing else saw it.
+    ///
+    /// `ignore` rather than `#[cfg(windows)]` (the older convention two screens down, on
+    /// `tls_identity_is_persistent_and_the_private_key_is_dpapi_protected`): the test still compiles on
+    /// Linux, and libtest prints it as ignored WITH this reason instead of silently not existing.
+    ///
+    /// KNOWN BLIND SPOT, stated rather than papered over: mutants inside the DPAPI-gated session paths
+    /// can no longer be killed on the Linux mutation gate and will be reported as survivors there. The
+    /// fixes that would close it — running the mutation gate on windows-latest, or giving the at-rest
+    /// protector a test-only non-Windows implementation — both touch how a security mechanism is
+    /// tested, so they go to the owner rather than landing unasked.
+    const _DPAPI_WINDOWS_ONLY_TESTS: () = ();
+
     fn test_db(dir: &std::path::Path) -> (Database, String) {
         let path = dir.join("couch-test.db").to_string_lossy().to_string();
         let db = Database::open(&path).unwrap();
@@ -2794,6 +2817,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "persists a Couch session: DPAPI-protected at rest, Windows-only")]
     fn concurrent_session_saves_never_leave_an_unparseable_file_or_stray_temps() {
         // save_session runs from any accept thread with no lock held, so several can be writing at
         // once. They used to share one fixed temp filename. A session file that does not parse is
@@ -3955,6 +3979,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "persists a Couch session: DPAPI-protected at rest, Windows-only")]
     fn start_issues_working_tokens_and_stop_takes_them_away() {
         let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // THE LAST GENUINELY UNTESTED LOGIC IN THIS FILE, and the mutation sweep is what proved it:
@@ -4070,6 +4095,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "persists a Couch session: DPAPI-protected at rest, Windows-only")]
     fn a_spot_check_served_before_a_restart_is_still_scored_after_it() {
         // Phase 4 of docs/REMOTE_PUBLIC_LINKS_PLAN.md, and the direct consequence of durable links:
         // restarts are now ROUTINE, so "the served-set is in memory" became a data-loss window. A
@@ -4123,6 +4149,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "persists a Couch session: DPAPI-protected at rest, Windows-only")]
     fn a_link_survives_closing_the_app_but_not_pressing_stop() {
         let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // What the owner asked for: open the page from any device whenever, review, close it, come
@@ -4183,6 +4210,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "persists a Couch session: DPAPI-protected at rest, Windows-only")]
     fn durable_stop_marker_blocks_a_stale_session_and_cleanup_errors_are_not_swallowed() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
@@ -4206,6 +4234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "persists a Couch session: DPAPI-protected at rest, Windows-only")]
     fn revoking_one_reviewer_must_outlive_a_restart_the_way_stop_does() {
         let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // The reason revoke exists is a LOST PHONE. Dropping the token from the in-memory map denied
@@ -4778,7 +4807,14 @@ mod tests {
         let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
         let port = server.server_addr().to_ip().unwrap().port();
         let state = Arc::new(Mutex::new(CouchState {
-            reviewers: [("tok-solo".to_string(), "Hawzhin".to_string())].into_iter().collect(),
+            // A reviewer name OF ITS OWN, which is not cosmetic: `COUCH_RATE_LIMITER` is a process-wide
+            // bucket keyed by REVIEWER NAME, and this soak deliberately drains that bucket (it backs off
+            // on 429 by design, ~130 submits deep). Every other HTTP test that also called itself
+            // "Hawzhin" then drew the 429 this one caused — `ureq` reports any non-2xx as `Err`, so the
+            // victim saw `status 0` and blamed its own server. Latent for as long as the schedule kept
+            // them apart; it surfaced the moment the six DPAPI tests above stopped running on Linux and
+            // shifted what runs beside what. One bucket per test, no shared starvation.
+            reviewers: [("tok-solo".to_string(), "Hawzhin-solo-drain".to_string())].into_iter().collect(),
             ..CouchState::default()
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
