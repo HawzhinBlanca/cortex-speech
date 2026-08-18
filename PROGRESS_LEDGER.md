@@ -9790,3 +9790,91 @@ rows, and the last snapshot's test split was 4 clips. Gate B needs **~10,000 hum
 technical is in the way. The live champion, database and registry were untouched throughout.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (evening) — the review that found what my review missed
+
+Codex reviewed PR #71 and returned **Request changes**. I verified every finding against the code and
+the live database before agreeing with any of it. Six of six check out. One is release-blocking, and
+it is worse than reported.
+
+### P0 — the challenger could never have trained on this corpus
+
+`train_challenger.py` admitted only `decision` in `{None, "accept"}`. `eval.rs` exports the review
+decision verbatim, and `edit` is what a reviewer produces when they read the champion draft and type
+the correct text. Measured on the live DB, not remembered:
+
+```
+edit    241        accept  188        reject   18 (already excluded by grade)      <null>  15458
+```
+
+**241 of 429 usable labels — 56% — were classified "non-training".** And pack problems are fail-closed
+(`if pack_problems: return 2`), so this never merely dropped those rows: **a single edited row refused
+the entire run.** Gate D was unreachable for a reason nobody had measured.
+
+Fixed by mirroring the Rust authority, `quality::is_human_rejected` — only a human REJECTION is
+non-training. Fail-before, with the old validator restored:
+
+```
+AssertionError: human corrections are training data, not contamination:
+["finetune_manifest.jsonl:1 carries non-training decision 'edit'",
+ "finetune_manifest.jsonl:2 carries non-training decision 'human_edit'"]
+```
+
+Two tests, both directions, so widening the set cannot become a hole. **82/82 python policies pass.**
+The line came from `b0c7f7a` — inside the range I integrated, reviewed, and reported seven defects on
+without catching this one. Every fixture in the cycle policy used `"accept"`.
+
+### Gate B: I have been quoting the wrong bar
+
+I repeatedly told the owner "~10,000 labels and nothing technical is in the way". The count is roughly
+right and the framing was wrong. `docs/LOOP_TO_10.md` gate B is **≥ 25 h labeled, top-1 recording
+≤ 30 %, ≥ 25 labeled recordings** — diversity is mandatory, not a bonus. Measured now:
+
+```
+labeled clips      : 429
+labeled duration   : 1.09 h  (65.1 min)      needs >= 25 h
+labeled recordings : 5                       needs >= 25
+top-1 share        : 94.5%                   needs <= 30%
+mean clip length   : 9.1 s
+```
+
+At 9.1 s, 25 h is ~9,890 clips — so the number was fine, but **10,000 more Lamofull clips would leave
+top-1 near 99 % and recordings at 5, and gate B would still fail.** Review order is the diversity
+lever, and the ledger now says so.
+
+### The WebView2 proof, recorded where it survives the session
+
+Codex correctly noted the PR-head ledger called this unfinished and no artifact backed it. It has now
+run, with a working positive control that proves the harness can SEE a genuine failure:
+
+```
+clip label: "بەش 126/429" -> "بەش 110/429"
+positive control saw the playback toast: true
+positive control OK — a real failure IS reported and IS visible to this harness
+stalling play() so it stays pending; driving 8 rapid advances...
+playback toast during the advance race: no
+RESULT: PASS
+```
+
+Four earlier runs were vacuous and I reported none of them as a pass: the on-disk key is
+`autoplay_segments` (snake_case), and the camelCase name is the serde-renamed FRONTEND view, so
+autoplay stayed off and no `play()` was ever pending.
+
+### Where I would not go as far as the review
+
+* **No promotion initiation path** — confirmed, zero non-test callers of `start_promotion`. But
+  `champion_promotion_runtime.rs` opens by saying so deliberately: recovery only, because "until
+  promotion evidence is backend-minted and owner-authorized, 'no initiation surface' is the only
+  honest trust boundary". A documented decision, not an oversight. Gate E is still blocked either way.
+* **Two IPC writes in `ReviewMode`** — confirmed as fact. The ordering is deliberate and the partial
+  state is the SAFE one: `recordHumanDecision` runs first and validates, so a failure in
+  `updateSegment` leaves the clip UNVERIFIED and still in the queue, where re-review self-heals it.
+  Worth closing; not a data-loss hazard today.
+
+### Standing correction
+
+Green CI on PR #71 means `verify_10.py --static`. It has never run gates C/D/E live, and I let "all
+four checks green" carry more weight than it earns. The live champion, database and registry were
+untouched throughout.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
