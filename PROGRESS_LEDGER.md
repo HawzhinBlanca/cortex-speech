@@ -9225,6 +9225,36 @@ AssertionError: advancing mid-start must not report a playback failure:
   expected [ Array(1) ] to deeply equal []
 ```
 
+### The same bug had a worse sibling, found by verifying at the consumer
+
+Checking the "locked out of Accept" claim against `ReviewMode.svelte` rather than asserting it turned
+up a second defect. `audioError` was cleared in exactly two places: when `audioPath` **changes**, and
+if the reviewer noticed the Retry link. Consecutive review clips from one recording SHARE an
+audioPath, and the dominant recording holds **403 of the 414 exportable clips** — so one failure kept
+Accept, Save and Mark-bad refused for the rest of that recording. While the banner is up it REPLACES
+the transport, so there is no play button left to press either.
+
+A `play()` that starts is proof the audio is audible, so it now clears the error.
+
+Pinning it needed a real parent component. `@testing-library`'s `rerender` reassigns every prop, which
+re-runs the audioPath effect and reloads the element — the one thing that already cleared the error,
+so the bug was invisible through that harness. The component's actual call sequence, traced rather
+than assumed:
+
+```
+load() >> play() >> [reject] >> banner? true >> [advance to clip-2]
+  >> pause() >> load() >> pending plays: 0
+```
+
+`tests/fixtures/AudioPlayerHost.svelte` holds audioPath fixed while clipKey advances, which is the
+shape `ReviewMode` actually has. With it the gate fails without the fix:
+
+```
+× the next clip of the SAME recording is not still blocked by the previous failure
+AssertionError: playback started on the next clip, so the audio is audible and the
+decision must unblock: expected null not to be null
+```
+
 ### Gates C and D, measured
 
 A real pack was exported and its snapshot sealed, then the chain was run against it.
