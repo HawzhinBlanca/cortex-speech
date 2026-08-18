@@ -4397,3 +4397,51 @@ fn a_reject_is_never_reclassified() {
     db.record_human_decision_by("rej-1", "reject", None, None, Some("Sara")).unwrap();
     assert_eq!(db.get_segment_by_id("rej-1").unwrap().unwrap().human_decision.as_deref(), Some("reject"));
 }
+
+/// Durability of an acknowledged human decision, and what it costs.
+///
+/// The connection runs `synchronous=NORMAL`; under WAL that is durable against a process crash but
+/// not necessarily against power loss. Everything else this app writes is reproducible — a human
+/// decision is not. So the decision commit alone escalates to FULL.
+#[test]
+fn a_human_decision_commit_is_fsynced_and_the_connection_returns_to_normal() {
+    let db = make_db();
+    seed_for_provenance(&db, "dur-1", "دەقی چامپیۆن");
+
+    let before: i64 = db.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, 1, "precondition: the connection runs NORMAL (1)");
+
+    db.record_human_decision_by("dur-1", "accept", Some("دەقی چامپیۆن"), None, Some("Sara")).unwrap();
+
+    let after: i64 = db.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+    assert_eq!(after, 1, "the escalation must not leak: other writes stay on NORMAL");
+    assert_eq!(
+        db.get_segment_by_id("dur-1").unwrap().unwrap().human_decision.as_deref(),
+        Some("accept"),
+        "the decision itself must still land"
+    );
+}
+
+/// Measure, do not assume: reviewer throughput has to survive the fsync.
+#[test]
+fn the_durability_cost_per_decision_is_measured_not_assumed() {
+    use std::time::Instant;
+    let db = make_db();
+    const N: usize = 40;
+    for i in 0..N {
+        seed_for_provenance(&db, &format!("perf-{i}"), "دەقی چامپیۆن");
+    }
+    let start = Instant::now();
+    for i in 0..N {
+        db.record_human_decision_by(&format!("perf-{i}"), "accept", Some("دەقی چامپیۆن"), None, Some("Sara")).unwrap();
+    }
+    let per_decision = start.elapsed().as_secs_f64() / N as f64;
+    println!("MEASURED: {:.1} ms per durable human decision (n={N})", per_decision * 1000.0);
+    // A reviewer decides a clip every few seconds at best. Anything under a quarter second is
+    // invisible to them; this bound catches an accidental fsync-per-row regression, not normal jitter.
+    assert!(
+        per_decision < 0.25,
+        "a durable decision cost {:.1} ms — that is slow enough for a reviewer to feel",
+        per_decision * 1000.0
+    );
+}

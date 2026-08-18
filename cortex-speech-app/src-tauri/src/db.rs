@@ -4547,6 +4547,18 @@ impl Database {
             _ => Vec::new(),
         };
 
+        // DURABILITY, exactly where the data is irreplaceable. The connection runs
+        // `synchronous=NORMAL`, which under WAL means a commit survives a process crash but not
+        // necessarily power loss — recent commits can still sit in the OS page cache. Every other
+        // write here is reproducible: audio can be re-transcribed, alignments recomputed, packs
+        // re-exported. A human decision cannot. It is a person listening to a clip once, and losing
+        // it means asking a paid reviewer to redo work with no way to know which clips were lost.
+        //
+        // SQLite refuses `PRAGMA synchronous` inside a transaction ("Safety level may not be changed
+        // inside a transaction"), so the escalation happens HERE, before the write opens, and is
+        // dropped after the commit. The cost lands on the decision write alone.
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
+
         // The human's verdict, the learning pair, and the audit-ledger row commit together as one
         // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
         let tx = self.conn.unchecked_transaction()?;
@@ -4709,7 +4721,23 @@ impl Database {
             )?;
         }
 
+        // DURABILITY, exactly where the data is irreplaceable. The connection runs
+        // `synchronous=NORMAL`, which under WAL means a commit is durable against a process crash
+        // but NOT necessarily against power loss: recent commits can still be sitting in the OS page
+        // cache when the machine drops. Every other write here is reproducible — audio can be
+        // re-transcribed, alignments recomputed, packs re-exported. A human decision cannot: it is a
+        // person listening to a clip once, and losing it means asking a paid reviewer to do the work
+        // again with no way to know which clips were lost.
+        //
+        // So this ONE commit escalates to FULL (an fsync at commit) and drops back afterwards. The
+        // cost lands on the decision write alone, not on transcription or import.
+        //
+        // On the error path the connection is deliberately LEFT at FULL: too-durable is the safe
+        // direction, and a slower connection is a better outcome than a silently less durable one.
         tx.commit()?;
+        // Back to NORMAL now the durable commit is done. On the error paths above the connection is
+        // deliberately left at FULL: too-durable is the safe direction to fail in.
+        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         self.track_write()?;
         Ok(Some(decided_revision))
     }
