@@ -9355,10 +9355,36 @@ So the standing "3 spot-check adjudications (21/24)" is STALE and is retired her
 the 12 wrong-dialect re-reviews, and now **whether to build a real challenger trainer** — the only
 thing standing between the wired loop and gate D.
 
+### The one red gate was RIGHT, and my first explanation of it was wrong
+
 A `verify_10.py --quick` sweep read `22 PASS, 1 FAIL (test-e2e+a11y), 18 skipped (env/not-built)`.
-That FAIL was **mine, not the code's**: I switched branches while the sweep was running, so it read a
-tree that changed underneath it. Re-run in isolation on a stable tree, the gate passes **95/95**.
-Recorded rather than quietly dropped, because a red gate nobody explains is how a real one gets
-ignored.
+
+I first guessed the FAIL was my own fault for switching branches mid-sweep, re-ran `npm run test:e2e`,
+got **95 passed**, and was ready to call it explained. Both halves of that were wrong, and reading the
+gate's own log instead of guessing is what caught it:
+
+```
+Error: http://localhost:1420 is already used, make sure that nothing is running on the
+port/url or set reuseExistingServer:true in config.webServer.
+```
+
+A **stale vite dev server, running since 20:44 the previous evening**, held port 1420.
+`playwright.config.ts` sets `reuseExistingServer: !CI && !CORTEX_GATE`, and `verify_10.py` exports
+`CORTEX_GATE` — deliberately, so that a stale-but-valid dev server makes the leg RED instead of green
+about code that is not under test. The gate was working exactly as designed.
+
+**And my re-run was the vacuous pass that config exists to prevent.** Run interactively, reuse is ON,
+so those 95 tests attached to yesterday's stale server. The number was real; what it measured was not
+what I claimed.
+
+Stopped the stale server and re-ran the gate the way the sweep runs it:
+
+```
+CORTEX_GATE=1 npm run test:e2e   ->  REAL EXIT=0,  95 passed (22.7s)
+```
+
+That one is honest — Playwright started and owned its own server. Recorded in full because the near
+miss is the lesson: I was one step from writing off a working gate using evidence the gate had already
+been hardened against.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
