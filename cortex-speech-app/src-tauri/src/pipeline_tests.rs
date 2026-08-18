@@ -797,12 +797,68 @@ fn public_preflight_fails_immediately_when_default_champion_is_unconfigured() {
 #[test]
 #[ignore] // needs WSL + a running cortex_7b_server.py on 127.0.0.1:8799
 fn wsl_7b_preflight_passes_when_server_up() {
+    // The preflight verifies the champion's EXACT identity, not merely that a port answers: it reads
+    // the registry's champion row and compares it with what the live server reports. The test DB
+    // therefore has to be a real one — migrated, with the champion registered.
+    //
+    // Before this it was neither, and failed with "no such table: model_versions". That read like a
+    // champion problem and was a fixture problem, and for as long as it lasted the leg proved nothing
+    // about identity at all.
     let settings = AppSettings {
         asr_model_size: AsrModelSize::WSL7B,
         external_asr_script_path: "cortex_7b_client.py".to_string(),
         ..AppSettings::default()
     };
     let (pipeline, _dir) = test_pipeline_with_settings(settings);
+
+    let live = match crate::db::Database::open(&pipeline.db_path) {
+        Ok(db) => db,
+        Err(error) => {
+            eprintln!("[7b-preflight] cannot open test db: {error}");
+            return;
+        }
+    };
+    live.initialize().expect("the preflight reads the registry, so the schema must exist");
+
+    // Register the SAME champion the running server is serving; anything else and an exact-identity
+    // preflight SHOULD fail, which is the invariant under test.
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        eprintln!("[7b-preflight] no APPDATA; skipping");
+        return;
+    };
+    let pointer = std::path::Path::new(&appdata).join("cortex-speech").join("champion.json");
+    let Ok(text) = std::fs::read_to_string(&pointer) else {
+        eprintln!("[7b-preflight] no live champion.json at {}; skipping", pointer.display());
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        eprintln!("[7b-preflight] champion.json is not JSON; skipping");
+        return;
+    };
+    let Some(entry) = value.get("champions").and_then(|c| c.get("omniasr-7b")) else {
+        eprintln!("[7b-preflight] no omniasr-7b champion registered live; skipping");
+        return;
+    };
+    let (Some(model_id), Some(sha), Some(path)) = (
+        entry.get("modelVersionId").and_then(|v| v.as_str()),
+        entry.get("deploymentSha256").and_then(|v| v.as_str()),
+        entry.get("deploymentManifestPath").and_then(|v| v.as_str()),
+    ) else {
+        eprintln!("[7b-preflight] champion entry is incomplete; skipping");
+        return;
+    };
+    // Raw connection: the registry's writer is not public to tests, and this fixture only needs the
+    // one row the preflight will read back.
+    let raw = rusqlite::Connection::open(&pipeline.db_path).expect("open test db for registration");
+    raw
+        .execute(
+            "INSERT INTO model_versions (id, family, model_card_name, checkpoint_sha256, checkpoint_path,                                          source, license, status)              VALUES (?1, 'omniasr-7b', 'soranivoice_omniASR_LLM_7B_v2_local', ?2, ?3, 'user-finetuned',                      'owner-full-rights', 'champion')",
+            rusqlite::params![model_id, sha, path],
+        )
+        .expect("register the incumbent so the preflight has an identity to compare");
+    drop(raw);
+    drop(live);
+
     pipeline.wsl_7b_server_preflight().expect("preflight must pass when the 7B server is up");
 }
 
