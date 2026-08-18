@@ -1154,39 +1154,62 @@ def test_wsl_import_pass_does_not_roll_back_the_file_on_a_benign_empty_result() 
         )
 
 
-def test_probe_wsl_7b_server_reaps_child_on_wait_error() -> None:
-    """probe_wsl_7b_server polls child.try_wait() in a loop; on a wait-status error its Err arm must
-    reap the child (kill_and_reap_wsl_child) before returning false — exactly like the sibling
-    try_wait loops (run_wsl_segment_transcript and the 7B preflight probe both reap on their Err
-    arm). std::process::Child does NOT kill/reap on drop, so a bare `return false` on the Err arm
-    leaks a WSL process on every failed status poll, and this probe is called on a poll.
-    Regression guard: iter-65."""
-    pipeline = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
-    marker = "fn probe_wsl_7b_server(timeout_secs: u64) -> bool {"
-    start = pipeline.find(marker)
-    if start == -1:
-        raise AssertionError("probe_wsl_7b_server not found — this gate would pass vacuously")
-    # Scope the check to this function body: slice to the start of the next free function.
-    rest = pipeline[start + len(marker):]
-    end = rest.find("\nfn ")
-    next_pub = rest.find("\npub(crate) fn ")
-    if next_pub != -1 and (end == -1 or next_pub < end):
-        end = next_pub
-    body = rest if end == -1 else rest[:end]
+def test_wsl_try_wait_loops_always_reap_the_child() -> None:
+    """A try_wait loop must never return without reaping. `std::process::Child` does NOT kill/reap on
+    drop, so a bare return on the Err arm leaks a WSL process on every failed status poll — and these
+    loops run on a poll.
 
-    # Forbidden: a try_wait Err arm that returns without reaping.
-    if "Err(_) => return false" in body:
+    Was scoped to `probe_wsl_7b_server`, which the exact-identity health check replaced. The guarantee
+    did not go away, it moved and split, so this guards BOTH surviving loops:
+
+      * `pipeline.rs` — the WSL transcript loop, which still reaps through `kill_and_reap_wsl_child`
+        on cancel, timeout and failure;
+      * `engine_runtime.rs::terminate_and_reap` — closes the Windows Job Object (the tree-kill), then
+        BREAKS out of every not-yet-exited arm into an UNCONDITIONAL kill + wait. That is the same
+        guarantee made structural: one exit path instead of two call sites that can drift apart.
+
+    Regression guard: iter-65; re-pointed 2026-08-18 when the probe was replaced.
+    """
+    pipeline = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
+    if "fn kill_and_reap_wsl_child(" not in pipeline:
+        raise AssertionError("kill_and_reap_wsl_child not found — this gate would pass vacuously")
+    reaps = pipeline.count("kill_and_reap_wsl_child(&mut child,")
+    if reaps < 3:
         raise AssertionError(
-            "probe_wsl_7b_server's try_wait Err arm returns false without reaping the child — it "
-            "leaks a WSL process on every failed status poll. Reap via kill_and_reap_wsl_child like "
-            "the sibling loops."
+            "the WSL transcript loop must reap on cancel, timeout AND failure "
+            f"(found {reaps} reap call(s); expected >= 3)"
         )
-    # Required: reap on BOTH the deadline branch AND the try_wait Err branch.
-    reaps = body.count('kill_and_reap_wsl_child(&mut child, "engine-status probe");')
-    if reaps < 2:
+    if "Err(_) => return false" in pipeline:
         raise AssertionError(
-            "probe_wsl_7b_server must reap the child on both the timeout branch and the try_wait Err "
-            f"branch (found {reaps} reap call(s); expected >= 2)"
+            "a try_wait Err arm in pipeline.rs returns without reaping the child — it leaks a WSL "
+            "process on every failed status poll. Reap via kill_and_reap_wsl_child."
+        )
+
+    runtime = (REPO_ROOT / "src-tauri" / "src" / "engine_runtime.rs").read_text(encoding="utf-8")
+    marker = "fn terminate_and_reap(&mut self) {"
+    start = runtime.find(marker)
+    if start == -1:
+        raise AssertionError("terminate_and_reap not found — this gate would pass vacuously")
+    rest = runtime[start + len(marker) :]
+    candidates = [offset for offset in (rest.find("\n    fn "), rest.find("\n}")) if offset != -1]
+    body = rest[: min(candidates)] if candidates else rest
+
+    if "try_wait()" not in body:
+        raise AssertionError("terminate_and_reap no longer polls try_wait — re-point this gate")
+    if re.search(r"Err\(_\)\s*=>\s*return", body):
+        raise AssertionError(
+            "terminate_and_reap's try_wait Err arm returns without reaping — it must fall through to "
+            "the unconditional kill + wait below the loop"
+        )
+    if "Ok(None) | Err(_) => break" not in body:
+        raise AssertionError(
+            "terminate_and_reap must BREAK out of both the deadline and the try_wait Err arm so every "
+            "not-yet-exited path reaches the unconditional reap"
+        )
+    if "self.child.kill()" not in body or "self.child.wait()" not in body:
+        raise AssertionError(
+            "terminate_and_reap must end in an unconditional kill + wait; without it a launcher that "
+            "never reports exit is leaked"
         )
 
 
@@ -2240,7 +2263,10 @@ def test_wsl_refinement_loop_refuses_blank_draft() -> None:
     src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
     if "commit_champion_transcript_if_unreviewed" not in src:
         raise AssertionError("atomic WSL refinement persist call not found in commands.rs")
-    if "Ok((raw_transcript, _)) if raw_transcript.trim().is_empty()" not in src:
+    # parse_wsl_segment_result now returns a Wsl7bResult STRUCT (it carries the serving identity too),
+    # so the guard destructures a field instead of a tuple. The behaviour is unchanged: a blank draft
+    # is skipped before the commit and the existing transcript is kept.
+    if "Ok(result) if result.raw_transcript.trim().is_empty()" not in src:
         raise AssertionError(
             "the WSL-7B refinement loop does not guard a blank draft before the atomic champion commit "
             '— an empty 7B result would overwrite a good transcript with "". Add the guarded match arm.'
@@ -2354,7 +2380,7 @@ def main() -> None:
     test_audio_decode_reset_required_fails_loud_not_silent_truncation()
     test_pipeline_wsl_subprocess_send_failures_are_reported()
     test_wsl_import_pass_does_not_roll_back_the_file_on_a_benign_empty_result()
-    test_probe_wsl_7b_server_reaps_child_on_wait_error()
+    test_wsl_try_wait_loops_always_reap_the_child()
     test_aligner_score_consistency_caps_clip_and_dp()
     test_finish_import_clears_cancel_token_before_opening_the_gate()
     test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert()

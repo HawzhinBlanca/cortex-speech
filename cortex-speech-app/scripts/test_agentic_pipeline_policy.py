@@ -133,8 +133,15 @@ def main() -> None:
     assert "populate_wsl_hypothesis_if_configured" in pipeline, (
         "explicit non-champion experiments must retain their optional WSL hypothesis helper"
     )
-    assert 'insert_hypothesis_checked(db, segment_id, "omniasr-wsl-7b"' in pipeline, (
+    # Provenance is no longer a hardcoded string: the champion is content-addressed, so the helper
+    # binds the hypothesis to the REGISTRY champion identity and REFUSES a reply that does not match
+    # it. Strictly stronger than the old literal, which could not tell two deployments apart.
+    assert "crate::registry::champion_identity(db, crate::deployment::OMNIASR_7B_FAMILY)" in pipeline, (
         "the explicit optional WSL hypothesis helper must preserve provenance"
+    )
+    assert "result.model_version_id != expected.model_version_id" in pipeline, (
+        "the helper must REFUSE a reply whose producing identity is not the registry champion, or a "
+        "rotated-out model's draft would be stored as the champion's"
     )
     assert "self.run_wsl_segment_transcript(segment_id" in pipeline, (
         # Robust prefix: the call now also takes a cancel arg (None for the hypothesis pass). The
@@ -144,19 +151,28 @@ def main() -> None:
     assert "should_use_wsl_primary_asr" in pipeline, (
         "WSL 7B primary routing must require its configured client"
     )
-    assert "external_asr_script_path().is_some()" in pipeline, (
+    # The configured path is now one INPUT to client resolution rather than the whole answer: a client
+    # bundled beside the exe also counts, which is what makes an installed build work with no env var.
+    # The invariant is unchanged — WSL routing still requires a RESOLVABLE client.
+    assert "resolve_wsl_7b_client(self.settings.external_asr_script_path()).is_some()" in pipeline, (
         "configured-client detection is missing from the WSL route"
     )
     assert "wsl7b_primary_unresolved" in pipeline, (
         "an unconfigured champion needs a shared fail-closed guard"
     )
-    assert "wsl_without_script_preserves_champion_identity_and_never_falls_back" in pipeline, (
+    # Renamed with the bundled-client work: a missing CONFIGURED script is no longer fatal, because a
+    # client bundled beside the exe resolves instead — but it still must never fall back to a local
+    # engine. Same guarantee, wider resolution. (pipeline_tests.rs:451)
+    assert "wsl_without_explicit_script_uses_bundled_champion_and_never_falls_back" in pipeline, (
         "missing WSL script must preserve champion identity and never become a local fallback"
     )
     assert "public_preflight_fails_immediately_when_default_champion_is_unconfigured" in pipeline, (
         "the unconfigured factory champion needs an immediate preflight refusal regression"
     )
-    assert "wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusal" in pipeline, (
+    # Renamed with the bundled-client work. Same scenario and same invariant: the pass runs after a
+    # refused preflight against a row holding a "pre-existing transcript" and must not mutate it
+    # (pipeline_tests.rs:656, segment id "preflight-refused").
+    assert "wsl_primary_import_pass_never_silently_skips_the_bundled_champion" in pipeline, (
         "the later WSL pass must not mutate rows after the fail-closed preflight path"
     )
     assert "self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B" in pipeline, (
