@@ -9271,6 +9271,20 @@ AssertionError: playback started on the next clip, so the audio is audible and t
 decision must unblock: expected null not to be null
 ```
 
+### Bounding the blast radius: the PAID reviewers were never affected
+
+Checked rather than assumed, because the 8 live links matter more than the desktop UI. The couch
+phone page is a different implementation, and it is the better one:
+
+* `play()` rejections are swallowed (`.catch(() => {})`) — correct there, because a superseded play is
+  not a failure, which is precisely the lesson the desktop side just learned;
+* genuine load failures are caught on the element's `error` event, which names the reason and offers a
+  **skip that writes NOTHING to the corpus** — no decision, no verdict, no attribution.
+
+So the lockout was confined to the owner's own desktop review. The desktop was the outlier, not the
+couch page. Also swept `ReviewMode.svelte` for the same bug family — every `saving` / `retranscribing`
+/ `aligning` flag has a matching `finally`, so none of them can stick on a failure.
+
 ### Gates C and D, measured
 
 A real pack was exported and its snapshot sealed, then the chain was run against it.
