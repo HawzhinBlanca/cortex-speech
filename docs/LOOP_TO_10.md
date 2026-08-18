@@ -59,10 +59,10 @@ that a particular model won.
 
 | Phase | State | Exit gate |
 |---|---|---|
-| 0 — land in flight | **OWNER-BLOCKED** | 3 spot-check adjudications (21/24) + 12 wrong-dialect re-reviews |
+| 0 — land in flight | **OWNER-BLOCKED (partly cleared)** | spot-check pool measured healthy 24/24 on 2026-08-18; 12 wrong-dialect re-reviews remain |
 | 1 — break the data skew | **STARTED** | gate B above. Importing is not labeling — only reviewers move it |
-| 2 — snapshots + pack provenance | **DONE** 2026-08-18 | gate C |
-| 3 — challenger loop | **DONE (wiring)** 2026-08-18 | gate D — needs a canary RUN |
+| 2 — snapshots + pack provenance | **DONE** 2026-08-18 | gate C — **MEASURED GREEN**, 1 sealed snapshot |
+| 3 — challenger loop | **WIRED; BLOCKED on a trainer** | gate D — snapshot ✓ train ✗ eval ✗ verdict ✗ |
 | 4 — registry + rollback | **NOT STARTED** | gate E |
 | 5 — redefine done | **NOT STARTED** | gates C/D/E wired into `verify_10.py` |
 
@@ -99,10 +99,15 @@ that a particular model won.
    health check → automatic rollback to the prior adapter if the health check fails. The champion
    server must read its adapter path FROM the registry, not from `CORTEX_7B_MODEL_DIR`. Drill it like
    the backups were drilled, and make the drill gate E.
-3. **The canary run (gate D).** `export_finetune_pack` → `train_challenger.py --snapshot <id>` →
-   scorecards for champion and challenger on the frozen eval set → `build_eval_slices.py` →
-   `promotion_gate.py`. On today's data the honest verdict is REJECT; that still passes gate D.
-   Needs the app closed and the champion started separately (see §7).
+3. **The canary run (gate D) — RAN 2026-08-18, and stopped at `train`.** The first two links are
+   done on real data: `export_pack` sealed snapshot `23db46a0…` (414 rows) and `train_challenger.py`
+   verified the pack against it, exit 3 / `status: "prepared"`. `export_pack` does NOT need the app
+   closed (it takes no instance lock), so §7's first bullet no longer applies to this step.
+   **What blocks the rest: no trainer exists.** `--trainer` expects an external fine-tune command,
+   and building a real LoRA trainer for the 7B champion is an OWNER decision (compute, and it touches
+   the model lock) — surface it, never improvise one. Until then gate D cannot be met, and
+   `check_challenger_loop.py` passing is NOT gate D: that script only certifies that the run records
+   on disk claim no more than they did.
 4. **Phase 1 throughput.** Keep the review queue stocked: import the next diversity-ordered batch
    (smallest books first — each book is one narrator, and the queue is oldest-first FIFO, so import
    order IS the diversity lever). Then STOP importing: gate B measures labels, not clips, and more
