@@ -268,17 +268,29 @@ def main() -> int:
     }
     recipe_sha = sha256_json({"trainer_sha256": sha256_of(trainer), "hyperparameters": hyper})
 
-    # The trainer has no --seed, so seed inside its own process before running it. runpy keeps this a
-    # launcher, not a fork of the trainer: the recipe hash still pins the trainer file byte-for-byte.
-    shim = (
-        "import os,sys,random,runpy;import torch;import numpy;"
-        f"s={seed};torch.manual_seed(s);torch.cuda.manual_seed_all(s);random.seed(s);numpy.random.seed(s);"
-        f"sys.argv=[{json.dumps(win_to_wsl(trainer))}]+sys.argv[1:];"
-        f"runpy.run_path({json.dumps(win_to_wsl(trainer))},run_name='__main__')"
+    # The trainer has no --seed, so seed inside each rank's process before running it. `torchrun`
+    # launches a SCRIPT (it rejects `python -c`), so the shim is written as a real file and handed to
+    # torchrun as the training script. runpy keeps this a launcher rather than a fork of the trainer:
+    # `recipe_sha256` still pins the trainer file byte-for-byte.
+    trainer_wsl = win_to_wsl(trainer)
+    shim_path = out_dir / "_seeded_launch.py"
+    shim_path.write_text(
+        "import sys, random, runpy\n"
+        "import torch, numpy\n"
+        f"SEED = {seed}\n"
+        "torch.manual_seed(SEED)\n"
+        "torch.cuda.manual_seed_all(SEED)\n"
+        "random.seed(SEED)\n"
+        "numpy.random.seed(SEED)\n"
+        f"TRAINER = {json.dumps(trainer_wsl)}\n"
+        "sys.argv = [TRAINER] + sys.argv[1:]\n"
+        "runpy.run_path(TRAINER, run_name='__main__')\n",
+        encoding="utf-8",
+        newline="\n",
     )
     command = [
         python, "-m", "torch.distributed.run", f"--nproc_per_node={gpus}", "--master_port=29517",
-        "-c", shim,
+        win_to_wsl(shim_path),
         "--train_jsonl", win_to_wsl(args.manifest),
         "--val_jsonl", win_to_wsl(val_manifest),
         "--base_audio_dir", win_to_wsl(audio_root),
