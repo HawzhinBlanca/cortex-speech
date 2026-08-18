@@ -34,6 +34,16 @@ ARTIFACT_MANIFEST_NAME = "artifact_manifest.json"
 DEPLOYMENT_MANIFEST_NAME = "deployment_manifest.json"
 RUN_RECORD_NAME = "challenger_run.json"
 VALID_SPLITS = {"train", "validation", "test"}
+# A pack row is training data unless a HUMAN rejected it. The authority is Rust's
+# `quality::is_human_rejected` — human_decision in {reject, human_reject}, or verdict == human_reject
+# — which eval.rs already applies via the grade, so this is the SECOND gate, not the first.
+#
+# `edit` is the highest-value label in the corpus: the human read the champion draft, typed the
+# correct text, and that text BECAME the row's sentence. Refusing it refused 241 of today's 429
+# labels, and because pack problems are fail-closed (`if pack_problems: return 2`), a single edited
+# row refused the ENTIRE challenger run. The legacy `human_*` spellings are accepted for the same
+# reason the DB queries still match them: older rows carry them.
+TRAINING_DECISIONS = {None, "accept", "human_accept", "edit", "human_edit"}
 OMNIASR_MODEL_CARD = "soranivoice_omniASR_LLM_7B_v2_local"
 CONTROL_FILES = {
     TRAIN_MANIFEST_NAME,
@@ -212,7 +222,7 @@ def inspect_pack(pack_dir: Path, snapshot_id: str, sealed: dict[str, Any]) -> tu
             problems.append(f"{MANIFEST_NAME}:{line_no} has invalid duration_seconds {duration!r}")
         if not isinstance(row.get("source_recording"), str) or not row["source_recording"]:
             problems.append(f"{MANIFEST_NAME}:{line_no} has no source_recording")
-        if row.get("decision") not in {None, "accept"}:
+        if row.get("decision") not in TRAINING_DECISIONS:
             problems.append(f"{MANIFEST_NAME}:{line_no} carries non-training decision {row.get('decision')!r}")
         revision = row.get("decision_revision")
         if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:

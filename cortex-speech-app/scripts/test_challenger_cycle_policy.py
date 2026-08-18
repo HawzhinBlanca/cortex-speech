@@ -99,6 +99,39 @@ def test_an_edited_pack_is_refused() -> None:
         assert any("does not match the snapshot" in p for p in problems), problems
 
 
+def test_a_human_corrected_row_is_training_data() -> None:
+    """`edit` means a human read the draft and typed the correct text — the best label there is.
+
+    Not to be confused with the tampered-pack test above: this is the review DECISION, not a mutated
+    byte. A validator admitting only `accept` refused 241 of the live corpus's 429 labels, and since
+    pack problems are fail-closed (`if pack_problems: return 2`) it refused the entire RUN, not just
+    those rows. Every fixture here used `accept`, so nothing caught it.
+
+    The contract is the mirror of Rust's `quality::is_human_rejected`: only a human REJECTION is
+    non-training. Regression guard: 2026-08-18.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        rows = [_row(0), _row(1), _row(2), _row(3, "validation")]
+        rows[0]["decision"] = "edit"
+        rows[1]["decision"] = "human_edit"
+        rows[2]["decision"] = None  # batch-verified: no live decision, still training data
+        pack, snapshot = _pack(tmp, rows)
+        problems = verify_pack(pack, snapshot, {"status": "sealed"})
+        assert problems == [], f"human corrections are training data, not contamination: {problems}"
+
+
+def test_a_human_rejection_is_still_refused() -> None:
+    """The complement — widening the accept-set must not let a REJECTED clip become training data."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        rows = [_row(0), _row(1), _row(2), _row(3, "validation")]
+        rows[0]["decision"] = "reject"
+        pack, snapshot = _pack(tmp, rows)
+        problems = verify_pack(pack, snapshot, {"status": "sealed"})
+        assert any("non-training decision" in p for p in problems), problems
+
+
 def test_a_pack_with_no_train_split_is_refused() -> None:
     """Training on validation/test is the leak the whole split exists to prevent."""
     with tempfile.TemporaryDirectory() as raw:
