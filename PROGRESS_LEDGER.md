@@ -9186,8 +9186,13 @@ byte-identity at unit scale. The fixture covers overlapping clips, a clip stradd
 
 Also in that PR: `export_pack`, a headless exporter (gate D forbids clicking through the desktop app
 to seal a snapshot; it deliberately does not take the instance lock, so producing a snapshot never
-costs reviewers their links), and a failed WAV **write** is now fatal rather than skipping a source —
-a full disk must not read as "some clips skipped".
+costs reviewers their links).
+
+*Correction to that PR's own commit message:* it claims a failed WAV **write** is "now fatal rather
+than skipping a source". Checked against `origin/main` — the original already used `?` on
+`write_wav_16k_mono`, so a write failure was ALWAYS fatal. The new code preserves that; it does not
+change it. What IS new is the decode-failure path: a dead source now skips its rows once and logs
+why, instead of each of its clips failing individually.
 
 ### The playback error the owner hit was not a codec (PR #65)
 
