@@ -1314,6 +1314,34 @@ export async function getEscalationQueue(limit: number): Promise<SpeechSegment[]
   return invoke<SpeechSegment[]>('get_escalation_queue', { limit });
 }
 
+/** Cumulative MEDIA time a reviewer actually advanced through one clip, at one revision.
+ *
+ * Not wall-clock, not a `play()` call, not a download — those prove the file arrived, never that
+ * anyone heard it. The backend binds the receipt to the segment, the revision AND the audio
+ * fingerprint, so it cannot be replayed against a different clip or survive the audio changing.
+ */
+export async function recordPlaybackReceipt(args: {
+  segmentId: string;
+  segmentRevision: number;
+  audioFingerprint: string;
+  playedMs: number;
+  clipDurationMs: number;
+  reviewer?: string | null;
+  sessionId?: string | null;
+  startedAtMs?: number;
+}): Promise<void> {
+  return invoke<void>('record_playback_receipt', {
+    segmentId: args.segmentId,
+    segmentRevision: args.segmentRevision,
+    audioFingerprint: args.audioFingerprint,
+    playedMs: Math.max(0, Math.round(args.playedMs)),
+    clipDurationMs: Math.max(0, Math.round(args.clipDurationMs)),
+    reviewer: args.reviewer ?? null,
+    sessionId: args.sessionId ?? null,
+    startedAtMs: args.startedAtMs ?? Date.now(),
+  });
+}
+
 export async function recordHumanDecision(
   segmentId: string,
   decision: 'accept' | 'edit' | 'reject',

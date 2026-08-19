@@ -269,6 +269,52 @@ pub fn record_human_decision(
     Ok(())
 }
 
+/// Record that a reviewer actually HEARD a clip, so a verdict on it can be more than a guess.
+///
+/// The renderer reports how much MEDIA time it advanced; the backend derives coverage and stamps the
+/// policy version. It is not a trust boundary on its own — a scripted client can post whatever it
+/// likes — which is exactly why `require_playback_evidence` binds the receipt to the segment, the
+/// revision AND the audio fingerprint: a fabricated receipt still has to name the bytes on file for
+/// the clip being decided, at the revision being decided.
+#[tauri::command]
+// A receipt is a wide but flat record — segment, revision, fingerprint, timings, who and when.
+// Collapsing it into a struct would only move the same fields behind one name, and Tauri would
+// still take them as a flat payload from the renderer.
+#[allow(clippy::too_many_arguments)]
+pub fn record_playback_receipt(
+    state: State<'_, AppState>,
+    segment_id: String,
+    segment_revision: i64,
+    audio_fingerprint: String,
+    played_ms: i64,
+    clip_duration_ms: i64,
+    reviewer: Option<String>,
+    session_id: Option<String>,
+    started_at_ms: i64,
+) -> Result<(), String> {
+    RATE_LIMITER.check("record_playback_receipt")?;
+    validate::validate_identifier(&segment_id)?;
+    validate::validate_text(&audio_fingerprint, 256, "Audio fingerprint")?;
+    if let Some(name) = reviewer.as_deref() {
+        validate::validate_text(name, 128, "Reviewer")?;
+    }
+    if played_ms < 0 || clip_duration_ms < 0 || segment_revision < 0 {
+        return Err("playback receipt fields must not be negative".to_string());
+    }
+    let db = state.lock_db();
+    db.record_playback_receipt(&crate::db::PlaybackReceipt {
+        segment_id,
+        segment_revision,
+        audio_fingerprint,
+        reviewer,
+        session_id,
+        started_at_ms,
+        played_ms,
+        clip_duration_ms,
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// P3-3: Revert a segment back to unreviewed state (NULL human_decision).
 /// This is the correct undo operation — avoids incorrectly re-setting to 'accept'.
 #[tauri::command]

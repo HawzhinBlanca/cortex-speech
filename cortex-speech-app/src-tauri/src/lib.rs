@@ -810,6 +810,7 @@ pub fn run() {
             commands::run_t0_gate,
             commands::get_escalation_queue,
             commands::record_human_decision,
+            commands::record_playback_receipt,
             commands::clear_human_decision,
             commands::clear_escalation,
             commands::write_segment_verdict,
