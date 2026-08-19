@@ -10540,3 +10540,65 @@ Totals after fixes: Rust 1288 passed, clippy -D warnings 0, vitest 280, 86 polic
 0 errors. Gate: READY (32/32 evidenced, 2 reviewers). Deployed exe still 128a067 — rebuild pending.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (voice focus) — one host's voice, found by cross-file presence, confirmed 15/15 by ear, now the whole queue
+
+Owner goal for this phase: collect the KBHP host's voice, clean and single-speaker, for voice cloning;
+guests later. Reviewer hours are the scarce resource, so the QUEUE narrows to his clips. The library
+does not change: nothing relabelled, nothing deleted, and removing one data-dir file restores the
+full queue on the next fetch.
+
+### Finding him
+
+The per-file SPEAKER_xx labels name nobody — the same person is SPEAKER_05 in one episode and
+SPEAKER_04 in the next (measured across the 32 files). `host_voice_probe` embedded every single-speaker
+clip with the production CAM++ service and clustered across ALL files at once:
+
+```
+clips embedded   8,753 (single-speaker, >= 2 s, across 25 of 32 files)
+clusters            39
+  cluster  files  audio  clips
+        1   24/25  2.25h   905   <- one voice in nearly every episode
+       28    1/25  1.06h   415   <- one file only: a guest
+       29    1/25  1.01h   408   <- one file only: a guest
+```
+
+Ranked by DISTINCT FILES PRESENT, not volume: a long-winded guest out-talks the host in their own
+episode, but cannot appear in 24 of them.
+
+### The owner's ear, blind
+
+15 clips, two-thirds candidate and one-third deliberately not, shuffled, audio embedded in a page so
+nothing had to be found or decoded. Owner: "all Kawa except 1, 2, 11, 13, 14." Scored against the
+key: **15 of 15 agree**. The activator is built to REFUSE past one disagreement — it refused once
+earlier when the owner ran the example command with my placeholder numbers (7 disagreements, wrote
+nothing), which is the safety working.
+
+### Live, proven at the serving path for all eight reviewers
+
+```
+Hawzhin / Rubar / Pavel   served 29 = 25 Kawa + 4 spot-checks   pendingTotal 905
+Alle / Lamo / Roza / Sabat / Sewa   served 0, pendingTotal 0  ("No clips in your dialect yet")
+```
+
+Kawa is Hawleri, the five are Sorani-restricted by the owner's roster, and the owner's decision is to
+leave them: Hawleri reviewers only this phase. The spot-checks (1 in 8 by canon) still fire inside
+the focus — the QC does not care which voice is being collected.
+
+### Two things caught on the way
+
+* The background `tauri build` wait-loop declared "done" on a STALE exe (it checked for cargo while
+  vite was still running; no focus code in the binary). Caught by the negative-control grep before
+  deploy; rebuilt in the foreground.
+* `check_reviewer_queues_live` reported 15,318 servable while every real queue held 905 — it
+  mirrored the pending query but not the focus, and would have read OK against an empty queue. Now
+  reads the same file the server reads; honest, it immediately surfaced the five-empty-queues fact.
+
+Caveats carried: 7 of 32 episodes contributed no candidate clips (no single-speaker scoring yet);
+clusters 10 and 17 (12 and 11 files) may be the host on other mic days — a second blind round could
+roughly double his hours. Not now: 905 clips / 2.25 h is a working set, and the reviewers should be
+on it rather than waiting.
+
+**GO_LINKS: YES** (Hawleri roster). **GO_MODEL_PROMOTION: NO** — unchanged.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
