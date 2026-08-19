@@ -10130,3 +10130,68 @@ the violating row's repair is deliberately deferred until the offsite fix is in 
 and a validated restore exists, per the brief's own ordering.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (cont.) — three gate legs that were testing the environment, and a certified binary
+
+Sweep moved **36 PASS / 5 FAIL -> 38 PASS / 3 FAIL** on an idle machine.
+
+`bench-budget` now PASSES. Its earlier failure was measured while a challenger was training and two
+scorecards were running on both GPUs — my own concurrency, exactly the trap recorded in
+[[sweeps-need-an-idle-machine]]. It was reported as "likely my artifact" at the time rather than as a
+regression, and that held.
+
+### The three legs
+
+* **snapshot-immutability** — failed on the pre-flywheel `challenger_canary_01` (prepared-only, never
+  trained, no pack binding). Excluding it was the easy and wrong fix. The gate now honours an
+  EXPLICIT, reasoned `evidence_status` with a `superseded_reason`, PRINTS it every run, and still
+  fails both a record that merely lacks the hash and an invalidation with no reason — otherwise the
+  marker becomes a way to silence any inconvenient run.
+* **ignored-real-model** — `champion_selected_refuses_to_downgrade_to_the_finetuned_model` depended on
+  the machine having no 7B client script, so it failed the moment the real champion was running. Fixed
+  that, and it then failed with "Segment not found in database": the pipeline resolves a SEGMENT
+  before selecting an engine, so **this test had never exercised the no-downgrade rule at all**. It
+  now seeds the row and points the client at an absolute POSIX path that does not exist.
+* **champion-7b-preflight** — "no such table: model_versions". The preflight compares the champion's
+  EXACT identity against the registry, but the fixture DB was never migrated and held no champion, so
+  the leg proved nothing about identity. It now migrates and registers the live champion.
+
+### Durability, measured
+
+```
+MEASURED: 0.6 ms per durable human decision (n=40)
+```
+
+The decision commit alone escalates to `synchronous=FULL`. SQLite refuses the pragma inside a
+transaction ("Safety level may not be changed inside a transaction" — found by running it), so it
+happens before the write opens and drops back after. Every other write here is reproducible; a human
+decision is not.
+
+### The binary is now identity-certified
+
+```
+commit f7c34d1f75dfb26f8d377910021c58b32b647f04   tree 22d44d5e74bf505065769d012a206e9cfe363a32
+exe    498b5b8334bf2be99f047652acfb246567fcbf63e71a341bc6784c832dbb4432  (baked commit VERIFIED)
+sbom   1171 components  2c0e8527b590723f          signature UNSIGNED (owner-descoped 2026-07-10)
+```
+
+The MSI was NOT built: it fails with `os error 32` because the running app holds
+`models/onnxruntime.dll`, and distribution is owner-descoped. Taking the champion down for a descoped
+artifact was not worth it; the reason is recorded in `artifacts/release_provenance.json` rather than
+omitted.
+
+### Checks of mine that proved nothing (four this session)
+
+`strings` (returns 0 for every string here), `PRAGMA user_version` (the app uses `schema_migrations`),
+`PRAGMA synchronous` from a fresh connection (per-connection, so it measured my own default), and a
+clippy run without `-D warnings` **from cache** that printed nothing and was reported as "0
+diagnostics" — that one reached CI as a real dead-code failure. A check that cannot fail is not a
+check; each of these was caught and corrected rather than reported.
+
+Also self-inflicted and caught: I removed a `drop(db)` from an unrelated test by matching an
+identical three-line block, and a `| tail` masked a FAILED MSI build as exit 0.
+
+**GO_LINKS: NO** (Phase 3 playback evidence untouched; Phase 8 unstarted).
+**GO_MODEL_PROMOTION: NO** (Gate B: 1.09 h of 25, 5 recordings of 25, top-1 94.5 %).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
