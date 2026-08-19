@@ -10612,7 +10612,7 @@ cluster 10 6/6 MERGE, cluster 17 6/6 MERGE.
 
 ```
 focus now : 1,352 clips | 3.35 h | across all 25 scored episodes | all pending
-serving   : Hawzhin/Rubar/Pavel pendingTotal 1352, 25 Kawa + 4 spot-checks per batch
+serving   : the three Hawleri reviewers, pendingTotal 1352, 25 Kawa + 4 spot-checks per batch
             Sorani-restricted reviewers still 0, by owner decision
 ```
 
