@@ -10286,3 +10286,89 @@ Phases 1, 2, 4, 7 complete. 5 at 3-of-5 (rest terminates at Gate B). 3, 6, 8 blo
 corpus and a reviewer slot respectively — none of them code.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (later) — the enforcement green light was vacuous, and the coverage denominator was the client's
+
+Asked to wire enforcement "after the log shows no `PLAYBACK_EVIDENCE_OBSERVE`". The log did show none.
+It was still not permission, and the reason is worth keeping.
+
+### Why zero warnings meant nothing
+
+```
+running exe bakes                    : c6c1bee   (NOT ddeb2c3, which added the guard)
+PLAYBACK_EVIDENCE_OBSERVE in the exe : 0 occurrences (grep -a)
+record_playback_receipt in the exe   : present
+playback_receipts rows               : 0
+last phone decision                  : 2026-08-18 21:19:20   (18 events, 21:11-21:19)
+running exe built                    : 2026-08-19 05:50      (8.5 h AFTER those decisions)
+```
+
+The observe guard was never deployed, so it could not warn; the receipt-minting build went live after
+the last phone review, so nothing had minted a receipt. Zero and zero, and the honest reading is
+"this code has never executed". Flipping to hard refusal on it would have shipped a rejection path to
+all eight reviewers on no evidence at all.
+
+`check_playback_enforcement_readiness.py` now asks whether the warning COULD have fired before
+treating its absence as evidence: marker present in the binary, real decisions in the window, more
+than one reviewer represented (playback ticks come from a device, not a policy), every decision
+covered at the bar. Negative controls drive it against this exact shape and require NOT READY; a
+positive control requires READY so it is not merely a refuser. Live verdict: **NOT READY, 2 checks
+failed** — which is the true state, not a failure of the work.
+
+### Half the guard was comparing the client with itself
+
+The receipt resolves revision and fingerprint server-side precisely so a client cannot mint evidence
+for a clip it never loaded — and then took the coverage DENOMINATOR from the client anyway. A page
+reporting `heardMs: 100, clipDurationMs: 100` for a 1.5 s sentence scored 1.00 and cleared the 0.90
+bar on a tenth of a second of audio.
+
+```
+before fix : receipt recorded clip_duration_ms = 100  (client's claim)
+after fix  : receipt recorded clip_duration_ms = 1500 (server's row), coverage 0.067 -> REFUSED
+live rows carrying a duration : 15,905 of 15,905, so the client's number is now dead in practice
+```
+
+### Phase 8 does not need a reviewer slot — the earlier entry was wrong
+
+Recorded above: "the rest of Phase 8 needs a claim session, and a 9th reviewer cannot be created".
+Five of those six items are already pinned against the REAL server on disposable in-memory profiles,
+which is exactly the dedicated audit profile the brief asked for, at zero cost to the roster. Each run
+individually and confirmed as `1 passed`, never a filtered-out zero:
+
+```
+cookie flags (Secure/HttpOnly/SameSite=Strict, pairing secret != session)  pairing_mints_distinct_secure_bounded_sessions
+token gate on every route, two reviewers kept apart                        live_server_gates_every_route_...
+a valid token in the query string is worthless                             a_valid_token_in_the_query_string_is_worthless
+idempotent replay, never recorded twice                                    a_legacy_interrupted_decision_..., a_mid_session_server_restart_...
+revocation, and revocation surviving a restart                             revoking_one_reviewer_..., ..._must_outlive_a_restart, durable_stop_marker_...
+sleep / restart                                                            a_lease_that_lapsed_while_the_phone_slept_..., a_spot_check_served_before_a_restart_...
+```
+
+Ranged-audio authorisation needed no new test: the auth gate returns 401 before the `Range` header is
+read and before any route dispatch, so a Range-specific bypass would require moving the audio route
+above the gate — which the existing 401 test already catches. Checking beat writing.
+
+### Gate B's refusal was blaming the corpus
+
+`EVAL SLICES: REFUSED - 348 manifest row(s) did not resolve to exactly one library segment` reads as
+corruption in `speech_segments`. Measured:
+
+```
+manifest rows        : 348
+rows with 0 matches  : 348
+rows with >1 match   : 0
+manifest             : runs/eval/fleurs_ckb_iq_frozen.eval.tsv  (FLEURS — external by canon)
+```
+
+Every row, not some. FLEURS clips are not library clips and never will be, so library-derived slices
+(speaker, dialect, SNR, source) cannot be built from that manifest at all. That is a question about
+which eval set gets sliced — a promotion-policy decision, owner-gated — not a corruption to hunt. The
+message now says so. The gate still REFUSES; nothing was weakened.
+
+### Standing verdicts
+
+**GO_LINKS: NO** — enforcement still observing. The precondition is now measurable rather than
+assumed, and the instrument that measures it exists and currently reads NOT READY.
+**GO_MODEL_PROMOTION: NO** — unchanged. Gate B: 1.09 h of 25, 5 recordings of 25.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
