@@ -21,6 +21,13 @@
 //!
 //! Usage:
 //!   host_voice_probe --source-like "%_batch_%" [--data-dir DIR] [--threshold 0.62] [--sample 15]
+//!   host_voice_probe --source-like "%_batch_%" --round2 10,17     # judge SPECIFIC clusters
+//!
+//! `--round2 A,B,...` samples from the named clusters (plus a control draw from the top cluster),
+//! writes the key with the CLUSTER per clip rather than candidate/other, and writes each named
+//! cluster's ids to its own file — so the owner can confirm or reject each suspect independently
+//! and a confirmed one can be MERGED into the focus without re-judging the host. Output goes to
+//! `voice_focus/round2/`; round-1 files are never overwritten.
 
 use cortex_speech_app_lib::diarization::{SpeakerEmbeddingService, SPEAKER_CHANGE_THRESHOLD};
 use cortex_speech_app_lib::{audio, chunking, models};
@@ -67,6 +74,8 @@ fn main() -> Result<(), String> {
     let source_like = arg(&args, "--source-like").ok_or("--source-like is required (SQL LIKE on audio_path)")?;
     let threshold: f32 = arg(&args, "--threshold").and_then(|v| v.parse().ok()).unwrap_or(0.62);
     let sample_n: usize = arg(&args, "--sample").and_then(|v| v.parse().ok()).unwrap_or(15);
+    let round2: Option<Vec<usize>> =
+        arg(&args, "--round2").map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect());
 
     let db_path = data_dir.join("cortex-speech.db");
     let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
@@ -212,40 +221,69 @@ fn main() -> Result<(), String> {
         );
     }
 
-    // Blind sample: ids only, no cluster hint, mixing candidate with others so the owner's ear is
-    // tested rather than led. Roughly two-thirds candidate. The answer key is written separately.
-    let out_dir = data_dir.join("voice_focus");
+    // Blind sample: ids only, no cluster hint, so the owner's ear is tested rather than led.
+    //
+    // Round 1 (default): two-thirds from the candidate-host cluster, one-third from everything else;
+    // the key says CANDIDATE / other. Round 2 (`--round2 A,B`): draws from each NAMED cluster plus a
+    // control draw from the confirmed host cluster; the key names the cluster per clip, so each
+    // suspect can be confirmed or rejected on its own.
+    let is_round2 = round2.is_some();
+    let out_dir = if is_round2 { data_dir.join("voice_focus").join("round2") } else { data_dir.join("voice_focus") };
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-    let mut candidate_ids: Vec<&str> =
-        embedded.iter().zip(&assign).filter(|(_, &c)| c == host_c).map(|((id, ..), _)| id.as_str()).collect();
-    let mut other_ids: Vec<&str> =
-        embedded.iter().zip(&assign).filter(|(_, &c)| c != host_c).map(|((id, ..), _)| id.as_str()).collect();
+    let ids_of = |cluster: usize| -> Vec<&str> {
+        embedded.iter().zip(&assign).filter(|(_, &c)| c == cluster).map(|((id, ..), _)| id.as_str()).collect()
+    };
+    let mut candidate_ids: Vec<&str> = ids_of(host_c);
     shuffle(&mut candidate_ids, 20_260_819);
-    shuffle(&mut other_ids, 20_260_820);
-    let take_c = (sample_n * 2 / 3).min(candidate_ids.len());
-    let take_o = (sample_n - take_c).min(other_ids.len());
-    let mut sample: Vec<(&str, bool)> = candidate_ids[..take_c]
-        .iter()
-        .map(|&i| (i, true))
-        .chain(other_ids[..take_o].iter().map(|&i| (i, false)))
-        .collect();
+
+    // (id, label): "CANDIDATE"/"other" in round 1, "cluster:N" in round 2.
+    let mut sample: Vec<(&str, String)> = Vec::new();
+    match &round2 {
+        None => {
+            let mut other_ids: Vec<&str> =
+                embedded.iter().zip(&assign).filter(|(_, &c)| c != host_c).map(|((id, ..), _)| id.as_str()).collect();
+            shuffle(&mut other_ids, 20_260_820);
+            let take_c = (sample_n * 2 / 3).min(candidate_ids.len());
+            let take_o = (sample_n - take_c).min(other_ids.len());
+            sample.extend(candidate_ids[..take_c].iter().map(|&i| (i, "CANDIDATE".to_string())));
+            sample.extend(other_ids[..take_o].iter().map(|&i| (i, "other".to_string())));
+        }
+        Some(suspects) => {
+            // Even split across the suspects, plus ~a quarter of the sample as host CONTROLS: if the
+            // owner calls a control clip "not him", the ear is off today and the round is void.
+            let controls = (sample_n / 4).max(2);
+            let per = ((sample_n.saturating_sub(controls)) / suspects.len().max(1)).max(1);
+            for (k, &c) in suspects.iter().enumerate() {
+                let mut ids = ids_of(c);
+                shuffle(&mut ids, 20_260_900 + k as u64);
+                let n = per.min(ids.len());
+                println!("round2: cluster {c} has {} clips, sampling {n}", ids.len());
+                sample.extend(ids[..n].iter().map(|&i| (i, format!("cluster:{c}"))));
+                std::fs::write(
+                    out_dir.join(format!("cluster_{c}_segment_ids.txt")),
+                    ids.iter().map(|id| format!("{id}\n")).collect::<String>(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            let take_ctl = controls.min(candidate_ids.len());
+            sample.extend(candidate_ids[..take_ctl].iter().map(|&i| (i, format!("cluster:{host_c}"))));
+        }
+    }
     shuffle(&mut sample, 7);
 
     let blind = out_dir.join("blind_sample.txt");
     let key = out_dir.join("blind_sample_KEY.txt");
-    let candidates = out_dir.join("candidate_segment_ids.txt");
     std::fs::write(&blind, sample.iter().map(|(id, _)| format!("{id}\n")).collect::<String>())
         .map_err(|e| e.to_string())?;
-    std::fs::write(
-        &key,
-        sample
-            .iter()
-            .map(|(id, is_c)| format!("{id}\t{}\n", if *is_c { "CANDIDATE" } else { "other" }))
-            .collect::<String>(),
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::write(&candidates, candidate_ids.iter().map(|id| format!("{id}\n")).collect::<String>())
+    std::fs::write(&key, sample.iter().map(|(id, label)| format!("{id}\t{label}\n")).collect::<String>())
         .map_err(|e| e.to_string())?;
+    if !is_round2 {
+        std::fs::write(
+            out_dir.join("candidate_segment_ids.txt"),
+            candidate_ids.iter().map(|id| format!("{id}\n")).collect::<String>(),
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     // The blind sample as playable WAVs, numbered in judging order. 16 kHz mono PCM, the clip only.
     let sample_dir = out_dir.join("blind_sample");
@@ -274,6 +312,14 @@ fn main() -> Result<(), String> {
     );
     println!("  {}   <- {} ids to judge by ear, in order", blind.display(), sample.len());
     println!("  {}   <- DO NOT open until judged", key.display());
-    println!("  {}   <- all {} candidate-host clip ids", candidates.display(), candidate_ids.len());
+    if is_round2 {
+        println!("  {}   <- one cluster_N_segment_ids.txt per suspect cluster", out_dir.display());
+    } else {
+        println!(
+            "  {}   <- all {} candidate-host clip ids",
+            out_dir.join("candidate_segment_ids.txt").display(),
+            candidate_ids.len()
+        );
+    }
     Ok(())
 }

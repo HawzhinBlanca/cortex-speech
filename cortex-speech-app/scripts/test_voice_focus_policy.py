@@ -77,6 +77,46 @@ def test_deactivate_retires_rather_than_deletes() -> None:
         assert list(tmp.glob("voice_focus.retired-*.json")), "the old focus is kept as history, not deleted"
 
 
+def _round2_fixture(tmp: Path) -> None:
+    """An ACTIVE focus of host cluster 1 (ids h1,h2), plus a round-2 key over clusters 10 and 17."""
+    _fixture(tmp)
+    (tmp / "voice_focus.json").write_text(
+        json.dumps({"name": "TestVoice", "segment_ids": ["h1", "h2"]}), encoding="utf-8"
+    )
+    r2 = tmp / "voice_focus" / "round2"
+    r2.mkdir()
+    # sample order: 1:c10  2:c17  3:CONTROL(h1)  4:c10  5:c17  6:CONTROL(h2)
+    key = [("t1", "cluster:10"), ("s1", "cluster:17"), ("h1", "cluster:1"),
+           ("t2", "cluster:10"), ("s2", "cluster:17"), ("h2", "cluster:1")]
+    (r2 / "blind_sample_KEY.txt").write_text("".join(f"{i}\t{l}\n" for i, l in key), encoding="utf-8")
+    (r2 / "cluster_10_segment_ids.txt").write_text("t1\nt2\nt3\n", encoding="utf-8")
+    (r2 / "cluster_17_segment_ids.txt").write_text("s1\ns2\ns3\n", encoding="utf-8")
+
+
+def test_round2_merges_only_the_cluster_the_owner_confirmed_on_every_clip() -> None:
+    """Cluster 10 confirmed on both clips -> merged. Cluster 17 confirmed on one of two -> rejected."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        _round2_fixture(tmp)
+        r = _run(tmp, "--merge-round2", "--host", "1,4,2,3,6")  # 10: yes,yes  17: yes,no  controls: yes,yes
+        assert r.returncode == 0, r.stdout + r.stderr
+        focus = json.loads((tmp / "voice_focus.json").read_text(encoding="utf-8"))
+        assert set(focus["segment_ids"]) == {"h1", "h2", "t1", "t2", "t3"}, focus["segment_ids"]
+        assert "s1" not in focus["segment_ids"], "a half-confirmed cluster must not pollute the host's set"
+
+
+def test_round2_is_void_if_the_owner_misses_a_control() -> None:
+    """Calling an already-confirmed host clip 'not him' means the ear is off; nothing may merge."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        _round2_fixture(tmp)
+        r = _run(tmp, "--merge-round2", "--host", "1,4,2,5,3")  # every suspect yes, but control #6 missed
+        assert r.returncode == 1, r.stdout
+        assert "VOID" in r.stdout
+        focus = json.loads((tmp / "voice_focus.json").read_text(encoding="utf-8"))
+        assert set(focus["segment_ids"]) == {"h1", "h2"}, "a void round must leave the focus untouched"
+
+
 def test_tracked_sources_carry_no_speaker_name() -> None:
     """The name is the owner's data, not the repo's. Only generic words may appear in code."""
     for path in TRACKED:
