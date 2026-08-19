@@ -10431,3 +10431,52 @@ coverage is the last gate leg and it hangs on the reject question above, not on 
 **GO_MODEL_PROMOTION: NO** — unchanged. Gate B: 1.10 h of 25, 6 recordings of 25.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (enforcement) — the guard now refuses, rejects included
+
+Owner call: bar to 0.85, rejects gated, enforcement live. Deployed at HEAD `128a067`; the running exe
+carries `PLAYBACK_EVIDENCE_REFUSED` and no longer carries the observe marker, verified against a
+negative control that returned 0. Eight reviewer links answering, champion pointer intact, exe fresh.
+
+A verdict on a clip played below the bar is refused with **428**. `skip` stays exempt — it writes no
+verdict, and gating it would leave a reviewer who cannot hear a clip with no legal move at all.
+
+### Two bugs the existing tests caught, both the same shape
+
+The server's own failure was being reported as the reviewer's fault:
+
+  * a locked database makes the evidence check unanswerable, and the first draft returned 428. Someone
+    who listened properly would replay the clip and be refused again, forever. Unanswerable is now 500.
+  * a receipt that could not be WRITTEN left nothing to judge, so a busy database refused honest work.
+    Now 500 — and it claims the lease first, or a transient error hands the clip to the next
+    reviewer's batch while the reviewer still has it open with their correction typed.
+
+Neither was visible from the enforcement code alone; both surfaced because 34 tests went red and one
+of them asserted `500, "a locked database must surface as a server error, not a verdict"`.
+
+### The Funnel link, and why the app never had it
+
+A reviewer lost audio mid-session and five skips silently failed to reach the server. Server healthy
+(shell 0.04 s, zero ERROR lines), every audio file present, all eight queues live, public Funnel
+answering in 0.05 s from outside. The app hands out a LAN URL and a tailnet URL; both die when the
+phone leaves the network, and iOS suspends the VPN whenever the app is backgrounded. The one link that
+still worked was the one never handed out. Now read from `tailscale serve status --json` — three
+conditions or no row, because a guessed hostname resolves and then refuses.
+
+### Gates that caught me this round
+
+  * repo hygiene: the owner's real device hostname went into a tracked test fixture. Redacted.
+  * the readiness pin: its marker string no longer existed in the source — exactly the "passes on
+    silence" trap it was written for. The gate is reframed for enforcement rather than retired.
+  * clippy MSRV: `is_none_or` is 1.82, the project floor is 1.81.
+  * a tab had eaten `C:\Program Files\Tailscale\tailscale.exe` into `Tailscale<TAB>ailscale.exe`.
+
+Rust 1282 passed, clippy -D warnings clean, 86 python policies, typecheck 0 errors.
+
+### Standing verdicts
+
+**GO_PILOT: YES.** **GO_LINKS: NO** — enforcement is live but has not yet refused a real reviewer;
+the first `PLAYBACK_EVIDENCE_REFUSED` in the log is the live proof, and it has not happened yet.
+**GO_MODEL_PROMOTION: NO** — Gate B unchanged: 1.10 h of 25, 6 recordings of 25.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
