@@ -4153,6 +4153,17 @@ impl Database {
             tx.query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![previous.id], |row| {
                 row.get(0)
             })?;
+        // Carry THIS reviewer's best listening receipt forward to the restored revision. The decision
+        // bumped the revision past the receipt, so without this the immediate re-decision on a clip
+        // the reviewer just heard, decided and undid was refused 428 — Undo punished listening.
+        // Fingerprint equality is the invariant that makes the carry honest: the revision is a write
+        // counter, but the receipt names the exact audio bytes, and those are unchanged. One row,
+        // best coverage, only if no receipt already sits at the restored revision, only for the
+        // reviewer doing the undo — everyone else still owes their own listen.
+        tx.execute(
+            "INSERT INTO playback_receipts (segment_id, segment_revision, audio_fingerprint, reviewer,                                             session_id, started_at_ms, played_ms, clip_duration_ms,                                             coverage_ratio, policy_version)              SELECT segment_id, ?3, audio_fingerprint, reviewer, session_id, started_at_ms,                     played_ms, clip_duration_ms, coverage_ratio, policy_version              FROM playback_receipts              WHERE segment_id = ?1 AND reviewer IS ?2                AND audio_fingerprint = (SELECT COALESCE(NULLIF(TRIM(COALESCE(audio_fingerprint, '')), ''),                                                          'id:' || id)                                          FROM speech_segments WHERE id = ?1)                AND NOT EXISTS (SELECT 1 FROM playback_receipts p2                                 WHERE p2.segment_id = ?1 AND p2.reviewer IS ?2                                   AND p2.segment_revision = ?3)              ORDER BY coverage_ratio DESC LIMIT 1",
+            params![previous.id, reviewer, restored_revision],
+        )?;
         tx.commit()?;
         self.track_write()?;
         Ok(Some(restored_revision))
@@ -4477,8 +4488,14 @@ impl Database {
     /// reviewer who never heard it cannot make it — a wrongly rejected clip is silently dropped from
     /// the corpus, which is the most expensive mistake available and the hardest to notice later.
     /// `skip` never reaches here: it writes no verdict at all.
-    pub fn require_playback_evidence(&self, segment_id: &str, revision: i64, fingerprint: &str) -> AppResult<()> {
-        if self.has_sufficient_playback_evidence(segment_id, revision, fingerprint)? {
+    pub fn require_playback_evidence(
+        &self,
+        segment_id: &str,
+        revision: i64,
+        fingerprint: &str,
+        reviewer: Option<&str>,
+    ) -> AppResult<()> {
+        if self.has_sufficient_playback_evidence(segment_id, revision, fingerprint, reviewer)? {
             return Ok(());
         }
         Err(AppError::Validation(format!(
@@ -4491,7 +4508,52 @@ impl Database {
     ///
     /// `played_ms` is cumulative MEDIA time advanced, never wall-clock and never a `play()` call —
     /// download, metadata load and an autoplay attempt all prove nothing about listening.
+    ///
+    /// EVERY identity field is resolved HERE, from the row — revision, fingerprint, and the
+    /// coverage denominator alike. The struct's values for those three are treated as claims and
+    /// overwritten. Found by the 2026-08-19 hunt: the phone path resolved all three at its call
+    /// site, the desktop resolved two and passed the renderer's clipDurationMs through — and both
+    /// desktop surfaces report the WHOLE source file's length (403 of 414 clips share one
+    /// recording), so an honest 10s listen scored ~0.004 and was refused, while a shrunk claim
+    /// minted 1.0. Per-caller resolution is exactly how one caller gets it wrong; this is the one
+    /// door, so no caller can.
     pub fn record_playback_receipt(&self, receipt: &PlaybackReceipt) -> AppResult<()> {
+        use rusqlite::OptionalExtension;
+        let row: Option<(i64, Option<String>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(review_revision, 0),
+                        NULLIF(TRIM(COALESCE(audio_fingerprint, '')), ''),
+                        COALESCE(duration_ms, 0)
+                 FROM speech_segments WHERE id = ?1",
+                [&receipt.segment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((revision, fingerprint, duration_ms)) = row else {
+            return Err(AppError::Validation(format!(
+                "cannot mint a listening receipt for unknown segment {}",
+                receipt.segment_id
+            )));
+        };
+        let resolved = PlaybackReceipt {
+            segment_revision: revision,
+            audio_fingerprint: fingerprint.unwrap_or_else(|| format!("id:{}", receipt.segment_id)),
+            // The row's own clip length wins; the claim survives only for a row with no duration,
+            // which on the live library is zero rows of 15,905.
+            clip_duration_ms: if duration_ms > 0 { duration_ms } else { receipt.clip_duration_ms },
+            ..receipt.clone()
+        };
+        self.record_playback_receipt_raw(&resolved)
+    }
+
+    /// The raw writer: stores exactly what it is given, resolving nothing.
+    ///
+    /// For tests that must fabricate divergent worlds (a receipt at a dead revision, audio bytes
+    /// that changed after the listen) and for the undo path carrying a reviewer's own evidence
+    /// forward. Production surfaces go through [`Self::record_playback_receipt`]; minting a receipt
+    /// from unresolved client claims through this is the exact bug the front door closed.
+    pub(crate) fn record_playback_receipt_raw(&self, receipt: &PlaybackReceipt) -> AppResult<()> {
         let coverage = if receipt.clip_duration_ms > 0 {
             (receipt.played_ms as f64 / receipt.clip_duration_ms as f64).min(1.0)
         } else {
@@ -4524,18 +4586,27 @@ impl Database {
     ///     different clip or survive the audio being swapped underneath it;
     ///   * coverage is cumulative media time, so a paused, seeked or replayed listen still counts
     ///     honestly and a download does not count at all.
+    ///
+    /// `reviewer` is part of the evidence's identity: listening is PERSONAL.
+    ///
+    /// Found by the hunt: matching on segment+revision+fingerprint alone let reviewer A's full
+    /// listen evidence reviewer B's blind verdict (a clip A heard and skipped goes to B's queue
+    /// with A's receipt still valid for it). `None` matches only anonymous (desktop-minted)
+    /// receipts, never a named phone receipt, and vice versa: SQL `IS` treats NULL as its own
+    /// identity.
     pub fn has_sufficient_playback_evidence(
         &self,
         segment_id: &str,
         revision: i64,
         fingerprint: &str,
+        reviewer: Option<&str>,
     ) -> AppResult<bool> {
         use rusqlite::OptionalExtension;
         let best: Option<f64> = self
             .conn
             .query_row(
-                "SELECT MAX(coverage_ratio) FROM playback_receipts                  WHERE segment_id = ?1 AND segment_revision = ?2 AND audio_fingerprint = ?3",
-                params![segment_id, revision, fingerprint],
+                "SELECT MAX(coverage_ratio) FROM playback_receipts                  WHERE segment_id = ?1 AND segment_revision = ?2 AND audio_fingerprint = ?3                    AND reviewer IS ?4",
+                params![segment_id, revision, fingerprint, reviewer],
                 |row| row.get(0),
             )
             .optional()?

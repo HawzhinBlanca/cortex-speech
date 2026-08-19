@@ -4464,12 +4464,84 @@ fn receipt(segment: &str, revision: i64, fingerprint: &str, played: i64, total: 
     }
 }
 
+/// The receipt's identity fields are the SERVER's to state, whichever surface minted it.
+///
+/// Found by the 2026-08-19 bug hunt, verified certain: the desktop mint command passed the
+/// renderer's clipDurationMs straight through, and both desktop surfaces report the WHOLE source
+/// file's duration (403 of 414 clips share one recording) — so an honest full listen of a 10s clip
+/// scored ~0.004 and was refused, while a lying client could shrink the clip to mint coverage 1.0.
+/// The phone path resolved the denominator server-side; the desktop did not. One resolving front
+/// door now serves every surface, so a caller cannot get it wrong again.
+#[test]
+fn a_receipt_is_measured_against_the_rows_own_clip_length() {
+    let db = make_db();
+    let mut seg = make_segment("pb-den", "/a/clip.wav");
+    seg.duration_ms = 10_000;
+    db.insert_segment(&seg).unwrap();
+
+    // The client claims the clip is 100ms and that it played all 100ms.
+    db.record_playback_receipt(&receipt("pb-den", 0, "fp-lie", 100, 100)).unwrap();
+    let (total, coverage): (i64, f64) = db
+        .connection()
+        .query_row(
+            "SELECT clip_duration_ms, coverage_ratio FROM playback_receipts WHERE segment_id = 'pb-den'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(total, 10_000, "the denominator is the row's duration, not the client's claim");
+    assert!(coverage < 0.02, "100ms of a 10s clip is not a listen, got {coverage}");
+}
+
+/// Mint and check must derive the SAME identity from the same row, or honest work deadlocks.
+///
+/// Found by the hunt: the desktop mint fell back to `path:{audio_path}` where the check fell back to
+/// `id:{segment_id}` — receipts for an unfingerprinted row could never satisfy the guard that reads
+/// them. Both now resolve inside the mint itself.
+#[test]
+fn mint_and_check_agree_on_identity_for_an_unfingerprinted_row() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-fp", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-fp", 7, "fp-client-claim", 1_000, 1_000)).unwrap();
+
+    let revision = db.segment_review_revision("pb-fp").unwrap().unwrap_or(0);
+    let fingerprint = db.segment_audio_fingerprint("pb-fp").unwrap().unwrap_or_else(|| format!("id:{}", "pb-fp"));
+    assert!(
+        db.has_sufficient_playback_evidence("pb-fp", revision, &fingerprint, Some("Sara")).unwrap(),
+        "the receipt must be findable under the exact identity the guard derives"
+    );
+}
+
+/// Listening is PERSONAL: someone else's ears are not your evidence.
+///
+/// Found by the hunt, verified certain: the guard matched receipts by segment+revision+fingerprint
+/// only, so reviewer A's full listen let reviewer B's blind verdict through — on the phone, a clip
+/// A skipped after hearing goes to B's queue with A's receipt still valid for it.
+#[test]
+fn someone_elses_listening_is_not_your_evidence() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-who", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-who", 0, "fp-a", 1_000, 1_000)).unwrap(); // by Sara
+
+    let revision = db.segment_review_revision("pb-who").unwrap().unwrap_or(0);
+    let fp = db.segment_audio_fingerprint("pb-who").unwrap().unwrap_or_else(|| "id:pb-who".into());
+    assert!(db.has_sufficient_playback_evidence("pb-who", revision, &fp, Some("Sara")).unwrap());
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-who", revision, &fp, Some("Hemn")).unwrap(),
+        "Sara's listen must not evidence Hemn's verdict"
+    );
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-who", revision, &fp, None).unwrap(),
+        "an anonymous desktop check must not ride a named phone receipt"
+    );
+}
+
 #[test]
 fn a_full_listen_is_sufficient_evidence() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-1", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-1", 0, "fp-a", 9_000, 9_000)).unwrap();
-    assert!(db.has_sufficient_playback_evidence("pb-1", 0, "fp-a").unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-1", 0, "fp-a", 9_000, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-1", 0, "fp-a", Some("Sara")).unwrap());
 }
 
 #[test]
@@ -4477,7 +4549,7 @@ fn no_receipt_at_all_is_not_evidence() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-2", "/a/clip.wav")).unwrap();
     assert!(
-        !db.has_sufficient_playback_evidence("pb-2", 0, "fp-a").unwrap(),
+        !db.has_sufficient_playback_evidence("pb-2", 0, "fp-a", Some("Sara")).unwrap(),
         "a clip nobody played must never satisfy the listening requirement"
     );
 }
@@ -4487,8 +4559,8 @@ fn opening_a_clip_without_hearing_it_is_not_evidence() {
     // The exact failure the old `audioError` gate allowed: the audio loaded fine and was never heard.
     let db = make_db();
     db.insert_segment(&make_segment("pb-3", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-3", 0, "fp-a", 0, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-3", 0, "fp-a").unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-3", 0, "fp-a", 0, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-3", 0, "fp-a", Some("Sara")).unwrap());
 }
 
 /// The bar is a TUNED number, so pin it by behaviour and not only by its own name.
@@ -4508,16 +4580,16 @@ fn the_listening_bar_sits_exactly_where_the_constant_says() {
     let just_over = (MIN_PLAYBACK_COVERAGE * total as f64).ceil() as i64;
 
     db.insert_segment(&make_segment("pb-bar-lo", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-bar-lo", 0, "fp-a", just_under, total)).unwrap();
+    db.record_playback_receipt_raw(&receipt("pb-bar-lo", 0, "fp-a", just_under, total)).unwrap();
     assert!(
-        !db.has_sufficient_playback_evidence("pb-bar-lo", 0, "fp-a").unwrap(),
+        !db.has_sufficient_playback_evidence("pb-bar-lo", 0, "fp-a", Some("Sara")).unwrap(),
         "{just_under}ms of {total}ms is below the bar and must not satisfy it"
     );
 
     db.insert_segment(&make_segment("pb-bar-hi", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-bar-hi", 0, "fp-a", just_over, total)).unwrap();
+    db.record_playback_receipt_raw(&receipt("pb-bar-hi", 0, "fp-a", just_over, total)).unwrap();
     assert!(
-        db.has_sufficient_playback_evidence("pb-bar-hi", 0, "fp-a").unwrap(),
+        db.has_sufficient_playback_evidence("pb-bar-hi", 0, "fp-a", Some("Sara")).unwrap(),
         "{just_over}ms of {total}ms is at or above the bar and must satisfy it"
     );
 }
@@ -4526,8 +4598,8 @@ fn the_listening_bar_sits_exactly_where_the_constant_says() {
 fn half_a_sentence_is_not_enough_to_judge_it() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-4", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-4", 0, "fp-a", 4_500, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-4", 0, "fp-a").unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-4", 0, "fp-a", 4_500, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-4", 0, "fp-a", Some("Sara")).unwrap());
 }
 
 #[test]
@@ -4536,9 +4608,9 @@ fn a_previous_clips_listen_can_never_unlock_this_one() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-5", "/a/clip.wav")).unwrap();
     db.insert_segment(&make_segment("pb-6", "/a/other.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-5", 0, "fp-a", 9_000, 9_000)).unwrap();
+    db.record_playback_receipt_raw(&receipt("pb-5", 0, "fp-a", 9_000, 9_000)).unwrap();
     assert!(
-        !db.has_sufficient_playback_evidence("pb-6", 0, "fp-b").unwrap(),
+        !db.has_sufficient_playback_evidence("pb-6", 0, "fp-b", Some("Sara")).unwrap(),
         "evidence for one clip must not unlock a different clip"
     );
 }
@@ -4548,8 +4620,8 @@ fn a_listen_of_different_audio_bytes_does_not_count() {
     // A receipt must not survive the audio being swapped underneath it.
     let db = make_db();
     db.insert_segment(&make_segment("pb-7", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-7", 0, "fp-old", 9_000, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-7", 0, "fp-new").unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-7", 0, "fp-old", 9_000, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-7", 0, "fp-new", Some("Sara")).unwrap());
 }
 
 #[test]
@@ -4557,10 +4629,10 @@ fn a_correction_requires_its_own_listen() {
     // Re-review after an edit changes the text under judgement, so the earlier listen does not carry.
     let db = make_db();
     db.insert_segment(&make_segment("pb-8", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-8", 0, "fp-a", 9_000, 9_000)).unwrap();
-    assert!(db.has_sufficient_playback_evidence("pb-8", 0, "fp-a").unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-8", 0, "fp-a", 9_000, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-8", 0, "fp-a", Some("Sara")).unwrap());
     assert!(
-        !db.has_sufficient_playback_evidence("pb-8", 1, "fp-a").unwrap(),
+        !db.has_sufficient_playback_evidence("pb-8", 1, "fp-a", Some("Sara")).unwrap(),
         "revision 1 is a different judgement and needs its own evidence"
     );
 }
@@ -4571,10 +4643,10 @@ fn seeking_and_replaying_accumulate_honestly() {
     // reviewer did hear all of it — while wall-clock or a play() count would have accepted neither.
     let db = make_db();
     db.insert_segment(&make_segment("pb-9", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-9", 0, "fp-a", 5_000, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-9", 0, "fp-a").unwrap());
-    db.record_playback_receipt(&receipt("pb-9", 0, "fp-a", 8_700, 9_000)).unwrap();
-    assert!(db.has_sufficient_playback_evidence("pb-9", 0, "fp-a").unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-9", 0, "fp-a", 5_000, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-9", 0, "fp-a", Some("Sara")).unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-9", 0, "fp-a", 8_700, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-9", 0, "fp-a", Some("Sara")).unwrap());
 }
 
 #[test]
@@ -4582,15 +4654,15 @@ fn a_zero_duration_clip_can_never_be_certified_heard() {
     // Corrupt/empty audio must fail closed rather than divide its way to 100% coverage.
     let db = make_db();
     db.insert_segment(&make_segment("pb-10", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-10", 0, "fp-a", 0, 0)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-10", 0, "fp-a").unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-10", 0, "fp-a", 0, 0)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-10", 0, "fp-a", Some("Sara")).unwrap());
 }
 
 #[test]
 fn a_receipt_records_which_policy_it_satisfied() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-11", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-11", 0, "fp-a", 9_000, 9_000)).unwrap();
+    db.record_playback_receipt_raw(&receipt("pb-11", 0, "fp-a", 9_000, 9_000)).unwrap();
     let version: i64 = db
         .connection()
         .query_row("SELECT policy_version FROM playback_receipts WHERE segment_id='pb-11'", [], |r| r.get(0))
@@ -4604,7 +4676,7 @@ fn a_verdict_without_a_listen_is_refused_by_the_backend() {
     // offline, so a disabled button is usability, not a guarantee.
     let db = make_db();
     db.insert_segment(&make_segment("pb-guard-1", "/a/clip.wav")).unwrap();
-    let error = db.require_playback_evidence("pb-guard-1", 0, "fp-a").unwrap_err().to_string();
+    let error = db.require_playback_evidence("pb-guard-1", 0, "fp-a", Some("Sara")).unwrap_err().to_string();
     assert!(error.contains("E_NO_PLAYBACK_EVIDENCE"), "refusal must be machine-readable, got: {error}");
 }
 
@@ -4612,8 +4684,12 @@ fn a_verdict_without_a_listen_is_refused_by_the_backend() {
 fn a_verdict_with_a_real_listen_is_allowed() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-guard-2", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-guard-2", 0, "fp-a", 9_000, 9_000)).unwrap();
-    db.require_playback_evidence("pb-guard-2", 0, "fp-a").expect("a heard clip must be decidable");
+    // Through the REAL front door: the mint resolves identity from the row, so the check derives it
+    // the same way every production caller does, instead of hardcoding a fingerprint.
+    db.record_playback_receipt(&receipt("pb-guard-2", 0, "ignored-claim", 9_000, 9_000)).unwrap();
+    let revision = db.segment_review_revision("pb-guard-2").unwrap().unwrap_or(0);
+    let fp = db.segment_audio_fingerprint("pb-guard-2").unwrap().unwrap_or_else(|| "id:pb-guard-2".into());
+    db.require_playback_evidence("pb-guard-2", revision, &fp, Some("Sara")).expect("a heard clip must be decidable");
 }
 
 #[test]
@@ -4622,5 +4698,5 @@ fn evidence_for_the_wrong_clip_does_not_satisfy_the_guard() {
     db.insert_segment(&make_segment("pb-guard-3", "/a/clip.wav")).unwrap();
     db.insert_segment(&make_segment("pb-guard-4", "/a/other.wav")).unwrap();
     db.record_playback_receipt(&receipt("pb-guard-3", 0, "fp-a", 9_000, 9_000)).unwrap();
-    assert!(db.require_playback_evidence("pb-guard-4", 0, "fp-b").is_err());
+    assert!(db.require_playback_evidence("pb-guard-4", 0, "fp-b", Some("Sara")).is_err());
 }

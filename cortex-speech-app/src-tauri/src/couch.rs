@@ -1011,11 +1011,31 @@ fn lan_ip() -> String {
 /// a Web handler on this host, at path `/`, proxying to this exact port, AND `AllowFunnel` true for
 /// it. Anything else returns None and the owner simply sees no Funnel row.
 fn funnel_host(port: u16) -> Option<String> {
-    let candidates = ["tailscale", r"C:\Program Files\Tailscale\tailscale.exe"];
-    let output = candidates.iter().find_map(|exe| {
-        std::process::Command::new(exe).args(["serve", "status", "--json"]).output().ok().filter(|o| o.status.success())
-    })?;
-    funnel_host_from_status(&serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?, port)
+    // CACHED for the process lifetime, and the subprocess waits at most 3 seconds — because this is
+    // called from status_of(), which runs UNDER the COUCH mutex. Unbounded, a wedged tailscale.exe
+    // would freeze every status call and is_running() itself, which is the restore fence: the whole
+    // app's DB-restore safety gated on an external binary answering. Timing out returns None (no
+    // Funnel row this session — the LAN and tailnet links still show), and the leaked waiter thread
+    // is one thread, once, only on a machine whose tailscale is already broken.
+    static FUNNEL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FUNNEL
+        .get_or_init(|| {
+            let (send, recv) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let candidates = ["tailscale", r"C:\Program Files\Tailscale\tailscale.exe"];
+                let output = candidates.iter().find_map(|exe| {
+                    std::process::Command::new(exe)
+                        .args(["serve", "status", "--json"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                });
+                let _ = send.send(output);
+            });
+            let output = recv.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten()?;
+            funnel_host_from_status(&serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?, port)
+        })
+        .clone()
 }
 
 /// The decision half of [`funnel_host`], split out so it can be tested without a tailnet.
@@ -2027,7 +2047,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         }
     }
     if parsed.action != "skip" {
-        match db.has_sufficient_playback_evidence(&parsed.id, revision, &fingerprint) {
+        match db.has_sufficient_playback_evidence(&parsed.id, revision, &fingerprint, Some(reviewer)) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!("PLAYBACK_EVIDENCE_REFUSED: {} by {reviewer} at revision {revision}", parsed.id);
@@ -2036,7 +2056,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 // outbox treats it as a settled answer rather than retrying what can never land.
                 return err_reply(
                     428,
-                    &db.require_playback_evidence(&parsed.id, revision, &fingerprint)
+                    &db.require_playback_evidence(&parsed.id, revision, &fingerprint, Some(reviewer))
                         .err()
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
@@ -2633,7 +2653,8 @@ mod tests {
         assert!(revision >= 0, "the revision is resolved server-side, not supplied");
 
         // And the evidence actually satisfies the guard for THIS clip at THIS revision.
-        db.require_playback_evidence("pr1", revision, &fingerprint).expect("a clip heard end to end must be decidable");
+        db.require_playback_evidence("pr1", revision, &fingerprint, Some("Sara"))
+            .expect("a clip heard end to end must be decidable");
     }
 
     /// The coverage DENOMINATOR is the server's clip length, never the client's claim about it.
@@ -2673,7 +2694,7 @@ mod tests {
         let revision = db.segment_review_revision("pr3").unwrap().unwrap_or(0);
         let fingerprint = db.segment_audio_fingerprint("pr3").unwrap().unwrap_or_default();
         assert!(
-            !db.has_sufficient_playback_evidence("pr3", revision, &fingerprint).unwrap(),
+            !db.has_sufficient_playback_evidence("pr3", revision, &fingerprint, Some("Sara")).unwrap(),
             "a tenth of a second must not satisfy the listening bar"
         );
     }
@@ -2740,6 +2761,44 @@ mod tests {
 
         let row = db.get_segment_by_id("enf2").unwrap().unwrap();
         assert!(!row.verified, "a skip still writes no verdict");
+    }
+
+    /// Undo must not orphan the reviewer's own listening: the immediate re-decision has to land.
+    ///
+    /// Found by the 2026-08-19 hunt: the decision bumps review_revision, the receipt stays keyed to
+    /// the pre-decision revision, and undo restores the ROW but not the evidence — so the very next
+    /// decision on a clip the reviewer just heard, decided and undid was refused 428 "play the whole
+    /// clip first". The reviewer is punished for using Undo, seconds after listening.
+    #[test]
+    fn undo_then_redecide_does_not_demand_a_second_listen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("un1", "دەقی ئەسڵی")).unwrap();
+        let state = state();
+
+        // Heard in full, decided.
+        let body = serde_json::json!({
+            "id": "un1", "action": "edit", "text": "ڕاستکراوە",
+            "heardMs": 1_500, "clipDurationMs": 1_500,
+        });
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        // Undone.
+        let (code, ..) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 200, "the undo itself must succeed");
+
+        // Re-decided seconds later, WITHOUT replaying a clip that was just heard end to end.
+        let body = serde_json::json!({"id": "un1", "action": "edit", "text": "ڕاستکراوەی دوو"});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "a re-decision after undo must not demand a second listen of the same audio");
+
+        // But SOMEBODY ELSE still has to listen for themselves.
+        let (code, ..) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        let body = serde_json::json!({"id": "un1", "action": "edit", "text": "دەقی کەسی تر"});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Hemn", &state);
+        assert_eq!(code, 428, "carried-forward evidence is personal; another reviewer must still listen");
     }
 
     /// A decision sent with no heard-time reports nothing, and must not fabricate evidence.

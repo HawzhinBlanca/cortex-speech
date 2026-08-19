@@ -258,12 +258,12 @@ fn require_listened(db: &crate::db::Database, segment_id: &str) -> Result<(), St
     let fingerprint =
         db.segment_audio_fingerprint(segment_id).ok().flatten().unwrap_or_else(|| format!("id:{segment_id}"));
     let revision = db.segment_review_revision(segment_id).ok().flatten().unwrap_or(0);
-    match db.has_sufficient_playback_evidence(segment_id, revision, &fingerprint) {
+    match db.has_sufficient_playback_evidence(segment_id, revision, &fingerprint, None) {
         Ok(true) => Ok(()),
         Ok(false) => {
             tracing::warn!("PLAYBACK_EVIDENCE_REFUSED: {segment_id} on the desktop at revision {revision}");
             Err(db
-                .require_playback_evidence(segment_id, revision, &fingerprint)
+                .require_playback_evidence(segment_id, revision, &fingerprint, None)
                 .err()
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()))
