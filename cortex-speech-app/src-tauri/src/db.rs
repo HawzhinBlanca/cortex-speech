@@ -4423,6 +4423,23 @@ impl Database {
     /// Read as a single column rather than widening `SpeechSegment`: that struct's field order is
     /// load-bearing for SEGMENT_SELECT_COLUMNS' index-based map_row, and adding to it has broken
     /// every destructuring site twice before.
+    /// The clip's length as the SERVER knows it — the denominator of every coverage ratio.
+    ///
+    /// A page reporting "I played 100ms of a 100ms clip" scores 1.0 against its own claim. The
+    /// length has to come from here or the guard compares the client's claim with the client's claim.
+    pub fn segment_clip_duration_ms(&self, segment_id: &str) -> AppResult<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT NULLIF(COALESCE(duration_ms, 0), 0) FROM speech_segments WHERE id = ?1",
+                [segment_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn segment_audio_fingerprint(&self, segment_id: &str) -> AppResult<Option<String>> {
         use rusqlite::OptionalExtension;
         Ok(self

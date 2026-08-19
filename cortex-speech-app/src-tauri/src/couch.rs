@@ -1941,7 +1941,14 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 session_id: None,
                 started_at_ms: now_ms,
                 played_ms: heard_ms.max(0),
-                clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0).max(0),
+                // The server's own clip length, so coverage is measured against the audio that was
+                // actually served. The page's `clipDurationMs` is a fallback for a row that has no
+                // duration recorded at all, and cannot be used to shrink a clip into a passing ratio.
+                clip_duration_ms: db
+                    .segment_clip_duration_ms(&parsed.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| parsed.clip_duration_ms.unwrap_or(0).max(0)),
             };
             if let Err(e) = db.record_playback_receipt(&receipt) {
                 tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
@@ -2503,6 +2510,48 @@ mod tests {
 
         // And the evidence actually satisfies the guard for THIS clip at THIS revision.
         db.require_playback_evidence("pr1", revision, &fingerprint).expect("a clip heard end to end must be decidable");
+    }
+
+    /// The coverage DENOMINATOR is the server's clip length, never the client's claim about it.
+    ///
+    /// Resolving the revision and the fingerprint server-side stops a client naming a clip it never
+    /// loaded, but left the length it is measured against in the client's hands: a page reporting
+    /// "I played 100ms of a 100ms clip" scores a perfect 1.0 and clears the bar having played a
+    /// tenth of a second of a 1.5s sentence. Both halves of the ratio have to come from the server
+    /// or the guard is still comparing the client's claim with the client's claim.
+    #[test]
+    fn a_client_cannot_shrink_the_clip_to_clear_the_bar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("pr3", "دەقی سێ")).unwrap();
+        let state = state();
+
+        // The fixture clip is 1500ms. The page claims it is 100ms and that it played all of it.
+        let body = serde_json::json!({
+            "id": "pr3", "action": "accept", "text": "دەقی سێ",
+            "heardMs": 100, "clipDurationMs": 100,
+        });
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        let (total, coverage): (i64, f64) = db
+            .connection()
+            .query_row(
+                "SELECT clip_duration_ms, coverage_ratio FROM playback_receipts WHERE segment_id = 'pr3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the receipt is still minted — it just tells the truth about how little was heard");
+
+        assert_eq!(total, 1_500, "the receipt records the SERVER's clip length, not the claimed one");
+        assert!(coverage < 0.10, "100ms of a 1.5s clip is not a listen, got {coverage}");
+
+        let revision = db.segment_review_revision("pr3").unwrap().unwrap_or(0);
+        let fingerprint = db.segment_audio_fingerprint("pr3").unwrap().unwrap_or_default();
+        assert!(
+            !db.has_sufficient_playback_evidence("pr3", revision, &fingerprint).unwrap(),
+            "a tenth of a second must not satisfy the listening bar"
+        );
     }
 
     /// A decision sent with no heard-time reports nothing, and must not fabricate evidence.
