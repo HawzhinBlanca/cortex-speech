@@ -1993,6 +1993,19 @@ impl Database {
     /// Judging a dialect you do not speak produces confident WRONG verdicts, and downstream those are
     /// indistinguishable from good ones — so this is a corpus-integrity filter, not a convenience.
     pub fn pending_segment_ids_for(&self, allowed_dialects: Option<&[String]>) -> AppResult<Vec<String>> {
+        self.pending_segment_ids_focused(allowed_dialects, None)
+    }
+
+    /// `pending_segment_ids_for`, additionally narrowed to a voice-focus set when one is active.
+    ///
+    /// The focus is an ALLOW-LIST of segment ids (see `voice_focus.rs`): `None` is the full queue,
+    /// `Some(set)` serves only clips in it. Applied after the dialect fence, never instead of it — a
+    /// reviewer restricted to Sorani stays restricted even when the focus set spans both dialects.
+    pub fn pending_segment_ids_focused(
+        &self,
+        allowed_dialects: Option<&[String]>,
+        focus: Option<&std::collections::HashSet<String>>,
+    ) -> AppResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, audio_path FROM speech_segments
              WHERE verified = 0
@@ -2011,7 +2024,7 @@ impl Database {
                 std::path::Path::new(&audio_path).is_file()
                     && crate::dialect::reviewer_may_judge(allowed_dialects, &audio_path)
             });
-            if ok {
+            if ok && focus.map_or(true, |set| set.contains(&id)) {
                 ids.push(id);
             }
         }

@@ -4536,6 +4536,34 @@ fn someone_elses_listening_is_not_your_evidence() {
     );
 }
 
+/// Voice focus narrows the queue to the named clips and NOTHING else — and no focus is the full queue.
+#[test]
+fn voice_focus_narrows_the_pending_queue_to_exactly_the_named_clips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db();
+    // Real files on disk: pending_segment_ids refuses clips whose audio is missing.
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        let path = dir.path().join(format!("c{n}.wav"));
+        std::fs::write(&path, b"RIFF").unwrap();
+        let id = format!("focus-{n}");
+        db.insert_segment(&make_segment(&id, path.to_str().unwrap())).unwrap();
+        ids.push(id);
+    }
+    let all = db.pending_segment_ids_focused(None, None).unwrap();
+    assert_eq!(all.len(), 4, "no focus is the full queue");
+
+    let focus: std::collections::HashSet<String> = ["focus-1".to_string(), "focus-3".to_string()].into();
+    let narrowed = db.pending_segment_ids_focused(None, Some(&focus)).unwrap();
+    assert_eq!(narrowed.len(), 2);
+    assert!(narrowed.contains(&"focus-1".to_string()) && narrowed.contains(&"focus-3".to_string()));
+    assert!(!narrowed.contains(&"focus-0".to_string()), "a clip outside the focus must not be served");
+
+    // An id that is focused but does not exist (or is not pending) simply yields nothing for it.
+    let ghost: std::collections::HashSet<String> = ["nope".to_string()].into();
+    assert!(db.pending_segment_ids_focused(None, Some(&ghost)).unwrap().is_empty());
+}
+
 #[test]
 fn a_full_listen_is_sufficient_evidence() {
     let db = make_db();

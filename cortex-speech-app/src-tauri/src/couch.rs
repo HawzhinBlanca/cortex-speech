@@ -1483,15 +1483,20 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // The <= 25 clips actually served are hydrated after the lock is released.
     // Dialect roster, re-read per fetch so the owner can change who reviews what without restarting
     // the app. A reviewer with no entry is unrestricted, exactly as before this existed.
-    let allowed_dialects: Option<Vec<String>> = {
+    // Voice focus (owner instruction 2026-08-19): when `<data_dir>/voice_focus.json` names a set of
+    // clips, every reviewer's queue narrows to it — so paid hours build the one speaker's set being
+    // collected now instead of spreading across 34 h of mixed audio. Same hot-reload-per-fetch,
+    // same fail-OPEN-on-error contract as the dialect roster, for the same reason: a typo must widen
+    // the queue, never empty it.
+    let (allowed_dialects, focus): (Option<Vec<String>>, Option<std::collections::HashSet<String>>) = {
         let guard = lock_state(state);
-        guard
-            .session_store
-            .as_ref()
-            .map(|(data_dir, _db_path)| data_dir.clone())
-            .and_then(|dir| crate::dialect::load_roster(&dir).get(reviewer).cloned())
+        let dir = guard.session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
+        (
+            dir.as_ref().and_then(|d| crate::dialect::load_roster(d).get(reviewer).cloned()),
+            dir.as_ref().and_then(|d| crate::voice_focus::load_focus(d)),
+        )
     };
-    let pending_ids = match db.pending_segment_ids_for(allowed_dialects.as_deref()) {
+    let pending_ids = match db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_ref()) {
         Ok(ids) => ids,
         Err(e) => return err_reply(500, &e.to_string()),
     };
