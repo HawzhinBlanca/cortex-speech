@@ -1011,7 +1011,7 @@ fn lan_ip() -> String {
 /// a Web handler on this host, at path `/`, proxying to this exact port, AND `AllowFunnel` true for
 /// it. Anything else returns None and the owner simply sees no Funnel row.
 fn funnel_host(port: u16) -> Option<String> {
-    let candidates = ["tailscale", r"C:\Program Files\Tailscale	ailscale.exe"];
+    let candidates = ["tailscale", r"C:\Program Files\Tailscale\tailscale.exe"];
     let output = candidates.iter().find_map(|exe| {
         std::process::Command::new(exe).args(["serve", "status", "--json"]).output().ok().filter(|o| o.status.success())
     })?;
