@@ -44,11 +44,19 @@ def decided_without_evidence(conn: sqlite3.Connection, since: str) -> list[dict]
     Matched on TIME, like the readiness gate and for the same reason: the decision advances the
     segment's revision, so the receipt it was judged against is always one behind afterwards.
     """
+    # ONLY the LATEST decision per segment. Found by the 2026-08-19 hunt, verified: judging every
+    # event in the window means a clip that was re-queued once and then properly re-reviewed (new
+    # decision, receipt at the bar) still matches on its OLD unevidenced event — so every rerun of
+    # --apply wipes the good re-review. The tool is written to be re-runnable; only the decision a
+    # segment currently stands on is the tool's business.
     rows = conn.execute(
         """
         SELECT e.segment_id, e.reviewer, e.action, e.created_at
         FROM review_events e
         WHERE e.source = 'couch' AND e.action <> 'skip' AND e.created_at >= ?
+          AND e.id = (SELECT MAX(e2.id) FROM review_events e2
+                      WHERE e2.segment_id = e.segment_id
+                        AND e2.source = 'couch' AND e2.action <> 'skip')
         ORDER BY e.created_at
         """,
         (since,),
@@ -59,9 +67,10 @@ def decided_without_evidence(conn: sqlite3.Connection, since: str) -> list[dict]
             """
             SELECT MAX(coverage_ratio) FROM playback_receipts
             WHERE segment_id = ?
+              AND reviewer = ?
               AND created_at BETWEEN datetime(?, '-5 seconds') AND datetime(?, '+5 seconds')
             """,
-            (segment_id, at, at),
+            (segment_id, reviewer, at, at),
         ).fetchone()[0]
         if best is not None and best >= MIN_PLAYBACK_COVERAGE:
             continue
@@ -118,7 +127,10 @@ def main() -> int:
         if first_receipt is None:
             print("no playback receipts exist yet — nothing can be judged unevidenced. Refusing.")
             return 1
-        since = args.since or first_receipt
+        # Normalise BEFORE the lexicographic fence compare: an ISO 'T' separator sorts after every
+        # digit, so '2026-08-01T00:00:00' read as later than the first receipt and sailed past the
+        # fence into an empty window — the bypass reported "nothing to re-queue" instead of refusing.
+        since = (args.since or first_receipt).replace("T", " ")
         if since < first_receipt:
             print(
                 "REFUSED: --since " + since + " predates the first receipt ever minted ("

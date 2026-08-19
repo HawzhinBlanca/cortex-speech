@@ -87,7 +87,7 @@ def decisions_since(conn: sqlite3.Connection, since: str) -> list[tuple[str, str
     ).fetchall()
 
 
-def uncovered(conn: sqlite3.Connection, segment_id: str, decided_at: str) -> str | None:
+def uncovered(conn: sqlite3.Connection, segment_id: str, decided_at: str, reviewer: str) -> str | None:
     """Was THIS decision backed by a receipt at the moment it was made?
 
     Matched on TIME, not on the segment's current revision. The server mints the receipt and runs the
@@ -105,9 +105,10 @@ def uncovered(conn: sqlite3.Connection, segment_id: str, decided_at: str) -> str
         """
         SELECT MAX(coverage_ratio) FROM playback_receipts
         WHERE segment_id = ?
+          AND reviewer = ?
           AND created_at BETWEEN datetime(?, '-5 seconds') AND datetime(?, '+5 seconds')
         """,
-        (segment_id, decided_at, decided_at),
+        (segment_id, reviewer, decided_at, decided_at),
     ).fetchone()[0]
     if best is None:
         return f"no receipt minted with the decision at {decided_at}"
@@ -179,7 +180,7 @@ def main() -> int:
         elif rows:
             print(f"PASS [devices]: {len(represented)} distinct reviewer(s) exercised the guard")
 
-        refused = [(seg, who, at, why) for seg, who, at in rows if (why := uncovered(conn, seg, at))]
+        refused = [(seg, who, at, why) for seg, who, at in rows if (why := uncovered(conn, seg, at, who))]
         if refused:
             failures += 1
             print(f"FAIL [coverage]: enforcement REFUSED {len(refused)} of {len(rows)} decision(s)")

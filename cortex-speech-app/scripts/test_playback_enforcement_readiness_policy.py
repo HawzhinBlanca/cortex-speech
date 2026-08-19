@@ -58,7 +58,7 @@ def _seed(db_path: Path) -> None:
         CREATE TABLE speech_segments (id TEXT PRIMARY KEY, review_revision INTEGER, audio_fingerprint TEXT);
         CREATE TABLE review_events (segment_id TEXT, reviewer TEXT, action TEXT, source TEXT, created_at TEXT);
         CREATE TABLE playback_receipts (segment_id TEXT, segment_revision INTEGER, audio_fingerprint TEXT,
-                                        coverage_ratio REAL, created_at TEXT);
+                                        coverage_ratio REAL, created_at TEXT, reviewer TEXT);
         INSERT INTO speech_segments VALUES ('s1', 0, 'fp1');
         INSERT INTO review_events VALUES ('s1', 'Sara', 'accept', 'couch', '2026-08-18 21:19:20');
         """
@@ -111,8 +111,8 @@ def test_a_covered_decision_passes_so_the_gate_is_not_merely_a_refuser() -> None
         # control that dodges one of the checks is not a control for the gate as configured.
         conn.execute("INSERT INTO speech_segments VALUES ('s2', 0, 'fp2')")
         conn.execute("INSERT INTO review_events VALUES ('s2', 'Hemn', 'edit', 'couch', '2026-08-20 10:00:00')")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.97, '2026-08-18 21:19:20')")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s2', 0, 'fp2', 0.93, '2026-08-20 10:00:00')")
+        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.97, '2026-08-18 21:19:20', 'Sara')")
+        conn.execute("INSERT INTO playback_receipts VALUES ('s2', 0, 'fp2', 0.93, '2026-08-20 10:00:00', 'Hemn')")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -132,7 +132,7 @@ def test_a_receipt_below_the_bar_is_reported_as_a_refusal() -> None:
         db_path = tmp / "t.db"
         _seed(db_path)
         conn = sqlite3.connect(db_path)
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.42, '2026-08-18 21:19:20')")
+        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.42, '2026-08-18 21:19:20', 'Sara')")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -153,7 +153,7 @@ def test_one_device_is_not_enough_to_enforce_on_eight() -> None:
         db_path = tmp / "t.db"
         _seed(db_path)
         conn = sqlite3.connect(db_path)
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.99, '2026-08-18 21:19:20')")
+        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.99, '2026-08-18 21:19:20', 'Sara')")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -207,10 +207,10 @@ def test_a_decision_that_bumped_the_revision_still_counts_as_evidenced() -> None
         conn = sqlite3.connect(db_path)
         # The decision landed at revision 3 and pushed the row to 4 -- exactly what the server does.
         conn.execute("UPDATE speech_segments SET review_revision = 4 WHERE id = 's1'")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 3, 'fp1', 0.96, '2026-08-18 21:19:20')")
+        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 3, 'fp1', 0.96, '2026-08-18 21:19:20', 'Sara')")
         conn.execute("INSERT INTO speech_segments VALUES ('s2', 4, 'fp2')")
         conn.execute("INSERT INTO review_events VALUES ('s2', 'Hemn', 'edit', 'couch', '2026-08-18 21:19:20')")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s2', 3, 'fp2', 0.93, '2026-08-18 21:19:20')")
+        conn.execute("INSERT INTO playback_receipts VALUES ('s2', 3, 'fp2', 0.93, '2026-08-18 21:19:20', 'Hemn')")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -225,6 +225,33 @@ def test_a_decision_that_bumped_the_revision_still_counts_as_evidenced() -> None
             + result.stdout
         )
         assert result.returncode == 0, result.stdout
+
+
+def test_anothers_receipt_does_not_evidence_my_decision() -> None:
+    """Listening is personal in the gate exactly as in the backend guard.
+
+    Found by the hunt: matching receipts on segment+time alone let reviewer A's listen evidence
+    reviewer B's blind verdict. The gate mirrors db::has_sufficient_playback_evidence, so it must
+    mirror the reviewer scoping too or it reports READY for a system the guard would refuse.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        # The receipt at the decision's own second — but minted by SOMEBODY ELSE.
+        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.99, '2026-08-18 21:19:20', 'Hemn')")
+        conn.commit()
+        conn.close()
+        exe = tmp / "cortex-speech-app.exe"
+        exe.write_bytes(gate.ENFORCE_MARKER)
+        result = subprocess.run(
+            [sys.executable, str(GATE), "--db", str(db_path), "--exe", str(exe),
+             "--since", "2020-01-01 00:00:00", "--min-decisions", "1"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1, "someone else's listen must not read as this reviewer's evidence: " + result.stdout
+        assert "enforcement REFUSED 1 of 1" in result.stdout, result.stdout
 
 
 def main() -> int:

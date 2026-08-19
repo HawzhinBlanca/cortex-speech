@@ -36,6 +36,13 @@ EXE_PATH = APP_ROOT / "src-tauri" / "target" / "release" / "cortex-speech-app.ex
 # binary while the gate printed "newer than all sources".
 SOURCE_DIRS = ["src", "src-tauri/src", "src-tauri/assets", "src-tauri/migrations"]
 SOURCE_FILES = [
+    # Build configuration is source: each of these changes the SHIPPED artifact with no .rs/.svelte
+    # edit (dependency pins, compiler options, bundler config), and the hunt found commits touching
+    # only these being classified "non-source" — so a stale exe read as current at HEAD.
+    "package-lock.json",
+    "svelte.config.js",
+    "vite.config.ts",
+    "tsconfig.json",
     "src-tauri/build.rs",
     "src-tauri/tauri.conf.json",
     "src-tauri/Cargo.toml",
