@@ -149,3 +149,7 @@ datasets/**
 
 # Challenger/canary run artifacts: packs, clips, run records and verdicts are OUTPUT, not source.
 runs/
+
+# Build/provenance artifacts: large, regenerated per release, and pinned by SHA256SUMS in the
+# release record rather than tracked as source.
+artifacts/
