@@ -231,6 +231,19 @@ pub struct CouchReviewer {
     /// WireGuard between devices in the tailnet — never the public internet). None when this machine
     /// has no Tailscale interface. The transport is Tailscale's; the couch token gate still applies.
     pub tailscale_url: Option<String>,
+    /// The same page over Tailscale Funnel — a PUBLIC https://<host>.ts.net address that works on any
+    /// network with no Tailscale client on the reviewer's device.
+    ///
+    /// The other two links die the moment a reviewer leaves the network: the LAN URL needs the same
+    /// Wi-Fi, and the tailnet URL needs the tailnet up on their phone — which iOS suspends whenever
+    /// the VPN app is backgrounded. Measured 2026-08-19: a reviewer mid-session lost audio and had
+    /// five skips silently fail to reach the server, while the server, the files and the Funnel were
+    /// all healthy. The only link that survived was the one the app never handed out.
+    ///
+    /// None unless Tailscale itself reports a Funnel serving THIS port. A guessed hostname would be
+    /// a dead link, which is worse than no link — so this is read from `tailscale serve status`,
+    /// never constructed. The transport is public; the couch token gate still applies to every route.
+    pub funnel_url: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -954,6 +967,7 @@ fn status_of(h: &CouchHandle) -> CouchStatus {
     // opens a socket, and every reviewer's URL differs only in its token.
     let lan = lan_ip();
     let tailscale = tailscale_ip();
+    let funnel = funnel_host(h.port);
     let state = lock_state(&h.state);
     let link_credentials = if state.pairing_codes.is_empty() { &state.reviewers } else { &state.pairing_codes };
     let mut reviewers: Vec<CouchReviewer> = link_credentials
@@ -965,6 +979,7 @@ fn status_of(h: &CouchHandle) -> CouchStatus {
             name: name.clone(),
             url: format!("https://{lan}:{}/#t={token}", h.port),
             tailscale_url: tailscale.as_ref().map(|ip| format!("https://{ip}:{}/#t={token}", h.port)),
+            funnel_url: funnel.as_ref().map(|host| format!("https://{host}/#t={token}")),
         })
         .collect();
     // HashMap iteration order is randomized per process, so sort for a stable Settings list — otherwise
@@ -986,6 +1001,46 @@ fn lan_ip() -> String {
         }
     }
     std::env::var("COMPUTERNAME").map(|h| format!("{h}.local")).unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+/// The public Funnel hostname serving THIS port, if Tailscale reports one.
+///
+/// Asks `tailscale serve status --json` rather than assembling a hostname, because a Funnel that is
+/// configured-but-off, or pointed at a different port, would produce a URL that resolves and then
+/// refuses — a dead link handed to a reviewer as if it were their way in. Three things must all hold:
+/// a Web handler on this host, at path `/`, proxying to this exact port, AND `AllowFunnel` true for
+/// it. Anything else returns None and the owner simply sees no Funnel row.
+fn funnel_host(port: u16) -> Option<String> {
+    let candidates = ["tailscale", r"C:\Program Files\Tailscale	ailscale.exe"];
+    let output = candidates.iter().find_map(|exe| {
+        std::process::Command::new(exe).args(["serve", "status", "--json"]).output().ok().filter(|o| o.status.success())
+    })?;
+    funnel_host_from_status(&serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?, port)
+}
+
+/// The decision half of [`funnel_host`], split out so it can be tested without a tailnet.
+fn funnel_host_from_status(parsed: &serde_json::Value, port: u16) -> Option<String> {
+    let web = parsed.get("Web")?.as_object()?;
+    let suffix = format!("://127.0.0.1:{port}");
+    for (host_port, entry) in web {
+        let proxies_here = entry
+            .get("Handlers")
+            .and_then(|h| h.get("/"))
+            .and_then(|h| h.get("Proxy"))
+            .and_then(|p| p.as_str())
+            .is_some_and(|proxy| proxy.ends_with(&suffix));
+        let funnel_on =
+            parsed.get("AllowFunnel").and_then(|f| f.get(host_port)).and_then(|v| v.as_bool()).unwrap_or(false);
+        if proxies_here && funnel_on {
+            // "host:443" -> "host". Any other port would need to stay in the URL, and a Funnel only
+            // ever serves 443/8443/10000, so a non-443 entry keeps its port rather than being guessed.
+            return Some(match host_port.strip_suffix(":443") {
+                Some(host) => host.to_string(),
+                None => host_port.clone(),
+            });
+        }
+    }
+    None
 }
 
 /// This machine's Tailscale IPv4 (CGNAT 100.64.0.0/10), if a tailnet is up. Same UDP-connect
@@ -2392,6 +2447,47 @@ mod tests {
         let mut blank = seg("s3", "raw draft");
         blank.annotated_transcript = Some("   ".into());
         assert_eq!(review_text(&blank), "raw draft");
+    }
+
+    #[test]
+    /// A Funnel URL is only worth handing to a reviewer if Tailscale is actually serving it.
+    ///
+    /// All three conditions matter independently: a handler on this port, at `/`, and AllowFunnel
+    /// true. Drop any one and the app publishes a hostname that resolves and then refuses — which is
+    /// worse than showing no Funnel row, because the reviewer cannot tell a dead link from a network
+    /// problem on their end. The happy-path fixture is the REAL output of `tailscale serve status
+    /// --json` from the owner's machine on 2026-08-19.
+    #[test]
+    fn a_funnel_url_is_only_offered_when_tailscale_really_serves_this_port() {
+        let live = serde_json::json!({
+            "TCP": { "443": { "HTTPS": true } },
+            "Web": { "hawapc01.tail721a13.ts.net:443": {
+                "Handlers": { "/": { "Proxy": "https+insecure://127.0.0.1:8737" } } } },
+            "AllowFunnel": { "hawapc01.tail721a13.ts.net:443": true }
+        });
+        assert_eq!(
+            super::funnel_host_from_status(&live, 8737).as_deref(),
+            Some("hawapc01.tail721a13.ts.net"),
+            "the live config serves 8737 with Funnel on — the reviewer should get this link"
+        );
+
+        // Funnel configured but NOT public: reachable only inside the tailnet, which is what
+        // tailscale_url already covers. Offering it as the any-network link would be a lie.
+        let mut private = live.clone();
+        private["AllowFunnel"]["hawapc01.tail721a13.ts.net:443"] = serde_json::json!(false);
+        assert_eq!(super::funnel_host_from_status(&private, 8737), None);
+
+        // Serving a DIFFERENT port — someone else's service, not Couch Review.
+        assert_eq!(super::funnel_host_from_status(&live, 9999), None);
+
+        // A Funnel with no root handler cannot serve the review page.
+        let mut subpath = live.clone();
+        subpath["Web"]["hawapc01.tail721a13.ts.net:443"]["Handlers"] =
+            serde_json::json!({ "/other": { "Proxy": "https+insecure://127.0.0.1:8737" } });
+        assert_eq!(super::funnel_host_from_status(&subpath, 8737), None);
+
+        // Nothing served at all.
+        assert_eq!(super::funnel_host_from_status(&serde_json::json!({}), 8737), None);
     }
 
     #[test]

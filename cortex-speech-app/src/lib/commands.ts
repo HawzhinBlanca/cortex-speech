@@ -485,6 +485,7 @@ export interface CouchReviewer {
    * end-to-end encrypted between devices in the tailnet. Null when no tailnet is up.
    */
   tailscaleUrl: string | null;
+  funnelUrl: string | null;
 }
 
 /** Couch Review: the token-gated phone review server (off by default, per-session). */

@@ -774,6 +774,7 @@ export const ckb: Record<string, string> = {
   'settings.couchStart': 'دەستپێکردن',
   'settings.couchWifiUrl': 'هەمان وایفای:',
   'settings.couchTailscaleUrl': 'لە هەر شوێنێکەوە (Tailscale — تەنیا ئامێرەکانی خۆت، کۆدکراو):',
+  'settings.couchFunnelUrl': 'لە هەر ڕایەڵەیەکەوە (Tailscale Funnel — ناونیشانی گشتی، پێویستی بە ئەپ نییە):',
   'settings.couchTlsFingerprint': 'پەنجەمۆری SHA-256ی بڕوانامەی TLS',
   'settings.couchTlsFingerprintHint':
     'لە یەکەم پەیوەندیدا دڵنیابە کە پەنجەمۆری بڕوانامەکە لە مۆبایلەکەت لەگەڵ ئەم بەهایەی کۆمپیوتەرە متمانەپێکراوەکە یەکسانە.',

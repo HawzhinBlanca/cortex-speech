@@ -596,6 +596,17 @@
                       onfocus={(e) => (e.target as HTMLInputElement).select()}
                     />
                   {/if}
+                  {#if reviewer.funnelUrl}
+                    <span class="text-[10px] text-subtle block"
+                      >{$t('settings.couchFunnelUrl')}</span
+                    >
+                    <input
+                      class="input w-full !text-xs font-mono"
+                      readonly
+                      value={reviewer.funnelUrl}
+                      onfocus={(e) => (e.target as HTMLInputElement).select()}
+                    />
+                  {/if}
                 </div>
               {/each}
               <p class="text-[10px] text-subtle">{$t('settings.couchRunningHint')}</p>

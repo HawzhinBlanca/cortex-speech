@@ -773,6 +773,7 @@ export const en: Record<string, string> = {
   'settings.couchStart': 'Start',
   'settings.couchWifiUrl': 'Same Wi-Fi:',
   'settings.couchTailscaleUrl': 'From anywhere (Tailscale — your devices only, encrypted):',
+  'settings.couchFunnelUrl': 'From any network (Tailscale Funnel — public address, no app needed):',
   'settings.couchTlsFingerprint': 'TLS certificate SHA-256 fingerprint',
   'settings.couchTlsFingerprintHint':
     'On first connection, verify the certificate fingerprint shown by your phone matches this trusted desktop value before accepting it.',
