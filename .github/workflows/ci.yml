@@ -154,11 +154,16 @@ jobs:
         # was cancelled by the job timeout, with nothing of ours having run; every later step
         # showed "skipped", and the PR read as red for a mirror stall. One hang is weather; three
         # is a step that needs a ceiling and a second try.
-        timeout-minutes: 10
+        # Fourth stall 2026-08-19: intermittent, not deterministic (two reruns passed), which is the
+        # signature of an apt mirror hiccup on a package with a large dependency tree. So apt is told
+        # to retry per PACKAGE (Acquire::Retries) rather than the whole install restarting from the
+        # top, and the lock-wait flag stops a background unattended-upgrades run from failing us.
+        timeout-minutes: 12
         run: |
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update
           for attempt in 1 2 3; do
-            sudo apt-get update &&             sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev             && exit 0
-            echo "apt attempt $attempt failed; retrying in 20s"
+            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30                  -o DPkg::Lock::Timeout=120 install -y --no-install-recommends                  libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev             && exit 0
+            echo "apt install attempt $attempt failed; retrying in 20s"
             sleep 20
           done
           exit 1
