@@ -28,6 +28,12 @@
 //! cluster's ids to its own file — so the owner can confirm or reject each suspect independently
 //! and a confirmed one can be MERGED into the focus without re-judging the host. Output goes to
 //! `voice_focus/round2/`; round-1 files are never overwritten.
+//!
+//! `--judge-new` (requires an ACTIVE voice_focus.json): re-clusters everything the filter matches,
+//! finds every cluster whose membership is MAJORITY already-confirmed ids (that voice, possibly
+//! split across mic days), and samples the ids in those clusters that are NOT yet in the focus —
+//! one synthetic suspect group `cluster:new` — plus controls from the confirmed set. Judged and
+//! merged with the same `--merge-round2`, since the key and files have the same shape.
 
 use cortex_speech_app_lib::diarization::{SpeakerEmbeddingService, SPEAKER_CHANGE_THRESHOLD};
 use cortex_speech_app_lib::{audio, chunking, models};
@@ -74,6 +80,7 @@ fn main() -> Result<(), String> {
     let source_like = arg(&args, "--source-like").ok_or("--source-like is required (SQL LIKE on audio_path)")?;
     let threshold: f32 = arg(&args, "--threshold").and_then(|v| v.parse().ok()).unwrap_or(0.62);
     let sample_n: usize = arg(&args, "--sample").and_then(|v| v.parse().ok()).unwrap_or(15);
+    let judge_new = args.iter().any(|a| a == "--judge-new");
     let round2: Option<Vec<usize>> =
         arg(&args, "--round2").map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect());
 
@@ -227,7 +234,7 @@ fn main() -> Result<(), String> {
     // the key says CANDIDATE / other. Round 2 (`--round2 A,B`): draws from each NAMED cluster plus a
     // control draw from the confirmed host cluster; the key names the cluster per clip, so each
     // suspect can be confirmed or rejected on its own.
-    let is_round2 = round2.is_some();
+    let is_round2 = round2.is_some() || judge_new;
     let out_dir = if is_round2 { data_dir.join("voice_focus").join("round2") } else { data_dir.join("voice_focus") };
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let ids_of = |cluster: usize| -> Vec<&str> {
@@ -238,35 +245,102 @@ fn main() -> Result<(), String> {
 
     // (id, label): "CANDIDATE"/"other" in round 1, "cluster:N" in round 2.
     let mut sample: Vec<(&str, String)> = Vec::new();
-    match &round2 {
-        None => {
-            let mut other_ids: Vec<&str> =
-                embedded.iter().zip(&assign).filter(|(_, &c)| c != host_c).map(|((id, ..), _)| id.as_str()).collect();
-            shuffle(&mut other_ids, 20_260_820);
-            let take_c = (sample_n * 2 / 3).min(candidate_ids.len());
-            let take_o = (sample_n - take_c).min(other_ids.len());
-            sample.extend(candidate_ids[..take_c].iter().map(|&i| (i, "CANDIDATE".to_string())));
-            sample.extend(other_ids[..take_o].iter().map(|&i| (i, "other".to_string())));
-        }
-        Some(suspects) => {
-            // Even split across the suspects, plus ~a quarter of the sample as host CONTROLS: if the
-            // owner calls a control clip "not him", the ear is off today and the round is void.
-            let controls = (sample_n / 4).max(2);
-            let per = ((sample_n.saturating_sub(controls)) / suspects.len().max(1)).max(1);
-            for (k, &c) in suspects.iter().enumerate() {
-                let mut ids = ids_of(c);
-                shuffle(&mut ids, 20_260_900 + k as u64);
-                let n = per.min(ids.len());
-                println!("round2: cluster {c} has {} clips, sampling {n}", ids.len());
-                sample.extend(ids[..n].iter().map(|&i| (i, format!("cluster:{c}"))));
-                std::fs::write(
-                    out_dir.join(format!("cluster_{c}_segment_ids.txt")),
-                    ids.iter().map(|id| format!("{id}\n")).collect::<String>(),
-                )
-                .map_err(|e| e.to_string())?;
+    if judge_new {
+        // The confirmed set is the ground truth this mode extends.
+        let focus_text = std::fs::read_to_string(data_dir.join("voice_focus.json"))
+            .map_err(|e| format!("--judge-new needs an active voice_focus.json: {e}"))?;
+        let focus: std::collections::HashSet<String> = serde_json::from_str::<serde_json::Value>(&focus_text)
+            .ok()
+            .and_then(|v| {
+                v.get("segment_ids")
+                    .and_then(|a| a.as_array())
+                    .map(|items| items.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            })
+            .ok_or("voice_focus.json holds no segment_ids")?;
+
+        // A cluster is "that voice" when confirmed ids are its MAJORITY (and at least 3 of them —
+        // one stray confirmed clip inside a big foreign cluster proves nothing). New ids inside
+        // those clusters clustered WITH him; everything else stays out and is reported for --round2.
+        let mut new_ids: Vec<&str> = Vec::new();
+        let mut him_clusters: Vec<usize> = Vec::new();
+        for (c, _, _, _) in &ranked {
+            let members: Vec<&str> =
+                embedded.iter().zip(&assign).filter(|(_, &a)| a == *c).map(|((id, ..), _)| id.as_str()).collect();
+            let confirmed = members.iter().filter(|id| focus.contains(**id)).count();
+            if confirmed >= 3 && confirmed * 2 > members.len() {
+                him_clusters.push(*c);
+                new_ids.extend(members.into_iter().filter(|id| !focus.contains(*id)));
             }
-            let take_ctl = controls.min(candidate_ids.len());
-            sample.extend(candidate_ids[..take_ctl].iter().map(|&i| (i, format!("cluster:{host_c}"))));
+        }
+        println!(
+            "judge-new: {} confirmed-majority cluster(s) {:?}; {} NEW id(s) clustered with the confirmed voice",
+            him_clusters.len(),
+            him_clusters,
+            new_ids.len()
+        );
+        for (c, f, ms, n) in ranked.iter().take(10) {
+            if !him_clusters.contains(c) && *n >= 50 {
+                let has_any = embedded.iter().zip(&assign).any(|((id, ..), &a)| a == *c && focus.contains(id.as_str()));
+                if !has_any {
+                    println!(
+                        "  note: cluster {c} ({f} files, {:.2} h, {n} clips) holds NO confirmed id — if it might be him, judge it via --round2 {c}",
+                        *ms as f64 / 3_600_000.0
+                    );
+                }
+            }
+        }
+        if new_ids.is_empty() {
+            return Err("no new ids clustered with the confirmed voice — nothing to judge".into());
+        }
+        shuffle(&mut new_ids, 20_261_000);
+        let controls = (sample_n / 4).max(2);
+        let take_new = sample_n.saturating_sub(controls).min(new_ids.len());
+        sample.extend(new_ids[..take_new].iter().map(|&i| (i, "cluster:new".to_string())));
+        let mut confirmed_ids: Vec<&str> =
+            embedded.iter().filter(|(id, ..)| focus.contains(id)).map(|(id, ..)| id.as_str()).collect();
+        shuffle(&mut confirmed_ids, 20_261_001);
+        let take_ctl = controls.min(confirmed_ids.len());
+        sample.extend(confirmed_ids[..take_ctl].iter().map(|&i| (i, "cluster:confirmed".to_string())));
+        std::fs::write(
+            out_dir.join("cluster_new_segment_ids.txt"),
+            new_ids.iter().map(|id| format!("{id}\n")).collect::<String>(),
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        match &round2 {
+            None => {
+                let mut other_ids: Vec<&str> = embedded
+                    .iter()
+                    .zip(&assign)
+                    .filter(|(_, &c)| c != host_c)
+                    .map(|((id, ..), _)| id.as_str())
+                    .collect();
+                shuffle(&mut other_ids, 20_260_820);
+                let take_c = (sample_n * 2 / 3).min(candidate_ids.len());
+                let take_o = (sample_n - take_c).min(other_ids.len());
+                sample.extend(candidate_ids[..take_c].iter().map(|&i| (i, "CANDIDATE".to_string())));
+                sample.extend(other_ids[..take_o].iter().map(|&i| (i, "other".to_string())));
+            }
+            Some(suspects) => {
+                // Even split across the suspects, plus ~a quarter of the sample as host CONTROLS: if the
+                // owner calls a control clip "not him", the ear is off today and the round is void.
+                let controls = (sample_n / 4).max(2);
+                let per = ((sample_n.saturating_sub(controls)) / suspects.len().max(1)).max(1);
+                for (k, &c) in suspects.iter().enumerate() {
+                    let mut ids = ids_of(c);
+                    shuffle(&mut ids, 20_260_900 + k as u64);
+                    let n = per.min(ids.len());
+                    println!("round2: cluster {c} has {} clips, sampling {n}", ids.len());
+                    sample.extend(ids[..n].iter().map(|&i| (i, format!("cluster:{c}"))));
+                    std::fs::write(
+                        out_dir.join(format!("cluster_{c}_segment_ids.txt")),
+                        ids.iter().map(|id| format!("{id}\n")).collect::<String>(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                let take_ctl = controls.min(candidate_ids.len());
+                sample.extend(candidate_ids[..take_ctl].iter().map(|&i| (i, format!("cluster:{host_c}"))));
+            }
         }
     }
     shuffle(&mut sample, 7);
