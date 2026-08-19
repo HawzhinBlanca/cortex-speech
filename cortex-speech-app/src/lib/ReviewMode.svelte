@@ -405,6 +405,17 @@
       undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
       // recordHumanDecision FIRST so a validation failure aborts before updateSegment commits (same
       // ordering rationale as submit()). freshRow AFTER it: same stale-spread rationale as submit().
+      // Same receipt the submit() path posts, for the same reason. A reject permanently removes
+      // a clip from the corpus, so it is a verdict on the audio exactly as much as an accept is.
+      try {
+        await api.recordPlaybackReceipt({
+          segmentId: seg.id,
+          playedMs: heardMs,
+          clipDurationMs: Math.round((playerDuration || 0) * 1000),
+        });
+      } catch (e) {
+        console.error('playback receipt failed', e);
+      }
       await api.recordHumanDecision(seg.id, 'reject', null);
       // P2.3b: targeted field update (verified is whitelisted) — no whole-row upsert of the batch-stale
       // store row, which would revert a concurrent batch's writes to this segment.

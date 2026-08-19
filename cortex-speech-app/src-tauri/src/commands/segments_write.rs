@@ -243,6 +243,37 @@ pub fn rename_speaker(old_id: String, new_id: String, state: State<'_, AppState>
     db.rename_speaker(&old_id, &new_id).map_err(|e| e.to_string())
 }
 
+/// The desktop half of the listening bar, extracted so it can be tested without a Tauri `State`.
+///
+/// The desktop was the last way to write a verdict on a clip nobody heard: `ReviewMode` posted a
+/// receipt on accept/edit but not on reject, `ReviewInbox` posted none at all, and the command never
+/// asked for one — so the comment in ReviewMode claiming "the backend refuses a verdict without
+/// sufficient evidence" described an intent that was never implemented. Both surfaces post now, and
+/// this is the check that makes it mean something.
+///
+/// Deliberately NOT applied to `bin/reject_speaker_change_clips`, which calls
+/// `Database::record_human_decision` directly: an owner batch tool with its own audit trail is not a
+/// human claiming to have listened.
+fn require_listened(db: &crate::db::Database, segment_id: &str) -> Result<(), String> {
+    let fingerprint =
+        db.segment_audio_fingerprint(segment_id).ok().flatten().unwrap_or_else(|| format!("id:{segment_id}"));
+    let revision = db.segment_review_revision(segment_id).ok().flatten().unwrap_or(0);
+    match db.has_sufficient_playback_evidence(segment_id, revision, &fingerprint) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!("PLAYBACK_EVIDENCE_REFUSED: {segment_id} on the desktop at revision {revision}");
+            Err(db
+                .require_playback_evidence(segment_id, revision, &fingerprint)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()))
+        }
+        // Not a verdict about the reviewer: an unwell database cannot answer the question, and
+        // telling someone who listened that they did not is both false and unactionable.
+        Err(e) => Err(format!("playback evidence check failed: {e}")),
+    }
+}
+
 #[tauri::command]
 pub fn record_human_decision(
     state: State<'_, AppState>,
@@ -258,6 +289,9 @@ pub fn record_human_decision(
         validate::validate_text(t, 100_000, "Corrected transcript")?;
     }
     let db = state.lock_db();
+
+    require_listened(&db, &segment_id)?;
+
     db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref(), timestamp_ms)
         .map_err(|e| e.to_string())?;
 
@@ -377,4 +411,69 @@ pub fn write_segment_verdict(
         escalated,
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_listened;
+    use crate::db::{Database, PlaybackReceipt, SpeechSegment};
+
+    fn db_with_clip(dir: &std::path::Path, id: &str) -> Database {
+        let db = Database::open(dir.join("t.db").to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&SpeechSegment {
+            id: id.into(),
+            audio_path: dir.join(format!("{id}.wav")).to_string_lossy().into_owned(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 10_000,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+        db
+    }
+
+    fn receipt(db: &Database, id: &str, played: i64) {
+        let fingerprint = db.segment_audio_fingerprint(id).unwrap().unwrap_or_else(|| format!("id:{id}"));
+        let revision = db.segment_review_revision(id).unwrap().unwrap_or(0);
+        db.record_playback_receipt(&PlaybackReceipt {
+            segment_id: id.into(),
+            segment_revision: revision,
+            audio_fingerprint: fingerprint,
+            reviewer: None,
+            session_id: None,
+            started_at_ms: 0,
+            played_ms: played,
+            clip_duration_ms: 10_000,
+        })
+        .unwrap();
+    }
+
+    /// The desktop must hold the same bar as the phone, or it is simply the easier way in.
+    ///
+    /// Until 2026-08-19 it had none: `ReviewInbox` posted no receipt at all and `ReviewMode`'s reject
+    /// skipped the one its own accept path posted, while this command never asked. The corpus could
+    /// be written from the desktop by anyone who never pressed play.
+    #[test]
+    fn the_desktop_refuses_a_verdict_on_a_clip_that_was_not_heard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "d1");
+
+        let refused = require_listened(&db, "d1").expect_err("no receipt at all must be refused");
+        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "the reason must be legible: {refused}");
+
+        receipt(&db, "d1", 3_000); // 30% of a 10s clip
+        let refused = require_listened(&db, "d1").expect_err("a third of a clip is not a listen");
+        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "{refused}");
+
+        receipt(&db, "d1", 9_000); // 90%, clear of the 0.85 bar
+        require_listened(&db, "d1").expect("a clip heard to the bar must be decidable");
+    }
+
+    /// A clip the library has never seen cannot have been heard, and must not pass by defaulting.
+    #[test]
+    fn an_unknown_segment_is_refused_rather_than_waved_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "d2");
+        assert!(require_listened(&db, "nonexistent").is_err(), "an unknown clip must not pass the guard");
+    }
 }

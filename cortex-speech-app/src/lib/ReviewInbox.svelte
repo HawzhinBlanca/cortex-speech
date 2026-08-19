@@ -43,6 +43,10 @@
   // Keyboard play/pause state for the current clip (Space); reset on queue navigation so a new
   // clip never inherits the previous clip's playing flag.
   let inboxPlaying = false;
+  // Cumulative MEDIA time heard for the clip on screen, bound from AudioPlayer. The backend
+  // refuses a verdict without it, so a decision here has to carry the same proof the phone does.
+  let inboxHeardMs = 0;
+  let inboxDuration = 0;
   // Non-null = this clip's audio failed to load. No verdict may be recorded on audio nobody could
   // hear: in a VERBATIM corpus an unheard "looks good" is indistinguishable from a real listen
   // downstream, and worse than no decision at all (audit find 2026-08-17).
@@ -211,6 +215,18 @@
       // Reassignment (not .push) — this component is legacy-mode, so only assignment invalidates
       // `disabled={history.length === 0}`; mutation left the Undo button permanently disabled.
       history = [...history, { id: cur.id, decision: 'accept', prev: { ...cur } }];
+      // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
+      // revision and fingerprint itself and refuses a decision without sufficient evidence.
+      // Reported, never thrown — losing the receipt must not lose the human's work.
+      try {
+        await api.recordPlaybackReceipt({
+          segmentId: cur.id,
+          playedMs: inboxHeardMs,
+          clipDurationMs: Math.round((inboxDuration || 0) * 1000),
+        });
+      } catch (e) {
+        console.error('playback receipt failed', e);
+      }
       await api.recordHumanDecision(cur.id, 'accept', null);
       queue[idx] = { ...cur, humanDecision: 'accept' };
       statusMsg = $t('inbox.status.accepted');
@@ -252,6 +268,18 @@
     isSubmitting = true;
     try {
       history = [...history, { id: cur.id, decision: 'edit', prev: { ...cur } }];
+      // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
+      // revision and fingerprint itself and refuses a decision without sufficient evidence.
+      // Reported, never thrown — losing the receipt must not lose the human's work.
+      try {
+        await api.recordPlaybackReceipt({
+          segmentId: cur.id,
+          playedMs: inboxHeardMs,
+          clipDurationMs: Math.round((inboxDuration || 0) * 1000),
+        });
+      } catch (e) {
+        console.error('playback receipt failed', e);
+      }
       await api.recordHumanDecision(cur.id, 'edit', text);
       queue[idx] = {
         ...cur,
@@ -278,6 +306,18 @@
     isSubmitting = true;
     try {
       history = [...history, { id: cur.id, decision: 'reject', prev: { ...cur } }];
+      // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
+      // revision and fingerprint itself and refuses a decision without sufficient evidence.
+      // Reported, never thrown — losing the receipt must not lose the human's work.
+      try {
+        await api.recordPlaybackReceipt({
+          segmentId: cur.id,
+          playedMs: inboxHeardMs,
+          clipDurationMs: Math.round((inboxDuration || 0) * 1000),
+        });
+      } catch (e) {
+        console.error('playback receipt failed', e);
+      }
       await api.recordHumanDecision(cur.id, 'reject', null);
       queue[idx] = { ...cur, humanDecision: 'reject' };
       statusMsg = $t('inbox.status.rejected');
@@ -623,6 +663,8 @@
                   endTime={inboxRange.endTime}
                   autoplay={settings?.autoplaySegments ?? false}
                   bind:playing={inboxPlaying}
+                  bind:heardMs={inboxHeardMs}
+                  bind:duration={inboxDuration}
                   bind:audioError
                 />
               {/key}
