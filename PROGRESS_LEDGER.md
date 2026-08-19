@@ -10372,3 +10372,62 @@ assumed, and the instrument that measures it exists and currently reads NOT READ
 **GO_MODEL_PROMOTION: NO** — unchanged. Gate B: 1.09 h of 25, 5 recordings of 25.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (pilot) — the two-reviewer pilot answered the device question, and found a workflow instead
+
+Bar lowered 0.90 -> 0.85 on the owner's call. Full sweep at exact HEAD: **RED**, 40 of 41 kept gates
+PASS, the one failure `challenger-loop` (one trained challenger, no linked verdict — the FLEURS eval
+manifest cannot produce library-derived slices). 9 legs owner-descoped, 3 owner-gated pending, so
+`CORTEX 10/10: ALL GATES GREEN` remains unreachable by the aggregator's own definition.
+
+### The device question is answered, and the answer is clean
+
+```
+reviewer   receipts   mean coverage   min coverage
+Rubar            22           0.981          0.932     every single one above the bar
+Hawzhin          18           0.721          0.000
+```
+
+Rubar's second device produced 22 receipts and not one false refusal. That was the whole point of the
+pilot: `timeupdate` fires on a browser, not on a policy, and one phone proved nothing about another.
+Two phones now agree.
+
+### What enforcement would actually have refused
+
+5 of 40. One is the case the guard exists for (0.352 — a 9.8 s clip decided after 3.5 s). The other
+four are a single pattern:
+
+```
+12:05:56  reject  clip 11797ms  heard 0ms
+12:05:56  reject  clip  8145ms  heard 0ms
+12:05:57  reject  clip  8575ms  heard 0ms
+12:05:57  reject  clip  7450ms  heard 0ms
+```
+
+Four rejects in two seconds with zero playback. Not a device fault and not dishonesty — a rapid
+rejection sweep, which is a real way to work. It is also indistinguishable, to the guard, from
+deleting corpus without listening.
+
+That is now an owner decision the pilot surfaced and no amount of code can settle: **does the guard
+gate a REJECT?** An accept or an edit injects text and must require listening. A reject removes a
+clip permanently, from a corpus whose size is already the binding blocker (1.10 h of 25). Refusing
+unheard rejects protects the corpus and breaks the sweep workflow; exempting them keeps the workflow
+and lets a careless reviewer silently delete clips nobody heard. Currently everything except `skip`
+is gated.
+
+### A gate of mine that manufactured the evidence it existed to refuse
+
+`check_playback_enforcement_readiness.py` reported **0 decisions while a reviewer was mid-session**.
+SQLite `datetime('now')` writes UTC and the tracing log stamps Zulu; the default window came from the
+exe mtime in LOCAL time, so on this UTC+3 box it discarded the last three hours — and with them the
+first genuine below-bar receipt. Seventh check of mine this session that proved nothing, and the only
+one that actively misled rather than merely failing to inform. Pinned by
+`test_the_default_window_is_utc_like_the_rows_it_filters`.
+
+### Standing verdicts
+
+**GO_PILOT: YES** (running). **GO_LINKS: NO** — 40 of 20 decisions and 2 of 2 reviewers now pass;
+coverage is the last gate leg and it hangs on the reject question above, not on a defect.
+**GO_MODEL_PROMOTION: NO** — unchanged. Gate B: 1.10 h of 25, 6 recordings of 25.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
