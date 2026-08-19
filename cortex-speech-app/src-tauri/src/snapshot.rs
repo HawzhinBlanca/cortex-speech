@@ -19,7 +19,14 @@ use crate::error::{AppError, AppResult};
 /// SINGLE SOURCE OF TRUTH: `restore_db_from_snapshot` (commands.rs) restores exactly this set, so the
 /// save-side and restore-side can never drift — a file added here is automatically restored, not
 /// silently snapshotted-but-never-restored.
-pub(crate) const EXTRA_STATE: &[&str] = &["settings.json", "champion.json"];
+/// `reviewer_dialects.json` and `voice_focus.json` are QUEUE POLICY, and leaving them out made the
+/// restore silently permissive: both fail OPEN by design (a typo must not empty eight paid
+/// reviewers' queues), so a library restored without them serves every reviewer every clip — the
+/// dialect fence gone and the collection focus gone, with nothing in the UI to say so. Found
+/// 2026-08-20 by an external audit; the same restore that proves the corpus survived would quietly
+/// undo who may review what.
+pub(crate) const EXTRA_STATE: &[&str] =
+    &["settings.json", "champion.json", "reviewer_dialects.json", "voice_focus.json"];
 
 const SNAPSHOT_PREFIX: &str = "snapshot_";
 const DB_FILE: &str = "cortex-speech.db";
@@ -1062,6 +1069,8 @@ mod offsite_state_tests {
 
         std::fs::write(primary.path().join("settings.json"), br#"{"backup_second_dir":"x"}"#).unwrap();
         std::fs::write(primary.path().join("champion.json"), br#"{"schema":2,"champions":{}}"#).unwrap();
+        std::fs::write(primary.path().join("reviewer_dialects.json"), br#"{"Sara":["sorani"]}"#).unwrap();
+        std::fs::write(primary.path().join("voice_focus.json"), br#"{"name":"V","segment_ids":["a"]}"#).unwrap();
 
         let snap = take_offsite_snapshot(&db, offsite.path(), primary.path(), 3).unwrap().expect("snapshot");
 
@@ -1091,6 +1100,8 @@ mod offsite_state_tests {
         db.initialize().unwrap();
         std::fs::write(primary.path().join("settings.json"), b"{\"a\":1}").unwrap();
         std::fs::write(primary.path().join("champion.json"), b"{\"schema\":2}").unwrap();
+        std::fs::write(primary.path().join("reviewer_dialects.json"), b"{}").unwrap();
+        std::fs::write(primary.path().join("voice_focus.json"), b"{}").unwrap();
 
         let snap = take_offsite_snapshot(&db, offsite.path(), primary.path(), 3).unwrap().unwrap();
         let manifest: serde_json::Value =
@@ -1134,6 +1145,8 @@ mod offsite_state_tests {
         db.initialize().unwrap();
         std::fs::write(data.path().join("settings.json"), b"{}").unwrap();
         std::fs::write(data.path().join("champion.json"), b"{}").unwrap();
+        std::fs::write(data.path().join("reviewer_dialects.json"), b"{}").unwrap();
+        std::fs::write(data.path().join("voice_focus.json"), b"{}").unwrap();
 
         let snap = take_snapshot(&db, data.path(), 3).unwrap().expect("snapshot");
         for name in EXTRA_STATE {

@@ -292,7 +292,10 @@ pub fn record_human_decision(
 
     require_listened(&db, &segment_id)?;
 
-    db.record_human_decision(&segment_id, &decision, corrected_transcript.as_deref(), timestamp_ms)
+    // ONE commit: decision, transcript, attribution and `verified` together. Two writes left nine
+    // rows decided-but-pending on the live library — ReviewMode's second `update_segment_fields`
+    // covered it, ReviewInbox never made that call, so its decisions never reached the corpus.
+    db.finalize_human_review(&segment_id, &decision, corrected_transcript.as_deref(), timestamp_ms, None)
         .map_err(|e| e.to_string())?;
 
     // M2.6: Update session with current review segment for cursor persistence on restart.

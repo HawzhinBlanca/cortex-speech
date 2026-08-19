@@ -4564,6 +4564,43 @@ fn voice_focus_narrows_the_pending_queue_to_exactly_the_named_clips() {
     assert!(db.pending_segment_ids_focused(None, Some(&ghost)).unwrap().is_empty());
 }
 
+/// A desktop decision must land COMPLETE in one call — decision and `verified` in the same commit.
+///
+/// Found 2026-08-20 by an external audit and confirmed on the live library: NINE rows carried
+/// `human_decision` with `verified = 0`, all from the owner's own desktop session. `finalize` was
+/// derived from `expected_revision.is_some()`, a CAS token only the phone supplies, so desktop
+/// decisions never finalized. ReviewMode papered over it with a SECOND write
+/// (`updateSegmentFields{verified:true}`); ReviewInbox has no such call at all, so every inbox
+/// decision ever made stayed invisible to the corpus — the export counts `verified = 1`.
+///
+/// The two fields are one adjudication and must share one transaction, exactly as the phone path's
+/// own doc comment already said.
+#[test]
+fn a_desktop_decision_is_finalized_in_the_same_commit() {
+    let db = make_db();
+    db.insert_segment(&make_segment("fin-1", "/a/clip.wav")).unwrap();
+
+    db.finalize_human_review("fin-1", "accept", None, None, None).unwrap();
+    let row = db.get_segment_by_id("fin-1").unwrap().unwrap();
+    assert_eq!(row.human_decision.as_deref(), Some("accept"));
+    assert!(row.verified, "a decided clip must be verified by the SAME call, not a second write");
+
+    // An edit carries its text in the same commit too.
+    db.insert_segment(&make_segment("fin-2", "/a/clip.wav")).unwrap();
+    db.finalize_human_review("fin-2", "edit", Some("دەقی ڕاست"), None, Some("Sara")).unwrap();
+    let row = db.get_segment_by_id("fin-2").unwrap().unwrap();
+    assert!(row.verified);
+    assert_eq!(row.reviewed_by.as_deref(), Some("Sara"));
+
+    // And the un-finalizing recorder still exists for batch tools that must NOT verify.
+    db.insert_segment(&make_segment("fin-3", "/a/clip.wav")).unwrap();
+    db.record_human_decision("fin-3", "accept", None, None).unwrap();
+    assert!(
+        !db.get_segment_by_id("fin-3").unwrap().unwrap().verified,
+        "the plain recorder must stay non-finalizing so batch tools keep their semantics"
+    );
+}
+
 #[test]
 fn a_full_listen_is_sufficient_evidence() {
     let db = make_db();

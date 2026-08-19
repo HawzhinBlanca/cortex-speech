@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -35,6 +36,10 @@ import tempfile
 from pathlib import Path
 
 REQUIRED = ["cortex-speech.db", "settings.json", "champion.json"]
+# Queue POLICY. Not "required" — a library legitimately has no focus, and an absent roster means
+# every reviewer is unrestricted. But if the PRIMARY has one and the snapshot does not, the restore
+# would silently widen who reviews what, so the drill compares against the live data dir.
+POLICY = ["reviewer_dialects.json", "voice_focus.json"]
 MANIFEST = "SNAPSHOT_MANIFEST.json"
 HUMAN_TABLES = ["speech_segments", "review_events", "spot_checks", "model_versions"]
 
@@ -61,6 +66,13 @@ def drill(snapshot: Path) -> list[str]:
         for name in REQUIRED:
             if not (profile / name).is_file():
                 problems.append(f"restored profile has no {name} — recovery would be incomplete")
+        live = Path(os.environ.get("APPDATA", "")) / "cortex-speech" if os.environ.get("APPDATA") else None
+        for name in POLICY:
+            if live and (live / name).is_file() and not (profile / name).is_file():
+                problems.append(
+                    f"{name} exists on the live system but NOT in this snapshot — a restore would "
+                    "silently unrestrict every reviewer queue"
+                )
 
         manifest_path = profile / MANIFEST
         if manifest_path.is_file():

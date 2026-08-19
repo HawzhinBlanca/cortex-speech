@@ -4288,6 +4288,7 @@ impl Database {
             timestamp_ms,
             annotator,
             None,
+            false,
         )?;
         Ok(())
     }
@@ -4337,7 +4338,33 @@ impl Database {
             None,
             Some(annotator),
             Some(expected_revision),
+            true,
         )
+    }
+
+    /// Record a DESKTOP adjudication complete: decision, transcript, attribution and `verified` in
+    /// one commit, so an interrupted second write can never leave a decided-but-pending row.
+    ///
+    /// The phone has had this since the finalization transaction was written; the desktop reached
+    /// `verified` through a separate `update_segment_fields` call that ReviewInbox never made.
+    pub fn finalize_human_review(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
+        annotator: Option<&str>,
+    ) -> AppResult<()> {
+        self.record_human_decision_by_with_finalize(
+            segment_id,
+            decision,
+            corrected_transcript,
+            timestamp_ms,
+            annotator,
+            None,
+            true,
+        )
+        .map(|_| ())
     }
 
     /// Finish a row written by an older release that committed the decision but not phone
@@ -4627,6 +4654,11 @@ impl Database {
         Ok(best.unwrap_or(0.0) >= MIN_PLAYBACK_COVERAGE)
     }
 
+    // Eight parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
+    // what verdict, whose text, when, who, at which revision, and whether this call finalizes).
+    // Bundling them into a struct would move the width rather than remove it, and this is a private
+    // helper with three call sites — all in this file.
+    #[allow(clippy::too_many_arguments)]
     fn record_human_decision_by_with_finalize(
         &self,
         segment_id: &str,
@@ -4635,10 +4667,16 @@ impl Database {
         timestamp_ms: Option<i64>,
         annotator: Option<&str>,
         expected_revision: Option<i64>,
+        finalize: bool,
     ) -> AppResult<Option<i64>> {
-        // A revision is supplied only by the phone path, whose adjudication and finalization share
-        // one transaction. Desktop decisions intentionally have no optimistic CAS token here.
-        let finalize = expected_revision.is_some();
+        // `finalize` and `expected_revision` are INDEPENDENT, and conflating them cost real work.
+        // Until 2026-08-20 finalize was derived as `expected_revision.is_some()` — a CAS token only
+        // the phone supplies — so no desktop decision ever set `verified`. ReviewMode hid it behind a
+        // second write; ReviewInbox had none, so its decisions never reached the corpus at all (the
+        // export counts `verified = 1`). Nine such rows were found on the live library.
+        //
+        // The SQL already treats them separately (`verified = CASE WHEN ?6`, and the CAS clause is
+        // `?7 IS NULL OR ...`), so a caller may finalize without a revision token.
         // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
         // update_*). Without it a decomposed (NFD) paste / IME input becomes the lone non-NFC label in an
         // otherwise-NFC corpus (verdict_transcript is the COALESCE-preferred gold source) and defeats the
