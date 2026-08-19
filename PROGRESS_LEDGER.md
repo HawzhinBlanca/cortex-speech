@@ -10602,3 +10602,25 @@ on it rather than waiting.
 **GO_LINKS: YES** (Hawleri roster). **GO_MODEL_PROMOTION: NO** — unchanged.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-20 (round 2) — the suspects were him: Kawa's set grows 905 -> 1,352 clips
+
+Round 2 sampled the two clusters that looked like the host on other mic days (10: 185 clips/12
+files, 17: 262 clips/11 files) — 6 clips each, plus 3 controls drawn from the already-confirmed
+905, shuffled. Owner verdict: all 15 are Kawa. Scored per cluster: controls 3/3 (round valid),
+cluster 10 6/6 MERGE, cluster 17 6/6 MERGE.
+
+```
+focus now : 1,352 clips | 3.35 h | across all 25 scored episodes | all pending
+serving   : Hawzhin/Rubar/Pavel pendingTotal 1352, 25 Kawa + 4 spot-checks per batch
+            Sorani-restricted reviewers still 0, by owner decision
+```
+
+The merge machinery refuses two ways by design (pinned): a cluster confirmed on only some of its
+clips is rejected whole, and a missed control voids the round. Neither fired — but they existed
+before the verdict did, which is the order that makes a clean merge mean something.
+
+Remaining Kawa upside, not taken now: 7 of 32 episodes still have no speaker-change scores, so
+none of their clips could enter any cluster. Scoring them and re-probing would grow the set again.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
