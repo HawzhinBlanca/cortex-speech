@@ -150,9 +150,18 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Linux system deps
+        # Bounded and retried. Three times on 2026-08-19 this step hung on apt for 45 minutes and
+        # was cancelled by the job timeout, with nothing of ours having run; every later step
+        # showed "skipped", and the PR read as red for a mirror stall. One hang is weather; three
+        # is a step that needs a ceiling and a second try.
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+          for attempt in 1 2 3; do
+            sudo apt-get update &&             sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev             && exit 0
+            echo "apt attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
+          exit 1
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
