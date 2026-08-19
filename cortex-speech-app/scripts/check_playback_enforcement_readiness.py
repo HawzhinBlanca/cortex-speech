@@ -45,9 +45,19 @@ DEFAULT_EXE = "src-tauri/target/release/cortex-speech-app.exe"
 
 
 def default_db_path() -> str:
-    return os.environ.get("CORTEX_DB") or os.path.join(
-        os.environ["APPDATA"], "cortex-speech", "cortex-speech.db"
-    )
+    """The live library, on whichever platform this runs.
+
+    `os.environ["APPDATA"]` raised KeyError on the macOS and Linux CI runners before the parser had
+    even finished building, so the gate died on import-time work no non-Windows caller had asked for
+    — including the policy tests, which pass `--db` explicitly and never wanted this value at all.
+    Same fallback as build_eval_slices._data_dir.
+    """
+    override = os.environ.get("CORTEX_DB")
+    if override:
+        return override
+    appdata = os.environ.get("APPDATA")
+    root = Path(appdata) / "cortex-speech" if appdata else Path.home() / ".local" / "share" / "cortex-speech"
+    return str(root / "cortex-speech.db")
 
 
 def binary_can_warn(exe: Path) -> tuple[bool, str]:
