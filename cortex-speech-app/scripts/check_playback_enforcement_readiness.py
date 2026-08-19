@@ -142,7 +142,14 @@ def main() -> int:
     since = args.since
     if since is None:
         if args.exe.is_file():
-            since = dt.datetime.fromtimestamp(args.exe.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            # UTC, because that is what the rows are in. SQLite's datetime('now') is UTC and the
+            # tracing log stamps Zulu; deriving the cutoff from a LOCAL-time mtime silently discarded
+            # every decision in the last UTC-offset hours. Measured 2026-08-19 on a UTC+3 box while a
+            # reviewer was actively working: the gate reported "0 decisions" against 9 real ones and
+            # concealed the first genuine would-be refusal.
+            since = dt.datetime.fromtimestamp(args.exe.stat().st_mtime, dt.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
         else:
             since = "9999-01-01 00:00:00"
     print(f"       window : decisions at or after {since}")

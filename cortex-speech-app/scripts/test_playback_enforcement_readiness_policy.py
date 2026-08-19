@@ -167,6 +167,30 @@ def test_one_device_is_not_enough_to_enforce_on_eight() -> None:
         assert "only 1 reviewer(s)" in result.stdout, result.stdout
 
 
+def test_the_default_window_is_utc_like_the_rows_it_filters() -> None:
+    """A local-time cutoff against UTC rows hides exactly the most recent work.
+
+    Measured 2026-08-19 on a UTC+3 machine while a reviewer was mid-session: the gate derived its
+    cutoff from the exe mtime in local time and compared it to SQLite `datetime('now')` values, which
+    are UTC. It reported 0 decisions against 9 real ones -- and concealed the first genuine
+    below-bar receipt the observe mode existed to surface.
+    """
+    import datetime as dt
+
+    with tempfile.TemporaryDirectory() as raw:
+        exe = Path(raw) / "cortex-speech-app.exe"
+        exe.write_bytes(gate.OBSERVE_MARKER)
+        mtime = exe.stat().st_mtime
+        expected = dt.datetime.fromtimestamp(mtime, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        result = subprocess.run(
+            [sys.executable, str(GATE), "--db", str(Path(raw) / "missing.db"), "--exe", str(exe)],
+            capture_output=True, text=True,
+        )
+        assert f"decisions at or after {expected}" in result.stdout, (
+            "the default window must be UTC, matching the timestamps in the database: " + result.stdout
+        )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for test in tests:

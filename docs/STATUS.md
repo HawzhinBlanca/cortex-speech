@@ -4,9 +4,9 @@
 
 # Gate status — generated
 
-**Commit:** `5d4a722` · **Mode:** full
+**Commit:** `21c639d` · **Mode:** full
 
-**Verdict:** **RED** — 1 kept gate(s) failed (spot-check-pool). NOT ship-ready.
+**Verdict:** **RED** — 1 kept gate(s) failed (challenger-loop). NOT ship-ready.
 
 ## Kept gates
 
@@ -19,8 +19,10 @@
 | `license-compat` | PASS |
 | `branch-protection` | PASS |
 | `python-policies` | PASS |
-| `spot-check-pool` | FAIL |
+| `spot-check-pool` | PASS |
 | `dataset-duplicates` | PASS |
+| `snapshot-immutability` | PASS |
+| `challenger-loop` | FAIL |
 | `reviewer-queues-live` | PASS |
 | `review-serving-provenance` | PASS |
 | `typecheck` | PASS |
