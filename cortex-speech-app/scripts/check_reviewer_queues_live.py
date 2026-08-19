@@ -128,16 +128,41 @@ def live_reviewers(data_dir: Path) -> list[str]:
     return []
 
 
-def servable_clips(db_path: Path, table: list[tuple[str, str]]) -> list[tuple[str, int]]:
+def load_focus(data_dir: Path) -> set[str] | None:
+    """Mirror of `voice_focus::load_focus`: the allow-list of clip ids every queue is narrowed to.
+
+    Same fail-OPEN contract as the Rust: missing, malformed or empty means no focus. The gate MUST
+    apply it, because the server does — measured 2026-08-19 the moment the focus went live: this
+    gate reported "15,318 servable pending" while every reviewer's real queue held 905. A gate that
+    counts clips the server will never hand out would read OK against an empty queue.
+    """
+    path = data_dir / "voice_focus.json"
+    if not path.is_file():
+        return None
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ids = parsed.get("segment_ids") if isinstance(parsed, dict) else None
+    if not isinstance(ids, list):
+        return None
+    focus = {i for i in ids if isinstance(i, str)}
+    return focus or None
+
+
+def servable_clips(
+    db_path: Path, table: list[tuple[str, str]], focus: set[str] | None = None
+) -> list[tuple[str, int]]:
     """(audio_path, duration_ms) for every clip the queue would hand out, before dialect.
 
-    The WHERE clause is `db::pending_segment_ids_for`'s, and the on-disk check is the one it does
-    per distinct path — a row whose audio is gone is not work anybody can do.
+    The WHERE clause is `db::pending_segment_ids_for`'s, the on-disk check is the one it does per
+    distinct path — a row whose audio is gone is not work anybody can do — and `focus` is the
+    voice-focus allow-list the server applies after both.
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = con.execute(
-            "SELECT audio_path, duration_ms FROM speech_segments "
+            "SELECT id, audio_path, duration_ms FROM speech_segments "
             " WHERE verified = 0 "
             "   AND TRIM(COALESCE(raw_transcript, '')) <> '' "
             "   AND NOT (TRIM(raw_transcript) LIKE '[%]')"
@@ -146,7 +171,9 @@ def servable_clips(db_path: Path, table: list[tuple[str, str]]) -> list[tuple[st
         con.close()
     on_disk: dict[str, bool] = {}
     out = []
-    for path, duration in rows:
+    for seg_id, path, duration in rows:
+        if focus is not None and seg_id not in focus:
+            continue
         if path not in on_disk:
             on_disk[path] = os.path.isfile(path)
         if on_disk[path]:
@@ -218,7 +245,10 @@ def main() -> int:
 
     table = source_dialects((_repo_root() / "src-tauri" / "src" / "dialect.rs").read_text(encoding="utf-8"))
     roster = load_roster(data_dir)
-    clips = servable_clips(db_path, table)
+    focus = load_focus(data_dir)
+    clips = servable_clips(db_path, table, focus)
+    if focus is not None:
+        print(f"voice focus ACTIVE: queues narrowed to {len(focus)} clip id(s)", flush=True)
 
     problems, warnings = evaluate_queues(reviewers=reviewers, roster=roster, clips=clips, table=table)
 
