@@ -819,6 +819,26 @@
       $('retry').textContent = '↻ ' + t('retry');
     }
   }
+  // Cumulative MEDIA time heard for the CURRENT clip. Not wall-clock, not a play() call, not a
+  // download: a clip can arrive, decode and sit at 0:00 while nobody hears a word of it. Only forward
+  // movement of a playing element counts, and a jump beyond one tick is a seek, not listening.
+  let heardMs = 0, lastPos = null;
+  const MAX_TICK_ADVANCE_S = 1.5;
+  (function trackHeardTime() {
+    const el = $('player');
+    if (!el) return;
+    el.addEventListener('timeupdate', () => {
+      if (el.paused) { lastPos = null; return; }
+      if (lastPos !== null) {
+        const d = el.currentTime - lastPos;
+        if (d > 0 && d <= MAX_TICK_ADVANCE_S) heardMs += d * 1000;
+      }
+      lastPos = el.currentTime;
+    });
+    // A new clip is new evidence; a previous clip's listen must never travel with the reviewer.
+    el.addEventListener('loadstart', () => { heardMs = 0; lastPos = null; });
+  })();
+
   async function decide(action) {
     if (busy || !queue[i]) return;
     // A skip is the ABSENCE of a verdict, so none of what follows a decision applies to it: it is not
@@ -830,7 +850,12 @@
     const btns = ['save','accept','bad','skip','undo'].map($); btns.forEach(b => b.disabled = true);
     // rowVersion: the row fingerprint this clip was SERVED with — the server refuses the decision
     // if the draft changed in between, so what gets recorded is always judged-as-seen.
-    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion };
+    // heardMs travels WITH the decision: the server mints the receipt for the clip it served, and
+    // resolves the revision and audio fingerprint itself, so a client cannot claim to have heard
+    // a clip it never loaded.
+    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion,
+                         heardMs: Math.max(0, Math.round(heardMs)),
+                         clipDurationMs: Math.max(0, Math.round((($('player') || {}).duration || 0) * 1000)) };
     try {
       const saved = await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),

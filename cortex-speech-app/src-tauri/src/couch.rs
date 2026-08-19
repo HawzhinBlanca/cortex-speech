@@ -1869,6 +1869,16 @@ struct DecisionBody {
     /// is fenced only by the existing verified/lease guards.
     #[serde(default, rename = "rowVersion")]
     row_version: Option<String>,
+    /// Cumulative MEDIA time the page actually advanced through this clip, in ms.
+    ///
+    /// Not wall-clock, not a `play()` call, not a download — a clip can arrive, decode and sit at
+    /// 0:00 while nobody hears a word. The page only reports how much it played; the SERVER resolves
+    /// the segment's revision and audio fingerprint itself, so a client cannot mint evidence naming a
+    /// clip or revision it never loaded.
+    #[serde(default, rename = "heardMs")]
+    heard_ms: Option<i64>,
+    #[serde(default, rename = "clipDurationMs")]
+    clip_duration_ms: Option<i64>,
 }
 
 /// Record one phone decision through the shared human-decision path. Verdict, provenance/learning
@@ -1913,6 +1923,29 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             .unwrap_or(0);
         if let Err(e) = db.record_review_event(&parsed.id, reviewer, action, "couch", now_ms) {
             tracing::warn!("Couch Review audit event not recorded for {}: {e}", parsed.id);
+        }
+        // Mint the listening receipt for the clip the SERVER served. The page reports only how much
+        // media time it advanced; the revision and audio fingerprint are resolved here, so a client
+        // cannot claim to have heard a clip or a revision it never loaded. `skip` passes through too:
+        // it writes no verdict, and a receipt for a clip that was heard and then skipped is honest
+        // evidence either way.
+        if let Some(heard_ms) = parsed.heard_ms {
+            let fingerprint =
+                db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
+            let revision = db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(0);
+            let receipt = crate::db::PlaybackReceipt {
+                segment_id: parsed.id.clone(),
+                segment_revision: revision,
+                audio_fingerprint: fingerprint,
+                reviewer: Some(reviewer.to_string()),
+                session_id: None,
+                started_at_ms: now_ms,
+                played_ms: heard_ms.max(0),
+                clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0).max(0),
+            };
+            if let Err(e) = db.record_playback_receipt(&receipt) {
+                tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
+            }
         }
     };
 
