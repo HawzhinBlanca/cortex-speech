@@ -177,3 +177,91 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     ).not.toBeNull();
   });
 });
+
+describe('cumulative media-time accounting (playback evidence)', () => {
+  // `audioError` proved the absence of a FAILURE, never the presence of listening. These pin the
+  // measure that replaces it: media time actually advanced.
+  function player() {
+    const el = { currentTime: 0, paused: false } as HTMLAudioElement;
+    let heard = 0;
+    let last: number | null = null;
+    const MAX = 1.5;
+    return {
+      el,
+      get heardMs() {
+        return heard;
+      },
+      reset() {
+        heard = 0;
+        last = null;
+      },
+      tick() {
+        if (el.paused) {
+          last = null;
+          return;
+        }
+        if (last !== null) {
+          const d = el.currentTime - last;
+          if (d > 0 && d <= MAX) heard += d * 1000;
+        }
+        last = el.currentTime;
+      },
+    };
+  }
+
+  it('counts forward playback', () => {
+    const p = player();
+    for (const t of [0, 0.25, 0.5, 0.75, 1.0]) {
+      p.el.currentTime = t;
+      p.tick();
+    }
+    expect(Math.round(p.heardMs)).toBe(1000);
+  });
+
+  it('does not count a seek as listening', () => {
+    const p = player();
+    p.el.currentTime = 0;
+    p.tick();
+    p.el.currentTime = 8; // scrubbed to the end
+    p.tick();
+    expect(p.heardMs).toBe(0);
+  });
+
+  it('does not count time while paused', () => {
+    const p = player();
+    p.el.currentTime = 0;
+    p.tick();
+    p.el.paused = true;
+    p.el.currentTime = 5;
+    p.tick();
+    expect(p.heardMs).toBe(0);
+  });
+
+  it('replaying the same half never adds up to the whole clip', () => {
+    const p = player();
+    for (const t of [0, 0.5, 1.0]) {
+      p.el.currentTime = t;
+      p.tick();
+    }
+    p.el.currentTime = 0; // back to the start
+    p.tick();
+    for (const t of [0.5, 1.0]) {
+      p.el.currentTime = t;
+      p.tick();
+    }
+    // Two listens of the first second are 2s of media time, but the clip is longer than that —
+    // coverage is decided by the backend against clip_duration_ms, and this only reports what played.
+    expect(Math.round(p.heardMs)).toBe(2000);
+  });
+
+  it('a new source resets the evidence', () => {
+    const p = player();
+    p.el.currentTime = 0;
+    p.tick();
+    p.el.currentTime = 1;
+    p.tick();
+    expect(p.heardMs).toBeGreaterThan(0);
+    p.reset();
+    expect(p.heardMs).toBe(0);
+  });
+});

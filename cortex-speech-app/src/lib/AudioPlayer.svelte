@@ -30,6 +30,12 @@
     // VERBATIM corpus — the queue already refuses clips whose FILE is gone (2026-08-15); this closes
     // the same disease coming through every other failure mode.
     audioError?: string | null;
+    // Cumulative MEDIA time this clip has actually advanced, in ms. Not wall-clock, not a play()
+    // call, not a download — a file can arrive, decode and sit at 0:00 while nobody hears a word of
+    // it, which is exactly the hole `audioError` left open: it proved the absence of a FAILURE, never
+    // the presence of listening. Seeks and pauses stop the accounting; a replay resumes adding to it,
+    // so hearing the first half twice never counts as hearing the whole clip.
+    heardMs?: number;
   }
   let {
     audioPath,
@@ -43,7 +49,27 @@
     autoplay = false,
     playing = $bindable(false),
     audioError = $bindable<string | null>(null),
+    heardMs = $bindable(0),
   }: Props = $props();
+
+  // Media-time position at the previous tick. Only FORWARD movement of a playing element counts, and
+  // a jump larger than one tick is a seek, not listening.
+  let lastMediaPos: number | null = null;
+  const MAX_TICK_ADVANCE_S = 1.5;
+
+  function accrueHeardTime(now: number) {
+    if (lastMediaPos !== null) {
+      const delta = now - lastMediaPos;
+      if (delta > 0 && delta <= MAX_TICK_ADVANCE_S) heardMs += delta * 1000;
+    }
+    lastMediaPos = now;
+  }
+
+  /// A new clip (or new audio) starts its own accounting: evidence never carries across clips.
+  export function resetHeardTime() {
+    heardMs = 0;
+    lastMediaPos = null;
+  }
   let audioEl: HTMLAudioElement | undefined = $state();
   let loading = $state(true);
   let playbackRate = $state(1.0);
@@ -102,6 +128,7 @@
       // 3. Set src directly; the onloadedmetadata handler will clear loading.
       const url = convertFileSrc(cleanPath);
       if (audioEl) {
+        resetHeardTime(); // new source => new evidence; a previous clip's listen never carries
         audioEl.src = url;
         audioEl.playbackRate = playbackRate;
         audioEl.load();
@@ -303,6 +330,8 @@
   function handleTimeUpdate() {
     if (!audioEl) return;
     currentTime = audioEl.currentTime;
+    if (!audioEl.paused) accrueHeardTime(audioEl.currentTime);
+    else lastMediaPos = null;
     // When the precise clip-stop timer is armed, let IT own the exact stop/loop. Acting here too, at
     // the ~250ms timeupdate granularity, can double-loop a short word window at the seam.
     if (clipStopTimer) return;
