@@ -1,7 +1,7 @@
 //! Voice focus: point every reviewer's queue at ONE speaker's clips, so their hours build the set
 //! the owner is collecting right now.
 //!
-//! Owner instruction 2026-08-19: this phase collects the KBHP host's voice — clean, single-speaker —
+//! Owner instruction 2026-08-19: this phase collects one podcast host's voice — clean, single-speaker —
 //! for voice cloning; guests come later. Reviewing 34 hours of mixed audio to get at one voice wastes
 //! paid reviewer time on clips that will not ship in this set. So the queue narrows, the library does
 //! not: nothing is relabelled, nothing is deleted, and removing the file restores the full queue.

@@ -1,8 +1,8 @@
 //! Find the one voice that appears in EVERY episode of a podcast — the host — without trusting the
 //! per-file `SPEAKER_xx` labels, which name nobody (the same person is SPEAKER_05 in one episode and
-//! SPEAKER_04 in the next, measured 2026-08-19 across 32 KBHP files).
+//! SPEAKER_04 in the next, measured 2026-08-19 across 32 episode files).
 //!
-//! Owner goal: collect the KBHP host's voice as a clean single-speaker set for voice cloning, and
+//! Owner goal: collect one podcast host's voice as a clean single-speaker set for voice cloning, and
 //! point reviewers ONLY at those clips so their hours build that set. Guests stay in the library
 //! untouched for a later phase. Nothing here writes to the database.
 //!
@@ -111,6 +111,9 @@ fn main() -> Result<(), String> {
     // One decode per source file (the speaker probe's lesson: per-clip decode died on the full library).
     let mut cached: Option<(String, u32, Vec<i16>)> = None;
     let mut embedded: Vec<(String, String, i64, Vec<f32>)> = Vec::new();
+    // Kept so the blind sample can be cut from the SAME PCM that was embedded — what the owner
+    // hears is exactly what the model judged, with no second decode pass.
+    let mut pcm_by_id: HashMap<String, (u32, Vec<i16>)> = HashMap::new();
     let mut skipped = 0usize;
     for (done, (id, path, dur, align)) in rows.iter().enumerate() {
         if done % 500 == 0 && done > 0 {
@@ -143,6 +146,7 @@ fn main() -> Result<(), String> {
             skipped += 1;
             continue;
         }
+        pcm_by_id.insert(id.clone(), (*rate, clip.to_vec()));
         embedded.push((id.clone(), path.clone(), *dur, vec));
     }
     println!("embedded  : {}   skipped: {skipped}\n", embedded.len());
@@ -243,7 +247,31 @@ fn main() -> Result<(), String> {
     std::fs::write(&candidates, candidate_ids.iter().map(|id| format!("{id}\n")).collect::<String>())
         .map_err(|e| e.to_string())?;
 
+    // The blind sample as playable WAVs, numbered in judging order. 16 kHz mono PCM, the clip only.
+    let sample_dir = out_dir.join("blind_sample");
+    std::fs::create_dir_all(&sample_dir).map_err(|e| e.to_string())?;
+    for (n, (id, _)) in sample.iter().enumerate() {
+        let Some((rate, pcm)) = pcm_by_id.get(*id) else { continue };
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: *rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let path = sample_dir.join(format!("{:02}.wav", n + 1));
+        let mut w = hound::WavWriter::create(&path, spec).map_err(|e| e.to_string())?;
+        for &v in pcm {
+            w.write_sample(v).map_err(|e| e.to_string())?;
+        }
+        w.finalize().map_err(|e| e.to_string())?;
+    }
+
     println!("\nwrote:");
+    println!(
+        "  {}   <- 01.wav .. {:02}.wav, the sample as audio, in judging order",
+        sample_dir.display(),
+        sample.len()
+    );
     println!("  {}   <- {} ids to judge by ear, in order", blind.display(), sample.len());
     println!("  {}   <- DO NOT open until judged", key.display());
     println!("  {}   <- all {} candidate-host clip ids", candidates.display(), candidate_ids.len());
