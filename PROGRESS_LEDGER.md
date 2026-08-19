@@ -10480,3 +10480,63 @@ the first `PLAYBACK_EVIDENCE_REFUSED` in the log is the live proof, and it has n
 **GO_MODEL_PROMOTION: NO** — Gate B unchanged: 1.10 h of 25, 6 recordings of 25.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (hunt) — the brutal bug hunt: 14 agents, 8 confirmed-certain, and a deploy that would have bricked the desktop
+
+Six specialised finders swept the codebase in parallel (read-only, while a reviewer worked live),
+32 raw findings deduped to 21, the top 8 adversarially verified — a second set of agents instructed
+to REFUTE each claim. All 8 survived as CONFIRMED at "certain". 1.56M tokens, 319 tool calls, 14 min.
+
+### The one that mattered most
+
+The staged desktop-enforcement build — already compiled, waiting only for the reviewer to finish so
+it could deploy — would have refused essentially every honest desktop verdict. Clips are windows into
+shared source files (403 of 414 exportable clips live in ONE recording), and both desktop surfaces
+report the WHOLE file's length as the coverage denominator: an honest full listen of a 10 s clip
+scored ~0.004 against the 0.85 bar. The hold-for-Rubar pause is the only reason it wasn't live.
+
+### Confirmed and fixed (each failing-first where a test could be written)
+
+1. **One front door for receipts** — db::record_playback_receipt resolves revision, fingerprint AND
+   denominator from the row, overriding every caller's claims. The desktop's `path:` vs `id:`
+   fingerprint deadlock died in the same stroke.
+2. **Listening is personal** — the guard matched segment+revision+fingerprint only, so reviewer A's
+   listen evidenced reviewer B's blind verdict. Guard, gate and requeue tool all reviewer-scoped now.
+3. **heardMs never reset between same-file clips** — resetHeardTime() had ZERO external callers;
+   clip B passed on clip A's minutes. Reset now fires on every clipKey change in the shared player.
+4. **Undo punished listening** — the decision bumps the revision past its own receipt, so re-deciding
+   a clip just heard and undone was refused 428. The undo txn carries the reviewer's best receipt
+   forward; fingerprint equality is what makes that honest. Measured 428 before, 200 after; another
+   reviewer still gets 428.
+5. **funnel_host under the COUCH mutex with no timeout** — a wedged tailscale.exe would have frozen
+   every status call and is_running(), the restore fence. Bounded 3 s, cached per process.
+6. **requeue --apply rerun wiped good re-reviews** — it judged every event in the window, not the
+   segment's LATEST decision. Plus the 'T'-separator fence bypass ('T' sorts after digits, so an ISO
+   timestamp sailed past the lexicographic fence into an empty window).
+7. **exe-freshness blind to build config** — commits touching only package-lock/vite/svelte/tsconfig
+   read as "non-source" and certified a stale exe as HEAD.
+8. **Desktop refusals in raw English** — E_NO_PLAYBACK_EVIDENCE shown verbatim; now review.mustListen
+   in both languages (Sorani awaiting the owner's native read, with the phone's copy).
+
+### Found, verified or plausible, NOT yet fixed — owner should know
+
+* **Side-door verdict writers**: batch_verify, write_segment_verdict, restore_segment_snapshot and
+  update_segment_fields can set verified/verdict without the listening guard. Some are legitimate
+  (undo/restore, owner batch tools with their own audit trail); whether batch_verify should demand
+  evidence is a policy call, not a code call.
+* Outbox flush before `me` is known can 409-destroy another reviewer's queued decision (phone).
+* api_decision mints the receipt at the CURRENT revision before the rowVersion CAS — a stale outbox
+  replay can mint evidence at a revision the phone never saw.
+* Spot-check pairs can outlive a batch-unverify, silently mis-scoring a real re-review.
+* The readiness gate's ±5 s window can pair one receipt with two same-segment decisions.
+
+### The instrument lied twice today before the hunt
+
+Local-time window vs UTC rows (hid 3 h of live work), then current-revision matching vs
+revision-bumping decisions (called nine correctly-guarded decisions unevidenced). Both times the gate
+UNDER-reported the system. The hunt's verifiers were told to refute, not confirm — same lesson.
+
+Totals after fixes: Rust 1288 passed, clippy -D warnings 0, vitest 280, 86 policy scripts, typecheck
+0 errors. Gate: READY (32/32 evidenced, 2 reviewers). Deployed exe still 128a067 — rebuild pending.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
