@@ -10236,3 +10236,53 @@ Phase 8 link drill.
 which is reviewer time and cannot be engineered.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (final) — enforcement in observation, and a security finding I nearly fabricated
+
+Phase 3 is wired end to end and now runs in OBSERVE-ONLY mode on the phone path: the guard is asked
+the real question and its answer is logged, but no decision is refused.
+
+The remaining unknown was never the rule — it is whether `timeupdate` fires often enough on a real
+mobile browser through the Funnel for coverage to reach the bar. Switching to hard refusal on an
+assumption about that would, if wrong, reject every decision from all eight reviewers at once.
+Observation makes the LIVE SYSTEM answer it: a day of real reviewing shows whether receipts land with
+sensible coverage, and only then is enforcement a one-line change backed by evidence.
+
+Watch for `PLAYBACK_EVIDENCE_OBSERVE` in the log. Zero of them across a day of reviewing means mobile
+accounting works and enforcement is safe to switch on.
+
+### Phase 8, the part that needs no reviewer session
+
+```
+public shell            : HTTP 200, 77,816 bytes
+secrets in public shell : NONE
+queue    without cookie : HTTP 401 -> REFUSED
+audio    without cookie : HTTP 401 -> REFUSED
+decision without cookie : HTTP 401 -> REFUSED
+```
+
+The rest of Phase 8 (cookie flags, ranged-audio authorisation, idempotent replay, revocation, reissue)
+needs a claim session, and a 9th reviewer cannot be created: canon caps the roster at 8 and a 9th
+raises the spot-check floor to 27 keys against the 24 that exist.
+
+### The fifth check of mine that proved nothing
+
+The first run of those probes reported **"audio SERVED without cookie (!!)"**. False. The couch server
+is HTTPS-only, plain HTTP timed out, and the probe treated a connection failure as "not refused" —
+it would have been a fabricated security finding. Re-run over TLS, everything refuses correctly.
+
+Five this session: `strings` (0 for every string), `PRAGMA user_version` (wrong migration table),
+`PRAGMA synchronous` (per-connection), a CACHED clippy run without `-D warnings` (reached CI as a real
+dead-code failure), and this one. **A check whose failure mode is indistinguishable from its pass mode
+is not a check** — every one of these looked conclusive and was empty.
+
+### Standing verdicts
+
+**GO_LINKS: NO** — enforcement observing, not refusing; Phase 8 needs a claim session.
+**GO_MODEL_PROMOTION: NO** — Gate B: 1.09 h of 25, 5 recordings of 25. ~9,800 listening decisions,
+which is reviewer time and cannot be engineered.
+
+Phases 1, 2, 4, 7 complete. 5 at 3-of-5 (rest terminates at Gate B). 3, 6, 8 blocked on a phone, a
+corpus and a reviewer slot respectively — none of them code.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

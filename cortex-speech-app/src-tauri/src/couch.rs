@@ -1947,6 +1947,30 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
             }
         }
+
+        // OBSERVE-ONLY enforcement. The guard is asked the real question and its answer is logged,
+        // but the decision is NOT refused.
+        //
+        // The remaining unknown is not the rule — it is whether `timeupdate` fires often enough on a
+        // real mobile browser through the Funnel for coverage to reach the bar. Switching to hard
+        // refusal on an assumption about that would, if wrong, reject every decision from all eight
+        // reviewers at once. Running it in observation first makes the LIVE SYSTEM answer the
+        // question: a day of real reviewing shows whether receipts land with sensible coverage, and
+        // only then is turning this into a refusal a one-line change backed by evidence rather than
+        // by hope.
+        if action != "skip" {
+            let fingerprint =
+                db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
+            let revision = db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(0);
+            match db.has_sufficient_playback_evidence(&parsed.id, revision, &fingerprint) {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    "PLAYBACK_EVIDENCE_OBSERVE: {} by {reviewer} would be REFUSED under enforcement                      (no receipt covering >= the bar for revision {revision})",
+                    parsed.id
+                ),
+                Err(e) => tracing::warn!("playback evidence check failed for {}: {e}", parsed.id),
+            }
+        }
     };
 
     // SKIP — the explicit NO-VERDICT (R4.4), handled before any of the write machinery because it
