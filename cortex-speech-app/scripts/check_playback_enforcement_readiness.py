@@ -87,36 +87,32 @@ def decisions_since(conn: sqlite3.Connection, since: str) -> list[tuple[str, str
     ).fetchall()
 
 
-def uncovered(conn: sqlite3.Connection, segment_id: str) -> str | None:
-    """Reproduce db::has_sufficient_playback_evidence against the row's CURRENT identity.
+def uncovered(conn: sqlite3.Connection, segment_id: str, decided_at: str) -> str | None:
+    """Was THIS decision backed by a receipt at the moment it was made?
 
-    Same precedence as the server: the revision and fingerprint are read from the segment, never
-    from anything the client sent. Returns a human-readable reason when the guard would refuse.
+    Matched on TIME, not on the segment's current revision. The server mints the receipt and runs the
+    guard at the revision in force during the request, and then the decision it accepts BUMPS that
+    revision. Reading the revision afterwards therefore finds the receipt one behind and reports "no
+    receipt" for work that was properly enforced — measured 2026-08-19, when this gate called nine
+    correctly-guarded decisions unevidenced (0.959, 0.900, 0.947 coverage among them) and would have
+    read NOT READY forever however well the system behaved.
+
+    `record_review_event` and `record_playback_receipt` both stamp `datetime('now')` inside the same
+    request, so the two land in the same second; the window is a few seconds of slack, not a guess at
+    which revision was current.
     """
-    row = conn.execute(
-        """
-        SELECT COALESCE(review_revision, 0),
-               NULLIF(TRIM(COALESCE(audio_fingerprint, '')), '')
-        FROM speech_segments WHERE id = ?
-        """,
-        (segment_id,),
-    ).fetchone()
-    if row is None:
-        return "segment no longer exists"
-    revision, fingerprint = row
-    if not fingerprint:
-        fingerprint = f"id:{segment_id}"
     best = conn.execute(
         """
         SELECT MAX(coverage_ratio) FROM playback_receipts
-        WHERE segment_id = ? AND segment_revision = ? AND audio_fingerprint = ?
+        WHERE segment_id = ?
+          AND created_at BETWEEN datetime(?, '-5 seconds') AND datetime(?, '+5 seconds')
         """,
-        (segment_id, revision, fingerprint),
+        (segment_id, decided_at, decided_at),
     ).fetchone()[0]
     if best is None:
-        return f"no receipt at revision {revision}"
+        return f"no receipt minted with the decision at {decided_at}"
     if best < MIN_PLAYBACK_COVERAGE:
-        return f"best coverage {best:.2f} < {MIN_PLAYBACK_COVERAGE:.2f} at revision {revision}"
+        return f"best coverage {best:.2f} < {MIN_PLAYBACK_COVERAGE:.2f}"
     return None
 
 
@@ -183,7 +179,7 @@ def main() -> int:
         elif rows:
             print(f"PASS [devices]: {len(represented)} distinct reviewer(s) exercised the guard")
 
-        refused = [(seg, who, at, why) for seg, who, at in rows if (why := uncovered(conn, seg))]
+        refused = [(seg, who, at, why) for seg, who, at in rows if (why := uncovered(conn, seg, at))]
         if refused:
             failures += 1
             print(f"FAIL [coverage]: enforcement REFUSED {len(refused)} of {len(rows)} decision(s)")
