@@ -2484,7 +2484,7 @@ mod tests {
     /// worse than showing no Funnel row, because the reviewer cannot tell a dead link from a network
     /// problem on their end. The happy-path fixture is the REAL output of `tailscale serve status
     /// --json` on 2026-08-19, with the hostname redacted to a placeholder — the SHAPE is what the
-/// parser reads, and a public repo has no business carrying a real device name.
+    /// parser reads, and a public repo has no business carrying a real device name.
     #[test]
     fn a_funnel_url_is_only_offered_when_tailscale_really_serves_this_port() {
         let live = serde_json::json!({
