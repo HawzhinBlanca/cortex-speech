@@ -107,7 +107,12 @@ def test_a_covered_decision_passes_so_the_gate_is_not_merely_a_refuser() -> None
         db_path = tmp / "t.db"
         _seed(db_path)
         conn = sqlite3.connect(db_path)
+        # TWO reviewers, because the gate's device bar is part of what "ready" means. A positive
+        # control that dodges one of the checks is not a control for the gate as configured.
+        conn.execute("INSERT INTO speech_segments VALUES ('s2', 0, 'fp2')")
+        conn.execute("INSERT INTO review_events VALUES ('s2', 'Hemn', 'edit', 'couch', '2026-08-20 10:00:00')")
         conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.97)")
+        conn.execute("INSERT INTO playback_receipts VALUES ('s2', 0, 'fp2', 0.93)")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -139,6 +144,27 @@ def test_a_receipt_below_the_bar_is_reported_as_a_refusal() -> None:
         )
         assert result.returncode == 1
         assert "would have REFUSED 1 of 1" in result.stdout, result.stdout
+
+
+def test_one_device_is_not_enough_to_enforce_on_eight() -> None:
+    """Coverage from a single phone is not evidence about the other seven reviewers' browsers."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.99)")
+        conn.commit()
+        conn.close()
+        exe = tmp / "cortex-speech-app.exe"
+        exe.write_bytes(b"\x00" + gate.OBSERVE_MARKER + b"\x00")
+        result = subprocess.run(
+            [sys.executable, str(GATE), "--db", str(db_path), "--exe", str(exe),
+             "--since", "2020-01-01 00:00:00", "--min-decisions", "1"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1, "one reviewer must not clear the device bar: " + result.stdout
+        assert "only 1 reviewer(s)" in result.stdout, result.stdout
 
 
 def main() -> int:

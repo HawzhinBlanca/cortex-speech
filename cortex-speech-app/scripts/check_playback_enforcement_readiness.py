@@ -15,8 +15,14 @@ that first, and refuses to return READY on an empty window:
 
   1. the binary under test actually CONTAINS the observe marker — otherwise silence is vacuous;
   2. phone decisions were taken in the window, at least ``--min-decisions`` of them;
-  3. every one of them is covered by a receipt meeting ``MIN_PLAYBACK_COVERAGE`` at the revision and
+  3. more than one reviewer is represented, because `timeupdate` fires on a DEVICE, not on a policy:
+     twenty clips from one phone say nothing about the other seven reviewers' browsers, and
+     enforcement lands on all of them at once;
+  4. every decision is covered by a receipt meeting ``MIN_PLAYBACK_COVERAGE`` at the revision and
      fingerprint the server resolved — i.e. enforcement would have refused nobody.
+
+The reviewers actually represented are NAMED in the output. The gate cannot prove a browser it has
+never seen will behave, so it reports its own coverage rather than implying it is complete.
 
 Run:  python scripts/check_playback_enforcement_readiness.py [--exe PATH] [--since ISO] [--min-decisions N]
 """
@@ -110,6 +116,7 @@ def main() -> int:
         help="ISO timestamp; defaults to the binary's build time, which is when it could first warn",
     )
     parser.add_argument("--min-decisions", type=int, default=20)
+    parser.add_argument("--min-reviewers", type=int, default=2)
     args = parser.parse_args()
 
     print("PLAYBACK ENFORCEMENT READINESS")
@@ -142,6 +149,18 @@ def main() -> int:
             )
         else:
             print(f"PASS [evidence]: {len(rows)} decision(s) is a real sample")
+
+        represented = sorted({who for _, who, _ in rows})
+        if rows:
+            print(f"       reviewers represented: {len(represented)} ({', '.join(represented)})")
+        if rows and len(represented) < args.min_reviewers:
+            failures += 1
+            print(
+                f"FAIL [devices]: only {len(represented)} reviewer(s) exercised the guard, need "
+                f"{args.min_reviewers} — playback ticks come from a browser, not from a policy"
+            )
+        elif rows:
+            print(f"PASS [devices]: {len(represented)} distinct reviewer(s) exercised the guard")
 
         refused = [(seg, who, at, why) for seg, who, at in rows if (why := uncovered(conn, seg))]
         if refused:
