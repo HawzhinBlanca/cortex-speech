@@ -4418,6 +4418,26 @@ impl Database {
         Ok(("edit".to_string(), Some(approved_text)))
     }
 
+    /// Refuse a gold-minting verdict that has no proof the reviewer heard THIS clip.
+    ///
+    /// The enforcement point is here, not in a renderer: a decision surface can be reloaded, scripted
+    /// or replayed offline, so "the button was disabled" is a usability property, never a guarantee.
+    /// This is the guarantee.
+    ///
+    /// `reject` is included deliberately. Marking a clip bad is a judgement about the AUDIO, and a
+    /// reviewer who never heard it cannot make it — a wrongly rejected clip is silently dropped from
+    /// the corpus, which is the most expensive mistake available and the hardest to notice later.
+    /// `skip` never reaches here: it writes no verdict at all.
+    pub fn require_playback_evidence(&self, segment_id: &str, revision: i64, fingerprint: &str) -> AppResult<()> {
+        if self.has_sufficient_playback_evidence(segment_id, revision, fingerprint)? {
+            return Ok(());
+        }
+        Err(AppError::Validation(format!(
+            "E_NO_PLAYBACK_EVIDENCE: no receipt shows this reviewer heard at least {:.0}% of segment              {segment_id} at revision {revision}. A verdict on an unheard clip is a guess, not a label.",
+            MIN_PLAYBACK_COVERAGE * 100.0
+        )))
+    }
+
     /// A reviewer's own record that they HEARD this exact clip at this exact revision.
     ///
     /// `played_ms` is cumulative MEDIA time advanced, never wall-clock and never a `play()` call —

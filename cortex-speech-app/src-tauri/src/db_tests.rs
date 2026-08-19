@@ -4566,3 +4566,30 @@ fn a_receipt_records_which_policy_it_satisfied() {
         .unwrap();
     assert_eq!(version, PLAYBACK_POLICY_VERSION, "a receipt must say which rule it met");
 }
+
+#[test]
+fn a_verdict_without_a_listen_is_refused_by_the_backend() {
+    // The enforcement point is the backend: a decision surface can be reloaded, scripted or replayed
+    // offline, so a disabled button is usability, not a guarantee.
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-guard-1", "/a/clip.wav")).unwrap();
+    let error = db.require_playback_evidence("pb-guard-1", 0, "fp-a").unwrap_err().to_string();
+    assert!(error.contains("E_NO_PLAYBACK_EVIDENCE"), "refusal must be machine-readable, got: {error}");
+}
+
+#[test]
+fn a_verdict_with_a_real_listen_is_allowed() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-guard-2", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-guard-2", 0, "fp-a", 9_000, 9_000)).unwrap();
+    db.require_playback_evidence("pb-guard-2", 0, "fp-a").expect("a heard clip must be decidable");
+}
+
+#[test]
+fn evidence_for_the_wrong_clip_does_not_satisfy_the_guard() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-guard-3", "/a/clip.wav")).unwrap();
+    db.insert_segment(&make_segment("pb-guard-4", "/a/other.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-guard-3", 0, "fp-a", 9_000, 9_000)).unwrap();
+    assert!(db.require_playback_evidence("pb-guard-4", 0, "fp-b").is_err());
+}
