@@ -121,6 +121,7 @@ export const en: Record<string, string> = {
   'review.progress': 'Clip {n} of {total}',
   'review.reviewedCount': '{done} of {total} reviewed',
   'review.editHint': 'Listen, then fix the text if needed',
+  'review.mustListen': 'Not saved: play the whole clip first. A verdict on audio nobody heard is a guess.',
   'review.listen': 'Listen & locate',
   'review.listenHint':
     'Tap a word to hear just that word; double-tap (or F2) to fix it in place. Coloured words are lower-confidence — check those first.',

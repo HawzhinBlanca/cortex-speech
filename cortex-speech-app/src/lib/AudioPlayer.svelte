@@ -175,6 +175,22 @@
     }
   });
 
+  // Evidence accounting is PER CLIP, and this is the reset that makes it true. Found by the
+  // 2026-08-19 bug hunt, verified certain: resetHeardTime() had zero external callers and the only
+  // internal one runs on a SOURCE change — but consecutive review clips share their source file
+  // (403 of 414 clips live in one recording), so heardMs accumulated across an entire same-file
+  // session and clip B passed the listening guard on clip A's minutes. Keyed on clipKey exactly
+  // like autoplay above, but unconditionally: evidence hygiene must not depend on the autoplay
+  // setting. The parent's bound heardMs snapshot is taken at decision time, before advance, so
+  // resetting on the NEW clip's arrival never races the receipt.
+  let accountedClip: string | number | undefined = undefined;
+  $effect(() => {
+    if (clipKey !== undefined && clipKey !== accountedClip) {
+      accountedClip = clipKey;
+      resetHeardTime();
+    }
+  });
+
   // Sync playbackRate changes to the audio element reactively.
   $effect(() => {
     if (audioEl) audioEl.playbackRate = playbackRate;

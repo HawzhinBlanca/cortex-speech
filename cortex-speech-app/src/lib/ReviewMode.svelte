@@ -433,7 +433,8 @@
       }
     } catch (e) {
       undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
-      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
+      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
     } finally {
       saving = false;
     }
@@ -742,7 +743,8 @@
       advance();
     } catch (e) {
       undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
-      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
+      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
     } finally {
       saving = false;
     }
@@ -784,7 +786,8 @@
           s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
         );
       } catch (e) {
-        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
+      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       } finally {
         saving = false;
       }
@@ -832,7 +835,8 @@
       // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
       // this component — so a lost draft is never silent.
       api.updateSegmentFields(seg.id, { annotatedTranscript: text }).catch((e) => {
-        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
+      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       });
     };
   });

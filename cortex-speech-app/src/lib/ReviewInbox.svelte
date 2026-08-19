@@ -235,7 +235,9 @@
       // The decision did not persist: drop the phantom undo entry pushed above and
       // tell the reviewer, rather than silently swallowing it (unhandled rejection).
       history = history.slice(0, -1);
-      statusMsg = $t('inbox.status.acceptFailed', { err: String(e) });
+      statusMsg = String(e).includes('E_NO_PLAYBACK_EVIDENCE')
+        ? $t('review.mustListen')
+        : $t('inbox.status.acceptFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
     }
@@ -252,6 +254,7 @@
   }
 
   async function commitEdit() {
+    if (audioError) return; // unplayable audio: refuse the verdict, same as accept/reject
     if (!current || !editText.trim() || isSubmitting || current.humanDecision) return;
     // Never write text opened for one segment onto another: if the queue navigated since startEdit
     // (any path the reactive reset above might not cover), drop the stale edit instead of persisting
@@ -291,7 +294,9 @@
       advance();
     } catch (e) {
       history = history.slice(0, -1);
-      statusMsg = $t('inbox.status.editFailed', { err: String(e) });
+      statusMsg = String(e).includes('E_NO_PLAYBACK_EVIDENCE')
+        ? $t('review.mustListen')
+        : $t('inbox.status.editFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
     }
@@ -324,7 +329,9 @@
       advance();
     } catch (e) {
       history = history.slice(0, -1);
-      statusMsg = $t('inbox.status.rejectFailed', { err: String(e) });
+      statusMsg = String(e).includes('E_NO_PLAYBACK_EVIDENCE')
+        ? $t('review.mustListen')
+        : $t('inbox.status.rejectFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
     }
