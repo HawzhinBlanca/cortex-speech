@@ -68,6 +68,7 @@
     "speakerChange": "more than one speaker",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
+    "mustListen": "Not saved: play the whole clip first. A verdict on audio nobody heard is a guess.",
     "editHint": "Listen, and correct the text if needed"
   },
   "ckb": {
@@ -96,6 +97,7 @@
     "speakerChange": "زیاتر لە یەک قسەکەر",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
+    "mustListen": "پاشەکەوت نەکرا: سەرەتا گوێ لە هەموو پارچەکە بگرە. بڕیاردان لەسەر دەنگێک کە کەس گوێی لێ نەگرتووە، تەنیا مەزەندەیە.",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
   },
   "source": {
@@ -124,6 +126,7 @@
     "speakerChange": null,
     "stillSending": null,
     "refused": null,
+    "mustListen": null,
     "editHint": "review.editHint"
   }
 }
@@ -915,7 +918,11 @@
         // language-neutral, still diagnostic, and fits the reviewed string's existing {err} slot with no
         // new Sorani. A transport failure has no status at all, and a dash is more honest there than
         // "Failed to fetch" — the Retry affordance is what actually helps.
-        toast(t('saveFailed', { err: e.status || '—' }), true);
+        // 428: the clip was not played enough to judge it. This is the ONE refusal the reviewer can
+        // fix themselves, so it gets a sentence rather than a status code — and the page stays on the
+        // clip, because replaying it is exactly what they should do next.
+        if (e.status === 428) toast(t('mustListen'), true);
+        else toast(t('saveFailed', { err: e.status || '—' }), true);
         // The server refused because someone else has this clip (409). Staying here would keep
         // re-submitting a decision that can never land, so move past it rather than trapping the reviewer.
         if (e.status === 409) { i += 1; show(); }

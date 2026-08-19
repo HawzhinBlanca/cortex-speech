@@ -1968,6 +1968,88 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Err(e) => return err_reply(500, &e.to_string()),
     };
 
+    // LISTENING EVIDENCE — minted, then ENFORCED, before anything is written.
+    //
+    // Order matters and is not obvious: the page reports its heard-time WITH the decision, so the
+    // receipt for this very submit has to be recorded before the guard can possibly pass. Checking
+    // first would refuse every decision forever. The revision and the fingerprint are still resolved
+    // server-side, and the coverage denominator is the server's own clip length, so neither half of
+    // the ratio is the client's to assert.
+    //
+    // A `skip` is exempt and always was: it writes no verdict, no attribution and no `verified`, so
+    // there is no claim to stand behind. It is the honest answer for a clip the reviewer cannot
+    // judge, and refusing it would leave someone who could not hear a clip with no legal move at all.
+    // A receipt is still minted for it — a clip that was heard and then skipped is real evidence.
+    //
+    // A REJECT is NOT exempt (owner decision 2026-08-19, after the pilot measured four rejects in two
+    // seconds with zero playback). An accept or an edit injects text; a reject permanently removes a
+    // clip from a corpus whose size is the binding constraint. Both are verdicts, and a verdict on a
+    // clip nobody heard is a guess either way.
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let fingerprint =
+        db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
+    let revision = db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(0);
+    if let Some(heard_ms) = parsed.heard_ms {
+        let receipt = crate::db::PlaybackReceipt {
+            segment_id: parsed.id.clone(),
+            segment_revision: revision,
+            audio_fingerprint: fingerprint.clone(),
+            reviewer: Some(reviewer.to_string()),
+            session_id: None,
+            started_at_ms: now_ms,
+            played_ms: heard_ms.max(0),
+            clip_duration_ms: db
+                .segment_clip_duration_ms(&parsed.id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| parsed.clip_duration_ms.unwrap_or(0).max(0)),
+        };
+        if let Err(e) = db.record_playback_receipt(&receipt) {
+            // NOT a warning to swallow any more. Under enforcement the receipt IS the reviewer's
+            // proof, so losing it silently means refusing them for the server's failure: they replay
+            // the clip, the write fails again, and nothing they can do will land. A busy database is
+            // a 500 -- which the page already holds and retries -- not a verdict about listening.
+            tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
+            // Hold the clip for THIS reviewer before giving up on it. A 428 is a rejected request and
+            // deliberately leaves no lease, but a 500 is the server's own failure: the reviewer still
+            // has the clip open with their correction typed and now queued, and a freed clip goes to
+            // the next reviewer's batch within seconds — their replay then loses a race that never
+            // needed to happen. Same rule the decision write below follows for the same reason.
+            {
+                let now = Instant::now();
+                let mut guard = lock_state(state);
+                if !guard.holder(&parsed.id, now).is_some_and(|who| who != reviewer) {
+                    guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
+                }
+            }
+            return err_reply(500, &format!("playback receipt not recorded: {e}"));
+        }
+    }
+    if parsed.action != "skip" {
+        match db.has_sufficient_playback_evidence(&parsed.id, revision, &fingerprint) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!("PLAYBACK_EVIDENCE_REFUSED: {} by {reviewer} at revision {revision}", parsed.id);
+                // 428 Precondition Required: the reviewer must do something first, and it is neither a
+                // conflict (409) nor a malformed request (400). The page holds the clip and says so; the
+                // outbox treats it as a settled answer rather than retrying what can never land.
+                return err_reply(
+                    428,
+                    &db.require_playback_evidence(&parsed.id, revision, &fingerprint)
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
+                );
+            }
+            // NOT a verdict about the reviewer. A locked or unwell database cannot answer the
+            // question, and telling someone who listened properly that they did not is both false and
+            // unactionable — they would replay the clip and be refused again. 500 says "the server is
+            // unwell", which the page already holds and retries.
+            Err(e) => return err_reply(500, &format!("playback evidence check failed: {e}")),
+        }
+    }
+
     // AUDIT TRAIL (v45), written for every accepted submit including spot checks — a reviewer's
     // throughput must count the work they actually did, and a check is real work to them. Best-effort
     // and logged on failure: losing the RECORD of a decision must never cost the DECISION.
@@ -1978,60 +2060,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             .unwrap_or(0);
         if let Err(e) = db.record_review_event(&parsed.id, reviewer, action, "couch", now_ms) {
             tracing::warn!("Couch Review audit event not recorded for {}: {e}", parsed.id);
-        }
-        // Mint the listening receipt for the clip the SERVER served. The page reports only how much
-        // media time it advanced; the revision and audio fingerprint are resolved here, so a client
-        // cannot claim to have heard a clip or a revision it never loaded. `skip` passes through too:
-        // it writes no verdict, and a receipt for a clip that was heard and then skipped is honest
-        // evidence either way.
-        if let Some(heard_ms) = parsed.heard_ms {
-            let fingerprint =
-                db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
-            let revision = db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(0);
-            let receipt = crate::db::PlaybackReceipt {
-                segment_id: parsed.id.clone(),
-                segment_revision: revision,
-                audio_fingerprint: fingerprint,
-                reviewer: Some(reviewer.to_string()),
-                session_id: None,
-                started_at_ms: now_ms,
-                played_ms: heard_ms.max(0),
-                // The server's own clip length, so coverage is measured against the audio that was
-                // actually served. The page's `clipDurationMs` is a fallback for a row that has no
-                // duration recorded at all, and cannot be used to shrink a clip into a passing ratio.
-                clip_duration_ms: db
-                    .segment_clip_duration_ms(&parsed.id)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| parsed.clip_duration_ms.unwrap_or(0).max(0)),
-            };
-            if let Err(e) = db.record_playback_receipt(&receipt) {
-                tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
-            }
-        }
-
-        // OBSERVE-ONLY enforcement. The guard is asked the real question and its answer is logged,
-        // but the decision is NOT refused.
-        //
-        // The remaining unknown is not the rule — it is whether `timeupdate` fires often enough on a
-        // real mobile browser through the Funnel for coverage to reach the bar. Switching to hard
-        // refusal on an assumption about that would, if wrong, reject every decision from all eight
-        // reviewers at once. Running it in observation first makes the LIVE SYSTEM answer the
-        // question: a day of real reviewing shows whether receipts land with sensible coverage, and
-        // only then is turning this into a refusal a one-line change backed by evidence rather than
-        // by hope.
-        if action != "skip" {
-            let fingerprint =
-                db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
-            let revision = db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(0);
-            match db.has_sufficient_playback_evidence(&parsed.id, revision, &fingerprint) {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(
-                    "PLAYBACK_EVIDENCE_OBSERVE: {} by {reviewer} would be REFUSED under enforcement                      (no receipt covering >= the bar for revision {revision})",
-                    parsed.id
-                ),
-                Err(e) => tracing::warn!("playback evidence check failed for {}: {e}", parsed.id),
-            }
         }
     };
 
@@ -2449,32 +2477,32 @@ mod tests {
         assert_eq!(review_text(&blank), "raw draft");
     }
 
-    #[test]
     /// A Funnel URL is only worth handing to a reviewer if Tailscale is actually serving it.
     ///
     /// All three conditions matter independently: a handler on this port, at `/`, and AllowFunnel
     /// true. Drop any one and the app publishes a hostname that resolves and then refuses — which is
     /// worse than showing no Funnel row, because the reviewer cannot tell a dead link from a network
     /// problem on their end. The happy-path fixture is the REAL output of `tailscale serve status
-    /// --json` from the owner's machine on 2026-08-19.
+    /// --json` on 2026-08-19, with the hostname redacted to a placeholder — the SHAPE is what the
+/// parser reads, and a public repo has no business carrying a real device name.
     #[test]
     fn a_funnel_url_is_only_offered_when_tailscale_really_serves_this_port() {
         let live = serde_json::json!({
             "TCP": { "443": { "HTTPS": true } },
-            "Web": { "hawapc01.tail721a13.ts.net:443": {
+            "Web": { "this-pc.example-tailnet.ts.net:443": {
                 "Handlers": { "/": { "Proxy": "https+insecure://127.0.0.1:8737" } } } },
-            "AllowFunnel": { "hawapc01.tail721a13.ts.net:443": true }
+            "AllowFunnel": { "this-pc.example-tailnet.ts.net:443": true }
         });
         assert_eq!(
             super::funnel_host_from_status(&live, 8737).as_deref(),
-            Some("hawapc01.tail721a13.ts.net"),
+            Some("this-pc.example-tailnet.ts.net"),
             "the live config serves 8737 with Funnel on — the reviewer should get this link"
         );
 
         // Funnel configured but NOT public: reachable only inside the tailnet, which is what
         // tailscale_url already covers. Offering it as the any-network link would be a lie.
         let mut private = live.clone();
-        private["AllowFunnel"]["hawapc01.tail721a13.ts.net:443"] = serde_json::json!(false);
+        private["AllowFunnel"]["this-pc.example-tailnet.ts.net:443"] = serde_json::json!(false);
         assert_eq!(super::funnel_host_from_status(&private, 8737), None);
 
         // Serving a DIFFERENT port — someone else's service, not Couch Review.
@@ -2482,7 +2510,7 @@ mod tests {
 
         // A Funnel with no root handler cannot serve the review page.
         let mut subpath = live.clone();
-        subpath["Web"]["hawapc01.tail721a13.ts.net:443"]["Handlers"] =
+        subpath["Web"]["this-pc.example-tailnet.ts.net:443"]["Handlers"] =
             serde_json::json!({ "/other": { "Proxy": "https+insecure://127.0.0.1:8737" } });
         assert_eq!(super::funnel_host_from_status(&subpath, 8737), None);
 
@@ -2628,7 +2656,7 @@ mod tests {
             "heardMs": 100, "clipDurationMs": 100,
         });
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
-        assert_eq!(code, 200);
+        assert_eq!(code, 428, "a tenth of a second cannot buy a verdict by relabelling the clip");
 
         let (total, coverage): (i64, f64) = db
             .connection()
@@ -2650,6 +2678,70 @@ mod tests {
         );
     }
 
+    /// ENFORCEMENT, end to end: an under-played clip is REFUSED and the row is left untouched.
+    ///
+    /// Every other test here proves the guard can ANSWER the question. This proves the answer is
+    /// acted on — the distinction the whole observe-only period existed to close. A guard that logs
+    /// its objection and writes the verdict anyway is decoration, and it looked identical to this one
+    /// in every log line it produced.
+    ///
+    /// A REJECT is included deliberately (owner decision 2026-08-19): an accept injects text, a
+    /// reject permanently removes a clip, and both are verdicts on audio nobody heard.
+    #[test]
+    fn an_under_played_clip_is_refused_and_writes_nothing() {
+        for action in ["accept", "edit", "bad"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (db, _) = test_db(tmp.path());
+            db.insert_segment(&seg("enf1", "دەقی ئەسڵی")).unwrap();
+            let state = state();
+
+            // The fixture clip is 1500ms; 300ms is a fifth of it.
+            let body = serde_json::json!({
+                "id": "enf1", "action": action, "text": "دەقی نوێ",
+                "heardMs": 300, "clipDurationMs": 1_500,
+            });
+            let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            assert_eq!(code, 428, "{action} on a fifth of a clip must be refused");
+
+            let row = db.get_segment_by_id("enf1").unwrap().unwrap();
+            assert!(!row.verified, "{action} was refused, so the row must not be verified");
+            assert_eq!(row.human_decision, None, "{action} was refused, so no decision may be recorded");
+            assert_eq!(row.annotated_transcript, None, "{action} was refused, so no text may be written");
+            assert_eq!(row.raw_transcript, "دەقی ئەسڵی", "the original draft must survive a refusal");
+            assert!(
+                lock_state(&state).holder("enf1", Instant::now()).is_none(),
+                "a refused request must not leave a lease on a clip it never decided"
+            );
+
+            // And the SAME reviewer, having now listened, gets through.
+            let body = serde_json::json!({
+                "id": "enf1", "action": action, "text": "دەقی نوێ",
+                "heardMs": 1_500, "clipDurationMs": 1_500,
+            });
+            let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            assert_eq!(code, 200, "{action} must land once the clip has actually been heard");
+        }
+    }
+
+    /// A SKIP stays legal on a clip that would not play at all — the one honest move left.
+    ///
+    /// Gating it would trap a reviewer whose audio is broken: they cannot judge the clip and could no
+    /// longer say so, which is precisely the guess the skip path exists to prevent.
+    #[test]
+    fn a_skip_is_never_refused_for_not_having_listened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("enf2", "دەقی دوو")).unwrap();
+        let state = state();
+
+        let body = serde_json::json!({"id": "enf2", "action": "skip", "heardMs": 0, "clipDurationMs": 1_500});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "a reviewer who cannot hear a clip must still be able to say so");
+
+        let row = db.get_segment_by_id("enf2").unwrap().unwrap();
+        assert!(!row.verified, "a skip still writes no verdict");
+    }
+
     /// A decision sent with no heard-time reports nothing, and must not fabricate evidence.
     #[test]
     fn a_phone_decision_without_reported_playback_mints_no_receipt() {
@@ -2660,7 +2752,7 @@ mod tests {
 
         let body = serde_json::json!({"id": "pr2", "action": "accept", "text": "دەقی دوو"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
-        assert_eq!(code, 200);
+        assert_eq!(code, 428, "a verdict that reports no listening at all must be refused outright");
 
         let receipts: i64 = db
             .connection()
@@ -2678,7 +2770,7 @@ mod tests {
         let state = state();
 
         // EDIT: corrected text becomes the annotated gold; row is verified; decision recorded.
-        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "دەق یەک ڕاستکراوە"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": "دەق یەک ڕاستکراوە"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
         let row = db.get_segment_by_id("s1").unwrap().unwrap();
@@ -2687,7 +2779,7 @@ mod tests {
         assert_eq!(row.reviewed_by.as_deref(), Some("Sara"), "a phone decision is attributed to its reviewer");
 
         // BAD: reject decision, still marked reviewed.
-        let body = serde_json::json!({"id": "s2", "action": "bad"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s2", "action": "bad"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
         assert!(db.get_segment_by_id("s2").unwrap().unwrap().verified);
@@ -2721,7 +2813,7 @@ mod tests {
         db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
         let state = state();
         let fix = "دەق یەک ڕاستکراوە";
-        let body = serde_json::json!({"id": "s1", "action": "edit", "text": fix});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": fix});
 
         let side = rusqlite::Connection::open(&path).unwrap();
         let pairs = |c: &rusqlite::Connection| -> i64 {
@@ -2764,7 +2856,7 @@ mod tests {
         db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
         let state = state();
 
-        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": "ڕاستکراوەی سارا"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
 
@@ -2797,7 +2889,7 @@ mod tests {
         db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
         let state = state();
 
-        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": "ڕاستکراوەی سارا"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
 
@@ -2846,7 +2938,7 @@ mod tests {
             )
             .unwrap();
 
-        let body = serde_json::json!({"id": "s1", "action": "accept", "text": "دەقی کۆن", "rowVersion": served});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "accept", "text": "دەقی کۆن", "rowVersion": served});
         let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 409, "a stale-version decision must be refused: {msg:?}");
         let row = db.get_segment_by_id("s1").unwrap().unwrap();
@@ -2855,8 +2947,7 @@ mod tests {
 
         // With the CURRENT version the same decision is accepted.
         let fresh = db.segment_row_stamp("s1").unwrap().unwrap();
-        let body =
-            serde_json::json!({"id": "s1", "action": "accept", "text": "دەقی نوێی چامپیۆن", "rowVersion": fresh});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "accept", "text": "دەقی نوێی چامپیۆن", "rowVersion": fresh});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
         assert!(db.get_segment_by_id("s1").unwrap().unwrap().verified);
@@ -2886,7 +2977,7 @@ mod tests {
         reopened.verified = false;
         db.insert_segment(&reopened).unwrap();
 
-        let body = serde_json::json!({"id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
 
@@ -2936,7 +3027,7 @@ mod tests {
         // Hold the lease as api_queue would have when it served her the clip.
         lock_state(&state).leases.insert("g1".to_string(), ("Sara".to_string(), std::time::Instant::now()));
 
-        let body = serde_json::json!({"id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         // The spot-check block runs BEFORE the already-reviewed guard at the end of api_decision, so
         // the contrast is exact: the old code graded against "" and returned 200 from inside that
@@ -2968,7 +3059,7 @@ mod tests {
 
         // Sara decided it, so she has something to undo.
         lock_state(&state).leases.insert("s1".to_string(), ("Sara".to_string(), Instant::now()));
-        let body = serde_json::json!({"id": "s1", "action": "accept", "text": "دەق"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "accept", "text": "دەق"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "precondition: Sara's decision landed");
 
@@ -2984,7 +3075,7 @@ mod tests {
         );
 
         // And the consequence that actually bites: Hemn can still save his work.
-        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوەی هێمن"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": "ڕاستکراوەی هێمن"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Hemn", &state);
         assert_eq!(code, 200, "the legitimate holder must not be 409'd by someone else's undo");
     }
@@ -2998,7 +3089,7 @@ mod tests {
         db.insert_segment(&seg("s1", "دەق")).unwrap();
         let state = state();
         lock_state(&state).leases.insert("s1".to_string(), ("Sara".to_string(), Instant::now()));
-        let body = serde_json::json!({"id": "s1", "action": "accept", "text": "دەق"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "accept", "text": "دەق"});
         assert_eq!(api_decision(&db, body.to_string().as_bytes(), "Sara", &state).0, 200);
 
         lock_state(&state).leases.remove("s1"); // nobody holds it now
@@ -3119,7 +3210,7 @@ mod tests {
         let blocker = rusqlite::Connection::open(&path).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").expect("take the write lock");
 
-        let body = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوە"});
+        let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": "ڕاستکراوە"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 500, "a locked database must surface as a server error, not a verdict");
 
@@ -3150,7 +3241,7 @@ mod tests {
         db.insert_segment(&seg("s2", "دەق دوو")).unwrap();
         let state = state();
 
-        let sara_work = serde_json::json!({"id": "s1", "action": "edit", "text": "ڕاستکراوە", "reviewer": "Sara"});
+        let sara_work = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": "ڕاستکراوە", "reviewer": "Sara"});
         let (code, _, msg, ..) = api_decision(&db, sara_work.to_string().as_bytes(), "Hemn", &state);
         assert_eq!(code, 409, "Sara's decision must not be written under Hemn's name");
         assert!(String::from_utf8_lossy(&msg).contains("Sara"), "the refusal must name the real author: {msg:?}");
@@ -3165,7 +3256,7 @@ mod tests {
         assert_eq!(db.get_segment_by_id("s1").unwrap().unwrap().reviewed_by.as_deref(), Some("Sara"));
 
         // A live submit carries no claim at all, and that ordinary path is unchanged.
-        let live = serde_json::json!({"id": "s2", "action": "bad"});
+        let live = serde_json::json!({"heardMs": 600_000, "id": "s2", "action": "bad"});
         let (code, ..) = api_decision(&db, live.to_string().as_bytes(), "Hemn", &state);
         assert_eq!(code, 200, "a submit with no reviewer field is the normal live path");
         assert_eq!(db.get_segment_by_id("s2").unwrap().unwrap().reviewed_by.as_deref(), Some("Hemn"));
@@ -3183,7 +3274,9 @@ mod tests {
         db.insert_segment(&seg("b1", "هی هێمن")).unwrap();
         let state = state();
 
-        let accept = |id: &str| serde_json::json!({"id": id, "action": "accept", "text": "هەر وایە"}).to_string();
+        let accept = |id: &str| {
+            serde_json::json!({"heardMs": 600_000, "id": id, "action": "accept", "text": "هەر وایە"}).to_string()
+        };
         assert_eq!(api_decision(&db, accept("a1").as_bytes(), "Sara", &state).0, 200);
         assert_eq!(api_decision(&db, accept("b1").as_bytes(), "Hemn", &state).0, 200);
 
@@ -3313,7 +3406,7 @@ mod tests {
         let state = state();
 
         assert_eq!(queue_ids(&db, "Sara", &state), vec!["x1"], "Sara leases the only clip");
-        let body = serde_json::json!({"id": "x1", "action": "accept", "text": "دەق"}).to_string();
+        let body = serde_json::json!({"heardMs": 600_000, "id": "x1", "action": "accept", "text": "دەق"}).to_string();
         let (code, _, msg, ..) = api_decision(&db, body.as_bytes(), "Hemn", &state);
         assert_eq!(code, 409, "Hemn must not decide a clip Sara holds");
         assert!(String::from_utf8_lossy(&msg).contains("another reviewer"), "the refusal says why");
@@ -3343,7 +3436,7 @@ mod tests {
         let state = state();
 
         // (a) Sara submits for u1 without ever calling /api/queue.
-        let ok = serde_json::json!({"id": "u1", "action": "accept", "text": "دەق"}).to_string();
+        let ok = serde_json::json!({"heardMs": 600_000, "id": "u1", "action": "accept", "text": "دەق"}).to_string();
         assert_eq!(api_decision(&db, ok.as_bytes(), "Sara", &state).0, 200);
         assert_eq!(
             lock_state(&state).leases.get("u1").map(|(who, _)| who.clone()),
@@ -3353,9 +3446,9 @@ mod tests {
 
         // (b) every rejected shape, none of which may strand a lease on u2.
         for bad in [
-            serde_json::json!({"id": "u2", "action": "accept", "text": "[Pending WSL 7B ASR]"}),
-            serde_json::json!({"id": "u2", "action": "edit", "text": ""}),
-            serde_json::json!({"id": "u2", "action": "explode", "text": "x"}),
+            serde_json::json!({"heardMs": 600_000, "id": "u2", "action": "accept", "text": "[Pending WSL 7B ASR]"}),
+            serde_json::json!({"heardMs": 600_000, "id": "u2", "action": "edit", "text": ""}),
+            serde_json::json!({"heardMs": 600_000, "id": "u2", "action": "explode", "text": "x"}),
         ] {
             let (code, ..) = api_decision(&db, bad.to_string().as_bytes(), "Sara", &state);
             assert_eq!(code, 400, "body: {bad}");
@@ -3408,7 +3501,8 @@ mod tests {
         db.insert_segment(&seg("r2", "دەق")).unwrap();
         let state = state();
 
-        let edit = serde_json::json!({"id": "r1", "action": "edit", "text": "دەقی ڕاستکراوە"}).to_string();
+        let edit =
+            serde_json::json!({"heardMs": 600_000, "id": "r1", "action": "edit", "text": "دەقی ڕاستکراوە"}).to_string();
         assert_eq!(api_decision(&db, edit.as_bytes(), "Sara", &state).0, 200);
         let pairs = |id: &str| -> i64 {
             db.connection()
@@ -3430,7 +3524,9 @@ mod tests {
         );
 
         // A GENUINE re-review (different text) is a new decision and must land.
-        let redo = serde_json::json!({"id": "r1", "action": "edit", "text": "دەقی دیسان ڕاستکراوە"}).to_string();
+        let redo =
+            serde_json::json!({"heardMs": 600_000, "id": "r1", "action": "edit", "text": "دەقی دیسان ڕاستکراوە"})
+                .to_string();
         assert_eq!(api_decision(&db, redo.as_bytes(), "Sara", &state).0, 200);
         assert_eq!(
             db.get_segment_by_id("r1").unwrap().unwrap().annotated_transcript.as_deref(),
@@ -3441,7 +3537,7 @@ mod tests {
         // A REJECT retry must also be absorbed. Only the edit path was covered, so deleting the
         // ("reject", _) arm of is_repeat_of_stored_decision changed nothing any test could see —
         // and a re-sent reject would have been recorded as a second human decision.
-        let rej = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
+        let rej = serde_json::json!({"heardMs": 600_000, "id": "r2", "action": "bad"}).to_string();
         assert_eq!(api_decision(&db, rej.as_bytes(), "Sara", &state).0, 200);
         let before = lock_state(&state).undo.get("Sara").map(Vec::len).unwrap_or(0);
         let (code, _, body, ..) = api_decision(&db, rej.as_bytes(), "Sara", &state);
@@ -3458,7 +3554,7 @@ mod tests {
         // fresh decision either. Writing this assertion is what exposed the LATE-SUBMIT gap: the lease
         // is released the instant a clip is decided, so an already-decided clip had NO protection, and
         // a stale page could silently replace another human's verdict minutes later.
-        let reject = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
+        let reject = serde_json::json!({"heardMs": 600_000, "id": "r2", "action": "bad"}).to_string();
         assert_eq!(api_decision(&db, reject.as_bytes(), "Sara", &state).0, 200);
         let (code, _, msg, ..) = api_decision(&db, reject.as_bytes(), "Hemn", &state);
         assert_eq!(code, 409, "a decided clip must not be re-decided by a different reviewer");
@@ -3550,10 +3646,12 @@ mod tests {
         }
 
         // Sara LISTENS: she corrects the wrong draft to the known answer.
-        let fix = serde_json::json!({"id": "g1", "action": "edit", "text": "دەقی ڕاست"}).to_string();
+        let fix =
+            serde_json::json!({"heardMs": 600_000, "id": "g1", "action": "edit", "text": "دەقی ڕاست"}).to_string();
         assert_eq!(api_decision(&db, fix.as_bytes(), "Sara", &state).0, 200);
         // Hemn does NOT: he hands the wrong draft straight back.
-        let blind = serde_json::json!({"id": "g1", "action": "accept", "text": "دەقی هەڵە"}).to_string();
+        let blind =
+            serde_json::json!({"heardMs": 600_000, "id": "g1", "action": "accept", "text": "دەقی هەڵە"}).to_string();
         assert_eq!(api_decision(&db, blind.as_bytes(), "Hemn", &state).0, 200);
 
         // Re-queries every call: a snapshot taken once would be read as live after later decisions.
@@ -3580,7 +3678,7 @@ mod tests {
         assert_eq!(of("Hemn").checks, 1, "a retried spot check is still ONE check, not two");
 
         // Rejecting counts as noticing — judging a clip unusable is attention, not a blind accept.
-        let reject = serde_json::json!({"id": "g2", "action": "bad"}).to_string();
+        let reject = serde_json::json!({"heardMs": 600_000, "id": "g2", "action": "bad"}).to_string();
         assert_eq!(api_decision(&db, reject.as_bytes(), "Hemn", &state).0, 200);
         let hemn = of("Hemn");
         assert_eq!((hemn.checks, hemn.noticed), (2, 1), "the reject scored as noticed");
@@ -4029,7 +4127,7 @@ mod tests {
         assert_eq!(served, vec!["sk1", "sk2"]);
 
         let before = db.get_segment_by_id("sk1").unwrap().unwrap();
-        let skip = serde_json::json!({"id": "sk1", "action": "skip"}).to_string();
+        let skip = serde_json::json!({"heardMs": 600_000, "id": "sk1", "action": "skip"}).to_string();
         assert_eq!(api_decision(&db, skip.as_bytes(), "Sara", &state).0, 200);
 
         // NOTHING reached the row: not the decision, not the verdict, not `verified`, not the name.
@@ -4102,7 +4200,7 @@ mod tests {
             .find(|g| first.iter().any(|id| id == g))
             .expect("the batch must carry a spot check to skip");
 
-        let skip = serde_json::json!({"id": check, "action": "skip"}).to_string();
+        let skip = serde_json::json!({"heardMs": 600_000, "id": check, "action": "skip"}).to_string();
         assert_eq!(api_decision(&db, skip.as_bytes(), "Sara", &state).0, 200);
 
         let second = queue_ids(&db, "Sara", &state);
@@ -4142,9 +4240,9 @@ mod tests {
                 .expect("every decision reply carries reviewedMs")
         };
 
-        let first = serde_json::json!({"id": "r1", "action": "accept", "text": "دەق"}).to_string();
+        let first = serde_json::json!({"heardMs": 600_000, "id": "r1", "action": "accept", "text": "دەق"}).to_string();
         assert_eq!(total_of(api_decision(&db, first.as_bytes(), "Sara", &state)), 9_000);
-        let second = serde_json::json!({"id": "r2", "action": "bad"}).to_string();
+        let second = serde_json::json!({"heardMs": 600_000, "id": "r2", "action": "bad"}).to_string();
         assert_eq!(
             total_of(api_decision(&db, second.as_bytes(), "Sara", &state)),
             30_000,
@@ -4159,7 +4257,8 @@ mod tests {
         // And the spot-check path, which returns before any of the machinery above.
         gold_seg(&db, "r-gold", "دەقی هەڵە", "دەقی ڕاست");
         lock_state(&state).spot_checks.insert(("r-gold".to_string(), "Sara".to_string()));
-        let check = serde_json::json!({"id": "r-gold", "action": "accept", "text": "دەقی ڕاست"}).to_string();
+        let check = serde_json::json!({"heardMs": 600_000, "id": "r-gold", "action": "accept", "text": "دەقی ڕاست"})
+            .to_string();
         assert!(
             total_of(api_decision(&db, check.as_bytes(), "Sara", &state)) > 30_000,
             "a spot check is audited as work, so it must move the badge like anything else"
@@ -4180,12 +4279,14 @@ mod tests {
         let state = state();
         lock_state(&state).spot_checks.insert(("e-gold".to_string(), "Sara".to_string()));
 
-        let edit = serde_json::json!({"id": "e1", "action": "edit", "text": "ڕاستکراوە"}).to_string();
+        let edit =
+            serde_json::json!({"heardMs": 600_000, "id": "e1", "action": "edit", "text": "ڕاستکراوە"}).to_string();
         assert_eq!(api_decision(&db, edit.as_bytes(), "Sara", &state).0, 200);
-        let reject = serde_json::json!({"id": "e2", "action": "bad"}).to_string();
+        let reject = serde_json::json!({"heardMs": 600_000, "id": "e2", "action": "bad"}).to_string();
         assert_eq!(api_decision(&db, reject.as_bytes(), "Hemn", &state).0, 200);
         // A spot check is real work to the reviewer who did it, so it is audited too.
-        let check = serde_json::json!({"id": "e-gold", "action": "accept", "text": "دەقی ڕاست"}).to_string();
+        let check = serde_json::json!({"heardMs": 600_000, "id": "e-gold", "action": "accept", "text": "دەقی ڕاست"})
+            .to_string();
         assert_eq!(api_decision(&db, check.as_bytes(), "Sara", &state).0, 200);
 
         let rows: Vec<(String, String, String)> = db
@@ -4365,7 +4466,7 @@ mod tests {
         }));
 
         // The answer arrives AFTER the restart.
-        let body = serde_json::json!({ "id": "trap1", "action": "edit", "text": "دەقی ڕاست" });
+        let body = serde_json::json!({"heardMs": 600_000,  "id": "trap1", "action": "edit", "text": "دەقی ڕاست" });
         let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state2);
         assert_eq!(
             code,
@@ -4653,7 +4754,7 @@ mod tests {
         let state = state();
 
         let refused = |text: &str, action: &str| {
-            let body = serde_json::json!({ "id": "d1", "action": action, "text": text });
+            let body = serde_json::json!({"heardMs": 600_000,  "id": "d1", "action": action, "text": text });
             api_decision(&db, body.to_string().as_bytes(), "Sara", &state).0
         };
 
@@ -4701,7 +4802,7 @@ mod tests {
         db.insert_segment_full(&s).unwrap();
 
         let state = state();
-        let body = serde_json::json!({ "id": "esc1", "action": "accept", "text": "دەق یەک" });
+        let body = serde_json::json!({"heardMs": 600_000,  "id": "esc1", "action": "accept", "text": "دەق یەک" });
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "the accept decision must succeed");
         assert!(db.get_segment_by_id("esc1").unwrap().unwrap().verified, "accept verifies the clip");
@@ -4733,11 +4834,14 @@ mod tests {
         let state = state();
 
         for (body, expect) in [
-            (serde_json::json!({"id": "s1", "action": "edit", "text": ""}), 400u16),
-            (serde_json::json!({"id": "s1", "action": "accept", "text": "[Pending WSL 7B ASR]"}), 400),
-            (serde_json::json!({"id": "s1", "action": "explode", "text": "x"}), 400),
-            (serde_json::json!({"id": "../etc", "action": "accept", "text": "x"}), 400),
-            (serde_json::json!({"id": "missing", "action": "accept", "text": "x"}), 404),
+            (serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": ""}), 400u16),
+            (
+                serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "accept", "text": "[Pending WSL 7B ASR]"}),
+                400,
+            ),
+            (serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "explode", "text": "x"}), 400),
+            (serde_json::json!({"heardMs": 600_000, "id": "../etc", "action": "accept", "text": "x"}), 400),
+            (serde_json::json!({"heardMs": 600_000, "id": "missing", "action": "accept", "text": "x"}), 404),
         ] {
             let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
             assert_eq!(code, expect, "body: {body}");
@@ -4749,7 +4853,8 @@ mod tests {
         // legitimate text. Only "[...]" on both sides is a placeholder, so this half-bracketed text
         // must be ACCEPTED. (A rejects-only loop could never have caught this: the bug refuses MORE.)
         db.insert_segment(&seg("s2", "دەق")).unwrap();
-        let half = serde_json::json!({"id": "s2", "action": "accept", "text": "[ناتەواو"}).to_string();
+        let half =
+            serde_json::json!({"heardMs": 600_000, "id": "s2", "action": "accept", "text": "[ناتەواو"}).to_string();
         assert_eq!(
             api_decision(&db, half.as_bytes(), "Sara", &state).0,
             200,
@@ -4772,7 +4877,8 @@ mod tests {
         }
         let state = state();
         for n in 0..total {
-            let body = serde_json::json!({ "id": format!("u{n:03}"), "action": "accept", "text": "دەق" });
+            let body =
+                serde_json::json!({"heardMs": 600_000,  "id": format!("u{n:03}"), "action": "accept", "text": "دەق" });
             let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
             assert_eq!(code, 200, "decision u{n:03} must land");
         }
@@ -4818,7 +4924,8 @@ mod tests {
         db.insert_segment(&row).unwrap();
 
         // Now the phone's submit lands, minutes late, carrying a different correction.
-        let body = serde_json::json!({ "id": "dk1", "action": "edit", "text": "ڕاستکراوەی مۆبایل" });
+        let body =
+            serde_json::json!({"heardMs": 600_000,  "id": "dk1", "action": "edit", "text": "ڕاستکراوەی مۆبایل" });
         let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Hawzhin", &state);
         assert_eq!(code, 409, "a late phone submit must be refused, not written over the desktop's work");
         assert!(
@@ -4876,7 +4983,8 @@ mod tests {
         assert!(first.len() >= 10, "need a real batch, got {}", first.len());
         // Decide the first five, then "reload" — a bare re-fetch, which is exactly what load() does.
         for id in first.iter().take(5) {
-            let body = serde_json::json!({ "id": id, "action": "accept", "text": "دەقی سەرەتایی" }).to_string();
+            let body = serde_json::json!({"heardMs": 600_000,  "id": id, "action": "accept", "text": "دەقی سەرەتایی" })
+                .to_string();
             let status = agent
                 .post(&format!("{base}/api/decision"))
                 .set("Cookie", &cookie_for("tok"))
@@ -4944,7 +5052,8 @@ mod tests {
             (server, port, shutdown, join)
         };
         let submit = |port: u16, id: &str| -> u16 {
-            let body = serde_json::json!({ "id": id, "action": "accept", "text": "دەقی سەرەتایی" }).to_string();
+            let body = serde_json::json!({"heardMs": 600_000,  "id": id, "action": "accept", "text": "دەقی سەرەتایی" })
+                .to_string();
             match agent
                 .post(&format!("http://127.0.0.1:{port}/api/decision"))
                 .set("Cookie", &cookie_for("tok"))
@@ -5074,7 +5183,9 @@ mod tests {
             }
             for item in items {
                 let id = item["id"].as_str().unwrap().to_string();
-                let body = serde_json::json!({ "id": id, "action": "accept", "text": item["text"] }).to_string();
+                let body =
+                    serde_json::json!({"heardMs": 600_000,  "id": id, "action": "accept", "text": item["text"] })
+                        .to_string();
                 // THROTTLING IS PART OF THE TEST, not an obstacle to it. A machine-speed drain burns
                 // the couch limiter's 60-token burst and then rides its 120/second refill, which is
                 // exactly what a phone in a reload loop does — and the first run of this soak hit 429
@@ -5183,7 +5294,7 @@ mod tests {
                             break;
                         }
                         for item in items {
-                            let body = serde_json::json!({
+                            let body = serde_json::json!({"heardMs": 600_000, 
                                 "id": item["id"], "action": "edit", "text": format!("{} ✓", item["text"].as_str().unwrap_or("x")),
                             })
                             .to_string();
@@ -5355,7 +5466,10 @@ mod tests {
         let resp = agent
             .post(&format!("{base}/api/decision"))
             .set("Cookie", &cookie_for("saratoken123"))
-            .send_string(&serde_json::json!({"id": mine, "action": "accept", "text": "دەقی تاقیکردنەوە"}).to_string())
+            .send_string(
+                &serde_json::json!({"heardMs": 600_000, "id": mine, "action": "accept", "text": "دەقی تاقیکردنەوە"})
+                    .to_string(),
+            )
             .unwrap();
         assert_eq!(resp.status(), 200);
         let db = Database::open(tmp.path().join("couch-test.db").to_string_lossy().as_ref()).unwrap();
@@ -5758,7 +5872,8 @@ mod tests {
             // Answer everything, checks included — a check is real work to the reviewer.
             for id in &ids {
                 let text = if id.starts_with('g') { "دەقی ڕاست" } else { "کاری ڕاستەقینە" };
-                let body = serde_json::json!({ "id": id, "action": "edit", "text": text }).to_string();
+                let body =
+                    serde_json::json!({"heardMs": 600_000,  "id": id, "action": "edit", "text": text }).to_string();
                 let (dc, ..) = api_decision(&db, body.as_bytes(), "Sara", &state);
                 assert_eq!(dc, 200, "round {round}: submitting {id}");
             }
@@ -5828,7 +5943,8 @@ mod tests {
         let (code, ..) = api_renew(renew.as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "a lapsed-but-unclaimed lease must be reclaimable by the reviewer holding it");
         // ...and the decision she typed before the phone slept must still land.
-        let decide = serde_json::json!({ "id": "s1", "action": "edit", "text": "دەستکاری" }).to_string();
+        let decide =
+            serde_json::json!({"heardMs": 600_000,  "id": "s1", "action": "edit", "text": "دەستکاری" }).to_string();
         assert_eq!(api_decision(&db, decide.as_bytes(), "Sara", &state).0, 200);
 
         // Now the other half: age the remaining lease again and let HEMN pick it up.
@@ -5919,7 +6035,8 @@ mod tests {
 
         // And it SHRINKS as work lands — a total that never moved would be a decoration, not progress.
         let first = payload["items"][0]["id"].as_str().unwrap();
-        let decision = serde_json::json!({ "id": first, "action": "accept", "text": "دەقی سەرەتایی" });
+        let decision =
+            serde_json::json!({"heardMs": 600_000,  "id": first, "action": "accept", "text": "دەقی سەرەتایی" });
         let (dc, ..) = api_decision(&db, decision.to_string().as_bytes(), "Sara", &state);
         assert_eq!(dc, 200);
         let (_, _, body3, ..) = api_queue(&db, "Sara", &state);

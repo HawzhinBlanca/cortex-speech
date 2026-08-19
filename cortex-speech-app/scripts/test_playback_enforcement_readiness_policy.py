@@ -44,8 +44,8 @@ def test_the_policy_version_matches_the_rust_constant() -> None:
     assert int(_rust_const("PLAYBACK_POLICY_VERSION", DB_RS)) == gate.PLAYBACK_POLICY_VERSION
 
 
-def test_the_observe_marker_is_the_string_the_server_actually_logs() -> None:
-    assert gate.OBSERVE_MARKER.decode() in COUCH_RS.read_text(encoding="utf-8"), (
+def test_the_refusal_marker_is_the_string_the_server_actually_logs() -> None:
+    assert gate.ENFORCE_MARKER.decode() in COUCH_RS.read_text(encoding="utf-8"), (
         "the gate greps the binary for a marker the server no longer emits, so it would pass on silence"
     )
 
@@ -81,14 +81,14 @@ def test_an_empty_window_is_refused_not_passed() -> None:
         db_path = tmp / "t.db"
         _seed(db_path)
         exe = tmp / "cortex-speech-app.exe"
-        exe.write_bytes(b"\x00" + gate.OBSERVE_MARKER + b"\x00")  # a binary that CAN warn
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")  # a binary that CAN warn
         result = _run(db_path, exe, "2026-08-19 05:50:31")
         assert result.returncode == 1, f"an empty window must not read as ready:\n{result.stdout}"
         assert "NOT READY" in result.stdout
         assert "0 decision(s)" in result.stdout
 
 
-def test_a_binary_that_cannot_warn_is_refused_however_quiet_the_log() -> None:
+def test_a_binary_that_cannot_enforce_is_refused_however_quiet_the_log() -> None:
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         db_path = tmp / "t.db"
@@ -116,7 +116,7 @@ def test_a_covered_decision_passes_so_the_gate_is_not_merely_a_refuser() -> None
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
-        exe.write_bytes(b"\x00" + gate.OBSERVE_MARKER + b"\x00")
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
         result = subprocess.run(
             [sys.executable, str(GATE), "--db", str(db_path), "--exe", str(exe),
              "--since", "2020-01-01 00:00:00", "--min-decisions", "1"],
@@ -136,14 +136,14 @@ def test_a_receipt_below_the_bar_is_reported_as_a_refusal() -> None:
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
-        exe.write_bytes(b"\x00" + gate.OBSERVE_MARKER + b"\x00")
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
         result = subprocess.run(
             [sys.executable, str(GATE), "--db", str(db_path), "--exe", str(exe),
              "--since", "2020-01-01 00:00:00", "--min-decisions", "1"],
             capture_output=True, text=True,
         )
         assert result.returncode == 1
-        assert "would have REFUSED 1 of 1" in result.stdout, result.stdout
+        assert "enforcement REFUSED 1 of 1" in result.stdout, result.stdout
 
 
 def test_one_device_is_not_enough_to_enforce_on_eight() -> None:
@@ -157,7 +157,7 @@ def test_one_device_is_not_enough_to_enforce_on_eight() -> None:
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
-        exe.write_bytes(b"\x00" + gate.OBSERVE_MARKER + b"\x00")
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
         result = subprocess.run(
             [sys.executable, str(GATE), "--db", str(db_path), "--exe", str(exe),
              "--since", "2020-01-01 00:00:00", "--min-decisions", "1"],
@@ -179,7 +179,7 @@ def test_the_default_window_is_utc_like_the_rows_it_filters() -> None:
 
     with tempfile.TemporaryDirectory() as raw:
         exe = Path(raw) / "cortex-speech-app.exe"
-        exe.write_bytes(gate.OBSERVE_MARKER)
+        exe.write_bytes(gate.ENFORCE_MARKER)
         mtime = exe.stat().st_mtime
         expected = dt.datetime.fromtimestamp(mtime, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         result = subprocess.run(

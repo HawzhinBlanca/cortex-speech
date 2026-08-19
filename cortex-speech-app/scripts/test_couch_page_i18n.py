@@ -34,6 +34,11 @@ CKB_TS = APP / "src" / "lib" / "i18n" / "ckb.ts"
 # Phone strings whose Sorani is NEW and has NOT had a native review. Owner-gated: this list is the
 # acknowledgement. Adding a key here is a deliberate act; growing it silently is not possible.
 UNREVIEWED_SORANI = {
+    # The playback refusal (2026-08-19). Shown when a verdict is rejected because the clip was not
+    # played far enough — the one refusal a reviewer can fix themselves, so the wording has to be
+    # unambiguous in Sorani or it reads as the app being broken. NOT natively reviewed: on the
+    # owner's read list.
+    "mustListen",
     "heldByOthers",
     "linkExpired",
     "loadingMore",

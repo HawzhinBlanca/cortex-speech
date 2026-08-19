@@ -1,8 +1,12 @@
-"""Gate: may the phone's listening guard be switched from OBSERVING to REFUSING?
+"""Gate: is the phone's listening guard deployed and ENFORCING, and is it refusing honest work?
 
-The guard in ``couch::api_decision`` currently asks the real question and only logs the answer
-(``PLAYBACK_EVIDENCE_OBSERVE``). Turning it into a refusal is a one-line change, and the informal
-test for "is it safe yet?" was: *grep the log; if no reviewer would have been refused, flip it.*
+The guard in ``couch::api_decision`` refuses a verdict on a clip that was not played to the bar
+(``PLAYBACK_EVIDENCE_REFUSED``, HTTP 428) — enforcement went live 2026-08-19 on the owner's call,
+rejects included. This gate ran through that decision and keeps its job afterwards: prove the
+DEPLOYED binary is the enforcing one, and surface every decision that landed without evidence.
+
+It was written while the guard was still only observing, and the informal test for "is it safe yet?"
+was: *grep the log; if no reviewer would have been refused, flip it.*
 
 That test is a trap, and it fired on 2026-08-19. The log held zero ``PLAYBACK_EVIDENCE_OBSERVE``
 lines — because the running binary was built from the commit BEFORE the guard existed, and because
@@ -40,7 +44,7 @@ from pathlib import Path
 # test_playback_enforcement_readiness_policy.py so a change on either side cannot drift silently.
 MIN_PLAYBACK_COVERAGE = 0.85
 PLAYBACK_POLICY_VERSION = 1
-OBSERVE_MARKER = b"PLAYBACK_EVIDENCE_OBSERVE"
+ENFORCE_MARKER = b"PLAYBACK_EVIDENCE_REFUSED"
 DEFAULT_EXE = "src-tauri/target/release/cortex-speech-app.exe"
 
 
@@ -61,13 +65,13 @@ def default_db_path() -> str:
 
 
 def binary_can_warn(exe: Path) -> tuple[bool, str]:
-    """Is the observe marker compiled into this binary? Silence from a build without it proves nothing."""
+    """Is the ENFORCING build deployed? Silence from a build that cannot refuse proves nothing."""
     if not exe.is_file():
         return False, f"{exe} does not exist — nothing to reason about"
     blob = exe.read_bytes()
-    if OBSERVE_MARKER not in blob:
-        return False, f"{exe.name} does not contain {OBSERVE_MARKER.decode()} — it cannot warn, so its silence is vacuous"
-    return True, f"{exe.name} contains the observe marker, so a refusal WOULD have been logged"
+    if ENFORCE_MARKER not in blob:
+        return False, f"{exe.name} does not contain {ENFORCE_MARKER.decode()} — this build does not enforce, so its silence is vacuous"
+    return True, f"{exe.name} contains the refusal marker, so this build enforces the listening bar"
 
 
 def decisions_since(conn: sqlite3.Connection, since: str) -> list[tuple[str, str, str]]:
@@ -182,7 +186,7 @@ def main() -> int:
         refused = [(seg, who, at, why) for seg, who, at in rows if (why := uncovered(conn, seg))]
         if refused:
             failures += 1
-            print(f"FAIL [coverage]: enforcement would have REFUSED {len(refused)} of {len(rows)} decision(s)")
+            print(f"FAIL [coverage]: enforcement REFUSED {len(refused)} of {len(rows)} decision(s)")
             for seg, who, at, why in refused[:10]:
                 print(f"  {seg} by {who} at {at}: {why}")
             if len(refused) > 10:
