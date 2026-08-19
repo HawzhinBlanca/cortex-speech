@@ -116,8 +116,27 @@ def test_missing_metadata_is_explicitly_protected_not_dropped() -> None:
 def test_unresolved_rows_and_zero_slices_fail_closed() -> None:
     slices, unresolved = build(manifest_paths(), {}, source_dialects())
     problems = validate_built_slices(slices, unresolved, N, 5)
-    assert any("did not resolve" in problem for problem in problems)
+    assert any("name a clip in this library" in problem for problem in problems)
     assert any("zero protected slices" in problem for problem in problems)
+
+
+def test_a_wholly_foreign_manifest_is_diagnosed_differently_from_a_few_bad_rows() -> None:
+    """All-missing and some-missing are different faults, and one message for both costs a hunt.
+
+    Measured 2026-08-19 against the live library: the challenger cycle's default eval manifest is
+    the frozen FLEURS set, whose 348 clips are external by canon, so every row resolved to nothing.
+    "348 row(s) did not resolve to exactly one library segment" reads as corruption in
+    speech_segments and sends you looking for rows that are fine.
+    """
+    every_row_foreign = validate_built_slices({}, list(range(N)), N, 5)
+    assert any("name a clip in this library" in problem for problem in every_row_foreign)
+    assert not any("did not resolve" in problem for problem in every_row_foreign)
+
+    index = clips_for_two_sources()
+    slices, unresolved = build(manifest_paths()[:-1] + ["nowhere/absent.wav"], index, source_dialects())
+    some_rows_bad = validate_built_slices(slices, unresolved, N, 5)
+    assert any("did not resolve" in problem for problem in some_rows_bad), some_rows_bad
+    assert not any("name a clip in this library" in problem for problem in some_rows_bad)
 
 
 def test_discovered_group_under_five_is_not_silently_dropped() -> None:

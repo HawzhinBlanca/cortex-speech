@@ -253,7 +253,20 @@ def validate_built_slices(
         )
     if min_clips < MIN_SLICE_CLIPS:
         problems.append(f"--min-clips cannot be below the mandatory floor {MIN_SLICE_CLIPS}")
-    if unresolved:
+    if unresolved and len(unresolved) == manifest_rows:
+        # EVERY row missing is a different diagnosis from SOME rows missing, and reporting them the
+        # same way costs an investigation. Measured 2026-08-19: the challenger cycle points this at
+        # the frozen FLEURS manifest, whose clips live outside the library by design (canon: FLEURS
+        # is never imported), so all 348 rows resolved to nothing. Read as a data-integrity fault it
+        # sends you looking through speech_segments for corruption that is not there; the real
+        # finding is that library-derived slices cannot be built from a manifest of non-library
+        # audio at all.
+        problems.append(
+            f"none of the {manifest_rows} manifest row(s) name a clip in this library — protected "
+            "slices are derived from library metadata (speaker, dialect, SNR, source), so an "
+            "external eval set cannot be sliced this way"
+        )
+    elif unresolved:
         problems.append(
             f"{len(unresolved)} manifest row(s) did not resolve to exactly one library segment "
             f"(first: {list(unresolved)[:5]})"
