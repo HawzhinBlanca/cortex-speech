@@ -373,7 +373,21 @@ pub const PLAYBACK_POLICY_VERSION: i64 = 1;
 /// Not 100%: a reviewer who has heard the sentence often stops before the trailing silence, and
 /// demanding the last frame would train them to leave it running rather than to listen. Not 50%
 /// either — half a Sorani sentence is exactly where a plausible-but-wrong verdict comes from.
-pub const MIN_PLAYBACK_COVERAGE: f64 = 0.90;
+///
+/// 0.85, set by the owner 2026-08-19 against the first real device evidence. The bar opened at 0.90
+/// and the observe-mode pilot measured 12 receipts from a live phone:
+///
+///   1.000 ×6 (replays, capped)   0.974   0.968   0.915   0.907   0.856   0.352
+///
+/// Two would have been refused at 0.90 and two more sat within 0.015 of it — roughly one honest
+/// decision in six rejected, on a flat ratio that punishes short clips hardest (the 0.856 case was a
+/// 3.4 s clip missing its last 489 ms of trailing silence). 0.85 keeps the 0.352 refusal, which is
+/// the case the guard exists for, and stops rejecting reviewers who heard the whole sentence.
+///
+/// Twelve samples from ONE device is a thin basis for a calibrated number. Revisit once the pilot
+/// has 20+ decisions across both reviewers; a length-aware rule (ratio OR a fixed unheard-tail
+/// allowance) is the likelier long-run answer than any single ratio.
+pub const MIN_PLAYBACK_COVERAGE: f64 = 0.85;
 
 /// A reviewer's record of having heard one clip at one revision.
 #[derive(Debug, Clone)]

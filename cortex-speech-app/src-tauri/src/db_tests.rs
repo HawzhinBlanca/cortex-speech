@@ -4491,6 +4491,37 @@ fn opening_a_clip_without_hearing_it_is_not_evidence() {
     assert!(!db.has_sufficient_playback_evidence("pb-3", 0, "fp-a").unwrap());
 }
 
+/// The bar is a TUNED number, so pin it by behaviour and not only by its own name.
+///
+/// Every other receipt fixture sits at 0%, 50% or 100%, so the comparison could drift — `>` for
+/// `>=`, an off-by-one, a literal hardcoded beside the constant — and the bar could be moved
+/// anywhere between 0.51 and 1.00 without reddening a single test.
+///
+/// This asserts the boundary BEHAVES as the constant declares. It deliberately does not pin the
+/// literal value (the owner tunes it; it went 0.90 -> 0.85 on 2026-08-19), so read it as "the
+/// function and the constant agree", not as "the bar is 0.85".
+#[test]
+fn the_listening_bar_sits_exactly_where_the_constant_says() {
+    let db = make_db();
+    let total = 10_000_i64;
+    let just_under = ((MIN_PLAYBACK_COVERAGE * total as f64) - 1.0).floor() as i64;
+    let just_over = (MIN_PLAYBACK_COVERAGE * total as f64).ceil() as i64;
+
+    db.insert_segment(&make_segment("pb-bar-lo", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-bar-lo", 0, "fp-a", just_under, total)).unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-bar-lo", 0, "fp-a").unwrap(),
+        "{just_under}ms of {total}ms is below the bar and must not satisfy it"
+    );
+
+    db.insert_segment(&make_segment("pb-bar-hi", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-bar-hi", 0, "fp-a", just_over, total)).unwrap();
+    assert!(
+        db.has_sufficient_playback_evidence("pb-bar-hi", 0, "fp-a").unwrap(),
+        "{just_over}ms of {total}ms is at or above the bar and must satisfy it"
+    );
+}
+
 #[test]
 fn half_a_sentence_is_not_enough_to_judge_it() {
     let db = make_db();

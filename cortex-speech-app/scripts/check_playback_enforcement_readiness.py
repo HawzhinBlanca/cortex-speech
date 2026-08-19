@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Mirrors db::MIN_PLAYBACK_COVERAGE and db::PLAYBACK_POLICY_VERSION. Pinned by
 # test_playback_enforcement_readiness_policy.py so a change on either side cannot drift silently.
-MIN_PLAYBACK_COVERAGE = 0.90
+MIN_PLAYBACK_COVERAGE = 0.85
 PLAYBACK_POLICY_VERSION = 1
 OBSERVE_MARKER = b"PLAYBACK_EVIDENCE_OBSERVE"
 DEFAULT_EXE = "src-tauri/target/release/cortex-speech-app.exe"
