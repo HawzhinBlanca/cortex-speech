@@ -2442,6 +2442,64 @@ mod tests {
         payload["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_string()).collect()
     }
 
+    /// The SERVER half of the phone's playback evidence: what the page reports is only how much
+    /// media time it played; the revision and the audio fingerprint are resolved here.
+    ///
+    /// A client that could name those could mint a receipt for a clip or revision it never loaded,
+    /// and the guard would then be comparing the client's claim with the client's claim.
+    #[test]
+    fn a_phone_decision_mints_a_receipt_with_server_resolved_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("pr1", "دەقی سەرەتایی")).unwrap();
+        let state = state();
+
+        let body = serde_json::json!({
+            "id": "pr1", "action": "accept", "text": "دەقی سەرەتایی",
+            "heardMs": 8_800, "clipDurationMs": 9_000,
+            // Deliberately NOT sent: revision and fingerprint are not the client's to assert.
+        });
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        let (segment_id, revision, fingerprint, played, coverage): (String, i64, String, i64, f64) = db
+            .connection()
+            .query_row(
+                "SELECT segment_id, segment_revision, audio_fingerprint, played_ms, coverage_ratio                  FROM playback_receipts WHERE segment_id = 'pr1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("a phone decision must leave a listening receipt");
+
+        assert_eq!(segment_id, "pr1");
+        assert_eq!(played, 8_800, "the page's reported media time is recorded verbatim");
+        assert!(coverage > 0.97, "8.8s of a 9s clip is a full listen, got {coverage}");
+        assert!(!fingerprint.is_empty(), "the receipt must name the audio it was minted against");
+        assert!(revision >= 0, "the revision is resolved server-side, not supplied");
+
+        // And the evidence actually satisfies the guard for THIS clip at THIS revision.
+        db.require_playback_evidence("pr1", revision, &fingerprint).expect("a clip heard end to end must be decidable");
+    }
+
+    /// A decision sent with no heard-time reports nothing, and must not fabricate evidence.
+    #[test]
+    fn a_phone_decision_without_reported_playback_mints_no_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("pr2", "دەقی دوو")).unwrap();
+        let state = state();
+
+        let body = serde_json::json!({"id": "pr2", "action": "accept", "text": "دەقی دوو"});
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200);
+
+        let receipts: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'pr2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipts, 0, "silence about listening must never become evidence OF listening");
+    }
+
     #[test]
     fn decision_accept_edit_bad_and_undo_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
