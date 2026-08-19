@@ -284,8 +284,6 @@ pub fn record_human_decision(
 pub fn record_playback_receipt(
     state: State<'_, AppState>,
     segment_id: String,
-    segment_revision: i64,
-    audio_fingerprint: String,
     played_ms: i64,
     clip_duration_ms: i64,
     reviewer: Option<String>,
@@ -294,18 +292,36 @@ pub fn record_playback_receipt(
 ) -> Result<(), String> {
     RATE_LIMITER.check("record_playback_receipt")?;
     validate::validate_identifier(&segment_id)?;
-    validate::validate_text(&audio_fingerprint, 256, "Audio fingerprint")?;
     if let Some(name) = reviewer.as_deref() {
         validate::validate_text(name, 128, "Reviewer")?;
     }
-    if played_ms < 0 || clip_duration_ms < 0 || segment_revision < 0 {
-        return Err("playback receipt fields must not be negative".to_string());
+    if played_ms < 0 || clip_duration_ms < 0 {
+        return Err("playback receipt durations must not be negative".to_string());
     }
     let db = state.lock_db();
+
+    // The REVISION and FINGERPRINT are resolved here, from the row itself — never accepted from the
+    // renderer. A client that could name them could mint a receipt for a revision it never heard, or
+    // for audio that has since been replaced; then the guard would be comparing the client's claim
+    // with the client's claim. Resolved server-side, the only thing a caller can assert is how much
+    // time it played, and that assertion is still bound to the clip actually on file.
+    let segment = db
+        .get_segment_by_id(&segment_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("segment not found: {segment_id}"))?;
+    // Fall back to the path only when no content hash has been computed yet: a receipt must still
+    // name SOMETHING stable, and `path:` is honestly weaker than a content hash rather than pretending
+    // to be one.
+    let fingerprint = db
+        .segment_audio_fingerprint(&segment_id)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| format!("path:{}", segment.audio_path));
+    let revision = db.segment_review_revision(&segment_id).map_err(|e| e.to_string())?.unwrap_or(0);
+
     db.record_playback_receipt(&crate::db::PlaybackReceipt {
         segment_id,
-        segment_revision,
-        audio_fingerprint,
+        segment_revision: revision,
+        audio_fingerprint: fingerprint,
         reviewer,
         session_id,
         started_at_ms,

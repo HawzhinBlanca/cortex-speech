@@ -1322,18 +1322,16 @@ export async function getEscalationQueue(limit: number): Promise<SpeechSegment[]
  */
 export async function recordPlaybackReceipt(args: {
   segmentId: string;
-  segmentRevision: number;
-  audioFingerprint: string;
   playedMs: number;
   clipDurationMs: number;
   reviewer?: string | null;
   sessionId?: string | null;
   startedAtMs?: number;
 }): Promise<void> {
+  // Revision and audio fingerprint are resolved by the BACKEND from the row itself; a client that
+  // could name them could mint a receipt for a clip it never heard.
   return invoke<void>('record_playback_receipt', {
     segmentId: args.segmentId,
-    segmentRevision: args.segmentRevision,
-    audioFingerprint: args.audioFingerprint,
     playedMs: Math.max(0, Math.round(args.playedMs)),
     clipDurationMs: Math.max(0, Math.round(args.clipDurationMs)),
     reviewer: args.reviewer ?? null,

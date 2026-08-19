@@ -10195,3 +10195,44 @@ identical three-line block, and a `| tail` masked a FAILED MSI build as exit 0.
 **GO_MODEL_PROMOTION: NO** (Gate B: 1.09 h of 25, 5 recordings of 25, top-1 94.5 %).
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (late) — Phase 3: proving a clip was HEARD, not merely loaded
+
+The decision surfaces gated on `audioError` — the ABSENCE of a failure, which is not the presence of
+listening. A clip that loaded fine and was never played was indistinguishable from one a reviewer
+listened to twice, and nothing in the row said which. For a verbatim corpus that is the difference
+between a label and a guess.
+
+Landed this session:
+
+* **migration 55 / `playback_receipts`** — keyed by (segment, revision), bound to the audio
+  fingerprint, storing cumulative media time, coverage and the policy version that judged it.
+* **`has_sufficient_playback_evidence` / `require_playback_evidence`** — fail-closed with
+  `E_NO_PLAYBACK_EVIDENCE`. Coverage bar 0.90: not 1.0 (a reviewer who has heard the sentence stops
+  before the trailing silence, and demanding the last frame trains them to leave it running rather
+  than listen), not 0.5 (half a Sorani sentence is where a plausible-but-wrong verdict comes from).
+  `reject` is covered too — marking a clip bad is a judgement about AUDIO, and a wrongly rejected clip
+  is silently dropped from the corpus.
+* **`AudioPlayer.heardMs`** — only forward movement of a not-paused element counts; a jump beyond one
+  tick is a seek, not listening; a source change resets it, so a previous clip's listen never travels.
+* **IPC + ReviewMode wiring** — the receipt is posted BEFORE the verdict, and its revision and
+  fingerprint are resolved SERVER-SIDE. A client that could name them could mint a receipt for a clip
+  it never heard; then the guard would be comparing the client's claim with the client's claim.
+
+18 tests across Rust and the frontend pin the rules that matter: a previous clip's listen cannot
+unlock the next, different audio bytes do not count, a correction needs its own listen, an
+opened-but-never-played clip is not evidence, a zero-duration clip fails closed instead of dividing
+its way to 100 %, and a scrub is not a listen.
+
+**Not yet enforcing.** The guard is proven but is not called from the decision path, because the phone
+surface (`couch.html`) does not post receipts yet: switching it on first would refuse every decision
+from all eight live reviewers. The running binary is unchanged.
+
+Rust 1275 / 0, clippy `-D warnings` 0, frontend 280 tests, typecheck 448 files / 0 errors.
+
+**GO_LINKS: NO** — couch.html receipts, guard wiring, real-device verification (WebView2 + Funnel),
+Phase 8 link drill.
+**GO_MODEL_PROMOTION: NO** — Gate B: 1.09 h of 25, 5 recordings of 25. ~9,800 listening decisions,
+which is reviewer time and cannot be engineered.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>

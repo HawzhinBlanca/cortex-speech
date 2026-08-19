@@ -182,7 +182,9 @@ describe('cumulative media-time accounting (playback evidence)', () => {
   // `audioError` proved the absence of a FAILURE, never the presence of listening. These pin the
   // measure that replaces it: media time actually advanced.
   function player() {
-    const el = { currentTime: 0, paused: false } as HTMLAudioElement;
+    // A minimal stand-in: `paused` is read-only on the real element, so the accounting rules are
+    // exercised against a writable shape rather than a live media element.
+    const el = { currentTime: 0, paused: false };
     let heard = 0;
     let last: number | null = null;
     const MAX = 1.5;

@@ -4418,6 +4418,24 @@ impl Database {
         Ok(("edit".to_string(), Some(approved_text)))
     }
 
+    /// The stored content fingerprint of a segment's audio, if one has been computed.
+    ///
+    /// Read as a single column rather than widening `SpeechSegment`: that struct's field order is
+    /// load-bearing for SEGMENT_SELECT_COLUMNS' index-based map_row, and adding to it has broken
+    /// every destructuring site twice before.
+    pub fn segment_audio_fingerprint(&self, segment_id: &str) -> AppResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT NULLIF(TRIM(COALESCE(audio_fingerprint, '')), '') FROM speech_segments WHERE id = ?1",
+                [segment_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Refuse a gold-minting verdict that has no proof the reviewer heard THIS clip.
     ///
     /// The enforcement point is here, not in a renderer: a decision surface can be reloaded, scripted

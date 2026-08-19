@@ -248,6 +248,9 @@
   // Bound from AudioPlayer: non-null means this clip's audio could not load/play, so no decision
   // surface may record a human verdict on it (audit find 2026-08-17).
   let audioError = $state<string | null>(null);
+  // Cumulative MEDIA time heard for the CURRENT clip; the player resets it on every
+  // source change, so a previous clip's listen can never travel with the reviewer.
+  let heardMs = $state(0);
   let lastLoadedId = $state<string | null>(null);
 
   // Engines that actually produced this clip's draft, recorded (never inferred) and shown as an
@@ -675,6 +678,19 @@
       // UNSEEN jury verdict_transcript survive and get exported as human-verified gold. For an edit the
       // typed text is the label; for an accept the displayed original is. (Backend only captures a
       // LOOP-0 memory / ledger row on 'edit', so an accept with text stays a pure verdict overwrite.)
+      // Post the listening receipt BEFORE the verdict. The backend resolves this segment's
+      // revision and audio fingerprint itself and refuses a verdict without sufficient evidence, so
+      // a decision recorded on a clip nobody heard becomes impossible rather than merely discouraged.
+      // Failing to record the receipt must not lose the human's work, so it is reported, not thrown.
+      try {
+        await api.recordPlaybackReceipt({
+          segmentId: seg.id,
+          playedMs: heardMs,
+          clipDurationMs: Math.round((playerDuration || 0) * 1000),
+        });
+      } catch (e) {
+        console.error('playback receipt failed', e);
+      }
       await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', text);
       // Build the upsert AFTER the slow decision call (whole-file hash on 'edit' takes hundreds of
       // ms) from the freshest store row: update_segment writes the whole row, so a pre-await spread
@@ -1289,6 +1305,7 @@
           bind:duration={playerDuration}
           bind:playing
           bind:audioError
+          bind:heardMs
           autoplay={$settings.autoplaySegments}
         />
       </div>
