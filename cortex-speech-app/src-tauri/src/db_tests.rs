@@ -4445,3 +4445,124 @@ fn the_durability_cost_per_decision_is_measured_not_assumed() {
         per_decision * 1000.0
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Playback evidence. The decision surfaces used to gate on `audioError` — the ABSENCE of a failure,
+// which is not the presence of listening. These pin what counts as having heard a clip.
+// ---------------------------------------------------------------------------------------------
+
+fn receipt(segment: &str, revision: i64, fingerprint: &str, played: i64, total: i64) -> PlaybackReceipt {
+    PlaybackReceipt {
+        segment_id: segment.to_string(),
+        segment_revision: revision,
+        audio_fingerprint: fingerprint.to_string(),
+        reviewer: Some("Sara".into()),
+        session_id: Some("sess-1".into()),
+        started_at_ms: 1_700_000_000_000,
+        played_ms: played,
+        clip_duration_ms: total,
+    }
+}
+
+#[test]
+fn a_full_listen_is_sufficient_evidence() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-1", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-1", 0, "fp-a", 9_000, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-1", 0, "fp-a").unwrap());
+}
+
+#[test]
+fn no_receipt_at_all_is_not_evidence() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-2", "/a/clip.wav")).unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-2", 0, "fp-a").unwrap(),
+        "a clip nobody played must never satisfy the listening requirement"
+    );
+}
+
+#[test]
+fn opening_a_clip_without_hearing_it_is_not_evidence() {
+    // The exact failure the old `audioError` gate allowed: the audio loaded fine and was never heard.
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-3", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-3", 0, "fp-a", 0, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-3", 0, "fp-a").unwrap());
+}
+
+#[test]
+fn half_a_sentence_is_not_enough_to_judge_it() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-4", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-4", 0, "fp-a", 4_500, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-4", 0, "fp-a").unwrap());
+}
+
+#[test]
+fn a_previous_clips_listen_can_never_unlock_this_one() {
+    // The generation/source-change race, at the level that actually enforces it.
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-5", "/a/clip.wav")).unwrap();
+    db.insert_segment(&make_segment("pb-6", "/a/other.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-5", 0, "fp-a", 9_000, 9_000)).unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-6", 0, "fp-b").unwrap(),
+        "evidence for one clip must not unlock a different clip"
+    );
+}
+
+#[test]
+fn a_listen_of_different_audio_bytes_does_not_count() {
+    // A receipt must not survive the audio being swapped underneath it.
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-7", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-7", 0, "fp-old", 9_000, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-7", 0, "fp-new").unwrap());
+}
+
+#[test]
+fn a_correction_requires_its_own_listen() {
+    // Re-review after an edit changes the text under judgement, so the earlier listen does not carry.
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-8", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-8", 0, "fp-a", 9_000, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-8", 0, "fp-a").unwrap());
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-8", 1, "fp-a").unwrap(),
+        "revision 1 is a different judgement and needs its own evidence"
+    );
+}
+
+#[test]
+fn seeking_and_replaying_accumulate_honestly() {
+    // Cumulative media time: two partial listens that together cover the clip DO count, because the
+    // reviewer did hear all of it — while wall-clock or a play() count would have accepted neither.
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-9", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-9", 0, "fp-a", 5_000, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-9", 0, "fp-a").unwrap());
+    db.record_playback_receipt(&receipt("pb-9", 0, "fp-a", 8_700, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-9", 0, "fp-a").unwrap());
+}
+
+#[test]
+fn a_zero_duration_clip_can_never_be_certified_heard() {
+    // Corrupt/empty audio must fail closed rather than divide its way to 100% coverage.
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-10", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-10", 0, "fp-a", 0, 0)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-10", 0, "fp-a").unwrap());
+}
+
+#[test]
+fn a_receipt_records_which_policy_it_satisfied() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-11", "/a/clip.wav")).unwrap();
+    db.record_playback_receipt(&receipt("pb-11", 0, "fp-a", 9_000, 9_000)).unwrap();
+    let version: i64 = db
+        .connection()
+        .query_row("SELECT policy_version FROM playback_receipts WHERE segment_id='pb-11'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, PLAYBACK_POLICY_VERSION, "a receipt must say which rule it met");
+}

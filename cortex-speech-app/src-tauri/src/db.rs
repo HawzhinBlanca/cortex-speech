@@ -364,6 +364,30 @@ type HumanDecisionContext =
 /// transcript. `couch.rs` needs it to tell a network retry apart from a genuine re-review: the write
 /// path NFC-normalizes, so a decomposed (NFD) paste from a phone IME would otherwise never compare
 /// equal to the value it just stored, and every retry would look like a brand-new decision.
+/// Bump when the sufficiency RULE changes. Stored on every receipt so a row always says which rule
+/// it satisfied, instead of being re-judged later under one it never met.
+pub const PLAYBACK_POLICY_VERSION: i64 = 1;
+
+/// How much of the clip's media time must actually have been played.
+///
+/// Not 100%: a reviewer who has heard the sentence often stops before the trailing silence, and
+/// demanding the last frame would train them to leave it running rather than to listen. Not 50%
+/// either — half a Sorani sentence is exactly where a plausible-but-wrong verdict comes from.
+pub const MIN_PLAYBACK_COVERAGE: f64 = 0.90;
+
+/// A reviewer's record of having heard one clip at one revision.
+#[derive(Debug, Clone)]
+pub struct PlaybackReceipt {
+    pub segment_id: String,
+    pub segment_revision: i64,
+    pub audio_fingerprint: String,
+    pub reviewer: Option<String>,
+    pub session_id: Option<String>,
+    pub started_at_ms: i64,
+    pub played_ms: i64,
+    pub clip_duration_ms: i64,
+}
+
 pub(crate) fn to_nfc(s: &str) -> String {
     s.nfc().collect()
 }
@@ -4392,6 +4416,62 @@ impl Database {
             "segment {segment_id}: accept reclassified as edit — the approved text matches none of              this segment's ASR hypotheses, so it is human-authored, not an engine transcript"
         );
         Ok(("edit".to_string(), Some(approved_text)))
+    }
+
+    /// A reviewer's own record that they HEARD this exact clip at this exact revision.
+    ///
+    /// `played_ms` is cumulative MEDIA time advanced, never wall-clock and never a `play()` call —
+    /// download, metadata load and an autoplay attempt all prove nothing about listening.
+    pub fn record_playback_receipt(&self, receipt: &PlaybackReceipt) -> AppResult<()> {
+        let coverage = if receipt.clip_duration_ms > 0 {
+            (receipt.played_ms as f64 / receipt.clip_duration_ms as f64).min(1.0)
+        } else {
+            0.0
+        };
+        self.conn.execute(
+            "INSERT INTO playback_receipts (segment_id, segment_revision, audio_fingerprint, reviewer,                                             session_id, started_at_ms, played_ms, clip_duration_ms,                                             coverage_ratio, policy_version)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                receipt.segment_id,
+                receipt.segment_revision,
+                receipt.audio_fingerprint,
+                receipt.reviewer,
+                receipt.session_id,
+                receipt.started_at_ms,
+                receipt.played_ms,
+                receipt.clip_duration_ms,
+                coverage,
+                PLAYBACK_POLICY_VERSION,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Is there evidence this reviewer heard ENOUGH of the CURRENT clip to judge it?
+    ///
+    /// Deliberately strict about identity, not just quantity:
+    ///   * the receipt must name this segment AND the revision being decided — a correction changes
+    ///     the text under judgement, so the previous listen does not carry over;
+    ///   * it must name the audio FINGERPRINT now on file, so a receipt cannot be replayed against a
+    ///     different clip or survive the audio being swapped underneath it;
+    ///   * coverage is cumulative media time, so a paused, seeked or replayed listen still counts
+    ///     honestly and a download does not count at all.
+    pub fn has_sufficient_playback_evidence(
+        &self,
+        segment_id: &str,
+        revision: i64,
+        fingerprint: &str,
+    ) -> AppResult<bool> {
+        use rusqlite::OptionalExtension;
+        let best: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(coverage_ratio) FROM playback_receipts                  WHERE segment_id = ?1 AND segment_revision = ?2 AND audio_fingerprint = ?3",
+                params![segment_id, revision, fingerprint],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(best.unwrap_or(0.0) >= MIN_PLAYBACK_COVERAGE)
     }
 
     fn record_human_decision_by_with_finalize(

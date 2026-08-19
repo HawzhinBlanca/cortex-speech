@@ -1569,6 +1569,45 @@ pub static MIGRATIONS: &[Migration] = &[
                  );",
         down_sql: Some("DROP TABLE IF EXISTS source_audio_provenance;"),
     },
+    Migration {
+        version: 55,
+        description: "Record that a reviewer actually HEARD a clip, so a verdict can be refused without it",
+        // 2026-08-19. Until now the decision surfaces gated only on `audioError` — the ABSENCE of a
+        // failure, which is not the presence of listening. A clip whose audio never loaded, or loaded
+        // and was never played, was indistinguishable from one the reviewer listened to twice. For a
+        // verbatim corpus that is the difference between a label and a guess, and it is invisible
+        // afterwards: nothing in the row says whether anyone heard it.
+        //
+        // A receipt is per (segment, revision): re-review after a correction needs its OWN evidence,
+        // because the text under judgement changed. `audio_fingerprint` binds the receipt to the
+        // BYTES that were played, so a receipt cannot be replayed against a different clip or survive
+        // the audio being swapped underneath it. `played_ms` is cumulative MEDIA time actually
+        // advanced — not wall-clock, not a play() call, and not a download — so seeking, pausing and
+        // replaying all account honestly.
+        //
+        // `policy_version` is stored per row on purpose: the sufficiency rule will be tuned, and a
+        // receipt must always say which rule it satisfied rather than being re-judged under a later
+        // one it never met.
+        up_sql: "CREATE TABLE IF NOT EXISTS playback_receipts (
+                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                     segment_id        TEXT NOT NULL,
+                     segment_revision  INTEGER NOT NULL,
+                     audio_fingerprint TEXT NOT NULL,
+                     reviewer          TEXT,
+                     session_id        TEXT,
+                     started_at_ms     INTEGER NOT NULL,
+                     played_ms         INTEGER NOT NULL,
+                     clip_duration_ms  INTEGER NOT NULL,
+                     coverage_ratio    REAL NOT NULL,
+                     policy_version    INTEGER NOT NULL,
+                     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY (segment_id) REFERENCES speech_segments(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_playback_receipts_segment
+                     ON playback_receipts(segment_id, segment_revision);",
+        down_sql: Some("DROP INDEX IF EXISTS idx_playback_receipts_segment;
+                        DROP TABLE IF EXISTS playback_receipts;"),
+    },
 ];
 
 #[cfg(test)]
