@@ -150,23 +150,21 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Linux system deps
-        # Bounded and retried. Three times on 2026-08-19 this step hung on apt for 45 minutes and
-        # was cancelled by the job timeout, with nothing of ours having run; every later step
-        # showed "skipped", and the PR read as red for a mirror stall. One hang is weather; three
-        # is a step that needs a ceiling and a second try.
-        # Fourth stall 2026-08-19: intermittent, not deterministic (two reruns passed), which is the
-        # signature of an apt mirror hiccup on a package with a large dependency tree. So apt is told
-        # to retry per PACKAGE (Acquire::Retries) rather than the whole install restarting from the
-        # top, and the lock-wait flag stops a background unattended-upgrades run from failing us.
-        timeout-minutes: 12
+        # READ FROM THE LOG, not inferred (fifth failure 2026-08-19): the runner's apt mirror list
+        # puts azure.archive.ubuntu.com first, and that host was DOWN -- every index fetch printed
+        # `Ign:` against it, waited out its timeout, retried, and only then fell back to
+        # archive.ubuntu.com (which answered instantly). Four suites x many index files x
+        # timeout x retries burned the whole step budget inside `apt-get update`; the install
+        # loop never ran. My earlier "Acquire::Retries=5" made it WORSE: more retries against
+        # a dead host. So: point apt straight at the canonical archive, skip the dead mirror
+        # entirely, keep one short retry for genuine hiccups.
+        timeout-minutes: 10
         run: |
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update
-          for attempt in 1 2 3; do
-            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30                  -o DPkg::Lock::Timeout=120 install -y --no-install-recommends                  libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev             && exit 0
-            echo "apt install attempt $attempt failed; retrying in 20s"
-            sleep 20
-          done
-          exit 1
+          # Replace the runner's mirror list with the canonical archive only. The file holds
+          # one mirror per line; apt tries them in order and waits for each.
+          printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15                -o DPkg::Lock::Timeout=120 install -y --no-install-recommends                libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
