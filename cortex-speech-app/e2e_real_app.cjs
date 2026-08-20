@@ -279,15 +279,41 @@ async function run() {
   const ENGINE = process.env.CORTEX_ASR_ENGINE || 'CTC300M';
   if (ENGINE !== 'keep') {
     console.log(`==> Provisioning ASR engine '${ENGINE}' in the disposable profile...`);
-    await page.evaluate(async (engine) => {
+    // WSL7B (2026-08-20, external review blocker #8): the CHAMPION path is now a first-class E2E
+    // mode, not a forced-CTC substitute. The disposable profile needs the client-script path — the
+    // "champion is configured" signal — which a fresh profile lacks.
+    const championScript = require('path').join(__dirname, 'scripts', 'cortex_7b_client.py');
+    await page.evaluate(async (cfg) => {
       const s = await window.__TAURI_INTERNALS__.invoke('get_settings');
-      s.asr_model_size = engine;
-      // Refinement off, same rationale as e2e_profile.cjs::provisionEngine: the default llm_mode
-      // (Local) makes this gate's verdict depend on an LLM server the machine may not be running,
-      // and a refinement failure hard-stops the clip by design.
+      s.asr_model_size = cfg.engine;
+      // Refinement off, same rationale as e2e_profile.cjs::provisionEngine: a configured refiner
+      // that fails hard-stops the clip by design, and this gate is about the ASR engine.
       s.llm_mode = 'None';
+      if (cfg.engine === 'WSL7B') s.external_asr_script_path = cfg.script;
       await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
-    }, ENGINE).catch((e) => { throw new Error('Could not provision the ASR engine: ' + e.message); });
+    }, { engine: ENGINE, script: championScript }).catch((e) => { throw new Error('Could not provision the ASR engine: ' + e.message); });
+    if (ENGINE === 'WSL7B') {
+      // The preflight and health checks verify the server against the REGISTRY champion; a fresh
+      // profile's registry is empty, so every identity check fails and the champion path can only
+      // hang or refuse (measured 2026-08-20: the import sat in source_reference forever). Register
+      // the LIVE machine's champion identity, exactly as the Rust preflight test does.
+      console.log('==> Registering the live champion identity in the disposable registry...');
+      const pointer = JSON.parse(
+        require('fs').readFileSync(path.join(process.env.APPDATA, 'cortex-speech', 'champion.json'), 'utf-8'),
+      ).champions['omniasr-7b'];
+      const regPy = path.join(OUT_DIR, 'register_champion.py');
+      const q = String.fromCharCode(34);
+      require('fs').writeFileSync(regPy, [
+        'import sqlite3',
+        'con = sqlite3.connect(r' + q + path.join(DATA_DIR, 'cortex-speech.db') + q + ')',
+        'sql = ' + q + 'INSERT OR REPLACE INTO model_versions (id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status) VALUES (?, ' + String.fromCharCode(39) + 'omniasr-7b' + String.fromCharCode(39) + ', ' + String.fromCharCode(39) + 'soranivoice_omniASR_LLM_7B_v2_local' + String.fromCharCode(39) + ', ?, ?, ' + String.fromCharCode(39) + 'user-finetuned' + String.fromCharCode(39) + ', ' + String.fromCharCode(39) + 'owner-full-rights' + String.fromCharCode(39) + ', ' + String.fromCharCode(39) + 'champion' + String.fromCharCode(39) + ')' + q,
+        'con.execute(sql, (' + q + pointer.modelVersionId + q + ', ' + q + pointer.deploymentSha256 + q + ', ' + q + pointer.deploymentManifestPath + q + '))',
+        'con.commit()',
+        'con.close()',
+        'print(' + q + 'registered' + q + ')',
+      ].join(String.fromCharCode(10)), 'utf-8');
+      console.log('   ' + execSync('python ' + JSON.stringify(regPy), { cwd: REPO }).toString().trim());
+    }
   }
 
   console.log('==> Importing real audio:', AUDIO);
@@ -513,13 +539,34 @@ async function reviewOverHttp(page, draftText) {
   }
   console.log(`   skip: nothing written, clip out of this reviewer's queue, backlog still ${afterSkip.pendingTotal}`);
 
+  // ENFORCEMENT IS LIVE (2026-08-19): a verdict without listening evidence is refused 428, and this
+  // harness is a CLIENT like any other — it must report its playback. It genuinely fetched the full
+  // clip above (RIFF asserted); heardMs declares that playback against the served duration, exactly
+  // as the phone page reports its media time. Sending none was this harness silently testing a
+  // pre-enforcement world.
+  const heardMs = Math.max(1, Number(item.durationMs) || 0);
+
+  // Refusal FIRST, as its own assertion: an unheard verdict must bounce with 428 and write nothing.
+  const unheard = await http(`${base}/api/decision`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ id: item.id, action: 'edit', text: 'unheard', rowVersion: item.rowVersion }),
+  });
+  if (unheard.status !== 428) {
+    throw new Error(`an evidence-free verdict returned ${unheard.status}, expected 428 — enforcement is not enforcing`);
+  }
+  console.log('   enforcement: evidence-free verdict refused with 428, as deployed');
+
   // The SAME clip, decided for real. A skip must not poison a clip: it is the absence of a verdict,
   // not a refusal, so the reviewer who skipped it can still come back and judge it.
   const corrected = draftText + ' ✔';
   const decision = await http(`${base}/api/decision`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ id: item.id, action: 'edit', text: corrected }),
+    body: JSON.stringify({
+      id: item.id, action: 'edit', text: corrected, rowVersion: item.rowVersion,
+      heardMs, clipDurationMs: heardMs,
+    }),
   });
   if (decision.status !== 200) {
     throw new Error(`POST /api/decision -> ${decision.status} ${await decision.text()}, expected 200`);
