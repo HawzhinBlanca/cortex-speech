@@ -39,6 +39,13 @@ const SOURCE_DIALECTS: &[(&str, &str)] = &[
     // The original corpus's pre-recovery location. Nothing lives here now (the 1,031 clips were
     // relinked into the tree above), kept so a clip restored from an old snapshot still maps.
     ("SoraniVoice_PC_", SORANI),
+    // A prepared single-speaker TTS set living OUTSIDE the organized tree, so the folder rule above
+    // cannot route it. Sorani on the evidence of its own name: the set is cut from the ZarPodcast
+    // material, which the owner filed under `Kurdish Corpora\sorani\`. Mapped explicitly because an
+    // UNMAPPED source is not a neutral state — `reviewer_may_judge` fails closed, so every restricted
+    // reviewer is served nothing from it and the clips sit unreviewable with no error anywhere
+    // (measured 2026-08-17, when 535 pending Sorani clips did exactly that to five reviewers).
+    (r"ZAR_Lamo_TTS_Dataset\", SORANI),
 ];
 
 /// The dialect of the recording this clip was cut from, or `None` when the source is not mapped.
