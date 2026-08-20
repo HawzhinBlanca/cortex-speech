@@ -113,6 +113,7 @@
       reviewLoadError = null;
       reviewRows = reset ? page.items : [...reviewRows, ...page.items];
       reviewCursor = page.nextCursor;
+      focusNarrowed = page.focusNarrowed === true;
       if (reset) {
         reviewTotal = page.total;
         reviewInitialTotal = page.total;
@@ -151,6 +152,13 @@
   // search scopes; the verified-filter is ignored here because review mode has its own
   // pending-first ordering (a verified-only filter would render the queue permanently "all done").
   const searchScoped = $derived($searchQuery.trim().length > 0);
+  // A voice focus narrows this queue to one speaker's clips, so — exactly like a search — the queue
+  // is a SUBSET and corpus-wide progress claims are lies about it. Set from the server's own answer
+  // (it alone knows whether a focus file was in force for this fetch), never inferred from the flag
+  // we sent. Review 2026-08-20: draining 1,318 focused clips announced the whole 15,262-clip library
+  // as reviewed, because the completion banner only ever excluded the SEARCH subset.
+  let focusNarrowed = $state(false);
+  const subsetScoped = $derived(searchScoped || focusNarrowed);
 
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
@@ -197,24 +205,24 @@
   // purpose — a fully-reviewed SEARCH SUBSET must never fire the completion banner. See
   // reviewProgress.ts, where that rule is unit-tested.
   const progress = $derived({
-    done: searchScoped
+    done: subsetScoped
       ? Math.max(0, reviewInitialTotal - reviewTotal)
       : Math.min(
           reviewCorpusTotal,
           reviewInitiallyVerified + Math.max(0, reviewInitialTotal - reviewTotal),
         ),
-    total: searchScoped ? reviewInitialTotal : reviewCorpusTotal,
+    total: subsetScoped ? reviewInitialTotal : reviewCorpusTotal,
     percent:
-      (searchScoped ? reviewInitialTotal : reviewCorpusTotal) > 0
+      (subsetScoped ? reviewInitialTotal : reviewCorpusTotal) > 0
         ? Math.round(
-            ((searchScoped
+            ((subsetScoped
               ? reviewInitialTotal - reviewTotal
               : reviewInitiallyVerified + reviewInitialTotal - reviewTotal) /
-              (searchScoped ? reviewInitialTotal : reviewCorpusTotal)) *
+              (subsetScoped ? reviewInitialTotal : reviewCorpusTotal)) *
               100,
           )
         : 0,
-    allReviewed: !searchScoped && reviewCorpusTotal > 0 && reviewTotal === 0,
+    allReviewed: !subsetScoped && reviewCorpusTotal > 0 && reviewTotal === 0,
   });
 
   $effect(() => {
@@ -1080,7 +1088,11 @@
       <EmptyState
         variant="empty"
         title={$t('review.allDone')}
-        description={searchScoped ? $t('review.searchScopeEmpty') : $t('review.allDoneHint')}
+        description={searchScoped
+          ? $t('review.searchScopeEmpty')
+          : focusNarrowed
+            ? $t('review.focusScopeEmpty')
+            : $t('review.allDoneHint')}
       />
       <div class="flex flex-wrap justify-center gap-2">
         {#if progress.allReviewed && onExport}
@@ -1144,13 +1156,14 @@
         </div>
       {/if}
 
-      {#if searchScoped}
-        <!-- Scope is never silent: the reviewer always sees they're on a subset. -->
+      {#if subsetScoped}
+        <!-- Scope is never silent: the reviewer always sees they're on a subset. A voice focus is a
+             subset too, and used to be the one that said nothing (review 2026-08-20). -->
         <div
           class="rounded-lg border border-amber-600/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300"
           data-testid="review-scope-banner"
         >
-          {$t('review.searchScope')
+          {$t(searchScoped ? 'review.searchScope' : 'review.focusScope')
             .replace('{n}', String(queue.length))
             .replace('{m}', String(reviewCorpusTotal))}
         </div>

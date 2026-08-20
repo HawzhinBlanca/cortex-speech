@@ -1794,18 +1794,14 @@ pub fn get_segments_page(
     // honoured serves NOTHING (present-but-broken fails CLOSED), and it is re-read per fetch so an
     // edit takes effect on the next refill. Only the review queue asks (`focused: true`); the
     // curate/library views stay unfocused — the queue narrows, the library does not.
-    let focus: Option<std::collections::HashSet<String>> = if focused.unwrap_or(false) {
+    let focus = if focused.unwrap_or(false) {
         let dir = state.lock_data_dir().clone();
-        match dir.map(|d| crate::voice_focus::load_focus(&d)) {
-            Some(Err(e)) => return Err(format!("policy file broken, no clips served: {e}")),
-            Some(Ok(f)) => f,
-            None => None,
-        }
+        crate::voice_focus::resolve(dir.as_deref())?
     } else {
         None
     };
     let db = state.lock_db();
-    db.get_segments_page_focused(verified, query.as_deref(), &sort, limit, cursor.as_deref(), focus.as_ref())
+    db.get_segments_page_focused(verified, query.as_deref(), &sort, limit, cursor.as_deref(), focus.as_deref())
         .map_err(|e| e.to_string())
 }
 

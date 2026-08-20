@@ -140,8 +140,16 @@ pub async fn check_agentic_readiness(state: State<'_, AppState>) -> Result<Agent
 #[tauri::command]
 pub fn get_escalation_queue(state: State<'_, AppState>, limit: usize) -> Result<Vec<crate::db::SpeechSegment>, String> {
     RATE_LIMITER.check("get_escalation_queue")?;
+    // The Inbox is a SERVING PATH: it plays these clips, mints playback receipts for them, and
+    // records accept/edit/reject against them. So the voice focus governs it exactly as it governs
+    // the review page and every phone queue — found by review 2026-08-20, when narrowing the review
+    // page still left the Inbox handing out the guest clips the focus exists to skip.
+    let focus = {
+        let dir = state.lock_data_dir().clone();
+        crate::voice_focus::resolve(dir.as_deref())?
+    };
     let db = state.lock_db();
-    db.get_escalation_queue(limit).map_err(|e| e.to_string())
+    db.get_escalation_queue(limit, focus.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

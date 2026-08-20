@@ -93,9 +93,37 @@ def test_no_respawn_after_a_deliberate_shutdown():
     assert exits == [1]
 
 
+def test_a_shutdown_that_arrives_during_the_backoff_still_cancels_the_respawn():
+    """The race the test above cannot see: `stopping` is set WHILE the loop sleeps.
+
+    Review 2026-08-20. The loop sampled `stopping` when it reaped, then slept 5 s before forking.
+    A SIGTERM landing inside that window had already SIGTERMed the generation it could see, so the
+    worker forked after the sleep was one nothing would ever signal — it outlives the parent holding
+    the listen port and ~19 GB of VRAM, and blocks the next server start. Fails without the
+    post-backoff re-check: `spawned` comes back as [0]."""
+    import threading
+
+    stopping = threading.Event()
+    deaths = iter([(101, 9), (102, 0)])
+    spawned = []
+    exits = []
+    supervise_workers(
+        {101: 0, 102: 1},
+        2,
+        reap=lambda: next(deaths),
+        exit_fn=lambda c: exits.append(c),
+        respawn=lambda i: spawned.append(i) or 999,
+        stopping=stopping,
+        backoff=lambda s: stopping.set(),  # the signal lands mid-wait
+    )
+    assert spawned == [], "a shutdown during the backoff must cancel the respawn, not race it"
+    assert exits == [1]
+
+
 if __name__ == "__main__":
     test_reaps_every_worker_before_exiting()
     test_single_replica_exits_on_its_death()
     test_a_dead_worker_is_respawned_on_its_own_device_with_a_bounded_budget()
     test_no_respawn_after_a_deliberate_shutdown()
+    test_a_shutdown_that_arrives_during_the_backoff_still_cancels_the_respawn()
     print("PASS: champion server graceful-degradation supervisor (4 tests)")

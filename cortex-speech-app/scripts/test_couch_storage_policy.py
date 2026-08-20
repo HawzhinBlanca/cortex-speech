@@ -72,7 +72,17 @@ def test_cookie_sessions_survive_a_restart() -> None:
     source = (Path(__file__).parents[1] / "src-tauri" / "src" / "couch.rs").read_text(encoding="utf-8")
     required = {
         "sessions are persisted": "struct SavedCookieSession",
-        "and restored on resume": "session_issued,",
+        # The RESTORE WIRING, not just the word `session_issued` — that substring also matches the
+        # struct declaration, so the pin used to stay green over a deleted restore (review
+        # 2026-08-20). The end-to-end test asserted below covers the behaviour; this keeps the shape
+        # greppable so a refactor has to notice it.
+        "restored sessions are rebuilt into the running state": "let restored: HashMap<String, (String, SystemTime)> =",
+        # One definition of which map holds the durable links: a save site that writes an empty
+        # pairing map kills every link on the next restart, and that guard used to exist at only one
+        # of the two save sites (review 2026-08-20).
+        "every save site uses the same durable-link map": "fn durable_pairing_codes(",
+        # The behaviour itself: a restored cookie must authenticate a REAL request over HTTP.
+        "the restart is proven end to end": "fn a_restored_session_authenticates_a_real_request_after_a_restart()",
         "a fresh claim is durable immediately": "persist_session_state(state);",
         "expiry uses the wall clock, which is the only clock that crosses a restart": "issued_unix",
         "a refused reviewer is visible in the log": "Couch Review refused an unauthenticated request",

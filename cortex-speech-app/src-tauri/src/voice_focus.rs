@@ -28,8 +28,43 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 pub const VOICE_FOCUS_FILE: &str = "voice_focus.json";
+
+/// The refusal a serving path must give while the focus file is present-but-broken. One string, so
+/// every queue tells the reviewer the same thing and a grep finds every site that can emit it.
+pub const POLICY_BROKEN_PREFIX: &str = "policy file broken, no clips served";
+
+/// Resolve the active voice focus for a serving path, fail-CLOSED, with the refusal already worded.
+///
+/// THE one entry point every queue must use. `load_focus` is the raw read; this is the policy:
+///
+///   * `Ok(None)`      — no data dir or no file: serve the full queue, exactly as before either existed;
+///   * `Ok(Some(ids))` — an active focus: serve only these clips;
+///   * `Err(message)`  — the file exists but cannot be honoured: serve NOTHING, and show this message.
+///
+/// It exists because the alternative was proven not to work. Each serving path used to spell the
+/// three-arm match out for itself, and on 2026-08-20 the owner heard guest clips on the desktop: the
+/// phone queue had the logic and the desktop review page had never been given it. A policy that must
+/// be re-derived per call site is a policy that will be missed at the next call site — so adding a
+/// queue is now a call to this function, and forgetting it is visible as a missing call rather than
+/// as a silent hole in the policy.
+///
+/// Deliberately NOT cached. A review flagged the repeated read as waste (a paging queue re-reads the
+/// id list once per page), and a 2-second cache was tried and REVERTED: it made a file that had just
+/// become broken keep serving clips for the rest of its TTL, which `a_broken_policy_file_stops_the
+/// _queue_instead_of_widening_it` caught immediately. Fail-closed has to mean "on the next fetch",
+/// not "soon" — the whole reason this policy exists is that pointing paid reviewers at the wrong
+/// audio costs real money per minute. The read is a stat and a parse of one small file against a
+/// query that already touches the library; that is not the expensive part of serving a queue.
+pub fn resolve(data_dir: Option<&Path>) -> Result<Option<Arc<HashSet<String>>>, String> {
+    let Some(dir) = data_dir else {
+        return Ok(None); // no library on disk: nothing to narrow against
+    };
+    // Pre-worded, so every serving path refuses in the same words.
+    Ok(load_focus(dir).map_err(|e| format!("{POLICY_BROKEN_PREFIX}: {e}"))?.map(Arc::new))
+}
 
 /// The set of segment ids a reviewer may currently be served.
 ///
@@ -111,6 +146,28 @@ mod tests {
                 "{bad:?} exists on disk, so it must serve NOTHING, not everything"
             );
         }
+    }
+
+    #[test]
+    fn a_broken_focus_refuses_and_the_owners_fix_lands_on_the_very_next_call() {
+        // No staleness in either direction: a broken file refuses NOW, and the fix takes effect NOW.
+        // A 2-second cache was tried here and reverted — it kept serving clips through a file that
+        // had just become broken, which is the failure this policy exists to prevent.
+        let dir = dir_with(Some(r#"{ not json"#));
+        assert!(resolve(Some(dir.path())).is_err(), "a broken file refuses");
+        assert!(
+            resolve(Some(dir.path())).unwrap_err().starts_with(POLICY_BROKEN_PREFIX),
+            "and refuses in the shared wording every serving path shows"
+        );
+
+        std::fs::write(dir.path().join(VOICE_FOCUS_FILE), br#"{"name":"V","segment_ids":["a"]}"#).unwrap();
+        let fixed = resolve(Some(dir.path())).expect("the very next call sees the fix, with no TTL to wait out");
+        assert_eq!(fixed.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn no_data_dir_means_no_restriction() {
+        assert!(resolve(None).unwrap().is_none(), "no library on disk cannot narrow anything");
     }
 
     #[test]

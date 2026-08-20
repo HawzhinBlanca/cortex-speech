@@ -166,6 +166,13 @@ export const en: Record<string, string> = {
   'review.searchScope':
     'Reviewing a search subset: {n} of {m} clips — clear the search to review everything.',
   'review.searchScopeEmpty': 'No clips match the current search — clear it to review everything.',
+  // The voice focus is a SUBSET like a search is, and the reviewer has to see that they are on one:
+  // its queue emptying means this speaker's clips are done, never that the library is. No speaker
+  // NAME appears here — that lives only in the owner's data-dir file (voice_focus.rs).
+  'review.focusScope':
+    "Reviewing one speaker's clips: {n} of {m} — the rest of the library is not in this queue.",
+  'review.focusScopeEmpty':
+    "This speaker's clips are all reviewed — the rest of the library is still waiting.",
   'review.waveformFailed':
     "Couldn't read this clip's audio — the waveform is unavailable, not silent.",
   // Refusal, not a warning: the decision was NOT recorded. A verdict on audio nobody could hear is

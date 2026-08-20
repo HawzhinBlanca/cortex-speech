@@ -58,6 +58,15 @@ def test_the_server_falls_back_to_ffmpeg_and_fails_loudly() -> None:
         "the ffmpeg call must SEEK to the requested window; decoding a 77-minute episode for a 9s clip "
         "scales work with the source instead of the clip"
     )
+    # 2026-08-20 (review): the seek must start EARLY and trim the excess. A decoder started mid-stream
+    # has no history — MEASURED on a 320 kbps MP3 master at a 42-minute offset, a bare seek made the
+    # first 10 ms of every clip as wrong as the signal was loud (0.0 dB) and 10-50 ms -5.4 dB, i.e. the
+    # word ONSET was garbage while everything from 50 ms on was bit-identical. With the pad the onset
+    # measures -381 dB against the exact whole-file slice: silence, as it should be.
+    assert "SEEK_PAD_MS" in src, "the padded-seek constant is gone — clip onsets go back to being decoder garbage"
+    assert "samples = samples[drop:]" in body, (
+        "the padded lead-in must be TRIMMED off; leaving it shifts every clip earlier by the pad"
+    )
 
 
 def test_the_ffmpeg_argv_actually_decodes_an_mp4() -> None:

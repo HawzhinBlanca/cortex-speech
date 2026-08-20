@@ -43,6 +43,8 @@ export interface SegmentsPage {
   items: SpeechSegment[];
   total: number;
   nextCursor: string | null;
+  /** True when a voice focus narrowed this page, i.e. `total` counts a SUBSET of the library. */
+  focusNarrowed?: boolean;
 }
 
 export interface GoldSegment {

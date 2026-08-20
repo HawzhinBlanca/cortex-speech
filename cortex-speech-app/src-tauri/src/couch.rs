@@ -99,6 +99,10 @@ const LISTENER_RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 const ACCEPT_POLL: Duration = Duration::from_millis(250);
 const TLS_IDENTITY_FILE: &str = "couch_tls_identity.json";
 const COUCH_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How stale a session's persisted issue time may get before a page load rewrites it. Small next to
+/// `COUCH_SESSION_TTL`, so the durable expiry tracks the in-memory one closely, and large enough that
+/// a reloading phone does not re-encrypt every session on every request (review 2026-08-20).
+const RENEWAL_PERSIST_AFTER: Duration = Duration::from_secs(15 * 60);
 const MAX_SESSIONS_PER_REVIEWER: usize = 8;
 
 /// Per-reviewer request budget (P1.6). Every desktop IPC command is throttled; these HTTP routes were
@@ -524,6 +528,22 @@ fn clear_session_revocation(data_dir: &Path) -> Result<(), String> {
 /// that merely forgets itself is recoverable by pressing Start again. `revoke` is the exception and
 /// must surface it: a revoke that lives only in memory is silently undone by the next restart, which
 /// is the opposite of what the owner just asked for.
+/// The map that holds the durable LINK tokens for this state.
+///
+/// Normally `pairing_codes`. A state where that map is empty but `reviewers` holds tokens is the
+/// pre-pairing-code shape, and there the session tokens ARE the links — writing an empty map there
+/// would hand `save_session` a `reviewers: {}` whose partial-write refusal passes vacuously (0 == 0),
+/// and `load_session` then returns `None` for the whole file: every reviewer link dead at the next
+/// restart. One definition, because this used to live only at the spot-check save site while the
+/// newer per-claim save had no idea it was needed (review 2026-08-20).
+fn durable_pairing_codes(st: &CouchState) -> HashMap<String, String> {
+    if st.pairing_codes.is_empty() {
+        st.reviewers.clone()
+    } else {
+        st.pairing_codes.clone()
+    }
+}
+
 /// Snapshot the session state and write it OUTSIDE the lock.
 ///
 /// Called wherever a cookie session is minted or renewed. Without this a session created after the
@@ -537,7 +557,7 @@ fn persist_session_state(state: &Mutex<CouchState>) {
     let snapshot = {
         let st = lock_state(state);
         st.session_store.clone().map(|(dir, db_path)| {
-            (dir, db_path, st.pairing_codes.clone(), st.spot_checks.clone(), snapshot_live_sessions(&st))
+            (dir, db_path, durable_pairing_codes(&st), st.spot_checks.clone(), snapshot_live_sessions(&st))
         })
     };
     if let Some((dir, db_path, reviewers, checks, sessions)) = snapshot {
@@ -1488,12 +1508,27 @@ fn handle_request(
             // reviewer's cookie renews on every visit, so a bookmark used weekly never dies while
             // the session lives. (A fixed Max-Age from first claim would expire mid-engagement.)
             Some((token, _)) => {
-                if let Some(issued) = lock_state(state).session_issued.get_mut(&token) {
-                    *issued = SystemTime::now();
-                }
                 // The slid time has to reach the file, or a restart restores the ORIGINAL issue time
-                // and an actively-used session still dies at 24 h from its first claim.
-                persist_session_state(state);
+                // and an actively-used session still dies at 24 h from its first claim. But it does
+                // NOT have to reach it on every page load: persisting costs one DPAPI encryption per
+                // live session (up to MAX_SESSIONS_PER_REVIEWER x reviewers) plus a full atomic
+                // rewrite, all inside the request path, and a phone on a flaky connection reloads a
+                // lot. Writing only once the stored time is RENEWAL_PERSIST_AFTER stale keeps the
+                // sliding window honest to within that much of a 24 h TTL for a fraction of the work.
+                let slid = {
+                    let mut guard = lock_state(state);
+                    match guard.session_issued.get_mut(&token) {
+                        Some(issued) => {
+                            let stale = SystemTime::now().duration_since(*issued).unwrap_or_default();
+                            *issued = SystemTime::now();
+                            stale >= RENEWAL_PERSIST_AFTER
+                        }
+                        None => false,
+                    }
+                };
+                if slid {
+                    persist_session_state(state);
+                }
                 page_reply_with_cookie(&token, shell)
             }
             // Unauthenticated: the bare shell, NO cookie. This is what a preview bot receives.
@@ -1653,13 +1688,11 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         Some(Ok(roster)) => crate::dialect::allowed_for(&roster, reviewer).cloned(),
         None => None,
     };
-    let focus: Option<std::collections::HashSet<String>> = match dir.as_ref().map(|d| crate::voice_focus::load_focus(d))
-    {
-        Some(Err(e)) => return err_reply(503, &format!("policy file broken, no clips served: {e}")),
-        Some(Ok(f)) => f,
-        None => None,
+    let focus = match crate::voice_focus::resolve(dir.as_deref()) {
+        Err(e) => return err_reply(503, &e),
+        Ok(f) => f,
     };
-    let pending_ids = match db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_ref()) {
+    let pending_ids = match db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_deref()) {
         Ok(ids) => ids,
         Err(e) => return err_reply(500, &e.to_string()),
     };
@@ -1792,11 +1825,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 // than 409ing the reviewer. Snapshot under the lock, write outside it — save_session
                 // does DPAPI + file IO, which has no business inside the request-path mutex.
                 let persist = if grew {
-                    let persisted_pairing_codes = if guard.pairing_codes.is_empty() {
-                        guard.reviewers.clone()
-                    } else {
-                        guard.pairing_codes.clone()
-                    };
+                    let persisted_pairing_codes = durable_pairing_codes(&guard);
                     let sessions = snapshot_live_sessions(&guard);
                     guard
                         .session_store
@@ -5017,6 +5046,72 @@ mod tests {
             "a link revoked with Stop must NOT come back to life on the next launch"
         );
         stop().expect("final stop");
+    }
+
+    #[test]
+    fn a_restored_session_authenticates_a_real_request_after_a_restart() {
+        // The end-to-end half of `a_cookie_session_survives_the_restart_that_used_to_forget_it`.
+        //
+        // That test proves the FILE round-trips. This one proves the WIRING: that what start_on_port
+        // rebuilds from the file actually authenticates a request over HTTP. Delete `reviewers` and
+        // `session_issued` from the CouchState it constructs and the round-trip test still passes
+        // while every reviewer is locked out again — which is exactly the shape of the bug being
+        // fixed, so the round-trip alone is not enough cover. Here the SAME cookie is presented to a
+        // server built the way a restart builds one, and 200 is the only honest answer.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("s1", "دەقی تاقیکردنەوە")).unwrap();
+        drop(db);
+
+        // A session claimed before the restart, written the way the running server writes it.
+        let issued = SystemTime::now();
+        let pairing = HashMap::from([("pair-secret".to_string(), "Sara".to_string())]);
+        let sessions = HashMap::from([("cookie-from-before".to_string(), ("Sara".to_string(), issued))]);
+        save_session(tmp.path(), &pairing, &db_path, &HashSet::new(), &sessions).unwrap();
+
+        // THE RESTART: rebuild state from the file exactly as start_on_port does.
+        let remembered = load_session(tmp.path(), &db_path).expect("session file readable");
+        let names: Vec<String> = remembered.pairing.values().cloned().collect();
+        let restored: HashMap<String, (String, SystemTime)> =
+            remembered.sessions.into_iter().filter(|(_, (n, _))| names.contains(n)).collect();
+        let state = Arc::new(Mutex::new(CouchState {
+            pairing_codes: remembered.pairing,
+            reviewers: restored.iter().map(|(t, (n, _))| (t.clone(), n.clone())).collect(),
+            session_issued: restored.into_iter().map(|(t, (_, at))| (t, at)).collect(),
+            ..CouchState::default()
+        }));
+
+        let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let join = spawn_server_loop(0, server.clone(), db_path.clone(), state, shutdown.clone())
+            .expect("test server thread spawns");
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build();
+        let status = |token: &str| -> u16 {
+            agent
+                .get(&format!("http://127.0.0.1:{port}/api/queue"))
+                .set("Cookie", &cookie_for(token))
+                .call()
+                .map(|r| r.status())
+                .unwrap_or_else(|e| match e {
+                    ureq::Error::Status(c, _) => c,
+                    other => panic!("transport error: {other}"),
+                })
+        };
+
+        assert_eq!(
+            status("cookie-from-before"),
+            200,
+            "the cookie the phone still holds must authenticate against a server that just restarted"
+        );
+        assert_eq!(status("some-other-cookie"), 401, "and an unknown cookie must still be refused");
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = ureq::get(&format!("http://127.0.0.1:{port}/")).call();
+        let _ = join.join();
     }
 
     #[test]

@@ -160,6 +160,14 @@ pub struct SegmentsPage {
     pub items: Vec<SpeechSegment>,
     pub total: usize,
     pub next_cursor: Option<String>,
+    /// True when a voice focus narrowed this page — i.e. `total` counts a SUBSET of the library.
+    ///
+    /// The page needs this to tell the truth. Review mode measures progress against the corpus and
+    /// fires an "all clips reviewed" banner when its queue empties, a rule it already suppresses for
+    /// a SEARCH subset. A focus is a subset too, so without this flag draining 1,318 focused clips
+    /// announced a 15,262-clip library as finished (review 2026-08-20).
+    #[serde(default)]
+    pub focus_narrowed: bool,
 }
 
 /// Opaque continuation token for a stable keyset walk through the library list.
@@ -2154,7 +2162,12 @@ impl Database {
         if let Some(raw_query) = text_query.map(str::trim).filter(|value| !value.is_empty()) {
             let match_query = to_fts5_match(&normalize_search_query(raw_query));
             if match_query.is_empty() {
-                return Ok(SegmentsPage { items: Vec::new(), total: 0, next_cursor: None });
+                return Ok(SegmentsPage {
+                    items: Vec::new(),
+                    total: 0,
+                    next_cursor: None,
+                    focus_narrowed: focus.is_some(),
+                });
             }
             let scoped_query =
                 format!("{{raw_transcript normalized_transcript annotated_transcript}} : ({match_query})");
@@ -2305,7 +2318,7 @@ impl Database {
         } else {
             None
         };
-        Ok(SegmentsPage { items, total, next_cursor })
+        Ok(SegmentsPage { items, total, next_cursor, focus_narrowed: focus.is_some() })
     }
 
     /// Lightweight batch scope: return only ids plus the transcript needed for the optional content
@@ -5182,17 +5195,39 @@ impl Database {
     }
 
     /// Return escalated segments ordered riskiest-first (lowest agreement_score).
-    pub fn get_escalation_queue(&self, limit: usize) -> AppResult<Vec<SpeechSegment>> {
+    /// The escalated clips awaiting a human, narrowed to the active voice focus when there is one.
+    ///
+    /// `focus` is the same allow-list `pending_segment_ids_focused` and `get_segments_page_focused`
+    /// take: `None` is the whole backlog, `Some(set)` only these ids. It is a parameter and not an
+    /// internal read for the same reason as the others — the policy is resolved once, fail-closed, at
+    /// the command boundary (`voice_focus::resolve`).
+    pub fn get_escalation_queue(
+        &self,
+        limit: usize,
+        focus: Option<&std::collections::HashSet<String>>,
+    ) -> AppResult<Vec<SpeechSegment>> {
+        let mut binds: Vec<Value> = vec![Value::Integer(limit as i64)];
+        let focus_clause = match focus {
+            Some(set) => {
+                let mut ids: Vec<&str> = set.iter().map(String::as_str).collect();
+                ids.sort_unstable();
+                let ids_json = serde_json::to_string(&ids)
+                    .map_err(|e| AppError::Validation(format!("Could not encode voice-focus ids: {e}")))?;
+                binds.push(Value::Text(ids_json));
+                format!(" AND id IN (SELECT value FROM json_each(?{}))", binds.len())
+            }
+            None => String::new(),
+        };
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS}
              FROM speech_segments
              WHERE escalated = 1
-               AND (human_decision IS NULL OR human_decision = '')
+               AND (human_decision IS NULL OR human_decision = ''){focus_clause}
              ORDER BY COALESCE(agreement_score, 0.5) ASC, id ASC
              LIMIT ?1"
         );
         let mut stmt = self.conn.prepare(&query)?;
-        let rows = stmt.query_map(params![limit as i64], Self::map_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), Self::map_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }

@@ -565,6 +565,11 @@ def encode_reply(reply: dict) -> bytes:
 # and then the replica. An EXPLICIT CORTEX_7B_DEVICES list is the owner's word and skips the check.
 MIN_FREE_VRAM_MIB = int(os.environ.get("CORTEX_7B_MIN_FREE_VRAM_MIB", "20000"))
 
+# How far BEFORE a requested window the decoder is started, so it has settled by the time the real
+# audio begins. 200 ms is 4x the 50 ms settling measured on a 320 kbps MP3 master (2026-08-20) and
+# costs 200 ms of extra decode on a multi-second clip.
+SEEK_PAD_MS = 200
+
 
 def free_vram_mib() -> dict:
     """GPU index -> free VRAM in MiB, via nvidia-smi (the parent must stay CUDA-free)."""
@@ -740,12 +745,30 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
         silently stuck at a weaker engine). ffmpeg is already a hard dependency of the import path.
         """
         cmd = ["ffmpeg", "-nostdin", "-loglevel", "error"]
-        if start_ms is not None and end_ms is not None and end_ms > start_ms:
-            cmd += ["-ss", f"{start_ms / 1000.0:.3f}", "-t", f"{(end_ms - start_ms) / 1000.0:.3f}"]
+        ranged = start_ms is not None and end_ms is not None and end_ms > start_ms
+        drop = 0
+        if ranged:
+            # PAD the seek and trim the excess exactly. A decoder started mid-stream has no history:
+            # MEASURED 2026-08-20 on a 320 kbps MP3 master at a 42-minute offset, a bare `-ss` seek
+            # reproduced the exact slice perfectly from 50 ms onward but the FIRST 10 ms carried an
+            # error as large as the signal itself (0.0 dB) and 10-50 ms was -5.4 dB — i.e. the clip's
+            # ONSET, where the first phoneme lives, was garbage. Seeking SEEK_PAD_MS early and
+            # discarding exactly that many samples gives the decoder time to settle before the real
+            # window opens, and keeps the win that matters (we still never decode the whole episode).
+            lead = min(start_ms, SEEK_PAD_MS)
+            drop = int(round(lead / 1000.0 * 16000))
+            cmd += [
+                "-ss",
+                f"{(start_ms - lead) / 1000.0:.3f}",
+                "-t",
+                f"{(lead + end_ms - start_ms) / 1000.0:.3f}",
+            ]
         cmd += ["-i", audio_path, "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "16000", "-"]
         proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_SECONDS)
         if proc.returncode == 0 and proc.stdout:
             samples = torch.frombuffer(bytearray(proc.stdout), dtype=torch.float32)
+            if drop:
+                samples = samples[drop:]
             return samples.unsqueeze(0), 16000, True  # already 16k mono, already clipped
         if start_ms is None and end_ms is None:
             try:
@@ -985,6 +1008,14 @@ def supervise_workers(live, total, reap=None, exit_fn=None, respawn=None, stoppi
                 flush=True,
             )
             backoff(5)
+            # Re-check AFTER the wait. A SIGTERM landing during the backoff has already set this and
+            # already SIGTERMed the generation that existed at that instant — forking now produces a
+            # worker nothing will ever signal, which outlives the parent holding the listen port and
+            # ~19 GB of VRAM. That orphan is exactly what the signal forwarding exists to prevent, and
+            # it blocks the next server start (review 2026-08-20).
+            if stopping is not None and stopping.is_set():
+                print(f"parent: shutdown began during backoff — not respawning gpu{index}.", flush=True)
+                continue
             new_pid = respawn(index)
             live[new_pid] = index
             continue

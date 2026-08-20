@@ -148,13 +148,29 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
     """
     src = REPO_ROOT / "src-tauri" / "src"
     anchors = [
-        (src / "couch.rs", "pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_ref())"),
+        # Every queue resolves the policy through ONE function, fail-closed and pre-worded. Spelling
+        # the three-arm match out per call site is what let the desktop miss it in the first place.
+        (src / "voice_focus.rs", "pub fn resolve("),
+        (src / "voice_focus.rs", "POLICY_BROKEN_PREFIX"),
+        (src / "couch.rs", "crate::voice_focus::resolve(dir.as_deref())"),
+        (src / "commands.rs", "crate::voice_focus::resolve(dir.as_deref())"),
+        # The Inbox serves the escalation queue: it plays clips, mints receipts and records verdicts,
+        # so it is a serving path and the focus governs it (review 2026-08-20 — narrowing the review
+        # page alone still left the Inbox handing out guests).
+        (src / "commands" / "agentic.rs", "crate::voice_focus::resolve(dir.as_deref())"),
         (src / "db.rs", "id IN (SELECT value FROM json_each("),
-        (src / "commands.rs", "policy file broken, no clips served"),
         (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte", "focused: true"),
+        # A narrowed queue must SAY it is narrowed, and must never claim the library is finished.
+        (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte", "subsetScoped"),
+        (src / "db.rs", "pub focus_narrowed: bool"),
     ]
     for path, needle in anchors:
         assert needle in path.read_text(encoding="utf-8"), f"{path.name} lost its focus anchor: {needle!r}"
+    review = (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte").read_text(encoding="utf-8")
+    assert "allReviewed: !subsetScoped" in review, (
+        "the completion banner must exclude EVERY subset, not just a search — a drained focus queue "
+        "announcing the whole library as reviewed is a false completion claim"
+    )
     curate = (REPO_ROOT / "src" / "lib" / "stores" / "segmentStore.ts").read_text(encoding="utf-8")
     assert "focused: true" not in curate, "the library/curate store must stay UNFOCUSED (the queue narrows, the library does not)"
 

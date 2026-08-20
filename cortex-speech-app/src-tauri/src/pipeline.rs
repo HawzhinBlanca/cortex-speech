@@ -366,9 +366,20 @@ fn wsl7b_request_direct(
         }
         let mut stream =
             std::net::TcpStream::connect_timeout(&addr, remaining.min(Duration::from_secs(5))).map_err(|e| {
-                AppError::Other(format!(
-                    "7B engine not running: cannot reach the OmniASR-7B server on 127.0.0.1:{port} ({e})"
-                ))
+                // A connect that failed because OUR budget ran out is a TIMEOUT, not a dead engine.
+                // After a long BUSY retry loop `remaining` can be a couple of milliseconds, and
+                // reporting that as "7B engine not running" sends the operator to restart a WSL
+                // server that was up the whole time (review 2026-08-20).
+                if std::time::Instant::now() >= deadline {
+                    AppError::Other(format!(
+                        "7B server reachable but timed out after {:.0}s on 127.0.0.1:{port}",
+                        timeout.as_secs_f64()
+                    ))
+                } else {
+                    AppError::Other(format!(
+                        "7B engine not running: cannot reach the OmniASR-7B server on 127.0.0.1:{port} ({e})"
+                    ))
+                }
             })?;
         let _ = stream.set_nodelay(true);
         let _ = stream.set_write_timeout(Some(remaining.min(Duration::from_secs(10))));

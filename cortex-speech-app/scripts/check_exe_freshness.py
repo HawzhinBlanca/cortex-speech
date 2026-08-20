@@ -114,7 +114,8 @@ def evaluate_freshness(
     # owner's to keep or discard.
     for name, mtime in stale_installers or []:
         problems.append(
-            f"STALE INSTALLER: {name} (mtime {mtime:.0f}) predates the built exe (mtime {exe_mtime:.0f}). "
+            f"STALE INSTALLER: {name} (mtime {mtime:.0f}) predates this checkout's newest source "
+            f"(mtime {newest_src_mtime:.0f}) — it would install an app built from older code. "
             f"Rebuild with `npm run tauri build`, or delete it so nothing can install an old version."
         )
 
@@ -238,18 +239,26 @@ BUNDLE_DIR = EXE_PATH.parent / "bundle"
 INSTALLER_GLOBS = ("msi/*.msi", "nsis/*-setup.exe")
 
 
-def find_stale_installers(exe_mtime: float) -> list[tuple[str, float]]:
-    """Bundled installers that predate the exe — i.e. would install an older app than this build."""
+def find_stale_installers(newest_src_mtime: float) -> list[tuple[str, float]]:
+    """Bundled installers that would install an app built from OLDER SOURCES than this checkout.
+
+    Measured against the newest SOURCE, not against the exe. Comparing installer-vs-exe asks the
+    wrong question: one `tauri build` writes the MSI, then patches the exe for NSIS, then writes the
+    setup exe, so a single build's own artifacts straddle its exe mtime (measured 2026-08-20: the MSI
+    of the very build being verified sat 336 s "behind" the exe it embeds). Answering that with a
+    time tolerance meant picking a window, and any window wide enough for a build (~6 min here) is
+    also wide enough to pass an installer from the PREVIOUS build — a gate with a build-sized hole.
+
+    The question that actually matters is the same one asked of the exe: does this artifact predate
+    the sources it claims to ship? That has an exact answer and needs no fudge factor. The incident
+    this gate exists for (2026-08-17, an installer four DAYS behind) is caught either way; a
+    same-build artifact 336 s "behind" its exe is still newer than every source and passes honestly.
+    """
     stale: list[tuple[str, float]] = []
     for pattern in INSTALLER_GLOBS:
         for path in sorted(BUNDLE_DIR.glob(pattern)):
             mtime = path.stat().st_mtime
-            # 15-minute tolerance: ONE `tauri build` writes the MSI, then patches the exe for
-            # NSIS, then writes the setup exe — so the artifacts of a single build straddle the
-            # exe's final mtime by however long candle/light take (measured 2026-08-20: the MSI of
-            # the very build being verified sat 336s "behind" the exe it embeds). The incident this
-            # gate exists for (2026-08-17) was four DAYS behind, far outside any bundling window.
-            if mtime < exe_mtime - 900.0:
+            if mtime < newest_src_mtime:
                 stale.append((path.name, mtime))
     return stale
 
@@ -285,7 +294,7 @@ def main() -> int:
         head_sha=effective_head,
         newest_src_mtime=newest_src_mtime,
         newest_src_file=str(newest_src_file.relative_to(APP_ROOT)) if newest_src_file else None,
-        stale_installers=find_stale_installers(exe_mtime) if exe_exists else [],
+        stale_installers=find_stale_installers(newest_src_mtime) if exe_exists else [],
     )
     if note and not problems:
         print(f"note: {note}", flush=True)

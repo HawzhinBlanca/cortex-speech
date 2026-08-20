@@ -888,7 +888,11 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
     db = db_surface()
     required = [
         "pub fn get_segments_by_ids(&self, ids: &[String]) -> AppResult<Vec<SpeechSegment>>",
-        "pub fn get_escalation_queue(&self, limit: usize) -> AppResult<Vec<SpeechSegment>>",
+        # The signature grew a focus parameter (review 2026-08-20: the Inbox is a serving path, so the
+        # voice focus governs it). This pin is about error PROPAGATION, so it anchors the return type
+        # and the collect below, not the argument list that a policy change may legitimately widen.
+        "pub fn get_escalation_queue(",
+        "focus: Option<&std::collections::HashSet<String>>,",
         "Ok(rows.collect::<Result<Vec<_>, _>>()?)",
         "fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str>",
         "fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String>",

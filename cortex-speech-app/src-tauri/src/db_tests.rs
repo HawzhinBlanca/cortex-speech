@@ -4184,6 +4184,35 @@ fn desktop_review_page_narrows_to_the_voice_focus_but_the_library_does_not() {
 }
 
 #[test]
+fn the_escalation_queue_obeys_the_voice_focus() {
+    // The Inbox is a SERVING PATH — it plays these clips, mints playback receipts for them and
+    // records verdicts against them — so the focus governs it exactly as it governs the review page.
+    // Review 2026-08-20: narrowing the review page still left this queue handing out the guest clips
+    // the focus exists to skip, which is the complaint that started the whole thread.
+    let db = make_db();
+    for id in ["host-1", "guest-1", "host-2"] {
+        let mut s = make_segment(id, &format!("/{id}.wav"));
+        s.escalated = true;
+        db.insert_segment_full(&s).unwrap();
+    }
+    let focus: std::collections::HashSet<String> = ["host-1", "host-2"].iter().map(|s| s.to_string()).collect();
+
+    let all = db.get_escalation_queue(10, None).unwrap();
+    assert_eq!(all.len(), 3, "unfocused, the whole escalation backlog is served");
+
+    let narrowed = db.get_escalation_queue(10, Some(&focus)).unwrap();
+    let mut ids: Vec<&str> = narrowed.iter().map(|s| s.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["host-1", "host-2"], "a guest clip must never reach the Inbox while a focus is active");
+
+    let ghost: std::collections::HashSet<String> = ["nobody"].iter().map(|s| s.to_string()).collect();
+    assert!(
+        db.get_escalation_queue(10, Some(&ghost)).unwrap().is_empty(),
+        "a focus naming nothing in the backlog serves nothing, never everything"
+    );
+}
+
+#[test]
 fn every_segment_sort_walks_each_row_exactly_once() {
     let db = make_db();
     for (index, id) in ["a", "b", "c", "d", "e"].into_iter().enumerate() {
