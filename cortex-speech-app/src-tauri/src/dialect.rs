@@ -73,49 +73,61 @@ pub fn reviewer_may_judge(allowed: Option<&[String]>, audio_path: &str) -> bool 
 /// { "Rubar": ["hawleri", "sorani"], "Roza": ["sorani"] }
 /// ```
 ///
-/// A missing file, or a reviewer absent from it, means UNRESTRICTED — so adding this file cannot
+/// A MISSING file, or a reviewer absent from it, means UNRESTRICTED — so adding this file cannot
 /// silently take work away from someone who was already reviewing.
 ///
-/// Parsed ENTRY BY ENTRY, not as one strict map, and that is the whole point. Deserializing straight
-/// into `HashMap<String, Vec<String>>` makes the file all-or-nothing: ONE value that is not an array
-/// of strings fails the parse, and the fallback is "unrestricted", so the entire protection silently
-/// switches off while the file still looks correct to anyone reading it.
+/// A file that EXISTS but cannot be honoured is `Err`, and the caller must serve NOTHING
+/// (owner instruction 2026-08-20 — present-but-broken policy files fail CLOSED). The old contract
+/// failed open — "not even JSON" meant every reviewer unrestricted — which is the 2026-08-16
+/// incident's failure mode wearing a different trigger: the protection off while the file sits on
+/// disk looking like it is on. A stopped queue is noticed in minutes; 13 wrong-dialect decisions
+/// were noticed in days.
 ///
-/// MEASURED 2026-08-16: that is exactly what happened. The file shipped with a `"_comment"` key —
-/// written to tell the owner how to edit it — whose value is a STRING. Every reviewer was therefore
-/// unrestricted from the moment the roster was installed, including the three who do not speak
-/// Hawleri and whose 13 wrong-dialect decisions are the reason this module exists. A helpful comment
-/// turned the safety feature off.
-///
-/// So: a value that is an array of strings is a roster entry, anything else is skipped and logged,
-/// and a reviewer only ever ends up restricted by a line that actually says so.
-pub fn load_roster(data_dir: &Path) -> HashMap<String, Vec<String>> {
+/// Within a file that IS JSON, entries are still judged one by one:
+///   * a value that is an array of strings is a roster entry;
+///   * a key starting with `_` is a comment and is skipped — MEASURED 2026-08-16, the file shipped
+///     with a `"_comment"` string, and parsing the whole map strictly would have made a helpful
+///     comment fatal (then: silently fail open; now: needlessly stop the line);
+///   * any OTHER non-list value is `Err`. It is a typo'd RESTRICTION — `"Roza": "sorani"` — and
+///     skipping it quietly un-restricts exactly the reviewer the line was written to restrict.
+pub fn load_roster(data_dir: &Path) -> Result<HashMap<String, Vec<String>>, String> {
     let path = data_dir.join("reviewer_dialects.json");
-    let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => {
+            tracing::error!(
+                "reviewer_dialects.json exists but is unreadable ({e}) — queues serve NOTHING until it is fixed"
+            );
+            return Err(format!("reviewer_dialects.json is unreadable: {e}"));
+        }
+    };
     let parsed: HashMap<String, serde_json::Value> = match serde_json::from_str(&text) {
         Ok(map) => map,
         Err(e) => {
-            // Still unrestricted, but this one really is unusable: the file is not even JSON.
-            tracing::error!(
-                "reviewer_dialects.json is not valid JSON ({e}) — every reviewer is unrestricted until it is fixed"
-            );
-            return HashMap::new();
+            tracing::error!("reviewer_dialects.json is not valid JSON ({e}) — queues serve NOTHING until it is fixed");
+            return Err(format!("reviewer_dialects.json is not valid JSON: {e}"));
         }
     };
     let mut roster: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in parsed {
+        if name.starts_with('_') {
+            tracing::info!("reviewer_dialects.json: ignoring comment key \"{name}\"");
+            continue;
+        }
         let dialects: Option<Vec<String>> =
             value.as_array().and_then(|items| items.iter().map(|v| v.as_str().map(str::to_string)).collect());
         match dialects {
             Some(dialects) => {
                 roster.insert(name, dialects);
             }
-            // A comment key, or a typo. Named in the log so a REAL entry that was meant to restrict
-            // somebody cannot be skipped quietly.
-            None => tracing::info!("reviewer_dialects.json: ignoring \"{name}\" (not a list of dialect names)"),
+            None => {
+                tracing::error!("reviewer_dialects.json: \"{name}\" is not a list of dialect names — queues serve NOTHING until it is fixed");
+                return Err(format!("entry \"{name}\" is not a list of dialect names (prefix comment keys with _)"));
+            }
         }
     }
-    roster
+    Ok(roster)
 }
 
 #[cfg(test)]
@@ -199,7 +211,7 @@ mod tests {
             r#"{ "_comment": "how to edit this file", "Roza": ["sorani"], "Rubar": ["hawleri", "sorani"] }"#,
         )
         .unwrap();
-        let roster = load_roster(dir.path());
+        let roster = load_roster(dir.path()).expect("an _-prefixed comment must not break the file");
         assert_eq!(roster.get("Roza"), Some(&vec![SORANI.to_string()]), "a real entry must still bind");
         assert_eq!(roster.len(), 2, "the comment is skipped, the two reviewers are kept: {roster:?}");
         assert!(
@@ -209,10 +221,28 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_json_at_all_leaves_everyone_unrestricted_rather_than_stranded() {
-        // The other direction, and it stays deliberate: an unusable file must not empty every queue.
+    fn a_file_that_is_not_json_at_all_fails_closed_not_open() {
+        // Owner instruction 2026-08-20. A broken file used to mean "everyone unrestricted" — the
+        // 2026-08-16 incident's outcome by another road. Present-but-unusable now stops the queue
+        // loudly instead of switching the guard off quietly.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("reviewer_dialects.json"), "{ not json").unwrap();
-        assert!(load_roster(dir.path()).is_empty());
+        assert!(load_roster(dir.path()).is_err(), "a broken roster must stop the line, not unrestrict it");
+    }
+
+    #[test]
+    fn a_missing_file_is_still_unrestricted() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_roster(dir.path()), Ok(HashMap::new()), "no file = the behaviour before the roster existed");
+    }
+
+    #[test]
+    fn a_typoed_restriction_fails_closed_instead_of_unrestricting_its_reviewer() {
+        // `"Roza": "sorani"` is a line somebody wrote to RESTRICT Roza. Skip-and-log honoured the
+        // file while silently un-restricting exactly her — the one reviewer the line was about.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Roza": "sorani" }"#).unwrap();
+        let err = load_roster(dir.path()).expect_err("a typo'd entry must stop the line");
+        assert!(err.contains("Roza"), "the error names the broken entry: {err}");
     }
 }

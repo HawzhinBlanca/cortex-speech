@@ -36,6 +36,13 @@ from pathlib import Path
 RUNWAY_WARN_CLIPS = 100
 
 
+class PolicyBroken(Exception):
+    """A policy file EXISTS but cannot be honoured. Mirror of the server's 503: the queue serves
+    NOTHING until the file is fixed (owner instruction 2026-08-20 — present-but-broken fails
+    CLOSED), so every live link is effectively dead and the gate must say FAIL, not count clips
+    the server will never hand out."""
+
+
 def _data_dir() -> Path:
     appdata = os.environ.get("APPDATA")
     if appdata:
@@ -94,21 +101,27 @@ def may_judge(allowed: list[str] | None, audio_path: str, table: list[tuple[str,
 
 
 def load_roster(data_dir: Path) -> dict[str, list[str]]:
-    """Mirror of `dialect::load_roster`: array-of-strings values are entries, anything else is not."""
+    """Mirror of `dialect::load_roster`: missing = unrestricted; present-but-broken raises
+    PolicyBroken (the server 503s every queue); `_`-prefixed keys are comments; any other
+    non-list-of-strings value is a typo'd RESTRICTION and is broken, not skippable."""
     path = data_dir / "reviewer_dialects.json"
     if not path.is_file():
         return {}
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as e:
+        raise PolicyBroken(f"reviewer_dialects.json is not valid JSON: {e}") from e
     if not isinstance(parsed, dict):
-        return {}
-    return {
-        name: value
-        for name, value in parsed.items()
-        if isinstance(value, list) and all(isinstance(v, str) for v in value)
-    }
+        raise PolicyBroken("reviewer_dialects.json is not a JSON object")
+    roster: dict[str, list[str]] = {}
+    for name, value in parsed.items():
+        if name.startswith("_"):
+            continue
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            roster[name] = value
+        else:
+            raise PolicyBroken(f'reviewer_dialects.json entry "{name}" is not a list of dialect names')
+    return roster
 
 
 def live_reviewers(data_dir: Path) -> list[str]:
@@ -131,23 +144,24 @@ def live_reviewers(data_dir: Path) -> list[str]:
 def load_focus(data_dir: Path) -> set[str] | None:
     """Mirror of `voice_focus::load_focus`: the allow-list of clip ids every queue is narrowed to.
 
-    Same fail-OPEN contract as the Rust: missing, malformed or empty means no focus. The gate MUST
-    apply it, because the server does — measured 2026-08-19 the moment the focus went live: this
-    gate reported "15,318 servable pending" while every reviewer's real queue held 905. A gate that
-    counts clips the server will never hand out would read OK against an empty queue.
+    Same fail-CLOSED contract as the Rust (owner instruction 2026-08-20): missing means no focus;
+    present-but-broken raises PolicyBroken, because the server 503s every queue until the file is
+    fixed. The gate MUST mirror the server exactly — measured 2026-08-19 the moment the focus went
+    live: this gate reported "15,318 servable pending" while every reviewer's real queue held 905.
+    A gate that counts clips the server will never hand out reads OK against a dead queue.
     """
     path = data_dir / "voice_focus.json"
     if not path.is_file():
         return None
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as e:
+        raise PolicyBroken(f"voice_focus.json is not valid JSON: {e}") from e
     ids = parsed.get("segment_ids") if isinstance(parsed, dict) else None
-    if not isinstance(ids, list):
-        return None
-    focus = {i for i in ids if isinstance(i, str)}
-    return focus or None
+    focus = {i for i in ids if isinstance(i, str)} if isinstance(ids, list) else set()
+    if not focus:
+        raise PolicyBroken("voice_focus.json names no segment ids")
+    return focus
 
 
 def servable_clips(
@@ -244,8 +258,14 @@ def main() -> int:
         return 0
 
     table = source_dialects((_repo_root() / "src-tauri" / "src" / "dialect.rs").read_text(encoding="utf-8"))
-    roster = load_roster(data_dir)
-    focus = load_focus(data_dir)
+    try:
+        roster = load_roster(data_dir)
+        focus = load_focus(data_dir)
+    except PolicyBroken as e:
+        # The server 503s every queue while a policy file is broken, so every live link is dead.
+        print("REVIEWER QUEUES: FAIL", flush=True)
+        print(f"  - {e} — the server serves NOTHING to any reviewer until this file is fixed", flush=True)
+        return 1
     clips = servable_clips(db_path, table, focus)
     if focus is not None:
         print(f"voice focus ACTIVE: queues narrowed to {len(focus)} clip id(s)", flush=True)

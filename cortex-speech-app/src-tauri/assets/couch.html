@@ -643,7 +643,13 @@
       // would attribute their judgement to this reviewer. Left queued for whoever actually made it.
       // (Items with no author predate this field; sending them is still better than dropping work,
       // and the server's own fence only engages when the claim is present.)
-      if (item.reviewer && me && item.reviewer !== me) continue;
+      //
+      // A stamped item is ALSO held while `me` is still '' (audit fix 2026-08-20). The first flush of
+      // a page load runs before the queue response names this reviewer, and that was exactly the one
+      // flush the guard sat out — so on a shared phone, a colleague's offline decisions flushed under
+      // whichever cookie loaded first. Held items go out moments later: load() re-flushes as soon as
+      // the server says who this link belongs to.
+      if (item.reviewer && item.reviewer !== me) continue;
       try {
         await api('/api/decision', {
           method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(item),
@@ -802,6 +808,10 @@
       // the reviewer must be able to see it — silent attribution is attribution nobody can correct.
       me = res.reviewer;
       $('who').textContent = ' · ' + res.reviewer;
+      // Now that the server has named this reviewer, send the stamped work the pre-identity flush
+      // above rightly held back (it must never guess whose cookie it is flushing under). Fire and
+      // forget: the queue is already rendered, and the 30s retry timer backstops a failure here.
+      if (readOutbox().length) void flushOutbox();
       show();
     } catch (e) {
       // "Loading clips..." must not sit beside a failure message — but an EMPTY-STATE message is a

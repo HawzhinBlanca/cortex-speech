@@ -1485,16 +1485,24 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // the app. A reviewer with no entry is unrestricted, exactly as before this existed.
     // Voice focus (owner instruction 2026-08-19): when `<data_dir>/voice_focus.json` names a set of
     // clips, every reviewer's queue narrows to it — so paid hours build the one speaker's set being
-    // collected now instead of spreading across 34 h of mixed audio. Same hot-reload-per-fetch,
-    // same fail-OPEN-on-error contract as the dialect roster, for the same reason: a typo must widen
-    // the queue, never empty it.
-    let (allowed_dialects, focus): (Option<Vec<String>>, Option<std::collections::HashSet<String>>) = {
-        let guard = lock_state(state);
-        let dir = guard.session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone());
-        (
-            dir.as_ref().and_then(|d| crate::dialect::load_roster(d).get(reviewer).cloned()),
-            dir.as_ref().and_then(|d| crate::voice_focus::load_focus(d)),
-        )
+    // collected now instead of spreading across 34 h of mixed audio. Same hot-reload-per-fetch.
+    //
+    // A policy file that EXISTS but cannot be honoured is a 503, not a shrug (owner instruction
+    // 2026-08-20 — present-but-broken fails CLOSED). Failing open here silently pointed every paid
+    // reviewer at work the file was written to keep them off; the page treats >=500 as retryable and
+    // shows the status, so the line stops loudly and the very next fetch after the owner fixes the
+    // file works. A MISSING file is still "no restriction", exactly as before either file existed.
+    let dir = { lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone()) };
+    let allowed_dialects: Option<Vec<String>> = match dir.as_ref().map(|d| crate::dialect::load_roster(d)) {
+        Some(Err(e)) => return err_reply(503, &format!("policy file broken, no clips served: {e}")),
+        Some(Ok(roster)) => roster.get(reviewer).cloned(),
+        None => None,
+    };
+    let focus: Option<std::collections::HashSet<String>> = match dir.as_ref().map(|d| crate::voice_focus::load_focus(d))
+    {
+        Some(Err(e)) => return err_reply(503, &format!("policy file broken, no clips served: {e}")),
+        Some(Ok(f)) => f,
+        None => None,
     };
     let pending_ids = match db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_ref()) {
         Ok(ids) => ids,
@@ -1993,6 +2001,71 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Err(e) => return err_reply(500, &e.to_string()),
     };
 
+    let (decision, text): (&str, Option<String>) = if parsed.action == "skip" {
+        ("skip", None)
+    } else {
+        match parsed.action.as_str() {
+            "accept" | "edit" => {
+                let text = parsed.text.trim().to_string();
+                if text.is_empty() {
+                    return err_reply(400, "empty transcript");
+                }
+                // Same guard as the desktop editor: a placeholder draft ("[Pending WSL 7B ASR]" /
+                // "[ASR unavailable…]") must never be verified as gold.
+                if text.starts_with('[') && text.ends_with(']') {
+                    return err_reply(400, "placeholder transcript cannot be verified");
+                }
+                let is_edit = text != review_text(&prev).trim();
+                (if is_edit { "edit" } else { "accept" }, Some(text))
+            }
+            "bad" => ("reject", None),
+            other => return err_reply(400, &format!("unknown action '{other}'")),
+        }
+    };
+
+    // A dropped RESPONSE (not a dropped request) means the write landed and the page never heard so.
+    // Answer the retry with the success it already earned, before taking a lease, minting a second
+    // receipt, or pushing an undo entry for a decision that is already recorded.
+    //
+    // `already_recorded` without `verified` is the HALF-WRITTEN state: write one committed and the row
+    // upsert did not. That is not a duplicate to be waved through — the clip is still unverified, so it
+    // would be served as pending work forever — and it is not new work either, because replaying write
+    // one would double the learning pair. It is an interrupted write to be FINISHED, below.
+    let already_recorded =
+        parsed.action != "skip" && is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref());
+    if already_recorded && prev.verified {
+        // Carries the total as well: this is the RETRY path after a dropped response, which is
+        // exactly when a reviewer is least sure their work registered.
+        return json_reply(
+            200,
+            serde_json::json!({ "ok": true, "duplicate": true, "reviewedMs": db.reviewed_audio_ms(reviewer).unwrap_or(0) }),
+        );
+    }
+
+    // SERVE/DECIDE VERSION FENCE (text-provenance audit #4). The queue stamped this clip's
+    // monotonic revision into the payload; if the row changed between serve and submit (batch
+    // re-transcribe, refine loop, desktop edit — all of which target exactly the unverified rows
+    // the couch serves), the reviewer judged text that no longer exists: recording it would
+    // misclassify accept-vs-edit against the NEW row and mint a DPO pair anti-training the fresher
+    // draft. Refuse; the page reloads and serves the current text. Skipped for a replay finishing
+    // an already-recorded decision — its write one landed, so the stamp has legitimately moved.
+    //
+    // Placed BEFORE the receipt mint (audit fix 2026-08-20). The receipt's revision, fingerprint
+    // and duration are all resolved from the CURRENT row, so minting one for a submit whose serve
+    // predates a re-chunk would bind this reviewer's real listening to audio they never heard —
+    // evidence manufactured by ordering. A stale serve must be refused while it is still only a
+    // claim, before it becomes a receipt.
+    if !already_recorded {
+        if let Some(served_stamp) = parsed.row_version.as_deref() {
+            let Ok(served_revision) = served_stamp.parse::<i64>() else {
+                return err_reply(409, "this clip was served by an older page — reload for the fresh draft");
+            };
+            if served_revision != request_revision {
+                return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
+            }
+        }
+    }
+
     // LISTENING EVIDENCE — minted, then ENFORCED, before anything is written.
     //
     // Order matters and is not obvious: the page reports its heard-time WITH the decision, so the
@@ -2014,7 +2087,9 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
     let fingerprint =
         db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
-    let revision = db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(0);
+    // The revision the fence just verified against the serve — NOT a fresh query, which could see a
+    // write landing in the microseconds since and rebind this receipt to a revision never served.
+    let revision = request_revision;
     if let Some(heard_ms) = parsed.heard_ms {
         let receipt = crate::db::PlaybackReceipt {
             segment_id: parsed.id.clone(),
@@ -2118,24 +2193,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         return json_reply(200, serde_json::json!({ "ok": true, "skipped": true }));
     }
 
-    let (decision, text): (&str, Option<String>) = match parsed.action.as_str() {
-        "accept" | "edit" => {
-            let text = parsed.text.trim().to_string();
-            if text.is_empty() {
-                return err_reply(400, "empty transcript");
-            }
-            // Same guard as the desktop editor: a placeholder draft ("[Pending WSL 7B ASR]" /
-            // "[ASR unavailable…]") must never be verified as gold.
-            if text.starts_with('[') && text.ends_with(']') {
-                return err_reply(400, "placeholder transcript cannot be verified");
-            }
-            let is_edit = text != review_text(&prev).trim();
-            (if is_edit { "edit" } else { "accept" }, Some(text))
-        }
-        "bad" => ("reject", None),
-        other => return err_reply(400, &format!("unknown action '{other}'")),
-    };
-
     // SPOT CHECK (P2.1): this clip already has a human answer, so the reviewer was being measured, not
     // asked to do new work. Record the score and stop — the corpus row is left completely untouched,
     // because a mechanism that grades reviewers must never be able to alter the data it grades against.
@@ -2193,42 +2250,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             200,
             serde_json::json!({ "ok": true, "reviewedMs": db.reviewed_audio_ms(reviewer).unwrap_or(0) }),
         );
-    }
-
-    // A dropped RESPONSE (not a dropped request) means the write landed and the page never heard so.
-    // Answer the retry with the success it already earned, before taking a lease or pushing an undo
-    // entry for a decision that is already recorded.
-    //
-    // `already_recorded` without `verified` is the HALF-WRITTEN state: write one committed and the row
-    // upsert did not. That is not a duplicate to be waved through — the clip is still unverified, so it
-    // would be served as pending work forever — and it is not new work either, because replaying write
-    // one would double the learning pair. It is an interrupted write to be FINISHED, below.
-    let already_recorded = is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref());
-    if already_recorded && prev.verified {
-        // Carries the total as well: this is the RETRY path after a dropped response, which is
-        // exactly when a reviewer is least sure their work registered.
-        return json_reply(
-            200,
-            serde_json::json!({ "ok": true, "duplicate": true, "reviewedMs": db.reviewed_audio_ms(reviewer).unwrap_or(0) }),
-        );
-    }
-
-    // SERVE/DECIDE VERSION FENCE (text-provenance audit #4). The queue stamped this clip's
-    // monotonic revision into the payload; if the row changed between serve and submit (batch
-    // re-transcribe, refine loop, desktop edit — all of which target exactly the unverified rows
-    // the couch serves), the reviewer judged text that no longer exists: recording it would
-    // misclassify accept-vs-edit against the NEW row and mint a DPO pair anti-training the fresher
-    // draft. Refuse; the page reloads and serves the current text. Skipped for a replay finishing
-    // an already-recorded decision — its write one landed, so the stamp has legitimately moved.
-    if !already_recorded {
-        if let Some(served_stamp) = parsed.row_version.as_deref() {
-            let Ok(served_revision) = served_stamp.parse::<i64>() else {
-                return err_reply(409, "this clip was served by an older page — reload for the fresh draft");
-            };
-            if served_revision != request_revision {
-                return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
-            }
-        }
     }
 
     // THE LATE-SUBMIT GUARD. The lease is RELEASED the moment a clip is decided — correctly, since it
@@ -2613,6 +2634,46 @@ mod tests {
         Mutex::new(CouchState::default())
     }
 
+    /// Present-but-broken policy files fail CLOSED (owner instruction 2026-08-20). Before this, a
+    /// corrupted `voice_focus.json` or `reviewer_dialects.json` meant "no restriction" — the queue
+    /// silently widened to everything the file was written to keep reviewers off, and nobody could
+    /// tell until the paid hours were already spent. Now it is a 503: the page already treats >=500
+    /// as retryable, the owner fixes the file, and the next fetch works. A MISSING file must still
+    /// mean "no restriction", exactly as before either file existed.
+    #[test]
+    fn a_broken_policy_file_stops_the_queue_instead_of_widening_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("q1", "دەقی کار")).unwrap();
+        let state = Mutex::new(CouchState {
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            ..CouchState::default()
+        });
+
+        // No policy files on disk: unrestricted, the clip is served.
+        assert!(queue_ids(&db, "Sara", &state).contains(&"q1".to_string()), "missing files must not restrict");
+
+        // A corrupted focus serves NOTHING — never the whole library.
+        std::fs::write(tmp.path().join("voice_focus.json"), "{ not json").unwrap();
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 503, "broken focus must 503, got {code}: {}", String::from_utf8_lossy(&body));
+        std::fs::remove_file(tmp.path().join("voice_focus.json")).unwrap();
+
+        // Same for a roster whose entry is a typo'd restriction.
+        std::fs::write(tmp.path().join("reviewer_dialects.json"), r#"{ "Sara": "hawleri" }"#).unwrap();
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 503, "broken roster must 503, got {code}: {}", String::from_utf8_lossy(&body));
+
+        // And fixing the file is all it takes — the very next fetch serves work again.
+        std::fs::write(
+            tmp.path().join("reviewer_dialects.json"),
+            r#"{ "_comment": "ok", "Sara": ["hawleri", "sorani"] }"#,
+        )
+        .unwrap();
+        let (code, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 200, "a repaired policy file must serve on the next fetch, no restart");
+    }
+
     /// The ids `reviewer` is handed by a queue request (and, as a side effect, leases).
     fn queue_ids(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Vec<String> {
         let (code, _, body, ..) = api_queue(db, reviewer, state);
@@ -2620,6 +2681,35 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["reviewer"], reviewer, "the queue names the reviewer it was served to");
         payload["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// The version fence must fire BEFORE the receipt mint (audit fix 2026-08-20). A receipt's
+    /// revision, fingerprint and duration are all resolved from the CURRENT row, so minting one for
+    /// a submit whose serve predates a re-chunk would bind this reviewer's real listening to a row
+    /// they were never shown — evidence manufactured purely by ordering. Without the fix this test
+    /// fails on the second assertion: the 409 still comes back, but the receipt is already on disk.
+    #[test]
+    fn a_stale_serve_is_refused_before_its_receipt_can_be_minted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("vf1", "دەقی کۆن")).unwrap();
+        let state = state();
+        let served_revision = db.segment_review_revision("vf1").unwrap().unwrap_or(0);
+        // The row moves on after the serve — a re-transcribe, refine loop or desktop edit.
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision = review_revision + 1 WHERE id = 'vf1'", [])
+            .unwrap();
+        let body = serde_json::json!({
+            "id": "vf1", "action": "accept", "text": "دەقی کۆن",
+            "heardMs": 9_000, "clipDurationMs": 9_000, "rowVersion": served_revision.to_string(),
+        });
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 409, "a stale serve is refused");
+        let receipts: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'vf1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipts, 0, "and no receipt exists for a row the reviewer was never shown");
     }
 
     /// The SERVER half of the phone's playback evidence: what the page reports is only how much

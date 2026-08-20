@@ -16,8 +16,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_reviewer_queues_live import (  # noqa: E402
+    PolicyBroken,
     dialect_of,
     evaluate_queues,
+    load_focus,
     load_roster,
     may_judge,
     source_dialects,
@@ -109,6 +111,42 @@ def test_a_comment_key_does_not_empty_the_roster() -> None:
         )
         roster = load_roster(Path(tmp))
     assert roster == {"Roza": ["sorani"]}, roster
+
+
+def test_a_broken_policy_file_fails_the_gate_instead_of_unrestricting_everyone() -> None:
+    # Owner instruction 2026-08-20: present-but-broken fails CLOSED. The server 503s every queue, so
+    # the gate must FAIL loudly — the old mirror returned "unrestricted"/"no focus" and would have
+    # counted thousands of servable clips against links that serve nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "reviewer_dialects.json").write_text("{ not json", encoding="utf-8")
+        try:
+            load_roster(Path(tmp))
+            raise AssertionError("a roster that is not JSON must raise PolicyBroken")
+        except PolicyBroken:
+            pass
+    with tempfile.TemporaryDirectory() as tmp:
+        # A typo'd RESTRICTION: skipping it silently un-restricts exactly the reviewer it names.
+        (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps({"Roza": "sorani"}), encoding="utf-8")
+        try:
+            load_roster(Path(tmp))
+            raise AssertionError("a typo'd roster entry must raise PolicyBroken")
+        except PolicyBroken as e:
+            assert "Roza" in str(e), e
+    for broken in ("{ not json", json.dumps({"name": "V"}), json.dumps({"name": "V", "segment_ids": []})):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "voice_focus.json").write_text(broken, encoding="utf-8")
+            try:
+                load_focus(Path(tmp))
+                raise AssertionError(f"a broken focus must raise PolicyBroken: {broken!r}")
+            except PolicyBroken:
+                pass
+
+
+def test_missing_policy_files_still_mean_unrestricted() -> None:
+    # The other half of the contract is unchanged: ABSENCE is the state before the files existed.
+    with tempfile.TemporaryDirectory() as tmp:
+        assert load_roster(Path(tmp)) == {}
+        assert load_focus(Path(tmp)) is None
 
 
 def test_the_gate_reads_the_dialect_map_out_of_the_rust_rather_than_restating_it() -> None:
