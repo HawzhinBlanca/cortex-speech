@@ -10677,3 +10677,56 @@ Accepted, not fixed: same-name link reissue to a different human is indistinguis
 open item.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-20 (champion) — the 7.5/10 review was right, and the champion pipeline is now proven at the serving path
+
+The external engineering review retracted its near-10 and rated 0f7d9ae ~7.5/10 with nine champion
+-pipeline blockers. All 19 cited code sites verified by hand: substantively correct (two
+overstatements noted: worker death was loud-but-permanent, not silent; all-GPU default matches this
+rig's intent — the silent-CPU fallback was the real hazard). Fixed in four commits
+(e9e869d, 6815605, e21ee38, 930a6a1), each with the pins updated in the same commit:
+
+1. Crash-atomic imports: resume discriminates interrupted stages (placeholder/empty drafts) from
+   completed files and discards+redoes them; adopting the 2026-08-14 incident state is now
+   impossible.
+2. Halt-on-first-failure at EVERY level: directory imports stop at the first failing file (resume
+   journal makes it cheap); an exhausted-empty champion result rolls the file back and halts —
+   escalate-and-continue is gone.
+3. One commit owner: batch_transcribe no longer re-writes the champion's atomic commit
+   (TranscriptionDraft.committed_by_pipeline, exactly one true site, pinned).
+4. Direct transport: Rust speaks the server protocol itself. Gone per clip: a Python interpreter
+   spawn, a ~108 MB live DB+WAL copy into WSL, TWO full decodes of a 55-80 min episode. Server
+   decodes only the clip window (ffmpeg -ss/-t). MEASURED same clip (9.5s, 42.6 min into EP26):
+   8.64s -> 3.42s warm server-side; in-app champion draft ~1.4s in the E2E.
+5. Cancellation: batch threads its token into the 7B call; the gate wait is cancellable (100ms
+   polls); the socket read polls cancel every 500ms.
+6. Fleet: dead workers respawn on their own device (bounded 3, backoff, unit-tested 4/4); GPU
+   discovery failure is a HARD STOP (CPU only by name); auto-discovery takes only cards with
+   >=20 GB free (measured: WSL-side nvidia-smi sees replica VRAM on this rig).
+7. Factory refinement default Local -> None: a fresh install's champion no longer depends on an
+   unrelated LLM endpoint (privacy pin updated: None is stricter).
+8. Gates test production: verify_10's champion probe speaks the protocol and matches the pinned
+   deploymentSha256 (verified green against the live server); the 7B test leg's skips are loud and
+   fatal under CORTEX_REQUIRE_7B=1; ONE port accessor ends the health-vs-transcribe port drift.
+9. Reproducible recovery: scripts/wsl7b_requirements.lock (158 pins frozen from the LIVE venv,
+   py3.12.13/Ubuntu 26.04); WSL_DR_RUNBOOK corrected off /root/cortex_env; start_7b_server.ps1
+   passes the champion pointer the server actually requires (it was setting an ignored variable).
+
+PROVEN AT THE SERVING PATH (deployed exe e21ee38, real audio, real 7B server):
+```
+E2E WSL7B : import -> VAD -> champion draft (direct transport) -> re-transcribe -> couch TLS
+            -> skip writes nothing -> 428 on evidence-free verdict (asserted) -> decision
+            persisted verified+attributed -> REAL-DATA RUN OK
+identity  : health probe sha ae33143e... == champion.json pin (content check, not port-open)
+suite     : cargo 1309/1309 | clippy clean | vitest 283 | python policies 87/87
+```
+
+Found live during the E2E (blocker #6's shape, reproduced): a second app instance's champion
+supervision churns 6-minute warm-ups against a port it can never own; production single-instance
+self-heals (measured: pkill -> supervision respawn) but slowly. Fast child-exit detection on the
+Rust side and multi-instance port arbitration are the honest remaining lifecycle gaps, now tracked.
+
+Still open and owner-facing: the 20-decision enforcement canary (needs real reviewing on this
+build), spot-check pool 22/24, and the strategic speaker-identity/train-test-split design.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
