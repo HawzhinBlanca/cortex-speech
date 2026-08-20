@@ -539,13 +539,50 @@ def _probe_champion_7b():
     there because the server was down, which turned the whole leg RED — taking six real-model tests
     that had genuinely PASSED down with it and burying the sweep's actual failures under an
     environmental one. A leg that cannot run must say SKIP-ENV, and the other six must keep running.
+
+    STRENGTHENED 2026-08-20 (external review: "the 7B gate checks only whether a port is open").
+    A reachable port proves a listener, not the champion: this now speaks the protocol — sends
+    {"op": "health"} and requires status=ready AND the exact deploymentSha256 the live
+    champion.json pins. A wrong or half-loaded model on the right port is a FAILURE, not a pass.
     """
+    import json as _json
+    import os as _os
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.settimeout(2.0)
-        if probe.connect_ex(("127.0.0.1", 8799)) != 0:
-            return "OmniASR-7B champion server not up on 127.0.0.1:8799 (`wsl python scripts/cortex_7b_server.py`)"
+    port = int(_os.environ.get("CORTEX_7B_PORT", "8799"))
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0) as probe:
+            probe.settimeout(8.0)
+            probe.sendall(b'{"op": "health"}\n')
+            buf = bytearray()
+            while b"\n" not in buf and len(buf) < 1024 * 1024:
+                chunk = probe.recv(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+    except OSError:
+        return f"OmniASR-7B champion server not up on 127.0.0.1:{port} (`wsl python scripts/cortex_7b_server.py`)"
+    try:
+        reply = _json.loads(bytes(buf).split(b"\n", 1)[0].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return f"7B server answered on {port} but its health reply is unparseable ({exc}) — NOT the champion protocol"
+    if reply.get("code") == "BUSY":
+        return None  # every replica mid-decode IS a ready champion under load
+    if reply.get("status") != "ready":
+        return f"7B server on {port} is not ready: {reply.get('error') or reply.get('status')!r}"
+    appdata = _os.environ.get("APPDATA")
+    pointer = Path(appdata) / "cortex-speech" / "champion.json" if appdata else None
+    if pointer and pointer.is_file():
+        try:
+            pinned = _json.loads(pointer.read_text(encoding="utf-8"))["champions"]["omniasr-7b"]["deploymentSha256"]
+        except (ValueError, KeyError, OSError) as exc:
+            return f"live champion.json is unreadable ({exc}) — cannot verify the served identity"
+        served = reply.get("deploymentSha256")
+        if served != pinned:
+            return (
+                f"7B server on {port} serves deployment {str(served)[:12]}… but the live champion pin is "
+                f"{pinned[:12]}… — the WRONG MODEL is answering the champion port"
+            )
     return None
 
 

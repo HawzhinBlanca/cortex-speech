@@ -181,7 +181,14 @@ def test_no_raw_server_english_is_shown_to_the_reviewer() -> None:
         # is not shown to anyone.
         if "e.message" in line
         and not line.lstrip().startswith("//")
-        and ("t(" in line or "textContent" in line or "toast(" in line or "showErr(" in line)
+        # `t(` as a CALL, not a substring: `/was made by/.test(e.message)` is routing LOGIC (the
+        # attribution-409 hold, 2026-08-20), renders nothing, and must not trip a rendering gate.
+        and (
+            re.search(r"(?<![A-Za-z0-9_.])t\(", line) is not None
+            or "textContent" in line
+            or "toast(" in line
+            or "showErr(" in line
+        )
     ]
     assert not offenders, (
         "raw English server text is being rendered to the reviewer:\n"

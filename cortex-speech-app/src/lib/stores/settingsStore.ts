@@ -84,7 +84,7 @@ export const defaultSettings: AppSettings = {
   hfSplitSeed: 42,
   hfSpeakerDisjoint: true,
   hfLicense: 'mit',
-  llmMode: 'Local',
+  llmMode: 'None', // factory default (2026-08-20): refinement is opt-in, never a champion dependency
   llmEndpoint: 'http://127.0.0.1:11434/v1/chat/completions',
   llmApiKey: '',
   llmApiKeyConfigured: false,

@@ -112,7 +112,7 @@ def uncovered(conn: sqlite3.Connection, segment_id: str, decided_at: str, review
         SELECT segment_revision FROM playback_receipts
         WHERE segment_id = ? AND reviewer = ?
           AND created_at <= datetime(?, '+5 seconds')
-        ORDER BY created_at DESC, id DESC LIMIT 1
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
         """,
         (segment_id, reviewer, decided_at),
     ).fetchone()

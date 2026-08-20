@@ -22,7 +22,7 @@ pub async fn get_champion_engine_status(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<EngineStatus, String> {
-    let port = crate::pipeline::WSL_7B_SERVER_PORT;
+    let port = crate::pipeline::wsl_7b_port();
     let expected =
         crate::registry::champion_identity(&state.lock_db(), crate::deployment::OMNIASR_7B_FAMILY).ok().flatten();
     let Some(expected) = expected else {

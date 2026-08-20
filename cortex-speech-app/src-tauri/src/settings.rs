@@ -242,8 +242,13 @@ fn default_multi_engine_hypotheses() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum LlmMode {
-    None,
+    /// The FACTORY default (2026-08-20 external review). It used to be `Local`, which coupled a
+    /// fresh install's champion imports to an unrelated local LLM endpoint: the owner's hard-stop
+    /// law (2026-08-11) correctly halts when a CONFIGURED refiner fails, so a machine with no LM
+    /// server running hard-stopped otherwise-successful 7B drafts out of the box. Refinement is an
+    /// explicit opt-in mode, never a default dependency of the champion path.
     #[default]
+    None,
     Local,
     Gemini,
 }
@@ -781,6 +786,15 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
+    /// 2026-08-20 external review, blocker #7: the FACTORY default coupled a fresh install's
+    /// champion imports to an unrelated local LLM endpoint — the owner's hard-stop law (correctly)
+    /// halted otherwise-successful 7B drafts when that endpoint was absent. Refinement is opt-in.
+    #[test]
+    fn factory_refinement_default_is_none() {
+        assert_eq!(LlmMode::default(), LlmMode::None, "a fresh install must not depend on any LLM endpoint");
+        assert_eq!(AppSettings::default().llm_mode, LlmMode::None);
+    }
+
     use super::*;
     use std::path::Path;
 

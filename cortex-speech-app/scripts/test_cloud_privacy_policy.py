@@ -111,7 +111,9 @@ def test_cloud_llm_defaults_are_opt_out() -> None:
     assert_contains(settings, "llm_api_key: \"\".to_string()", SETTINGS_RS.name)
     assert_contains(settings, "llm_api_key_configured: false", SETTINGS_RS.name)
     assert_contains(settings, "llm_mode: LlmMode::default()", SETTINGS_RS.name)
-    assert_contains(settings, "#[default]\n    Local", SETTINGS_RS.name)
+    # 2026-08-20: factory default moved Local -> None (strictly MORE private - a fresh install
+    # talks to no LLM endpoint at all until the owner opts in; external review blocker #7).
+    assert_contains(settings, "#[default]\n    None", SETTINGS_RS.name)
 
 
 def test_gemini_refinement_requires_effective_opt_in_mode() -> None:

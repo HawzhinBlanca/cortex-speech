@@ -502,7 +502,7 @@ pub(crate) fn query_loaded_champion_with_client(
     let client_wsl =
         if client.starts_with('/') { client.to_string() } else { crate::pipeline::win_path_to_wsl(client) };
     let python = std::env::var("CORTEX_7B_PYTHON").unwrap_or_else(|_| "/home/ai/.venv-wsl-whisper/bin/python".into());
-    let port = std::env::var("CORTEX_7B_PORT").unwrap_or_else(|_| crate::pipeline::WSL_7B_SERVER_PORT.to_string());
+    let port = crate::pipeline::wsl_7b_port().to_string();
     let mut command = Command::new("wsl");
     command
         .arg("--")
