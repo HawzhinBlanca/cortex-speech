@@ -153,3 +153,4 @@ runs/
 # Build/provenance artifacts: large, regenerated per release, and pinned by SHA256SUMS in the
 # release record rather than tracked as source.
 artifacts/
+scratch-target/

@@ -588,6 +588,8 @@ pub fn run() {
     }
 
     let settings_path = data_dir.join("settings.json");
+    // `mut` is used only by the debug-only integration override below; releases see it unused.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
     let mut settings = AppSettings::load(&settings_path);
     // Test-only override: a release process must never be able to downgrade the champion through an
     // inherited environment variable. Integration binaries are debug builds and still get their
