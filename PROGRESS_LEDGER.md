@@ -10624,3 +10624,56 @@ Remaining Kawa upside, not taken now: 7 of 32 episodes still have no speaker-cha
 none of their clips could enter any cluster. Scoring them and re-probing would grow the set again.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-20 (round 2 hunt) — 24 confirmed findings fixed, and Kawa's masters were 48 kHz all along
+
+Second adversarial sweep (54 agents: 6 scoped finders, 2 independent refuters per finding): 24
+raw findings, 24 confirmed, 0 disputed. All-confirmed earned extra suspicion, so every finding was
+re-verified by hand against the source before any fix — all 24 held. Every fix landed with a test
+that fails on the pre-fix code (spot-verified by swapping HEAD files back in).
+
+The ones that mattered most:
+
+* Policy fail-closed had TWO remaining holes: a roster KEY that mismatches the live name by
+  case/whitespace bound nobody (the 2026-08-16 incident back through the keyhole — lookup now
+  matches the session layer's name rules, colliding keys are a broken file), and the Python
+  mirrors parsed NaN/Infinity that serde 503s (parse_constant rejector, repo precedent).
+* My own morning fix was incomplete: the receipt front door re-resolved revision AFTER the fence,
+  re-opening the manufactured-evidence window. The mint is now a single atomic
+  check-and-insert (`record_playback_receipt_if_at_revision`) — verified revision or no row.
+* The reorder had broken skips (fenced into an endless boomerang + false "work lost") and served
+  spot checks (one bulk stamp away from 409ing every check in flight). Both are now fence-exempt;
+  a stale-serve skip lands WITHOUT evidence.
+* Pay integrity: the review_events audit row now commits INSIDE the decision transaction, the
+  event snapshots its clip's duration (migration v56), and reviewed_audio_ms LEFT JOINs — so a
+  kill window or a deleted clip can no longer erase paid work. reject_speaker_change_clips
+  collapsed to the same one-commit finalize.
+* Shared-phone identity: attribution-409s HOLD work for its author (both flush and live paths),
+  drafts/refused banners are reviewer-scoped, a background refill no longer yanks the reviewer to
+  clip 0 mid-listen (and re-showing the same clip no longer zeroes heardMs).
+* Settings: auto-saves clamp unsaved consent GRANTS (Cancel genuinely cancels, measured leak
+  closed), rollbacks target the last BACKEND-confirmed state, the inbox autonomy dial updates the
+  global store. Gate mirrors: live_reviewers honors the revocation marker + db_path binding;
+  enforcement readiness matches receipts the way the guard does (any age at the decided revision).
+
+```
+cargo test        1305/1305 green (after: 2 migration tests taught that v56 exists)
+clippy            clean, release + dev
+vitest            283 pass (55 files) — 3 new consent tests fail-before-verified
+python policies   87 scripts pass; queue-gate core 14 tests
+```
+
+**Kawa audio verdict (owner question): GOOD — and better than we were using.** The 1,352-clip
+focus (3.35 h): SNR median 40 dB (2 clips under 20), zero clipping, RMS median −24.7 dBFS,
+192 of 201 min pass SNR≥20 + RMS≥−30. Stored per-clip QC verified exact against re-measured audio
+(8/8, Δ 0.0 dB). The find: the pipeline's 16 kHz WAVs are downmixed copies — the true masters are
+48 kHz stereo 320 kbps MP3s (all 32 episodes, timeline-identical: lag 0.0 ms, corr 0.999), and
+every focus clip carries source offsets. Cloning exports must cut from the masters (8–12 kHz
+sibilance the 16 k copies cannot carry) and loudness-normalize per clip (episode medians spread
+−29.1…−21.7 dBFS). No re-recording, no reviewer workflow change.
+
+Accepted, not fixed: same-name link reissue to a different human is indistinguishable by design
+(the name IS the identity unit); global speaker identity across the corpus remains the strategic
+open item.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
