@@ -110,6 +110,34 @@ describe('SettingsPanel cloud-consent transaction', () => {
     expect(published.cloudSttOptIn).toBe(false);
   });
 
+  it('a slow failing save cannot roll back past a newer successful one (persists are serialized)', async () => {
+    // The race (audit fix 2026-08-20): two overlapping persists each snapshot their own `prev`; if
+    // the OLDER write fails after a NEWER one succeeded, its rollback reverts the store past the
+    // newer persisted state — worst case re-granting a consent the user successfully withdrew.
+    // Serialized, the second write only starts after the first settles, so its snapshot is honest.
+    settings.set({ ...defaultSettings, cloudSttOptIn: true });
+    let failFirst!: (e: Error) => void;
+    mocks.updateSettings
+      .mockImplementationOnce(() => new Promise<void>((_, reject) => (failFirst = reject)))
+      .mockResolvedValueOnce(undefined);
+    render(SettingsPanel);
+
+    await fireEvent.click(sttCheckbox()); // withdraw -> save #1, held in flight
+    expect(mocks.updateSettings).toHaveBeenCalledTimes(1);
+    await fireEvent.click(screen.getByRole('button', { name: /^save$/i })); // save #2, must queue
+    expect(mocks.updateSettings).toHaveBeenCalledTimes(1); // queued, not interleaved
+
+    failFirst(new Error('backend hiccup')); // the OLD save fails after the new one was requested
+    await Promise.resolve().then(() => {}); // let the queue drain: rollback #1, then run save #2
+    await vi.waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(2));
+
+    // The newer state (withdrawn) is what save #2 persisted and what the app must end on. Without
+    // the queue, save #1's rollback lands LAST and silently re-grants the withdrawn consent.
+    expect(mocks.updateSettings.mock.calls[1][0]).toMatchObject({ cloudSttOptIn: false });
+    expect(get(settings).cloudSttOptIn).toBe(false);
+    expect(sttCheckbox().checked).toBe(false);
+  });
+
   it('WITHDRAWING consent persists immediately — a stop instruction cannot wait for Save', async () => {
     settings.set({ ...defaultSettings, cloudSttOptIn: true });
     render(SettingsPanel);

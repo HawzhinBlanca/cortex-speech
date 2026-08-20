@@ -243,6 +243,32 @@ def test_settings_close_persist_routes_through_savequietly() -> None:
         )
 
 
+def test_settings_persists_are_serialized_so_a_stale_rollback_cannot_clobber_a_newer_save() -> None:
+    """saveQuietly fires from dozens of onblur/onchange handlers, consent withdrawal, and the
+    close-to-save path; save() from the button. Unserialized, two overlapping persists each capture
+    their own `prev` snapshot, and an OLDER write failing after a NEWER one succeeded rolls the store
+    and every input back past the newer persisted state — worst case re-granting a cloud consent the
+    user had successfully withdrawn (audit fix 2026-08-20). Every backend settings write must route
+    through one queue so a rollback target is always the true last-persisted state."""
+    src = _read("src/lib/SettingsPanel.svelte")
+    if "persistQueue.then(job)" not in src or "persistBusy" not in src:
+        raise AssertionError(
+            "SettingsPanel no longer chains settings writes through persistQueue — overlapping saves "
+            "can interleave, and a stale rollback then reverts a newer successful save (consent included)."
+        )
+    for caller, needle in (("saveQuietly", "return enqueuePersist("), ("save", "await enqueuePersist(")):
+        body = _function_body(src, f"function {caller}(")
+        if needle not in body:
+            raise AssertionError(f"{caller}() must persist via enqueuePersist, not a bare api.updateSettings")
+    # No settings write may bypass the queue: every updateSettings call sits inside an enqueued job.
+    outside = [
+        i for i in range(len(src))
+        if src.startswith("api.updateSettings(", i) and "enqueuePersist(" not in src[max(0, i - 1200) : i]
+    ]
+    if outside:
+        raise AssertionError("an api.updateSettings call bypasses the persist queue — the race is back")
+
+
 def test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval() -> None:
     """RefineryPanel surfaces eval-run WER/CER. A run that scored ZERO segments — the all-engine-fail case
     (every gold clip's transcription errors → run_gold_eval_with_transcriber and both pipeline closed-loop
@@ -971,38 +997,13 @@ def test_reason_code_vocabulary_matches_rust() -> None:
 
 
 def main() -> None:
-    test_a_skip_never_clears_the_reviewers_draft_on_either_route()
-    test_reason_code_vocabulary_matches_rust()
-    test_review_decisions_stay_on_screen_in_one_sticky_bar()
-    test_poor_audio_thresholds_match_the_rust_authority()
-    test_every_declared_readiness_blocker_action_is_actually_rendered()
-    test_retranscribe_guards_editor_writes_against_navigation()
-    test_submit_guards_editor_writes_against_navigation()
-    test_go_draft_persist_uses_targeted_field_update()
-    test_inbox_undo_bails_while_a_decision_is_in_flight()
-    test_app_normalize_uses_freshrow_not_a_stale_spread()
-    test_app_export_audio_excludes_human_rejected()
-    test_waveform_stretches_peaks_across_the_canvas()
-    test_app_save_handlers_use_field_level_updates()
-    test_settings_close_persist_routes_through_savequietly()
-    test_refinery_panel_renders_undefined_metric_for_a_zero_segment_eval()
-    test_validation_signal_anomaly_distinguishes_not_screened_from_clean()
-    test_audioplayer_autoplays_each_clip_not_only_on_source_reload()
-    test_speaker_rename_confirms_before_merging_into_an_existing_speaker()
-    test_segment_reload_invalidates_the_frozen_search_scope()
-    test_processing_progress_eta_uses_chunk_scoped_elapsed_not_whole_pipeline()
-    test_segment_stats_verified_excludes_placeholder_only_rows()
-    test_keyboard_shortcuts_help_each_uses_a_unique_key()
-    test_selection_reseats_playback_centrally_for_store_only_selections()
-    test_verify_all_pending_excludes_placeholder_and_empty_rows()
-    test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself()
-    test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated()
-    test_library_reads_fail_loudly_instead_of_reporting_an_empty_library()
-    test_a_failed_waveform_decode_is_not_rendered_as_a_silent_clip()
-    test_the_uncalibrated_panel_names_the_real_cause_when_there_is_no_confidence_at_all()
-    test_readiness_verdict_is_sourced_from_the_export_rule_not_the_verified_count()
-    test_readiness_is_unknown_not_ready_when_its_inputs_failed_to_load()
-    print("frontend review-guard source policy passed")
+    # Discovered, not listed: a hand-maintained call list silently skipped a newly added test
+    # (caught 2026-08-20), which is the vacuous-pass failure this suite exists to prevent.
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for test in tests:
+        test()
+    print(f"frontend review-guard source policy passed ({len(tests)} pins)")
+
 
 
 if __name__ == "__main__":

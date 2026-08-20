@@ -261,25 +261,58 @@
   const llmConsentToggled = () => consentToggled('cloudLlmOptIn');
   const juryConsentToggled = () => consentToggled('juryCloudOptIn');
 
-  async function saveQuietly() {
-    coerceSettingsForRuntime();
-    if (!tauriAvailable) {
+  // ONE settings write in flight at a time (audit fix 2026-08-20). saveQuietly fires from dozens of
+  // onblur/onchange handlers, consent withdrawal, and close-to-save — and two overlapping runs each
+  // capture their own `prev` snapshot. If the OLDER write then fails after a NEWER one succeeded,
+  // its rollbackTo(prev) reverts the store and every input past the newer persisted state; for the
+  // consent toggles that is the worst case — re-granting a cloud consent the user had successfully
+  // withdrawn, silently. Serialized, every job's `prev` really is the last-persisted state, so a
+  // rollback can only ever land where the backend actually is.
+  // Idle → the job starts SYNCHRONOUSLY, exactly as the unqueued code did: a consent withdrawal is
+  // a stop instruction and must reach the backend now, not a microtask later. Only a genuinely
+  // overlapping save waits.
+  let persistQueue: Promise<void> = Promise.resolve();
+  let persistBusy = false;
+  // Jobs enqueued and not yet settled, the failing one included. A failed save whose count is >1
+  // has been SUPERSEDED: a newer save is already queued carrying the user's current intent, so
+  // rolling the inputs back would erase edits the very next write is about to persist — the queued
+  // save re-asserts the truth either way, succeeding or surfacing its own failure.
+  let persistPending = 0;
+  function enqueuePersist(job: () => Promise<void>): Promise<void> {
+    const run = persistBusy ? persistQueue.then(job) : job();
+    persistBusy = true;
+    persistPending += 1;
+    const settled = run.catch(() => {}); // a failed save must not wedge every later one
+    persistQueue = settled;
+    void settled.then(() => {
+      persistPending -= 1;
+      if (persistQueue === settled) persistBusy = false; // still the tail: the queue is drained
+    });
+    return run;
+  }
+
+  function saveQuietly(): Promise<void> {
+    return enqueuePersist(async () => {
+      coerceSettingsForRuntime();
+      if (!tauriAvailable) {
+        settings.set(publishable());
+        return;
+      }
+      const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
       settings.set(publishable());
-      return;
-    }
-    const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
-    settings.set(publishable());
-    try {
-      await api.updateSettings(localSettings);
-    } catch (e) {
-      console.error('Auto-save settings failed:', e);
-      // Roll BACK so the UI can't show a consent toggle (or any setting) as applied when the backend
-      // REJECTED the write. A silent consent mismatch — the user believes cloud STT/LLM is on (or off)
-      // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
-      // to the last-persisted state and surface the failure instead of only logging it.
-      rollbackTo(prev);
-      notifications.error($t('settingsSaveFailed'), { detail: String(e) });
-    }
+      try {
+        await api.updateSettings(localSettings);
+      } catch (e) {
+        console.error('Auto-save settings failed:', e);
+        if (persistPending > 1) return; // superseded — the queued save re-asserts current intent (see enqueuePersist)
+        // Roll BACK so the UI can't show a consent toggle (or any setting) as applied when the backend
+        // REJECTED the write. A silent consent mismatch — the user believes cloud STT/LLM is on (or off)
+        // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
+        // to the last-persisted state and surface the failure instead of only logging it.
+        rollbackTo(prev);
+        notifications.error($t('settingsSaveFailed'), { detail: String(e) });
+      }
+    });
   }
 
   // What the store may hold: a COPY, never the object the panel's inputs are bound to.
@@ -337,28 +370,36 @@
 
   async function save() {
     saving = true;
-    const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
     try {
-      applySourceReferenceModelsInput();
-      coerceSettingsForRuntime();
-      settings.set(publishable());
-      if (!tauriAvailable) {
-        notifications.info($t('settingsPreviewOnly'));
-        showSettings.set(false);
-        return;
-      }
-      // BEFORE update_settings: its load() scrubs llm_api_key, so a key still sitting in an input when
-      // the user presses Save would otherwise be dropped without a word. See flushPendingKeys.
-      await flushPendingKeys();
-      await api.updateSettings(localSettings);
-      notifications.success($t('settingsSaved'));
-      showSettings.set(false);
-    } catch (e) {
-      // The store was set optimistically above and the backend then REFUSED the write. Without this
-      // the panel stayed open showing rejected values while the whole app read them as current —
-      // the same lie `saveQuietly` already rolls back, on the path the user actually presses.
-      rollbackTo(prev);
-      notifications.error($t('settingsSaveFailed'), { detail: String(e) });
+      // Through the SAME queue as saveQuietly: a Save pressed while an auto-save is in flight must
+      // not interleave with it (see enqueuePersist — a stale rollback past a newer write is the race).
+      await enqueuePersist(async () => {
+        const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
+        try {
+          applySourceReferenceModelsInput();
+          coerceSettingsForRuntime();
+          settings.set(publishable());
+          if (!tauriAvailable) {
+            notifications.info($t('settingsPreviewOnly'));
+            showSettings.set(false);
+            return;
+          }
+          // BEFORE update_settings: its load() scrubs llm_api_key, so a key still sitting in an input when
+          // the user presses Save would otherwise be dropped without a word. See flushPendingKeys.
+          await flushPendingKeys();
+          await api.updateSettings(localSettings);
+          notifications.success($t('settingsSaved'));
+          showSettings.set(false);
+        } catch (e) {
+          console.error('Save settings failed:', e);
+          if (persistPending > 1) return; // superseded — the queued save re-asserts current intent (see enqueuePersist)
+          // The store was set optimistically above and the backend then REFUSED the write. Without this
+          // the panel stayed open showing rejected values while the whole app read them as current —
+          // the same lie `saveQuietly` already rolls back, on the path the user actually presses.
+          rollbackTo(prev);
+          notifications.error($t('settingsSaveFailed'), { detail: String(e) });
+        }
+      });
     } finally {
       saving = false;
     }
