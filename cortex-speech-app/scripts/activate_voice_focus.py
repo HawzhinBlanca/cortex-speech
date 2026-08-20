@@ -160,6 +160,11 @@ def main() -> int:
         )
         return 1
 
+    if not candidates:
+        # The server treats a focus that names no ids as BROKEN and serves NOTHING to anyone
+        # (fail-closed, 2026-08-20). Refusing to write it here keeps eight queues alive.
+        print("REFUSED: candidate_segment_ids.txt names no clips — activating this focus would 503 every queue.")
+        return 1
     record = {
         "name": args.name,
         "activated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

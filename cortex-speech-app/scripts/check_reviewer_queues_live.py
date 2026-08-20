@@ -36,6 +36,13 @@ from pathlib import Path
 RUNWAY_WARN_CLIPS = 100
 
 
+def _reject_nonfinite(token: str):
+    """serde_json rejects NaN/Infinity; Python's json accepts (and json.dumps EMITS) them. A mirror
+    that parses what the server refuses reads OK against a dead queue — same rejector the repo
+    already uses in bootstrap_legacy_champion and promotion_gate."""
+    raise ValueError(f"non-finite JSON token {token!r} (the server rejects this file)")
+
+
 class PolicyBroken(Exception):
     """A policy file EXISTS but cannot be honoured. Mirror of the server's 503: the queue serves
     NOTHING until the file is fixed (owner instruction 2026-08-20 — present-but-broken fails
@@ -108,7 +115,7 @@ def load_roster(data_dir: Path) -> dict[str, list[str]]:
     if not path.is_file():
         return {}
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_nonfinite)
     except (OSError, ValueError) as e:
         raise PolicyBroken(f"reviewer_dialects.json is not valid JSON: {e}") from e
     if not isinstance(parsed, dict):
@@ -118,20 +125,49 @@ def load_roster(data_dir: Path) -> dict[str, list[str]]:
         if name.startswith("_"):
             continue
         if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            dupe = next((k for k in roster if k.strip().lower() == name.strip().lower()), None)
+            if dupe is not None:
+                raise PolicyBroken(f'reviewer_dialects.json: "{name}" and "{dupe}" name the same reviewer')
             roster[name] = value
         else:
             raise PolicyBroken(f'reviewer_dialects.json entry "{name}" is not a list of dialect names')
     return roster
 
 
-def live_reviewers(data_dir: Path) -> list[str]:
-    """The names whose links are live right now, from the remembered couch session."""
+def allowed_for(roster: dict[str, list[str]], reviewer: str) -> list[str] | None:
+    """Mirror of `dialect::allowed_for`: matched the way the session layer matches names (trimmed,
+    case-insensitive), never an exact dict lookup — an orphaned roster key silently un-restricted
+    exactly the reviewer it named (2026-08-20 hunt)."""
+    want = reviewer.strip().lower()
+    for name, dialects in roster.items():
+        if name.strip().lower() == want:
+            return dialects
+    return None
+
+
+def live_reviewers(data_dir: Path, db_path: Path) -> list[str]:
+    """The names whose links are live right now, mirroring `couch::load_session`'s OWN authority
+    rules (2026-08-20 hunt) — the gate previously read couch_session.json alone and passed a
+    red/green verdict about links the server itself considers dead:
+
+      * `couch_session.revoked` is authoritative: Stop writes it FIRST, and its teardown may fail to
+        delete the credential file — session present + marker present = NO live links;
+      * a session remembered against a DIFFERENT library never resumes, so its reviewers are not
+        live against this db_path;
+      * an unreadable session file is a question the gate cannot answer — FAIL loudly, never
+        "OK (no couch session)" while a running server may be serving from memory.
+    """
     session = data_dir / "couch_session.json"
+    if (data_dir / "couch_session.revoked").exists():
+        return []
     if not session.is_file():
         return []
     try:
         payload = json.loads(session.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        raise PolicyBroken(f"couch_session.json exists but cannot be read: {e}") from e
+    saved_db = payload.get("db_path")
+    if isinstance(saved_db, str) and saved_db and Path(saved_db) != db_path:
         return []
     reviewers = payload.get("reviewers")
     if isinstance(reviewers, dict):  # token -> name
@@ -154,7 +190,7 @@ def load_focus(data_dir: Path) -> set[str] | None:
     if not path.is_file():
         return None
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_nonfinite)
     except (OSError, ValueError) as e:
         raise PolicyBroken(f"voice_focus.json is not valid JSON: {e}") from e
     ids = parsed.get("segment_ids") if isinstance(parsed, dict) else None
@@ -213,7 +249,7 @@ def wrong_dialect_decisions(db_path: Path, roster: dict[str, list[str]], table: 
         con.close()
     offenders: dict[str, int] = {}
     for reviewer, _segment_id, path in rows:
-        allowed = roster.get(reviewer)
+        allowed = allowed_for(roster, reviewer)
         if allowed is not None and not may_judge(allowed, path, table):
             offenders[reviewer] = offenders.get(reviewer, 0) + 1
     return offenders
@@ -231,7 +267,7 @@ def evaluate_queues(
     problems: list[str] = []
     warnings: list[str] = []
     for who in reviewers:
-        allowed = roster.get(who)
+        allowed = allowed_for(roster, who)
         mine = [(p, d) for p, d in clips if may_judge(allowed, p, table)]
         tag = ", ".join(allowed) if allowed else "unrestricted"
         if not mine:
@@ -252,7 +288,12 @@ def main() -> int:
         print(f"REVIEWER QUEUES: SKIP-ENV (no library at {db_path})", flush=True)
         return 0
 
-    reviewers = live_reviewers(data_dir)
+    try:
+        reviewers = live_reviewers(data_dir, db_path)
+    except PolicyBroken as e:
+        print("REVIEWER QUEUES: FAIL", flush=True)
+        print(f"  - {e} — cannot tell which links are live; a running server may be serving from memory", flush=True)
+        return 1
     if not reviewers:
         print("REVIEWER QUEUES: OK (no couch session — no links are live)", flush=True)
         return 0

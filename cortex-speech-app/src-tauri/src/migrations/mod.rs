@@ -1608,6 +1608,21 @@ pub static MIGRATIONS: &[Migration] = &[
         down_sql: Some("DROP INDEX IF EXISTS idx_playback_receipts_segment;
                         DROP TABLE IF EXISTS playback_receipts;"),
     },
+    Migration {
+        version: 56,
+        description: "Snapshot each decision's audio length onto its audit event, so pay survives clip deletion",
+        // 2026-08-20 hunt. `reviewed_audio_ms` — the phone's progress badge and the basis the owner
+        // pays on — INNER JOINed speech_segments, so deleting a reviewed clip silently shrank a
+        // reviewer's total for work they genuinely did. The audit trail kept the event (no FK, by
+        // design); the pay metric lost the duration the moment the row died. The event now carries
+        // the length it was paid against, backfilled from every clip that still exists; a legacy
+        // event whose clip is already gone stays unpriceable rather than invented.
+        up_sql: "ALTER TABLE review_events ADD COLUMN duration_ms INTEGER;
+                 UPDATE review_events SET duration_ms =
+                     (SELECT duration_ms FROM speech_segments s WHERE s.id = review_events.segment_id)
+                 WHERE duration_ms IS NULL;",
+        down_sql: Some("ALTER TABLE review_events DROP COLUMN duration_ms;"),
+    },
 ];
 
 #[cfg(test)]
@@ -1683,7 +1698,17 @@ mod tests {
         // dropping any column a post-v40 migration added. Re-apply everything after v40 so HEAD-schema
         // readers (get_segment_by_id below) see the real current shape — future-proof against v42+.
         for later in MIGRATIONS.iter().filter(|m| m.version > 40) {
-            db.connection().execute_batch(later.up_sql).expect("re-applying a post-v40 migration must succeed");
+            if let Err(e) = db.connection().execute_batch(later.up_sql) {
+                // "duplicate column" here is the GOOD outcome for a table v40's recreate never
+                // touched (v56 alters review_events): the column survived, there is nothing to
+                // restore. Any other error is a real re-application failure.
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("duplicate column name"),
+                    "re-applying post-v40 migration v{} must succeed or be a no-op: {msg}",
+                    later.version
+                );
+            }
         }
 
         let conn = db.connection();

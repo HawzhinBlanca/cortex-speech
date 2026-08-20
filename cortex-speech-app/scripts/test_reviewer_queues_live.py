@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_reviewer_queues_live import (  # noqa: E402
     PolicyBroken,
+    allowed_for,
     dialect_of,
     evaluate_queues,
     load_focus,
@@ -140,6 +141,70 @@ def test_a_broken_policy_file_fails_the_gate_instead_of_unrestricting_everyone()
                 raise AssertionError(f"a broken focus must raise PolicyBroken: {broken!r}")
             except PolicyBroken:
                 pass
+
+
+def test_a_roster_key_binds_across_case_and_whitespace_and_duplicates_are_broken() -> None:
+    # 2026-08-20 hunt: the exact-match lookup let an orphaned key ("roza " vs live "Roza") load
+    # cleanly and bind NOBODY — its reviewer served unrestricted, the wrong-dialect incident back
+    # through a typo'd key. The lookup now matches the way the session layer matches names.
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps({"roza ": ["sorani"]}), encoding="utf-8")
+        roster = load_roster(Path(tmp))
+        assert allowed_for(roster, "Roza") == ["sorani"], "the key must bind its reviewer across case/space"
+        assert allowed_for(roster, "Rubar") is None
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "reviewer_dialects.json").write_text(
+            json.dumps({"Roza": ["sorani"], "roza": ["hawleri"]}), encoding="utf-8"
+        )
+        try:
+            load_roster(Path(tmp))
+            raise AssertionError("case-colliding keys are one broken file")
+        except PolicyBroken:
+            pass
+
+
+def test_nonfinite_json_is_broken_exactly_as_the_server_sees_it() -> None:
+    # Python's json accepts (and emits!) NaN/Infinity; serde_json 503s them. The mirror must refuse
+    # the same bytes the server refuses, or the gate reads OK against a dead queue.
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "voice_focus.json").write_text('{"name":"V","score":Infinity,"segment_ids":["a"]}', encoding="utf-8")
+        try:
+            load_focus(Path(tmp))
+            raise AssertionError("Infinity parses in Python but 503s the server — must be PolicyBroken")
+        except PolicyBroken:
+            pass
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "reviewer_dialects.json").write_text('{"_note": NaN, "Sara": ["sorani"]}', encoding="utf-8")
+        try:
+            load_roster(Path(tmp))
+            raise AssertionError("NaN parses in Python but 503s the server — must be PolicyBroken")
+        except PolicyBroken:
+            pass
+
+
+def test_live_reviewers_mirrors_the_servers_own_session_authority() -> None:
+    from check_reviewer_queues_live import live_reviewers
+
+    db = Path("C:/anywhere/cortex-speech.db")
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "couch_session.json").write_text(
+            json.dumps({"db_path": str(db), "reviewers": {"tok": "Sara"}}), encoding="utf-8"
+        )
+        assert live_reviewers(d, db) == ["Sara"], "a plain remembered session is live"
+        # Stop writes the revocation marker FIRST and may fail to delete the file: marker wins.
+        (d / "couch_session.revoked").write_text("revoked\n", encoding="utf-8")
+        assert live_reviewers(d, db) == [], "the revocation marker is authoritative — no links are live"
+        (d / "couch_session.revoked").unlink()
+        # A session remembered against a DIFFERENT library never resumes.
+        assert live_reviewers(d, Path("C:/other/lib.db")) == [], "wrong library = not live"
+        # An unreadable file is a question, not an all-clear.
+        (d / "couch_session.json").write_text("{ not json", encoding="utf-8")
+        try:
+            live_reviewers(d, db)
+            raise AssertionError("an unreadable session file must FAIL, never read as 'no links'")
+        except PolicyBroken:
+            pass
 
 
 def test_missing_policy_files_still_mean_unrestricted() -> None:

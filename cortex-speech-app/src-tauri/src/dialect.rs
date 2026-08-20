@@ -119,6 +119,13 @@ pub fn load_roster(data_dir: &Path) -> Result<HashMap<String, Vec<String>>, Stri
             value.as_array().and_then(|items| items.iter().map(|v| v.as_str().map(str::to_string)).collect());
         match dialects {
             Some(dialects) => {
+                // Two keys that are the same NAME under the session layer's matching (see
+                // `allowed_for`) are a broken file: which restriction binds would depend on hash
+                // iteration order, and one of them was certainly a typo of the other.
+                if let Some(existing) = roster.keys().find(|k| k.trim().eq_ignore_ascii_case(name.trim())) {
+                    tracing::error!("reviewer_dialects.json: \"{name}\" and \"{existing}\" name the same reviewer — queues serve NOTHING until it is fixed");
+                    return Err(format!("\"{name}\" and \"{existing}\" name the same reviewer"));
+                }
                 roster.insert(name, dialects);
             }
             None => {
@@ -128,6 +135,18 @@ pub fn load_roster(data_dir: &Path) -> Result<HashMap<String, Vec<String>>, Stri
         }
     }
     Ok(roster)
+}
+
+/// The roster entry for `reviewer`, matched the way the SESSION layer matches names: trimmed and
+/// ASCII-case-insensitive (`normalize_reviewers` treats "roza" and "Roza" as the same person).
+///
+/// 2026-08-20 hunt: the lookup was an exact `HashMap::get`, so a roster key differing from the live
+/// session name by case or a stray space LOADED cleanly and bound NOBODY — the reviewer it named
+/// was served unrestricted, which is the 2026-08-16 wrong-dialect incident reproduced through a
+/// typo'd KEY instead of a typo'd value. The two layers must agree on what "the same name" means.
+pub fn allowed_for<'r>(roster: &'r HashMap<String, Vec<String>>, reviewer: &str) -> Option<&'r Vec<String>> {
+    let want = reviewer.trim();
+    roster.iter().find(|(name, _)| name.trim().eq_ignore_ascii_case(want)).map(|(_, dialects)| dialects)
 }
 
 #[cfg(test)]
@@ -234,6 +253,30 @@ mod tests {
     fn a_missing_file_is_still_unrestricted() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_roster(dir.path()), Ok(HashMap::new()), "no file = the behaviour before the roster existed");
+    }
+
+    #[test]
+    fn a_roster_key_binds_its_reviewer_across_case_and_whitespace() {
+        // 2026-08-20 hunt: the session layer treats "roza" and "Roza" as the SAME person, but the
+        // roster lookup was an exact HashMap::get — so a key typed in the wrong case loaded cleanly
+        // and bound nobody, serving its reviewer the full queue. The 2026-08-16 incident, back
+        // through a typo'd KEY.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "roza ": ["sorani"] }"#).unwrap();
+        let roster = load_roster(dir.path()).unwrap();
+        let allowed = allowed_for(&roster, "Roza").expect("'roza ' must bind the live reviewer 'Roza'");
+        assert_eq!(allowed, &vec![SORANI.to_string()]);
+        assert!(allowed_for(&roster, "Rubar").is_none(), "and nobody else");
+    }
+
+    #[test]
+    fn two_keys_naming_the_same_reviewer_fail_closed() {
+        // Which restriction would bind depends on hash iteration order — one is certainly a typo of
+        // the other, and a file that cannot say what it means must stop the line, not guess.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("reviewer_dialects.json"), r#"{ "Roza": ["sorani"], "roza": ["hawleri"] }"#)
+            .unwrap();
+        assert!(load_roster(dir.path()).is_err(), "case-colliding keys are one broken file");
     }
 
     #[test]

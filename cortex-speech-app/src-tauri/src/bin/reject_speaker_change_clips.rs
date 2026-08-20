@@ -59,21 +59,13 @@ fn main() -> Result<(), String> {
         let score = s.speaker_change_score.unwrap_or_default();
         println!("  {}  score {score:.4}  speaker {}", &s.id[..8], s.speaker_id.as_deref().unwrap_or("-"));
         if apply {
-            // TWO writes, exactly as `couch::api_decision` does them, because one is not enough.
-            // The first records the decision IDENTITY (human_decision + verdict). The second marks
-            // the row reviewed so it leaves the queue — `verified` is an artefact of that second
-            // write, and the first version of this tool did only the first: the 13 clips came back
-            // correctly rejected AND still pending, so a reviewer would have been served every one
-            // of them again. Caught by diffing against the snapshot, not by the tool's own count.
-            db.record_human_decision(&s.id, "reject", None, None).map_err(|e| format!("{}: {e}", s.id))?;
-            // FRESH row, read AFTER the decision write. Reusing the copy fetched before it would
-            // upsert a pre-decision snapshot straight back over the verdict just written.
-            let mut fresh = db
-                .get_segment_by_id(&s.id)
-                .map_err(|e| format!("re-read {}: {e}", s.id))?
-                .ok_or_else(|| format!("{} vanished mid-write", s.id))?;
-            fresh.verified = true; // "reviewed" — a reject stays in the library, out of exports
-            db.insert_segment(&fresh).map_err(|e| format!("mark reviewed {}: {e}", s.id))?;
+            // ONE commit (2026-08-20 hunt). The previous two-write version — decision first, then a
+            // whole-row upsert to set `verified` — left a kill window in which a clip came back
+            // correctly rejected AND still pending, exactly the half-written state the finalize
+            // transaction exists to make unrepresentable. `finalize_human_review` records the
+            // decision identity, verdict and `verified` atomically; a reject stays in the library,
+            // out of exports, and out of every queue.
+            db.finalize_human_review(&s.id, "reject", None, None, None).map_err(|e| format!("{}: {e}", s.id))?;
             done += 1;
         }
     }

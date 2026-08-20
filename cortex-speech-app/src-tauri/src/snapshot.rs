@@ -20,11 +20,11 @@ use crate::error::{AppError, AppResult};
 /// save-side and restore-side can never drift — a file added here is automatically restored, not
 /// silently snapshotted-but-never-restored.
 /// `reviewer_dialects.json` and `voice_focus.json` are QUEUE POLICY, and leaving them out made the
-/// restore silently permissive: both fail OPEN by design (a typo must not empty eight paid
-/// reviewers' queues), so a library restored without them serves every reviewer every clip — the
-/// dialect fence gone and the collection focus gone, with nothing in the UI to say so. Found
-/// 2026-08-20 by an external audit; the same restore that proves the corpus survived would quietly
-/// undo who may review what.
+/// restore silently permissive: a MISSING policy file means "no restriction" (only a
+/// present-but-broken one fails closed, owner instruction 2026-08-20), so a library restored
+/// without them serves every reviewer every clip — the dialect fence gone and the collection focus
+/// gone, with nothing in the UI to say so. Found 2026-08-20 by an external audit; the same restore
+/// that proves the corpus survived would quietly undo who may review what.
 pub(crate) const EXTRA_STATE: &[&str] =
     &["settings.json", "champion.json", "reviewer_dialects.json", "voice_focus.json"];
 

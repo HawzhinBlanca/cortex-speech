@@ -117,6 +117,17 @@ def test_round2_is_void_if_the_owner_misses_a_control() -> None:
         assert set(focus["segment_ids"]) == {"h1", "h2"}, "a void round must leave the focus untouched"
 
 
+def test_an_empty_candidate_list_is_refused_not_activated() -> None:
+    """The server treats a focus naming no ids as BROKEN and 503s every queue (fail-closed,
+    2026-08-20). The activator must refuse to write that file, however perfect the verdict."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = _fixture(Path(raw))
+        (tmp / "voice_focus" / "candidate_segment_ids.txt").write_text("", encoding="utf-8")
+        r = _run(tmp, "--name", "TestVoice", "--host", "1,2,4,5")  # a PERFECT verdict
+        assert r.returncode == 1, "zero candidates must refuse: activating would 503 every queue"
+        assert not (tmp / "voice_focus.json").is_file(), "and write nothing"
+
+
 def test_tracked_sources_carry_no_speaker_name() -> None:
     """The name is the owner's data, not the repo's. Only generic words may appear in code."""
     for path in TRACKED:

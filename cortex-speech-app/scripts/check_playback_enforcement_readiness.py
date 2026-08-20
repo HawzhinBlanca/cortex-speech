@@ -98,22 +98,36 @@ def uncovered(conn: sqlite3.Connection, segment_id: str, decided_at: str, review
     read NOT READY forever however well the system behaved.
 
     `record_review_event` and `record_playback_receipt` both stamp `datetime('now')` inside the same
-    request, so the two land in the same second; the window is a few seconds of slack, not a guess at
-    which revision was current.
+    request, so the newest receipt at the decision names the revision that was in force.
+
+    Coverage is then taken over EVERY receipt at that revision for this reviewer, any age — because
+    that is the server's own rule (`has_sufficient_playback_evidence` has no time bound). The ±5s
+    coverage window this gate used before was stricter than the guard it audits: a reviewer who
+    fully played a clip, skipped it, and accepted it after a restart passes the live guard on the
+    day-old receipt, and this gate reported that honest decision as "enforcement REFUSED"
+    (2026-08-20 hunt). A monitor must mirror the guard, not out-judge it.
     """
+    minted = conn.execute(
+        """
+        SELECT segment_revision FROM playback_receipts
+        WHERE segment_id = ? AND reviewer = ?
+          AND created_at <= datetime(?, '+5 seconds')
+        ORDER BY created_at DESC, id DESC LIMIT 1
+        """,
+        (segment_id, reviewer, decided_at),
+    ).fetchone()
+    if minted is None:
+        return f"no receipt minted by the decision at {decided_at}"
     best = conn.execute(
         """
         SELECT MAX(coverage_ratio) FROM playback_receipts
-        WHERE segment_id = ?
-          AND reviewer = ?
-          AND created_at BETWEEN datetime(?, '-5 seconds') AND datetime(?, '+5 seconds')
+        WHERE segment_id = ? AND reviewer = ? AND segment_revision = ?
+          AND created_at <= datetime(?, '+5 seconds')
         """,
-        (segment_id, reviewer, decided_at, decided_at),
+        (segment_id, reviewer, minted[0], decided_at),
     ).fetchone()[0]
-    if best is None:
-        return f"no receipt minted with the decision at {decided_at}"
-    if best < MIN_PLAYBACK_COVERAGE:
-        return f"best coverage {best:.2f} < {MIN_PLAYBACK_COVERAGE:.2f}"
+    if best is None or best < MIN_PLAYBACK_COVERAGE:
+        return f"best coverage {(best or 0.0):.2f} < {MIN_PLAYBACK_COVERAGE:.2f}"
     return None
 
 

@@ -1705,9 +1705,12 @@ impl Database {
         source: &str,
         timestamp_ms: i64,
     ) -> AppResult<()> {
+        // v56: the event snapshots the clip's length at the moment of the act, because
+        // `reviewed_audio_ms` is the basis the owner PAYS on and must survive the clip later being
+        // deleted — the audit trail always did; the pay metric silently lost the row's duration.
         self.conn.execute(
-            "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, (SELECT duration_ms FROM speech_segments WHERE id = ?1))",
             params![segment_id, reviewer, action, source, timestamp_ms],
         )?;
         self.track_write()?;
@@ -1739,11 +1742,18 @@ impl Database {
     /// than reusing `reviewer_throughput`, which walks every event of every reviewer: this runs on
     /// each queue fetch from a phone, so it stays a single aggregate.
     pub fn reviewed_audio_ms(&self, reviewer: &str) -> AppResult<i64> {
+        // LEFT JOIN + the event's own duration snapshot (v56): an INNER JOIN silently shrank this
+        // total whenever the owner deleted a reviewed clip — real paid work vanishing from the one
+        // number reviewers are paid on. The event's snapshot wins; the live row backfills events
+        // that predate v56; an event whose clip is gone AND predates the snapshot stays 0 rather
+        // than invented.
         Ok(self.conn.query_row(
-            "SELECT COALESCE(SUM(s.duration_ms), 0)
-               FROM (SELECT DISTINCT segment_id FROM review_events
-                     WHERE reviewer = ?1 AND action IN ('accept', 'edit', 'reject')) e
-               JOIN speech_segments s ON s.id = e.segment_id",
+            "SELECT COALESCE(SUM(d), 0)
+               FROM (SELECT MAX(COALESCE(e.duration_ms, s.duration_ms, 0)) AS d
+                       FROM review_events e
+                       LEFT JOIN speech_segments s ON s.id = e.segment_id
+                      WHERE e.reviewer = ?1 AND e.action IN ('accept', 'edit', 'reject')
+                      GROUP BY e.segment_id)",
             params![reviewer],
             |row| row.get(0),
         )?)
@@ -4289,6 +4299,7 @@ impl Database {
             annotator,
             None,
             false,
+            None,
         )?;
         Ok(())
     }
@@ -4339,6 +4350,8 @@ impl Database {
             Some(annotator),
             Some(expected_revision),
             true,
+            // The phone's pay-bearing audit row commits WITH the decision (2026-08-20 hunt).
+            Some("couch"),
         )
     }
 
@@ -4363,6 +4376,7 @@ impl Database {
             annotator,
             None,
             true,
+            None,
         )
         .map(|_| ())
     }
@@ -4587,6 +4601,51 @@ impl Database {
         self.record_playback_receipt_raw(&resolved)
     }
 
+    /// Mint a receipt ONLY IF the row is still at `expected_revision` — one atomic statement.
+    ///
+    /// The 2026-08-20 hunt found the front door's own resolution re-opening the hole the serve/decide
+    /// fence had just closed: the fence verifies the serve against the current revision, then
+    /// [`Self::record_playback_receipt`] re-queries the row, so a write landing in between rebinds
+    /// the receipt to a revision (and fingerprint) the reviewer never heard. Check-and-insert as one
+    /// `INSERT … SELECT … WHERE review_revision = ?` closes that: SQLite executes it atomically, so
+    /// either the receipt is minted against exactly the verified revision or nothing is written.
+    ///
+    /// Returns `false` (and writes NOTHING) when the row moved or vanished — the caller treats that
+    /// as the fence firing late, not as an error.
+    pub fn record_playback_receipt_if_at_revision(
+        &self,
+        receipt: &PlaybackReceipt,
+        expected_revision: i64,
+    ) -> AppResult<bool> {
+        let changed = self.conn.execute(
+            "INSERT INTO playback_receipts (segment_id, segment_revision, audio_fingerprint, reviewer,
+                                            session_id, started_at_ms, played_ms, clip_duration_ms,
+                                            coverage_ratio, policy_version)
+             SELECT s.id, ?2,
+                    COALESCE(NULLIF(TRIM(COALESCE(s.audio_fingerprint, '')), ''), 'id:' || s.id),
+                    ?3, ?4, ?5, ?6,
+                    CASE WHEN COALESCE(s.duration_ms, 0) > 0 THEN s.duration_ms ELSE ?7 END,
+                    CASE WHEN CASE WHEN COALESCE(s.duration_ms, 0) > 0 THEN s.duration_ms ELSE ?7 END > 0
+                         THEN MIN(1.0, CAST(?6 AS REAL)
+                                       / (CASE WHEN COALESCE(s.duration_ms, 0) > 0 THEN s.duration_ms ELSE ?7 END))
+                         ELSE 0.0 END,
+                    ?8
+             FROM speech_segments s
+             WHERE s.id = ?1 AND COALESCE(s.review_revision, 0) = ?2",
+            params![
+                receipt.segment_id,
+                expected_revision,
+                receipt.reviewer,
+                receipt.session_id,
+                receipt.started_at_ms,
+                receipt.played_ms.max(0),
+                receipt.clip_duration_ms.max(0),
+                PLAYBACK_POLICY_VERSION,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// The raw writer: stores exactly what it is given, resolving nothing.
     ///
     /// For tests that must fabricate divergent worlds (a receipt at a dead revision, audio bytes
@@ -4654,10 +4713,16 @@ impl Database {
         Ok(best.unwrap_or(0.0) >= MIN_PLAYBACK_COVERAGE)
     }
 
-    // Eight parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
-    // what verdict, whose text, when, who, at which revision, and whether this call finalizes).
-    // Bundling them into a struct would move the width rather than remove it, and this is a private
-    // helper with three call sites — all in this file.
+    // Nine parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
+    // what verdict, whose text, when, who, at which revision, whether this call finalizes, and which
+    // surface audits it). Bundling them into a struct would move the width rather than remove it,
+    // and this is a private helper with three call sites — all in this file.
+    //
+    // `audit_source`: when `Some`, the review_events audit row — the basis reviewers are PAID on —
+    // is written INSIDE this same transaction. The 2026-08-20 hunt measured the alternative: the
+    // phone wrote it as a separate best-effort INSERT after the commit, so a kill (or SQLITE_BUSY)
+    // in between left a verified row whose completed work no pay metric could ever see, and the
+    // outbox replay hit the duplicate fast-path without backfilling it. Requires `annotator`.
     #[allow(clippy::too_many_arguments)]
     fn record_human_decision_by_with_finalize(
         &self,
@@ -4668,6 +4733,7 @@ impl Database {
         annotator: Option<&str>,
         expected_revision: Option<i64>,
         finalize: bool,
+        audit_source: Option<&str>,
     ) -> AppResult<Option<i64>> {
         // `finalize` and `expected_revision` are INDEPENDENT, and conflating them cost real work.
         // Until 2026-08-20 finalize was derived as `expected_revision.is_some()` — a CAS token only
@@ -4989,6 +5055,23 @@ impl Database {
                 "INSERT INTO decision_log (segment_id, decision_type, timestamp_ms, human_decision, created_at)
                  VALUES (?1, ?2, ?3, ?4, datetime('now'))",
                 params![segment_id, decision, ts_ms, decision],
+            )?;
+        }
+
+        // The audit row rides the SAME commit as the decision it records (see the fn doc): a
+        // verified row without its pay-bearing event, or an event for a verdict that never
+        // committed, are both now unrepresentable states rather than kill-window outcomes.
+        if let (Some(source), Some(who)) = (audit_source, annotator) {
+            let event_ts = timestamp_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            });
+            tx.execute(
+                "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT duration_ms FROM speech_segments WHERE id = ?1))",
+                params![segment_id, who, decision, source, event_ts],
             )?;
         }
 

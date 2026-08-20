@@ -1495,7 +1495,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     let dir = { lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone()) };
     let allowed_dialects: Option<Vec<String>> = match dir.as_ref().map(|d| crate::dialect::load_roster(d)) {
         Some(Err(e)) => return err_reply(503, &format!("policy file broken, no clips served: {e}")),
-        Some(Ok(roster)) => roster.get(reviewer).cloned(),
+        // Matched the way the session layer matches names (trim + ASCII case), never an exact
+        // HashMap::get — a roster key that binds nobody is the wrong-dialect incident returning.
+        Some(Ok(roster)) => crate::dialect::allowed_for(&roster, reviewer).cloned(),
         None => None,
     };
     let focus: Option<std::collections::HashSet<String>> = match dir.as_ref().map(|d| crate::voice_focus::load_focus(d))
@@ -1512,7 +1514,11 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // An empty queue means two very different things, and the page must not say "all clips reviewed"
     // for the second: everything really is done, OR this reviewer is restricted to a dialect that has
     // no work right now (today: everything playable is Hawleri, so a Sorani-only reviewer has none).
-    let restricted_and_empty = allowed_dialects.is_some() && pending_total == 0;
+    // A VOICE FOCUS counts as a restriction here too (2026-08-20 hunt): with the queue narrowed to
+    // one speaker and that set drained, an unrestricted reviewer used to be shown "all clips
+    // reviewed 🎉" while thousands of pending clips sat outside the focus — a lie about the
+    // library, told at the exact moment the owner would want to widen the focus.
+    let restricted_and_empty = (allowed_dialects.is_some() || focus.is_some()) && pending_total == 0;
     let now = Instant::now();
     let mut guard = lock_state(state);
     let mut serving: Vec<String> = Vec::new();
@@ -2042,20 +2048,50 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         );
     }
 
+    // SPOT-CHECK DETECTION, hoisted above the version fence (2026-08-20 hunt). Grading a check
+    // writes NOTHING to the corpus row, so a revision bump between serve and submit cannot
+    // invalidate it — and bulk metadata runs (a rights stamp, a re-annotation) bump every GOLD
+    // row's revision at once, which would otherwise 409 every check in flight and cost the honesty
+    // measurement its scores. The full staleness rationale for the key itself is on the grading
+    // block below.
+    let expected_key: Option<String> = {
+        let mut guard = lock_state(state);
+        let key = (parsed.id.clone(), reviewer.to_string());
+        if !guard.spot_checks.contains(&key) {
+            None
+        } else if let Some(answer) = crate::quality::human_verified_text(&prev) {
+            Some(answer.to_string())
+        } else {
+            // The answer key is gone — the thing that made this a check. Drop the stale pair so it
+            // cannot swallow this clip again, and treat the submit as what it is: real work.
+            guard.spot_checks.remove(&key);
+            tracing::info!("Couch Review: stale spot check for {} dropped — the human answer key is gone", parsed.id);
+            None
+        }
+    };
+
     // SERVE/DECIDE VERSION FENCE (text-provenance audit #4). The queue stamped this clip's
     // monotonic revision into the payload; if the row changed between serve and submit (batch
     // re-transcribe, refine loop, desktop edit — all of which target exactly the unverified rows
     // the couch serves), the reviewer judged text that no longer exists: recording it would
     // misclassify accept-vs-edit against the NEW row and mint a DPO pair anti-training the fresher
-    // draft. Refuse; the page reloads and serves the current text. Skipped for a replay finishing
-    // an already-recorded decision — its write one landed, so the stamp has legitimately moved.
+    // draft. Refuse; the page reloads and serves the current text.
     //
     // Placed BEFORE the receipt mint (audit fix 2026-08-20). The receipt's revision, fingerprint
-    // and duration are all resolved from the CURRENT row, so minting one for a submit whose serve
-    // predates a re-chunk would bind this reviewer's real listening to audio they never heard —
-    // evidence manufactured by ordering. A stale serve must be refused while it is still only a
-    // claim, before it becomes a receipt.
-    if !already_recorded {
+    // and duration are all resolved from the row, so minting one for a submit whose serve predates
+    // a re-chunk would bind this reviewer's real listening to audio they never heard — evidence
+    // manufactured by ordering. A stale serve must be refused while it is still only a claim.
+    //
+    // Three exemptions, each because the fence would refuse an act that cannot conflict:
+    //   * a replay finishing an already-recorded decision — its write one landed, so the stamp has
+    //     legitimately moved;
+    //   * a SKIP — it writes no verdict, and fencing it boomeranged the clip back to the same
+    //     reviewer forever (the lease is kept on a 409) while the offline replay of the skip was
+    //     dropped into the "work lost" banner, all for an act with nothing to be stale about;
+    //   * a SPOT CHECK — see above.
+    // Neither exemption can manufacture evidence: the mint below re-verifies the revision
+    // atomically and simply declines the receipt when the row has moved.
+    if !already_recorded && parsed.action != "skip" && expected_key.is_none() {
         if let Some(served_stamp) = parsed.row_version.as_deref() {
             let Ok(served_revision) = served_stamp.parse::<i64>() else {
                 return err_reply(409, "this clip was served by an older page — reload for the fresh draft");
@@ -2087,10 +2123,29 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
     let fingerprint =
         db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
-    // The revision the fence just verified against the serve — NOT a fresh query, which could see a
-    // write landing in the microseconds since and rebind this receipt to a revision never served.
-    let revision = request_revision;
-    if let Some(heard_ms) = parsed.heard_ms {
+    // The revision this receipt binds to. For a decision it is the one the fence just verified
+    // against the serve. For a SPOT CHECK it is the row as it stands NOW: bulk stamps bump gold
+    // rows' revisions without touching the audio, the fence exempts checks for exactly that
+    // reason, and the receipt + evidence check must agree on one value or an honest listener
+    // would be refused.
+    let revision = if expected_key.is_some() {
+        db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(request_revision)
+    } else {
+        request_revision
+    };
+    // A skip whose SERVE is already stale mints nothing at all: the skip itself still lands (it
+    // writes no verdict), but the mint below resolves identity from the CURRENT row, and listening
+    // that happened on a serve the fence can no longer verify must not become evidence bound to a
+    // row state the reviewer never saw.
+    let stale_skip = parsed.action == "skip"
+        && parsed
+            .row_version
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok())
+            .is_some_and(|served| served != request_revision);
+    if stale_skip {
+        tracing::info!("skip on {} kept, receipt declined: the serve predates the current row", parsed.id);
+    } else if let Some(heard_ms) = parsed.heard_ms {
         let receipt = crate::db::PlaybackReceipt {
             segment_id: parsed.id.clone(),
             segment_revision: revision,
@@ -2099,31 +2154,44 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             session_id: None,
             started_at_ms: now_ms,
             played_ms: heard_ms.max(0),
-            clip_duration_ms: db
-                .segment_clip_duration_ms(&parsed.id)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| parsed.clip_duration_ms.unwrap_or(0).max(0)),
+            clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0).max(0),
         };
-        if let Err(e) = db.record_playback_receipt(&receipt) {
-            // NOT a warning to swallow any more. Under enforcement the receipt IS the reviewer's
-            // proof, so losing it silently means refusing them for the server's failure: they replay
-            // the clip, the write fails again, and nothing they can do will land. A busy database is
-            // a 500 -- which the page already holds and retries -- not a verdict about listening.
-            tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
-            // Hold the clip for THIS reviewer before giving up on it. A 428 is a rejected request and
-            // deliberately leaves no lease, but a 500 is the server's own failure: the reviewer still
-            // has the clip open with their correction typed and now queued, and a freed clip goes to
-            // the next reviewer's batch within seconds — their replay then loses a race that never
-            // needed to happen. Same rule the decision write below follows for the same reason.
-            {
-                let now = Instant::now();
-                let mut guard = lock_state(state);
-                if !guard.holder(&parsed.id, now).is_some_and(|who| who != reviewer) {
-                    guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
-                }
+        // Atomic check-and-mint (2026-08-20 hunt): the front door's own resolution re-queried the
+        // row AFTER the fence, so a write landing in between rebound the receipt to a revision the
+        // reviewer never heard. The mint now verifies the revision in the same statement that
+        // inserts — fingerprint and duration are resolved from exactly the verified row.
+        match db.record_playback_receipt_if_at_revision(&receipt, revision) {
+            Ok(true) => {}
+            Ok(false) if parsed.action == "skip" => {
+                // The row moved between fetch and mint. The skip still proceeds — it writes no
+                // verdict — but WITHOUT a receipt: evidence nobody can bind to the served audio
+                // is worth less than no evidence.
+                tracing::info!("skip on {} kept, receipt declined: the row moved since the serve", parsed.id);
             }
-            return err_reply(500, &format!("playback receipt not recorded: {e}"));
+            Ok(false) => {
+                // The fence firing late: same refusal, same page recovery (reload, fresh serve).
+                return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
+            }
+            Err(e) => {
+                // NOT a warning to swallow any more. Under enforcement the receipt IS the reviewer's
+                // proof, so losing it silently means refusing them for the server's failure: they replay
+                // the clip, the write fails again, and nothing they can do will land. A busy database is
+                // a 500 -- which the page already holds and retries -- not a verdict about listening.
+                tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
+                // Hold the clip for THIS reviewer before giving up on it. A 428 is a rejected request and
+                // deliberately leaves no lease, but a 500 is the server's own failure: the reviewer still
+                // has the clip open with their correction typed and now queued, and a freed clip goes to
+                // the next reviewer's batch within seconds — their replay then loses a race that never
+                // needed to happen. Same rule the decision write below follows for the same reason.
+                {
+                    let now = Instant::now();
+                    let mut guard = lock_state(state);
+                    if !guard.holder(&parsed.id, now).is_some_and(|who| who != reviewer) {
+                        guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
+                    }
+                }
+                return err_reply(500, &format!("playback receipt not recorded: {e}"));
+            }
         }
     }
     if parsed.action != "skip" {
@@ -2150,9 +2218,12 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         }
     }
 
-    // AUDIT TRAIL (v45), written for every accepted submit including spot checks — a reviewer's
-    // throughput must count the work they actually did, and a check is real work to them. Best-effort
-    // and logged on failure: losing the RECORD of a decision must never cost the DECISION.
+    // AUDIT TRAIL (v45) for the paths that write no corpus row: SKIP and SPOT CHECK. Best-effort
+    // and logged on failure — losing the RECORD of those acts must never cost the act. A real
+    // DECISION's audit row no longer goes through this: it rides the decision's own transaction
+    // (2026-08-20 hunt — a kill between the decision commit and this closure left verified work
+    // permanently missing from the pay basis, and the outbox replay's duplicate fast-path never
+    // backfilled it).
     let audit = |db: &Database, action: &str| {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2220,21 +2291,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // answer, so a reviewer who transcribed the clip CORRECTLY was recorded at a fabricated 1.00 CER
     // (or 0.00 for a reject) and averaged into spot_check_report with no filter — while the HTTP reply
     // was byte-identical to a real success. Test the key, not its artefact.
-    let expected_key: Option<String> = {
-        let mut guard = lock_state(state);
-        let key = (parsed.id.clone(), reviewer.to_string());
-        if !guard.spot_checks.contains(&key) {
-            None
-        } else if let Some(answer) = crate::quality::human_verified_text(&prev) {
-            Some(answer.to_string())
-        } else {
-            // The answer key is gone — the thing that made this a check. Drop the stale pair so it
-            // cannot swallow this clip again, and treat the submit as what it is: real work.
-            guard.spot_checks.remove(&key);
-            tracing::info!("Couch Review: stale spot check for {} dropped — the human answer key is gone", parsed.id);
-            None
-        }
-    };
     if let Some(expected) = expected_key {
         let submitted = text.as_deref().unwrap_or_default();
         if let Err(e) = db.record_spot_check(&parsed.id, reviewer, decision, submitted, &expected) {
@@ -2357,7 +2413,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // Decided, so the lease has served its purpose — release it rather than waiting out the TTL. (The
     // clip also leaves the pending queue, so this is housekeeping, not correctness.)
     lock_state(state).leases.remove(&parsed.id);
-    audit(db, decision);
+    // No audit() here: the review_events row committed WITH the decision, inside its transaction.
     // The reviewer's audio total, refreshed HERE rather than waiting for the next queue fetch. This
     // is the number they are paid on, and it used to move only when a batch refilled — so a reviewer
     // could finish twenty clips and watch it sit still, which reads as "my work is not being
@@ -2674,6 +2730,33 @@ mod tests {
         assert_eq!(code, 200, "a repaired policy file must serve on the next fetch, no restart");
     }
 
+    /// A drained VOICE FOCUS is a restriction, not completion (2026-08-20 hunt): with the queue
+    /// narrowed to one speaker and that set done, the page said "🎉 all clips reviewed" to a
+    /// reviewer while thousands of pending clips sat outside the focus.
+    #[test]
+    fn a_drained_focus_reports_restriction_not_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("out1", "دەرەوەی فۆکەس")).unwrap(); // pending, but OUTSIDE the focus
+        let state = Mutex::new(CouchState {
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            ..CouchState::default()
+        });
+        std::fs::write(
+            tmp.path().join("voice_focus.json"),
+            r#"{ "name": "V", "segment_ids": ["not-a-pending-clip"] }"#,
+        )
+        .unwrap();
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["items"].as_array().map(Vec::len), Some(0), "the focus is drained");
+        assert_eq!(
+            payload["noWorkInYourDialect"], true,
+            "an empty FOCUSED queue must read as 'nothing assigned to you', never 'all reviewed'"
+        );
+    }
+
     /// The ids `reviewer` is handed by a queue request (and, as a side effect, leases).
     fn queue_ids(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Vec<String> {
         let (code, _, body, ..) = api_queue(db, reviewer, state);
@@ -2681,6 +2764,88 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["reviewer"], reviewer, "the queue names the reviewer it was served to");
         payload["items"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// A SKIP is exempt from the version fence (2026-08-20 hunt): it writes no verdict, so there is
+    /// nothing for a revision bump to conflict with — and fencing it boomeranged the clip back to
+    /// the same reviewer forever while the offline replay of the skip was reported as lost work.
+    /// The receipt is simply declined when the row moved: the skip lands, the evidence does not.
+    #[test]
+    fn a_skip_on_a_stale_serve_succeeds_without_minting_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("sk1", "دەقی کۆن")).unwrap();
+        let state = state();
+        let served = db.segment_review_revision("sk1").unwrap().unwrap_or(0);
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision = review_revision + 1 WHERE id = 'sk1'", [])
+            .unwrap();
+        let body = serde_json::json!({
+            "id": "sk1", "action": "skip", "heardMs": 9_000, "rowVersion": served.to_string(),
+        });
+        let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "a skip cannot be stale — it writes nothing: {}", String::from_utf8_lossy(&msg));
+        let receipts: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'sk1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipts, 0, "but its evidence is declined — nobody can bind it to the served audio");
+    }
+
+    /// A SPOT CHECK is exempt from the version fence too: grading writes nothing to the row, and
+    /// bulk metadata runs (a rights stamp) bump every GOLD row's revision at once — one such run
+    /// must not 409 every check in flight and thin the honesty measurement.
+    #[test]
+    fn a_spot_check_is_graded_even_when_a_bulk_stamp_bumped_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        gold_seg(&db, "sc1", "دەقی هەڵە", "دەقی ڕاست");
+        let data_dir = tmp.path().to_path_buf();
+        let state = Mutex::new(CouchState {
+            spot_checks: HashSet::from([("sc1".to_string(), "Sara".to_string())]),
+            session_store: Some((data_dir, db_path)),
+            ..CouchState::default()
+        });
+        let served = db.segment_review_revision("sc1").unwrap().unwrap_or(0);
+        // The bulk stamp: touches metadata, bumps the revision, changes no audio and no answer key.
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision = review_revision + 1 WHERE id = 'sc1'", [])
+            .unwrap();
+        let body = serde_json::json!({
+            "id": "sc1", "action": "edit", "text": "دەقی ڕاست",
+            "heardMs": 600_000, "rowVersion": served.to_string(),
+        });
+        let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "the check is graded, not bounced: {}", String::from_utf8_lossy(&msg));
+        let report = db.spot_check_report().unwrap();
+        assert_eq!(report.len(), 1, "and SCORED");
+        assert_eq!(report[0].noticed, 1, "she corrected the planted error");
+    }
+
+    /// The pay-bearing audit row commits WITH the decision, inside its transaction — a verified row
+    /// whose work the pay metric cannot see is no longer a representable state (2026-08-20 hunt).
+    #[test]
+    fn a_phone_decision_and_its_audit_event_are_one_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("au1", "دەقی کار")).unwrap();
+        let revision = db.segment_review_revision("au1").unwrap().unwrap_or(0);
+        // Straight at the DB layer: no couch closure in sight, so the event can only have come from
+        // the decision's own transaction.
+        db.record_phone_human_decision_by_at_revision("au1", "accept", Some("دەقی کار"), "Sara", revision)
+            .unwrap()
+            .expect("decision lands");
+        let (n, src): (i64, String) = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*), MAX(source) FROM review_events WHERE segment_id = 'au1' AND reviewer = 'Sara'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "exactly one audit row rides the decision commit");
+        assert_eq!(src, "couch");
+        assert!(db.reviewed_audio_ms("Sara").unwrap() > 0, "and the pay basis sees the work immediately");
     }
 
     /// The version fence must fire BEFORE the receipt mint (audit fix 2026-08-20). A receipt's

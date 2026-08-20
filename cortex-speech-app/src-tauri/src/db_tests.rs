@@ -886,7 +886,10 @@ fn v35_repairs_divergent_segments_fts_so_segment_writes_succeed() {
                  ALTER TABLE speech_segments DROP COLUMN cloud_call;
                  ALTER TABLE speech_segments DROP COLUMN confidence_source;
                  ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;
-                 ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;",
+                 ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;
+                 -- v56 must be hand-reverted like the columns above: replaying from v34 re-runs its
+                 -- ADD COLUMN, and a real v34 database has no review_events.duration_ms either.
+                 ALTER TABLE review_events DROP COLUMN duration_ms;",
         )
         .unwrap();
     db.connection().execute("DELETE FROM schema_migrations WHERE version >= 35", []).unwrap();
@@ -2691,6 +2694,7 @@ fn restore_of_an_older_snapshot_migrates_it_forward_to_head() {
                 "DROP TABLE IF EXISTS jobs; \
                      ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score; \
                      ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence; \
+                     ALTER TABLE review_events DROP COLUMN duration_ms; \
                      DELETE FROM schema_migrations WHERE version >= {JOBS_MIGRATION};"
             ))
             .unwrap();
@@ -4049,6 +4053,13 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
     assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "9s + 21s, the retry not double-counted");
     assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000);
     assert_eq!(db.reviewed_audio_ms("Nobody").unwrap(), 0, "a reviewer with no work owes no rows");
+
+    // PAY SURVIVES DELETION (2026-08-20 hunt): the owner pruning a reviewed clip must not shrink
+    // the total for work that was genuinely done — the event snapshots the duration it was paid
+    // against (v56), so the number the owner pays on is append-only in practice.
+    db.delete_segment("a").unwrap();
+    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "clip 'a' is gone; Rubar's 9s of work is not");
+    assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000, "hers neither");
 }
 
 #[test]
@@ -4607,6 +4618,39 @@ fn a_full_listen_is_sufficient_evidence() {
     db.insert_segment(&make_segment("pb-1", "/a/clip.wav")).unwrap();
     db.record_playback_receipt_raw(&receipt("pb-1", 0, "fp-a", 9_000, 9_000)).unwrap();
     assert!(db.has_sufficient_playback_evidence("pb-1", 0, "fp-a", Some("Sara")).unwrap());
+}
+
+/// The atomic mint (2026-08-20 hunt): check-and-insert in ONE statement, so a write landing between
+/// a caller's version fence and the mint can never rebind the receipt to a revision (and
+/// fingerprint) the reviewer never heard. `false` writes NOTHING.
+#[test]
+fn a_receipt_is_minted_only_at_the_expected_revision() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-rev", "/a/clip.wav")).unwrap();
+    let current = db.segment_review_revision("pb-rev").unwrap().unwrap_or(0);
+
+    // At the verified revision: minted, with identity resolved from the row.
+    assert!(db
+        .record_playback_receipt_if_at_revision(&receipt("pb-rev", 0, "claimed-fp", 9_000, 9_000), current)
+        .unwrap());
+    let n: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id='pb-rev'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // At a revision the row is no longer on: declined, and NOTHING is written.
+    assert!(!db
+        .record_playback_receipt_if_at_revision(&receipt("pb-rev", 0, "claimed-fp", 9_000, 9_000), current + 7)
+        .unwrap());
+    let n: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id='pb-rev'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "a declined mint leaves no row behind");
+
+    // And for a segment that does not exist at all: declined, not an error.
+    assert!(!db.record_playback_receipt_if_at_revision(&receipt("ghost", 0, "fp", 1_000, 1_000), 0).unwrap());
 }
 
 #[test]
