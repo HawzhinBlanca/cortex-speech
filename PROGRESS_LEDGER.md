@@ -10730,3 +10730,36 @@ Still open and owner-facing: the 20-decision enforcement canary (needs real revi
 build), spot-check pool 22/24, and the strategic speaker-identity/train-test-split design.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-20 (voice focus) — the desktop was still playing guests, and the canary needs a Hawleri speaker
+
+The owner, reviewing on desktop with the Kawa_Hawleri focus active, heard guests. The focus was
+real, live, and narrowing every PHONE queue — and the desktop review page had never heard of it.
+`pending_segment_ids_focused` was couch-only; the desktop reads through `get_segments_page`, which
+served the whole library. Fourth incident of the same class: the check lived on one serving path
+while another path served the lie.
+
+Fix (65deefa): `get_segments_page_focused` joins the allow-list in SQL (`json_each`) so rows,
+COUNT, and keyset pages agree; the focus SET is hashed into the cursor scope, so a cursor dies
+when `voice_focus.json` changes (its total was computed under the retired list); the command
+mirrors couch's fail-closed wording on a present-but-broken file; ReviewMode asks `focused: true`;
+curate/library stays unfocused on purpose — the queue narrows, the library does not.
+
+```
+proof     : db test desktop_review_page_narrows_to_the_voice_focus_but_the_library_does_not
+            (guest never enters the queue; total counts the queue; focused cursor refused against
+            an edited set AND against the full library)
+pins      : test_voice_focus_policy +1 — one anchor per serving layer (couch, db, command,
+            ReviewMode) + curate must never turn the focus on
+suite     : cargo 1310/1310 | clippy clean | vitest 283 | svelte-check 0 | 88/88 policy scripts
+deployed  : exe at HEAD 65deefa, supervision OK (8 links answering), stale installers deleted
+```
+
+Same session, the canary and the roster met: readiness is 22 decisions / coverage-clean but
+single-reviewer — and the live queue gate shows why the second reviewer hasn't appeared. The
+Kawa_Hawleri focus leaves every sorani-only reviewer (Alle, Lamo, Roza, Sabat, Sewa) with a live
+link and ZERO servable clips; Alle's "empty queue" screenshot was the system obeying the roster,
+not a bug. The second canary reviewer must be Rubar or Pavel. Owner decision surfaced: five paid
+links are idle for as long as the focus holds.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
