@@ -244,7 +244,12 @@ def find_stale_installers(exe_mtime: float) -> list[tuple[str, float]]:
     for pattern in INSTALLER_GLOBS:
         for path in sorted(BUNDLE_DIR.glob(pattern)):
             mtime = path.stat().st_mtime
-            if mtime < exe_mtime:
+            # 15-minute tolerance: ONE `tauri build` writes the MSI, then patches the exe for
+            # NSIS, then writes the setup exe — so the artifacts of a single build straddle the
+            # exe's final mtime by however long candle/light take (measured 2026-08-20: the MSI of
+            # the very build being verified sat 336s "behind" the exe it embeds). The incident this
+            # gate exists for (2026-08-17) was four DAYS behind, far outside any bundling window.
+            if mtime < exe_mtime - 900.0:
                 stale.append((path.name, mtime))
     return stale
 
