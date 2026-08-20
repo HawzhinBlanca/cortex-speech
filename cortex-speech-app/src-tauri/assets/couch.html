@@ -58,7 +58,7 @@
     "retry": "Retry",
     "linkExpired": "This link has expired. Ask for a new one — anything you already saved is safe, and anything still waiting to send will go through on the new link.",
     "allDone": "All clips reviewed!",
-    "noDialectWork": "No clips in your dialect yet. Nothing to do — you will be told when there are.",
+    "noDialectWork": "No clips are assigned to you right now. Nothing to do — you will be told when there are.",
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
     "loadingMore": "Loading clips…",
     "queued": "Queued — it will send when you are back online",
@@ -87,7 +87,7 @@
     "retry": "دووبارە",
     "linkExpired": "ئەم بەستەرە بەسەرچووە. داوای بەستەرێکی نوێ بکە — هەرچی پاشەکەوتت کردووە پارێزراوە، و هەرچی چاوەڕێی ناردنە بە بەستەرە نوێیەکە دەنێردرێت.",
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
-    "noDialectWork": "هێشتا هیچ پارچەیەک بە زاری تۆ نییە. شتێک نییە بۆ کردن — کاتێک هەبوو پێت دەڵێین.",
+    "noDialectWork": "لە ئێستادا هیچ پارچەیەک بۆ تۆ دانەنراوە. شتێک نییە بۆ کردن — کاتێک هەبوو پێت دەڵێین.",
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
     "loadingMore": "بارکردنی پارچەکان…",
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
@@ -504,7 +504,9 @@
     // Unsent work outranks both other messages. Decisions sitting in the outbox have NOT reached the
     // server, and "All clips reviewed" over the top of them told the reviewer they were finished at
     // the exact moment closing the page would have cost them the lot.
-    const unsent = readOutbox().length;
+    // Only what THIS reviewer can still send: items stamped for someone else are held by the
+    // flush guard and would ask this person to keep the page open for work that is not theirs.
+    const unsent = readOutbox().filter((q) => !q.reviewer || !me || q.reviewer === me).length;
     if (unsent) { $('done').textContent = t('stillSending', { n: unsent }); return; }
     // An empty queue does NOT mean the work is finished when other reviewers are holding clips —
     // claiming "all reviewed" there would be a flat lie to whoever loaded last.
@@ -571,6 +573,10 @@
   // Kept in localStorage rather than memory: the most likely way to lose a submit is the reviewer
   // giving up on a frozen page and reloading it. Flushed on load and whenever the phone reconnects.
   // Safe to replay because the server answers an identical re-submit as already-recorded.
+  // Clips THIS page decided successfully this session. A stale outbox replay of one of these can
+  // be refused (its rowVersion predates the re-decision) — that is not lost work, the newer verdict
+  // landed, and the refused banner must not say otherwise (2026-08-20 hunt).
+  const decidedHere = new Set();
   const OUTBOX = 'cortex.couch.outbox';
   const readOutbox = () => { try { return JSON.parse(localStorage.getItem(OUTBOX)) || []; } catch { return []; } };
   const writeOutbox = (v) => localStorage.setItem(OUTBOX, JSON.stringify(v));
@@ -578,10 +584,21 @@
   // did not land — silently discarding it after having toasted "Saved" is how a corpus quietly loses
   // human labour nobody can account for afterwards.
   const REFUSED = 'cortex.couch.refused';
-  const readRefused = () => { try { return JSON.parse(localStorage.getItem(REFUSED)) || []; } catch { return []; } };
+  // Entries are { id, by } — `by` is the reviewer whose work was refused, because this store is
+  // localStorage and therefore SHARED by everyone who uses this phone: an unscoped banner told the
+  // next reviewer that work "could not be saved" which was never theirs (2026-08-20 hunt). Plain-id
+  // entries predate the stamp and stay visible to everyone rather than being dropped.
+  const readRefused = () => {
+    try {
+      return (JSON.parse(localStorage.getItem(REFUSED)) || []).map((x) => (typeof x === 'string' ? { id: x, by: null } : x));
+    } catch { return []; }
+  };
+  // The entries that concern the CURRENT reviewer: their own, the unstamped legacy ones, and — while
+  // identity is still unknown — everything, since hiding a warning is worse than over-showing it.
+  const refusedMine = () => readRefused().filter((x) => !x.by || !me || x.by === me);
   function noteRefused(id) {
     const r = readRefused();
-    if (!r.includes(id)) localStorage.setItem(REFUSED, JSON.stringify([...r, id]));
+    if (!r.some((x) => x.id === id)) localStorage.setItem(REFUSED, JSON.stringify([...r, { id, by: me || null }]));
   }
   // ...and RETRACTED when that clip's decision finally lands. Nothing cleared this list, so a single
   // refusal pinned the banner for the life of the browser profile — it kept telling the reviewer work
@@ -589,8 +606,8 @@
   // banner exists to prevent, pointing the other way.
   function clearRefused(id) {
     const r = readRefused();
-    if (!r.includes(id)) return;
-    const left = r.filter((x) => x !== id);
+    if (!r.some((x) => x.id === id)) return;
+    const left = r.filter((x) => x.id !== id);
     if (left.length) {
       localStorage.setItem(REFUSED, JSON.stringify(left));
       if (errKind === 'refused') renderRefused(); // recount, still showing
@@ -600,8 +617,9 @@
     clearErr('refused'); // a no-op if #err is currently carrying a more urgent message
   }
   function renderRefused() {
-    const n = readRefused().length;
-    if (!n) return;
+    const n = refusedMine().length;
+    // A count of zero must also TAKE DOWN a banner a previous reviewer's entries put up.
+    if (!n) { if (errKind === 'refused') clearErr('refused'); return; }
     // Persistent, not a toast: this needs the reviewer to go back and re-do specific clips, and a
     // message that disappears in three seconds cannot ask that. Never overwrites a link-expired
     // verdict — that one needs an action from the reviewer and outranks this.
@@ -616,8 +634,8 @@
   // jump, because the reviewer would trust it. No new string; the banner itself is the affordance.
   $('err').addEventListener('click', () => {
     if (errKind !== 'refused') return;
-    const refused = readRefused();
-    const pos = queue.findIndex((s) => refused.includes(s.id));
+    const refused = refusedMine();
+    const pos = queue.findIndex((s) => refused.some((x) => x.id === s.id));
     if (pos < 0) return;
     i = pos;
     show();
@@ -666,12 +684,19 @@
         //                the server never rejected — it only asked us to slow down.
         //   5xx        — the server is unwell, not disagreeing.
         if (e.status === undefined || e.status === 401 || e.status === 429 || e.status >= 500) return;
+        // The ATTRIBUTION fence (409 "made by X, not Y"): the cookie belongs to a different
+        // reviewer right now — another tab or the installed PWA claimed a colleague's link after
+        // these were queued. That is a fact about THIS COOKIE, not about the decision, and the
+        // server refused precisely so the work could be held for its author. Deleting it here was
+        // the exact loss the fence exists to prevent (2026-08-20 hunt). Hold everything and stop —
+        // the flush under the right identity sends it.
+        if (e.status === 409 && item.reviewer && /was made by/.test(e.message || '')) return;
         // Everything else (409 taken, 400 invalid) IS a real answer about this decision. Retrying can
         // never change it, so drop it rather than wedging the queue behind something that will never
         // land — but the reviewer's TYPED TEXT is not the server's to discard. Deleting the draft here
         // destroyed the one copy of a correction they had already been told was saved. Keep it, and
         // say what happened.
-        noteRefused(item.id);
+        if (!decidedHere.has(item.id)) noteRefused(item.id);
         writeOutbox(readOutbox().filter((q) => q.id !== item.id));
         continue;
       }
@@ -712,8 +737,13 @@
       return;
     }
     const audioUrl = '/api/audio/' + encodeURIComponent(seg.id);
-    $('player').src = audioUrl;
-    void loadWave(audioUrl);
+    // Re-assigning even the SAME src reloads the element, and loadstart zeroes heardMs — so a
+    // re-show of the clip already on screen (background refill, held position after a refusal)
+    // must not touch it, or real accumulated listening evaporates (2026-08-20 hunt).
+    if (!($('player').src || '').endsWith(audioUrl)) {
+      $('player').src = audioUrl;
+      void loadWave(audioUrl);
+    }
     $('player').playbackRate = speed;
     $('player').loop = looping;
     pausedByEdit = false; // a new clip owes the reviewer no rewind
@@ -792,7 +822,15 @@
       const res = await api('/api/queue');
       retryable = false;
       clearErr('load');
+      // If the clip on screen survives into the fresh batch, STAY on it (2026-08-20 hunt): the 60s
+      // background retry lands mid-listen, and snapping to clip 0 re-assigns the src, which zeroes
+      // the accumulated heardMs — destroying real listening the 0.85 gate then makes them redo.
+      const showingId = queue[i] && queue[i].id;
       queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
+      if (showingId) {
+        const stillAt = queue.findIndex((s) => s.id === showingId);
+        if (stillAt > 0) i = stillAt;
+      }
       skippedByYou = Number(res.skippedByYou) || 0;
       // The whole pending backlog, not just this batch (R1.5). Absent on an older server, and the
       // progress line falls back to per-batch counting when it is.
@@ -808,6 +846,20 @@
       // the reviewer must be able to see it — silent attribution is attribution nobody can correct.
       me = res.reviewer;
       $('who').textContent = ' · ' + res.reviewer;
+      // A tab that CHANGES HANDS must not hand the next person the previous reviewer's typed
+      // drafts (2026-08-20 hunt): sessionStorage survives navigating from one link to another in
+      // the same tab, and a saved draft overrides the served text — reviewer B would be shown, and
+      // could save, reviewer A's half-typed correction as their own. Identity change = the drafts
+      // are gone; the banner recount below re-scopes the refused list the same way.
+      const prevWho = sessionStorage.getItem('cortex.couch.who');
+      if (prevWho !== null && prevWho !== me) {
+        for (let k = sessionStorage.length - 1; k >= 0; k--) {
+          const key = sessionStorage.key(k);
+          if (key && key.startsWith('cortex.couch.draft.')) sessionStorage.removeItem(key);
+        }
+        renderRefused();
+      }
+      sessionStorage.setItem('cortex.couch.who', me);
       // Now that the server has named this reviewer, send the stamped work the pre-identity flush
       // above rightly held back (it must never guess whose cookie it is flushing under). Fire and
       // forget: the queue is already rendered, and the 30s retry timer backstops a failure here.
@@ -881,6 +933,7 @@
       if (!isSkip) {
         sessionStorage.removeItem(draftKey(submission.id));
         clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
+        decidedHere.add(submission.id); // so a STALE outbox replay of this clip cannot claim work was lost
         toast(action === 'bad' ? t('markedBad') : t('saved'));
         doneThisSession += 1;
       }
@@ -931,6 +984,16 @@
         // 428: the clip was not played enough to judge it. This is the ONE refusal the reviewer can
         // fix themselves, so it gets a sentence rather than a status code — and the page stays on the
         // clip, because replaying it is exactly what they should do next.
+        // The ATTRIBUTION fence: this cookie belongs to a different reviewer right now (another
+        // tab / the PWA claimed a colleague's link). The verdict itself is fine — queue it under
+        // its author's stamp for the flush that runs when their link is current again, instead of
+        // discarding a judgement over a cookie race (2026-08-20 hunt).
+        if (e.status === 409 && submission.reviewer && /was made by/.test(e.message || '')) {
+          writeOutbox([...readOutbox().filter((q) => q.id !== submission.id), submission]);
+          toast(t('queued'));
+          i += 1; show();
+          return;
+        }
         if (e.status === 428) toast(t('mustListen'), true);
         else toast(t('saveFailed', { err: e.status || '—' }), true);
         // The server refused because someone else has this clip (409). Staying here would keep
