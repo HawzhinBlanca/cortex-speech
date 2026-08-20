@@ -110,6 +110,50 @@ describe('SettingsPanel cloud-consent transaction', () => {
     expect(published.cloudSttOptIn).toBe(false);
   });
 
+  it('an unrelated auto-save cannot smuggle an unsaved consent grant to the backend', async () => {
+    // The leak (2026-08-20 hunt): granting only flips localSettings, but saveQuietly persisted the
+    // WHOLE object — so blurring ANY other field put the grant on disk, and Cancel then "cancelled"
+    // a consent that was already live. Auto-saves must clamp grants to the last-persisted value.
+    render(SettingsPanel);
+    await fireEvent.click(sttCheckbox()); // grant — pending Save
+
+    // An unrelated edit guarantees the close-to-save diff fires, then the panel closes WITHOUT
+    // Save — the ✕/Escape gesture, which routes through saveQuietly (an auto-save).
+    const numeric = document.querySelector('input[type="number"]') as HTMLInputElement;
+    await fireEvent.input(numeric, { target: { value: '7' } });
+    cleanup(); // unmount = onDestroy close-to-save
+
+    expect(mocks.updateSettings).toHaveBeenCalled(); // the unrelated edit did persist...
+    for (const call of mocks.updateSettings.mock.calls) {
+      expect(call[0].cloudSttOptIn).toBe(false); // ...but the grant stayed home
+    }
+    expect(get(settings).cloudSttOptIn).toBe(false);
+  });
+
+  it('a failing save chain rolls back to the BACKEND state, never a phantom optimistic one', async () => {
+    // Job1 fails while job2 is queued (superseded — no rollback), then job2 fails too. Job2's
+    // rollback target must be the last state the backend CONFIRMED, not job1's optimistic store
+    // value that never reached disk — the phantom left the UI showing OFF while the backend held ON
+    // until restart (2026-08-20 hunt).
+    settings.set({ ...defaultSettings, cloudSttOptIn: true });
+    let failFirst!: (e: Error) => void;
+    let failSecond!: (e: Error) => void;
+    mocks.updateSettings
+      .mockImplementationOnce(() => new Promise<void>((_, reject) => (failFirst = reject)))
+      .mockImplementationOnce(() => new Promise<void>((_, reject) => (failSecond = reject)));
+    render(SettingsPanel);
+
+    await fireEvent.click(sttCheckbox()); // withdraw -> job1 in flight
+    await fireEvent.click(screen.getByRole('button', { name: /^save$/i })); // job2 queued
+    failFirst(new Error('disk full'));
+    await vi.waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(2));
+    failSecond(new Error('disk full'));
+    await vi.waitFor(() => expect(get(settings).cloudSttOptIn).toBe(true));
+
+    // Both writes failed: the backend still has the consent ON, and the UI must say so.
+    expect(sttCheckbox().checked).toBe(true);
+  });
+
   it('a slow failing save cannot roll back past a newer successful one (persists are serialized)', async () => {
     // The race (audit fix 2026-08-20): two overlapping persists each snapshot their own `prev`; if
     // the OLDER write fails after a NEWER one succeeded, its rollback reverts the store past the

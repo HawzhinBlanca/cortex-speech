@@ -17,6 +17,7 @@
   import { parseSourceMeta, chunkPlaybackRange } from './alignment';
   import type { SpeechSegment } from './types';
   import type { AppSettings } from './stores/settingsStore';
+  import { settings as settingsStore } from './stores/settingsStore';
   import AudioPlayer from './AudioPlayer.svelte';
 
   // ── Props ───────────────────────────────────────────────────────────────────
@@ -85,6 +86,10 @@
       const next = { ...settings, juryAutonomyLevel: val };
       await api.updateSettings(next);
       settings = next;
+      // The GLOBAL store too (2026-08-20 hunt): SettingsPanel seeds its inputs from it and persists
+      // the WHOLE object, so a store left stale here meant "change the theme, close Settings" wrote
+      // the old autonomy level back over the owner's explicit dial choice — silently.
+      settingsStore.set({ ...next });
       statusMsg = $t('inbox.status.autonomySet', {
         level: $t(`inbox.autonomy.${autonomyKey(val)}`),
       });

@@ -291,17 +291,41 @@
     return run;
   }
 
+  // The last state the BACKEND confirmed, maintained across the persist queue. `get(settings)` is
+  // NOT that: the store is set optimistically before each write, so a failed job's phantom values
+  // could become the next failure's "rollback target" — the UI then rolls back to a state that was
+  // never on disk and diverges from the backend until restart (2026-08-20 hunt). Every rollback
+  // lands HERE, and only a confirmed write moves it.
+  let lastPersisted: AppSettings = { ...get(settings) };
+
+  // The three cloud-consent PERMISSIONS, clamped by autosavable() below.
+  const CONSENT_FIELDS = ['cloudSttOptIn', 'cloudLlmOptIn', 'juryCloudOptIn'] as const;
+
+  // What an AUTO-save may publish and persist: everything the panel holds, except that a consent
+  // GRANT stays at its last-persisted value until the user presses Save. The consent transaction
+  // (2026-08-17) promises Cancel genuinely cancels a grant — but saveQuietly fires from dozens of
+  // unrelated handlers, and the 2026-08-20 hunt measured the leak: check juryCloudOptIn, tap the
+  // model quick-select (an auto-save), press Cancel — the grant was already on disk. A WITHDRAWAL
+  // (false) always goes through immediately: `local && persisted` can only ever clamp toward OFF.
+  function autosavable(): AppSettings {
+    const clamped = { ...localSettings };
+    for (const field of CONSENT_FIELDS) clamped[field] = localSettings[field] && lastPersisted[field];
+    return clamped;
+  }
+
   function saveQuietly(): Promise<void> {
     return enqueuePersist(async () => {
       coerceSettingsForRuntime();
+      const payload = autosavable();
       if (!tauriAvailable) {
-        settings.set(publishable());
+        settings.set(payload);
         return;
       }
-      const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
-      settings.set(publishable());
+      const prev = { ...lastPersisted };
+      settings.set({ ...payload });
       try {
-        await api.updateSettings(localSettings);
+        await api.updateSettings(payload);
+        lastPersisted = { ...payload };
       } catch (e) {
         console.error('Auto-save settings failed:', e);
         if (persistPending > 1) return; // superseded — the queued save re-asserts current intent (see enqueuePersist)
@@ -374,7 +398,7 @@
       // Through the SAME queue as saveQuietly: a Save pressed while an auto-save is in flight must
       // not interleave with it (see enqueuePersist — a stale rollback past a newer write is the race).
       await enqueuePersist(async () => {
-        const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
+        const prev = { ...lastPersisted }; // the true last-persisted state, never an optimistic store value
         try {
           applySourceReferenceModelsInput();
           coerceSettingsForRuntime();
@@ -388,6 +412,7 @@
           // the user presses Save would otherwise be dropped without a word. See flushPendingKeys.
           await flushPendingKeys();
           await api.updateSettings(localSettings);
+          lastPersisted = { ...localSettings }; // Save is the one path that persists consent GRANTS
           notifications.success($t('settingsSaved'));
           showSettings.set(false);
         } catch (e) {
