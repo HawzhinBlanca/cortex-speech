@@ -10803,3 +10803,58 @@ lockout; and the 20-decision enforcement canary has been measuring a system most
 not log into.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-21 (review) — the desktop fix was half a fix, and the Inbox was 89% guests
+
+An xhigh-recall review of the branch found 11 defects. The first one undid the previous entry's
+claim: `ReviewInbox` serves the ESCALATION queue — it plays clips, mints playback receipts and
+records accept/edit/reject — and applied no focus at all. Narrowing the review page had left the
+owner's actual complaint reachable one tab over.
+
+```
+escalated & awaiting a human : 11331
+  inside the voice focus     :  1293
+  OUTSIDE it (guests etc.)   : 10038   <- 89% of what the Inbox served
+```
+
+Ten of eleven fixed, one deliberately skipped. The ones worth naming:
+
+  * the Inbox obeys the focus, and `voice_focus::resolve` is now THE entry point — one three-arm
+    policy, one refusal wording. Re-deriving it per call site is exactly how the desktop missed it,
+    and how the Inbox then missed it again;
+  * a narrowed queue can no longer claim the library is finished. `allReviewed` excluded only the
+    SEARCH subset, so draining 1,318 focused clips announced all 15,262 as reviewed. The banner and
+    empty state now say which subset, in both locales, with no speaker name in tracked strings;
+  * `durable_pairing_codes()`: the empty-map guard existed at one save site and not at the newer
+    per-claim one, where it would have written a linkless session file over a good one;
+  * `supervise_workers` re-checks the stopping event AFTER its backoff — a SIGTERM landing mid-wait
+    used to fork a replica nothing would ever signal, orphaning ~19 GB of VRAM and the listen port;
+  * the ffmpeg seek starts early and trims exactly. MEASURED on a 320 kbps MP3 master at 42 min: a
+    bare seek left the first 10 ms as wrong as the signal was loud (0.0 dB) and 10-50 ms at -5.4 dB
+    — the word ONSET — while everything past 50 ms was bit-identical. With the pad the onset
+    measures -381 dB against the exact whole-file slice;
+  * the stale-installer check compares against the newest SOURCE instead of a 15-minute tolerance
+    that was wider than a full build (CLAUDE.md: never weaken a gate).
+
+SKIPPED, with the reasoning recorded on `resolve()`: caching the focus file. A 2 s TTL was built and
+reverted — it kept serving clips through a file that had just become broken, which the existing
+fail-closed test caught at once. Fail-closed means "on the next fetch", and this policy exists
+because pointing paid reviewers at the wrong audio costs money per minute.
+
+And the monitoring gap that hid the nine-day lockout is closed. `check_reviewer_links_live.py`
+DPAPI-decrypts each reviewer's real pairing token, claims a session with it, and fetches their real
+queue — the thing `check_supervision_live.py` never did, which is why it read OK throughout.
+
+```
+REVIEWER LINKS (live, deployed build, real credentials)
+  3 reviewers IN with 29 clips served / 1293 pending
+  5 reviewers IN but 0 clips  (the Hawleri focus against a sorani-only roster)
+  0 links refused
+suite    : cargo 1315/1315 | clippy clean | vitest 283 | svelte-check 0 | 88/88 policy scripts
+deployed : exe at HEAD 245a472, supervision OK, freshness OK
+```
+
+Owner-facing, unchanged by any of this: each device still needs its original link ONCE more (cookies
+that were never saved cannot be resurrected), and five paid links stay idle while the focus holds.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
