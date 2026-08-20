@@ -560,22 +560,79 @@ def encode_reply(reply: dict) -> bytes:
     return payload
 
 
+# Auto-discovered devices must have at least this much VRAM free, or they are not taken. The 7B
+# replica needs ~19 GiB resident; grabbing a card that training already owns OOMs the training run
+# and then the replica. An EXPLICIT CORTEX_7B_DEVICES list is the owner's word and skips the check.
+MIN_FREE_VRAM_MIB = int(os.environ.get("CORTEX_7B_MIN_FREE_VRAM_MIB", "20000"))
+
+
+def free_vram_mib() -> dict:
+    """GPU index -> free VRAM in MiB, via nvidia-smi (the parent must stay CUDA-free)."""
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"nvidia-smi --query-gpu exited {out.returncode}")
+    result = {}
+    for line in out.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit():
+            result[int(parts[0])] = int(float(parts[1]))
+    return result
+
+
 def parse_device_indices() -> list:
     """GPU indices to serve on — WITHOUT touching CUDA. The parent must stay CUDA-free: a forked
     child cannot safely inherit an initialized CUDA context, so device discovery goes through
-    nvidia-smi and each child initializes CUDA itself after pinning CUDA_VISIBLE_DEVICES."""
+    nvidia-smi and each child initializes CUDA itself after pinning CUDA_VISIBLE_DEVICES.
+
+    FAIL LOUD, NEVER SIDEWAYS (2026-08-20 external review). Two silent hazards lived here:
+      * discovery failure returned [] — which the caller reads as "CPU mode", so a broken
+        nvidia-smi launched a champion that "works" at a fraction of the speed while the owner
+        believes the GPUs are serving. CPU is now a mode you must ask for by name.
+      * auto-discovery took EVERY card unconditionally — including one a training run already
+        owns, OOMing both sides. Auto mode now takes only cards with MIN_FREE_VRAM_MIB free and
+        refuses to start if none qualifies. An explicit CORTEX_7B_DEVICES list is the owner's
+        word and is honoured verbatim, checks and all skipped.
+    """
     spec = os.environ.get("CORTEX_7B_DEVICES", "").strip()
     if spec.lower() == "cpu":
         return []
     if spec:
         return [int(i) for i in spec.split(",") if i.strip() != ""]
     try:
-        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
-        if out.returncode == 0:
-            return list(range(len([l for l in out.stdout.splitlines() if l.startswith("GPU ")])))
-    except Exception:
-        pass
-    return []
+        free = free_vram_mib()
+    except Exception as exc:
+        raise SystemExit(
+            f"7B server: GPU discovery failed ({exc}). Fix nvidia-smi, set CORTEX_7B_DEVICES "
+            f"explicitly, or set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
+        ) from exc
+    if not free:
+        raise SystemExit(
+            "7B server: nvidia-smi reports no GPUs. Set CORTEX_7B_DEVICES=cpu to run on CPU deliberately."
+        )
+    # Attribution note (measured on this rig 2026-08-20): nvidia-smi run INSIDE WSL does see
+    # WSL-side VRAM (two loaded replicas read 6435 MiB free per card), so the floor catches both a
+    # host-side training run and an orphaned WSL replica. Windows-side nvidia-smi is the blind one
+    # (2026-08-16 pin) — this check runs inside WSL, where the numbers are honest.
+    eligible = sorted(i for i, mib in free.items() if mib >= MIN_FREE_VRAM_MIB)
+    busy = sorted(i for i, mib in free.items() if mib < MIN_FREE_VRAM_MIB)
+    if busy:
+        print(
+            f"devices: skipping GPU(s) {busy} — less than {MIN_FREE_VRAM_MIB} MiB free "
+            f"(another workload owns them); set CORTEX_7B_DEVICES to override",
+            flush=True,
+        )
+    if not eligible:
+        raise SystemExit(
+            f"7B server: no GPU has {MIN_FREE_VRAM_MIB} MiB free "
+            f"(free now: { {i: f'{m} MiB' for i, m in sorted(free.items())} }). Another workload owns the cards. "
+            f"Set CORTEX_7B_DEVICES to claim specific GPUs anyway, or CORTEX_7B_DEVICES=cpu for CPU."
+        )
+    return eligible
 
 
 def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None:
@@ -669,42 +726,44 @@ def worker(srv: socket.socket, tag: str, deployment: VerifiedDeployment) -> None
     )
     print(f"[{tag}] Pipeline ready.", flush=True)
 
-    def load_any(audio_path: str):
-        """torchaudio first; ffmpeg for anything its backend cannot open.
+    def load_any(audio_path: str, start_ms=None, end_ms=None):
+        """Decode ONLY the requested interval (2026-08-20 external review), ffmpeg-seek first.
 
-        MEASURED 2026-08-10: a 25-clip podcast source in an .mp4 container failed EVERY 7B request with
-        "Error opening ...: Format not recognised" — libsndfile, torchaudio's soundfile backend, handles
-        no MPEG-4/AAC. The app's own import path decodes it fine, so those clips imported, chunked and
-        transcribed locally, and then silently could not be re-transcribed by the champion: the review
-        queue ended up 462 clips at 7B quality and 25 at the weaker engine, with nothing saying so.
+        The previous shape decoded the WHOLE source and sliced in memory — for a 9 s clip cut from a
+        77-minute episode that is ~500x the work per request, every request, and it scaled with the
+        SOURCE length instead of the clip length. `ffmpeg -ss <start> -t <dur>` seeks in the
+        container and decodes just the window. A request with no range still decodes fully (a whole
+        short clip is the legitimate case).
 
-        A container the rest of the app accepts must not be a container the champion refuses. ffmpeg is
-        already a hard dependency of the import path, so this adds no new one.
+        ffmpeg-first here, torchaudio as the rangeless fallback: MEASURED 2026-08-10, torchaudio's
+        libsndfile backend refuses MPEG-4/AAC containers the rest of the app accepts (25 clips
+        silently stuck at a weaker engine). ffmpeg is already a hard dependency of the import path.
         """
-        try:
-            return torchaudio.load(audio_path)
-        except Exception as exc:  # noqa: BLE001 - any backend failure is a decode failure here
-            print(f"[{tag}] torchaudio could not open {audio_path} ({exc}); decoding via ffmpeg", flush=True)
-            proc = subprocess.run(
-                ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", audio_path,
-                 "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "16000", "-"],
-                capture_output=True,
-                timeout=FFMPEG_TIMEOUT_SECONDS,
-            )
-            if proc.returncode != 0 or not proc.stdout:
-                # FAIL, never a silent empty clip: an empty tensor would transcribe to "" and the
-                # caller treats "" as a transient server-under-load result.
-                raise RuntimeError(
-                    f"ffmpeg could not decode {audio_path}: "
-                    f"{(proc.stderr or b'').decode('utf-8', 'replace').strip()[:200]}"
-                ) from exc
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+        if start_ms is not None and end_ms is not None and end_ms > start_ms:
+            cmd += ["-ss", f"{start_ms / 1000.0:.3f}", "-t", f"{(end_ms - start_ms) / 1000.0:.3f}"]
+        cmd += ["-i", audio_path, "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "16000", "-"]
+        proc = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+        if proc.returncode == 0 and proc.stdout:
             samples = torch.frombuffer(bytearray(proc.stdout), dtype=torch.float32)
-            return samples.unsqueeze(0), 16000
+            return samples.unsqueeze(0), 16000, True  # already 16k mono, already clipped
+        if start_ms is None and end_ms is None:
+            try:
+                wav, sr = torchaudio.load(audio_path)
+                return wav, sr, False
+            except Exception:  # noqa: BLE001 - fall through to the honest ffmpeg error below
+                pass
+        # FAIL, never a silent empty clip: an empty tensor would transcribe to "" and the
+        # caller treats "" as a transient server-under-load result.
+        raise RuntimeError(
+            f"ffmpeg could not decode {audio_path}: "
+            f"{(proc.stderr or b'').decode('utf-8', 'replace').strip()[:200]}"
+        )
 
     def transcribe(audio_path: str, start_ms=None, end_ms=None) -> str:
-        """Resample to 16 kHz mono (OmniASR requirement), optionally clip [start_ms,end_ms), transcribe."""
-        wav, sr = load_any(audio_path)  # (channels, samples)
-        if start_ms is not None and end_ms is not None and end_ms > start_ms:
+        """Resample to 16 kHz mono (OmniASR requirement), decode only [start_ms,end_ms), transcribe."""
+        wav, sr, clipped = load_any(audio_path, start_ms, end_ms)  # (channels, samples)
+        if not clipped and start_ms is not None and end_ms is not None and end_ms > start_ms:
             a = max(0, int(start_ms / 1000.0 * sr))
             b = min(wav.size(1), int(end_ms / 1000.0 * sr))
             wav = wav[:, a:b]
@@ -848,17 +907,23 @@ def main(argv=None) -> int:
         return 0
 
     print(f"Devices: GPUs {indices} — pre-forking one worker process per GPU", flush=True)
-    children = []
-    for i in indices:
+
+    def spawn_worker(i):
         pid = os.fork()
         if pid == 0:
             # Child: pin the card BEFORE any CUDA init, then never return.
             os.environ["CUDA_VISIBLE_DEVICES"] = str(i)
             worker(srv, f"gpu{i}", deployment)
             os._exit(0)
-        children.append(pid)
-    srv.close()  # only the workers accept
-    print(f"parent: {len(children)} workers forked (pids {children}); serving once all load.", flush=True)
+        return pid
+
+    fleet = {}
+    for i in indices:
+        fleet[spawn_worker(i)] = i
+    # The parent deliberately KEEPS the listen socket open (2026-08-20): a respawned worker inherits
+    # it at fork time, so closing it here would cap the fleet at its first generation. The parent
+    # never accept()s, so holding the fd costs nothing.
+    print(f"parent: {len(fleet)} workers forked (pids {sorted(fleet)}); serving once all load.", flush=True)
 
     # Forward termination to the fleet: without this, killing the parent (pkill / a restart script)
     # ORPHANS the GPU replicas — they keep the listen port and ~19 GB VRAM per card, and the
@@ -866,9 +931,12 @@ def main(argv=None) -> int:
     # SIGTERM every child, then let the normal supervise loop below reap them and exit.
     import signal
 
+    stopping = threading.Event()
+
     def _forward_termination(signum, _frame):
-        print(f"parent: signal {signum} — terminating {len(children)} worker(s)", flush=True)
-        for pid in children:
+        stopping.set()  # no respawns after a deliberate shutdown
+        print(f"parent: signal {signum} — terminating {len(fleet)} worker(s)", flush=True)
+        for pid in list(fleet):
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -877,28 +945,59 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, _forward_termination)
     signal.signal(signal.SIGINT, _forward_termination)
 
-    supervise_workers(set(children), len(children))
+    supervise_workers(fleet, len(fleet), respawn=spawn_worker, stopping=stopping)
     return 1
 
 
-def supervise_workers(live, total, reap=None, exit_fn=None):
-    """Reap workers as they exit, degrading gracefully. SCALE RESILIENCE: a single worker death (a
-    rare OOM / CUDA hiccup over a long session) must NOT take the whole server down — that turns a
-    transient blip into a ~10-min full reload. The surviving workers keep accept()ing on the shared
-    listen socket, so remaining replicas serve on (at reduced throughput); the parent logs LOUDLY so
-    the reduced capacity is never silent (the earlier build deliberately died here to avoid a silent
-    half-capacity server — loud logging keeps that honesty while staying ALIVE). Only exit once EVERY
-    worker is gone. `live` is the set of child pids; `total` the original count. `reap`/`exit_fn` are
-    injectable so the loop is unit-testable without real fork()/os.wait() (Linux-only)."""
+def supervise_workers(live, total, reap=None, exit_fn=None, respawn=None, stopping=None, respawn_budget=3, backoff=None):
+    """Reap workers as they exit — and RESPAWN them, bounded (2026-08-20 external review).
+
+    The previous contract degraded gracefully but permanently: one OOM/CUDA hiccup cost a replica
+    for the whole session, "restart when convenient" being the only cure. Now a dead worker is
+    respawned on its own device after a short backoff, at most `respawn_budget` times per device —
+    so a transient blip heals itself while a crash-looping card stops burning forks and degrades
+    loudly instead. `os.wait` returns the moment any child dies, so a worker that fails DURING
+    warm-up is respawned immediately rather than the failure hiding behind the load window.
+
+    `live` is a dict pid -> device index, MUTATED IN PLACE so the parent's signal handler always
+    terminates the current generation (a set is accepted for legacy callers: no device info, so no
+    respawns). `stopping` suppresses respawns after a deliberate shutdown. `reap`/`exit_fn`/
+    `respawn`/`backoff` are injectable so the loop is unit-testable without real fork()/os.wait()
+    (Linux-only). Exits only once every worker is gone and no respawn is owed."""
     reap = reap or os.wait
     exit_fn = exit_fn or sys.exit
+    backoff = backoff or time.sleep
+    if not isinstance(live, dict):
+        live = {pid: None for pid in live}
+    respawns_used = {}
     while live:
         pid, status = reap()
-        live.discard(pid)
+        if pid not in live:
+            continue
+        index = live.pop(pid)
+        shutting_down = stopping is not None and stopping.is_set()
+        used = respawns_used.get(index, 0)
+        if respawn is not None and index is not None and not shutting_down and used < respawn_budget:
+            respawns_used[index] = used + 1
+            print(
+                f"parent: WORKER {pid} (gpu{index}) DIED (status {status}) — "
+                f"respawning ({used + 1}/{respawn_budget} for this device) after backoff.",
+                flush=True,
+            )
+            backoff(5)
+            new_pid = respawn(index)
+            live[new_pid] = index
+            continue
         if live:
             print(
                 f"parent: WORKER {pid} DIED (status {status}) — SERVING DEGRADED on {len(live)} of "
-                f"{total} replica(s). Restart the server when convenient to restore full capacity.",
+                f"{total} replica(s)"
+                + (
+                    ""
+                    if shutting_down or index is None
+                    else f" (respawn budget for gpu{index} exhausted after {used})"
+                )
+                + ". Restart the server when convenient to restore full capacity.",
                 flush=True,
             )
         else:

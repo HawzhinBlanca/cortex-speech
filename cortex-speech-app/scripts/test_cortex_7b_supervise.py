@@ -42,7 +42,60 @@ def test_single_replica_exits_on_its_death():
     assert exits == [1], f"single replica must exit on its own death; got {exits}"
 
 
+def test_a_dead_worker_is_respawned_on_its_own_device_with_a_bounded_budget():
+    """2026-08-20 external review: a dead worker used to stay dead for the whole session. Now each
+    death respawns on the SAME device until that device's budget is spent; a crash-looping card
+    stops burning forks and the fleet degrades loudly instead."""
+    deaths = iter([(101, 9), (102, 7), (201, 9), (202, 7)])
+    spawned = []
+    next_pid = [200]
+
+    def respawn(index):
+        spawned.append(index)
+        next_pid[0] += 1
+        return next_pid[0]
+
+    exits = []
+    slept = []
+    supervise_workers(
+        {101: 0, 102: 1},
+        2,
+        reap=lambda: next(deaths),
+        exit_fn=lambda c: exits.append(c),
+        respawn=respawn,
+        respawn_budget=1,
+        backoff=slept.append,
+    )
+    assert spawned == [0, 1], f"each device respawns once on its own index; got {spawned}"
+    assert slept == [5, 5], "every respawn waits out the backoff"
+    assert exits == [1], f"exit only after both budgets are spent and every worker is gone; got {exits}"
+
+
+def test_no_respawn_after_a_deliberate_shutdown():
+    """SIGTERM fan-out sets `stopping`; reaping those deaths must not fork replacements."""
+    import threading
+
+    stopping = threading.Event()
+    stopping.set()
+    deaths = iter([(101, 0), (102, 0)])
+    spawned = []
+    exits = []
+    supervise_workers(
+        {101: 0, 102: 1},
+        2,
+        reap=lambda: next(deaths),
+        exit_fn=lambda c: exits.append(c),
+        respawn=lambda i: spawned.append(i) or 999,
+        stopping=stopping,
+        backoff=lambda s: None,
+    )
+    assert spawned == [], "a shutdown must reap, never respawn"
+    assert exits == [1]
+
+
 if __name__ == "__main__":
     test_reaps_every_worker_before_exiting()
     test_single_replica_exits_on_its_death()
-    print("PASS: champion server graceful-degradation supervisor")
+    test_a_dead_worker_is_respawned_on_its_own_device_with_a_bounded_budget()
+    test_no_respawn_after_a_deliberate_shutdown()
+    print("PASS: champion server graceful-degradation supervisor (4 tests)")
