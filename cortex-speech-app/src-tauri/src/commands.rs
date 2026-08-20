@@ -1767,6 +1767,7 @@ pub fn get_segments_page(
     sort: Option<String>,
     limit: Option<usize>,
     cursor: Option<String>,
+    focused: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<SegmentsPage, String> {
     RATE_LIMITER.check("get_segments_page")?;
@@ -1787,8 +1788,25 @@ pub fn get_segments_page(
         }
     }
     let limit = limit.unwrap_or(200).clamp(1, 500);
+    // Voice focus for the DESKTOP review queue (owner report 2026-08-20: guests still played on
+    // desktop while the phones were narrowed — the focus lived only on the couch path). Same
+    // semantics as couch.rs: a MISSING file is no restriction, a file that EXISTS but cannot be
+    // honoured serves NOTHING (present-but-broken fails CLOSED), and it is re-read per fetch so an
+    // edit takes effect on the next refill. Only the review queue asks (`focused: true`); the
+    // curate/library views stay unfocused — the queue narrows, the library does not.
+    let focus: Option<std::collections::HashSet<String>> = if focused.unwrap_or(false) {
+        let dir = state.lock_data_dir().clone();
+        match dir.map(|d| crate::voice_focus::load_focus(&d)) {
+            Some(Err(e)) => return Err(format!("policy file broken, no clips served: {e}")),
+            Some(Ok(f)) => f,
+            None => None,
+        }
+    } else {
+        None
+    };
     let db = state.lock_db();
-    db.get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref()).map_err(|e| e.to_string())
+    db.get_segments_page_focused(verified, query.as_deref(), &sort, limit, cursor.as_deref(), focus.as_ref())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

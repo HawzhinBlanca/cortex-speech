@@ -491,7 +491,11 @@ fn canonical_segment_sort(sort: &str) -> &str {
     }
 }
 
-fn segment_page_scope(verified: Option<bool>, text_query: Option<&str>) -> String {
+fn segment_page_scope(
+    verified: Option<bool>,
+    text_query: Option<&str>,
+    focus: Option<&std::collections::HashSet<String>>,
+) -> String {
     let mut hash = Sha256::new();
     hash.update(match verified {
         Some(true) => b"verified:1".as_slice(),
@@ -500,6 +504,18 @@ fn segment_page_scope(verified: Option<bool>, text_query: Option<&str>) -> Strin
     });
     hash.update(b"\0query:");
     hash.update(text_query.unwrap_or_default().trim().as_bytes());
+    // The focus SET is part of the scope, not just its presence: `total` and every page boundary were
+    // computed under one allow-list, and a cursor carried across an edit to voice_focus.json would
+    // keep serving pages (and a total) from the retired list.
+    hash.update(b"\0focus:");
+    if let Some(set) = focus {
+        let mut ids: Vec<&str> = set.iter().map(String::as_str).collect();
+        ids.sort_unstable();
+        for id in ids {
+            hash.update(id.as_bytes());
+            hash.update(b"\n");
+        }
+    }
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.finalize())
 }
 
@@ -2092,9 +2108,29 @@ impl Database {
         limit: usize,
         cursor: Option<&str>,
     ) -> AppResult<SegmentsPage> {
+        self.get_segments_page_focused(verified, text_query, sort, limit, cursor, None)
+    }
+
+    /// `get_segments_page`, additionally narrowed to a voice-focus allow-list when one is active.
+    ///
+    /// Same contract as `pending_segment_ids_focused` (the phone queue's narrowing): `None` is the
+    /// full library, `Some(set)` serves only clips in it. The DESKTOP review queue reads through this
+    /// — found 2026-08-20 when the owner, reviewing on desktop with a focus active, was still served
+    /// the guests the focus existed to skip: the narrowing lived only on the couch path, and the
+    /// desktop is a serving path too. The curate/library views keep calling the unfocused wrapper on
+    /// purpose: the QUEUE narrows, the LIBRARY does not (voice_focus.rs).
+    pub fn get_segments_page_focused(
+        &self,
+        verified: Option<bool>,
+        text_query: Option<&str>,
+        sort: &str,
+        limit: usize,
+        cursor: Option<&str>,
+        focus: Option<&std::collections::HashSet<String>>,
+    ) -> AppResult<SegmentsPage> {
         let limit = limit.clamp(1, 500);
         let sort = canonical_segment_sort(sort);
-        let scope = segment_page_scope(verified, text_query);
+        let scope = segment_page_scope(verified, text_query, focus);
         let decoded_cursor = cursor.map(decode_segment_cursor).transpose()?;
         if let Some(ref cursor) = decoded_cursor {
             if cursor.sort != sort || cursor.scope != scope {
@@ -2125,6 +2161,17 @@ impl Database {
             bind_values.push(Value::Text(scoped_query));
             where_parts
                 .push(format!("id IN (SELECT id FROM segments_fts WHERE segments_fts MATCH ?{})", bind_values.len()));
+        }
+        if let Some(set) = focus {
+            // One JSON-array bind, unpacked by json_each — the allow-list joins the SQL WHERE so the
+            // COUNT, the keyset pages, and `total` all agree. Filtering rows after the query instead
+            // would report the unfocused total and shrink every page by however many guests it held.
+            let mut ids: Vec<&str> = set.iter().map(String::as_str).collect();
+            ids.sort_unstable();
+            let ids_json = serde_json::to_string(&ids)
+                .map_err(|e| AppError::Validation(format!("Could not encode voice-focus ids: {e}")))?;
+            bind_values.push(Value::Text(ids_json));
+            where_parts.push(format!("id IN (SELECT value FROM json_each(?{}))", bind_values.len()));
         }
         let total = if let Some(ref cursor) = decoded_cursor {
             cursor.total

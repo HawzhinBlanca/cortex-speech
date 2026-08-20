@@ -4141,6 +4141,49 @@ fn segment_page_cursor_is_opaque_versioned_and_scope_bound() {
 }
 
 #[test]
+fn desktop_review_page_narrows_to_the_voice_focus_but_the_library_does_not() {
+    // Owner report 2026-08-20: with a voice focus active, the phones were narrowed but the DESKTOP
+    // review queue still played guests — the focus lived only on the couch path. The review page
+    // reads through get_segments_page_focused; this pins that the allow-list governs its rows AND
+    // its total, that the unfocused wrapper still serves the whole library, and that a cursor minted
+    // under one focus set dies when the set changes (its total was computed under the old list).
+    let db = make_db();
+    db.insert_segments_batch(&[
+        make_segment("host-1", "/h1.wav"),
+        make_segment("guest-1", "/g1.wav"),
+        make_segment("host-2", "/h2.wav"),
+    ])
+    .unwrap();
+    let focus: std::collections::HashSet<String> = ["host-1", "host-2"].iter().map(|s| s.to_string()).collect();
+
+    let page = db.get_segments_page_focused(None, None, "oldest", 10, None, Some(&focus)).unwrap();
+    let mut ids: Vec<&str> = page.items.iter().map(|s| s.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["host-1", "host-2"], "a guest clip must never enter the focused queue");
+    assert_eq!(page.total, 2, "the total counts the focused queue, not the library");
+
+    let library = db.get_segments_page(None, None, "oldest", 10, None).unwrap();
+    assert_eq!(library.total, 3, "the queue narrows, the library does not");
+
+    // A cursor from a focused walk is scope-bound to that exact id set.
+    let first = db.get_segments_page_focused(None, None, "oldest", 1, None, Some(&focus)).unwrap();
+    let cursor = first.next_cursor.as_deref().expect("two focused rows leave a second page");
+    let edited: std::collections::HashSet<String> = ["host-1"].iter().map(|s| s.to_string()).collect();
+    assert!(
+        db.get_segments_page_focused(None, None, "oldest", 1, Some(cursor), Some(&edited)).is_err(),
+        "a cursor must not survive an edit to the focus set"
+    );
+    assert!(
+        db.get_segments_page(None, None, "oldest", 1, Some(cursor)).is_err(),
+        "a focused cursor must not be redeemable against the full library"
+    );
+    assert!(
+        db.get_segments_page_focused(None, None, "oldest", 1, Some(cursor), Some(&focus)).is_ok(),
+        "the same set keeps paging"
+    );
+}
+
+#[test]
 fn every_segment_sort_walks_each_row_exactly_once() {
     let db = make_db();
     for (index, id) in ["a", "b", "c", "d", "e"].into_iter().enumerate() {

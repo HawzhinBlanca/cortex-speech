@@ -136,6 +136,29 @@ def test_tracked_sources_carry_no_speaker_name() -> None:
             assert forbidden not in text, f"{path.name} names a real person or private source ({forbidden!r})"
 
 
+def test_every_review_queue_serving_path_applies_the_focus() -> None:
+    """The focus must narrow EVERY queue that serves a reviewer clips, or reviewers hear the guests
+    the file exists to skip. Found live 2026-08-20: the couch (phone) path was narrowed, the desktop
+    review page was not — the owner heard guests on desktop. One greppable anchor per layer:
+
+      * couch.rs      — the phone queue passes the focus into its pending query;
+      * db.rs         — the desktop page query joins the allow-list in SQL (json_each);
+      * commands.rs   — the desktop command fails CLOSED on a present-but-broken file, like couch;
+      * ReviewMode    — the desktop review queue actually ASKS for the focus (curate must not).
+    """
+    src = REPO_ROOT / "src-tauri" / "src"
+    anchors = [
+        (src / "couch.rs", "pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_ref())"),
+        (src / "db.rs", "id IN (SELECT value FROM json_each("),
+        (src / "commands.rs", "policy file broken, no clips served"),
+        (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte", "focused: true"),
+    ]
+    for path, needle in anchors:
+        assert needle in path.read_text(encoding="utf-8"), f"{path.name} lost its focus anchor: {needle!r}"
+    curate = (REPO_ROOT / "src" / "lib" / "stores" / "segmentStore.ts").read_text(encoding="utf-8")
+    assert "focused: true" not in curate, "the library/curate store must stay UNFOCUSED (the queue narrows, the library does not)"
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for test in tests:

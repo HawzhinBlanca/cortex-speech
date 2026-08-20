@@ -180,6 +180,8 @@ export interface GetSegmentsPageOptions {
   sort?: string;
   limit?: number;
   cursor?: string | null;
+  /** Apply the active voice-focus allow-list (review queue only — the library stays unfocused). */
+  focused?: boolean;
 }
 
 export async function getSegment(segmentId: string): Promise<SpeechSegment> {
@@ -197,6 +199,7 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
     sort: options.sort ?? 'newest',
     limit: options.limit ?? 300,
     cursor: options.cursor ?? null,
+    focused: options.focused ?? false,
   });
   // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
   // app understands" into "your library is empty" — a failure that looks exactly like success. Every

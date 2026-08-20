@@ -104,6 +104,9 @@
         sort: suspectFirst ? 'suspectFirst' : 'oldest',
         limit: 100,
         cursor,
+        // The desktop review queue obeys the voice focus like every phone queue does (owner report
+        // 2026-08-20: guests still played here while the couch was narrowed). Curate stays unfocused.
+        focused: true,
       });
       const stats = await statsPromise;
       if (generation !== reviewGeneration) return;
