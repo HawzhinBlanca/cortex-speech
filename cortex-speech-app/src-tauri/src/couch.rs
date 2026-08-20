@@ -48,7 +48,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The single global server handle (at most one couch session at a time).
 static COUCH: Mutex<Option<CouchHandle>> = Mutex::new(None);
@@ -158,7 +158,12 @@ struct CouchState {
     pairing_codes: HashMap<String, String>,
     /// Session token -> issue time. Production sessions are bounded and expire even if a client never
     /// revisits. Legacy unit fixtures omit this metadata and remain valid only inside their test state.
-    session_issued: HashMap<String, Instant>,
+    ///
+    /// WALL CLOCK, not `Instant`, since 2026-08-20: an `Instant` is meaningless across a process
+    /// restart, and these sessions now SURVIVE one (see `SavedCookieSession`). A backwards clock jump
+    /// makes `duration_since` fail, and every such site treats the failure as "not expired" — the
+    /// available direction. A clock skew must never log eight reviewers out.
+    session_issued: HashMap<String, SystemTime>,
     /// (segment id, reviewer) pairs this session actually SERVED as spot checks.
     ///
     /// A spot check must be identified by why the clip was HANDED OUT, never by its current state.
@@ -430,6 +435,37 @@ struct SavedSession {
     /// still loads (missing field = empty set).
     #[serde(default)]
     spot_checks: Vec<(String, String)>,
+    /// Live COOKIE sessions, protected at rest exactly like the pairing tokens above.
+    ///
+    /// Added 2026-08-20 after measuring why six of eight paid reviewers went silent. The pairing
+    /// tokens were durable (that is what this whole file is for), but the session credential layered
+    /// on top of them lived only in memory — so every app restart made the server forget every cookie
+    /// it had issued, while the browser went on holding a perfectly valid one for its full 24 h
+    /// `Max-Age`. The app restarted 4–9 times a DAY (48 times in the nine days measured). Each restart
+    /// answered every reviewer's next request `401`, and the page turns a settled 401 into the
+    /// terminal "link expired" — with no Retry, because an expired link is genuinely unrecoverable.
+    ///
+    /// It was not expired. The server had amnesia, and the reviewer had no way to know the difference:
+    /// the page deliberately strips `#t=` from the address bar after claiming, so whatever they
+    /// bookmarked (or installed to their home screen, whose `start_url` is `/`) carries no token to
+    /// re-claim with. One restart turned a working shortcut into a dead end, and the only way back was
+    /// to find the original chat message from days earlier.
+    ///
+    /// `serde(default)` so a session file written before this field still loads.
+    #[serde(default)]
+    sessions: Vec<SavedCookieSession>,
+}
+
+/// One remembered cookie session. Same protection as a pairing token: it is a credential.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedCookieSession {
+    /// DPAPI-protected session token — the cookie value the browser will present.
+    token: String,
+    reviewer: String,
+    /// Seconds since the epoch. Wall clock because an `Instant` cannot cross a restart, which is the
+    /// entire point of writing this down. Restoring compares it against `COUCH_SESSION_TTL`, so a
+    /// session that expired while the app was closed stays expired instead of being resurrected.
+    issued_unix: u64,
 }
 
 /// Tokens SURVIVE closing the app, and do not survive pressing Stop.
@@ -488,11 +524,48 @@ fn clear_session_revocation(data_dir: &Path) -> Result<(), String> {
 /// that merely forgets itself is recoverable by pressing Start again. `revoke` is the exception and
 /// must surface it: a revoke that lives only in memory is silently undone by the next restart, which
 /// is the opposite of what the owner just asked for.
+/// Snapshot the session state and write it OUTSIDE the lock.
+///
+/// Called wherever a cookie session is minted or renewed. Without this a session created after the
+/// last save existed only in memory — which is exactly the amnesia this whole mechanism exists to
+/// end, just with a smaller window. DPAPI + file IO must never run inside the request-path mutex, so
+/// the snapshot is taken under the lock and the write happens after it is dropped.
+///
+/// Advisory: a save that fails costs the reviewer a re-claim from their link, never their access
+/// right now. It must not turn a successful claim into an error.
+fn persist_session_state(state: &Mutex<CouchState>) {
+    let snapshot = {
+        let st = lock_state(state);
+        st.session_store.clone().map(|(dir, db_path)| {
+            (dir, db_path, st.pairing_codes.clone(), st.spot_checks.clone(), snapshot_live_sessions(&st))
+        })
+    };
+    if let Some((dir, db_path, reviewers, checks, sessions)) = snapshot {
+        if let Err(e) = save_session(&dir, &reviewers, &db_path, &checks, &sessions) {
+            tracing::warn!(
+                "Couch Review session not remembered ({e}) — a restart will ask this device to re-open its link"
+            );
+        }
+    }
+}
+
+/// The live cookie sessions, in the shape `save_session` persists.
+///
+/// One place builds this, so a new save site cannot accidentally write the pairing map into the
+/// session field or forget the issue times that make expiry meaningful.
+fn snapshot_live_sessions(st: &CouchState) -> HashMap<String, (String, SystemTime)> {
+    st.reviewers
+        .iter()
+        .filter_map(|(token, name)| st.session_issued.get(token).map(|at| (token.clone(), (name.clone(), *at))))
+        .collect()
+}
+
 fn save_session(
     data_dir: &Path,
     reviewers: &HashMap<String, String>,
     db_path: &str,
     spot_checks: &HashSet<(String, String)>,
+    sessions: &HashMap<String, (String, SystemTime)>,
 ) -> Result<(), String> {
     let protected: HashMap<String, String> = reviewers
         .iter()
@@ -512,6 +585,22 @@ fn save_session(
         // as checks — worth protecting from casual reading no more than the queue itself, and DPAPI
         // per entry would make every batch serve cost a round of CryptProtectData for no threat.
         spot_checks: spot_checks.iter().cloned().collect(),
+        // Best-effort, unlike the pairing map above: a session that cannot be protected is simply not
+        // remembered, and its reviewer re-claims from their link. The pairing map refuses to write a
+        // PARTIAL set because a missing pairing token is an unrecoverable dead link; a missing session
+        // costs one re-claim, so failing the whole save over it would trade a small loss for a total
+        // one. Sessions past the TTL are dropped here rather than written and discarded on load.
+        sessions: sessions
+            .iter()
+            .filter(|(_, (_, issued))| {
+                SystemTime::now().duration_since(*issued).unwrap_or_default() < COUCH_SESSION_TTL
+            })
+            .filter_map(|(token, (reviewer, issued))| {
+                let protected = crate::dpapi::protect(token).ok()?;
+                let issued_unix = issued.duration_since(UNIX_EPOCH).ok()?.as_secs();
+                Some(SavedCookieSession { token: protected, reviewer: reviewer.clone(), issued_unix })
+            })
+            .collect(),
     };
     let path = session_path(data_dir);
     let Ok(json) = serde_json::to_string_pretty(&saved) else {
@@ -552,8 +641,20 @@ fn clear_session(data_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// What `load_session` recovers: the token->name map and the served-but-unanswered spot checks.
-type RememberedSession = (HashMap<String, String>, HashSet<(String, String)>);
+/// What `load_session` recovers.
+///
+/// A NAMED struct, not a tuple: this grew a third member and every destructuring site would have
+/// broken silently-or-loudly at once (it has cost this repo two rounds of that already).
+#[derive(Default)]
+struct RememberedSession {
+    /// Pairing token -> reviewer name. The long-lived secret in the link the owner sends.
+    pairing: HashMap<String, String>,
+    /// Served-but-unanswered spot checks.
+    spot_checks: HashSet<(String, String)>,
+    /// Cookie session token -> (reviewer, issued). Already filtered to sessions still within
+    /// `COUCH_SESSION_TTL`: restoring is resuming, never extending.
+    sessions: HashMap<String, (String, SystemTime)>,
+}
 
 /// Read back a remembered session, or None if there is none / it is unreadable / it belongs to a
 /// different library.
@@ -581,7 +682,26 @@ fn load_session(data_dir: &Path, db_path: &str) -> Option<RememberedSession> {
         let token = crate::dpapi::unprotect(&protected).ok()?;
         out.insert(token, name);
     }
-    (!out.is_empty()).then_some((out, saved.spot_checks.into_iter().collect()))
+    // Cookie sessions are restored INDIVIDUALLY and best-effort, the mirror of how they are saved: an
+    // unreadable or expired one costs its holder a re-claim, never the whole resume. Expiry is judged
+    // against the wall clock now, so time that passed while the app was closed still counts — a
+    // restart resumes a session, it never grants it a fresh 24 hours.
+    let now = SystemTime::now();
+    let sessions: HashMap<String, (String, SystemTime)> = saved
+        .sessions
+        .into_iter()
+        .filter_map(|entry| {
+            let token = crate::dpapi::unprotect(&entry.token).ok()?;
+            let issued = UNIX_EPOCH.checked_add(Duration::from_secs(entry.issued_unix))?;
+            (now.duration_since(issued).unwrap_or_default() < COUCH_SESSION_TTL)
+                .then_some((token, (entry.reviewer, issued)))
+        })
+        .collect();
+    (!out.is_empty()).then_some(RememberedSession {
+        pairing: out,
+        spot_checks: saved.spot_checks.into_iter().collect(),
+        sessions,
+    })
 }
 
 /// The port [`start`] and [`resume`] bind: [`COUCH_PORT`], unless `CORTEX_COUCH_PORT` overrides it.
@@ -628,8 +748,8 @@ pub fn resume(db_path: String, data_dir: &Path) -> Option<CouchStatus> {
 /// revoke has to survive happens HERE, in the roster rebuilt from the remembered file, so the test
 /// must drive this exact path — and it cannot bind 8737 while the owner's own server is using it.
 fn resume_on_port(db_path: String, data_dir: &Path, port: u16) -> Option<CouchStatus> {
-    let (remembered, _) = load_session(data_dir, &db_path)?;
-    let mut names: Vec<String> = remembered.values().cloned().collect();
+    let remembered = load_session(data_dir, &db_path)?;
+    let mut names: Vec<String> = remembered.pairing.values().cloned().collect();
     names.sort();
     match start_on_port(db_path, names, port, Some(data_dir.to_path_buf())) {
         Ok(status) => {
@@ -691,12 +811,12 @@ fn start_on_port(
     // REUSED from the remembered session when the same person is still on the list, so a link the
     // owner already sent keeps working after the app is closed and reopened. A name that was not in
     // the saved session gets a fresh token, and a name that has been dropped simply stops existing.
-    let (remembered, served_checks) =
-        data_dir.as_deref().and_then(|dir| load_session(dir, &db_path)).unwrap_or_default();
+    let remembered = data_dir.as_deref().and_then(|dir| load_session(dir, &db_path)).unwrap_or_default();
+    let served_checks = remembered.spot_checks.clone();
     let tokens: HashMap<String, String> = names
         .iter()
         .map(|name| {
-            let existing = remembered.iter().find(|(_, n)| n == &name).map(|(t, _)| t.clone());
+            let existing = remembered.pairing.iter().find(|(_, n)| n == &name).map(|(t, _)| t.clone());
             let token = existing
                 .unwrap_or_else(|| format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()));
             (token, name.clone())
@@ -731,8 +851,27 @@ fn start_on_port(
     let spot_checks: HashSet<(String, String)> =
         served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
     let session_store = data_dir.as_ref().map(|dir| (dir.clone(), db_path.clone()));
-    let state =
-        Arc::new(Mutex::new(CouchState { pairing_codes: tokens, spot_checks, session_store, ..CouchState::default() }));
+    // Cookie sessions come back with the server, for names still on the roster. Without this the
+    // browser holds a valid cookie the server has never heard of, answers 401, and the page reports
+    // "link expired" for a link that is fine — the amnesia that silenced six of eight reviewers.
+    // Filtered by name so a reviewer REMOVED from the roster does not keep a working session.
+    let restored: HashMap<String, (String, SystemTime)> =
+        remembered.sessions.into_iter().filter(|(_, (name, _))| names.contains(name)).collect();
+    let reviewers: HashMap<String, String> =
+        restored.iter().map(|(token, (name, _))| (token.clone(), name.clone())).collect();
+    let session_issued: HashMap<String, SystemTime> =
+        restored.into_iter().map(|(token, (_, issued))| (token, issued)).collect();
+    if !reviewers.is_empty() {
+        tracing::info!("Couch Review restored {} live session(s) — saved shortcuts keep working", reviewers.len());
+    }
+    let state = Arc::new(Mutex::new(CouchState {
+        pairing_codes: tokens,
+        spot_checks,
+        session_store,
+        reviewers,
+        session_issued,
+        ..CouchState::default()
+    }));
     // One accept thread per reviewer. tiny_http hands a request to whichever thread is free, so a
     // reviewer downloading a clip no longer blocks another reviewer's save — with a single reviewer this
     // is exactly the previous one-thread server. Each thread owns its own WAL connection (SQLite
@@ -770,14 +909,14 @@ fn start_on_port(
     // Remember it only once the server is actually serving. Saving earlier would leave a session file
     // pointing at a start that failed, and the next launch would resume links to nothing.
     if let Some(dir) = data_dir.as_deref() {
-        let (reviewers, checks) = {
+        let (reviewers, checks, sessions) = {
             let st = lock_state(&handle.state);
-            (st.pairing_codes.clone(), st.spot_checks.clone())
+            (st.pairing_codes.clone(), st.spot_checks.clone(), snapshot_live_sessions(&st))
         };
         // Advisory here: a session that fails to persist still serves every link it just issued. A
         // prior Stop marker is cleared ONLY after the fresh token map is durably written; clearing it
         // first could revive the stale pre-Stop file if the new save then failed.
-        if save_session(dir, &reviewers, &db_path, &checks).is_ok() {
+        if save_session(dir, &reviewers, &db_path, &checks, &sessions).is_ok() {
             if let Err(e) = clear_session_revocation(dir) {
                 tracing::warn!("Couch Review is running, but this fresh session will not auto-resume: {e}");
             }
@@ -926,14 +1065,15 @@ fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
     //
     // Snapshot under the lock and write outside it, like the batch-serve path: save_session does DPAPI
     // plus file IO, which has no business inside the request-path mutex.
-    let persist =
-        st.session_store.clone().map(|(dir, db_path)| (dir, db_path, st.pairing_codes.clone(), st.spot_checks.clone()));
+    let persist = st.session_store.clone().map(|(dir, db_path)| {
+        (dir, db_path, st.pairing_codes.clone(), st.spot_checks.clone(), snapshot_live_sessions(&st))
+    });
     drop(st);
-    if let Some((dir, db_path, reviewers, checks)) = persist {
+    if let Some((dir, db_path, reviewers, checks, sessions)) = persist {
         // Access is already denied in memory at this point, so this is not a rollback — it is the
         // difference between "revoked" and "revoked until the next restart", and the owner revoking a
         // LOST PHONE has to be told which one they got.
-        save_session(&dir, &reviewers, &db_path, &checks).map_err(|e| {
+        save_session(&dir, &reviewers, &db_path, &checks, &sessions).map_err(|e| {
             format!("Access denied now, but it will come back when the app restarts — the session could not be saved ({e}). Press Stop to revoke every link for certain.")
         })?;
     }
@@ -1174,11 +1314,13 @@ fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) 
         // Same answer as every other bad credential: no hint whether the token was close.
         return (err_reply(401, "unauthorized"), None);
     };
-    let now = Instant::now();
+    let now = SystemTime::now();
     let expired: Vec<String> = guard
         .session_issued
         .iter()
-        .filter(|(_, issued)| now.duration_since(**issued) >= COUCH_SESSION_TTL)
+        // `unwrap_or_default()` = a clock that moved backwards reads as "no time passed", i.e. NOT
+        // expired. Availability is the safe direction here: a skew must never sign eight reviewers out.
+        .filter(|(_, issued)| now.duration_since(**issued).unwrap_or_default() >= COUCH_SESSION_TTL)
         .map(|(token, _)| token.clone())
         .collect();
     for token in expired {
@@ -1202,6 +1344,8 @@ fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) 
     guard.reviewers.insert(session_token.clone(), reviewer.clone());
     guard.session_issued.insert(session_token.clone(), now);
     drop(guard);
+    // Durable from the moment it is issued, not from the next unrelated save.
+    persist_session_state(state);
     (
         (
             200,
@@ -1324,19 +1468,18 @@ fn handle_request(
     // The token still RESOLVES the reviewer everywhere else: an unknown token has no identity, so
     // there is no path on which a decision can be written without a name attached. Resolved from the
     // SHARED map on every request, so a revoked token stops working immediately.
-    let authenticated = token_from_request(request).and_then(|token| {
-        let mut guard = lock_state(state);
-        if guard
-            .session_issued
-            .get(&token)
-            .is_some_and(|issued| Instant::now().duration_since(*issued) >= COUCH_SESSION_TTL)
-        {
-            guard.session_issued.remove(&token);
-            guard.reviewers.remove(&token);
-            return None;
-        }
-        guard.reviewers.get(&token).cloned().map(|name| (token, name))
-    });
+    let authenticated =
+        token_from_request(request).and_then(|token| {
+            let mut guard = lock_state(state);
+            if guard.session_issued.get(&token).is_some_and(|issued| {
+                SystemTime::now().duration_since(*issued).unwrap_or_default() >= COUCH_SESSION_TTL
+            }) {
+                guard.session_issued.remove(&token);
+                guard.reviewers.remove(&token);
+                return None;
+            }
+            guard.reviewers.get(&token).cloned().map(|name| (token, name))
+        });
 
     if let (tiny_http::Method::Get, "/") = (&method, path.as_str()) {
         let shell = include_str!("../assets/couch.html").as_bytes().to_vec();
@@ -1346,8 +1489,11 @@ fn handle_request(
             // the session lives. (A fixed Max-Age from first claim would expire mid-engagement.)
             Some((token, _)) => {
                 if let Some(issued) = lock_state(state).session_issued.get_mut(&token) {
-                    *issued = Instant::now();
+                    *issued = SystemTime::now();
                 }
+                // The slid time has to reach the file, or a restart restores the ORIGINAL issue time
+                // and an actively-used session still dies at 24 h from its first claim.
+                persist_session_state(state);
                 page_reply_with_cookie(&token, shell)
             }
             // Unauthenticated: the bare shell, NO cookie. This is what a preview bot receives.
@@ -1380,6 +1526,13 @@ fn handle_request(
     }
 
     let Some((token, reviewer)) = authenticated else {
+        // LOUD, because a refused reviewer is otherwise invisible. Six of eight paid reviewers went
+        // silent over nine days and the log held not one line about it: nothing recorded a refusal,
+        // so "their link is dead" and "they stopped working" looked identical from here. The path is
+        // safe to print; the credential never is, and is not printed.
+        tracing::warn!(
+            "Couch Review refused an unauthenticated request for {path} — a reviewer whose session the server no longer knows sees \"link expired\" and cannot re-enter without their original link"
+        );
         return (err_reply(401, "unauthorized"), None);
     };
     let _ = token;
@@ -1644,13 +1797,17 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                     } else {
                         guard.pairing_codes.clone()
                     };
-                    guard.session_store.clone().map(|s| (s, persisted_pairing_codes, guard.spot_checks.clone()))
+                    let sessions = snapshot_live_sessions(&guard);
+                    guard
+                        .session_store
+                        .clone()
+                        .map(|s| (s, persisted_pairing_codes, guard.spot_checks.clone(), sessions))
                 } else {
                     None
                 };
                 drop(guard);
-                if let Some(((dir, db_path), reviewers, checks)) = persist {
-                    let _ = save_session(&dir, &reviewers, &db_path, &checks);
+                if let Some(((dir, db_path), reviewers, checks, sessions)) = persist {
+                    let _ = save_session(&dir, &reviewers, &db_path, &checks, &sessions);
                 }
             }
             // A spot check is a quality measure, never a reason to stop a reviewer working.
@@ -3485,7 +3642,7 @@ mod tests {
                     reviewers.insert(format!("token-{n}-{k}-{}", "x".repeat(n * 8)), format!("Reviewer{n}{k}"));
                 }
                 for _ in 0..10 {
-                    let _ = save_session(&dir, &reviewers, &db_path, &HashSet::new());
+                    let _ = save_session(&dir, &reviewers, &db_path, &HashSet::new(), &HashMap::new());
                 }
             }));
         }
@@ -4775,11 +4932,11 @@ mod tests {
         // reviewers map is saved alongside; simulate what start_on_port persists at startup too.)
 
         // THE RESTART: a brand-new state built the way start_on_port builds it — from the file.
-        let (remembered, rehydrated) = load_session(&data_dir, &db_path).expect("session file readable");
-        assert_eq!(remembered.get("tok-sara").map(String::as_str), Some("Sara"), "the token survived");
+        let remembered = load_session(&data_dir, &db_path).expect("session file readable");
+        assert_eq!(remembered.pairing.get("tok-sara").map(String::as_str), Some("Sara"), "the token survived");
         let state2 = Arc::new(Mutex::new(CouchState {
-            reviewers: remembered,
-            spot_checks: rehydrated,
+            reviewers: remembered.pairing,
+            spot_checks: remembered.spot_checks,
             session_store: Some((data_dir, db_path)),
             ..CouchState::default()
         }));
@@ -4863,12 +5020,58 @@ mod tests {
     }
 
     #[test]
+    fn a_cookie_session_survives_the_restart_that_used_to_forget_it() {
+        // MEASURED 2026-08-20, and it silenced six of eight paid reviewers. The pairing tokens were
+        // durable, but the COOKIE the page actually authenticates with lived only in memory, so every
+        // app restart — 4 to 9 a day, 48 in the nine days measured — made the server forget every
+        // session it had issued. The browser went on presenting a cookie valid for its full 24 h
+        // Max-Age, got 401, and the page showed the terminal "link expired". Nothing had expired.
+        //
+        // The reviewer could not recover: the page strips `#t=` from the address bar after claiming,
+        // so a bookmark (or the installed PWA, whose start_url is "/") carries no token to re-claim
+        // with. One restart turned a working shortcut into a dead end.
+        //
+        // Fails without the fix: `sessions` is empty on reload, so the cookie authenticates nobody.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db_path = data_dir.join("library.db").to_string_lossy().to_string();
+        let pairing = HashMap::from([("pair-secret".to_string(), "Alle".to_string())]);
+        let issued = SystemTime::now();
+        let sessions = HashMap::from([("cookie-abc".to_string(), ("Alle".to_string(), issued))]);
+        save_session(data_dir, &pairing, &db_path, &HashSet::new(), &sessions).unwrap();
+
+        let back = load_session(data_dir, &db_path).expect("session file readable");
+        assert_eq!(
+            back.sessions.get("cookie-abc").map(|(name, _)| name.as_str()),
+            Some("Alle"),
+            "the cookie the browser still holds must still name its reviewer after a restart"
+        );
+        assert_eq!(back.pairing.get("pair-secret").map(String::as_str), Some("Alle"), "and the link too");
+
+        // A session already past its TTL stays dead: restoring resumes, it never extends.
+        let stale = SystemTime::now() - COUCH_SESSION_TTL - Duration::from_secs(60);
+        let expired = HashMap::from([("cookie-old".to_string(), ("Alle".to_string(), stale))]);
+        save_session(data_dir, &pairing, &db_path, &HashSet::new(), &expired).unwrap();
+        let back = load_session(data_dir, &db_path).expect("session file readable");
+        assert!(back.sessions.is_empty(), "an expired session must not be resurrected by a restart");
+
+        // A reviewer dropped from the roster loses their session even if the file still holds it —
+        // mirrors the name filter start_on_port applies when it rehydrates.
+        let names = ["Rubar".to_string()];
+        save_session(data_dir, &pairing, &db_path, &HashSet::new(), &sessions).unwrap();
+        let back = load_session(data_dir, &db_path).expect("session file readable");
+        let kept: HashMap<String, (String, SystemTime)> =
+            back.sessions.into_iter().filter(|(_, (name, _))| names.contains(name)).collect();
+        assert!(kept.is_empty(), "a removed reviewer's session must not survive the roster change");
+    }
+
+    #[test]
     fn durable_stop_marker_blocks_a_stale_session_and_cleanup_errors_are_not_swallowed() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let db_path = data_dir.join("library.db").to_string_lossy().to_string();
         let reviewers = HashMap::from([("old-secret".to_string(), "Sara".to_string())]);
-        save_session(data_dir, &reviewers, &db_path, &HashSet::new()).unwrap();
+        save_session(data_dir, &reviewers, &db_path, &HashSet::new(), &HashMap::new()).unwrap();
         assert!(load_session(data_dir, &db_path).is_some(), "precondition: stale credentials can resume");
 
         write_session_revocation(data_dir).unwrap();
