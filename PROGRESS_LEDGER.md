@@ -10763,3 +10763,43 @@ not a bug. The second canary reviewer must be Rubar or Pavel. Owner decision sur
 links are idle for as long as the focus holds.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-20 (couch sessions) — six of eight reviewers were locked out by the server's amnesia
+
+Asked why one reviewer's link "doesn't work", and the answer was not the one I gave first. My initial
+read — dialect roster x voice focus = 0 clips, therefore a people problem — was HALF the story and
+the wrong half. Measured properly, six of eight paid reviewers had stopped at staggered dates
+(Sewa/Lamo 08-13, Roza/Sabat 08-15, Pavel 08-16, Alle 08-17) and the cause was a defect.
+
+The pairing tokens were durable. The COOKIE the page authenticates with was not: `CouchState` was
+rebuilt with `..CouchState::default()` on every start, so the server forgot every session it had
+issued while the browser went on presenting one valid for its full 24 h `Max-Age`. The app restarts
+4-9 times a DAY on this machine (48 in the nine days measured) — every restart a mass logout. And the
+reviewer could not recover: the page strips `#t=` from the address bar after claiming, so a bookmark
+or the installed PWA (`start_url` "/") carries no token to re-claim with. Settled 401 renders as the
+terminal "link expired", no Retry. Nothing expired; the server had amnesia. Nothing logged it either,
+so "their link is dead" and "they stopped working" were indistinguishable from the owner's side.
+
+```
+LIVE, same machine, same cookie, at the serving path:
+  before (unfixed 65deefa) : /api/queue 200 -> restart -> 401   session FORGOTTEN
+  after  (fixed   0224dad) : /api/queue 200 -> restart -> 200   session SURVIVED
+  live log : "Couch Review restored 1 live session(s) — saved shortcuts keep working"
+fail-before: reverting the restore reds the new test; source restored byte-identical (0813a620be3a7681)
+suite     : cargo 1311/1311 | clippy clean | vitest 283 | 88/88 policy scripts
+deployed  : exe at HEAD 0224dad, supervision OK (8 links answering), watchdog re-enabled
+```
+
+Fix: sessions are DPAPI-protected at rest beside the pairing tokens, restored on resume, filtered by
+roster name AND by TTL (restoring resumes, never extends); `session_issued` is wall-clock because an
+`Instant` cannot cross the restart it is saved for; `persist_session_state()` runs on claim and on the
+sliding page-load renewal; the pairing/session separation is untouched. Refused requests now LOG.
+
+Owner-facing: the reviewers' OLD cookies were never saved and cannot be resurrected — each device
+needs its original `#t=` link once more, and after that restarts stop mattering. Two gaps this
+exposed, now known: `check_supervision_live.py` proves only that the PORT answers and that the file
+lists N reviewers — it never presents a credential, so it read OK through nine days of total
+lockout; and the 20-decision enforcement canary has been measuring a system most reviewers could
+not log into.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
