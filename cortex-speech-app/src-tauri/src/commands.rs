@@ -1413,7 +1413,14 @@ pub fn batch_transcribe(
             if let Some(seg) = seg {
                 // Capture full snapshot BEFORE transcription for complete undo.
                 let pre_transcription_snapshot = seg.clone();
-                match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
+                // The batch's cancel token rides into the 7B call (2026-08-20 external review: it
+                // passed None, so Cancel could not reach an in-flight or gate-queued champion call).
+                match pipeline.transcribe(
+                    Some(id),
+                    &seg.audio_path,
+                    seg.alignment_json.as_deref(),
+                    Some(cancel.as_atomic()),
+                ) {
                     Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty() => {
                         // A blank draft is NOT a transcript. update_batch_transcription_if_unreviewed would
                         // overwrite an existing good (unreviewed) transcript with "" — e.g. a jury_accept 7B
@@ -1424,6 +1431,21 @@ pub fn batch_transcribe(
                             "Batch transcribe skipped {id}: empty transcript (silent clip) — existing transcript kept"
                         );
                         skipped_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(draft) if draft.committed_by_pipeline => {
+                        // ONE commit owner (2026-08-20 external review): the champion branch of
+                        // `transcribe` already committed transcript + sole hypothesis + provenance
+                        // atomically (and refused if the row gained a human decision). Writing the
+                        // same result again here created a second owner whose failure reported
+                        // "failed" for a row the first commit had already changed. Account for the
+                        // work; write nothing.
+                        if let Ok(mut previous_segments) = previous_segments_shared.lock() {
+                            previous_segments.push(pre_transcription_snapshot);
+                        }
+                        if let Ok(mut transcribed_ids) = transcribed_ids_shared.lock() {
+                            transcribed_ids.push(id.clone());
+                        }
+                        succeeded_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     Ok(draft) => {
                         let normalized = normalizer.normalize(&draft.final_text);

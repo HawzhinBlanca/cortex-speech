@@ -794,6 +794,17 @@ fn public_preflight_fails_immediately_when_default_champion_is_unconfigured() {
     assert!(error.to_string().contains(super::ASR_7B_UNAVAILABLE_TAG));
 }
 
+/// SKIP-ENV or FAIL, never a silent pass (2026-08-20 external review): the 7B leg's missing
+/// prerequisites early-returned as SUCCESS, so the "production gate" could go green on a machine
+/// where nothing about the champion was tested. Under CORTEX_REQUIRE_7B=1 (set by the verify sweep
+/// on the production machine) every skip is a hard failure.
+fn skip_7b_leg(reason: &str) {
+    if std::env::var("CORTEX_REQUIRE_7B").as_deref() == Ok("1") {
+        panic!("CORTEX_REQUIRE_7B=1 but the 7B leg cannot run: {reason}");
+    }
+    eprintln!("[7b-preflight] SKIP-ENV: {reason}");
+}
+
 #[test]
 #[ignore] // needs WSL + a running cortex_7b_server.py on 127.0.0.1:8799
 fn wsl_7b_preflight_passes_when_server_up() {
@@ -814,7 +825,7 @@ fn wsl_7b_preflight_passes_when_server_up() {
     let live = match crate::db::Database::open(&pipeline.db_path) {
         Ok(db) => db,
         Err(error) => {
-            eprintln!("[7b-preflight] cannot open test db: {error}");
+            skip_7b_leg(&format!("cannot open test db: {error}"));
             return;
         }
     };
@@ -823,20 +834,20 @@ fn wsl_7b_preflight_passes_when_server_up() {
     // Register the SAME champion the running server is serving; anything else and an exact-identity
     // preflight SHOULD fail, which is the invariant under test.
     let Some(appdata) = std::env::var_os("APPDATA") else {
-        eprintln!("[7b-preflight] no APPDATA; skipping");
+        skip_7b_leg("no APPDATA");
         return;
     };
     let pointer = std::path::Path::new(&appdata).join("cortex-speech").join("champion.json");
     let Ok(text) = std::fs::read_to_string(&pointer) else {
-        eprintln!("[7b-preflight] no live champion.json at {}; skipping", pointer.display());
+        skip_7b_leg(&format!("no live champion.json at {}", pointer.display()));
         return;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        eprintln!("[7b-preflight] champion.json is not JSON; skipping");
+        skip_7b_leg("champion.json is not JSON");
         return;
     };
     let Some(entry) = value.get("champions").and_then(|c| c.get("omniasr-7b")) else {
-        eprintln!("[7b-preflight] no omniasr-7b champion registered live; skipping");
+        skip_7b_leg("no omniasr-7b champion registered live");
         return;
     };
     let (Some(model_id), Some(sha), Some(path)) = (
@@ -844,7 +855,7 @@ fn wsl_7b_preflight_passes_when_server_up() {
         entry.get("deploymentSha256").and_then(|v| v.as_str()),
         entry.get("deploymentManifestPath").and_then(|v| v.as_str()),
     ) else {
-        eprintln!("[7b-preflight] champion entry is incomplete; skipping");
+        skip_7b_leg("champion entry is incomplete");
         return;
     };
     // Raw connection: the registry's writer is not public to tests, and this fixture only needs the
@@ -1326,7 +1337,7 @@ fn the_7b_gate_admits_exactly_its_permit_count_at_once() {
     std::thread::scope(|scope| {
         for _ in 0..8 {
             scope.spawn(|| {
-                let _permit = super::WSL_7B_GATE.acquire();
+                let _permit = super::WSL_7B_GATE.acquire(None).expect("uncancelled acquire always yields a permit");
                 let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 // Long enough that every thread overlaps if the gate lets them.
@@ -1356,4 +1367,58 @@ fn seven_b_concurrency_falls_back_to_one_for_every_unusable_value() {
     assert_eq!(super::parse_wsl_7b_concurrency(Some("9")), 1, "above the cap -> 1, never uncapped");
     assert_eq!(super::parse_wsl_7b_concurrency(Some("2")), 2);
     assert_eq!(super::parse_wsl_7b_concurrency(Some(" 4 ")), 4);
+}
+
+/// 2026-08-20 external review, blocker #4: the clip's source window is extracted WITHOUT decoding,
+/// mirroring the WSL client's rule exactly — absent = whole file, present-but-unusable = hard
+/// error (transcribing the whole source as if it were the clip stores a transcript of the wrong
+/// audio, which is worse than failing).
+#[test]
+fn wsl7b_source_range_mirrors_the_client_contract() {
+    use super::wsl7b_source_range;
+    assert_eq!(wsl7b_source_range(None).unwrap(), None, "no alignment: the file IS the clip");
+    assert_eq!(wsl7b_source_range(Some("  ")).unwrap(), None, "blank alignment is absent alignment");
+    assert_eq!(
+        wsl7b_source_range(Some(r#"{"source_start_ms": 1200, "source_end_ms": 4800, "words": []}"#)).unwrap(),
+        Some((1200, 4800))
+    );
+    assert!(wsl7b_source_range(Some(r#"{"words": []}"#)).is_err(), "a clobbered chunk must refuse, not widen");
+    assert!(wsl7b_source_range(Some("{ not json")).is_err());
+    assert!(
+        wsl7b_source_range(Some(r#"{"source_start_ms": 4800, "source_end_ms": 1200}"#)).is_err(),
+        "an inverted window would silently transcribe the whole source"
+    );
+}
+
+/// The direct transport must refuse a reachable but untrustworthy champion — byte-for-byte the WSL
+/// client's identity rules, now enforced in Rust because Rust is the caller.
+#[test]
+fn wsl7b_identity_validation_refuses_impostors() {
+    use super::wsl7b_validate_identity;
+    let sha = "a".repeat(64);
+    let good = serde_json::json!({
+        "protocol": "cortex-omniasr-adapter", "protocolVersion": 1, "family": "omniasr-7b",
+        "modelVersionId": "omniasr-7b-legacy-c348ade8a816", "deploymentSha256": sha,
+        "componentSha256": {"base": sha, "adapter": sha, "adapterConfig": sha, "tokenizer": sha},
+        "language": "ckb_Arab", "manifestSha256": sha,
+        "provenanceKind": "legacy_bootstrap", "worker": "gpu0", "transcript": "دەق"
+    });
+    let (model, dep) = wsl7b_validate_identity(&good).expect("a complete identity passes");
+    assert_eq!(model, "omniasr-7b-legacy-c348ade8a816");
+    assert_eq!(dep, sha);
+
+    for (field, value) in [
+        ("family", serde_json::json!("whisper-large")),
+        ("language", serde_json::json!("eng_Latn")),
+        ("deploymentSha256", serde_json::json!("not-a-sha")),
+        ("provenanceKind", serde_json::json!("mystery")),
+        ("protocolVersion", serde_json::json!(2)),
+    ] {
+        let mut bad = good.clone();
+        bad[field] = value;
+        assert!(wsl7b_validate_identity(&bad).is_err(), "{field} drift must be refused");
+    }
+    let mut missing_component = good.clone();
+    missing_component["componentSha256"] = serde_json::json!({"base": sha});
+    assert!(wsl7b_validate_identity(&missing_component).is_err(), "a partial component identity is no identity");
 }

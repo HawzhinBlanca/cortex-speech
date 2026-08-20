@@ -47,6 +47,12 @@ pub struct TranscriptionDraft {
     pub confidence_source: Option<String>,
     pub model_version_id: Option<String>,
     pub cloud_call: bool,
+    /// TRUE when `transcribe` itself already committed this draft to the segment row (the WSL-7B
+    /// champion branch commits transcript + sole hypothesis + provenance atomically). Callers must
+    /// then NOT write again: the 2026-08-20 external review found batch_transcribe re-writing the
+    /// same result, so a failed second write reported "failed" for a row the first commit had
+    /// already changed — two owners for one commit. One inference, one commit, one owner.
+    pub committed_by_pipeline: bool,
 }
 
 /// A primary transcript that was already computed for this exact PCM during the current operation.
@@ -303,6 +309,206 @@ pub(crate) struct Wsl7bResult {
     pub deployment_sha256: String,
 }
 
+/// The clip's source window from alignment metadata, mirroring the WSL client's rule exactly:
+/// ABSENT alignment = whole file (the file IS the clip); PRESENT but offsetless or inverted = a
+/// clobbered chunk and a hard error — transcribing the whole source as if it were the clip would
+/// store a transcript of the wrong audio.
+fn wsl7b_source_range(alignment_json: Option<&str>) -> AppResult<Option<(i64, i64)>> {
+    let Some(raw) = alignment_json.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        AppError::Validation(format!(
+            "segment alignment metadata is present but is not valid JSON ({e}) — re-import the file"
+        ))
+    })?;
+    match (
+        parsed.get("source_start_ms").and_then(serde_json::Value::as_i64),
+        parsed.get("source_end_ms").and_then(serde_json::Value::as_i64),
+    ) {
+        (Some(start), Some(end)) if end > start && start >= 0 => Ok(Some((start, end))),
+        _ => Err(AppError::Validation(
+            "segment alignment metadata has no usable source_start_ms/source_end_ms offsets (clobbered chunk) — re-import the file"
+                .into(),
+        )),
+    }
+}
+
+/// One bounded newline-terminated JSON request to the champion server over TCP — the DIRECT
+/// transport (2026-08-20 external review). The per-segment WSL client subprocess re-derived
+/// (audio_path, start, end) by snapshot-copying the LIVE DB + WAL (~108 MB on this library) into
+/// WSL and spawning a Python interpreter for EVERY clip; Rust already holds every one of those
+/// values. Same wire protocol, same BUSY backpressure retry, same bounded single-reply read, no
+/// process spawn, no DB transport. Cancel is polled every 500 ms while waiting on the socket.
+fn wsl7b_request_direct(
+    request: &serde_json::Value,
+    timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<serde_json::Value> {
+    use std::io::{Read, Write};
+    const MAX_REPLY_BYTES: usize = 1024 * 1024; // matches the server's MAX_RESPONSE_BYTES
+    let port = wsl_7b_port();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut payload = serde_json::to_vec(request).map_err(|e| AppError::Other(e.to_string()))?;
+    payload.push(b'\n');
+    let deadline = std::time::Instant::now() + timeout;
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+    loop {
+        if cancelled() {
+            return Err(AppError::Other("7B call cancelled".into()));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AppError::Other(format!(
+                "7B server stayed busy for {:.0}s on 127.0.0.1:{port}",
+                timeout.as_secs_f64()
+            )));
+        }
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&addr, remaining.min(Duration::from_secs(5))).map_err(|e| {
+                AppError::Other(format!(
+                    "7B engine not running: cannot reach the OmniASR-7B server on 127.0.0.1:{port} ({e})"
+                ))
+            })?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_write_timeout(Some(remaining.min(Duration::from_secs(10))));
+        stream
+            .write_all(&payload)
+            .map_err(|e| AppError::Other(format!("7B engine request could not be sent on 127.0.0.1:{port} ({e})")))?;
+        // Read ONE newline-terminated bounded reply, polling cancel between short read timeouts.
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            if cancelled() {
+                return Err(AppError::Other("7B call cancelled".into()));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(AppError::Other(format!(
+                    "7B server reachable but timed out after {:.0}s on 127.0.0.1:{port}",
+                    timeout.as_secs_f64()
+                )));
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > MAX_REPLY_BYTES {
+                        return Err(AppError::Other(format!("7B engine reply exceeded {MAX_REPLY_BYTES} bytes")));
+                    }
+                    if buf.contains(&b'\n') {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    continue;
+                }
+                Err(e) => return Err(AppError::Other(format!("7B engine connection failed mid-reply ({e})"))),
+            }
+        }
+        if buf.is_empty() {
+            return Err(AppError::Other(format!("7B engine returned no data from 127.0.0.1:{port}")));
+        }
+        let Some(newline) = buf.iter().position(|&b| b == b'\n') else {
+            return Err(AppError::Other("7B engine reply was not newline-terminated".into()));
+        };
+        if buf[newline + 1..].iter().any(|&b| !b.is_ascii_whitespace()) {
+            return Err(AppError::Other("7B engine sent more than one reply".into()));
+        }
+        let reply: serde_json::Value = serde_json::from_slice(&buf[..newline])
+            .map_err(|e| AppError::Other(format!("7B engine sent an unparseable reply: {e}")))?;
+        if !reply.is_object() {
+            return Err(AppError::Other("7B engine reply is not a JSON object".into()));
+        }
+        if reply.get("code").and_then(serde_json::Value::as_str) == Some("BUSY") {
+            std::thread::sleep(Duration::from_millis(50));
+            continue; // every replica mid-decode: reconnect so the kernel can pick a freed worker
+        }
+        if let Some(error) = reply.get("error") {
+            let message = error.as_str().filter(|m| !m.is_empty()).unwrap_or("unknown server error");
+            return Err(AppError::Other(format!("7B engine error: {message}")));
+        }
+        return Ok(reply);
+    }
+}
+
+/// Refuse a reachable but untrustworthy champion: byte-for-byte the WSL client's identity rules.
+fn wsl7b_validate_identity(reply: &serde_json::Value) -> AppResult<(String, String)> {
+    fn is_sha(value: Option<&serde_json::Value>) -> bool {
+        value
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    }
+    let fail = |message: &str| AppError::Other(format!("7B engine identity error: {message}"));
+    if reply.get("protocol").and_then(serde_json::Value::as_str) != Some("cortex-omniasr-adapter")
+        || reply.get("protocolVersion").and_then(serde_json::Value::as_i64) != Some(1)
+    {
+        return Err(fail("reply is not from the compatible Cortex OmniASR deployment protocol"));
+    }
+    if reply.get("family").and_then(serde_json::Value::as_str) != Some("omniasr-7b") {
+        return Err(fail("reply has an unexpected model family"));
+    }
+    let Some(model_id) =
+        reply.get("modelVersionId").and_then(serde_json::Value::as_str).filter(|m| !m.trim().is_empty())
+    else {
+        return Err(fail("reply has no modelVersionId"));
+    };
+    if !is_sha(reply.get("deploymentSha256")) {
+        return Err(fail("reply has no canonical deploymentSha256"));
+    }
+    let Some(components) = reply.get("componentSha256").and_then(serde_json::Value::as_object) else {
+        return Err(fail("reply has no complete componentSha256 identity"));
+    };
+    let expected = ["adapter", "adapterConfig", "base", "tokenizer"];
+    let mut keys: Vec<&str> = components.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    if keys != expected || expected.iter().any(|k| !is_sha(components.get(*k))) {
+        return Err(fail("reply has no complete componentSha256 identity"));
+    }
+    if reply.get("language").and_then(serde_json::Value::as_str) != Some("ckb_Arab") {
+        return Err(fail("reply has an unexpected language"));
+    }
+    if !is_sha(reply.get("manifestSha256")) {
+        return Err(fail("reply has no canonical manifestSha256"));
+    }
+    if !matches!(reply.get("provenanceKind").and_then(serde_json::Value::as_str), Some("flywheel" | "legacy_bootstrap"))
+    {
+        return Err(fail("reply has an unexpected provenanceKind"));
+    }
+    if !reply.get("worker").and_then(serde_json::Value::as_str).is_some_and(|w| !w.trim().is_empty()) {
+        return Err(fail("reply has no worker identity"));
+    }
+    let sha = reply.get("deploymentSha256").and_then(serde_json::Value::as_str).unwrap_or_default();
+    Ok((model_id.to_string(), sha.to_string()))
+}
+
+/// The champion call over the direct transport: one gate permit, one request, validated identity.
+pub(crate) fn run_wsl_segment_transcript_direct(
+    audio_path: &str,
+    alignment_json: Option<&str>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<Wsl7bResult> {
+    let Some(_gate) = WSL_7B_GATE.acquire(cancel) else {
+        return Err(AppError::Other("7B call cancelled while waiting for a server slot".into()));
+    };
+    let range = wsl7b_source_range(alignment_json)?;
+    let wsl_path = if audio_path.starts_with('/') { audio_path.to_string() } else { win_path_to_wsl(audio_path) };
+    let mut request = serde_json::json!({ "audio_path": wsl_path });
+    if let Some((start, end)) = range {
+        request["start_ms"] = start.into();
+        request["end_ms"] = end.into();
+    }
+    let timeout = Duration::from_secs_f64(
+        std::env::var("CORTEX_7B_TRANSCRIPTION_TIMEOUT_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(280.0),
+    );
+    let reply = wsl7b_request_direct(&request, timeout, cancel)?;
+    let Some(transcript) = reply.get("transcript").and_then(serde_json::Value::as_str) else {
+        return Err(AppError::Other("7B engine identity error: transcription reply has no string transcript".into()));
+    };
+    let (model_version_id, deployment_sha256) = wsl7b_validate_identity(&reply)?;
+    Ok(Wsl7bResult { raw_transcript: transcript.to_string(), confidence: None, model_version_id, deployment_sha256 })
+}
+
 fn parse_wsl_segment_result(stdout: &str) -> AppResult<Wsl7bResult> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -411,15 +617,27 @@ impl Wsl7bGate {
         Self { in_flight: std::sync::Mutex::new(0), released: std::sync::Condvar::new() }
     }
 
-    /// Blocks until a permit is free. Poison-tolerant like every other lock in this crate.
-    fn acquire(&self) -> Wsl7bPermit<'_> {
+    /// Blocks until a permit is free — or until `cancel` flips, checked every 100 ms
+    /// (2026-08-20 external review: an uncancellable condvar wait meant a Cancel pressed while a
+    /// clip was QUEUED behind the gate did nothing until the clip's turn came). `None` = the caller
+    /// gave up because it was cancelled; no permit was taken.
+    ///
+    /// Poison-tolerant like every other lock in this crate.
+    fn acquire(&self, cancel: Option<&std::sync::atomic::AtomicBool>) -> Option<Wsl7bPermit<'_>> {
         let limit = wsl_7b_concurrency();
         let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while *in_flight >= limit {
-            in_flight = self.released.wait(in_flight).unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return None;
+            }
+            let (guard, _timeout) = self
+                .released
+                .wait_timeout(in_flight, Duration::from_millis(100))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_flight = guard;
         }
         *in_flight += 1;
-        Wsl7bPermit { gate: self }
+        Some(Wsl7bPermit { gate: self })
     }
 }
 
@@ -441,6 +659,14 @@ impl Drop for Wsl7bPermit<'_> {
 /// preflight probe AND passed to the client via `CORTEX_7B_PORT`, so the app, client, and server can't
 /// drift (a mismatch would even green-light the preflight against the wrong service).
 pub(crate) const WSL_7B_SERVER_PORT: u16 = 8799; // must match cortex_7b_server.py
+
+/// THE one port every 7B consumer uses. Health/start already honored `CORTEX_7B_PORT`; transcription
+/// and the agentic preflight used the raw const, so a configured non-default port passed the health
+/// check and then transcribed against a dead socket (2026-08-20 external review). One accessor, no
+/// drift.
+pub(crate) fn wsl_7b_port() -> u16 {
+    std::env::var("CORTEX_7B_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(WSL_7B_SERVER_PORT)
+}
 /// Stable provenance id for the owner's sole production ASR. Keep selection, persisted hypotheses,
 /// review filtering, and health/readiness checks tied to one identifier so an auxiliary model can
 /// never be mistaken for the champion by string drift between subsystems.
@@ -531,8 +757,11 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> AppResult<Wsl7bResult> {
     // Hold a permit for the whole spawn+wait so no more 7B calls are in flight than the server has
-    // replicas to serve them. Released on drop, including on an early return.
-    let _gate = WSL_7B_GATE.acquire();
+    // replicas to serve them. Released on drop, including on an early return. A cancel that lands
+    // while QUEUED here returns immediately — no permit, no spawn.
+    let Some(_gate) = WSL_7B_GATE.acquire(cancel) else {
+        return Err(AppError::Other("7B call cancelled while waiting for a server slot".into()));
+    };
 
     let external_script =
         if external_script.starts_with('/') { external_script.to_string() } else { win_path_to_wsl(external_script) };
@@ -544,7 +773,7 @@ pub(crate) fn run_wsl_segment_transcript_with_script(
     // app is the single source of truth for both.
     cmd.arg("env")
         .arg(format!("CORTEX_7B_DB={}", win_path_to_wsl(db_path)))
-        .arg(format!("CORTEX_7B_PORT={WSL_7B_SERVER_PORT}"))
+        .arg(format!("CORTEX_7B_PORT={}", wsl_7b_port()))
         .arg(python)
         .arg(external_script)
         .arg("--segment-id")
@@ -1494,7 +1723,7 @@ impl ProcessingPipeline {
         }
         let _status_guard = ImportStatusGuard(self);
         let mut succeeded = 0;
-        let mut failed = 0;
+        let failed = 0; // halt-on-first-failure (2026-08-20): a COMPLETED import has zero failures by definition
         let mut imported_ids = Vec::new();
 
         for (idx, file) in files.iter().enumerate() {
@@ -1520,7 +1749,30 @@ impl ProcessingPipeline {
                 Vec::new()
             };
             let journaled = resume_completed.is_some_and(|done| done.contains(&file_path_str));
-            if resume_should_skip_file(resume_completed.is_some(), journaled, !resume_existing_ids.is_empty()) {
+            // An UN-journaled file whose rows still hold placeholders/empty drafts is an interrupted
+            // STAGE, not a completed file (2026-08-20 external review; the 2026-08-14 incident's 36
+            // rows are exactly this state). Adopting it would publish a file the champion never
+            // finished. Discard the stage and re-import it from scratch — the per-file pipeline is
+            // the unit of atomicity, and the resume journal marks only files that truly finished.
+            // An unreadable placeholder check counts as incomplete: fail toward re-doing work, never
+            // toward publishing an unfinished stage.
+            let staged_incomplete = resume_completed.is_some()
+                && !journaled
+                && !resume_existing_ids.is_empty()
+                && db.audio_path_has_placeholder_rows(&file_path_str).unwrap_or(true);
+            if staged_incomplete {
+                tracing::warn!(
+                    "resume: {} left {} staged row(s) from an interrupted import — discarding the stage and re-importing",
+                    file_path_str,
+                    resume_existing_ids.len()
+                );
+                db.delete_segments_batch(&resume_existing_ids)?;
+            }
+            if resume_should_skip_file(
+                resume_completed.is_some(),
+                journaled,
+                !resume_existing_ids.is_empty() && !staged_incomplete,
+            ) {
                 succeeded += 1;
                 if let Some(ref jid) = job_id {
                     let _ = db.mark_import_file_done(jid, &file_path_str);
@@ -1618,8 +1870,18 @@ impl ProcessingPipeline {
                     }
                 }
                 Err(e) => {
-                    failed += 1;
-                    callback(PipelineEvent::Error { file: fname, error: e.to_string() });
+                    // HALT ON THE FIRST REAL FAILURE (owner rule 2026-08-11; wired here 2026-08-20).
+                    // This arm used to count the failure and continue to the next file, ending with
+                    // `Completed { failed: n }` and Ok(()) — the exact "partly-drafted dataset that
+                    // looks finished" the champion law forbids, one directory level up from where
+                    // batch_transcribe already halts. The resume journal makes halting cheap: every
+                    // finished file is journaled, so re-running the import picks up exactly here.
+                    callback(PipelineEvent::Error { file: fname.clone(), error: e.to_string() });
+                    // _status_guard's Drop clears the running flag on this early return.
+                    return Err(AppError::Other(format!(
+                        "import HALTED at {fname} ({succeeded} file(s) completed before it): {e}. \
+                         Nothing after it was attempted — fix the cause and re-import; completed files resume as done."
+                    )));
                 }
             }
         }
@@ -2800,20 +3062,31 @@ impl ProcessingPipeline {
                 };
 
                 if let Some(reason) = problem {
-                    tracing::warn!("WSL 7B import: segment {} failed after retries: {reason}", seg.id);
-                    if let Err(e) = self.mark_wsl_primary_unavailable(db, seg, &reason) {
+                    // HALT, do not escalate-and-continue (owner rule 2026-08-11, wired 2026-08-20).
+                    // These are VAD speech chunks — silence was already filtered out — so a champion
+                    // that returns nothing for one after three retries is an anomaly, not a
+                    // classification. The old path wrote an "escalated" verdict and let the import
+                    // finish "successfully" with unresolved rows inside it: exactly the tally the
+                    // law forbids. Roll the whole file back and stop; re-import resumes cleanly.
+                    tracing::error!(
+                        "WSL 7B primary ASR unavailable before jury: segment {} failed after retries ({reason}); \
+                         rolling back {} segment(s) and HALTING the import",
+                        seg.id,
+                        import_ids.len()
+                    );
+                    if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
                         tracing::error!(
-                            "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
+                            "failed to roll back {} segment(s) after champion halt: {rollback_err}",
                             import_ids.len()
                         );
-                        if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
-                            tracing::error!(
-                                "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
-                                import_ids.len()
-                            );
-                        }
-                        return Err(e);
                     }
+                    return Err(AppError::Other(format!(
+                        "champion produced no usable draft for segment {} after retries ({reason}). \
+                         The import was HALTED and this file's {} segment(s) rolled back — nothing was stored unresolved. \
+                         Check the 7B server load and re-import.",
+                        seg.id,
+                        import_ids.len()
+                    )));
                 }
             }
 
@@ -2883,18 +3156,6 @@ impl ProcessingPipeline {
         } else {
             ChampionAttempt::Empty(last_problem)
         }
-    }
-
-    fn mark_wsl_primary_unavailable(&self, db: &Database, seg: &mut SpeechSegment, reason: &str) -> AppResult<()> {
-        let rationale = format!("WSL 7B primary ASR unavailable before jury: {reason}");
-        tracing::warn!("{} ({})", rationale, seg.id);
-        // Explicit lowest confidence (0.0), NOT None: a None here becomes COALESCE(agreement_score, 0.5)
-        // in the suspect-first queue, tying these unresolved-primary clips (empty/failed 7B, unknown
-        // quality — exactly the ones most needing attention) at the 0.5 plateau to sort by id. 0.0 sorts
-        // them to the very front.
-        db.write_segment_verdict(&seg.id, "escalated", None, Some(&rationale), None, Some(0.0), true)?;
-        self.refresh_segment_from_db(db, seg)?;
-        Ok(())
     }
 
     fn refresh_segment_from_db(&self, db: &Database, seg: &mut SpeechSegment) -> AppResult<bool> {
@@ -3051,71 +3312,13 @@ impl ProcessingPipeline {
             return Err(AppError::Validation("Empty audio file".into()));
         }
 
-        let decode_timeout = Duration::from_secs((duration_ms as f64 / 1000.0 * 2.0).clamp(30.0, 3600.0) as u64);
-        let (sample_rate, pcm) = audio::decode_to_pcm_with_timeout(path, decode_timeout)?;
-        let (sample_rate, pcm) = audio::ensure_pcm_16khz(sample_rate, pcm)?;
-        if pcm.is_empty() {
-            return Err(AppError::Audio(crate::error::AudioError::EmptyBuffer));
-        }
-
-        let (chunk_pcm, chunk_suffix) = chunking::slice_pcm_by_alignment(&pcm, sample_rate, alignment_json)?;
-
-        // Primary-engine override: when use_finetuned_asr is set, transcribe with the embedded
-        // fine-tuned MMS-CTC engine (best local Sorani quality) regardless of asr_model_size. Any
-        // failure (model absent / inference error / empty output) falls through to the configured
-        // engine below, so transcription never breaks.
-        if self.finetuned_override_active() {
-            if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
-                match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_pcm) {
-                    Ok(raw_text) if !raw_text.trim().is_empty() => {
-                        let final_text = match self.build_refiner() {
-                            Some(refiner) => match refiner.refine_text(&raw_text) {
-                                Ok(refined) => accept_refinement(&raw_text, &refined),
-                                Err(_) => raw_text.clone(),
-                            },
-                            None => raw_text.clone(),
-                        };
-                        let final_text = self.fire_loop0_if_enabled(&final_text);
-                        if let Some(id) = segment_id {
-                            if let Ok(db) = self.open_db() {
-                                let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
-                                let primary = PrimaryHypothesis {
-                                    model_id: "finetuned-mms-ckb",
-                                    transcript: &raw_text,
-                                    confidence: None,
-                                };
-                                if let Err(error) =
-                                    self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary))
-                                {
-                                    log_hypothesis_population_failure(id, &error);
-                                }
-                            }
-                        }
-                        let cloud_call = self.llm_refinement_uses_cloud();
-                        return Ok(TranscriptionDraft {
-                            raw_text,
-                            final_text,
-                            confidence: None,
-                            confidence_source: Some("fine_tuned_no_posterior".to_string()),
-                            model_version_id: Some("finetuned-mms-ckb".to_string()),
-                            cloud_call,
-                        });
-                    }
-                    Ok(_) => {
-                        tracing::warn!("fine-tuned ASR returned empty output; falling back to the configured engine")
-                    }
-                    Err(e) => {
-                        tracing::warn!("fine-tuned ASR failed ({e}); falling back to the configured engine")
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "use_finetuned_asr is set but the fine-tuned model is absent; using the configured engine"
-                );
-            }
-        }
-
-        if self.should_use_wsl_primary_asr() {
+        // CHAMPION FIRST, BEFORE ANY DECODE (2026-08-20 external review). The WSL-7B branch sends
+        // the server a path + source window and never touches PCM — yet this function fully decoded
+        // the source before selecting an engine, so every champion call on a 9 s clip cut from a
+        // 77-minute episode decoded the whole episode in Rust and threw it away. Work must scale
+        // with the CLIP, not the source. Only the fine-tuned override still needs PCM before the
+        // engine choice, and it keeps its precedence below.
+        if self.should_use_wsl_primary_asr() && !self.finetuned_override_active() {
             let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
             let audio_path_str = path.to_string_lossy().to_string();
 
@@ -3154,7 +3357,8 @@ impl ProcessingPipeline {
 
                 // Tag a 7B failure (server down / timeout / empty) so the UI can offer a champion retry
                 // — and NEVER silently fall through to a smaller model here.
-                let wsl_result = self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;
+                let wsl_result =
+                    self.run_wsl_segment_transcript(audio_path, alignment_json, cancel).map_err(tag_7b_unavailable)?;
                 let raw_transcript = wsl_result.raw_transcript.clone();
                 let confidence = wsl_result.confidence;
 
@@ -3269,12 +3473,78 @@ impl ProcessingPipeline {
                     confidence_source: Some("external_provider".to_string()),
                     model_version_id: Some(wsl_result.model_version_id),
                     cloud_call,
+                    committed_by_pipeline: true, // commit_champion_transcript_if_unreviewed above was THE write
                 });
             } else {
                 return Err(AppError::Other(
                     "Segment not found in database. Please import the audio file first to generate speech segments."
                         .into(),
                 ));
+            }
+        }
+
+        let decode_timeout = Duration::from_secs((duration_ms as f64 / 1000.0 * 2.0).clamp(30.0, 3600.0) as u64);
+        let (sample_rate, pcm) = audio::decode_to_pcm_with_timeout(path, decode_timeout)?;
+        let (sample_rate, pcm) = audio::ensure_pcm_16khz(sample_rate, pcm)?;
+        if pcm.is_empty() {
+            return Err(AppError::Audio(crate::error::AudioError::EmptyBuffer));
+        }
+
+        let (chunk_pcm, chunk_suffix) = chunking::slice_pcm_by_alignment(&pcm, sample_rate, alignment_json)?;
+
+        // Primary-engine override: when use_finetuned_asr is set, transcribe with the embedded
+        // fine-tuned MMS-CTC engine (best local Sorani quality) regardless of asr_model_size. Any
+        // failure (model absent / inference error / empty output) falls through to the configured
+        // engine below, so transcription never breaks.
+        if self.finetuned_override_active() {
+            if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
+                match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_pcm) {
+                    Ok(raw_text) if !raw_text.trim().is_empty() => {
+                        let final_text = match self.build_refiner() {
+                            Some(refiner) => match refiner.refine_text(&raw_text) {
+                                Ok(refined) => accept_refinement(&raw_text, &refined),
+                                Err(_) => raw_text.clone(),
+                            },
+                            None => raw_text.clone(),
+                        };
+                        let final_text = self.fire_loop0_if_enabled(&final_text);
+                        if let Some(id) = segment_id {
+                            if let Ok(db) = self.open_db() {
+                                let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+                                let primary = PrimaryHypothesis {
+                                    model_id: "finetuned-mms-ckb",
+                                    transcript: &raw_text,
+                                    confidence: None,
+                                };
+                                if let Err(error) =
+                                    self.populate_hypotheses_reusing_primary(&db, id, &f32_pcm, Some(primary))
+                                {
+                                    log_hypothesis_population_failure(id, &error);
+                                }
+                            }
+                        }
+                        let cloud_call = self.llm_refinement_uses_cloud();
+                        return Ok(TranscriptionDraft {
+                            raw_text,
+                            final_text,
+                            confidence: None,
+                            confidence_source: Some("fine_tuned_no_posterior".to_string()),
+                            model_version_id: Some("finetuned-mms-ckb".to_string()),
+                            cloud_call,
+                            committed_by_pipeline: false,
+                        });
+                    }
+                    Ok(_) => {
+                        tracing::warn!("fine-tuned ASR returned empty output; falling back to the configured engine")
+                    }
+                    Err(e) => {
+                        tracing::warn!("fine-tuned ASR failed ({e}); falling back to the configured engine")
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "use_finetuned_asr is set but the fine-tuned model is absent; using the configured engine"
+                );
             }
         }
 
@@ -3306,6 +3576,7 @@ impl ProcessingPipeline {
                 confidence_source: Some("cache_replay".to_string()),
                 model_version_id: Some(model_id.clone()),
                 cloud_call: self.llm_refinement_uses_cloud(),
+                committed_by_pipeline: false,
             });
         }
 
@@ -3375,6 +3646,7 @@ impl ProcessingPipeline {
             confidence_source: Some(confidence_source.as_db_value().to_string()),
             model_version_id: Some(model_id),
             cloud_call: self.llm_refinement_uses_cloud(),
+            committed_by_pipeline: false,
         })
     }
 
@@ -3697,7 +3969,10 @@ impl ProcessingPipeline {
             return Ok(());
         }
 
-        match self.run_wsl_segment_transcript(segment_id, None) {
+        let Some(seg) = db.get_segment_by_id(segment_id)? else {
+            return Ok(()); // the row vanished between selection and this auxiliary pass
+        };
+        match self.run_wsl_segment_transcript(&seg.audio_path, seg.alignment_json.as_deref(), None) {
             Ok(result) => {
                 if result.model_version_id != expected.model_version_id
                     || result.deployment_sha256 != expected.deployment_sha256
@@ -3723,15 +3998,21 @@ impl ProcessingPipeline {
 
     fn run_wsl_segment_transcript(
         &self,
-        segment_id: &str,
+        audio_path: &str,
+        alignment_json: Option<&str>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> AppResult<Wsl7bResult> {
-        let Some(external_script) = resolve_wsl_7b_client(self.settings.external_asr_script_path()) else {
+        // The resolvable client script stays the "champion is configured" signal (it gates
+        // should_use_wsl_primary_asr and the whole fail-hard contract) — but the TRANSPORT no
+        // longer spawns it (2026-08-20 external review): Rust already holds the path and the source
+        // offsets the client re-derived by snapshot-copying the live DB into WSL per clip. The
+        // script remains the manual/CLI transport (scorecards, the WSL console runner).
+        if resolve_wsl_7b_client(self.settings.external_asr_script_path()).is_none() {
             return Err(AppError::Validation(
                 "External ASR provider is not configured. Set the WSL script path in Settings before using the 7B provider.".into(),
             ));
-        };
-        run_wsl_segment_transcript_with_script(&external_script, segment_id, &self.db_path, cancel)
+        }
+        run_wsl_segment_transcript_direct(audio_path, alignment_json, cancel)
     }
 
     pub fn align(

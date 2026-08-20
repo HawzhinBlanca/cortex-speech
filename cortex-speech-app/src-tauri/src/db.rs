@@ -4506,6 +4506,24 @@ impl Database {
     ///
     /// A page reporting "I played 100ms of a 100ms clip" scores 1.0 against its own claim. The
     /// length has to come from here or the guard compares the client's claim with the client's claim.
+    /// Does this recording still carry any machine PLACEHOLDER (`[...]`-shaped) or EMPTY drafts?
+    ///
+    /// Resume uses it to tell an ADOPTABLE finished file from a crash-interrupted stage: rows are
+    /// committed before the champion pass fills them, so "rows exist" alone proved nothing — the
+    /// 2026-08-14 incident left 36 placeholder rows that every later resume would have adopted as a
+    /// completed file (found again by the 2026-08-20 external review). Same `[%]` narrowing the
+    /// review-queue exclusion uses, so the two cannot disagree about what a placeholder is.
+    pub fn audio_path_has_placeholder_rows(&self, audio_path: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM speech_segments
+             WHERE audio_path = ?1
+               AND (TRIM(COALESCE(raw_transcript, '')) LIKE '[%]' OR TRIM(COALESCE(raw_transcript, '')) = '')",
+            params![audio_path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn segment_clip_duration_ms(&self, segment_id: &str) -> AppResult<Option<i64>> {
         use rusqlite::OptionalExtension;
         Ok(self

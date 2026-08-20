@@ -1426,7 +1426,7 @@ def test_pipeline_wsl_retranscribe_rejects_an_empty_result() -> None:
     raw_transcript (return a tagged 7B-unavailable Err) BEFORE the DB write. transcribe() needs the WSL
     server + audio + DB, so it is not unit-injectable — source-pinned."""
     pipeline = pipeline_surface()
-    anchor = "self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;"
+    anchor = "self.run_wsl_segment_transcript(audio_path, alignment_json, cancel).map_err(tag_7b_unavailable)?;"
     start = pipeline.find(anchor)
     if start == -1:
         raise AssertionError("run_wsl_segment_transcript call not found — this gate would pass vacuously")

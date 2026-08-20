@@ -143,9 +143,10 @@ def main() -> None:
         "the helper must REFUSE a reply whose producing identity is not the registry champion, or a "
         "rotated-out model's draft would be stored as the champion's"
     )
-    assert "self.run_wsl_segment_transcript(segment_id" in pipeline, (
-        # Robust prefix: the call now also takes a cancel arg (None for the hypothesis pass). The
-        # invariant is that the pass uses the real external provider, not the exact argument list.
+    assert "self.run_wsl_segment_transcript(&seg.audio_path" in pipeline, (
+        # Robust prefix: the transport is now direct (path + offsets), so the call passes the row's
+        # audio path rather than a bare segment id. The invariant is unchanged — the pass uses the
+        # real external provider, not the exact argument list.
         "the explicit optional WSL hypothesis helper must use the real external provider"
     )
     assert "should_use_wsl_primary_asr" in pipeline, (
@@ -183,6 +184,25 @@ def main() -> None:
     )
     assert "WSL 7B primary ASR unavailable before jury" in pipeline, (
         "WSL 7B failures must be explicit before jury adjudication"
+    )
+    # 2026-08-20 external review — the champion pipeline's crash/consistency contract:
+    assert "import HALTED at" in pipeline, (
+        "directory import must HALT on the first real failure (owner rule 2026-08-11), never tally and continue"
+    )
+    assert "rolled back — nothing was stored unresolved" in pipeline, (
+        "an exhausted-empty champion result must roll the file back and halt, never store unresolved rows in a 'successful' import"
+    )
+    assert "audio_path_has_placeholder_rows" in pipeline, (
+        "resume must discriminate an interrupted stage (placeholder rows) from a completed file — rows-exist is not done"
+    )
+    assert pipeline.count("committed_by_pipeline: true") == 1, (
+        "exactly ONE transcribe path commits its own draft (the champion branch); a second committing path is a second owner"
+    )
+    assert "Ok(draft) if draft.committed_by_pipeline =>" in commands, (
+        "batch_transcribe must not re-write a draft the pipeline already committed (one inference, one commit, one owner)"
+    )
+    assert "run_wsl_segment_transcript_direct" in pipeline, (
+        "the champion transport is the direct Rust->server protocol, not a per-segment WSL subprocess with a DB copy"
     )
     assert "hypothesis_coverage_guard" in commands, (
         "jury must fail closed when fewer than two chunk-level model hypotheses are available"

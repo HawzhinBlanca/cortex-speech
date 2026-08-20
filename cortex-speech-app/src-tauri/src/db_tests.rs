@@ -4809,3 +4809,36 @@ fn evidence_for_the_wrong_clip_does_not_satisfy_the_guard() {
     db.record_playback_receipt(&receipt("pb-guard-3", 0, "fp-a", 9_000, 9_000)).unwrap();
     assert!(db.require_playback_evidence("pb-guard-4", 0, "fp-b", Some("Sara")).is_err());
 }
+
+/// 2026-08-20 external review, blocker #1: "rows exist" must never mean "file completed". A
+/// crash between persist_segments and the champion pass leaves `[Pending WSL 7B ASR]` rows (the
+/// 2026-08-14 incident left 36 of them), and resume used to ADOPT them as a finished file. This
+/// helper is the discriminator resume now uses to discard the stage instead.
+#[test]
+fn placeholder_rows_mark_a_file_as_an_interrupted_stage() {
+    let db = make_db();
+    let path = "/audio/interrupted-episode.wav";
+    let mut staged = make_segment("stage-1", path);
+    staged.raw_transcript = "[Pending WSL 7B ASR]".to_string();
+    db.insert_segment(&staged).unwrap();
+    let mut done = make_segment("stage-2", path);
+    done.raw_transcript = "دەقی تەواو".to_string();
+    db.insert_segment(&done).unwrap();
+
+    assert!(
+        db.audio_path_has_placeholder_rows(path).unwrap(),
+        "one placeholder row is enough: the champion never finished this file"
+    );
+
+    // The champion fills the placeholder: the file becomes adoptable.
+    db.connection()
+        .execute("UPDATE speech_segments SET raw_transcript = 'دەقی چامپیۆن' WHERE id = 'stage-1'", [])
+        .unwrap();
+    assert!(!db.audio_path_has_placeholder_rows(path).unwrap(), "all real text = a completed file");
+
+    // An EMPTY draft is an unfinished stage too, not a completed file.
+    db.connection().execute("UPDATE speech_segments SET raw_transcript = '  ' WHERE id = 'stage-2'", []).unwrap();
+    assert!(db.audio_path_has_placeholder_rows(path).unwrap(), "blank text cannot be adopted as done");
+
+    assert!(!db.audio_path_has_placeholder_rows("/audio/other.wav").unwrap(), "no rows = nothing staged");
+}
