@@ -3555,6 +3555,35 @@ impl Database {
     /// import-resume to fold already-imported files back into the post-import jury batch — the jury
     /// runs once at the end keyed on the freshly-imported ids, so without this the files persisted
     /// before a crash would never be adjudicated (they are skipped from re-processing on resume).
+    /// Every source file under `dir_prefix` that already has segments in the library.
+    ///
+    /// The set a re-run of a large directory import passes as `resume_completed`. Without it a
+    /// re-run is a FRESH import: `AudioFingerprint::new()` starts empty, so the cross-session
+    /// duplicate check cannot see the earlier run, and every already-imported file is processed
+    /// again and persisted a SECOND time under the same `audio_path` — the 2026-08-14 shape, where
+    /// one folder re-import silently doubled 494 already-reviewed clips.
+    ///
+    /// Deliberately "has ANY rows", not "has good rows": the importer re-checks each candidate for
+    /// placeholder/empty drafts itself (`staged_incomplete`) and re-does the ones that were left
+    /// mid-stage. Answering that question here as well would put the same rule in two places.
+    ///
+    /// Prefix-matched in Rust rather than with SQL `LIKE`: a Windows path is full of `\`, and `_`
+    /// is a LIKE wildcard that `lamo_000056.wav` contains twice, so the pattern would need escaping
+    /// on two axes at once to avoid silently matching more paths than were asked for.
+    pub fn audio_paths_with_segments_under(&self, dir_prefix: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT audio_path FROM speech_segments")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let prefix = dir_prefix.to_lowercase().replace('/', "\\");
+        let mut out = Vec::new();
+        for row in rows {
+            let path = row?;
+            if path.to_lowercase().replace('/', "\\").starts_with(&prefix) {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn segment_ids_for_audio_path(&self, audio_path: &str) -> AppResult<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT id FROM speech_segments WHERE audio_path = ?1 ORDER BY rowid")?;
         let rows = stmt.query_map(params![audio_path], |row| row.get::<_, String>(0))?;

@@ -62,7 +62,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CODE reflects reality — otherwise a cron/CI wrapper pointed at a mistyped/empty dir sees exit 0
     // and believes the import succeeded when it did nothing.
     let outcome = std::cell::Cell::new((0usize, 0usize, 0usize)); // (total, succeeded, failed)
-    pipeline.import_directory(&target_dir, None, |event| {
+
+    // RE-RUNNING A DIRECTORY IS A RESUME, NOT A FRESH IMPORT.
+    //
+    // Halt-on-first-failure means a big import stops partway by design, and a growing folder means
+    // the same directory is imported again and again. Both make the re-run the normal case, and a
+    // re-run without this is destructive: `AudioFingerprint::new()` starts with an empty map, so the
+    // duplicate check cannot see the previous run at all, and every already-imported file is
+    // processed a second time and persisted AGAIN under the same `audio_path`. That is the
+    // 2026-08-14 shape, where one folder re-import silently doubled 494 already-reviewed clips.
+    //
+    // Handing the importer the set of paths it already holds turns that into the resume the
+    // machinery was written for: finished files are adopted (never re-persisted), and a file left
+    // mid-stage — placeholder or empty drafts from an interrupted run — is discarded and redone.
+    let already_imported: std::collections::HashSet<String> = db
+        .audio_paths_with_segments_under(&target_dir.to_string_lossy())
+        .map_err(|e| format!("could not read what is already imported from this directory: {e}"))?
+        .into_iter()
+        .collect();
+    if already_imported.is_empty() {
+        println!("Fresh import: this directory has no clips in the library yet.");
+    } else {
+        println!("Resuming: {} file(s) from this directory are already in the library.", already_imported.len());
+    }
+
+    pipeline.import_directory_with_agent_run_id(&target_dir, None, None, Some(&already_imported), |event| {
         use cortex_speech_app_lib::pipeline::PipelineEvent;
         match event {
             PipelineEvent::Progress { current, total, file, status } => {

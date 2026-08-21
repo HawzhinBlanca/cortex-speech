@@ -4184,6 +4184,39 @@ fn desktop_review_page_narrows_to_the_voice_focus_but_the_library_does_not() {
 }
 
 #[test]
+fn resume_set_lists_exactly_the_files_this_directory_already_holds() {
+    // What a re-run of a directory import passes as `resume_completed`. If this under-reports, the
+    // re-run persists those files a SECOND time under the same audio_path (the 2026-08-14 shape:
+    // one folder re-import doubled 494 already-reviewed clips). If it over-reports, real work is
+    // skipped and never imported at all.
+    let db = make_db();
+    for (id, path) in [
+        ("a", r"D:\Set\wavs\lamo_000001.wav"),
+        ("b", r"D:\Set\wavs\lamo_000002.wav"),
+        ("c", r"D:\Set\wavs_other\lamo_000003.wav"), // a SIBLING dir sharing the prefix's start
+        ("d", r"D:\Elsewhere\lamo_000004.wav"),
+    ] {
+        db.insert_segment(&make_segment(id, path)).unwrap();
+    }
+
+    let mut found = db.audio_paths_with_segments_under(r"D:\Set\wavs\").unwrap();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![r"D:\Set\wavs\lamo_000001.wav".to_string(), r"D:\Set\wavs\lamo_000002.wav".to_string()],
+        "only files under the asked-for directory — the sibling `wavs_other` must not be adopted"
+    );
+
+    assert!(
+        db.audio_paths_with_segments_under(r"D:\Nothing\").unwrap().is_empty(),
+        "a directory the library has never seen resumes nothing"
+    );
+    // Separator and case are cosmetic on Windows; a path differing only in those is the SAME file
+    // and must still be recognised, or the re-run imports it a second time.
+    assert_eq!(db.audio_paths_with_segments_under(r"d:/set/wavs/").unwrap().len(), 2);
+}
+
+#[test]
 fn the_escalation_queue_obeys_the_voice_focus() {
     // The Inbox is a SERVING PATH — it plays these clips, mints playback receipts for them and
     // records verdicts against them — so the focus governs it exactly as it governs the review page.
