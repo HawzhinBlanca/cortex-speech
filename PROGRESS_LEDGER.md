@@ -10858,3 +10858,179 @@ Owner-facing, unchanged by any of this: each device still needs its original lin
 that were never saved cannot be resurrected), and five paid links stay idle while the focus holds.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-21 (paid-review hardening) — focused champion provenance is green; production readiness is not
+
+The owner requested a proof-backed, reliability-only audit before the first paid review batch, with
+the fine-tuned OmniASR-7B champion as the sole normal drafting path and no GPU disturbance. This
+audit did not start any ASR model, model server, or GPU workload.
+
+Measured state:
+
+```
+active Hawleri focus       : 1293 playable pending; 1293/1293 exact champion provenance
+global untouched backlog  : 8731 rows without champion hypothesis (focus must remain enforced)
+live review serving       : watchdog disabled; port 8737 down; 8/8 saved links unreachable
+reviewer allocation       : Alle/Lamo/Roza/Sabat/Sewa have 0 eligible clips under this focus
+hidden-check pool         : 0,2,0,2,0,0,0,0 — all eight reviewers below floor
+playback canary           : 0/20 post-deployment decisions
+frontend                  : 283 tests; typecheck/lint/build pass; format check red on 6 old files
+Rust full library suite   : 1340 pass, 8 ignored, 1 fail (compensation-law contradiction only)
+Python policy suite       : 86/88 scripts; ledger staleness fixed by this entry, watchdog still red
+```
+
+Reliability fixes in the dirty, uncommitted worktree: decision-time row-version/focus/dialect
+authorization; idempotent legacy retries; immutable/retryable spot-check scoring; globally ordered
+session persistence so a stale snapshot cannot resurrect a revoked reviewer; case-normalized dialect
+rosters; reviewed-audio export restricted to current human accept/edit with exact revision-bound
+metadata; public reviewer redaction; and production bundle rights/source-byte rechecks with BLAKE3
+source and recipient-readable licence/credit manifests. Production bundle generation now uses a
+fresh sibling stage, one frozen core-row snapshot, selected-ID DPO output, stored canonical-PCM
+verification, and publish-on-success rename; stale or partial files cannot be sealed. Independent
+concurrency review found no production deadlock, lock inversion, or unguarded save path. Targeted
+export suites passed (19 audio, 39 bundle, 65 dataset with 1 ignored, 10 validation, 18 learning).
+The final rights gate also replaced punctuation-stripping licence normalization with an exact,
+case-insensitive alias allowlist. Sorani/Chinese compound suffixes and punctuation suffixes now fail
+closed instead of collapsing to `CC0-1.0`; 39/39 bundle tests and an independent validator passed.
+
+Stop-ship contradiction: protected `docs/OWNER_CANON.md` defines compensation differently from both
+the owner's latest 100% edit / 10% unchanged accept / 10% valid reject request and the current dirty
+code (accept/edit 100%, reject 0%). The mismatch is the full Rust suite's sole failure. No pay logic
+was changed; owner authorization must be the literal phrase `change canon: review compensation`.
+The eventual ledger must use policy versions, canonical work IDs, idempotency keys, integer micro-IQD,
+reversals, and settlement state; rejected audio remains outside every dataset and corrected-duration
+total even if a valid reject earns the proposed 10% review fee.
+
+Dataset boundary remains strategic: hardened production bundles are ASR-oriented. Generic audio
+export still lacks equivalent commit-time consent/source-byte sealing, and the app has no explicit
+first-class sibling `asr/<export_id>` and `tts/<export_id>` artifacts. TTS needs preserved-rate masters,
+speaker/session/consent provenance, and deterministic speaker-disjoint splits.
+
+Verdict: **NO-GO for paid production**, not 10/10. Engineering reliability is materially higher, but
+compensation authorization, supervision, credentialed links, deliberate roster allocation, hidden
+checks, a two-reviewer 20-decision canary, export snapshot closure, and backup/restore plus load drills
+must pass before release-candidate status.
+
+## 2026-08-21 (GPU-safe recovery) — code green; serving remains deliberately fail-closed
+
+The initial global champion-provenance result above was wrong. The gate hard-coded the historical
+`omniasr-wsl-7b` label even though the authoritative registry identifies the same pinned deployment
+as `omniasr-7b-legacy-c348ade8a816` (deployment SHA-256
+`ae33143ec8b25f45e393f4aa484c3a3d165850f0dc15e95254dd6e4cb4c05cbf`). The corrected gate resolves
+exactly one `omniasr-7b` champion, admits the old alias only for that immutable id/hash tuple, and
+uses a bound model-plus-transcript `EXISTS` check. Twelve resolver/fallback regressions pass. During
+the live import it rejects only the single segment currently between placeholder insertion and its
+champion hypothesis; the earlier 8,731-row claim must not be used.
+
+The running `batch_importer.exe` owns the same exclusive `cortex.lock` as the GUI and was left
+untouched. At 18:08 +03:00 it had completed 5,136 of 6,922 Lamo WAVs; 5,135 had champion hypotheses
+and one was the expected in-flight placeholder. The existing OmniASR-7B server remained the sole
+model listener on `127.0.0.1:8799`. No 300M/1B inference, ElevenLabs Scribe call, extra model server,
+or GPU restart was performed. Live settings remain `WSL7B`, cloud STT off, with champion process
+supervision temporarily disabled so review-only startup cannot duplicate the importer's workers; a
+timestamped settings backup exists beside the live settings file.
+
+The watchdog now probes the OS lock rather than file existence: real Windows sharing violations
+defer cleanly, stale lockfiles continue to launch, and all other probe faults block nonzero. Its
+throwaway-process drill passes 13 branches, and the live dry run reports `defer` on the importer.
+The watchdog task remains disabled intentionally because automatic launch after import would expose
+five empty reviewer queues and exhausted hidden-check pools. The exact hardened release binary was
+rebuilt from HEAD (`07debb908967d285a87abb7f47c1752e281e671cc8a1bea1fdf35f4243255e03`), and the freshness gate
+passes.
+
+Verification after the fixes: 1,341 Rust library tests passed (0 failed, 8 ignored); 283 frontend
+tests passed across 55 files; Svelte/TypeScript typecheck and ESLint passed; formatting/diff checks
+passed; champion hard-stop, agentic export, playback, provenance, queue, spot-pool, and watchdog
+policy regressions passed. The Python policy sweep's only remaining red test is the deliberately
+disabled live watchdog gate.
+
+The unauthorized partial compensation edit (accept/edit 100%, reject 0%) was removed, restoring the
+currently protected distinct-reviewed-clip rule and eliminating the Rust contradiction. The desired
+edit 100% / unchanged accept 10% / valid reject 10% schedule is still not implemented; it requires
+the literal owner authorization `change canon: review compensation` and a versioned immutable ledger.
+
+Serving-path result remains **NO-GO**: all eight links are down while the importer owns the database;
+Alle/Lamo/Roza/Sabat/Sewa have zero eligible Hawleri work; hidden-check capacity is
+0,2,0,2,0,0,0,0; and the exact new binary has 0/20 required playback-evidenced decisions. Those are
+real campaign/owner/reviewer prerequisites, not defects that may be fabricated away.
+
+## 2026-08-21 18:23 +03:00 — final certification checkpoint
+
+The result remains **NO-GO for real paid review**. This is a proof-backed operational stop, not a
+code-quality guess.
+
+Fresh read-only evidence:
+
+```
+importer             : PID 57180 still active; 5359/6922 source rows at sample; GUI absent
+listeners            : OmniASR-7B only on 127.0.0.1:8799; review port 8737 absent
+browser/a11y E2E     : 95/95 passed against a fresh mocked-Tauri Vite instance
+freshness logic      : 22/22 passed
+release attestation  : FAIL — 12 compiled Rust source inputs are uncommitted
+format/diff hygiene  : cargo fmt --check PASS; git diff --check PASS
+```
+
+The corrected freshness gate now rejects dirty tracked, staged, renamed, or untracked build inputs.
+The executable SHA-256 `07debb908967d285a87abb7f47c1752e281e671cc8a1bea1fdf35f4243255e03`
+is therefore a tested local candidate, not an immutable reproducible release. Version the intended
+source and rebuild before production certification.
+
+Operational blockers remain: the importer's exclusive lock, disabled watchdog, dead reviewer
+serving path, five empty Hawleri reviewer queues, hidden-check counts `0,2,0,2,0,0,0,0`, and a
+`0/20` exact-build two-reviewer playback canary. Three genuine Hawleri answer keys are only the
+minimum needed to cross the structural hidden-check floor for the three compatible reviewers; under
+the current 25-item/every-eighth-hidden cadence, a balanced full 1,293-clip Hawleri shift needs about
+69 genuine Hawleri keys. Keys must never be fabricated. A Sorani campaign is possible only after an
+explicit owner campaign/focus/roster decision.
+
+No ASR inference, smaller model, ElevenLabs Scribe call, model restart, GPU workload, campaign
+mutation, reviewer credential claim, or production service start was performed during this final
+checkpoint.
+
+The concurrent live provenance probe passed human-field and accepted-text provenance, then failed
+closed on exactly one new untouched in-flight row with no champion hypothesis
+(`86d131f6-8a80-470e-9089-9464c869bcdf`). This is consistent with the importer's known two-step write
+window and is precisely why the gate must be rerun only after the importer exits and then pass clean.
+
+## 2026-08-21 18:47 +03:00 — handover accepted; hidden-check exhaustion now fails closed
+
+Accepted `cortex-speech-app/docs/HANDOVER_TO_CODEX.md` from commit `e68c9f9` as the coordination and
+ownership surface. The highest-value unclaimed reliability gap was the listening-check pool silently
+ending while paid review continued. The fixed `>= 200` planning target was replaced with an
+enforceable capacity contract derived from the actual Rust serving constants and live campaign.
+
+Commit `3694999` (`fix(review): fail closed when listening proof expires`) now provides both layers:
+
+- `check_spot_check_pool.py` mirrors the live focus, roster, dialect routing, on-disk audio, prior
+  per-reviewer scores, and Rust `QUEUE_BATCH=25` / `SPOT_CHECK_EVERY=8` constants. It computes the
+  refill-rounded worst-case key requirement for each reviewer because no enforced work quota
+  prevents one eligible reviewer from draining the campaign.
+- A credentialed durable serving session now refuses a batch with retryable HTTP 503 when fewer
+  genuine checks exist than the batch requires, and releases every work lease from that unserved
+  batch immediately. Adding a genuine key makes the next request work without restart.
+- Ephemeral internal/test sessions retain best-effort behavior; synthetic keys remain forbidden.
+- `verify_10.py` carries the full-campaign capacity gate permanently.
+
+Fresh live read-only result:
+
+```
+human decisions : 623
+active focus     : yes
+cadence          : 25 work clips; ceil(batch/8) checks per refill
+Hawzhin          : 2 available / 207 required for 1293 accessible work clips
+Pavel            : 2 / 207 for 1293
+Rubar            : 0 / 207 for 1293
+other five       : 0 / 3 with zero accessible Hawleri work
+```
+
+The earlier estimate of 69 keys assumed a balanced three-reviewer split that the application does
+not enforce. It is not a production safety bound. The 207 figure is the requirement against the
+current unchanged backlog; genuine owner adjudications inside the focus both add keys and reduce
+pending work, so the gate recomputes the target on every run.
+
+Verification: spot-check Python core 7/7; runtime pause/unpause/lease regression passed; Couch
+88/89; full Rust 1,341 passed, 1 failed, 8 ignored; Python policies 88/89. The two reds are preserved
+and unrelated to `3694999`: live watchdog intentionally disabled during import, and compensation
+commit `e68c9f9` changed reject pay to zero while an existing canonical Couch test still requires a
+reject to count as reviewed audio. Do not edit the money rule/test/canon by implication; owner
+authorization remains `change canon: review compensation`.
