@@ -33,37 +33,43 @@ everything sorts to the **top** of the trust list. That is backwards regardless 
 | clip duration p10 / median / p90 | 6.45 s / 8.45 s / 10.45 s |
 | Lamo gold set | 6,922 clips / 15.20 h, 0 duplicates, 0 clipping, SNR median 34.7 dB |
 
-### The pay basis — SETTLED by the owner, 2026-08-21
+### The pay rule — FINAL, owner-stated 2026-08-21
 
-**Reviewers are paid 18,000 IQD per hour of WORK — time at the desk, not hours of audio reviewed.**
-The coins are entertainment on top of that, not a separate payroll.
+> *"18K per hour of audio corrected, excluding the rejected ones. Reviewers get paid to correct the
+> sentences; the ones that are bad they reject and they don't get paid. The corrected seconds do not
+> measure the rejected ones."*
 
-This matters more than it sounds, because it deletes most of the attack surface before it exists:
+**Pay = 18,000 IQD per hour of audio whose transcript they CORRECTED.**
 
-* **Speed stops paying.** Every exploit that optimises clips-per-hour — blind accept, one-keystroke
-  edit, reject-blasting — earns exactly the same as careful work. The 7–11x arbitrage that made those
-  strategies rational simply is not there.
-* **The careful reviewer is no longer punished.** On an audio-hour basis the most accurate person on
-  the team (18/18 traps) earned the least, 3,600 IQD/hour against a 18,000 headline. On a labour-hour
-  basis everyone earns 18,000 and accuracy costs them nothing.
+| action | counts toward pay? | why |
+|---|---|---|
+| `edit` | **yes** | the transcript was corrected — the work product |
+| `accept` | **yes** | the draft was verified as already correct — also work |
+| `reject` | **no** | the clip is discarded; there is no corrected transcript |
+| `skip` | **no** | already excluded, explicitly declined |
 
-Note this is **not** what the code currently computes. `Database::reviewed_audio_ms` sums audio
-duration and its own doc says *"reviewers are paid per hour of audio reviewed, not per hour at the
-desk"* — that comment is now out of date and the panel must not be built on it.
+**The code does not implement this today.** `Database::reviewed_audio_ms` sums
+`action IN ('accept','edit','reject')` — it pays for rejects. The fix is removing one word from one
+SQL string, and it is now owner-confirmed, not my inference.
 
-**The one exploit a labour-hour basis creates, and the guard for it: idling.** If money accrues while
-the page is merely open, the optimal strategy is to open it and walk away. So the counter must measure
-ACTIVE work, never page-open time:
+#### What this pay rule gets right, and the one thing it leaves open
 
-* the clock advances only while something is happening — audio playing, text being edited, a decision
-  being submitted;
-* a gap longer than **IDLE_CUTOFF (120 s)** with no activity does not accrue, and the panel visibly
-  pauses so the reviewer knows why;
-* the counter is session-local and resets on reload, and is labelled as an estimate — it is
-  motivation, not a timesheet. Payroll stays the owner's own record.
+It kills the worst exploit by construction. **Reject-blasting no longer pays** — which matters
+because rejecting is the one action that destroys corpus permanently, and (see the headline) the
+trust report currently *rewards* it. Excluding rejects from pay removes the money motive entirely.
 
-This is honest in both directions: a reviewer who is genuinely working never sees it pause, and a
-phone left open on a table earns nothing.
+It leaves **blind accept** as the dominant remaining exploit, and this is the one to defend against:
+
+* Accept is the fastest paid action — one tap, no keystrokes, full clip value.
+* At ~3 s/clip that is **50,000+ IQD/hour** against ~7,000 for honest work: a **7x arbitrage**.
+* The corpus damage is the subtle part. `training_transcript_with_source` returns
+  `(raw_transcript, "human_verified")` for a bare accept, so a blind accept **stamps champion output
+  at 7.03 % CER as human gold**. Fine-tuning on that is self-distillation on our own errors, and every
+  CER measured against it understates true error — the model graded against its own transcripts.
+* Today's only defence is the spot-check pool, which is **26 keys** and exhausts in about an hour.
+
+So the pay rule is sound; the *measurement* behind it is not yet. §2.3 and §2.4 are the prerequisites,
+not optional polish.
 
 ### Measured pace, for sizing the work
 
@@ -75,12 +81,8 @@ phone left open on a table earns nothing.
 | Lamo | 32 | 26.7 | 16 % | 0.50 |
 | Roza | 6 | 18.2 | 57 % | 0.00 |
 
-Honest review runs about **2.5x realtime**, so 15.2 h of audio is roughly **38 person-hours** =
-**~684,000 IQD** at 18,000/hour. Across eight reviewers that is under five hours each.
-
-The accept-rate and trap-score spread still matters even without a money incentive: the
-highest-volume reviewer is at 56 % bare accepts and misses two traps in three, today. That is a
-training and measurement problem (§2.4, §2.5), not a pay problem.
+Honest review runs about **2.5× realtime**. 15.2 h of corrected audio pays **273,600 IQD** in total
+and costs roughly **38 person-hours** — under five hours each across eight reviewers.
 
 ### The measurement capacity nobody knows is exhausted
 
@@ -108,14 +110,18 @@ AND the human text differs from the draft             →   26     ← the entir
 
 Ordered by (damage prevented ÷ effort). The first three are one-line changes.
 
-### 2.1 `reviewed_audio_ms` is a THROUGHPUT metric, not the pay basis — **relabel it**
+### 2.1 Stop counting rejects as paid audio — **one word**, owner-confirmed
 
-Its doc comment claims *"reviewers are paid per hour of audio reviewed, not per hour at the desk."*
-Pay is now per hour of work (§1), so that sentence is false and the next person to read it will build
-on it exactly as this plan nearly did.
+`reviewed_audio_ms` sums `action IN ('accept','edit','reject')`. The owner's rule pays only for
+audio **corrected**, so a reject must not accrue. The same function already excludes `skip` for
+exactly this reasoning — *"counting those would credit somebody for work they explicitly did not do"* —
+and a reject makes the same claim: no transcript was produced.
 
-→ Correct the comment. Keep `'reject'` in the sum — a rejected clip really was listened to, and as a
-throughput figure that is honest. Nothing about pay depends on it any more, which is the point.
+→ Remove `'reject'` from the whitelist, and correct the doc comment, which still says reviewers are
+paid *"per hour of audio reviewed."* They are paid per hour of audio **corrected**.
+
+Rejecting stays the right thing to do for a bad clip — it is simply unpaid, which is the owner's
+intent and removes any motive to reject-blast.
 
 ### 2.2 A reject on a spot check is WRONG, not right — **one boolean**
 
@@ -123,7 +129,8 @@ A served spot check is by construction a clip with a real human transcript. Reje
 answer. Today `action == "reject"` sets `noticed = 1` unconditionally, so a 100 %-rejector scores
 perfect and sorts to the top of the trust report.
 
-→ On a served spot check, a reject scores `noticed = 0`.
+→ On a served spot check, a reject scores `noticed = 0`. With rejects also unpaid (§2.1) the money
+motive is gone, but the *scoring* must still be right or the trust report keeps promoting rejectors.
 
 ### 2.3 `noticed` must mean "found the error", not "typed something" — **small**
 

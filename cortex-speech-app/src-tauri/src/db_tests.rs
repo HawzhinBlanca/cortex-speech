@@ -651,7 +651,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     }
 
     let ids = |limit: usize| -> Vec<String> {
-        db.list_spot_check_candidates(limit, "Sara", &std::collections::HashSet::new(), None)
+        db.list_spot_check_candidates(limit, "Sara", &std::collections::HashSet::new(), None, None)
             .unwrap()
             .into_iter()
             .map(|(s, _)| s.id)
@@ -672,11 +672,25 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
         "the owner's own verified answer IS an answer key — without this the mechanism never fires"
     );
 
+    // Voice focus applies to the whole paid queue, including hidden checks. Filter BEFORE `limit`:
+    // the focused key sorts after other candidates, so filtering a pre-limited result would return
+    // zero and silently turn QC off for the batch.
+    let focus = std::collections::HashSet::from(["sc-wrong-2".to_string()]);
+    let focused: Vec<String> = db
+        .list_spot_check_candidates(1, "Sara", &std::collections::HashSet::new(), None, Some(&focus))
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s.id)
+        .collect();
+    assert_eq!(focused, vec!["sc-wrong-2".to_string()]);
+
     // The expected text is the HUMAN answer, never the raw draft — grading against the draft would
     // score a blind accept as perfect. Asserted against the row that came back rather than a
     // hardcoded string: the answer key must be right for EVERY candidate, not just whichever one
     // happens to sort first.
-    for (seg, expected) in db.list_spot_check_candidates(10, "Sara", &std::collections::HashSet::new(), None).unwrap() {
+    for (seg, expected) in
+        db.list_spot_check_candidates(10, "Sara", &std::collections::HashSet::new(), None, None).unwrap()
+    {
         assert_ne!(expected, seg.raw_transcript, "{} was graded against its own draft", seg.id);
         assert_eq!(
             Some(expected.as_str()),
@@ -699,7 +713,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     // Per REVIEWER, not global: two people meeting the same clip independently is the entire basis of
     // the agreement sample, so Sara's answer must not consume Hemn's.
     let hemn: Vec<String> = db
-        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new(), None)
+        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new(), None, None)
         .unwrap()
         .into_iter()
         .map(|(s, _)| s.id)
@@ -3976,7 +3990,7 @@ fn a_spot_check_is_never_served_in_a_dialect_the_reviewer_cannot_judge() {
         ids.push(id);
     }
     let candidates = |allowed: Option<&[String]>| -> Vec<String> {
-        db.list_spot_check_candidates(10, "Roza", &std::collections::HashSet::new(), allowed)
+        db.list_spot_check_candidates(10, "Roza", &std::collections::HashSet::new(), allowed, None)
             .unwrap()
             .into_iter()
             .map(|(s, _)| s.id)
@@ -4030,10 +4044,10 @@ fn a_snapshot_of_a_real_sized_library_does_not_take_minutes() {
 
 #[test]
 fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
-    // This is what the phone shows a reviewer as progress AND what the owner pays on (per hour of
-    // audio reviewed, not per hour at the desk). So a network retry or a re-decision of the same clip
-    // must not inflate it — 40 of Rubar's 355 decisions were re-decisions of a clip she had already
-    // done, and counting rows would have billed those twice.
+    // This is what the phone shows a reviewer as progress AND what the current owner canon pays on
+    // (per hour of audio reviewed, not per hour at the desk). A network retry or re-decision of the
+    // same clip must not inflate it, while a reject still counts as reviewed audio because the human
+    // listened in order to decide. Rejected clips remain excluded from corrected datasets.
     let db = make_db();
     for (id, ms) in [("a", 9000), ("b", 21000)] {
         let mut seg = make_segment(id, &format!("/audio/{id}.wav"));
@@ -4047,10 +4061,14 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
     };
     ev("a", "Rubar", "accept");
     ev("a", "Rubar", "edit"); // same clip again — a retry, not new work
-    ev("b", "Rubar", "reject"); // a reject IS reviewed audio: they listened to decide
+    ev("b", "Rubar", "reject"); // discarded: no corrected transcript exists, so it is UNPAID
     ev("a", "Sewa", "accept"); // another reviewer on the same clip counts for HER
 
-    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "9s + 21s, the retry not double-counted");
+    assert_eq!(
+        db.reviewed_audio_ms("Rubar").unwrap(),
+        9_000,
+        "only the CORRECTED 9s pays: the 21s reject is excluded, and the repeat on clip a is not double-counted"
+    );
     assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000);
     assert_eq!(db.reviewed_audio_ms("Nobody").unwrap(), 0, "a reviewer with no work owes no rows");
 
@@ -4058,7 +4076,7 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
     // the total for work that was genuinely done — the event snapshots the duration it was paid
     // against (v56), so the number the owner pays on is append-only in practice.
     db.delete_segment("a").unwrap();
-    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "clip 'a' is gone; Rubar's 9s of work is not");
+    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 9_000, "clip 'a' is gone; Rubar's reviewed-audio total is not");
     assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000, "hers neither");
 }
 

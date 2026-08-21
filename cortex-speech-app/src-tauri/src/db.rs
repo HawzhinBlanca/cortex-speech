@@ -1615,6 +1615,7 @@ impl Database {
         reviewer: &str,
         exclude: &std::collections::HashSet<String>,
         allowed_dialects: Option<&[String]>,
+        focus: Option<&std::collections::HashSet<String>>,
     ) -> AppResult<Vec<(SpeechSegment, String)>> {
         // `reviewed_by IS NULL` keeps OWNER-desktop decisions (which pass no annotator name) as
         // keys while excluding a phone peer's fresh correction — grading one reviewer against
@@ -1641,6 +1642,12 @@ impl Database {
             let seg = row?;
             if exclude.contains(&seg.id) {
                 continue; // they already declined this one; find them a different key
+            }
+            // A voice focus constrains the entire paid queue, including its hidden quality checks.
+            // Serving an out-of-focus check and then correctly rejecting it at the decision boundary
+            // would strand honest work; filtering before `limit` preserves the requested check count.
+            if focus.is_some_and(|ids| !ids.contains(&seg.id)) {
+                continue;
             }
             let Some(expected) = crate::quality::human_verified_text(&seg) else {
                 continue; // a machine verdict is not an answer key
@@ -1675,9 +1682,9 @@ impl Database {
         Ok(out)
     }
 
-    /// Record how a reviewer answered one spot check. Upserts on (segment_id, reviewer) so a network
-    /// retry cannot inflate a score with duplicate rows — and so a reviewer is graded on their latest
-    /// answer for a clip rather than on whichever attempt happened to arrive first.
+    /// Record how a reviewer answered one spot check. The FIRST answer is immutable: a network retry
+    /// cannot inflate the score, and a reviewer cannot improve a failed hidden check by submitting a
+    /// different answer later. `ON CONFLICT DO NOTHING` still makes a lost-response replay idempotent.
     ///
     /// Writes ONLY to `spot_checks`. Grading a reviewer must never be able to alter the corpus it
     /// grades against, so the segment itself is left completely untouched.
@@ -1691,30 +1698,33 @@ impl Database {
     ) -> AppResult<()> {
         let submitted_nfc = to_nfc(submitted.trim());
         let expected_nfc = to_nfc(expected.trim());
-        // "Noticed" = they did not simply hand back the draft they were given. A reject counts: judging
-        // a clip unusable is a real act of attention, not a blind accept.
-        let raw: String = self.conn.query_row(
-            "SELECT raw_transcript FROM speech_segments WHERE id = ?1",
-            params![segment_id],
-            |row| row.get(0),
-        )?;
-        let noticed = action == "reject" || learning_text_key(&submitted_nfc) != learning_text_key(&raw);
+        // A hidden check has a known-valid human answer. "Noticed" therefore means the reviewer
+        // actually recovered that answer (under the same normalized text key used by the learning
+        // paths), not merely that they changed *something*. A blanket reject or arbitrary garbage
+        // used to score as attentive and sort a reject-spammer to the top of the trust report.
+        let noticed = action != "reject" && learning_text_key(&submitted_nfc) == learning_text_key(&expected_nfc);
         let cer = crate::wer::compute_cer(&expected_nfc, &submitted_nfc);
         self.conn.execute(
             "INSERT INTO spot_checks
                  (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(segment_id, reviewer) DO UPDATE SET
-                action=excluded.action,
-                submitted_transcript=excluded.submitted_transcript,
-                expected_transcript=excluded.expected_transcript,
-                noticed=excluded.noticed,
-                cer=excluded.cer,
-                created_at=datetime('now')",
+             ON CONFLICT(segment_id, reviewer) DO NOTHING",
             params![segment_id, reviewer, action, submitted_nfc, expected_nfc, noticed as i32, cer],
         )?;
         self.track_write()?;
         Ok(())
+    }
+
+    /// Has this reviewer already supplied the immutable first answer for this hidden check?
+    /// Used only to acknowledge outbox retries without appending another generic review event.
+    pub fn has_spot_check_result(&self, segment_id: &str, reviewer: &str) -> AppResult<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM spot_checks WHERE segment_id = ?1 AND reviewer = ?2
+             )",
+            params![segment_id, reviewer],
+            |row| row.get(0),
+        )?)
     }
 
     /// Append one row to the audit trail (Migration v45). Never updates, never deletes.
@@ -1766,6 +1776,16 @@ impl Database {
     /// than reusing `reviewer_throughput`, which walks every event of every reviewer: this runs on
     /// each queue fetch from a phone, so it stays a single aggregate.
     pub fn reviewed_audio_ms(&self, reviewer: &str) -> AppResult<i64> {
+        // Audio CORRECTED — the basis the owner pays on at 18,000 IQD/hour, owner-stated 2026-08-21:
+        // "18K per hour of audio corrected, excluding the rejected ones ... the ones that are bad they
+        // reject and they don't get paid." So `reject` is NOT summed: a rejected clip yields no
+        // corrected transcript, which is exactly the reasoning that already excludes `skip`. It also
+        // leaves no money motive to reject-blast — the one action that destroys corpus permanently.
+        // Current owner canon counts a distinct clip after any real review verdict: accept, edit, or
+        // reject. A reject remains excluded from corrected datasets, but the reviewer still listened
+        // to the clip in order to judge it. `skip` is different: it explicitly records no judgement.
+        // Keep payout-policy changes out of this aggregate until they are authorized and implemented
+        // as a versioned ledger rather than silently changing the meaning of an existing counter.
         // LEFT JOIN + the event's own duration snapshot (v56): an INNER JOIN silently shrank this
         // total whenever the owner deleted a reviewed clip — real paid work vanishing from the one
         // number reviewers are paid on. The event's snapshot wins; the live row backfills events
@@ -1776,7 +1796,7 @@ impl Database {
                FROM (SELECT MAX(COALESCE(e.duration_ms, s.duration_ms, 0)) AS d
                        FROM review_events e
                        LEFT JOIN speech_segments s ON s.id = e.segment_id
-                      WHERE e.reviewer = ?1 AND e.action IN ('accept', 'edit', 'reject')
+                      WHERE e.reviewer = ?1 AND e.action IN ('accept', 'edit')
                       GROUP BY e.segment_id)",
             params![reviewer],
             |row| row.get(0),
