@@ -46,7 +46,11 @@ const SOURCE_DIALECTS: &[(&str, &str)] = &[
     // UNMAPPED source is not a neutral state — `reviewer_may_judge` fails closed, so every restricted
     // reviewer is served nothing from it and the clips sit unreviewable with no error anywhere
     // (measured 2026-08-17, when 535 pending Sorani clips did exactly that to five reviewers).
-    (r"ZAR_Lamo_TTS_Dataset\", SORANI),
+    // Matched on the `ZAR_Lamo` prefix, not on one folder name, so the curated cuts of this set
+    // (`ZAR_Lamo_15H_Gold_TTS`, and whatever the next selection pass is called) are routed the day
+    // they appear. The alternative is remembering to add a line per folder, and forgetting means the
+    // clips are transcribed and then served to NOBODY — silently, because unmapped fails closed.
+    (r"ZAR_Lamo", SORANI),
 ];
 
 /// The dialect of the recording this clip was cut from, or `None` when the source is not mapped.
