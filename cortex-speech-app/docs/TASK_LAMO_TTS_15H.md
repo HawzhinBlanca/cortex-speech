@@ -80,10 +80,11 @@ similarity floor   clips    hours     within 3–11 s
    each file becomes exactly one DB row. **At 10000 this VAD-splits 670 clips into several segments
    and destroys the 1-wav = 1-transcript pairing TTS needs.** Verify this setting before every import.
 4. **The source is mapped as `sorani`** in `src-tauri/src/dialect.rs`
-   (`(r"ZAR_Lamo_TTS_Dataset\", SORANI)`), on the evidence of the `ZAR` prefix (ZarPodcast, filed by
-   the owner under `Kurdish Corpora\sorani\`). An UNMAPPED source fails closed — every restricted
-   reviewer is served nothing from it, silently. **OWNER-GATED if it turns out Lamo is Hawleri:** one
-   line, but ask before changing.
+   (`(r"ZAR_Lamo_TTS_Dataset\", SORANI)`). **SETTLED — the owner confirmed it on 2026-08-21**
+   ("Lamo is not hawleri, he is sorani"). Do not re-raise it. Consequence worth knowing: every one of
+   the eight reviewers is rostered for Sorani, so **all eight can judge these clips** — the five who
+   currently have empty queues included. (An UNMAPPED source would fail closed and be served to
+   nobody, silently; that is why the entry exists at all.)
 5. **Exact duplicates are quarantined, not deleted.** 4,348 moved to `duplicates_exact\`. The
    extractor emits them at 22.4% with a systematic offset-56 pattern
    (`lamo_005630`↔`005686`, `005631`↔`005687`, …). Expect more; re-scan before each import.

@@ -40,8 +40,9 @@ const SOURCE_DIALECTS: &[(&str, &str)] = &[
     // relinked into the tree above), kept so a clip restored from an old snapshot still maps.
     ("SoraniVoice_PC_", SORANI),
     // A prepared single-speaker TTS set living OUTSIDE the organized tree, so the folder rule above
-    // cannot route it. Sorani on the evidence of its own name: the set is cut from the ZarPodcast
-    // material, which the owner filed under `Kurdish Corpora\sorani\`. Mapped explicitly because an
+    // cannot route it. OWNER-CONFIRMED Sorani, 2026-08-21 ("Lamo is not hawleri, he is sorani"),
+    // which also matches the `ZAR` prefix: the set is cut from the ZarPodcast material, which the
+    // owner filed under `Kurdish Corpora\sorani\`. Mapped explicitly because an
     // UNMAPPED source is not a neutral state — `reviewer_may_judge` fails closed, so every restricted
     // reviewer is served nothing from it and the clips sit unreviewable with no error anywhere
     // (measured 2026-08-17, when 535 pending Sorani clips did exactly that to five reviewers).
