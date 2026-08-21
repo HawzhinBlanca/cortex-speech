@@ -7,17 +7,18 @@ estimated. Where something is an owner decision it says **OWNER**.
 
 ## The one thing to read if you read nothing else
 
-**Do not ship the coin panel before the four integrity fixes in §2.** Not for tidiness — because of a
-specific, measured migration:
+Pay is **per hour of work**, which removes the speed exploits by construction (§1). Two things still
+have to be true before the panel ships, and neither is about money:
 
-* The system pays on `reviewed_audio_ms`, whose SQL whitelist is `action IN ('accept','edit','reject')`.
-* `db.rs` sets `noticed = 1` **unconditionally** when a spot-check answer is a reject, and the
-  trustworthiness report sorts by `noticed ASC` — so a reviewer who rejects everything sorts to the
-  **top** of the trust list.
-* Therefore, the moment money is on screen, **"reject everything" becomes the globally optimal
-  strategy**: highest pay, lowest effort, best trust score, and it destroys clips permanently.
+1. **The counter must measure ACTIVE work, not page-open time** (§1) — otherwise the optimal
+   strategy becomes leaving the phone open on a table.
+2. **The quality measurement is currently exhausted** — 26 trap keys against 22,783 pending clips,
+   burned in about an hour per reviewer, after which it ends *silently* (§1, §2.4). Showing a
+   reviewer their score means little when the score stops being measurable after the first hour.
 
-Adding a visible price to this pipeline without fixing that is not a UI change. It is an instruction.
+And one plain bug, worth fixing whatever the pay basis: a spot check answered with **reject** scores
+`noticed = 1` unconditionally, and the trust report sorts by `noticed ASC` — so a reviewer who rejects
+everything sorts to the **top** of the trust list. That is backwards regardless of incentives.
 
 ---
 
@@ -32,35 +33,54 @@ Adding a visible price to this pipeline without fixing that is not a UI change. 
 | clip duration p10 / median / p90 | 6.45 s / 8.45 s / 10.45 s |
 | Lamo gold set | 6,922 clips / 15.20 h, 0 duplicates, 0 clipping, SNR median 34.7 dB |
 
-### The pay arithmetic, honestly
+### The pay basis — SETTLED by the owner, 2026-08-21
 
-At 18,000 IQD per hour of **audio reviewed**, one clip is worth **≈42 IQD**. But honest review runs at
-about **2.5× realtime**, so:
+**Reviewers are paid 18,000 IQD per hour of WORK — time at the desk, not hours of audio reviewed.**
+The coins are entertainment on top of that, not a separate payroll.
 
-| reviewer | decisions | median s/clip | accept % | spot-checks noticed | **IQD per hour of their life** |
-|---|---|---|---|---|---|
-| Rubar | 482 | 21.0 | **56 %** | **0.33** | 7,236 |
-| Sewa | 168 | 21.6 | 24 % | 0.88 | 7,052 |
-| Hawzhin (owner) | 159 | 42.2 | 11 % | **1.00** | **3,600** |
-| Lamo | 32 | 26.7 | 16 % | 0.50 | 5,706 |
-| Roza | 6 | 18.2 | 57 % | 0.00 | 8,356 |
+This matters more than it sounds, because it deletes most of the attack surface before it exists:
 
-Two facts that must shape the design:
+* **Speed stops paying.** Every exploit that optimises clips-per-hour — blind accept, one-keystroke
+  edit, reject-blasting — earns exactly the same as careful work. The 7–11x arbitrage that made those
+  strategies rational simply is not there.
+* **The careful reviewer is no longer punished.** On an audio-hour basis the most accurate person on
+  the team (18/18 traps) earned the least, 3,600 IQD/hour against a 18,000 headline. On a labour-hour
+  basis everyone earns 18,000 and accuracy costs them nothing.
 
-1. **The most careful reviewer earns the least** — 3,600 IQD/hour, exactly 20 % of the headline
-   number. A panel advertising "18,000/hour" to someone receiving 3,600 does not just expose the
-   arbitrage, it manufactures the grievance that justifies taking it.
-2. **The highest-volume reviewer already has the worst judgement score** — 56 % of all decided work,
-   56 % bare accepts, missing two traps in three. That gradient is being climbed *today, with no money
-   on screen.* The panel would supply the reward signal that is currently missing.
+Note this is **not** what the code currently computes. `Database::reviewed_audio_ms` sums audio
+duration and its own doc says *"reviewers are paid per hour of audio reviewed, not per hour at the
+desk"* — that comment is now out of date and the panel must not be built on it.
 
-**OWNER DECISION — the headline rate.** Either
-(a) keep 18,000 IQD per **audio-hour** and label the panel honestly as such, so nobody reads it as an
-hourly wage; or
-(b) pay per **labour-hour** at a rate you choose, which removes the speed incentive entirely and
-makes careful work pay the same as fast work. **(b) is what I would choose** — it is the only option
-where the careful reviewer is not punished, and it deletes exploits 1–3 at the root rather than
-policing them.
+**The one exploit a labour-hour basis creates, and the guard for it: idling.** If money accrues while
+the page is merely open, the optimal strategy is to open it and walk away. So the counter must measure
+ACTIVE work, never page-open time:
+
+* the clock advances only while something is happening — audio playing, text being edited, a decision
+  being submitted;
+* a gap longer than **IDLE_CUTOFF (120 s)** with no activity does not accrue, and the panel visibly
+  pauses so the reviewer knows why;
+* the counter is session-local and resets on reload, and is labelled as an estimate — it is
+  motivation, not a timesheet. Payroll stays the owner's own record.
+
+This is honest in both directions: a reviewer who is genuinely working never sees it pause, and a
+phone left open on a table earns nothing.
+
+### Measured pace, for sizing the work
+
+| reviewer | decisions | median s/clip | accept % | spot-checks noticed |
+|---|---|---|---|---|
+| Rubar | 482 | 21.0 | **56 %** | **0.33** |
+| Sewa | 168 | 21.6 | 24 % | 0.88 |
+| Hawzhin (owner) | 159 | 42.2 | 11 % | **1.00** |
+| Lamo | 32 | 26.7 | 16 % | 0.50 |
+| Roza | 6 | 18.2 | 57 % | 0.00 |
+
+Honest review runs about **2.5x realtime**, so 15.2 h of audio is roughly **38 person-hours** =
+**~684,000 IQD** at 18,000/hour. Across eight reviewers that is under five hours each.
+
+The accept-rate and trap-score spread still matters even without a money incentive: the
+highest-volume reviewer is at 56 % bare accepts and misses two traps in three, today. That is a
+training and measurement problem (§2.4, §2.5), not a pay problem.
 
 ### The measurement capacity nobody knows is exhausted
 
@@ -88,14 +108,14 @@ AND the human text differs from the draft             →   26     ← the entir
 
 Ordered by (damage prevented ÷ effort). The first three are one-line changes.
 
-### 2.1 Stop paying for rejects — **one word**
+### 2.1 `reviewed_audio_ms` is a THROUGHPUT metric, not the pay basis — **relabel it**
 
-`reviewed_audio_ms` whitelists `'reject'`. A reject is a claim that no work product exists; paying for
-it funds deletion. The same file already excludes `skip` for exactly this reason — *"counting those
-would credit somebody for work they explicitly did not do."*
+Its doc comment claims *"reviewers are paid per hour of audio reviewed, not per hour at the desk."*
+Pay is now per hour of work (§1), so that sentence is false and the next person to read it will build
+on it exactly as this plan nearly did.
 
-→ Remove `'reject'` from the whitelist. Reviewers are still **expected** to reject bad clips; they are
-simply not paid by the hour for doing it. Pair with §2.2 so honesty is not punished.
+→ Correct the comment. Keep `'reject'` in the sum — a rejected clip really was listened to, and as a
+throughput figure that is honest. Nothing about pay depends on it any more, which is the point.
 
 ### 2.2 A reject on a spot check is WRONG, not right — **one boolean**
 
