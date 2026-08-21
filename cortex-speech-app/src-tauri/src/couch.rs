@@ -52,6 +52,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The single global server handle (at most one couch session at a time).
 static COUCH: Mutex<Option<CouchHandle>> = Mutex::new(None);
+/// Serializes snapshot+write as one ordered persistence operation. Atomic rename prevents torn JSON,
+/// but without ordering an older request could snapshot before a revoke, finish after it, and restore
+/// the revoked credential on restart.
+static SESSION_PERSIST: Mutex<()> = Mutex::new(());
 
 /// Fixed default port — memorable, and stable across restarts so the phone bookmark keeps working.
 const COUCH_PORT: u16 = 8737;
@@ -553,13 +557,25 @@ fn durable_pairing_codes(st: &CouchState) -> HashMap<String, String> {
 ///
 /// Advisory: a save that fails costs the reviewer a re-claim from their link, never their access
 /// right now. It must not turn a successful claim into an error.
+fn lock_session_persist() -> std::sync::MutexGuard<'static, ()> {
+    SESSION_PERSIST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn persist_session_state(state: &Mutex<CouchState>) {
+    persist_session_state_with_hook(state, || {});
+}
+
+fn persist_session_state_with_hook<F: FnOnce()>(state: &Mutex<CouchState>, after_snapshot: F) {
+    // Acquire BEFORE snapshotting. Locking only around save_session still lets an old snapshot wait
+    // behind a newer revoke and then overwrite it after the revoke completes.
+    let _persist = lock_session_persist();
     let snapshot = {
         let st = lock_state(state);
         st.session_store.clone().map(|(dir, db_path)| {
             (dir, db_path, durable_pairing_codes(&st), st.spot_checks.clone(), snapshot_live_sessions(&st))
         })
     };
+    after_snapshot();
     if let Some((dir, db_path, reviewers, checks, sessions)) = snapshot {
         if let Err(e) = save_session(&dir, &reviewers, &db_path, &checks, &sessions) {
             tracing::warn!(
@@ -929,6 +945,7 @@ fn start_on_port(
     // Remember it only once the server is actually serving. Saving earlier would leave a session file
     // pointing at a start that failed, and the next launch would resume links to nothing.
     if let Some(dir) = data_dir.as_deref() {
+        let _persist = lock_session_persist();
         let (reviewers, checks, sessions) = {
             let st = lock_state(&handle.state);
             (st.pairing_codes.clone(), st.spot_checks.clone(), snapshot_live_sessions(&st))
@@ -1060,6 +1077,9 @@ fn release_listener(port: u16) {
 /// which is exactly what happened, and that test then PASSED against a deliberately broken revoke.
 /// A guarantee proven only by a copy of the code is not proven at all.
 fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
+    // Ordered before the state lock, matching persist_session_state. Every older snapshot must finish
+    // before this mutation, and every later save must snapshot the already-revoked maps.
+    let _persist = lock_session_persist();
     let mut st = lock_state(state);
     let roster = if st.pairing_codes.is_empty() { &st.reviewers } else { &st.pairing_codes };
     if !roster.values().any(|reviewer| reviewer.eq_ignore_ascii_case(name)) {
@@ -1656,6 +1676,37 @@ fn holds_a_speaker_change(seg: &SpeechSegment) -> bool {
     seg.speaker_change_score.is_some_and(|s| (s as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD)
 }
 
+/// Resolve the policy that authorizes one reviewer's queue and decisions.
+///
+/// This is deliberately shared by BOTH boundaries. Filtering only `/api/queue` is not authorization:
+/// a phone can retain an id in its outbox, and anyone holding a valid reviewer credential can POST a
+/// known id without fetching a queue first. Re-reading here preserves the policy files' hot-reload
+/// contract and makes a change effective on the next decision as well as the next queue fetch.
+fn reviewer_policy(
+    reviewer: &str,
+    state: &Mutex<CouchState>,
+) -> Result<(Option<Vec<String>>, Option<Arc<HashSet<String>>>), String> {
+    let dir = { lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone()) };
+    let allowed_dialects = match dir.as_ref().map(|d| crate::dialect::load_roster(d)) {
+        Some(Err(e)) => return Err(format!("policy file broken, no clips served: {e}")),
+        // Matched the way the session layer matches names (trim + ASCII case), never an exact
+        // HashMap::get — a roster key that binds nobody is the wrong-dialect incident returning.
+        Some(Ok(roster)) => crate::dialect::allowed_for(&roster, reviewer).cloned(),
+        None => None,
+    };
+    let focus = crate::voice_focus::resolve(dir.as_deref())?;
+    Ok((allowed_dialects, focus))
+}
+
+fn reviewer_policy_allows(
+    allowed_dialects: Option<&[String]>,
+    focus: Option<&HashSet<String>>,
+    segment: &SpeechSegment,
+) -> bool {
+    crate::dialect::reviewer_may_judge(allowed_dialects, &segment.audio_path)
+        && focus.map_or(true, |ids| ids.contains(&segment.id))
+}
+
 /// Pending (unverified) clips, oldest first — the same "work that needs doing" the desktop queue leads
 /// with — MINUS anything another reviewer currently holds, and leased to this reviewer on the way out.
 ///
@@ -1680,17 +1731,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // reviewer at work the file was written to keep them off; the page treats >=500 as retryable and
     // shows the status, so the line stops loudly and the very next fetch after the owner fixes the
     // file works. A MISSING file is still "no restriction", exactly as before either file existed.
-    let dir = { lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone()) };
-    let allowed_dialects: Option<Vec<String>> = match dir.as_ref().map(|d| crate::dialect::load_roster(d)) {
-        Some(Err(e)) => return err_reply(503, &format!("policy file broken, no clips served: {e}")),
-        // Matched the way the session layer matches names (trim + ASCII case), never an exact
-        // HashMap::get — a roster key that binds nobody is the wrong-dialect incident returning.
-        Some(Ok(roster)) => crate::dialect::allowed_for(&roster, reviewer).cloned(),
-        None => None,
-    };
-    let focus = match crate::voice_focus::resolve(dir.as_deref()) {
+    let (allowed_dialects, focus) = match reviewer_policy(reviewer, state) {
         Err(e) => return err_reply(503, &e),
-        Ok(f) => f,
+        Ok(policy) => policy,
     };
     let pending_ids = match db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_deref()) {
         Ok(ids) => ids,
@@ -1738,6 +1781,11 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // Spot checks are inserted after the loop above, so the skip filter in that loop never sees them —
     // without passing this along, a check somebody skipped was re-inserted into every batch forever.
     let skipped_by_me = guard.skipped.get(reviewer).cloned().unwrap_or_default();
+    // A persisted session is the production paid-review path. Ephemeral test/dev callers preserve
+    // their historical best-effort behaviour, while a real durable reviewer link must never receive
+    // unmeasured work after its hidden-key pool runs dry.
+    let require_complete_spot_checks =
+        guard.session_store.is_some() && (!guard.pairing_codes.is_empty() || !guard.reviewers.is_empty());
     drop(guard);
 
     // Hydrate ONLY what is being served — at most QUEUE_BATCH rows — and do it OUTSIDE the state lock,
@@ -1781,8 +1829,30 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // something. A reviewer must not be able to coast just because their batches came out short.
         let wanted = queue.len().div_ceil(SPOT_CHECK_EVERY);
         let work_len = queue.len();
-        match db.list_spot_check_candidates(wanted, reviewer, &skipped_by_me, allowed_dialects.as_deref()) {
+        match db.list_spot_check_candidates(
+            wanted,
+            reviewer,
+            &skipped_by_me,
+            allowed_dialects.as_deref(),
+            focus.as_deref(),
+        ) {
             Ok(candidates) => {
+                if require_complete_spot_checks && candidates.len() < wanted {
+                    // These work ids were leased above but no batch is being served. Release only
+                    // this reviewer's batch so another request is not told the work is held while
+                    // every reviewer is correctly paused on the same quality-capacity failure.
+                    let mut guard = lock_state(state);
+                    for id in &serving {
+                        if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
+                            guard.leases.remove(id);
+                        }
+                    }
+                    return err_reply(
+                        503,
+                        "Review is temporarily paused because quality-control capacity is unavailable. \
+                         Retry after the owner adds genuine adjudicated answer keys.",
+                    );
+                }
                 let mut guard = lock_state(state);
                 let mut grew = false;
                 for (idx, (seg, _)) in candidates.into_iter().enumerate() {
@@ -1822,24 +1892,24 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 }
                 // Persist the grown served-set into the remembered session (phase 4): a check served
                 // now may be answered AFTER an app restart, and it must still be scored then rather
-                // than 409ing the reviewer. Snapshot under the lock, write outside it — save_session
-                // does DPAPI + file IO, which has no business inside the request-path mutex.
-                let persist = if grew {
-                    let persisted_pairing_codes = durable_pairing_codes(&guard);
-                    let sessions = snapshot_live_sessions(&guard);
-                    guard
-                        .session_store
-                        .clone()
-                        .map(|s| (s, persisted_pairing_codes, guard.spot_checks.clone(), sessions))
-                } else {
-                    None
-                };
+                // than 409ing the reviewer. The persistence helper snapshots after taking the global
+                // ordering lock, so an older queue save cannot overwrite a later credential revoke.
                 drop(guard);
-                if let Some(((dir, db_path), reviewers, checks, sessions)) = persist {
-                    let _ = save_session(&dir, &reviewers, &db_path, &checks, &sessions);
+                if grew {
+                    persist_session_state(state);
                 }
             }
-            // A spot check is a quality measure, never a reason to stop a reviewer working.
+            Err(e) if require_complete_spot_checks => {
+                let mut guard = lock_state(state);
+                for id in &serving {
+                    if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
+                        guard.leases.remove(id);
+                    }
+                }
+                return err_reply(503, &format!("Review is temporarily paused: quality-control check failed: {e}"));
+            }
+            // Ephemeral test/dev sessions retain best-effort behavior; production durable sessions
+            // take the fail-closed arms above.
             Err(e) => tracing::warn!("Couch Review spot-check selection failed: {e}"),
         }
     }
@@ -2145,8 +2215,7 @@ struct DecisionBody {
     /// queue payload carries it and the page echoes it back, so a decision made against a draft
     /// that a background writer replaced in between is refused rather than recorded — the accept/
     /// edit classification and the DPO pair are only meaningful against the text the reviewer saw.
-    /// Optional for one deploy generation: a page from before this field exists sends nothing and
-    /// is fenced only by the existing verified/lease guards.
+    /// Required for every verdict. `skip` is the sole exemption because it writes no judgement.
     #[serde(default, rename = "rowVersion")]
     row_version: Option<String>,
     /// Cumulative MEDIA time the page actually advanced through this clip, in ms.
@@ -2234,6 +2303,71 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         );
     }
 
+    // A completed hidden check never changes the corpus row, so the corpus duplicate predicate above
+    // cannot recognize its retry. The served-check set persists across restart and the DB result is
+    // first-answer immutable; once both say this reviewer already answered, every replay is a pure ACK.
+    // This must be before the new-write rowVersion guard so an outbox created by the previous page build
+    // can drain, and before `audit` so retries cannot append another pay-shaped generic review event.
+    let was_served_as_spot_check = {
+        let guard = lock_state(state);
+        guard.spot_checks.contains(&(parsed.id.clone(), reviewer.to_string()))
+    };
+    let still_has_answer_key = prev.verified
+        && !crate::quality::is_human_rejected(&prev)
+        && crate::quality::human_verified_text(&prev).is_some();
+    if was_served_as_spot_check && still_has_answer_key {
+        match db.has_spot_check_result(&parsed.id, reviewer) {
+            Ok(true) => {
+                return json_reply(
+                    200,
+                    serde_json::json!({ "ok": true, "reviewedMs": db.reviewed_audio_ms(reviewer).unwrap_or(0) }),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => return err_reply(500, &format!("spot-check retry lookup failed: {error}")),
+        }
+    }
+
+    // A NEW (or half-written) verdict without the serve-time revision has no proof of which draft the
+    // reviewer judged. Reject it before minting playback evidence, claiming a lease, scoring a hidden
+    // check, writing an audit event, or touching the corpus. The completed identical retry above is
+    // deliberately earlier: acknowledging bytes that are already durably stored writes nothing and
+    // lets an outbox created by the immediately previous phone build drain safely after deployment.
+    // Spot checks still require a parseable stamp, though their stamp is not compared for freshness
+    // because grading never mutates the answer-key row. A skip remains the only mutating-flow
+    // exemption because it writes no verdict.
+    let served_revision = if parsed.action == "skip" {
+        None
+    } else {
+        let Some(stamp) = parsed.row_version.as_deref() else {
+            return err_reply(400, "rowVersion is required — reload this clip before deciding");
+        };
+        let Ok(revision) = stamp.parse::<i64>() else {
+            return err_reply(400, "rowVersion is invalid — reload this clip before deciding");
+        };
+        Some(revision)
+    };
+
+    // WRITE-TIME AUTHORIZATION. Queue filtering alone is not a security boundary: an outbox can
+    // retain an old id after the owner changes reviewer_dialects.json / voice_focus.json, and a valid
+    // bearer can POST any known id without fetching `/api/queue`. Re-read both hot policies for every
+    // non-duplicate submit and refuse before ANY state or database write. An identical lost-response
+    // retry above is only an acknowledgement of a write that already committed, so it needs no new
+    // authorization and remains idempotent.
+    let (allowed_dialects, focus) = match reviewer_policy(reviewer, state) {
+        Ok(policy) => policy,
+        Err(e) => return err_reply(503, &e),
+    };
+    if !reviewer_policy_allows(allowed_dialects.as_deref(), focus.as_deref(), &prev) {
+        // If policy changed after this reviewer was served the clip, release only THEIR lease so it
+        // can immediately return to an eligible reviewer. Never disturb somebody else's live work.
+        let mut guard = lock_state(state);
+        if guard.holder(&parsed.id, Instant::now()).is_some_and(|who| who == reviewer) {
+            guard.leases.remove(&parsed.id);
+        }
+        return err_reply(403, "this clip is outside your current review assignment — reload your queue");
+    }
+
     // SPOT-CHECK DETECTION, hoisted above the version fence (2026-08-20 hunt). Grading a check
     // writes NOTHING to the corpus row, so a revision bump between serve and submit cannot
     // invalidate it — and bulk metadata runs (a rights stamp, a re-annotation) bump every GOLD
@@ -2245,14 +2379,24 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         let key = (parsed.id.clone(), reviewer.to_string());
         if !guard.spot_checks.contains(&key) {
             None
-        } else if let Some(answer) = crate::quality::human_verified_text(&prev) {
-            Some(answer.to_string())
         } else {
-            // The answer key is gone — the thing that made this a check. Drop the stale pair so it
-            // cannot swallow this clip again, and treat the submit as what it is: real work.
-            guard.spot_checks.remove(&key);
-            tracing::info!("Couch Review: stale spot check for {} dropped — the human answer key is gone", parsed.id);
-            None
+            let answer = if crate::quality::is_human_rejected(&prev) {
+                None
+            } else {
+                crate::quality::human_verified_text(&prev)
+            };
+            if let Some(answer) = answer {
+                Some(answer.to_string())
+            } else {
+                // The answer key is gone — the thing that made this a check. Drop the stale pair so it
+                // cannot swallow this clip again, and treat the submit as what it is: real work.
+                guard.spot_checks.remove(&key);
+                tracing::info!(
+                    "Couch Review: stale spot check for {} dropped — the human answer key is gone",
+                    parsed.id
+                );
+                None
+            }
         }
     };
 
@@ -2278,13 +2422,8 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // Neither exemption can manufacture evidence: the mint below re-verifies the revision
     // atomically and simply declines the receipt when the row has moved.
     if !already_recorded && parsed.action != "skip" && expected_key.is_none() {
-        if let Some(served_stamp) = parsed.row_version.as_deref() {
-            let Ok(served_revision) = served_stamp.parse::<i64>() else {
-                return err_reply(409, "this clip was served by an older page — reload for the fresh draft");
-            };
-            if served_revision != request_revision {
-                return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
-            }
+        if served_revision != Some(request_revision) {
+            return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
         }
     }
 
@@ -2480,9 +2619,14 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     if let Some(expected) = expected_key {
         let submitted = text.as_deref().unwrap_or_default();
         if let Err(e) = db.record_spot_check(&parsed.id, reviewer, decision, submitted, &expected) {
-            // Losing a score must not cost the reviewer their place in the queue: answer normally and
-            // let the missing row show up as a smaller `checks` count rather than as a failed save.
             tracing::warn!("Couch Review spot-check not recorded for {}: {e}", parsed.id);
+            // A 200 removes this decision from the phone's durable outbox forever. If the score did
+            // not commit, success would silently discard the first answer and let a later attempt
+            // replace the measurement. Return the same retryable 5xx class used by ordinary decision
+            // write failures; keep the client-facing text generic so the hidden check stays hidden.
+            // The retry is safe: record_spot_check is first-answer immutable, and the early completed-
+            // check ACK above absorbs every replay once the insert has committed.
+            return err_reply(500, "decision not recorded — retrying is safe");
         }
         audit(db, decision);
         // A spot check is audited like any other decision (see `audit` above — it IS work to the
@@ -2734,6 +2878,28 @@ mod tests {
         }
     }
 
+    /// Existing endpoint tests model the current phone, which always echoes the queue's rowVersion.
+    /// Add that protocol field when a test is about some OTHER property; tests of the mandatory-field
+    /// fence call `super::api_decision` directly. Explicit stamps (especially stale ones) are preserved.
+    fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+        let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return super::api_decision(db, body, reviewer, state);
+        };
+        let action = payload.get("action").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let verdict = matches!(action, "accept" | "edit" | "bad");
+        if verdict && payload.get("rowVersion").is_none() {
+            let stamp = payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| db.segment_row_stamp(id).ok().flatten());
+            if let (Some(stamp), Some(object)) = (stamp, payload.as_object_mut()) {
+                object.insert("rowVersion".to_string(), serde_json::Value::String(stamp));
+            }
+        }
+        let encoded = payload.to_string();
+        super::api_decision(db, encoded.as_bytes(), reviewer, state)
+    }
+
     #[test]
     fn the_phone_never_serves_a_spot_check_its_own_answer_key() {
         // Pins the reason review_text must NOT delegate to quality::effective_transcript. On a gold
@@ -2914,6 +3080,146 @@ mod tests {
         .unwrap();
         let (code, ..) = api_queue(&db, "Sara", &state);
         assert_eq!(code, 200, "a repaired policy file must serve on the next fetch, no restart");
+    }
+
+    #[test]
+    fn every_verdict_requires_row_version_while_skip_remains_exempt() {
+        for action in ["accept", "edit", "bad"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (db, _) = test_db(tmp.path());
+            db.insert_segment(&seg("revision_required", "دەقی خاو")).unwrap();
+            let state = state();
+            let body = serde_json::json!({
+                "id": "revision_required",
+                "action": action,
+                "text": "دەقی خاو",
+                "heardMs": 600_000,
+            });
+
+            let (code, _, message, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            assert_eq!(code, 400, "{action} without rowVersion must be refused");
+            assert!(String::from_utf8_lossy(&message).contains("rowVersion"));
+            let row = db.get_segment_by_id("revision_required").unwrap().unwrap();
+            assert!(!row.verified && row.human_decision.is_none(), "a protocol refusal must not decide the row");
+            let receipts: i64 =
+                db.connection().query_row("SELECT COUNT(*) FROM playback_receipts", [], |r| r.get(0)).unwrap();
+            let events: i64 =
+                db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |r| r.get(0)).unwrap();
+            assert_eq!((receipts, events), (0, 0), "the fence must run before every verdict-side write");
+            assert!(lock_state(&state).leases.is_empty());
+            assert!(lock_state(&state).undo.values().all(Vec::is_empty));
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("skip_without_revision", "دەقی خاو")).unwrap();
+        let state = state();
+        let skip = serde_json::json!({"id": "skip_without_revision", "action": "skip"});
+        assert_eq!(
+            super::api_decision(&db, skip.to_string().as_bytes(), "Sara", &state).0,
+            200,
+            "skip writes no verdict and remains the only rowVersion exemption"
+        );
+        let row = db.get_segment_by_id("skip_without_revision").unwrap().unwrap();
+        assert!(!row.verified && row.human_decision.is_none());
+    }
+
+    #[test]
+    fn a_spot_check_still_requires_row_version_before_it_can_be_scored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        gold_seg(&db, "spot_revision", "دەقی هەڵە", "دەقی ڕاست");
+        let state = Mutex::new(CouchState {
+            spot_checks: HashSet::from([("spot_revision".to_string(), "Sara".to_string())]),
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            ..CouchState::default()
+        });
+        let body = serde_json::json!({
+            "id": "spot_revision",
+            "action": "edit",
+            "text": "دەقی ڕاست",
+            "heardMs": 600_000,
+        });
+        let (code, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 400, "a hidden check is still a verdict and must carry the served revision");
+        assert!(db.spot_check_report().unwrap().is_empty(), "the missing-field refusal must not score the reviewer");
+    }
+
+    #[test]
+    fn a_decision_reloads_dialect_and_focus_policy_before_any_write() {
+        // A known, UNLEASED Hawleri id cannot be posted directly by a Sorani-only reviewer.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let (db, db_path) = test_db(tmp.path());
+            db.insert_segment(&seg("KBHP_direct", "دەقی خاو")).unwrap();
+            std::fs::write(tmp.path().join("reviewer_dialects.json"), r#"{"Sara":["sorani"]}"#).unwrap();
+            let state = Mutex::new(CouchState {
+                session_store: Some((tmp.path().to_path_buf(), db_path)),
+                ..CouchState::default()
+            });
+            assert!(lock_state(&state).leases.is_empty(), "the client never fetched this id");
+            let body = serde_json::json!({
+                "id": "KBHP_direct",
+                "action": "accept",
+                "text": "دەقی خاو",
+                "heardMs": 600_000,
+                "rowVersion": db.segment_row_stamp("KBHP_direct").unwrap().unwrap(),
+            });
+            let (code, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            assert_eq!(code, 403, "queue filtering must not be the only dialect authorization check");
+            let row = db.get_segment_by_id("KBHP_direct").unwrap().unwrap();
+            assert!(!row.verified && row.human_decision.is_none());
+            let writes: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM playback_receipts) + (SELECT COUNT(*) FROM review_events)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(writes, 0, "denial must precede receipts and audit/pay events");
+            assert!(lock_state(&state).leases.is_empty() && lock_state(&state).undo.values().all(Vec::is_empty));
+        }
+
+        // A clip that WAS validly served is refused if the owner removes it from focus before submit.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let (db, db_path) = test_db(tmp.path());
+            db.insert_segment(&seg("focus_old", "دەقی یەک")).unwrap();
+            db.insert_segment(&seg("focus_new", "دەقی دوو")).unwrap();
+            std::fs::write(tmp.path().join("voice_focus.json"), r#"{"name":"V","segment_ids":["focus_old"]}"#).unwrap();
+            let state = Mutex::new(CouchState {
+                session_store: Some((tmp.path().to_path_buf(), db_path)),
+                ..CouchState::default()
+            });
+            assert_eq!(queue_ids(&db, "Sara", &state), vec!["focus_old".to_string()]);
+            let served = db.segment_row_stamp("focus_old").unwrap().unwrap();
+            std::fs::write(tmp.path().join("voice_focus.json"), r#"{"name":"V","segment_ids":["focus_new"]}"#).unwrap();
+            let body = serde_json::json!({
+                "id": "focus_old",
+                "action": "accept",
+                "text": "دەقی یەک",
+                "heardMs": 600_000,
+                "rowVersion": served,
+            });
+            let (code, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            assert_eq!(code, 403, "the decision must obey the focus that is current at submit time");
+            let row = db.get_segment_by_id("focus_old").unwrap().unwrap();
+            assert!(!row.verified && row.human_decision.is_none());
+            assert!(
+                lock_state(&state).holder("focus_old", Instant::now()).is_none(),
+                "policy denial releases the stale owner's lease for an eligible reviewer"
+            );
+            let writes: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM playback_receipts) + (SELECT COUNT(*) FROM review_events)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(writes, 0, "focus denial must precede every database side effect");
+        }
     }
 
     /// A drained VOICE FOCUS is a restriction, not completion (2026-08-20 hunt): with the queue
@@ -3476,6 +3782,7 @@ mod tests {
 
         // It was handed to Sara as a check while it was still verified.
         lock_state(&state).spot_checks.insert(("g1".to_string(), "Sara".to_string()));
+        db.record_spot_check("g1", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
 
         // The owner then un-verifies it, so it is pending work again and no longer an answer key.
         let mut reopened = db.get_segment_by_id("g1").unwrap().unwrap();
@@ -4016,6 +4323,27 @@ mod tests {
         };
         assert_eq!(pairs("r1"), 1, "the edit produced exactly one learning pair");
 
+        // Rolling deployment compatibility: an outbox entry created by the immediately previous
+        // page build has no rowVersion. If its response was lost but the write committed, the exact
+        // stored decision is safe to ACK — it performs no mutation. A different/new verdict without
+        // the stamp is still refused by the mandatory-version test above.
+        let legacy_retry = serde_json::json!({
+            "heardMs": 600_000,
+            "id": "r1",
+            "action": "edit",
+            "text": "دەقی ڕاستکراوە",
+        });
+        let events_before: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        let (code, _, body, ..) = super::api_decision(&db, legacy_retry.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 200, "a completed identical legacy retry must drain safely after deployment");
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["duplicate"], true);
+        assert_eq!(pairs("r1"), 1, "the legacy retry must not add a learning pair");
+        let events_after: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        assert_eq!(events_after, events_before, "an acknowledged retry must not append an audit/pay event");
+
         // The identical resubmit — the retry — must be answered as already-done.
         let (code, _, body, ..) = api_decision(&db, edit.as_bytes(), "Sara", &state);
         assert_eq!(code, 200, "a retry must succeed, not error");
@@ -4127,6 +4455,35 @@ mod tests {
     }
 
     #[test]
+    fn durable_review_pauses_instead_of_serving_work_after_quality_keys_run_dry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("paid-work", "دەقی کار")).unwrap();
+        let state = Mutex::new(CouchState {
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            pairing_codes: HashMap::from([("test-token".to_string(), "Sara".to_string())]),
+            ..CouchState::default()
+        });
+
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 503, "a durable paid-review session must fail closed when its hidden pool is empty");
+        assert!(
+            String::from_utf8_lossy(&body).contains("quality-control capacity"),
+            "the reviewer gets a retryable operational reason, not a fake empty/success queue"
+        );
+        assert!(
+            lock_state(&state).leases.is_empty(),
+            "a batch refused before delivery must release its work leases immediately"
+        );
+
+        gold_seg(&db, "quality-key", "دەقی هەڵە", "دەقی ڕاست");
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 200, "adding a genuine answer key unpauses the next fetch without a restart");
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["items"].as_array().unwrap().len(), 2, "one work clip plus its required hidden check");
+    }
+
+    #[test]
     fn spot_checks_catch_a_blind_accepter_without_touching_the_corpus() {
         // P2.1 — the item the whole remote-review plan turns on. Once review is handed to other
         // people the dominant failure mode is a human tapping "accept" without listening, and nothing
@@ -4140,7 +4497,7 @@ mod tests {
         gold_seg(&db, "g2", "دەقی هەڵەی دوو", "دەقی ڕاستی دوو");
         let state = state();
 
-        let candidates = db.list_spot_check_candidates(10, "Sara", &HashSet::new(), None).unwrap();
+        let candidates = db.list_spot_check_candidates(10, "Sara", &HashSet::new(), None, None).unwrap();
         assert_eq!(candidates.len(), 2, "both clips have a human answer that differs from the raw draft");
         // A check is graded only because it was SERVED as one; mark both as served to each reviewer,
         // which is exactly what api_queue records when it salts a batch.
@@ -4178,15 +4535,96 @@ mod tests {
         assert_eq!(row.annotated_transcript, None, "and must not write the reviewer's text into the corpus");
         assert!(lock_state(&state).undo.get("Hemn").is_none_or(Vec::is_empty), "nor leave an undo entry");
 
-        // A retry must not inflate a score: the row is keyed (segment, reviewer) and upserts.
-        assert_eq!(api_decision(&db, blind.as_bytes(), "Hemn", &state).0, 200);
+        // A retry from the immediately previous page build may have no rowVersion. The immutable score
+        // is already durable, so acknowledge it without appending another generic pay-shaped event.
+        let events_before: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        assert_eq!(super::api_decision(&db, blind.as_bytes(), "Hemn", &state).0, 200);
         assert_eq!(of("Hemn").checks, 1, "a retried spot check is still ONE check, not two");
+        let events_after: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        assert_eq!(events_after, events_before, "a retried hidden check must not append another audit/pay event");
 
-        // Rejecting counts as noticing — judging a clip unusable is attention, not a blind accept.
+        // This is a known-valid answer key. Rejecting it is wrong, and must not make a reject-spammer
+        // look trustworthy merely because they avoided the Accept button.
         let reject = serde_json::json!({"heardMs": 600_000, "id": "g2", "action": "bad"}).to_string();
         assert_eq!(api_decision(&db, reject.as_bytes(), "Hemn", &state).0, 200);
         let hemn = of("Hemn");
-        assert_eq!((hemn.checks, hemn.noticed), (2, 1), "the reject scored as noticed");
+        assert_eq!((hemn.checks, hemn.noticed), (2, 0), "rejecting a known-valid clip must fail the check");
+
+        // The first answer is the measurement. A later replay with a corrected answer cannot erase
+        // the evidence that the reviewer originally blind-accepted this hidden check.
+        let events_before_improve: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        let improve =
+            serde_json::json!({"heardMs": 600_000, "id": "g1", "action": "edit", "text": "دەقی ڕاست"}).to_string();
+        assert_eq!(api_decision(&db, improve.as_bytes(), "Hemn", &state).0, 200);
+        let hemn = of("Hemn");
+        assert_eq!((hemn.checks, hemn.noticed), (2, 0), "a replay cannot improve an immutable first score");
+        let events_after_improve: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            events_after_improve, events_before_improve,
+            "a changed replay is still a no-op after the first score"
+        );
+    }
+
+    #[test]
+    fn a_spot_check_write_failure_is_retryable_and_never_claimed_saved() {
+        // A score is the hidden check's only durable result. Returning 200 when that INSERT fails
+        // makes the phone delete its outbox entry, permanently loses the first answer, and lets a
+        // later attempt become the measurement. Force precisely that INSERT to fail without a busy
+        // timeout, then prove the same queued payload lands once the database recovers.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        gold_seg(&db, "score-failure", "دەقی هەڵە", "دەقی ڕاست");
+        let state = state();
+        lock_state(&state).spot_checks.insert(("score-failure".to_string(), "Sara".to_string()));
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER force_spot_score_failure
+                 BEFORE INSERT ON spot_checks
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced score write failure');
+                 END;",
+            )
+            .unwrap();
+
+        let body = serde_json::json!({
+            "heardMs": 600_000,
+            "id": "score-failure",
+            "action": "edit",
+            "text": "دەقی ڕاست",
+        })
+        .to_string();
+        let event_count = || -> i64 {
+            db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap()
+        };
+        let events_before = event_count();
+
+        let (code, _, response, ..) = api_decision(&db, body.as_bytes(), "Sara", &state);
+        assert_eq!(code, 500, "an unpersisted score is a retryable server failure, never success");
+        let message = String::from_utf8_lossy(&response);
+        assert!(message.contains("decision not recorded"));
+        assert!(!message.to_ascii_lowercase().contains("spot"), "the failure response must not reveal a hidden check");
+        assert!(db.spot_check_report().unwrap().is_empty(), "the forced failure must leave no partial score");
+        assert_eq!(event_count(), events_before, "an unpersisted score must not append an audit/pay event");
+        let key = db.get_segment_by_id("score-failure").unwrap().unwrap();
+        assert_eq!(key.verdict_transcript.as_deref(), Some("دەقی ڕاست"), "the answer-key row stays untouched");
+
+        db.connection().execute_batch("DROP TRIGGER force_spot_score_failure").unwrap();
+        assert_eq!(api_decision(&db, body.as_bytes(), "Sara", &state).0, 200, "the queued retry must land");
+        let report = db.spot_check_report().unwrap();
+        assert_eq!((report.len(), report[0].checks, report[0].noticed), (1, 1, 1));
+        let events_after_success = event_count();
+        assert_eq!(events_after_success, events_before + 1, "one landed first answer produces one audit event");
+
+        // Model the rolling-deploy outbox: the original payload has no rowVersion. Once the score is
+        // durable, the pre-version duplicate ACK must drain it without another score or event.
+        assert_eq!(super::api_decision(&db, body.as_bytes(), "Sara", &state).0, 200);
+        let report = db.spot_check_report().unwrap();
+        assert_eq!((report[0].checks, report[0].noticed), (1, 1));
+        assert_eq!(event_count(), events_after_success, "a completed retry is side-effect free");
     }
 
     #[test]
@@ -5248,6 +5686,75 @@ mod tests {
     }
 
     #[test]
+    fn an_older_session_snapshot_cannot_resurrect_a_concurrently_revoked_reviewer() {
+        // The previous revoke fix made the one obvious path durable, but save sites still followed
+        // this order: snapshot state -> write later. If another request took its snapshot before the
+        // revoke, paused, and wrote after the revoke's newer file, it resurrected the lost phone on
+        // restart. Hold that exact old snapshot in the test while revoke tries to run.
+        let tmp = tempfile::tempdir().unwrap();
+        let (_db, db_path) = test_db(tmp.path());
+        let issued = SystemTime::now();
+        let state = Arc::new(Mutex::new(CouchState {
+            pairing_codes: HashMap::from([
+                ("pair-sara".to_string(), "Sara".to_string()),
+                ("pair-hemn".to_string(), "Hemn".to_string()),
+            ]),
+            reviewers: HashMap::from([
+                ("session-sara".to_string(), "Sara".to_string()),
+                ("session-hemn".to_string(), "Hemn".to_string()),
+            ]),
+            session_issued: HashMap::from([("session-sara".to_string(), issued), ("session-hemn".to_string(), issued)]),
+            session_store: Some((tmp.path().to_path_buf(), db_path.clone())),
+            ..CouchState::default()
+        }));
+        persist_session_state(&state);
+
+        let (snapshotted_tx, snapshotted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old_writer_state = state.clone();
+        let old_writer = std::thread::spawn(move || {
+            persist_session_state_with_hook(&old_writer_state, || {
+                snapshotted_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        snapshotted_rx.recv_timeout(Duration::from_secs(2)).expect("old save reached its paused snapshot");
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let revoke_state = state.clone();
+        let revoker = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            result_tx.send(revoke_in(&revoke_state, "Sara")).unwrap();
+        });
+        attempted_rx.recv_timeout(Duration::from_secs(2)).expect("revoke thread started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "revoke must wait behind an older in-flight persistence transaction"
+        );
+
+        release_tx.send(()).unwrap();
+        old_writer.join().unwrap();
+        result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("revoke completed after old save")
+            .expect("revoke succeeds");
+        revoker.join().unwrap();
+
+        let remembered = load_session(tmp.path(), &db_path).expect("final session file loads");
+        assert!(
+            !remembered.pairing.values().any(|name| name == "Sara"),
+            "the stale snapshot must never restore the revoked pairing token"
+        );
+        assert!(
+            !remembered.sessions.values().any(|(name, _)| name == "Sara"),
+            "the stale snapshot must never restore the revoked cookie session"
+        );
+        assert_eq!(remembered.pairing.values().filter(|name| name.as_str() == "Hemn").count(), 1);
+        assert_eq!(remembered.sessions.values().filter(|(name, _)| name == "Hemn").count(), 1);
+    }
+
+    #[test]
     fn release_listener_gives_up_in_bounded_time_when_the_port_never_frees() {
         // `stop_couch_review` is a SYNC #[tauri::command], so it runs on the UI thread — and
         // release_listener retries. The happy path returns on the first attempt (measured 6-28 ms in
@@ -5585,7 +6092,7 @@ mod tests {
         let join = spawn_server_loop(0, server.clone(), db_path.clone(), state.clone(), shutdown.clone()).unwrap();
         let base = format!("http://127.0.0.1:{port}");
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
-        let fetch = || -> Vec<String> {
+        let fetch = || -> Vec<serde_json::Value> {
             let q: serde_json::Value = agent
                 .get(&format!("{base}/api/queue"))
                 .set("Cookie", &cookie_for("tok"))
@@ -5593,15 +6100,22 @@ mod tests {
                 .unwrap()
                 .into_json()
                 .unwrap();
-            q["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect()
+            q["items"].as_array().unwrap().clone()
         };
 
         let first = fetch();
         assert!(first.len() >= 10, "need a real batch, got {}", first.len());
         // Decide the first five, then "reload" — a bare re-fetch, which is exactly what load() does.
-        for id in first.iter().take(5) {
-            let body = serde_json::json!({"heardMs": 600_000,  "id": id, "action": "accept", "text": "دەقی سەرەتایی" })
-                .to_string();
+        for item in first.iter().take(5) {
+            let id = item["id"].as_str().unwrap();
+            let body = serde_json::json!({
+                "heardMs": 600_000,
+                "id": id,
+                "action": "accept",
+                "text": "دەقی سەرەتایی",
+                "rowVersion": item["rowVersion"],
+            })
+            .to_string();
             let status = agent
                 .post(&format!("{base}/api/decision"))
                 .set("Cookie", &cookie_for("tok"))
@@ -5619,12 +6133,15 @@ mod tests {
 
         // NO decided clip may come back. This is the assertion that protects the reviewer from being
         // asked to judge the same audio twice.
-        for id in first.iter().take(5) {
-            assert!(!after.contains(id), "{id} was decided, yet the reload served it again");
+        let after_ids: HashSet<&str> = after.iter().filter_map(|item| item["id"].as_str()).collect();
+        for item in first.iter().take(5) {
+            let id = item["id"].as_str().unwrap();
+            assert!(!after_ids.contains(id), "{id} was decided, yet the reload served it again");
         }
         // The UNDECIDED remainder of the same batch must still be theirs — the reload must not abandon
         // in-progress work for a fresh batch, which is the whole reason api_queue preserves own leases.
-        let kept = first.iter().skip(5).filter(|id| after.contains(id)).count();
+        let kept =
+            first.iter().skip(5).filter_map(|item| item["id"].as_str()).filter(|id| after_ids.contains(id)).count();
         assert_eq!(
             kept,
             first.len() - 5,
@@ -5668,9 +6185,15 @@ mod tests {
             let join = spawn_server_loop(0, server.clone(), db_path, state.clone(), shutdown.clone()).expect("spawn");
             (server, port, shutdown, join)
         };
-        let submit = |port: u16, id: &str| -> u16 {
-            let body = serde_json::json!({"heardMs": 600_000,  "id": id, "action": "accept", "text": "دەقی سەرەتایی" })
-                .to_string();
+        let submit = |port: u16, id: &str, row_version: &serde_json::Value| -> u16 {
+            let body = serde_json::json!({
+                "heardMs": 600_000,
+                "id": id,
+                "action": "accept",
+                "text": "دەقی سەرەتایی",
+                "rowVersion": row_version,
+            })
+            .to_string();
             match agent
                 .post(&format!("http://127.0.0.1:{port}/api/decision"))
                 .set("Cookie", &cookie_for("tok"))
@@ -5691,11 +6214,15 @@ mod tests {
             .unwrap()
             .into_json()
             .unwrap();
-        let held: Vec<String> =
-            queue["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+        let held: Vec<(String, serde_json::Value)> = queue["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| (i["id"].as_str().unwrap().to_string(), i["rowVersion"].clone()))
+            .collect();
         assert!(held.len() >= 10, "need a real batch to interrupt, got {}", held.len());
-        for id in held.iter().take(5) {
-            assert_eq!(submit(port, id), 200, "pre-restart decision {id} must land");
+        for (id, row_version) in held.iter().take(5) {
+            assert_eq!(submit(port, id, row_version), 200, "pre-restart decision {id} must land");
             decided.push(id.clone());
         }
 
@@ -5708,14 +6235,14 @@ mod tests {
         let (server2, port2, shutdown2, join2) = boot(db_path.clone());
         // The phone does NOT refetch — it works through the queue it already had, which is exactly what
         // a page mid-batch does. Every remaining clip must still be accepted.
-        for id in held.iter().skip(5) {
-            let code = submit(port2, id);
+        for (id, row_version) in held.iter().skip(5) {
+            let code = submit(port2, id, row_version);
             assert_eq!(code, 200, "post-restart decision {id} must still land, got {code}");
             decided.push(id.clone());
         }
         // And a REPLAY of a pre-restart decision must be recognised as already-done, not recorded twice
         // — the retry guard reads the row, not process memory, so it has to survive the restart.
-        let replay = submit(port2, &decided[0]);
+        let replay = submit(port2, &decided[0], &held[0].1);
         assert_eq!(replay, 200, "an outbox replay across a restart must be answered as already-done");
 
         shutdown2.store(true, Ordering::SeqCst);
@@ -5800,9 +6327,14 @@ mod tests {
             }
             for item in items {
                 let id = item["id"].as_str().unwrap().to_string();
-                let body =
-                    serde_json::json!({"heardMs": 600_000,  "id": id, "action": "accept", "text": item["text"] })
-                        .to_string();
+                let body = serde_json::json!({
+                    "heardMs": 600_000,
+                    "id": id,
+                    "action": "accept",
+                    "text": item["text"],
+                    "rowVersion": item["rowVersion"],
+                })
+                .to_string();
                 // THROTTLING IS PART OF THE TEST, not an obstacle to it. A machine-speed drain burns
                 // the couch limiter's 60-token burst and then rides its 120/second refill, which is
                 // exactly what a phone in a reload loop does — and the first run of this soak hit 429
@@ -5913,6 +6445,7 @@ mod tests {
                         for item in items {
                             let body = serde_json::json!({"heardMs": 600_000, 
                                 "id": item["id"], "action": "edit", "text": format!("{} ✓", item["text"].as_str().unwrap_or("x")),
+                                "rowVersion": item["rowVersion"],
                             })
                             .to_string();
                             // Returns (ok, throttled) rather than ureq's Result: clippy flags a
@@ -6080,12 +6613,24 @@ mod tests {
 
         // A phone decision over real HTTP verifies the row in the real db file, under the right name.
         let mine = sara_ids[0];
+        let mine_item = sara["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == mine)
+            .expect("the selected queue item still carries its rowVersion");
         let resp = agent
             .post(&format!("{base}/api/decision"))
             .set("Cookie", &cookie_for("saratoken123"))
             .send_string(
-                &serde_json::json!({"heardMs": 600_000, "id": mine, "action": "accept", "text": "دەقی تاقیکردنەوە"})
-                    .to_string(),
+                &serde_json::json!({
+                    "heardMs": 600_000,
+                    "id": mine,
+                    "action": "accept",
+                    "text": "دەقی تاقیکردنەوە",
+                    "rowVersion": mine_item["rowVersion"],
+                })
+                .to_string(),
             )
             .unwrap();
         assert_eq!(resp.status(), 200);
