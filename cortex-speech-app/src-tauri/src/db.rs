@@ -3114,6 +3114,9 @@ impl Database {
             "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
              WHERE verified = 1 AND raw_transcript <> '' AND (is_gold = 1 OR reviewed_by IS NULL)
                AND id NOT IN (SELECT segment_id FROM spot_checks WHERE reviewer = ?1)
+               AND id NOT IN (
+                   SELECT segment_id FROM review_events WHERE reviewer = ?1 COLLATE NOCASE
+               )
              ORDER BY id ASC"
         );
         let mut stmt = self.conn.prepare(&query)?;
@@ -3768,6 +3771,35 @@ impl Database {
                 return Err(AppError::Validation(format!(
                     "controlled-review hidden-key reservation exceeds reviewer quota {required_quota}"
                 )));
+            }
+
+            // A hidden quality check must be blind. The append-only event log—not reviewed_by on
+            // the mutable segment row—is the durable evidence that this reviewer has heard a clip.
+            // Allow only this pilot's own post-baseline hidden result (or its legacy skip path) when
+            // rehydrating a completed reservation; any ordinary or older encounter makes the key
+            // ineligible forever for this reviewer. Validate inside the same IMMEDIATE transaction
+            // so a concurrent review cannot race candidate selection and key reservation.
+            for segment_id in &complete {
+                let exposed: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM review_events
+                          WHERE segment_id = ?1
+                            AND reviewer = ?2 COLLATE NOCASE
+                            AND NOT (
+                                id > ?3 AND (
+                                    source = 'couch_spot_check'
+                                    OR (source = 'couch' AND action = 'skip')
+                                )
+                            )
+                     )",
+                    params![segment_id, reviewer, after_review_event_id],
+                    |row| row.get(0),
+                )?;
+                if exposed {
+                    return Err(AppError::Validation(format!(
+                        "controlled-review hidden key {segment_id} was already seen by {reviewer}"
+                    )));
+                }
             }
 
             let global_count: i64 = tx.query_row(

@@ -810,6 +810,27 @@ def audit_active_hidden_state(
             raise PilotContractError("durable hidden-key grants exceed the max-2 reviewer quota")
         if sum(map(len, grants.values())) > TOTAL_HIDDEN_KEYS:
             raise PilotContractError("durable hidden-key grants exceed the max-4 policy quota")
+        exposed = connection.execute(
+            """SELECT key.reviewer, key.segment_id, event.id
+                 FROM review_pilot_hidden_keys key
+                 JOIN review_events event
+                   ON event.segment_id = key.segment_id
+                  AND event.reviewer = key.reviewer COLLATE NOCASE
+                WHERE key.policy_sha256 = ? AND key.after_review_event_id = ?
+                  AND NOT (
+                      event.id > key.after_review_event_id AND (
+                          event.source = 'couch_spot_check'
+                          OR (event.source = 'couch' AND event.action = 'skip')
+                      )
+                  )
+                ORDER BY event.id
+                LIMIT 1""",
+            (digest, baseline),
+        ).fetchone()
+        if exposed is not None:
+            raise PilotContractError(
+                f"hidden key {exposed[0]}/{exposed[1]} was not blind; prior review event {exposed[2]} exists"
+            )
     except sqlite3.Error as error:
         raise PilotContractError(f"durable hidden-key grants cannot be read: {error}") from error
 

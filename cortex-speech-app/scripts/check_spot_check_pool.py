@@ -397,12 +397,19 @@ def main() -> int:
         (segment_id, reviewer.strip().lower())
         for segment_id, reviewer in conn.execute("SELECT segment_id, reviewer FROM spot_checks").fetchall()
     }
+    # A quality check must be blind. ``reviewed_by`` describes current row authority and can be
+    # cleared by a later owner edit or legacy migration; the append-only event log is the durable
+    # evidence that this reviewer has already heard the clip. Mirror the Rust selector exactly.
+    previously_reviewed = {
+        (segment_id, reviewer.strip().lower())
+        for segment_id, reviewer in conn.execute("SELECT segment_id, reviewer FROM review_events").fetchall()
+    }
     counts = available_keys_by_reviewer(
         reviewers=reviewers,
         roster=roster,
         focus=focus,
         candidates=candidates,
-        already_scored=already_scored,
+        already_scored=already_scored | previously_reviewed,
         dialect_table=dialect_table,
     )
     work = servable_clips(Path(db_path), dialect_table, focus)
@@ -463,7 +470,7 @@ def main() -> int:
                     roster=roster,
                     focus=focus,
                     candidates=[candidate for candidate in candidates if candidate[0] in unresolved],
-                    already_scored=set(),
+                    already_scored=previously_reviewed,
                     dialect_table=dialect_table,
                 )[canonical]
                 if valid != len(unresolved):
@@ -483,7 +490,7 @@ def main() -> int:
             roster=roster,
             focus=focus,
             candidates=candidates,
-            already_scored=already_scored | served_as_scored,
+            already_scored=already_scored | previously_reviewed | served_as_scored,
             dialect_table=dialect_table,
         )
         certification_issues = pilot_certification_issues(

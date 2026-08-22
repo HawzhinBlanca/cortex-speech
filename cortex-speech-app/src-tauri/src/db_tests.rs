@@ -798,15 +798,11 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     let plant = |id: &str, raw: &str, answer: Option<&str>| {
         let mut s = make_segment(id, &audio_path(id));
         s.raw_transcript = raw.to_string();
-        s.verified = true;
-        s.is_gold = true;
-        if let Some(a) = answer {
-            s.human_decision = Some("edit".into());
-            s.verdict = Some("human_edit".into());
-            s.verdict_transcript = Some(a.to_string());
-        }
-        db.insert_segment_full(&s).unwrap();
+        db.insert_segment(&s).unwrap();
         ensure_test_audio_content_hash(&db, id);
+        if let Some(a) = answer {
+            db.finalize_human_review(id, "edit", Some(a), None, None).unwrap();
+        }
     };
     plant("sc-wrong-1", "دەقی هەڵە", Some("دەقی ڕاست"));
     plant("sc-wrong-2", "هەڵەی دوو", Some("ڕاستی دوو"));
@@ -824,13 +820,8 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     {
         let mut peer = make_segment("sc-peer-edit", &audio_path("peer"));
         peer.raw_transcript = "دەقی هەڵە".into();
-        peer.verified = true;
-        peer.is_gold = false;
-        peer.human_decision = Some("edit".into());
-        peer.verdict = Some("human_edit".into());
-        peer.verdict_transcript = Some("وەڵامی هاوکار".into());
-        peer.reviewed_by = Some("Hemn".into()); // decided on a phone, by someone who is not the owner
-        db.insert_segment_full(&peer).unwrap();
+        db.insert_segment(&peer).unwrap();
+        record_test_phone_decision(&db, "sc-peer-edit", "edit", Some("وەڵامی هاوکار"), "Hemn");
     }
     // The OWNER's own desktop verification: not flagged gold either, but `reviewed_by` is NULL
     // because the desktop path passes no annotator. This is the case that makes the mechanism
@@ -838,13 +829,9 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     {
         let mut owner = make_segment("sc-owner-edit", &audio_path("owner"));
         owner.raw_transcript = "دەقی هەڵەی سێ".into();
-        owner.verified = true;
-        owner.is_gold = false;
-        owner.human_decision = Some("edit".into());
-        owner.verdict = Some("human_edit".into());
-        owner.verdict_transcript = Some("ڕاستی سێ".into());
-        owner.reviewed_by = None;
-        db.insert_segment_full(&owner).unwrap();
+        db.insert_segment(&owner).unwrap();
+        ensure_test_audio_content_hash(&db, "sc-owner-edit");
+        db.finalize_human_review("sc-owner-edit", "edit", Some("ڕاستی سێ"), None, None).unwrap();
     }
 
     let ids = |limit: usize| -> Vec<String> {
@@ -867,6 +854,34 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
     assert!(
         all.contains(&"sc-owner-edit".to_string()),
         "the owner's own verified answer IS an answer key — without this the mechanism never fires"
+    );
+
+    // A hidden check must be BLIND. Historical review_events survive later desktop corrections and
+    // migrations that clear reviewed_by, so reviewed_by=NULL alone cannot prove this reviewer has
+    // never heard the clip. Re-testing a clip Sara already reviewed measures memory/disagreement,
+    // not whether she listened to a genuinely unseen check.
+    db.connection()
+        .execute(
+            "INSERT INTO review_events
+                 (segment_id, reviewer, action, source, timestamp_ms)
+             VALUES ('sc-owner-edit', 'sArA', 'accept', 'legacy', 1)",
+            [],
+        )
+        .unwrap();
+    let unseen_after_history = ids(10);
+    assert!(
+        !unseen_after_history.contains(&"sc-owner-edit".to_string()),
+        "a clip previously reviewed by the same person is not a blind quality check"
+    );
+    let unseen_for_other: Vec<String> = db
+        .list_spot_check_candidates(10, "Hemn", &std::collections::HashSet::new(), None, None)
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s.id)
+        .collect();
+    assert!(
+        unseen_for_other.contains(&"sc-owner-edit".to_string()),
+        "one person's prior exposure must not consume another person's blind key"
     );
 
     // Voice focus applies to the whole paid queue, including hidden checks. Filter BEFORE `limit`:
@@ -4608,11 +4623,10 @@ fn a_spot_check_is_never_served_in_a_dialect_the_reviewer_cannot_judge() {
         std::fs::write(&path, b"RIFF").unwrap();
         let mut seg = make_segment(id, path.to_str().unwrap());
         seg.raw_transcript = "دەقی هەڵە".into();
-        seg.verified = true;
         db.insert_segment(&seg).unwrap();
         ensure_test_audio_content_hash(&db, id);
         // Through the real decision path, so the answer key lands where a human edit leaves it.
-        db.record_human_decision(id, "edit", Some("دەقی ڕاست"), None).unwrap();
+        db.finalize_human_review(id, "edit", Some("دەقی ڕاست"), None, None).unwrap();
         ids.push(id);
     }
     let candidates = |allowed: Option<&[String]>| -> Vec<String> {
@@ -5446,6 +5460,22 @@ fn pilot_hidden_keys_are_policy_bound_idempotent_quota_limited_and_immutable() {
     let global =
         db.reserve_review_pilot_hidden_keys(&policy, 0, "Ali", &["global-fifth".into()], 2).unwrap_err().to_string();
     assert!(global.contains("global quota"), "unexpected global quota error: {global}");
+
+    let exposed_db = make_db();
+    exposed_db
+        .connection()
+        .execute(
+            "INSERT INTO review_events
+                 (segment_id, reviewer, action, source, timestamp_ms)
+             VALUES ('already-heard', 'sArA', 'accept', 'legacy', 1)",
+            [],
+        )
+        .unwrap();
+    let exposed = exposed_db
+        .reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &["already-heard".into()], 2)
+        .unwrap_err()
+        .to_string();
+    assert!(exposed.contains("already seen"), "unexpected blind-key exposure error: {exposed}");
 }
 
 #[test]
