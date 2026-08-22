@@ -5538,6 +5538,8 @@ fn validate_restore_target_semantics(db: &crate::db::Database) -> Result<(), Str
     validate_review_compensation_semantics(db)?;
     validate_review_effect_semantics(db)?;
     validate_playback_receipt_semantics(db)?;
+    crate::review_campaign::load(db)
+        .map_err(|error| format!("database restore refused: sequential campaign authority is invalid: {error}"))?;
     Ok(())
 }
 
@@ -9705,6 +9707,26 @@ mod tests {
 
         validate_restore_target_semantics(&db)
             .expect("every current phone/desktop/flag writer state must pass the actual restore gate");
+    }
+
+    #[test]
+    fn staged_restore_rejects_orphaned_sequential_campaign_authority() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_campaign_registry
+                    (campaign_id, focus_segment_count, focus_sha256, first_reviewer, second_reviewer,
+                     after_review_event_id, activated_at_review_event_id)
+                 VALUES('123e4567-e89b-42d3-a456-426614174000', 1, ?1, 'Rubar', 'Alle', 0, 0)",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("campaign authority") && error.contains("without its base campaign policy"),
+            "orphaned campaign authority must fail the actual restore gate: {error}"
+        );
     }
 
     #[test]

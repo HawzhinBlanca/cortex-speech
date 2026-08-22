@@ -51,6 +51,15 @@ REVIEW_PILOT_ABSENT_BYTES = b"review-pilot-policy-absent-v1\n"
 MANIFEST = "SNAPSHOT_MANIFEST.json"
 HUMAN_TABLES = ("speech_segments", "review_events", "spot_checks", "model_versions")
 BASE_EVIDENCE_TABLES = HUMAN_TABLES + ("import_jobs", "import_job_files")
+CAMPAIGN_SCHEMA_VERSION = 61
+CAMPAIGN_EVIDENCE_TABLES = (
+    "review_campaign_registry",
+    "review_campaign_focus",
+    "review_campaign_transitions",
+    "independent_review_decisions",
+    "independent_review_reversals",
+    "review_campaign_adjudications",
+)
 FILE_ROW_FIELDS = {"path", "sizeBytes", "sha256"}
 SCHEMA_FIELDS = {
     1: {"schema", "reviewPilotPolicyStateSchema", "createdAtEpochSecs", "appGitSha", "files"},
@@ -76,13 +85,14 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Schema-2 evidence emitted before v59 did not—and must not—claim the v59 table."""
+    """Preserve old evidence shapes and bind all durable authority added at v59/v61."""
 
-    return (
-        BASE_EVIDENCE_TABLES + (HIDDEN_KEY_TABLE,)
-        if schema_version >= HIDDEN_KEY_SCHEMA_VERSION
-        else BASE_EVIDENCE_TABLES
-    )
+    tables = BASE_EVIDENCE_TABLES
+    if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
+        tables += (HIDDEN_KEY_TABLE,)
+    if schema_version >= CAMPAIGN_SCHEMA_VERSION:
+        tables += CAMPAIGN_EVIDENCE_TABLES
+    return tables
 
 
 def state_absence_marker(name: str) -> str:

@@ -646,6 +646,14 @@ def test_migration_history_requires_an_exact_description_bound_canonical_prefix(
             assert_refused(root, expected)
 
 
+def test_schema61_evidence_requires_every_campaign_authority_table() -> None:
+    tables = drill_module.evidence_tables_for_schema(61)
+    assert tables[-len(drill_module.CAMPAIGN_EVIDENCE_TABLES) :] == drill_module.CAMPAIGN_EVIDENCE_TABLES
+    assert drill_module.evidence_tables_for_schema(60) == drill_module.BASE_EVIDENCE_TABLES + (
+        drill_module.HIDDEN_KEY_TABLE,
+    )
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
     for test in tests:

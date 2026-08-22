@@ -1494,6 +1494,30 @@ impl Database {
         Ok(Self { conn, path: path.to_string() })
     }
 
+    /// Take a WAL-consistent, detached in-memory snapshot of an existing database without acquiring
+    /// source write authority or changing its journal mode. Offline certification and production
+    /// export use the private copy so they can never bootstrap, migrate, or mutate the live library.
+    /// The copy stays writable because SQLite's FTS5 integrity check uses temporary internal writes;
+    /// even an accidental caller write can affect only this disposable connection.
+    pub fn open_detached_read_snapshot(path: &str) -> AppResult<Self> {
+        let source = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        source.execute_batch("PRAGMA busy_timeout=10000;")?;
+        let mut conn = Connection::open_in_memory()?;
+        {
+            let backup = backup::Backup::new(&source, &mut conn)?;
+            backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
+        }
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA cache_size=-64000;
+             PRAGMA busy_timeout=10000;",
+        )?;
+        Ok(Self { conn, path: path.to_string() })
+    }
+
     /// Open the database with a retry policy for corruption.
     ///
     /// Recovery is fail-CLOSED: `recover_database_at` is DESTRUCTIVE (it renames the live db away and

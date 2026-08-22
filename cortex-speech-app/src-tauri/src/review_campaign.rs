@@ -88,6 +88,15 @@ pub struct FocusEvidence {
     pub sha256: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FirstPassStatus {
+    pub focus_segment_count: usize,
+    pub completed_segment_count: usize,
+    pub pending_segment_count: usize,
+    pub max_review_event_id: i64,
+}
+
 impl SequentialReviewCampaign {
     fn validate(mut self) -> Result<Self, String> {
         self.reviewer = self.reviewer.trim().to_string();
@@ -164,6 +173,56 @@ pub fn parse(raw: &str) -> Result<SequentialReviewCampaign, String> {
         .validate()
 }
 
+fn campaign_authority_row_count(db: &Database) -> Result<i64, String> {
+    let schema_version = crate::migrations::get_current_version(db).map_err(|error| error.to_string())?;
+    if schema_version < 61 {
+        return Ok(0);
+    }
+    db.connection()
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM review_campaign_registry)
+               + (SELECT COUNT(*) FROM review_campaign_focus)
+               + (SELECT COUNT(*) FROM review_campaign_transitions)
+               + (SELECT COUNT(*) FROM independent_review_decisions)
+               + (SELECT COUNT(*) FROM independent_review_reversals)
+               + (SELECT COUNT(*) FROM review_campaign_adjudications)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("campaign database authority cannot be counted: {error}"))
+}
+
+fn validate_campaign_authority_scope(db: &Database, campaign_id: &str) -> Result<(), String> {
+    let invalid: i64 = db
+        .connection()
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM review_campaign_registry WHERE campaign_id <> ?1)
+               + (SELECT COUNT(*) FROM review_campaign_focus WHERE campaign_id <> ?1)
+               + (SELECT COUNT(*) FROM review_campaign_transitions WHERE campaign_id <> ?1)
+               + (SELECT COUNT(*) FROM independent_review_decisions WHERE campaign_id <> ?1)
+               + (SELECT COUNT(*) FROM review_campaign_adjudications WHERE campaign_id <> ?1)
+               + (SELECT COUNT(*) FROM independent_review_reversals reversal
+                    WHERE NOT EXISTS (
+                          SELECT 1 FROM independent_review_decisions decision
+                           WHERE decision.id = reversal.decision_id
+                             AND decision.campaign_id = ?1
+                    ))",
+            [campaign_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("campaign database authority scope cannot be read: {error}"))?;
+    let registries: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_campaign_registry", [], |row| row.get(0))
+        .map_err(|error| format!("campaign registry scope cannot be read: {error}"))?;
+    if invalid != 0 || registries != 1 {
+        return Err("campaign database authority is not exclusively bound to the active campaign".to_string());
+    }
+    Ok(())
+}
+
 pub fn load(db: &Database) -> Result<Option<SequentialReviewCampaign>, String> {
     let raw: Option<String> = db
         .connection()
@@ -183,6 +242,9 @@ pub fn load(db: &Database) -> Result<Option<SequentialReviewCampaign>, String> {
         if orphan_progress.is_some() {
             return Err("sequential review progress exists without its base campaign policy".to_string());
         }
+        if campaign_authority_row_count(db)? != 0 {
+            return Err("campaign database authority exists without its base campaign policy".to_string());
+        }
         return Ok(None);
     };
     let mut policy = parse(&raw)?;
@@ -195,8 +257,11 @@ pub fn load(db: &Database) -> Result<Option<SequentialReviewCampaign>, String> {
         .map_err(|error| format!("sequential review progress cannot be read: {error}"))?;
     if let Some(progress_raw) = progress_raw {
         let progress = parse_progress(&progress_raw, &policy)?;
+        validate_campaign_authority_scope(db, &policy.campaign_id)?;
         validate_progress_authority(db, &progress_raw, &policy, &progress)?;
         policy.progress = Some(progress);
+    } else if campaign_authority_row_count(db)? != 0 {
+        return Err("campaign database authority exists before the first-pass transition".to_string());
     }
     Ok(Some(policy))
 }
@@ -429,6 +494,65 @@ pub fn verify_registered_focus(db: &Database, policy: &SequentialReviewCampaign)
         ));
     }
     Ok(evidence)
+}
+
+/// Read-only first-pass status for the exact external focus. Activation repeats this proof inside
+/// its own IMMEDIATE transaction and compare-and-swap boundary before changing campaign phase.
+pub fn first_pass_status_for_focus(
+    db: &Database,
+    policy: &SequentialReviewCampaign,
+    focus_ids: &HashSet<String>,
+) -> Result<FirstPassStatus, String> {
+    if policy.phase() != CampaignPhase::FirstPassActive || policy.progress.is_some() {
+        return Err("external first-pass status is available only before second-pass activation".to_string());
+    }
+    let evidence = focus_evidence(focus_ids)?;
+    if evidence.segment_count != policy.focus_segment_count || evidence.sha256 != policy.focus_sha256 {
+        return Err("supplied focus does not match the immutable first-pass policy".to_string());
+    }
+    let mut sorted: Vec<&str> = focus_ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let focus_json =
+        serde_json::to_string(&sorted).map_err(|error| format!("voice focus cannot be encoded: {error}"))?;
+    let (completed, maximum): (i64, i64) = db
+        .connection()
+        .query_row(
+            "WITH supplied(segment_id) AS (SELECT value FROM json_each(?1))
+             SELECT COUNT(DISTINCT supplied.segment_id), COALESCE(MAX(event.id), 0)
+               FROM supplied
+               JOIN speech_segments segment ON segment.id = supplied.segment_id
+               JOIN effective_human_decision_effects_v60 effect
+                 ON effect.segment_id = supplied.segment_id
+               JOIN review_events event ON event.id = effect.review_event_id
+              WHERE effect.reviewer = ?2 COLLATE NOCASE
+                AND event.reviewer = ?2 COLLATE NOCASE
+                AND event.source = 'couch'
+                AND event.id > ?3
+                AND event.action IN ('accept','edit','reject')
+                AND effect.action = event.action
+                AND segment.reviewed_by = ?2 COLLATE NOCASE
+                AND segment.human_decision = effect.action
+                AND segment.verified = 1
+                AND (
+                     (effect.action IN ('accept','edit')
+                      AND segment.annotated_transcript IS effect.decision_annotated_transcript
+                      AND trim(COALESCE(segment.annotated_transcript, '')) <> '')
+                     OR (effect.action = 'reject' AND segment.verdict = 'human_reject')
+                )",
+            rusqlite::params![focus_json, policy.reviewer, policy.after_review_event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("first-pass status cannot be read: {error}"))?;
+    let completed = usize::try_from(completed).map_err(|_| "first-pass completed count is invalid".to_string())?;
+    if completed > evidence.segment_count {
+        return Err("first-pass completed count exceeds the immutable focus".to_string());
+    }
+    Ok(FirstPassStatus {
+        focus_segment_count: evidence.segment_count,
+        completed_segment_count: completed,
+        pending_segment_count: evidence.segment_count - completed,
+        max_review_event_id: maximum,
+    })
 }
 
 /// Prove that every bound clip currently carries Rubar's effective, non-reversed phone decision and
@@ -1304,6 +1428,51 @@ mod tests {
         assert!(error.contains("cannot be proven"), "{error}");
     }
 
+    fn insert_test_campaign_registry(db: &Database, policy: &SequentialReviewCampaign) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_campaign_registry
+                    (campaign_id, focus_segment_count, focus_sha256, first_reviewer, second_reviewer,
+                     after_review_event_id, activated_at_review_event_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    policy.campaign_id,
+                    policy.focus_segment_count as i64,
+                    policy.focus_sha256,
+                    "Rubar",
+                    SECOND_PASS_REVIEWER,
+                    policy.after_review_event_id,
+                    policy.activated_at_review_event_id,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn database_authority_without_base_policy_is_refused() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_test_campaign_registry(&db, &valid_policy());
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("without its base campaign policy"), "{error}");
+    }
+
+    #[test]
+    fn database_authority_before_first_pass_transition_is_refused() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let policy = valid_policy();
+        db.connection()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2)",
+                [SEQUENTIAL_CAMPAIGN_SETTINGS_KEY, &serde_json::to_string(&policy).unwrap()],
+            )
+            .unwrap();
+        insert_test_campaign_registry(&db, &policy);
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("before the first-pass transition"), "{error}");
+    }
+
     fn seeded_first_pass(count: usize) -> (Database, HashSet<String>, SequentialReviewCampaign, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::open(":memory:").unwrap();
@@ -1392,6 +1561,14 @@ mod tests {
     #[test]
     fn second_pass_is_blind_separate_reversible_and_completion_is_proof_gated() {
         let (db, ids, base, _temp) = seeded_first_pass(2);
+        let status = first_pass_status_for_focus(&db, &base, &ids).unwrap();
+        assert_eq!(status.focus_segment_count, 2);
+        assert_eq!(status.completed_segment_count, 2);
+        assert_eq!(status.pending_segment_count, 0);
+        assert_eq!(status.max_review_event_id, db.max_review_event_id().unwrap());
+        let mut wrong_focus = ids.clone();
+        wrong_focus.insert("not-in-campaign".into());
+        assert!(first_pass_status_for_focus(&db, &base, &wrong_focus).is_err());
         let maximum = db.max_review_event_id().unwrap();
         let activated = activate_second_pass(&db, &ids, maximum).unwrap();
         assert_eq!(activated.phase, CampaignPhase::SecondPassActive);

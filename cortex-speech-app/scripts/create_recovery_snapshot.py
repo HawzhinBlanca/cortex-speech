@@ -73,6 +73,15 @@ BASE_COUNT_TABLES = (
     "import_jobs",
     "import_job_files",
 )
+CAMPAIGN_SCHEMA_VERSION = 61
+CAMPAIGN_COUNT_TABLES = (
+    "review_campaign_registry",
+    "review_campaign_focus",
+    "review_campaign_transitions",
+    "independent_review_decisions",
+    "independent_review_reversals",
+    "review_campaign_adjudications",
+)
 MANIFEST_FIELDS = {
     "schema",
     "createdAtEpochSecs",
@@ -100,13 +109,14 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Keep schema-2 row-count evidence backward-compatible with pre-v59 snapshots."""
+    """Keep old evidence shapes exact while binding v59/v61 authority when present."""
 
-    return (
-        BASE_COUNT_TABLES + (HIDDEN_KEY_TABLE,)
-        if schema_version >= HIDDEN_KEY_SCHEMA_VERSION
-        else BASE_COUNT_TABLES
-    )
+    tables = BASE_COUNT_TABLES
+    if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
+        tables += (HIDDEN_KEY_TABLE,)
+    if schema_version >= CAMPAIGN_SCHEMA_VERSION:
+        tables += CAMPAIGN_COUNT_TABLES
+    return tables
 
 
 def state_absence_marker(name: str) -> str:

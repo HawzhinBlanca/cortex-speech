@@ -13,6 +13,27 @@ fn make_db() -> Database {
     db
 }
 
+#[test]
+fn detached_read_snapshot_cannot_mutate_its_source_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("read-only.db");
+    {
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+    }
+    let snapshot = Database::open_detached_read_snapshot(path.to_str().unwrap()).unwrap();
+    assert_eq!(crate::migrations::validate_applied_history(snapshot.connection()).unwrap(), 61);
+    snapshot.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).unwrap();
+    assert_eq!(snapshot.integrity_check().unwrap(), "ok", "FTS5 validation runs on the writable private copy");
+    drop(snapshot);
+    let source = Database::open(path.to_str().unwrap()).unwrap();
+    let persisted: i64 = source
+        .connection()
+        .query_row("SELECT COUNT(*) FROM settings WHERE key='must-not-write'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(persisted, 0, "writes to the certification snapshot must never reach its source file");
+}
+
 fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
     SpeechSegment {
         id: id.to_string(),

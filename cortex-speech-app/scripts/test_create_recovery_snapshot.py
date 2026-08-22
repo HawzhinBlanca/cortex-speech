@@ -827,6 +827,14 @@ def test_offsite_overlap_is_rejected_before_any_write() -> None:
         assert not (local / "snapshots").exists()
 
 
+def test_schema61_evidence_includes_every_campaign_authority_table() -> None:
+    tables = snapshot.evidence_tables_for_schema(61)
+    assert tables[-len(snapshot.CAMPAIGN_COUNT_TABLES) :] == snapshot.CAMPAIGN_COUNT_TABLES
+    assert snapshot.evidence_tables_for_schema(60) == snapshot.BASE_COUNT_TABLES + (
+        snapshot.HIDDEN_KEY_TABLE,
+    )
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
     for test in tests:
