@@ -790,6 +790,7 @@ pub fn export_dataset_bundle(
     production: bool,
     warning_threshold: usize,
 ) -> AppResult<BundleExportResult> {
+    crate::review_campaign::require_export_unblocked(db, "dataset bundle export")?;
     if production {
         return export_production_bundle_staged(output_dir, |staging_dir| {
             export_dataset_bundle_inner(db, model_manager, staging_dir, settings, production, warning_threshold)

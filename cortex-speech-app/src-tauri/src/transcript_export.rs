@@ -195,6 +195,7 @@ fn ensure_single_source_for_subtitles(cues: &[Cue], format: TranscriptFormat) ->
 
 /// Read the exportable segments and write the transcript/subtitle file atomically.
 pub fn export_transcript(db: &Database, path: &std::path::Path, format: TranscriptFormat) -> AppResult<()> {
+    crate::review_campaign::require_export_unblocked(db, "transcript export")?;
     // Include gold/holdout (the owner wants THEIR transcripts — this is not a training artifact), but
     // drop human-rejected clips and not-yet-transcribed placeholders: the same "not real output"
     // filter the dataset export uses, minus the training-leakage holdout exclusion.

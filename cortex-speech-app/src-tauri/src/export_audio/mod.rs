@@ -98,6 +98,7 @@ pub fn export_audio_segments(
     segment_ids: &[String],
     options: &AudioExportOptions,
 ) -> AppResult<AudioExportResult> {
+    crate::review_campaign::require_export_unblocked(db, "reviewed audio export")?;
     // Round-24/25 #11: the working buffer is decoded+downmixed to 16 kHz (audio::decode_to_pcm), so a
     // requested rate ABOVE 16000 would only UPSAMPLE a band-limited signal and write a WAV/FLAC header
     // (and metadata.csv export_sample_rate) that overstates the true bandwidth of a shared dataset

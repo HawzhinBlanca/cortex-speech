@@ -484,6 +484,7 @@ pub(crate) fn exclude_unexportable_segments(
 }
 
 pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportFormat) -> AppResult<()> {
+    crate::review_campaign::require_export_unblocked(db, "dataset export")?;
     // Drop held-out gold segments BEFORE counting or writing any format, so the training tables
     // (JSON/JSONL/CSV/Parquet) — including the production bundle that delegates through here — never
     // publish the eval set's reference transcripts; closes the eval-on-train leak the HF export
@@ -976,6 +977,7 @@ pub fn export_huggingface_dataset(
     dir: &std::path::Path,
     settings: &crate::settings::AppSettings,
 ) -> AppResult<()> {
+    crate::review_campaign::require_export_unblocked(db, "Hugging Face dataset export")?;
     // Telemetry (Week-1 "measure first"): real HuggingFace-export wall-clock (audio copy + shard writes).
     let _span = crate::telemetry::TRACER.start_span("export.huggingface", crate::telemetry::Tracer::metadata(vec![]));
     std::fs::create_dir_all(dir)?;

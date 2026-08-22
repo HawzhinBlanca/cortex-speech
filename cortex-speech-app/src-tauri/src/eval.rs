@@ -263,6 +263,7 @@ fn write_wav_16k_mono(path: &std::path::Path, pcm: &[i16], sample_rate: u32) -> 
 /// train-time exclusion, not an eval-time one — the eval set deliberately includes it). Gold whose
 /// source audio can no longer be decoded is skipped so the set stays self-consistent.
 pub fn export_gold_eval_set(db: &Database, out_dir: &std::path::Path) -> AppResult<GoldEvalExport> {
+    crate::review_campaign::require_export_unblocked(db, "gold evaluation export")?;
     use std::io::Write as _;
     let gold = list_gold_segments(db)?;
     let clips_dir = out_dir.join("clips");
@@ -400,6 +401,7 @@ pub fn export_finetune_pack(
     out_dir: &std::path::Path,
     corpus_ledger_path: Option<&std::path::Path>,
 ) -> AppResult<FinetunePackResult> {
+    crate::review_campaign::require_export_unblocked(db, "fine-tune training export")?;
     use std::io::Write as _;
     let verified = db.get_segments(Some(true))?;
     let total_verified = verified.len();

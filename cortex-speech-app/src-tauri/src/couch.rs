@@ -239,6 +239,10 @@ struct CouchState {
     /// The exact operating policy this session was started under. A file edit never hot-resets a
     /// paid counter: any mismatch pauses requests until the owner explicitly stops and restarts.
     pilot_policy: Option<crate::review_pilot::ReviewPilotPolicy>,
+    /// Rubar-only full first pass. Unlike the bounded pilot this has no action cap and deliberately
+    /// mints no pseudo-gold hidden checks; its database-bound contract blocks every export until an
+    /// independent second pass exists. Any live policy/focus drift pauses the request path.
+    campaign_policy: Option<crate::review_campaign::SequentialReviewCampaign>,
 }
 
 impl CouchState {
@@ -1053,12 +1057,32 @@ where
         }
         None => None,
     };
+    let preflight_db = Database::open(&db_path).map_err(|e| format!("Couch Review cannot open the library: {e}"))?;
+    let configured_campaign = crate::review_campaign::load(&preflight_db)
+        .map_err(|error| format!("sequential review campaign cannot start: {error}"))?;
+    if configured_pilot.is_some() && configured_campaign.is_some() {
+        return Err("controlled pilot and sequential review campaign cannot be active together".to_string());
+    }
     if let Some(policy) = configured_pilot.as_ref() {
         if !policy.matches_session(&names) {
             return Err(format!(
                 "controlled review pilot requires exactly these two reviewers: {}",
                 policy.reviewer_names().join(", ")
             ));
+        }
+    }
+    if let Some(policy) = configured_campaign.as_ref() {
+        if names.len() != 1 || !policy.matches_reviewer(&names[0]) {
+            return Err(format!("sequential first pass requires exactly reviewer {}", policy.reviewer));
+        }
+        let Some(dir) = data_dir.as_deref() else {
+            return Err("sequential first pass requires the durable app data directory".to_string());
+        };
+        crate::review_campaign::validate_focus(dir, policy)
+            .map_err(|error| format!("sequential review campaign cannot start: {error}"))?;
+        let maximum = preflight_db.max_review_event_id().map_err(|error| error.to_string())?;
+        if policy.activated_at_review_event_id > maximum {
+            return Err("sequential review campaign activation boundary is ahead of durable history".to_string());
         }
     }
 
@@ -1094,7 +1118,6 @@ where
     // phone hangs instead of failing fast, and the watchdog sees an unreachable port that restarting
     // cannot fix. Checking here turns it into an honest error on Start, and never binds a port this
     // server cannot serve.
-    let preflight_db = Database::open(&db_path).map_err(|e| format!("Couch Review cannot open the library: {e}"))?;
     let mut durable_pilot_served_checks = HashSet::new();
     if let Some(policy) = configured_pilot.as_ref() {
         if policy.after_review_event_id > preflight_db.max_review_event_id().map_err(|error| error.to_string())? {
@@ -1170,6 +1193,7 @@ where
         reviewers,
         session_issued,
         pilot_policy: configured_pilot,
+        campaign_policy: configured_campaign,
         ..CouchState::default()
     }));
     // One accept thread per reviewer. tiny_http hands a request to whichever thread is free, so a
@@ -2435,6 +2459,46 @@ fn active_pilot_policy(
     Ok(current)
 }
 
+/// Re-read the database-owned sequential campaign and compare it with the policy bound at Start.
+/// A SQL edit or focus-file change while paid work is live is a pause, never a hot authorization
+/// change. The reviewer check is repeated at every request boundary so a retained cookie cannot be
+/// used outside the single-reviewer first pass.
+fn active_campaign_policy(
+    db: &Database,
+    reviewer: &str,
+    state: &Mutex<CouchState>,
+) -> Result<Option<crate::review_campaign::SequentialReviewCampaign>, String> {
+    let (bound, data_dir, live_names) = {
+        let guard = lock_state(state);
+        let names: Vec<String> = if guard.pairing_codes.is_empty() {
+            guard.reviewers.values().cloned().collect()
+        } else {
+            guard.pairing_codes.values().cloned().collect()
+        };
+        (guard.campaign_policy.clone(), guard.session_store.as_ref().map(|(dir, _)| dir.clone()), names)
+    };
+    let current = crate::review_campaign::load(db)?;
+    if current != bound {
+        return Err(
+            "sequential review campaign changed during this session; review is paused until the owner stops and restarts it"
+                .to_string(),
+        );
+    }
+    if let Some(policy) = current.as_ref() {
+        if !policy.matches_reviewer(reviewer)
+            || live_names.len() != 1
+            || !live_names.iter().all(|name| policy.matches_reviewer(name))
+        {
+            return Err("this reviewer is outside the active Rubar-only first pass".to_string());
+        }
+        let dir = data_dir
+            .as_deref()
+            .ok_or_else(|| "sequential review campaign has no durable data directory".to_string())?;
+        crate::review_campaign::validate_focus(dir, policy)?;
+    }
+    Ok(current)
+}
+
 /// Remaining review-action slots for this reviewer, validated against the global count as well.
 /// Returns an error for unauthorized/over-cap history rather than hiding it behind zero.
 fn pilot_remaining_slots(
@@ -2598,6 +2662,13 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
+    let campaign_policy = match active_campaign_policy(db, reviewer, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if pilot_policy.is_some() && campaign_policy.is_some() {
+        return err_reply(503, "conflicting paid-review policies are active");
+    }
     let pilot_slots = match pilot_policy.as_ref() {
         Some(policy) => match pilot_remaining_slots(db, reviewer, policy) {
             Ok(remaining) => Some(remaining),
@@ -2723,8 +2794,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // A persisted session is the production paid-review path. Ephemeral test/dev callers preserve
     // their historical best-effort behaviour, while a real durable reviewer link must never receive
     // unmeasured work after its hidden-key pool runs dry.
-    let require_complete_spot_checks =
-        guard.session_store.is_some() && (!guard.pairing_codes.is_empty() || !guard.reviewers.is_empty());
+    let require_complete_spot_checks = campaign_policy.is_none()
+        && guard.session_store.is_some()
+        && (!guard.pairing_codes.is_empty() || !guard.reviewers.is_empty());
     drop(guard);
 
     // Hydrate ONLY what is being served — at most QUEUE_BATCH rows — and do it OUTSIDE the state lock,
@@ -2772,7 +2844,12 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // something. A reviewer must not be able to coast just because their batches came out short.
         let work_len = queue.len();
         let cadence_wanted = work_len.div_ceil(SPOT_CHECK_EVERY);
-        let selected: SpotCheckSelection = if let Some(policy) = pilot_policy.as_ref() {
+        let selected: SpotCheckSelection = if campaign_policy.is_some() {
+            // This campaign's quality authority is an independent later pass, not synthetic or
+            // circular hidden keys. The database-bound policy keeps every first-pass result
+            // provisional and blocks export/training until that second pass is complete.
+            Ok(None)
+        } else if let Some(policy) = pilot_policy.as_ref() {
             (|| {
                 let quota = pilot_spot_check_quota(policy, reviewer)?;
                 let policy_sha256 = policy.policy_sha256()?;
@@ -3199,6 +3276,10 @@ fn audio_assignment(
 fn authorize_audio(db: &Database, id: &str, reviewer: &str, state: &Mutex<CouchState>) -> Result<SpeechSegment, Reply> {
     let (allowed_dialects, focus) = reviewer_policy(reviewer, state).map_err(|error| err_reply(503, &error))?;
     let pilot_policy = active_pilot_policy(reviewer, state).map_err(|error| err_reply(503, &error))?;
+    let campaign_policy = active_campaign_policy(db, reviewer, state).map_err(|error| err_reply(503, &error))?;
+    if pilot_policy.is_some() && campaign_policy.is_some() {
+        return Err(err_reply(503, "conflicting paid-review policies are active"));
+    }
     let assignment = audio_assignment(db, id, reviewer, state, pilot_policy.as_ref())?;
 
     match (assignment, pilot_policy.as_ref()) {
@@ -3683,6 +3764,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
+    let campaign_policy = match active_campaign_policy(db, reviewer, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if pilot_policy.is_some() && campaign_policy.is_some() {
+        return err_reply(503, "conflicting paid-review policies are active");
+    }
     let pilot_namespace = match pilot_policy.as_ref() {
         Some(policy) => match policy.policy_sha256() {
             Ok(policy_sha256) => Some((policy_sha256, policy.after_review_event_id)),
@@ -3831,6 +3919,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     if current_pilot_policy != pilot_policy {
         return err_reply(503, "controlled review policy changed while this decision was being checked");
     }
+    let current_campaign_policy = match active_campaign_policy(db, reviewer, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if current_campaign_policy != campaign_policy {
+        return err_reply(503, "sequential review campaign changed while this decision was being checked");
+    }
     match pilot_policy.as_ref() {
         Some(policy) if parsed.pilot_after_review_event_id != Some(policy.after_review_event_id) => {
             return err_reply(409, "controlled review pilot changed — reload the queue before deciding")
@@ -3969,6 +4064,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         };
         if current != pilot_policy {
             return err_reply(503, "controlled review policy changed while this decision was being checked");
+        }
+        let current_campaign = match active_campaign_policy(db, reviewer, state) {
+            Ok(policy) => policy,
+            Err(error) => return err_reply(503, &error),
+        };
+        if current_campaign != campaign_policy {
+            return err_reply(503, "sequential review campaign changed while this decision was being committed");
         }
         if let Some(policy) = current.as_ref() {
             match pilot_remaining_slots(db, reviewer, policy) {
@@ -5153,6 +5255,7 @@ mod tests {
         fail_cookie_protection_for: Option<String>,
         skipped: HashMap<String, HashSet<String>>,
         pilot_policy: Option<crate::review_pilot::ReviewPilotPolicy>,
+        campaign_policy: Option<crate::review_campaign::SequentialReviewCampaign>,
     }
 
     fn snapshot_couch_state(state: &Mutex<CouchState>) -> CouchStateTestSnapshot {
@@ -5184,6 +5287,7 @@ mod tests {
             fail_cookie_protection_for: state.fail_cookie_protection_for.clone(),
             skipped: state.skipped.clone(),
             pilot_policy: state.pilot_policy.clone(),
+            campaign_policy: state.campaign_policy.clone(),
         }
     }
 
@@ -5243,6 +5347,60 @@ mod tests {
         .unwrap();
         let (code, ..) = api_queue(&db, "Sara", &state);
         assert_eq!(code, 200, "a repaired policy file must serve on the next fetch, no restart");
+    }
+
+    #[test]
+    fn sequential_campaign_serves_a_full_rubar_batch_without_synthetic_checks_and_fails_on_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let ids: HashSet<String> = (0..(QUEUE_BATCH + 5)).map(|n| format!("campaign-{n:02}")).collect();
+        for id in &ids {
+            db.insert_segment(&seg(id, "دەقی کاری ڕووبار")).unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("voice_focus.json"),
+            serde_json::json!({"name":"Rubar first pass", "segment_ids": &ids}).to_string(),
+        )
+        .unwrap();
+        let focus = crate::review_campaign::focus_evidence(&ids).unwrap();
+        let campaign = crate::review_campaign::SequentialReviewCampaign {
+            schema_version: 1,
+            campaign_id: "123e4567-e89b-42d3-a456-426614174000".into(),
+            mode: crate::review_campaign::SEQUENTIAL_CAMPAIGN_MODE.into(),
+            status: crate::review_campaign::SEQUENTIAL_CAMPAIGN_STATUS.into(),
+            reviewer: "Rubar".into(),
+            after_review_event_id: 0,
+            activated_at_review_event_id: 0,
+            focus_segment_count: focus.segment_count,
+            focus_sha256: focus.sha256,
+            provisional_export_block: true,
+            independent_second_pass_required: true,
+        };
+        db.connection()
+            .execute(
+                "INSERT INTO settings(key, value) VALUES(?1, ?2)",
+                [crate::review_campaign::SEQUENTIAL_CAMPAIGN_SETTINGS_KEY, &serde_json::to_string(&campaign).unwrap()],
+            )
+            .unwrap();
+        let state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-rubar".into(), "Rubar".into())]),
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            campaign_policy: Some(campaign),
+            ..CouchState::default()
+        });
+
+        let (code, _, body, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(code, 200, "campaign queue failed: {}", String::from_utf8_lossy(&body));
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["items"].as_array().unwrap().len(), QUEUE_BATCH);
+        assert!(lock_state(&state).spot_checks.is_empty(), "first pass must not mint circular hidden keys");
+
+        let (code, ..) = api_queue(&db, "Alle", &state);
+        assert_eq!(code, 503, "the first pass must authorize Rubar only");
+        std::fs::write(tmp.path().join("voice_focus.json"), r#"{"name":"drift", "segment_ids":["campaign-00"]}"#)
+            .unwrap();
+        let (code, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(code, 503, "focus drift must pause the live queue");
     }
 
     #[test]
