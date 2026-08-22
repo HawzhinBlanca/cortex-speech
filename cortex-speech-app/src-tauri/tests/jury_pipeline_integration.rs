@@ -1,7 +1,7 @@
 mod fixtures;
 
 use cortex_speech_app_lib::db::{Database, SegmentHypothesis, SpeechSegment};
-use cortex_speech_app_lib::jury::{self, Verdict};
+use cortex_speech_app_lib::jury;
 use tempfile::NamedTempFile;
 
 fn make_seg(id: &str, path: &str, text: &str) -> SpeechSegment {
@@ -38,7 +38,7 @@ fn make_seg(id: &str, path: &str, text: &str) -> SpeechSegment {
 }
 
 #[test]
-fn test_jury_pipeline_t0_escalates_and_t1_resolves() {
+fn test_production_schema_keeps_t0_t1_advisory_until_human_review() {
     let tmp_db = NamedTempFile::new().unwrap();
     let db_path = tmp_db.path().to_str().unwrap().to_string();
     let db = Database::open(&db_path).unwrap();
@@ -85,36 +85,34 @@ fn test_jury_pipeline_t0_escalates_and_t1_resolves() {
         )
         .unwrap();
 
-    // 1. Run T0 Gate (default autonomy = ActConfirm: auto-accept agreements, escalate the rest).
-    let t0_report =
+    // Production schema v60+ deliberately refuses all legacy machine-verdict commits.
+    let t0_error =
         jury::run_t0_gate(&db, &[seg_id.to_string()], &cortex_speech_app_lib::settings::AutonLevel::ActConfirm, false)
-            .unwrap();
-    println!("T0 report: {:?}", t0_report);
-    assert_eq!(t0_report.total, 1);
-    assert_eq!(t0_report.escalated, 1); // Disagreement leads to escalation
+            .unwrap_err()
+            .to_string();
+    assert!(t0_error.contains("machine jury writes are disabled"), "unexpected boundary error: {t0_error}");
 
-    // Verify database shows escalated segment
+    // Refusal is atomic: the row remains undecided for evidence-backed human review.
     let seg_after_t0 = db.get_segment_by_id(seg_id).unwrap().unwrap();
-    assert_eq!(seg_after_t0.verdict.unwrap(), "escalated");
-    assert!(seg_after_t0.escalated);
+    assert!(seg_after_t0.verdict.is_none());
+    assert!(!seg_after_t0.escalated);
 
     // 2. T1 text judge - let's run T1 judge on the hypotheses
     let t1_threshold = 0.85;
     let decision = jury::t1_judge::judge_t1(seg_id, &[hyp1.clone(), hyp2.clone()], t1_threshold);
 
-    // We expect judge_t1 to return a decision. Assert or write verdict based on it
+    // T1 remains advisory at schema v60+: machine verdict writers cannot mutate a row after the
+    // evidence boundary. Prove the judge returns a typed decision without bypassing that boundary.
     match decision {
         jury::t1_judge::T1Decision::Commit { transcript, reason, .. } => {
-            jury::write_verdict(&db, seg_id, Verdict::JuryAccept, Some(&transcript), Some(&reason), None, Some(0.9))
-                .unwrap();
+            assert!(!transcript.trim().is_empty());
+            assert!(!reason.trim().is_empty());
         }
-        jury::t1_judge::T1Decision::EscalateToT2 { .. } => {
-            jury::write_verdict(&db, seg_id, Verdict::Escalated, None, Some("T2 fallback integration"), None, None)
-                .unwrap();
-        }
+        jury::t1_judge::T1Decision::EscalateToT2 { segment_id, .. } => assert_eq!(segment_id, seg_id),
     }
 
-    // Verify the state of segment in the DB
+    // Advisory computation still cannot manufacture persisted truth.
     let seg_final = db.get_segment_by_id(seg_id).unwrap().unwrap();
-    assert!(seg_final.verdict.is_some());
+    assert!(seg_final.verdict.is_none());
+    assert!(!seg_final.escalated);
 }

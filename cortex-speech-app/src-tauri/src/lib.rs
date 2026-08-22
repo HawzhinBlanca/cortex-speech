@@ -56,6 +56,7 @@ pub mod migrations;
 pub mod models;
 pub mod normalizer;
 pub mod pipeline;
+pub mod production_dataset;
 pub mod quality;
 pub mod registry;
 pub mod review_campaign;

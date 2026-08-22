@@ -616,7 +616,7 @@ fn stored_pcm_hash_state(db: &Database, audio_path: &str) -> AppResult<StoredPcm
     })
 }
 
-fn current_canonical_pcm_blake3(audio_path: &Path) -> AppResult<String> {
+pub(crate) fn current_canonical_pcm_blake3(audio_path: &Path) -> AppResult<String> {
     // Match the import/backfill identity exactly: BLAKE3(sample_rate LE || canonical 16 kHz mono i16
     // PCM). Decode in bounded windows so a multi-hour recording is never materialized in RAM.
     let mut identity = crate::fingerprint::StreamingIdentity::new();

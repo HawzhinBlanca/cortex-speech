@@ -3622,6 +3622,304 @@ pub static MIGRATIONS: &[Migration] = &[
              DROP INDEX idx_review_compensation_one_reversal_per_entry;",
         ),
     },
+    Migration {
+        version: 61,
+        description: "Persist blinded independent review, adjudication, and campaign completion authority",
+        // A sequential campaign cannot become exportable merely because somebody edits its JSON
+        // setting.  The database now owns an immutable copy of the exact focus, every blinded
+        // second-pass judgement, every reversal, every adjudication, and every phase transition.
+        // The first-pass corpus row remains untouched during the independent pass: Alle sees the
+        // champion raw draft and writes into `independent_review_decisions`, so Rubar's correction
+        // is neither leaked as an answer nor overwritten by a competing judgement.
+        up_sql: "CREATE TABLE review_campaign_registry (
+                     campaign_id                    TEXT PRIMARY KEY,
+                     focus_segment_count            INTEGER NOT NULL CHECK(focus_segment_count > 0),
+                     focus_sha256                    TEXT NOT NULL
+                                                         CHECK(length(focus_sha256) = 64
+                                                           AND focus_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     first_reviewer                  TEXT NOT NULL CHECK(first_reviewer = 'Rubar'),
+                     second_reviewer                 TEXT NOT NULL CHECK(second_reviewer = 'Alle'),
+                     after_review_event_id           INTEGER NOT NULL CHECK(after_review_event_id >= 0),
+                     activated_at_review_event_id    INTEGER NOT NULL
+                                                         CHECK(activated_at_review_event_id >= after_review_event_id),
+                     created_at                      TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_registry_immutable_update
+                 BEFORE UPDATE ON review_campaign_registry
+                 BEGIN SELECT RAISE(ABORT, 'review campaign registry is immutable'); END;
+                 CREATE TRIGGER review_campaign_registry_immutable_delete
+                 BEFORE DELETE ON review_campaign_registry
+                 BEGIN SELECT RAISE(ABORT, 'review campaign registry is immutable'); END;
+
+                 CREATE TABLE review_campaign_focus (
+                     campaign_id                    TEXT NOT NULL,
+                     segment_id                     TEXT NOT NULL,
+                     ordinal                        INTEGER NOT NULL CHECK(ordinal >= 0),
+                     PRIMARY KEY(campaign_id, segment_id),
+                     UNIQUE(campaign_id, ordinal),
+                     FOREIGN KEY(campaign_id) REFERENCES review_campaign_registry(campaign_id),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_focus_immutable_update
+                 BEFORE UPDATE ON review_campaign_focus
+                 BEGIN SELECT RAISE(ABORT, 'review campaign focus is immutable'); END;
+                 CREATE TRIGGER review_campaign_focus_immutable_delete
+                 BEFORE DELETE ON review_campaign_focus
+                 BEGIN SELECT RAISE(ABORT, 'review campaign focus is immutable'); END;
+
+                 CREATE TABLE review_campaign_transitions (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     transition_id                  TEXT NOT NULL UNIQUE,
+                     campaign_id                    TEXT NOT NULL,
+                     from_phase                     TEXT NOT NULL
+                                                         CHECK(from_phase IN ('first_pass_active',
+                                                                              'second_pass_active',
+                                                                              'adjudication_active')),
+                     to_phase                       TEXT NOT NULL
+                                                         CHECK(to_phase IN ('second_pass_active',
+                                                                            'adjudication_active',
+                                                                            'completed')),
+                     max_review_event_id            INTEGER NOT NULL CHECK(max_review_event_id >= 0),
+                     independent_decision_count     INTEGER NOT NULL CHECK(independent_decision_count >= 0),
+                     adjudication_count             INTEGER NOT NULL CHECK(adjudication_count >= 0),
+                     conflicts_remaining            INTEGER NOT NULL CHECK(conflicts_remaining >= 0),
+                     progress_sha256                TEXT NOT NULL
+                                                         CHECK(length(progress_sha256) = 64
+                                                           AND progress_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(campaign_id) REFERENCES review_campaign_registry(campaign_id)
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_transition_sequence_insert
+                 BEFORE INSERT ON review_campaign_transitions
+                 WHEN
+                      (NEW.from_phase = 'first_pass_active' AND NEW.to_phase <> 'second_pass_active')
+                   OR (NEW.from_phase = 'second_pass_active'
+                       AND NEW.to_phase NOT IN ('adjudication_active', 'completed'))
+                   OR (NEW.from_phase = 'adjudication_active' AND NEW.to_phase <> 'completed')
+                   OR NEW.from_phase = NEW.to_phase
+                   OR COALESCE((
+                          SELECT to_phase FROM review_campaign_transitions
+                           WHERE campaign_id = NEW.campaign_id ORDER BY id DESC LIMIT 1
+                      ), 'first_pass_active') <> NEW.from_phase
+                 BEGIN SELECT RAISE(ABORT, 'review campaign transition is out of sequence'); END;
+                 CREATE TRIGGER review_campaign_transitions_immutable_update
+                 BEFORE UPDATE ON review_campaign_transitions
+                 BEGIN SELECT RAISE(ABORT, 'review campaign transitions are append-only'); END;
+                 CREATE TRIGGER review_campaign_transitions_immutable_delete
+                 BEFORE DELETE ON review_campaign_transitions
+                 BEGIN SELECT RAISE(ABORT, 'review campaign transitions are append-only'); END;
+
+                 CREATE TABLE independent_review_decisions (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     campaign_id                    TEXT NOT NULL,
+                     segment_id                     TEXT NOT NULL,
+                     reviewer                       TEXT NOT NULL,
+                     action                         TEXT NOT NULL
+                                                         CHECK(action IN ('accept','edit','reject','skip')),
+                     submitted_transcript           TEXT,
+                     served_transcript              TEXT NOT NULL CHECK(trim(served_transcript) <> ''),
+                     served_revision                INTEGER NOT NULL CHECK(served_revision >= 0),
+                     audio_content_hash             TEXT,
+                     source_start_ms                INTEGER,
+                     source_end_ms                  INTEGER,
+                     duration_ms                    INTEGER NOT NULL CHECK(duration_ms >= 0),
+                     requested_action               TEXT NOT NULL
+                                                         CHECK(requested_action IN ('accept','edit','bad','skip')),
+                     requested_transcript           TEXT NOT NULL,
+                     operation_id                   TEXT NOT NULL UNIQUE CHECK(trim(operation_id) <> ''),
+                     operation_payload_hash         TEXT NOT NULL
+                                                         CHECK(length(operation_payload_hash) = 64
+                                                           AND operation_payload_hash NOT GLOB '*[^0-9a-f]*'),
+                     app_git_sha                    TEXT NOT NULL
+                                                         CHECK(length(app_git_sha) = 40
+                                                           AND app_git_sha NOT GLOB '*[^0-9a-f]*'),
+                     playback_guard_version         TEXT NOT NULL
+                                                         CHECK(playback_guard_version = 'content-hash-raw-counter-v3'),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(campaign_id, segment_id)
+                         REFERENCES review_campaign_focus(campaign_id, segment_id),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE INDEX idx_independent_review_segment
+                     ON independent_review_decisions(campaign_id, segment_id, id);
+                 CREATE TRIGGER independent_review_decision_validate_insert
+                 BEFORE INSERT ON independent_review_decisions
+                 WHEN
+                      COALESCE((SELECT to_phase FROM review_campaign_transitions
+                                 WHERE campaign_id = NEW.campaign_id ORDER BY id DESC LIMIT 1), '')
+                          <> 'second_pass_active'
+                   OR NEW.reviewer <> (SELECT second_reviewer FROM review_campaign_registry
+                                        WHERE campaign_id = NEW.campaign_id)
+                   OR (NEW.action IN ('accept','edit')
+                       AND (NEW.submitted_transcript IS NULL OR trim(NEW.submitted_transcript) = ''))
+                   OR (NEW.action IN ('reject','skip') AND NEW.submitted_transcript IS NOT NULL)
+                   OR (NEW.action <> 'skip' AND (
+                          NEW.audio_content_hash IS NULL
+                          OR length(NEW.audio_content_hash) <> 64
+                          OR NEW.audio_content_hash GLOB '*[^0-9a-f]*'
+                          OR typeof(NEW.source_start_ms) <> 'integer'
+                          OR typeof(NEW.source_end_ms) <> 'integer'
+                          OR NEW.source_start_ms < 0
+                          OR NEW.source_end_ms <= NEW.source_start_ms
+                       ))
+                   OR EXISTS (
+                          SELECT 1 FROM independent_review_decisions prior
+                           WHERE prior.campaign_id = NEW.campaign_id
+                             AND prior.segment_id = NEW.segment_id
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM independent_review_reversals reversal
+                                   WHERE reversal.decision_id = prior.id
+                             )
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'independent review decision is invalid or already active'); END;
+                 CREATE TRIGGER independent_review_decisions_immutable_update
+                 BEFORE UPDATE ON independent_review_decisions
+                 BEGIN SELECT RAISE(ABORT, 'independent review decisions are append-only'); END;
+                 CREATE TRIGGER independent_review_decisions_immutable_delete
+                 BEFORE DELETE ON independent_review_decisions
+                 BEGIN SELECT RAISE(ABORT, 'independent review decisions are append-only'); END;
+
+                 CREATE TABLE independent_review_reversals (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     decision_id                    INTEGER NOT NULL UNIQUE,
+                     operation_id                   TEXT NOT NULL UNIQUE CHECK(trim(operation_id) <> ''),
+                     reviewer                       TEXT NOT NULL,
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     FOREIGN KEY(decision_id) REFERENCES independent_review_decisions(id)
+                 ) STRICT;
+                 CREATE TRIGGER independent_review_reversal_validate_insert
+                 BEFORE INSERT ON independent_review_reversals
+                 WHEN COALESCE((
+                          SELECT transition.to_phase
+                            FROM independent_review_decisions decision
+                            JOIN review_campaign_transitions transition
+                              ON transition.campaign_id = decision.campaign_id
+                           WHERE decision.id = NEW.decision_id
+                           ORDER BY transition.id DESC LIMIT 1
+                      ), '') <> 'second_pass_active'
+                   OR NEW.reviewer <> (SELECT reviewer FROM independent_review_decisions
+                                        WHERE id = NEW.decision_id)
+                   OR EXISTS (
+                          SELECT 1
+                            FROM independent_review_decisions newer
+                            JOIN independent_review_decisions target
+                              ON target.id = NEW.decision_id
+                           WHERE newer.campaign_id = target.campaign_id
+                             AND newer.segment_id = target.segment_id
+                             AND newer.id > target.id
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM independent_review_reversals prior_reversal
+                                   WHERE prior_reversal.decision_id = newer.id
+                             )
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'independent review reversal is invalid or stale'); END;
+                 CREATE TRIGGER independent_review_reversals_immutable_update
+                 BEFORE UPDATE ON independent_review_reversals
+                 BEGIN SELECT RAISE(ABORT, 'independent review reversals are append-only'); END;
+                 CREATE TRIGGER independent_review_reversals_immutable_delete
+                 BEFORE DELETE ON independent_review_reversals
+                 BEGIN SELECT RAISE(ABORT, 'independent review reversals are append-only'); END;
+
+                 CREATE VIEW effective_independent_review_decisions_v61 AS
+                 SELECT decision.*
+                   FROM independent_review_decisions decision
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM independent_review_reversals reversal
+                         WHERE reversal.decision_id = decision.id
+                  );
+
+                 CREATE TABLE review_campaign_adjudications (
+                     id                             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     adjudication_id                TEXT NOT NULL UNIQUE,
+                     campaign_id                    TEXT NOT NULL,
+                     segment_id                     TEXT NOT NULL,
+                     first_review_event_id          INTEGER NOT NULL,
+                     second_decision_id             INTEGER NOT NULL,
+                     resolution_kind                TEXT NOT NULL
+                                                         CHECK(resolution_kind IN ('exact_agreement','manual')),
+                     final_action                   TEXT NOT NULL CHECK(final_action IN ('retain','reject')),
+                     final_transcript               TEXT,
+                     adjudicator                    TEXT NOT NULL CHECK(trim(adjudicator) <> ''),
+                     created_at_ms                  INTEGER NOT NULL CHECK(created_at_ms > 0),
+                     UNIQUE(campaign_id, segment_id),
+                     FOREIGN KEY(campaign_id, segment_id)
+                         REFERENCES review_campaign_focus(campaign_id, segment_id),
+                     FOREIGN KEY(first_review_event_id) REFERENCES review_events(id),
+                     FOREIGN KEY(second_decision_id) REFERENCES independent_review_decisions(id)
+                 ) STRICT;
+                 CREATE TRIGGER review_campaign_adjudication_validate_insert
+                 BEFORE INSERT ON review_campaign_adjudications
+                 WHEN
+                      COALESCE((SELECT to_phase FROM review_campaign_transitions
+                                 WHERE campaign_id = NEW.campaign_id ORDER BY id DESC LIMIT 1), '')
+                          NOT IN ('second_pass_active', 'adjudication_active')
+                   OR (NEW.final_action = 'retain'
+                       AND (NEW.final_transcript IS NULL OR trim(NEW.final_transcript) = ''))
+                   OR (NEW.final_action = 'reject' AND NEW.final_transcript IS NOT NULL)
+                   OR (NEW.resolution_kind = 'exact_agreement'
+                       AND NEW.adjudicator <> 'system:exact-independent-agreement')
+                   OR (NEW.resolution_kind = 'manual'
+                       AND lower(NEW.adjudicator) GLOB 'system:*')
+                   OR NOT EXISTS (
+                          SELECT 1 FROM effective_independent_review_decisions_v61 decision
+                           WHERE decision.id = NEW.second_decision_id
+                             AND decision.campaign_id = NEW.campaign_id
+                             AND decision.segment_id = NEW.segment_id
+                      )
+                   OR NOT EXISTS (
+                          SELECT 1 FROM review_events event
+                           WHERE event.id = NEW.first_review_event_id
+                             AND event.segment_id = NEW.segment_id
+                             AND event.reviewer = (SELECT first_reviewer
+                                                     FROM review_campaign_registry
+                                                    WHERE campaign_id = NEW.campaign_id)
+                             AND event.action IN ('accept','edit','reject')
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'review campaign adjudication has invalid evidence'); END;
+                 CREATE TRIGGER review_campaign_adjudications_immutable_update
+                 BEFORE UPDATE ON review_campaign_adjudications
+                 BEGIN SELECT RAISE(ABORT, 'review campaign adjudications are append-only'); END;
+                 CREATE TRIGGER review_campaign_adjudications_immutable_delete
+                 BEFORE DELETE ON review_campaign_adjudications
+                 BEGIN SELECT RAISE(ABORT, 'review campaign adjudications are append-only'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE review_campaign_v61_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_campaign_v61_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM review_campaign_registry)
+                         OR EXISTS (SELECT 1 FROM review_campaign_focus)
+                         OR EXISTS (SELECT 1 FROM review_campaign_transitions)
+                         OR EXISTS (SELECT 1 FROM independent_review_decisions)
+                         OR EXISTS (SELECT 1 FROM independent_review_reversals)
+                         OR EXISTS (SELECT 1 FROM review_campaign_adjudications);
+             DROP TABLE review_campaign_v61_rollback_guard;
+             DROP TRIGGER review_campaign_adjudications_immutable_delete;
+             DROP TRIGGER review_campaign_adjudications_immutable_update;
+             DROP TRIGGER review_campaign_adjudication_validate_insert;
+             DROP TABLE review_campaign_adjudications;
+             DROP VIEW effective_independent_review_decisions_v61;
+             DROP TRIGGER independent_review_reversals_immutable_delete;
+             DROP TRIGGER independent_review_reversals_immutable_update;
+             DROP TRIGGER independent_review_reversal_validate_insert;
+             DROP TABLE independent_review_reversals;
+             DROP TRIGGER independent_review_decisions_immutable_delete;
+             DROP TRIGGER independent_review_decisions_immutable_update;
+             DROP TRIGGER independent_review_decision_validate_insert;
+             DROP INDEX idx_independent_review_segment;
+             DROP TABLE independent_review_decisions;
+             DROP TRIGGER review_campaign_transitions_immutable_delete;
+             DROP TRIGGER review_campaign_transitions_immutable_update;
+             DROP TRIGGER review_campaign_transition_sequence_insert;
+             DROP TABLE review_campaign_transitions;
+             DROP TRIGGER review_campaign_focus_immutable_delete;
+             DROP TRIGGER review_campaign_focus_immutable_update;
+             DROP TABLE review_campaign_focus;
+             DROP TRIGGER review_campaign_registry_immutable_delete;
+             DROP TRIGGER review_campaign_registry_immutable_update;
+             DROP TABLE review_campaign_registry;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -3632,7 +3930,7 @@ mod tests {
     fn database_at_v57() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 3).unwrap(), vec![60, 59, 58], "fixture must stop immediately before v58");
+        assert_eq!(rollback(&db, 4).unwrap(), vec![61, 60, 59, 58], "fixture must stop immediately before v58");
         assert_eq!(get_current_version(&db).unwrap(), 57);
         db
     }
@@ -3640,8 +3938,16 @@ mod tests {
     fn database_at_v59() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "fixture must expose the populated-v59 boundary");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "fixture must expose the populated-v59 boundary");
         assert_eq!(get_current_version(&db).unwrap(), 59);
+        db
+    }
+
+    fn database_at_v60() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![61], "fixture must expose the v60 boundary");
+        assert_eq!(get_current_version(&db).unwrap(), 60);
         db
     }
 
@@ -3919,7 +4225,7 @@ mod tests {
     fn v59_hidden_key_schema_enforces_policy_scoped_quotas_and_append_only_history() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "fixture must expose the v59 layer directly");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "fixture must expose the v59 layer directly");
         assert_eq!(get_current_version(&db).unwrap(), 59);
         let policy = "a".repeat(64);
         for (reviewer, segment_id) in [("Sara", "s-a"), ("sARA", "s-b"), ("Hemn", "h-a"), ("HEMN", "h-b")] {
@@ -4008,10 +4314,10 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 1).unwrap(), vec![60]);
+        assert_eq!(rollback(&empty, 2).unwrap(), vec![61, 60]);
         assert_eq!(rollback(&empty, 1).unwrap(), vec![59]);
         assert_eq!(get_current_version(&empty).unwrap(), 58);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60]);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61]);
     }
 
     #[test]
@@ -4065,7 +4371,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61]);
+        assert_eq!(rollback(&db, 1).unwrap(), vec![61], "this test isolates the v60 migration");
         assert_eq!(get_current_version(&db).unwrap(), 60);
         let state: (i64, i64) = db
             .connection()
@@ -4283,8 +4590,7 @@ mod tests {
 
     #[test]
     fn v60_reviewed_snapshot_cannot_bless_forged_post_cutoff_human_truth() {
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = database_at_v60();
         db.connection()
             .execute(
                 "INSERT INTO speech_segments
@@ -4367,7 +4673,7 @@ mod tests {
                  VALUES ('delete-memory-proof', 'w', 'r', 'slot', 'phon', 'delete-memory');",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61]);
 
         assert_eq!(
             db.connection().execute("DELETE FROM speech_segments WHERE id='delete-clean'", []).unwrap(),
@@ -4979,8 +5285,7 @@ mod tests {
 
     #[test]
     fn v60_policy3_playback_receipts_bind_exact_server_identity_and_span_and_are_immutable() {
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = database_at_v60();
         db.connection()
             .execute_batch(
                 "INSERT INTO speech_segments
@@ -6127,16 +6432,14 @@ mod tests {
 
     #[test]
     fn v60_rollback_guard_detects_effects_and_post_migration_reversals() {
-        let with_effect = Database::open(":memory:").unwrap();
-        with_effect.initialize().unwrap();
+        let with_effect = database_at_v60();
         insert_effect_event(&with_effect, None, "rollback-effect", None, "desktop", 1);
         let effect_error =
             rollback(&with_effect, 1).expect_err("a recorded v60 effect cannot be erased by downgrade").to_string();
         assert!(effect_error.contains("CHECK constraint failed"), "unexpected effect guard: {effect_error}");
         assert_eq!(get_current_version(&with_effect).unwrap(), 60);
 
-        let with_flag_effect = Database::open(":memory:").unwrap();
-        with_flag_effect.initialize().unwrap();
+        let with_flag_effect = database_at_v60();
         let flag_effect = insert_flag_effect_event(
             &with_flag_effect,
             "rollback-flag-effect",
@@ -6162,7 +6465,8 @@ mod tests {
         let with_reversal = database_at_v59();
         let (_, baseline_entry) =
             insert_review_original(&with_reversal, "baseline-reversal", "baseline-work", "Sara", "legacy");
-        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60]);
+        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61]);
+        assert_eq!(rollback(&with_reversal, 1).unwrap(), vec![61]);
         reverse_review_entry(&with_reversal, &baseline_entry, "post-v60-baseline-undo").unwrap();
         let reversal_error = rollback(&with_reversal, 1)
             .expect_err("the ledger cutoff must distinguish a reversal appended after migration")
@@ -6192,7 +6496,8 @@ mod tests {
                          1, 'human correction', 'edit', '2026-08-20 00:00:00', 'Sara', 1);",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61]);
+        assert_eq!(rollback(&db, 1).unwrap(), vec![61]);
 
         let (machine_snapshots, human_overlap, exact): (i64, i64, i64) = db
             .connection()
@@ -6255,7 +6560,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(run_migrations(&drifted).unwrap(), vec![60]);
+        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61]);
+        assert_eq!(rollback(&drifted, 1).unwrap(), vec![61]);
         drifted
             .connection()
             .execute("UPDATE speech_segments SET rationale='forged rationale' WHERE id='legacy-machine-drift'", [])
@@ -6264,8 +6570,7 @@ mod tests {
             rollback(&drifted, 1).expect_err("downgrade must refuse a drifted machine frontier").to_string();
         assert!(drift_error.contains("CHECK constraint failed"), "unexpected drift guard: {drift_error}");
 
-        let unbound = Database::open(":memory:").unwrap();
-        unbound.initialize().unwrap();
+        let unbound = database_at_v60();
         unbound
             .connection()
             .execute(
@@ -6971,7 +7276,7 @@ mod tests {
     fn migration_v20_creates_correction_memory() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "this test isolates the pre-v60 v20 surface");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "this test isolates the pre-v60 v20 surface");
         let conn = db.connection();
 
         // The table and both lookup indexes exist after initialize().
@@ -7031,7 +7336,7 @@ mod tests {
     fn migration_v32_adds_evidence_confidence_columns() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "this test isolates the pre-v60 v32 surface");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "this test isolates the pre-v60 v32 surface");
         let conn = db.connection();
 
         // Both firing-outcome counters exist and default to 0. A raw insert keeps the column-default
@@ -7058,7 +7363,7 @@ mod tests {
         // keeps the memory — and crucially does NOT block the segment deletion itself.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "this test isolates the pre-v60 FK behavior");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "this test isolates the pre-v60 FK behavior");
         let conn = db.connection();
         // FK enforcement must be on for the SET NULL action to fire (it is, per Database::open).
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -7087,7 +7392,7 @@ mod tests {
     fn migration_v21_creates_corrections_ledger() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "this test isolates the pre-v60 v21 surface");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "this test isolates the pre-v60 v21 surface");
         let conn = db.connection();
 
         let table: i64 = conn
@@ -7124,7 +7429,7 @@ mod tests {
         // with segment_id SET NULL.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "this test isolates the pre-v60 FK behavior");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "this test isolates the pre-v60 FK behavior");
         let conn = db.connection();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
@@ -7333,7 +7638,7 @@ mod tests {
         // honest, and nothing downstream would notice a smaller number.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "this test isolates v46's historical surface");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "this test isolates v46's historical surface");
         assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
 
         db.insert_segment(&crate::db::SpeechSegment {
@@ -7387,7 +7692,7 @@ mod tests {
     fn v57_starts_prospectively_after_the_last_legacy_event() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 4).unwrap(), vec![60, 59, 58, 57], "fixture must return to the v56 schema");
+        assert_eq!(rollback(&db, 5).unwrap(), vec![61, 60, 59, 58, 57], "fixture must return to the v56 schema");
 
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pay-cutoff".into(),
@@ -7407,7 +7712,7 @@ mod tests {
             .unwrap();
         let legacy_event_id = db.connection().last_insert_rowid();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61]);
         let cutoff: i64 = db
             .connection()
             .query_row(
@@ -7430,7 +7735,7 @@ mod tests {
         assert_eq!(before.earned_micro_iqd, 0, "legacy activity is reported, never silently repriced");
         assert_eq!(before.legacy_events_pending_reconciliation, 1);
 
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "the remainder of this test isolates v57 accounting");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "the remainder of this test isolates v57 accounting");
         let (priced_event_id, _) = insert_review_original(&db, "pay-cutoff", "prospective-paid-work", "Sara", "couch");
         let after = db.review_compensation_summary("Sara").unwrap();
         assert_eq!(after.earned_micro_iqd, 5_000_000);
@@ -7442,7 +7747,7 @@ mod tests {
     fn v57_policy_and_ledger_rows_are_physically_immutable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![60], "this test isolates v57's immutable ledger");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![61, 60], "this test isolates v57's immutable ledger");
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pay-immutable".into(),
             audio_path: "/pay-immutable.wav".into(),
@@ -7569,7 +7874,7 @@ mod tests {
         for history_kind in ["ledger", "unledgered-event"] {
             let db = Database::open(":memory:").unwrap();
             db.initialize().unwrap();
-            assert_eq!(rollback(&db, 3).unwrap(), vec![60, 59, 58], "fixture must target v57 rollback semantics");
+            assert_eq!(rollback(&db, 4).unwrap(), vec![61, 60, 59, 58], "fixture must target v57 rollback semantics");
             db.insert_segment(&crate::db::SpeechSegment {
                 id: format!("pay-no-rollback-{history_kind}"),
                 audio_path: format!("/pay-no-rollback-{history_kind}.wav"),
@@ -7698,7 +8003,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archive_counts: (i64, i64) = db
             .connection()
@@ -7945,7 +8250,7 @@ mod tests {
         // Once an operator separately resolves the unknown class, the same pending migration can
         // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
         db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archived: i64 = db
             .connection()
@@ -7975,12 +8280,12 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61]);
 
         assert_eq!(
-            rollback(&db, 2).unwrap(),
-            vec![60, 59],
-            "the empty v60/v59 layers must be removed before probing v58"
+            rollback(&db, 3).unwrap(),
+            vec![61, 60, 59],
+            "the empty v61/v60/v59 layers must be removed before probing v58"
         );
 
         let rollback_error = rollback(&db, 1)
@@ -8051,7 +8356,7 @@ mod tests {
 
         // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
         // restored children in place. This pins the full up/down/up round trip.
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61]);
         let reapply_counts: (i64, i64, i64, i64) = db
             .connection()
             .query_row(
