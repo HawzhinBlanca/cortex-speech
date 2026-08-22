@@ -116,6 +116,7 @@ def test_activation_preserves_target_tokens_narrows_every_session_surface_and_ba
         policy = json.loads((root / POLICY_FILE).read_text(encoding="utf-8"))
         session = json.loads((root / SESSION_FILE).read_text(encoding="utf-8"))
         assert policy == session["pilot_policy"]
+        assert [entry["name"] for entry in policy["reviewers"]] == ["Alle", "Rubar"]
         assert policy["after_review_event_id"] == 863
         assert policy["max_total_corpus_actions"] == 20
         assert result["maxCorpusActions"] == 20

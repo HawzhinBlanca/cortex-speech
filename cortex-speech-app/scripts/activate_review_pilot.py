@@ -6,7 +6,8 @@ app, importer, and watchdog to be offline; takes SQLite's write reservation; com
 event-id precondition; revokes auto-resume; backs up the remembered session/policy; narrows durable
 pairing, cookie, and outstanding hidden-check state to Rubar + Alle without decrypting or changing
 their DPAPI tokens; writes the same policy snapshot into the session; rechecks the event-id; then
-promotes both files. The revocation marker is removed last. Any crash after mutation begins therefore
+promotes the policy, session, and optional focus together. The revocation marker is removed last.
+Any crash after mutation begins therefore
 leaves Couch unable to resume, never unrestricted.
 
 For a pre-v59 library, establish durable revocation before the offline maintenance migration. Once
@@ -319,8 +320,11 @@ def pilot_policy(after_review_event_id: int) -> dict[str, object]:
         "schema_version": 1,
         "after_review_event_id": after_review_event_id,
         "max_total_corpus_actions": TOTAL_CAP,
+        # Rust sorts names while validating the standalone policy, then structurally compares it
+        # with the policy embedded in the remembered session. Emit that canonical order here too.
         "reviewers": [
-            {"name": name, "max_corpus_actions": CAP_PER_REVIEWER} for name in REVIEWERS
+            {"name": name, "max_corpus_actions": CAP_PER_REVIEWER}
+            for name in sorted(REVIEWERS, key=str.lower)
         ],
     })
 
