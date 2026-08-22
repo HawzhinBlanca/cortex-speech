@@ -386,7 +386,10 @@ def validate_snapshot_manifest(directory: Path) -> ManifestContract:
 
 def inspect_database(path: Path) -> DatabaseInspection:
     try:
-        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        # The manifest has already proved this is a closed, self-contained snapshot.  Immutable mode
+        # keeps the recovery drill observational even when an older valid snapshot retains a WAL-mode
+        # database header: inspection must not mint disposable ``-wal``/``-shm`` state.
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro&immutable=1", uri=True)
     except sqlite3.Error as error:
         raise SnapshotValidationError(f"restored database could not be opened read-only: {error}") from error
     try:

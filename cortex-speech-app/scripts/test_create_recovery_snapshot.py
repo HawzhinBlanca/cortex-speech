@@ -102,6 +102,65 @@ def test_snapshot_and_offsite_copy_are_manifest_verified() -> None:
             snapshot.verify_tree(tree, expected_evidence=evidence, expected_foreign_keys=0)
 
 
+def test_wal_mode_snapshot_verification_never_creates_unlisted_sidecars() -> None:
+    """A production WAL database must remain an exact manifest tree after self-verification."""
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        offsite = base / "offsite"
+        data.mkdir()
+        seed_profile(data)
+        con = sqlite3.connect(data / snapshot.DB_FILE)
+        try:
+            assert con.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        finally:
+            con.close()
+
+        local, evidence = snapshot.promote_snapshot(
+            data, label="wal_mode", expected_foreign_keys=0, repo_root=base
+        )
+        assert not (local / f"{snapshot.DB_FILE}-wal").exists()
+        assert not (local / f"{snapshot.DB_FILE}-shm").exists()
+        con = snapshot.open_readonly(local / snapshot.DB_FILE, immutable=True)
+        try:
+            assert con.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+        finally:
+            con.close()
+
+        remote = snapshot.mirror_offsite(local, offsite, evidence=evidence, expected_foreign_keys=0)
+        for tree in (local, remote):
+            assert not (tree / f"{snapshot.DB_FILE}-wal").exists()
+            assert not (tree / f"{snapshot.DB_FILE}-shm").exists()
+            snapshot.verify_tree(tree, expected_evidence=evidence, expected_foreign_keys=0)
+
+
+def test_post_verification_inventory_check_refuses_a_verifier_side_effect() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data)
+        real_db_evidence = snapshot.db_evidence
+
+        def polluting_db_evidence(path: Path, *, immutable: bool = False) -> dict[str, object]:
+            evidence = real_db_evidence(path, immutable=immutable)
+            if immutable:
+                (path.parent / f"{snapshot.DB_FILE}-wal").write_bytes(b"unexpected verifier output")
+            return evidence
+
+        with mock.patch.object(snapshot, "db_evidence", side_effect=polluting_db_evidence):
+            try:
+                snapshot.promote_snapshot(
+                    data, label="polluted", expected_foreign_keys=0, repo_root=base
+                )
+            except RuntimeError as error:
+                assert "unlisted" in str(error), error
+            else:
+                raise AssertionError("a verifier-created sidecar must block snapshot promotion")
+        assert not list((data / "snapshots" / "pinned").glob("polluted_*"))
+
+
 def test_wrong_expected_fk_count_refuses_before_promotion() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)

@@ -119,8 +119,19 @@ def git_sha(repo_root: Path) -> str:
         return "unknown"
 
 
-def open_readonly(path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=30)
+def open_readonly(path: Path, *, immutable: bool = False) -> sqlite3.Connection:
+    """Open SQLite read-only, optionally without creating WAL/SHM sidecars.
+
+    The live source must use ordinary ``mode=ro`` so SQLite incorporates any committed WAL pages
+    into the online backup.  A completed snapshot is different: its database is a closed,
+    self-contained copy, and verification must not mutate its exact manifest inventory by creating
+    ``-wal``/``-shm`` files.  ``immutable=1`` is therefore reserved for that closed copy.
+    """
+
+    immutable_query = "&immutable=1" if immutable else ""
+    return sqlite3.connect(
+        f"file:{path.as_posix()}?mode=ro{immutable_query}", uri=True, timeout=30
+    )
 
 
 def validate_migration_history(actual: tuple[tuple[int, str], ...]) -> int:
@@ -154,8 +165,8 @@ def validate_migration_history(actual: tuple[tuple[int, str], ...]) -> int:
     return current
 
 
-def db_evidence(path: Path) -> dict[str, object]:
-    con = open_readonly(path)
+def db_evidence(path: Path, *, immutable: bool = False) -> dict[str, object]:
+    con = open_readonly(path, immutable=immutable)
     try:
         quick = [row[0] for row in con.execute("PRAGMA quick_check")]
         integrity = [row[0] for row in con.execute("PRAGMA integrity_check")]
@@ -194,6 +205,14 @@ def online_backup(source: Path, destination: Path) -> None:
     try:
         src.backup(dest, pages=4096, sleep=0.001)
         dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # SQLite's backup API copies the live database's persistent WAL-mode header.  A recovery
+        # snapshot is a closed, standalone artifact, not a live WAL database: leaving that header in
+        # place lets a later read-only verifier create unlisted ``-wal``/``-shm`` files beside the
+        # manifest after its inventory was checked.  Normalize the staged copy to rollback-journal
+        # mode while it is still exclusively owned and refuse promotion unless SQLite confirms it.
+        journal_mode = dest.execute("PRAGMA journal_mode=DELETE").fetchone()
+        if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+            raise RuntimeError(f"snapshot database refused DELETE journal mode: {journal_mode}")
     finally:
         dest.close()
         src.close()
@@ -321,7 +340,7 @@ def verify_review_pilot_state(tree: Path) -> None:
             raise RuntimeError(f"snapshot {REVIEW_PILOT_FILE} is not a regular file")
         parsed = validate_review_pilot_policy(policy.read_bytes())
         verify_controlled_pilot_focus(tree)
-        con = open_readonly(tree / DB_FILE)
+        con = open_readonly(tree / DB_FILE, immutable=True)
         try:
             max_event_id = int(con.execute("SELECT COALESCE(MAX(id), 0) FROM review_events").fetchone()[0])
         finally:
@@ -535,7 +554,11 @@ def verify_tree(
     if manifest["databaseEvidence"] != expected_evidence:
         raise RuntimeError("snapshot manifest databaseEvidence differs from the live source evidence")
     verify_review_pilot_state(tree)
-    evidence = db_evidence(tree / DB_FILE)
+    # Verification is observational: opening a WAL-mode backup with plain ``mode=ro`` creates
+    # unlisted sidecars after the inventory check, so the locally promoted tree later fails its
+    # offsite copy.  The backup is closed and self-contained here; immutable mode reads its exact
+    # database pages without changing the snapshot tree.
+    evidence = db_evidence(tree / DB_FILE, immutable=True)
     if evidence["quickCheck"] != ["ok"] or evidence["integrityCheck"] != ["ok"]:
         raise RuntimeError(f"snapshot database failed SQLite checks: {evidence}")
     if evidence["foreignKeyViolationCount"] != expected_foreign_keys:
@@ -545,6 +568,9 @@ def verify_tree(
         )
     if evidence != expected_evidence:
         raise RuntimeError(f"snapshot database evidence differs from live source: {evidence} != {expected_evidence}")
+    # Database validation itself must be side-effect free.  Revalidate the complete inventory after
+    # every SQLite handle has closed so a platform-specific verifier sidecar can never be promoted.
+    validate_manifest_tree(tree)
 
 
 def unique_final(root: Path, label: str, epoch: int) -> Path:
