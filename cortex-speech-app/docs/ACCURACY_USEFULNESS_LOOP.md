@@ -120,7 +120,8 @@ like.* The highest-value orders today (build the harness first, then the order b
 - Never claim accuracy improved without a real harness run pasted into the ledger.
 - Never ship a pseudo-label round (or any retrain) that a real held-out eval did not bless — self-training
   bakes in the teacher's blind spots; that is the designed-against failure.
-- Never adopt a banned/unverified model (Qwen-family for ckb; cloud ckb = Gemini 2.5 Pro + Scribe only).
+- The only consent-gated advisory cloud model is Gemini 2.5 Pro. Never use a cloud or smaller-model
+  fallback for production ASR; OmniASR-7B Champion failure is a hard stop.
 - Never make cloud load-bearing in the default path; never persist/echo API keys; never hardcode private
   Windows paths. Treat voice as biometric (consent + license + attribution before publish/train).
 - Never let "machinery built" masquerade as "accuracy raised." They are different claims; keep them apart

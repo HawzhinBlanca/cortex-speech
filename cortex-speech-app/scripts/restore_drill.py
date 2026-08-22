@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
-"""Destructive-restore drill: prove a snapshot can actually bring the library back.
+"""Fail-closed recovery drill for a Cortex snapshot.
 
-"The backup exists" was the strongest claim available before this, and it was true while every
-off-drive snapshot silently held the database ALONE (measured 2026-08-19, 11 of 11 trees). A restore
-from one of those comes back with no champion pointer, and the 7B server refuses to start without a
-valid schema-2 pointer — so the backup would resurrect a library that cannot transcribe.
-
-This restores into a DISPOSABLE profile and never touches the live data directory. It simulates loss
-of the primary by restoring solely from the snapshot under test, then verifies the recovered state:
-
-  * required files present at all (DB + settings.json + champion.json)
-  * manifest, when present, agrees with the bytes on disk
-  * PRAGMA quick_check and foreign_key_check
-  * schema version (migrations applied), so a restored DB is not silently older than the app
-  * row counts for the tables that hold irreplaceable human work
-  * champion identity: the registry's champion row and champion.json name the SAME deployment
+The drill restores only into a disposable temporary profile. A production pass requires a strict,
+complete ``SNAPSHOT_MANIFEST.json`` written by either the Rust snapshot writer (schema 1) or the
+headless recovery writer (schema 2). Manifest-less historical trees are deliberately refused: they
+can be inspected manually, but cannot prove a production recovery.
 
 Usage:
     python scripts/restore_drill.py <snapshot-dir> [--expect-fail]
 
-`--expect-fail` inverts the verdict, so an incomplete tree can be asserted as a NEGATIVE control in
-the same harness. A drill that cannot fail proves nothing.
+``--expect-fail`` is the negative-control mode. A drill that cannot reject an intentionally broken
+tree proves nothing.
 """
 
 from __future__ import annotations
@@ -28,20 +18,78 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import sqlite3
-import sys
+import stat
 import tempfile
-from pathlib import Path
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path, PureWindowsPath
+from typing import Any
 
-REQUIRED = ["cortex-speech.db", "settings.json", "champion.json"]
-# Queue POLICY. Not "required" — a library legitimately has no focus, and an absent roster means
-# every reviewer is unrestricted. But if the PRIMARY has one and the snapshot does not, the restore
-# would silently widen who reviews what, so the drill compares against the live data dir.
-POLICY = ["reviewer_dialects.json", "voice_focus.json"]
+from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
+from pilot_focus_contract import verify_controlled_pilot_focus
+
+DB_FILE = "cortex-speech.db"
+# Each state has a mandatory representation: the real JSON file or its exact absence marker.
+REQUIRED_STATE = ("settings.json", "champion.json", "reviewer_dialects.json", "voice_focus.json")
+REVIEW_PILOT_FILE = "review_pilot_policy.json"
+REVIEW_PILOT_ABSENT_FILE = "review_pilot_policy.absent"
+REVIEW_PILOT_ABSENT_BYTES = b"review-pilot-policy-absent-v1\n"
 MANIFEST = "SNAPSHOT_MANIFEST.json"
-HUMAN_TABLES = ["speech_segments", "review_events", "spot_checks", "model_versions"]
+HUMAN_TABLES = ("speech_segments", "review_events", "spot_checks", "model_versions")
+EVIDENCE_TABLES = HUMAN_TABLES + ("import_jobs", "import_job_files")
+FILE_ROW_FIELDS = {"path", "sizeBytes", "sha256"}
+SCHEMA_FIELDS = {
+    1: {"schema", "reviewPilotPolicyStateSchema", "createdAtEpochSecs", "appGitSha", "files"},
+    2: {"schema", "createdAtEpochSecs", "appGitSha", "sourceDataDir", "databaseEvidence", "files"},
+}
+DATABASE_EVIDENCE_FIELDS = {
+    "quickCheck",
+    "integrityCheck",
+    "foreignKeyViolationCount",
+    "schemaVersion",
+    "rowCounts",
+}
+PILOT_FIELDS = {"schema_version", "after_review_event_id", "max_total_corpus_actions", "reviewers"}
+PILOT_REVIEWER_FIELDS = {"name", "max_corpus_actions"}
+WINDOWS_RESERVED_NAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
+
+
+def state_absence_marker(name: str) -> str:
+    return f"{name}.absent"
+
+
+def state_absence_bytes(name: str) -> bytes:
+    return f"cortex-snapshot-state-absent-v1:{name}\n".encode("ascii")
+
+
+class SnapshotValidationError(RuntimeError):
+    """A snapshot contract violation that must fail the drill closed."""
+
+
+@dataclass(frozen=True)
+class ManifestContract:
+    schema: int
+    file_names: tuple[str, ...]
+    database_evidence: dict[str, Any] | None
+    pilot_policy: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class DatabaseInspection:
+    evidence: dict[str, Any]
+    human_counts: dict[str, int]
+    max_review_event_id: int | None
+    champion_row: tuple[str, str] | None
+    migration_history: tuple[tuple[int, str], ...]
 
 
 def sha256_of(path: Path) -> str:
@@ -52,98 +100,446 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
+def _load_json_bytes(raw: bytes, label: str) -> Any:
+    def reject_constant(value: str) -> Any:
+        raise ValueError(f"non-finite JSON number {value}")
+
+    try:
+        return json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise SnapshotValidationError(f"{label} is invalid JSON: {error}") from error
+
+
+def _load_json_file(path: Path, label: str) -> Any:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise SnapshotValidationError(f"{label} is unreadable: {error}") from error
+    return _load_json_bytes(raw, label)
+
+
+def _require_exact_object(value: Any, fields: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise SnapshotValidationError(f"{label} must be a JSON object")
+    actual = set(value)
+    if actual != fields:
+        missing = sorted(fields - actual)
+        extra = sorted(actual - fields)
+        raise SnapshotValidationError(f"{label} fields are invalid (missing={missing}, extra={extra})")
+    return value
+
+
+def _require_nonnegative_int(value: Any, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise SnapshotValidationError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _safe_single_component(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or value.casefold() == MANIFEST.casefold()
+    ):
+        raise SnapshotValidationError(f"snapshot manifest contains unsafe file path {value!r}")
+    windows = PureWindowsPath(value)
+    if (
+        windows.drive
+        or windows.root
+        or len(windows.parts) != 1
+        or "/" in value
+        or "\\" in value
+        or any(char in '<>:"|?*' or ord(char) < 32 for char in value)
+        or value.endswith((" ", "."))
+        or value.split(".", 1)[0].casefold() in WINDOWS_RESERVED_NAMES
+    ):
+        raise SnapshotValidationError(f"snapshot manifest contains unsafe file path {value!r}")
+    return value
+
+
+def _regular_file(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise SnapshotValidationError(f"{label} is missing or unreadable: {error}") from error
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise SnapshotValidationError(f"{label} must be a regular, non-symlink file")
+
+
+def validate_review_pilot_policy(raw: bytes) -> dict[str, Any]:
+    value = _require_exact_object(
+        _load_json_bytes(raw, REVIEW_PILOT_FILE), PILOT_FIELDS, REVIEW_PILOT_FILE
+    )
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} schema_version must be exactly integer 1")
+    after = _require_nonnegative_int(value["after_review_event_id"], f"{REVIEW_PILOT_FILE} baseline")
+    if after > 2**63 - 1:
+        raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} baseline exceeds signed i64")
+    if type(value["max_total_corpus_actions"]) is not int or value["max_total_corpus_actions"] != 20:
+        raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} must cap the pilot at exactly 20 actions")
+    reviewers = value["reviewers"]
+    if not isinstance(reviewers, list) or len(reviewers) != 2:
+        raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} must contain exactly two reviewers")
+    normalized_names: list[str] = []
+    for index, raw_reviewer in enumerate(reviewers):
+        reviewer = _require_exact_object(
+            raw_reviewer, PILOT_REVIEWER_FIELDS, f"{REVIEW_PILOT_FILE} reviewer {index}"
+        )
+        name = reviewer["name"]
+        if not isinstance(name, str):
+            raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} reviewer {index} has an invalid name")
+        name = name.strip()
+        if not name or len(name) > 40:
+            raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} reviewer {index} has an invalid name")
+        if any(unicodedata.category(char) == "Cc" for char in name):
+            raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} reviewer {index} has an invalid name")
+        if type(reviewer["max_corpus_actions"]) is not int or reviewer["max_corpus_actions"] != 10:
+            raise SnapshotValidationError(
+                f"{REVIEW_PILOT_FILE} reviewer {index} must be capped at exactly 10 actions"
+            )
+        normalized_names.append("".join(char.lower() if "A" <= char <= "Z" else char for char in name))
+    if normalized_names[0] == normalized_names[1]:
+        raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} reviewer names must be distinct")
+    return value
+
+
+def _validate_database_evidence_shape(value: Any) -> dict[str, Any]:
+    evidence = _require_exact_object(value, DATABASE_EVIDENCE_FIELDS, "schema-2 databaseEvidence")
+    for field in ("quickCheck", "integrityCheck"):
+        rows = evidence[field]
+        if not isinstance(rows, list) or not rows or any(not isinstance(row, str) for row in rows):
+            raise SnapshotValidationError(f"schema-2 databaseEvidence.{field} must be a non-empty string array")
+    _require_nonnegative_int(
+        evidence["foreignKeyViolationCount"], "schema-2 databaseEvidence.foreignKeyViolationCount"
+    )
+    _require_nonnegative_int(evidence["schemaVersion"], "schema-2 databaseEvidence.schemaVersion")
+    counts = _require_exact_object(
+        evidence["rowCounts"], set(EVIDENCE_TABLES), "schema-2 databaseEvidence.rowCounts"
+    )
+    for table, count in counts.items():
+        _require_nonnegative_int(count, f"schema-2 databaseEvidence.rowCounts.{table}")
+    return evidence
+
+
+def validate_migration_history(actual: tuple[tuple[int, str], ...]) -> int:
+    """Mirror Rust ``validate_applied_history``: exact description-bound canonical prefix."""
+
+    try:
+        canonical = source_migrations(DEFAULT_MIGRATIONS)
+    except (OSError, ValueError) as error:
+        raise SnapshotValidationError(f"canonical migration history cannot be resolved: {error}") from error
+    if not actual:
+        raise SnapshotValidationError(
+            "schema_migrations is missing or empty; external snapshot history cannot be proven"
+        )
+    current = actual[-1][0]
+    head = canonical[-1][0]
+    if current > head:
+        raise SnapshotValidationError(
+            f"restored schema v{current} is newer than this source supports (v{head})"
+        )
+    expected = tuple(row for row in canonical if row[0] <= current)
+    if actual != expected:
+        actual_by_version = dict(actual)
+        expected_by_version = dict(expected)
+        missing = sorted(set(expected_by_version) - set(actual_by_version))
+        unknown = sorted(set(actual_by_version) - set(expected_by_version))
+        mismatched = sorted(
+            version
+            for version in set(actual_by_version) & set(expected_by_version)
+            if actual_by_version[version] != expected_by_version[version]
+        )
+        raise SnapshotValidationError(
+            "schema migration history is incomplete or altered: "
+            f"missing={missing}, unknown={unknown}, descriptionMismatch={mismatched}"
+        )
+    return current
+
+
+def _actual_inventory(directory: Path) -> dict[str, Path]:
+    inventory: dict[str, Path] = {}
+    folded: set[str] = set()
+    try:
+        entries = list(directory.iterdir())
+    except OSError as error:
+        raise SnapshotValidationError(f"snapshot directory is unreadable: {error}") from error
+    for path in entries:
+        if path.name == MANIFEST:
+            _regular_file(path, MANIFEST)
+            continue
+        name = _safe_single_component(path.name)
+        _regular_file(path, f"snapshot file {name!r}")
+        folded_name = name.casefold()
+        if folded_name in folded:
+            raise SnapshotValidationError(f"snapshot tree contains a case-colliding duplicate file {name!r}")
+        folded.add(folded_name)
+        inventory[name] = path
+    return inventory
+
+
+def validate_snapshot_manifest(directory: Path) -> ManifestContract:
+    manifest_path = directory / MANIFEST
+    _regular_file(manifest_path, MANIFEST)
+    manifest_value = _load_json_file(manifest_path, MANIFEST)
+    if not isinstance(manifest_value, dict):
+        raise SnapshotValidationError(f"{MANIFEST} must be a JSON object")
+    schema = manifest_value.get("schema")
+    if type(schema) is not int or schema not in SCHEMA_FIELDS:
+        raise SnapshotValidationError(f"{MANIFEST} schema must be exactly integer 1 or 2")
+    manifest = _require_exact_object(manifest_value, SCHEMA_FIELDS[schema], f"schema-{schema} manifest")
+    _require_nonnegative_int(manifest["createdAtEpochSecs"], "manifest createdAtEpochSecs")
+    if not isinstance(manifest["appGitSha"], str) or not manifest["appGitSha"]:
+        raise SnapshotValidationError("manifest appGitSha must be a non-empty string")
+    if schema == 1:
+        if type(manifest["reviewPilotPolicyStateSchema"]) is not int or manifest[
+            "reviewPilotPolicyStateSchema"
+        ] != 1:
+            raise SnapshotValidationError("schema-1 reviewPilotPolicyStateSchema must be exactly integer 1")
+        database_evidence = None
+    else:
+        if not isinstance(manifest["sourceDataDir"], str) or not manifest["sourceDataDir"]:
+            raise SnapshotValidationError("schema-2 sourceDataDir must be a non-empty string")
+        database_evidence = _validate_database_evidence_shape(manifest["databaseEvidence"])
+
+    rows = manifest["files"]
+    if not isinstance(rows, list):
+        raise SnapshotValidationError("manifest files must be an array")
+    declared: dict[str, dict[str, Any]] = {}
+    folded: set[str] = set()
+    for index, raw_row in enumerate(rows):
+        row = _require_exact_object(raw_row, FILE_ROW_FIELDS, f"manifest file row {index}")
+        name = _safe_single_component(row["path"])
+        folded_name = name.casefold()
+        if folded_name in folded:
+            raise SnapshotValidationError(f"manifest contains duplicate file {name!r}")
+        folded.add(folded_name)
+        _require_nonnegative_int(row["sizeBytes"], f"manifest size for {name!r}")
+        digest = row["sha256"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise SnapshotValidationError(f"manifest SHA-256 for {name!r} must be 64 lowercase hex digits")
+        declared[name] = row
+
+    actual = _actual_inventory(directory)
+    missing = sorted(set(declared) - set(actual))
+    unlisted = sorted(set(actual) - set(declared))
+    if missing or unlisted:
+        raise SnapshotValidationError(
+            f"manifest inventory is not exact (missing={missing}, unlisted={unlisted})"
+        )
+    for name, row in declared.items():
+        path = actual[name]
+        size = path.stat().st_size
+        if size != row["sizeBytes"]:
+            raise SnapshotValidationError(
+                f"snapshot file {name!r} size mismatch: expected {row['sizeBytes']}, got {size}"
+            )
+        if sha256_of(path) != row["sha256"]:
+            raise SnapshotValidationError(f"snapshot file {name!r} SHA-256 mismatch")
+
+    required = {DB_FILE}
+    absent_required = sorted(required - set(declared))
+    if absent_required:
+        raise SnapshotValidationError(f"manifest is incomplete: missing required files {absent_required}")
+    for name in REQUIRED_STATE:
+        marker = state_absence_marker(name)
+        present = name in declared
+        absent = marker in declared
+        if present == absent:
+            raise SnapshotValidationError(f"manifest must contain exactly one of {name} or {marker}")
+        if absent and actual[marker].read_bytes() != state_absence_bytes(name):
+            raise SnapshotValidationError(f"{marker} has invalid contents")
+    policy_present = REVIEW_PILOT_FILE in declared
+    absence_present = REVIEW_PILOT_ABSENT_FILE in declared
+    if policy_present == absence_present:
+        raise SnapshotValidationError(
+            f"manifest must contain exactly one of {REVIEW_PILOT_FILE} or {REVIEW_PILOT_ABSENT_FILE}"
+        )
+    pilot_policy = None
+    if policy_present:
+        pilot_policy = validate_review_pilot_policy(actual[REVIEW_PILOT_FILE].read_bytes())
+        try:
+            verify_controlled_pilot_focus(directory)
+        except RuntimeError as error:
+            raise SnapshotValidationError(f"snapshot controlled-pilot focus is invalid: {error}") from error
+    elif actual[REVIEW_PILOT_ABSENT_FILE].read_bytes() != REVIEW_PILOT_ABSENT_BYTES:
+        raise SnapshotValidationError(f"{REVIEW_PILOT_ABSENT_FILE} has invalid contents")
+    return ManifestContract(schema, tuple(declared), database_evidence, pilot_policy)
+
+
+def inspect_database(path: Path) -> DatabaseInspection:
+    try:
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise SnapshotValidationError(f"restored database could not be opened read-only: {error}") from error
+    try:
+        existing = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        quick = [str(row[0]) for row in connection.execute("PRAGMA quick_check").fetchall()]
+        integrity = [str(row[0]) for row in connection.execute("PRAGMA integrity_check").fetchall()]
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+        migration_history = (
+            tuple(
+                (int(version), str(description))
+                for version, description in connection.execute(
+                    "SELECT version, description FROM schema_migrations ORDER BY version"
+                )
+            )
+            if "schema_migrations" in existing
+            else ()
+        )
+        schema_version = migration_history[-1][0] if migration_history else 0
+        row_counts = {
+            table: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            for table in EVIDENCE_TABLES
+            if table in existing
+        }
+        human_counts = {table: row_counts[table] for table in HUMAN_TABLES if table in row_counts}
+        max_review_event_id = (
+            int(connection.execute("SELECT COALESCE(MAX(id), 0) FROM review_events").fetchone()[0])
+            if "review_events" in existing
+            else None
+        )
+        champion_row = None
+        if "model_versions" in existing:
+            row = connection.execute(
+                "SELECT id, checkpoint_sha256 FROM model_versions WHERE status='champion' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is not None and isinstance(row[0], str) and isinstance(row[1], str):
+                champion_row = (row[0], row[1])
+        evidence = {
+            "quickCheck": quick,
+            "integrityCheck": integrity,
+            "foreignKeyViolationCount": len(foreign_keys),
+            "schemaVersion": schema_version,
+            "rowCounts": row_counts,
+        }
+        return DatabaseInspection(evidence, human_counts, max_review_event_id, champion_row, migration_history)
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        raise SnapshotValidationError(f"restored database inspection failed: {error}") from error
+    finally:
+        connection.close()
+
+
+def _load_recovery_state_objects(
+    profile: Path, contract: ManifestContract
+) -> dict[str, dict[str, Any] | None]:
+    parsed: dict[str, dict[str, Any] | None] = {}
+    for name in REQUIRED_STATE:
+        if name not in contract.file_names:
+            parsed[name] = None
+            continue
+        value = _load_json_file(profile / name, name)
+        if not isinstance(value, dict):
+            raise SnapshotValidationError(f"{name} must contain a JSON object")
+        parsed[name] = value
+    return parsed
+
+
+def _copy_validated_snapshot(snapshot: Path, profile: Path, contract: ManifestContract) -> ManifestContract:
+    for name in (*contract.file_names, MANIFEST):
+        try:
+            shutil.copyfile(snapshot / name, profile / name)
+        except OSError as error:
+            raise SnapshotValidationError(f"could not restore validated snapshot file {name!r}: {error}") from error
+    # Prove the copied disposable tree—not merely the source—still matches after the copy boundary.
+    return validate_snapshot_manifest(profile)
+
+
 def drill(snapshot: Path) -> list[str]:
     problems: list[str] = []
     with tempfile.TemporaryDirectory(prefix="cortex-restore-drill-") as raw:
         profile = Path(raw) / "cortex-speech"
         profile.mkdir(parents=True)
+        try:
+            source_contract = validate_snapshot_manifest(snapshot)
+            contract = _copy_validated_snapshot(snapshot, profile, source_contract)
+            state = _load_recovery_state_objects(profile, contract)
+            inspection = inspect_database(profile / DB_FILE)
+            validate_migration_history(inspection.migration_history)
+        except (SnapshotValidationError, OSError) as error:
+            return [str(error)]
 
-        # Restore SOLELY from the snapshot — nothing may be borrowed from the live directory.
-        for item in snapshot.iterdir():
-            if item.is_file():
-                shutil.copyfile(item, profile / item.name)
+        evidence = inspection.evidence
+        if evidence["quickCheck"] != ["ok"]:
+            problems.append(f"restored DB failed quick_check: {evidence['quickCheck']}")
+        if evidence["integrityCheck"] != ["ok"]:
+            problems.append(f"restored DB failed integrity_check: {evidence['integrityCheck']}")
+        if evidence["foreignKeyViolationCount"] != 0:
+            problems.append(
+                f"restored DB has {evidence['foreignKeyViolationCount']} foreign-key violation(s)"
+            )
+        if evidence["schemaVersion"] <= 0:
+            problems.append("restored DB has no positive schema migration version")
+        missing_tables = sorted(set(HUMAN_TABLES) - set(inspection.human_counts))
+        for table in missing_tables:
+            problems.append(f"restored DB has no {table} table")
+        if inspection.human_counts.get("speech_segments", 0) == 0:
+            problems.append("restored DB holds zero segments — this is not a usable library")
 
-        for name in REQUIRED:
-            if not (profile / name).is_file():
-                problems.append(f"restored profile has no {name} — recovery would be incomplete")
-        live = Path(os.environ.get("APPDATA", "")) / "cortex-speech" if os.environ.get("APPDATA") else None
-        for name in POLICY:
-            if live and (live / name).is_file() and not (profile / name).is_file():
+        if contract.database_evidence is not None and contract.database_evidence != evidence:
+            problems.append(
+                "schema-2 databaseEvidence does not exactly match the restored database: "
+                f"manifest={contract.database_evidence!r}, restored={evidence!r}"
+            )
+        if contract.pilot_policy is not None:
+            baseline = contract.pilot_policy["after_review_event_id"]
+            maximum = inspection.max_review_event_id
+            if maximum is None:
+                problems.append("restored DB has no review_events table for the paid-pilot baseline")
+            elif baseline > maximum:
                 problems.append(
-                    f"{name} exists on the live system but NOT in this snapshot — a restore would "
-                    "silently unrestrict every reviewer queue"
+                    "review pilot baseline is ahead of the restored DB review-event maximum: "
+                    f"{baseline} > {maximum}"
                 )
 
-        manifest_path = profile / MANIFEST
-        if manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            for row in manifest.get("files", []):
-                target = profile / row["path"]
-                if not target.is_file():
-                    problems.append(f"manifest lists {row['path']} but it is not in the tree")
-                    continue
-                if sha256_of(target) != row["sha256"]:
-                    problems.append(f"{row['path']} does not match its manifest hash")
-                if target.stat().st_size != row["sizeBytes"]:
-                    problems.append(f"{row['path']} does not match its manifest size")
+        champion_row = inspection.champion_row
+        champion_state = state["champion.json"]
+        if champion_state is None:
+            if champion_row is None:
+                problems.append("restored state has NO champion in either the registry or the pointer")
         else:
-            problems.append(f"{MANIFEST} absent — the tree cannot prove what it contains")
+            champions = champion_state.get("champions")
+            entry = champions.get("omniasr-7b") if isinstance(champions, dict) else None
+            if champion_row and isinstance(entry, dict):
+                if entry.get("modelVersionId") != champion_row[0]:
+                    problems.append(
+                        f"champion.json names {entry.get('modelVersionId')!r} but the registry champion is "
+                        f"{champion_row[0]!r}"
+                    )
+                if entry.get("deploymentSha256") != champion_row[1]:
+                    problems.append("champion.json deployment hash disagrees with the registry")
+            elif champion_row and not isinstance(entry, dict):
+                problems.append("registry has a champion but restored champion.json names none")
+            elif isinstance(entry, dict) and not champion_row:
+                problems.append("champion.json names a champion the restored registry does not hold")
+            else:
+                problems.append("restored state has NO champion in either the registry or the pointer")
 
-        db_path = profile / "cortex-speech.db"
-        if db_path.is_file():
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                quick = con.execute("PRAGMA quick_check").fetchone()[0]
-                if quick != "ok":
-                    problems.append(f"restored DB failed quick_check: {quick}")
-                fk = con.execute("PRAGMA foreign_key_check").fetchall()
-                if fk:
-                    problems.append(f"restored DB has {len(fk)} foreign-key violation(s)")
-                # The app tracks migrations in `schema_migrations`, NOT PRAGMA user_version — reading
-                # the wrong one reported "migrations did not travel" against a perfectly good snapshot.
-                try:
-                    version = con.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
-                except sqlite3.Error:
-                    version = 0
-                    problems.append("restored DB has no schema_migrations table — migrations did not travel")
-                if not version:
-                    problems.append("restored DB reports migration version 0 — migrations did not travel")
-                counts = {}
-                for table in HUMAN_TABLES:
-                    try:
-                        counts[table] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                    except sqlite3.Error:
-                        problems.append(f"restored DB has no {table} table")
-                if counts.get("speech_segments", 0) == 0:
-                    problems.append("restored DB holds zero segments — this is not a usable library")
-                print(f"  schema version : {version}")
-                print(f"  row counts     : {counts}")
-
-                # Champion identity must survive the round trip, or the restored app serves nothing.
-                champion_row = con.execute(
-                    "SELECT id, checkpoint_sha256 FROM model_versions WHERE status='champion'"
-                ).fetchone()
-                pointer_file = profile / "champion.json"
-                if pointer_file.is_file():
-                    pointer = json.loads(pointer_file.read_text(encoding="utf-8"))
-                    entry = (pointer.get("champions") or {}).get("omniasr-7b")
-                    if champion_row and entry:
-                        if entry.get("modelVersionId") != champion_row[0]:
-                            problems.append(
-                                f"champion.json names {entry.get('modelVersionId')!r} but the registry "
-                                f"champion is {champion_row[0]!r}"
-                            )
-                        if entry.get("deploymentSha256") != champion_row[1]:
-                            problems.append("champion.json deployment hash disagrees with the registry")
-                        print(f"  champion       : {champion_row[0]}")
-                    elif champion_row and not entry:
-                        problems.append("registry has a champion but restored champion.json names none")
-                    elif entry and not champion_row:
-                        problems.append("champion.json names a champion the restored registry does not hold")
-                    else:
-                        problems.append("restored state has NO champion in either the registry or the pointer")
-            finally:
-                con.close()
+        print(f"  manifest schema: {contract.schema}")
+        print(f"  schema version : {evidence['schemaVersion']}")
+        print(f"  row counts     : {inspection.human_counts}")
+        if champion_row:
+            print(f"  champion       : {champion_row[0]}")
     return problems
 
 

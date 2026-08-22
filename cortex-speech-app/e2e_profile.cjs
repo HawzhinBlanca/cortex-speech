@@ -1,31 +1,35 @@
 /**
  * Disposable-profile launch guard for the IPC e2e harnesses.
  *
- * WHY THIS EXISTS. `e2e_constrained_ipc`, `e2e_finetuned_ipc` and `e2e_pipeline_ipc` all spawned the
- * real exe with `{ ...process.env }` and nothing else — no `CORTEX_APP_DATA_DIR` — so they ran against
+ * WHY THIS EXISTS. The real-exe IPC harnesses once spawned with `{ ...process.env }` and nothing
+ * else — no `CORTEX_APP_DATA_DIR` — so they ran against
  * the owner's REAL `%APPDATA%\cortex-speech` library and imported audio straight into a corpus that
  * holds human review decisions. They also killed by IMAGE NAME (`taskkill /F /IM`), which takes down
  * the owner's own running Cortex, and left the WebView2 profile shared, which is the documented cause
  * of a launch that times out on a debug port nobody opened whenever his app happens to be open.
  *
- * `e2e_real_app.cjs` had all three protections. They were written for that one harness and its three
- * siblings were left behind — the same shape as a guard applied at one call site instead of the
+ * `e2e_real_app.cjs` had all three protections. They were written for that one harness while its
+ * sibling was left behind — the same shape as a guard applied at one call site instead of the
  * shared one.
  *
  * NOT SHARED WITH `e2e_real_app.cjs`, deliberately. That harness is the only one wired into a gate
  * (verify-10, package.json, ci.yml), it works, and `test_real_data_runner_policy.py` pins its guards
  * literal by literal. Rewriting the one harness that actually gates the repo so it can share code
- * with three that nothing runs is the wrong risk trade. This module gives the three the same
+ * with a diagnostic harness is the wrong risk trade. This module gives it the same
  * protections; the policy now checks both.
  */
-const { execSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
 /** The production profile this must never touch. */
 const PROD_PROFILE = process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech') : null;
-const normPath = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+const normPath = (p) =>
+  path
+    .resolve(p)
+    .replace(/[\\/]+$/, '')
+    .toLowerCase();
 
 /**
  * Resolve the profile this run may use, refusing the production one outright.
@@ -125,7 +129,10 @@ async function cleanupProfile(dataDir, ours) {
  * timeout — blaming the app for a busy port. Say so up front instead.
  */
 async function refuseIfDebugPortBusy(debugPort, harness) {
-  const answering = await fetch(`http://localhost:${debugPort}/json`).then((r) => r.ok, () => false);
+  const answering = await fetch(`http://localhost:${debugPort}/json`).then(
+    (r) => r.ok,
+    () => false,
+  );
   if (answering) {
     console.error(
       `PRECONDITION FAILED: debug port ${debugPort} is already answering — a previous instance is ` +
@@ -137,7 +144,7 @@ async function refuseIfDebugPortBusy(debugPort, harness) {
 }
 
 /**
- * Point the DISPOSABLE profile at an offline ASR engine before importing anything.
+ * Point the DISPOSABLE profile at an explicitly selected ASR engine before importing anything.
  *
  * A fresh profile takes the app's default engine, which is the OmniASR-7B champion — and that needs
  * the owner's warm WSL 7B server. These harnesses never had to think about it because they ran
@@ -146,24 +153,94 @@ async function refuseIfDebugPortBusy(debugPort, harness) {
  * its `get_segments` poll with nothing ever arriving, and would have blamed VAD for an import that
  * could not decode.
  *
- * CTC300M is the same choice `e2e_real_app.cjs` makes: bundled, fully offline, runnable on any box.
+ * The standard proof path uses WSL7B. Smaller engines remain available only when a diagnostic
+ * harness names one explicitly; this helper never substitutes one because the champion is busy or
+ * unavailable. WSL7B setup mirrors production identity checks while keeping the test database and
+ * settings fully disposable.
  */
-async function provisionEngine(page, engine = 'CTC300M') {
+async function provisionEngine(page, dataDir, engine = 'WSL7B') {
+  if (!dataDir) throw new Error('provisionEngine requires the disposable profile path');
+  if (
+    PROD_PROFILE &&
+    (normPath(dataDir) === normPath(PROD_PROFILE) ||
+      normPath(dataDir).startsWith(normPath(PROD_PROFILE) + path.sep))
+  ) {
+    throw new Error(`REFUSED: provisionEngine was given the REAL profile (${PROD_PROFILE})`);
+  }
+
+  const championScript = path.join(__dirname, 'scripts', 'cortex_7b_client.py');
   await page
-    .evaluate(async (e) => {
-      const s = await window.__TAURI_INTERNALS__.invoke('get_settings');
-      s.asr_model_size = e;
-      // Refinement OFF, explicitly. The default is llm_mode = Local, which needs an LLM server on
-      // 127.0.0.1 that this machine may or may not be running — and a refinement failure is a HARD
-      // STOP by design, so the whole gate then fails for a reason that has nothing to do with what
-      // it proves (import -> VAD -> ASR). A gate must own every setting its verdict depends on.
-      // Measured 2026-08-17: Ollama answered 404 and three green pipelines reported dead.
-      s.llm_mode = 'None';
-      await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
-    }, engine)
+    .evaluate(
+      async ({ selectedEngine, clientScript }) => {
+        const s = await window.__TAURI_INTERNALS__.invoke('get_settings');
+        s.asr_model_size = selectedEngine;
+        // Refinement OFF, explicitly. The default is llm_mode = Local, which needs an LLM server on
+        // 127.0.0.1 that this machine may or may not be running — and a refinement failure is a HARD
+        // STOP by design, so the whole gate then fails for a reason that has nothing to do with what
+        // it proves (import -> VAD -> ASR). A gate must own every setting its verdict depends on.
+        // Measured 2026-08-17: Ollama answered 404 and three green pipelines reported dead.
+        s.llm_mode = 'None';
+        s.multi_engine_hypotheses = false;
+        s.use_finetuned_asr = false;
+        s.cloud_stt_opt_in = false;
+        s.cloud_llm_opt_in = false;
+        s.jury_cloud_opt_in = false;
+        s.champion_supervision_enabled = false;
+        if (selectedEngine === 'WSL7B') s.external_asr_script_path = clientScript;
+        await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
+      },
+      { selectedEngine: engine, clientScript: championScript },
+    )
     .catch((e) => {
       throw new Error('Could not provision the ASR engine in the disposable profile: ' + e.message);
     });
+
+  if (engine === 'WSL7B') {
+    const pointerPath =
+      process.env.CORTEX_CHAMPION_POINTER ||
+      (process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech', 'champion.json') : '');
+    if (!pointerPath || !fs.existsSync(pointerPath)) {
+      throw new Error(
+        'OmniASR-7B proof requires the live champion pointer; set CORTEX_CHAMPION_POINTER to champion.json',
+      );
+    }
+    const pointer = JSON.parse(fs.readFileSync(pointerPath, 'utf-8')).champions?.['omniasr-7b'];
+    for (const key of ['modelVersionId', 'deploymentSha256', 'deploymentManifestPath']) {
+      if (!pointer || typeof pointer[key] !== 'string' || !pointer[key].trim()) {
+        throw new Error(`champion.json has no valid champions.omniasr-7b.${key}`);
+      }
+    }
+    const dbPath = path.join(dataDir, 'cortex-speech.db');
+    if (!fs.existsSync(dbPath)) throw new Error(`disposable Cortex database is missing: ${dbPath}`);
+    const code = [
+      'import sqlite3, sys',
+      'db, model_id, deployment_sha, manifest = sys.argv[1:]',
+      'con = sqlite3.connect(db, timeout=30)',
+      'con.execute("PRAGMA busy_timeout=30000")',
+      'try:',
+      '    con.execute("BEGIN IMMEDIATE")',
+      "    con.execute(\"UPDATE model_versions SET status = 'rolled_back' WHERE family = 'omniasr-7b' AND status = 'champion' AND id <> ?\", (model_id,))",
+      "    con.execute(\"INSERT OR REPLACE INTO model_versions (id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status) VALUES (?, 'omniasr-7b', 'soranivoice_omniASR_LLM_7B_v2_local', ?, ?, 'user-finetuned', 'owner-full-rights', 'champion')\", (model_id, deployment_sha, manifest))",
+      '    con.commit()',
+      'except:',
+      '    con.rollback()',
+      '    raise',
+      'finally:',
+      '    con.close()',
+    ].join('\n');
+    execFileSync(
+      process.env.PYTHON || 'python',
+      [
+        '-c',
+        code,
+        dbPath,
+        pointer.modelVersionId,
+        pointer.deploymentSha256,
+        pointer.deploymentManifestPath,
+      ],
+      { stdio: 'pipe' },
+    );
+  }
   console.log(`==> Provisioned ASR engine '${engine}' (refinement off) in the disposable profile`);
 }
 

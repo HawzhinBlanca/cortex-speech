@@ -30,6 +30,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from activate_review_pilot import acquire_cortex_lock
+
 MIN_PLAYBACK_COVERAGE = 0.85  # mirrors db::MIN_PLAYBACK_COVERAGE
 
 
@@ -114,6 +116,15 @@ def main() -> int:
     )
     parser.add_argument("--apply", action="store_true", help="write the change; otherwise report only")
     args = parser.parse_args()
+
+    if args.apply:
+        db_path = Path(args.db).expanduser().resolve()
+        with acquire_cortex_lock(db_path.parent):
+            return run(args)
+    return run(args)
+
+
+def run(args: argparse.Namespace) -> int:
 
     conn = sqlite3.connect(args.db)
     try:

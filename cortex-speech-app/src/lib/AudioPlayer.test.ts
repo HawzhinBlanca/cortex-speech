@@ -116,10 +116,7 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
       errors.map((n) => n.message),
       'advancing mid-start must not report a playback failure',
     ).toEqual([]);
-    expect(
-      get(notifications).length,
-      'no notification of any kind for a normal advance',
-    ).toBe(0);
+    expect(get(notifications).length, 'no notification of any kind for a normal advance').toBe(0);
   });
 
   it('a genuinely undecodable clip is STILL reported', async () => {
@@ -138,9 +135,10 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     );
     await settle();
 
-    expect(errors.length, 'an undecodable clip is still an error the reviewer sees').toBeGreaterThan(
-      0,
-    );
+    expect(
+      errors.length,
+      'an undecodable clip is still an error the reviewer sees',
+    ).toBeGreaterThan(0);
   });
 
   it('the next clip of the SAME recording is not still blocked by the previous failure', async () => {

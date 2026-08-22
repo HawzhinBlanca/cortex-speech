@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Regression tests for fail-closed controlled-pilot activation."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import tempfile
+from unittest import mock
+from pathlib import Path
+
+import activate_review_pilot as activator
+from activate_review_pilot import (
+    POLICY_FILE,
+    REVOCATION_FILE,
+    SESSION_FILE,
+    acquire_cortex_lock,
+    pilot_policy,
+    prepare_maintenance_revocation,
+    sha256_file,
+    validate_pilot_policy,
+)
+from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
+from pilot_focus_contract import (
+    PilotFocusError,
+    contract_for_ids,
+    load_pilot_focus_contract,
+    verify_controlled_pilot_focus,
+)
+
+TEST_FOCUS_IDS = ("focus-a", "focus-b", "focus-c")
+TEST_FOCUS_CONTRACT = contract_for_ids(TEST_FOCUS_IDS)
+
+
+def _verify_test_focus(data_dir: Path):
+    return verify_controlled_pilot_focus(data_dir, TEST_FOCUS_CONTRACT)
+
+
+def activate(*args, **kwargs):
+    """Exercise the real activator with an explicit small test contract; CLI has no override."""
+    with mock.patch.object(activator, "verify_controlled_pilot_focus", side_effect=_verify_test_focus):
+        return activator.activate(*args, **kwargs)
+
+
+def seed(root: Path, *, schema: int = 58) -> tuple[Path, dict[str, object]]:
+    db_path = root / "cortex-speech.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        f"""
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT NOT NULL);
+        CREATE TABLE review_events(id INTEGER PRIMARY KEY, reviewer TEXT, action TEXT, source TEXT);
+        INSERT INTO review_events VALUES(863, 'legacy', 'accept', 'couch');
+        CREATE TABLE review_compensation_policies(policy_version TEXT PRIMARY KEY);
+        INSERT INTO review_compensation_policies VALUES('review-iqd-v1-2026-08-21');
+        """
+    )
+    conn.executemany(
+        "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
+        [entry for entry in source_migrations(DEFAULT_MIGRATIONS) if entry[0] <= schema],
+    )
+    conn.commit()
+    conn.close()
+    session: dict[str, object] = {
+        "reviewers": {
+            "dpapi-hawzhin": "Hawzhin",
+            "dpapi-pavel": "Pavel",
+            "dpapi-rubar": "Rubar",
+        },
+        "db_path": str(db_path),
+        "spot_checks": [["h1", "Hawzhin"], ["p1", "Pavel"], ["r1", "Rubar"]],
+        "pilot_spot_checks": [["ph1", "Hawzhin"], ["pp1", "Pavel"], ["pr1", "Rubar"]],
+        "sessions": [
+            {"token": "cookie-h", "reviewer": "Hawzhin", "issued_unix": 1},
+            {"token": "cookie-p", "reviewer": "Pavel", "issued_unix": 2},
+            {"token": "cookie-r", "reviewer": "Rubar", "issued_unix": 3},
+        ],
+    }
+    (root / SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
+    (root / "voice_focus.json").write_text(
+        json.dumps({"name": "test", "segment_ids": list(TEST_FOCUS_IDS)}),
+        encoding="utf-8",
+    )
+    return db_path, session
+
+
+def test_activation_preserves_target_tokens_narrows_every_session_surface_and_backs_up() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, original = seed(root)
+        result = activate(
+            root,
+            db_path,
+            expected_max_review_event_id=863,
+            check_runtime=False,
+        )
+        policy = json.loads((root / POLICY_FILE).read_text(encoding="utf-8"))
+        session = json.loads((root / SESSION_FILE).read_text(encoding="utf-8"))
+        assert policy == session["pilot_policy"]
+        assert policy["after_review_event_id"] == 863
+        assert policy["max_total_corpus_actions"] == 20
+        assert result["maxCorpusActions"] == 20
+        assert result["maxHiddenQcActions"] == 4
+        assert result["maxCompensatedUiActions"] == 24
+        assert result["controlledPilotFocusCount"] == len(TEST_FOCUS_IDS)
+        assert result["controlledPilotFocusDigest"] == TEST_FOCUS_CONTRACT.sorted_unique_segment_ids_sha256
+        assert session["reviewers"] == {
+            "dpapi-hawzhin": "Hawzhin",
+            "dpapi-pavel": "Pavel",
+        }, "protected DPAPI token bytes must be preserved exactly"
+        assert {entry["reviewer"] for entry in session["sessions"]} == {"Hawzhin", "Pavel"}
+        assert {entry[1] for entry in session["spot_checks"]} == {"Hawzhin", "Pavel"}
+        assert {entry[1] for entry in session["pilot_spot_checks"]} == {"Hawzhin", "Pavel"}
+        assert not (root / REVOCATION_FILE).exists()
+        backup = Path(result["backup"])
+        assert json.loads((backup / SESSION_FILE).read_text(encoding="utf-8")) == original
+        assert (backup / f"{POLICY_FILE}.ABSENT").is_file()
+
+
+def test_event_id_and_existing_policy_are_compare_and_swap_guards() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, _ = seed(root)
+        try:
+            activate(root, db_path, expected_max_review_event_id=862, check_runtime=False)
+        except RuntimeError as error:
+            assert "CAS mismatch" in str(error)
+        else:
+            raise AssertionError("stale event-id precondition was accepted")
+        assert not (root / POLICY_FILE).exists()
+
+        existing = root / POLICY_FILE
+        existing.write_text("{}", encoding="utf-8")
+        try:
+            activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        except RuntimeError as error:
+            assert "expected-policy-sha256" in str(error)
+        else:
+            raise AssertionError("an existing policy was overwritten without a hash CAS")
+        assert sha256_file(existing) == sha256_file(existing)
+
+
+def test_interrupted_activation_leaves_durable_revocation_instead_of_old_unrestricted_resume() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, original = seed(root)
+        try:
+            activate(
+                root,
+                db_path,
+                expected_max_review_event_id=863,
+                check_runtime=False,
+                fail_after_revocation_for_test=True,
+            )
+        except RuntimeError as error:
+            assert "injected" in str(error)
+        else:
+            raise AssertionError("injected interruption did not abort")
+        assert (root / REVOCATION_FILE).is_file(), "a restart must remain denied after interruption"
+        assert json.loads((root / SESSION_FILE).read_text(encoding="utf-8")) == original
+
+
+def test_schema_56_is_refused_before_any_activation_file_changes() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, original = seed(root, schema=56)
+        try:
+            activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        except RuntimeError as error:
+            assert "schema 56/58" in str(error)
+        else:
+            raise AssertionError("pre-compensation database was accepted")
+        assert not (root / POLICY_FILE).exists()
+        assert not (root / REVOCATION_FILE).exists()
+        assert json.loads((root / SESSION_FILE).read_text(encoding="utf-8")) == original
+
+
+def test_missing_middle_or_description_drift_is_refused_before_file_changes() -> None:
+    for sql, expected in (
+        ("DELETE FROM schema_migrations WHERE version=23", "missing=[23]"),
+        ("UPDATE schema_migrations SET description='tampered' WHERE version=31", "descriptionMismatch=[31]"),
+    ):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path, original = seed(root)
+            conn = sqlite3.connect(db_path)
+            conn.execute(sql)
+            conn.commit()
+            conn.close()
+            try:
+                activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+            except RuntimeError as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError("damaged migration history was accepted")
+            assert not (root / POLICY_FILE).exists()
+            assert not (root / REVOCATION_FILE).exists()
+            assert json.loads((root / SESSION_FILE).read_text(encoding="utf-8")) == original
+
+
+def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, session = seed(root)
+        session["sessions"][0]["issued_unix"] = True
+        session_path = root / SESSION_FILE
+        session_path.write_text(json.dumps(session), encoding="utf-8")
+        before = session_path.read_bytes()
+        try:
+            activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        except RuntimeError as error:
+            assert "cannot survive restart" in str(error)
+        else:
+            raise AssertionError("a non-serde cookie session was accepted")
+        assert session_path.read_bytes() == before
+        assert not (root / POLICY_FILE).exists()
+        assert not (root / REVOCATION_FILE).exists()
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, session = seed(root)
+        session_path = root / SESSION_FILE
+        encoded_db = json.dumps(str(db_path))
+        session_path.write_text(
+            '{"reviewers":{"dpapi-secret":"Hawzhin","dpapi-secret":"Pavel"},'
+            f'"db_path":{encoded_db}}}',
+            encoding="utf-8",
+        )
+        before = session_path.read_bytes()
+        try:
+            activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        except ValueError as error:
+            assert str(error) == "duplicate JSON object key"
+        else:
+            raise AssertionError("duplicate credential JSON was accepted")
+        assert session_path.read_bytes() == before
+        assert not (root / POLICY_FILE).exists()
+        assert not (root / REVOCATION_FILE).exists()
+
+
+def test_maintenance_revocation_precedes_schema_56_to_58_work_and_survives_refusal() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, original = seed(root, schema=56)
+        result = prepare_maintenance_revocation(root, check_runtime=False)
+        assert result["autoResumeBlocked"] is True
+        marker_before = (root / REVOCATION_FILE).read_bytes()
+        try:
+            activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        except RuntimeError as error:
+            assert "schema 56/58" in str(error)
+        else:
+            raise AssertionError("schema 56 unexpectedly activated")
+        assert (root / REVOCATION_FILE).read_bytes() == marker_before
+        assert not (root / POLICY_FILE).exists()
+        assert json.loads((root / SESSION_FILE).read_text(encoding="utf-8")) == original
+
+
+def test_live_cortex_instance_lock_refuses_activation_without_touching_state() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, original = seed(root)
+        with acquire_cortex_lock(root):
+            try:
+                activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+            except RuntimeError as error:
+                assert "cortex.lock" in str(error) or "app or importer" in str(error)
+            else:
+                raise AssertionError("activation raced a live app/importer lock")
+        assert not (root / POLICY_FILE).exists()
+        assert not (root / REVOCATION_FILE).exists()
+        assert json.loads((root / SESSION_FILE).read_text(encoding="utf-8")) == original
+
+
+def test_missing_or_wrong_focus_is_refused_before_activation_mutates_state() -> None:
+    for replacement, expected in (
+        (None, "is required"),
+        ({"segment_ids": ["focus-a", "focus-b"]}, "expected exactly 3"),
+        ({"segment_ids": ["focus-a", "focus-b", "focus-wrong"]}, "digest mismatch"),
+    ):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path, original = seed(root)
+            focus = root / "voice_focus.json"
+            if replacement is None:
+                focus.unlink()
+            else:
+                focus.write_text(json.dumps(replacement), encoding="utf-8")
+            try:
+                activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+            except RuntimeError as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError("activation accepted a missing or wrong focus")
+            assert not (root / POLICY_FILE).exists()
+            assert not (root / REVOCATION_FILE).exists()
+            assert json.loads((root / SESSION_FILE).read_text(encoding="utf-8")) == original
+
+
+def test_focus_is_rechecked_immediately_before_promotion_and_commit() -> None:
+    for drift_on_call, promoted in ((2, False), (3, True)):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path, _ = seed(root)
+            calls = 0
+
+            def verify_then_drift(data_dir: Path):
+                nonlocal calls
+                calls += 1
+                if calls == drift_on_call:
+                    (data_dir / "voice_focus.json").write_text(
+                        json.dumps({"segment_ids": ["focus-a", "focus-b", "focus-wrong"]}),
+                        encoding="utf-8",
+                    )
+                return _verify_test_focus(data_dir)
+
+            with mock.patch.object(activator, "verify_controlled_pilot_focus", side_effect=verify_then_drift):
+                try:
+                    activator.activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+                except RuntimeError as error:
+                    assert "digest mismatch" in str(error), error
+                else:
+                    raise AssertionError("a focus drift escaped the activation recheck")
+            assert calls == drift_on_call
+            assert (root / REVOCATION_FILE).is_file(), "interrupted activation must remain paused"
+            assert (root / POLICY_FILE).is_file() is promoted
+
+
+def test_policy_contract_rejects_unknown_fields_and_python_bool_in_integer_slots() -> None:
+    valid = pilot_policy(863)
+    for mutate in (
+        lambda value: value.update(typo=True),
+        lambda value: value.update(schema_version=True),
+        lambda value: value.update(after_review_event_id=True),
+        lambda value: value.update(max_total_corpus_actions=True),
+        lambda value: value["reviewers"][0].update(max_corpus_actions=True),
+        lambda value: value["reviewers"][0].update(typo=True),
+    ):
+        broken = json.loads(json.dumps(valid))
+        mutate(broken)
+        try:
+            validate_pilot_policy(broken)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"non-serde pilot policy was accepted: {broken}")
+
+    try:
+        pilot_policy(True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Python bool was accepted as a review-event baseline")
+
+
+def test_tracked_focus_contract_and_8273_8275_wrong_id_failures_are_exact() -> None:
+    production = load_pilot_focus_contract()
+    assert production.segment_id_count == 8_274
+    assert (
+        production.sorted_unique_segment_ids_sha256
+        == "bd5ecab6ee15e2ac15ad247e8fa90e79bf1fc7550ae8fb47db00ee757989528c"
+    )
+
+    baseline = [f"segment-{index:05}" for index in range(8_274)]
+    contract = contract_for_ids(baseline)
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        focus = root / "voice_focus.json"
+
+        def expect_refusal(ids: list[str], expected: str) -> None:
+            focus.write_text(json.dumps({"segment_ids": ids}), encoding="utf-8")
+            try:
+                verify_controlled_pilot_focus(root, contract)
+            except PilotFocusError as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError(f"focus variation was accepted: {expected}")
+
+        expect_refusal(baseline[:-1], "8273")
+        expect_refusal([*baseline, "segment-extra"], "8275")
+        expect_refusal([*baseline[:-1], "segment-wrong"], "digest mismatch")
+
+
+def main() -> int:
+    tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
+    for test in tests:
+        test()
+        print(f"  ok  {test.__name__}")
+    print(f"REVIEW PILOT ACTIVATION: {len(tests)} tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

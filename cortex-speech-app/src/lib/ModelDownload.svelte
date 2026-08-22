@@ -47,7 +47,7 @@
       const result = await modelsDownloadAll();
       if (result.total === 0 && result.skipped > 0) {
         notifications.info($t('models.noneAvailable'), {
-          detail: `${result.skipped} missing optional model files require a pinned checksum before automatic download.`,
+          detail: `${result.skipped} missing support model files require a pinned checksum before automatic download.`,
         });
       } else if (result.failed > 0) {
         notifications.warning($t('models.completedWithFailures'), {
@@ -57,7 +57,7 @@
         notifications.success($t('models.completed'), {
           detail:
             result.skipped > 0
-              ? `${result.skipped} unavailable model files were skipped.`
+              ? `${result.skipped} unavailable support model files were skipped.`
               : undefined,
         });
       }

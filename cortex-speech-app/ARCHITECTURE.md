@@ -57,7 +57,7 @@ The pipeline takes a `db_path` string and opens its own connection. This avoids 
 | `pipeline.rs` | Import/process audio files | `ProcessingPipeline` |
 | `db.rs` | SQLite CRUD + FTS5 search + backup/restore + WAL checkpoint + VACUUM + busy timeout | `Database`, `SpeechSegment` |
 | `audio.rs` | Decode, downmix, resample, Silero VAD | `decode_to_pcm()`, `compute_waveform()` |
-| `asr.rs` | Meta OmniASR CTC 300M via sherpa-onnx `OfflineRecognizer` | `KurdishAsrService`, GPU auto-detection (CUDA/DirectML/CoreML/CPU) |
+| `asr.rs` | Offline diagnostic CTC engine via sherpa-onnx `OfflineRecognizer` | `KurdishAsrService`; never a production fallback |
 | `normalizer.rs` | AsoSoft-based Sorani normalizer (std::sync::LazyLock) | `SoraniNormalizer` |
 | `diff/` | LCS word-level diff engine | `compute_diff()`, `TextDiff` |
 | `history/` | Undo/redo command pattern | `HistoryManager`, `Command` |
@@ -77,9 +77,11 @@ The pipeline takes a `db_path` string and opens its own connection. This avoids 
 | `session/` | Session state save/restore with atomic temp+rename | `SessionManager`, `SessionState` |
 | `benches/` | Criterion benchmarks for normalizer, diff, audio decode | Bench functions |
 
-### 4. Meta OmniASR CTC 300M
+### 4. OmniASR-7B production champion and optional CTC diagnostics
 
-Transcription uses Meta **Omnilingual ASR v2 CTC 300M** through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx):
+Production transcription uses the pinned **OmniASR-7B + Kurdish LoRA** WSL service. Failure is a hard
+stop. CTC 300M/1B remain explicitly selected diagnostics through sherpa-onnx and are never bundled or
+used as champion fallbacks:
 
 | File | Role |
 |------|------|
@@ -87,9 +89,11 @@ Transcription uses Meta **Omnilingual ASR v2 CTC 300M** through [sherpa-onnx](ht
 | `omniasr-ctc-300m/tokens.txt` | Vocabulary |
 | `silero_vad_v4.onnx` | Voice-activity detection (Silero VAD v4) |
 
-Models resolve from the user app-data `models/` directory when present, otherwise from bundled `src-tauri/models/`. The **ModelDownload** panel can fetch Silero VAD and the official OmniASR tar.bz2 archive.
+Optional models resolve from user app-data or the development model directory when explicitly used.
+Standard bundles contain only VAD/ORT support plus the WSL7B client/server scripts.
 
-Settings `asr_model_size`, `num_asr_threads`, and `enable_gpu` are passed into the sherpa recognizer config. CTC 300M and 1B are both supported and wired.
+Production loads settings through `AppSettings::load_production`, which always clamps ASR routing to
+`WSL7B`. CTC settings are retained only for explicit offline diagnostic binaries and tests.
 
 ### 5. Long-Audio Handling
 
@@ -144,7 +148,7 @@ historyStore      → canUndo/canRedo, undo()/redo()
 ## Performance Characteristics
 
 - **Audio decode**: symphonia (pure Rust) — ~10MB/s per core
-- **ASR**: Meta OmniASR CTC 300M via sherpa-onnx — GPU (CUDA/DirectML/CoreML) when enabled, CPU fallback
+- **Production ASR**: pinned OmniASR-7B WSL service; unavailable means fail closed. CTC/MMS execution is diagnostic-only.
 - **Normalizer**: O(n) with LRU cache — ~1M chars/s cached
 - **Diff**: O(n×m) LCS — 100 words in <1ms
 - **DB**: SQLite WAL mode — 10K inserts/sec
@@ -157,7 +161,7 @@ historyStore      → canUndo/canRedo, undo()/redo()
 - CSP headers restrict inline scripts, media-src, worker-src, and upgrade-insecure-requests
 - Session files use atomic writes (temp file + rename) to prevent partial writes
 - Database backup/restore includes integrity checks (`PRAGMA integrity_check`)
-- **Offline-first**: transcription and curation run without network access once models are present. Built-in downloads: Silero VAD and Meta OmniASR CTC 300M archive via `ModelManager`.
+- **Offline-first**: production transcription and curation run without cloud access once the pinned WSL champion and Silero VAD are provisioned. Optional CTC/MMS artifacts are diagnostics, not production dependencies.
 
 ## Test Coverage
 

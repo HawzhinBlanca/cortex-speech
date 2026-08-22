@@ -156,13 +156,13 @@ def test_every_spawning_harness_is_isolated_from_the_production_library() -> Non
     """EVERY harness that launches the exe, not just e2e_real_app.cjs.
 
     The profile isolation, the PID-tree kill and the WebView2 folder were built for one harness and
-    its siblings were left behind — `e2e_constrained_ipc`, `e2e_finetuned_ipc` and `e2e_pipeline_ipc`
-    all spawned the app with a bare `{...process.env}`, so they ran against the owner's real
+    its sibling was left behind — `e2e_pipeline_ipc` spawned the app with a bare `{...process.env}`,
+    so it ran against the owner's real
     %APPDATA% library and imported audio into a corpus holding human review decisions, then killed
     by IMAGE NAME, taking his own running Cortex with them. Same shape as a guard applied at one call
     site instead of the shared one, which is why this checks the whole set.
 
-    e2e_real_app.cjs keeps its own (pinned above); the other three share e2e_profile.cjs.
+    e2e_real_app.cjs keeps its own (pinned above); the diagnostic harness shares e2e_profile.cjs.
     """
     for path in sorted(REPO_ROOT.glob("e2e_*.cjs")):
         src = path.read_text(encoding="utf-8")

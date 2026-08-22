@@ -541,12 +541,12 @@ fn test_omniasr_on_real_audio() {
     assert!(conf > 0.0 && conf <= 1.0, "ASR confidence score {} should be in (0.0, 1.0]", conf);
 }
 
-/// Default real-ASR gate on a COMMITTED, CC-BY-licensed fixture (Google FLEURS `ckb_iq`, see
-/// tests/fixtures/ATTRIBUTION.md). Unlike the `#[ignore]`d tests above, this needs no external
-/// CORTEX_REAL_AUDIO_DIR — the audio is in-repo — so it runs from a fresh clone once the OmniASR
-/// model is present (`npm run fetch-models`). It skips cleanly when the model isn't fetched, and
-/// asserts the real OmniASR produces a non-blank Kurdish (Arabic-script) transcript (no-fabrication).
+/// Explicit offline diagnostic for the retired optional OmniASR-CTC-300M engine on a committed,
+/// CC-BY-licensed fixture (Google FLEURS `ckb_iq`; see tests/fixtures/ATTRIBUTION.md). Production and
+/// default validation use only the fine-tuned OmniASR-7B champion, so an installed optional 300M file
+/// must never make the ordinary CPU/GPU-safe suite initialize this model.
 #[test]
+#[ignore = "offline optional-model diagnostic; production/default ASR is fine-tuned OmniASR-7B"]
 fn omniasr_on_committed_fleurs_ckb_fixture() {
     let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "omniasr_on_committed_fleurs_ckb_fixture");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");

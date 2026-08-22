@@ -82,13 +82,15 @@ pub fn load_focus(data_dir: &Path) -> Result<Option<HashSet<String>>, String> {
             return Err(format!("{VOICE_FOCUS_FILE} is unreadable: {e}"));
         }
     };
-    let parsed: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("{VOICE_FOCUS_FILE} is not valid JSON ({e}) — queues serve NOTHING until it is fixed");
-            return Err(format!("{VOICE_FOCUS_FILE} is not valid JSON: {e}"));
-        }
-    };
+    parse_focus_text(&text)
+}
+
+/// Strict, non-mutating parser shared by live serving and snapshot promotion/preflight.
+pub(crate) fn parse_focus_text(text: &str) -> Result<Option<HashSet<String>>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+        tracing::error!("{VOICE_FOCUS_FILE} is not valid JSON ({e}) — queues serve NOTHING until it is fixed");
+        format!("{VOICE_FOCUS_FILE} is not valid JSON: {e}")
+    })?;
     let ids: HashSet<String> = parsed
         .get("segment_ids")
         .and_then(|v| v.as_array())

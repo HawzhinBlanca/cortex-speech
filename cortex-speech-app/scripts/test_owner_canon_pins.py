@@ -27,6 +27,64 @@ def test_canon_document_exists_and_keeps_its_sections() -> None:
         assert section in canon, f"OWNER_CANON.md lost its '{section}' section"
 
 
+def test_review_compensation_v2_and_lamo_scope_are_pinned_in_canon() -> None:
+    """The owner explicitly changed this canon on 2026-08-21; drift needs another change-canon order."""
+    canon = (REPO / "docs" / "OWNER_CANON.md").read_text(encoding="utf-8")
+    required = [
+        "review-iqd-v1-2026-08-21",
+        "18,000 IQD per full-equivalent audio hour",
+        "edit = 100%",
+        "accept = 10%",
+        "reject = 10%",
+        "skip = 0%",
+        "durable semantic action",
+        "`reviewed_audio_ms` is activity, not money",
+        "corrected-audio projection counts retained human edits only",
+        "`SUM(review_compensation_ledger.delta_micro_iqd)`",
+        "prospective",
+        "idempotency key",
+        "explicit reversal or adjustment",
+        "6,922 final Lamo ids",
+        "1,352-id focus",
+        "8,274-id union",
+        "fail closed",
+    ]
+    missing = [rule for rule in required if rule not in canon]
+    assert not missing, f"review compensation/Lamo owner canon drifted: missing {missing}"
+
+
+def test_champion_only_production_canon_is_pinned() -> None:
+    canon = (REPO / "docs" / "OWNER_CANON.md").read_text(encoding="utf-8")
+    required = [
+        "sole main, default and production ASR",
+        "not release prerequisites",
+        "never selected automatically",
+        "never fallbacks for WSL7B",
+        "ElevenLabs Scribe is not a dependency or production feature",
+        "client, commands, key, consent",
+        "lifecycle supervision is off",
+    ]
+    missing = [rule for rule in required if rule not in canon]
+    assert not missing, f"champion-only owner canon drifted: missing {missing}"
+
+
+def test_compensation_code_constants_match_owner_canon() -> None:
+    db = _read("src-tauri/src/db.rs")
+    migrations = _read("src-tauri/src/migrations/mod.rs")
+    pins = [
+        'REVIEW_PAY_POLICY_VERSION: &str = "review-iqd-v1-2026-08-21"',
+        "REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR: i64 = 18_000_000_000",
+        "REVIEW_PAY_EDIT_BPS: i64 = 10_000",
+        "REVIEW_PAY_ACCEPT_BPS: i64 = 1_000",
+        "REVIEW_PAY_REJECT_BPS: i64 = 1_000",
+        "REVIEW_PAY_SKIP_BPS: i64 = 0",
+    ]
+    missing = [pin for pin in pins if pin not in db]
+    assert not missing, f"compiled compensation constants drifted from canon: {missing}"
+    assert "CREATE TABLE review_compensation_ledger" in migrations
+    assert "review compensation ledger is append-only" in migrations
+
+
 def test_the_calibrated_thresholds_have_not_drifted() -> None:
     d = _read("src-tauri/src/diarization.rs")
     assert "SPEAKER_CHANGE_THRESHOLD: f32 = 0.59" in d, "0.59 was owner-calibrated (blind pass, 15/15)"

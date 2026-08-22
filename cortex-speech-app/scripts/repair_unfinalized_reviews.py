@@ -23,6 +23,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from activate_review_pilot import acquire_cortex_lock
+
 MIN_COVERAGE = 0.85
 OWNER_LICENSE = "owner-full-rights"
 OWNER_USE = "unrestricted: train, evaluate, publish, redistribute, commercial"
@@ -44,6 +46,15 @@ def main() -> int:
         help="SQL LIKE over audio_path naming OWNER-supplied recordings to stamp; repeatable, required",
     )
     args = ap.parse_args()
+
+    if args.apply:
+        db_path = Path(args.db).expanduser().resolve()
+        with acquire_cortex_lock(db_path.parent):
+            return run(args)
+    return run(args)
+
+
+def run(args: argparse.Namespace) -> int:
     con = sqlite3.connect(args.db)
     try:
         print("=== 1. decided-but-unverified rows ===")

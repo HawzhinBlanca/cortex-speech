@@ -19,9 +19,11 @@ describe('model runtime defaults', () => {
     expect(settingsSource).toMatch(
       /fn default_multi_engine_hypotheses\(\) -> bool \{\s*false\s*\}/,
     );
-    // The legacy offline helper hard-stops for WSL7B and preserves an explicitly selected local model;
-    // AsrLoadConfig's library default can never silently choose 300M for it.
-    expect(batchProcessorSource).toContain('model_size: settings.asr_model_size.clone()');
-    expect(batchProcessorSource).not.toContain('AsrModelSize::CTC1B');
+    expect(settingsSource).toContain('pub fn load_production(');
+    expect(settingsSource).toContain('settings.enforce_production_canon();');
+    // The obsolete headless writer is a tombstone: no settings-dependent branch can reach a local
+    // engine or open the production database under stale configuration.
+    expect(batchProcessorSource).toContain('HARD STOP');
+    expect(batchProcessorSource).not.toMatch(/Database|AsrPool|AppSettings|insert_segments/);
   });
 });

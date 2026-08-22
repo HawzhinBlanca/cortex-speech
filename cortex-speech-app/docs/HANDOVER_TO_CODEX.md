@@ -1,5 +1,15 @@
 # Handover — Claude → Codex, 2026-08-21
 
+> **Owner amendment after this handover:** section 3 records the earlier reject-zero proposal and is
+> retained as history, not current canon. Canon revision 2 uses immutable policy id
+> `review-iqd-v1-2026-08-21`:
+> **18,000 IQD per full-equivalent audio hour; edit 100%, unchanged accept 10%, valid reject 10%,
+> skip 0%.** Activity, corrected audio and payable credit are separate; old events are not silently
+> repriced. The owner also authorized the additive 1,352 + 6,922 = **8,274-id** focus, but serving
+> remains fail closed until release, provenance, playback and hidden-check gates pass.
+> Documentation provenance: HEAD `8cbe84dd7795c9e6db45b4d9a22da503a223b9e9`, dirty shared
+> implementation worktree; this amendment is not a certified release claim.
+
 We are both working on **the same checkout, the same branch, the same uncommitted working tree**.
 That has already cost one change (below). This file is the coordination surface: read §1 before your
 next edit.
@@ -43,9 +53,14 @@ laundering problem I document in `docs/PLAN_LAMO_GOLD_SESSION.md` §2.5. Please 
 
 ---
 
-## 3. The one change of mine now in the tree — do not revert it again
+## 3. Historical reject-zero change — superseded by compensation v2
 
 `Database::reviewed_audio_ms` now sums `action IN ('accept', 'edit')` — **`'reject'` removed.**
+
+> This paragraph describes commit `e68c9f9`, not the prospective owner policy. Do not restore its
+> reject-zero interpretation and do not make `reviewed_audio_ms` a weighted money counter. The v2
+> implementation needs a durable semantic action and a policy-versioned, idempotent credit/reversal
+> ledger; full reviewed activity and edit-only corrected audio remain independent projections.
 
 This is not a style preference. It is the owner's pay rule, stated 2026-08-21:
 
@@ -84,24 +99,29 @@ Learned the hard way in this session; none of it is in CLAUDE.md yet.
 
 ---
 
-## 5. Where I am, so we do not collide
+## 5. Historical machine state at the handover (not a live-health source)
 
-**Running right now** (do not restart the app or kill these):
+> The bullets in this section captured commit `e68c9f9` on 2026-08-21. They are preserved for
+> provenance only. Process, port, watchdog, database-schema and executable-freshness gates must be
+> measured again immediately before a rollout; this section must never be used to claim the app is
+> currently serving or an import is currently running.
+
+**Was running at handover time** (the original collision warning):
 
 * the standalone champion server on `127.0.0.1:8799` (a `wsl.exe` process I own — the app is CLOSED,
   and the watchdog is **disabled** deliberately; do not re-enable it until the import finishes);
 * `batch_importer.exe` transcribing `D:\ZAR_Lamo_15H_Gold_TTS\wavs` (6,922 clips, ~2 h left).
 
-**Mine, in progress — please don't start these:**
+**Was owned by the handover author at that time:**
 
 * the reviewer earnings/coins panel in `assets/couch.html` (spec in `PLAN_LAMO_GOLD_SESSION.md` §3);
 * the dual TTS/ASR dataset export (§4 of the plan) — though see §6, your `export_bundle.rs` work may
   already be the better foundation, in which case I will build on it instead.
 
-**Yours, as far as I can tell — I will not touch:** `export_bundle.rs`, `export_audio/mod.rs`,
+**Was assigned to Codex at that time:** `export_bundle.rs`, `export_audio/mod.rs`,
 `check_spot_check_pool.py`, `check_review_serving_provenance.py`, the watchdog scripts.
 
-**Shared, so announce before a big rewrite:** `db.rs`, `couch.rs`, `dialect.rs`.
+**Was shared at that time:** `db.rs`, `couch.rs`, `dialect.rs`.
 
 ---
 
@@ -121,12 +141,14 @@ AND the human text differs from the draft             →   26   ← the entire 
   returns empty and measurement ends **silently** — counted, never alerted.
 * Every reviewer gets the same 26 in `ORDER BY id ASC`: the same clips, in the same order.
 
-We are about to open ~15 h of paid review where the fastest paid action is a bare accept — worth
-roughly a 7× arbitrage over honest work — and the only thing that detects it is those 26 keys.
+The original ~7× figure assumed a full-value bare accept and is superseded by accept's 10% v2 weight.
+Blind acceptance can still launder champion text into apparent gold, so the hidden-check and playback
+gates remain mandatory even though that old payout estimate no longer applies.
 
 Your scoring fix made each key *meaningful*. Refilling the pool is what makes the measurement *exist*.
-If you want one thing to take next, take that: build the pool to ≥ 200 keys and add an alert when it
-runs dry. You have already been in `check_spot_check_pool.py`, so it is your ground.
+The handover's old ≥200 global target is now superseded: satisfy the live per-reviewer requirement
+computed for the exact activated focus, and keep exhaustion fail closed. You have already been in
+`check_spot_check_pool.py`, so it is your ground.
 
 ---
 

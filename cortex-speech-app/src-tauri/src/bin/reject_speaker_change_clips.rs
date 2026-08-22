@@ -36,6 +36,18 @@ fn main() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("cortex-speech"));
 
+    // Selection and finalization must observe one generation. `--apply` therefore shares the
+    // desktop's exclusive instance lock instead of writing beside a live app/restore.
+    let _instance_lock = if apply {
+        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(&data_dir).map_err(|error| {
+            format!(
+                "Cannot apply bulk rejection while Cortex is running: {error}. Stop review and close the app first."
+            )
+        })?)
+    } else {
+        None
+    };
+
     let db_path = data_dir.join("cortex-speech.db").to_string_lossy().to_string();
     let db = Database::open(&db_path).map_err(|e| format!("open {db_path}: {e}"))?;
     println!("db    : {db_path}");

@@ -15,6 +15,49 @@ const PAGE = pathToFileURL(resolve(process.cwd(), 'src-tauri/assets/couch.html')
 
 const WCAG_AA = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
+const OUTBOX_OPERATION_PREFIX = 'cortex.couch.outbox.operation.';
+
+type CouchOutboxSubmission = {
+  operationId: string;
+  id: string;
+  action: string;
+  text: string;
+  reviewer?: string;
+  [key: string]: unknown;
+};
+
+/** Read the physical v2 operation records, not the retired aggregate-array compatibility key. */
+async function readOperationOutbox(
+  page: import('@playwright/test').Page,
+): Promise<CouchOutboxSubmission[]> {
+  return page.evaluate(`
+    (() => Object.keys(localStorage)
+      .filter((key) => key.startsWith('${OUTBOX_OPERATION_PREFIX}'))
+      .sort()
+      .map((key) => {
+        const record = JSON.parse(localStorage.getItem(key));
+        if (!record || record.version !== 1 || !record.submission) {
+          throw new Error('expected a version-1 operation outbox record');
+        }
+        return record.submission;
+      }))()
+  `);
+}
+
+async function operationOutboxCount(page: import('@playwright/test').Page): Promise<number> {
+  return (await readOperationOutbox(page)).length;
+}
+
+/** Seed through the page's real writer so fixtures exercise validation, wrapping and readback. */
+async function seedOperationOutbox(
+  page: import('@playwright/test').Page,
+  submissions: CouchOutboxSubmission[],
+): Promise<void> {
+  await page.evaluate(
+    `(${JSON.stringify(submissions)}).forEach((submission) => queueSubmission(submission))`,
+  );
+}
+
 /** Put the page into its REVIEWING state — the state a reviewer actually spends their session in.
  *
  * Evaluated as a STRING, not an arrow function. The page's state lives in top-level `let` bindings,
@@ -24,8 +67,8 @@ const WCAG_AA = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 async function showAClip(page: import('@playwright/test').Page) {
   await page.evaluate(`
     queue = [
-      { id: 's1', text: 'ئەمە دەقێکی نموونەیی کوردییە بۆ پێداچوونەوە', durationMs: 4200, speakerId: 'spk_01' },
-      { id: 's2', text: 'دەقی دووەم', durationMs: 3100, speakerId: null },
+      { id: 's1', text: 'ئەمە دەقێکی نموونەیی کوردییە بۆ پێداچوونەوە', durationMs: 4200, speakerId: 'spk_01', rowVersion: '1', pilotAfterReviewEventId: null },
+      { id: 's2', text: 'دەقی دووەم', durationMs: 3100, speakerId: null, rowVersion: '2', pilotAfterReviewEventId: null },
     ];
     i = 0;
     document.getElementById('err').hidden = true;
@@ -135,26 +178,46 @@ test.describe('Couch Review phone page', () => {
     await page.locator('#accept').click();
 
     // Their decision is HELD, not lost — and they are moved on rather than stranded on a dead clip.
-    const queued = await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
-    );
+    const queued = await readOperationOutbox(page);
     expect(queued).toHaveLength(1);
-    expect((queued as Array<{ id: string }>)[0].id).toBe('s1');
+    expect(queued[0]).toMatchObject({ id: 's1', action: 'accept' });
+    expect(queued[0].operationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    await expect
+      .poll(async () => page.evaluate(`localStorage.getItem('cortex.couch.outbox')`))
+      .toBeNull();
     await expect(page.locator('#text')).toHaveValue('دەقی دووەم', { timeout: 5000 });
 
     // Network returns; the next load flushes it. Replay is safe only because the SERVER answers an
     // identical re-submit as already-recorded (couch.rs is_repeat_of_stored_decision).
     await page.evaluate(`window.__net.fail = false`);
     await page.reload();
-    await page.waitForFunction(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length === 0`,
-      null,
-      {
-        timeout: 5000,
-      },
-    );
+    await expect.poll(async () => operationOutboxCount(page), { timeout: 5000 }).toBe(0);
     const calls = (await page.evaluate(`window.__net.calls`)) as string[];
     expect(calls.some((c) => c.includes('/api/decision') && c.includes('s1'))).toBe(true);
+  });
+
+  test('outbox readback uses the same undefined-property semantics as JSON storage and wire', async ({
+    page,
+  }) => {
+    const operationId = '00000000-0000-4000-8000-000000000001';
+    await page.evaluate(`queueSubmission({
+      operationId: '${operationId}',
+      id: 'json-shape',
+      action: 'skip',
+      text: 'پارچە',
+      reviewer: 'Sara',
+      rowVersion: '1',
+      pilotAfterReviewEventId: undefined,
+      heardMs: 0,
+      clipDurationMs: 1000,
+    })`);
+
+    const queued = await readOperationOutbox(page);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ operationId, id: 'json-shape', action: 'skip' });
+    expect(queued[0]).not.toHaveProperty('pilotAfterReviewEventId');
   });
 
   test('a submit the server REFUSES is dropped, not retried forever', async ({ page }) => {
@@ -174,11 +237,7 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await showAClip(page);
     await page.locator('#accept').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
   });
 
   test('draining a batch fetches the next one instead of claiming the corpus is finished', async ({
@@ -194,8 +253,26 @@ test.describe('Couch Review phone page', () => {
     await page.addInitScript(() => {
       (window as unknown as { __q: { fetches: number } }).__q = { fetches: 0 };
       const batches = [
-        [{ id: 'a1', text: 'یەکەم', durationMs: 1000, speakerId: null }],
-        [{ id: 'b1', text: 'دووەم', durationMs: 1000, speakerId: null }],
+        [
+          {
+            id: 'a1',
+            text: 'یەکەم',
+            durationMs: 1000,
+            speakerId: null,
+            rowVersion: '1',
+            pilotAfterReviewEventId: null,
+          },
+        ],
+        [
+          {
+            id: 'b1',
+            text: 'دووەم',
+            durationMs: 1000,
+            speakerId: null,
+            rowVersion: '2',
+            pilotAfterReviewEventId: null,
+          },
+        ],
         [],
       ];
       window.fetch = async (input: RequestInfo | URL) => {
@@ -253,7 +330,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'x1', text: 'دەقی سەرەتایی', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'x1',
+                  text: 'دەقی سەرەتایی',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -275,28 +361,21 @@ test.describe('Couch Review phone page', () => {
     // Offline: type a correction and save. It is QUEUED, and must not be called "Saved".
     await page.locator('#text').fill('ڕاستکراوەی سارا');
     await page.locator('#save').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
     await expect(page.locator('#toast')).toHaveText(
       'لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت',
     );
-    const queued = (await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')[0]`,
-    )) as { reviewer?: string; text: string };
+    const [queued] = await readOperationOutbox(page);
     expect(queued.reviewer).toBe('Sara'); // stamped, so it can never be replayed under another name
     expect(queued.text).toBe('ڕاستکراوەی سارا');
+    expect(queued.operationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
 
     // Back online, the server refuses it. Driven by the 'online' event rather than a reload:
     // addInitScript re-runs on every navigation and would reset __net.offline back to true.
     await page.evaluate(`window.__net.offline = false; dispatchEvent(new Event('online'))`);
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
 
     // The decision is dropped — correct — but the WORK is kept and the reviewer is told.
     expect(await page.evaluate(`sessionStorage.getItem('cortex.couch.draft.x1')`)).toBe(
@@ -340,22 +419,38 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#who')).toHaveText(' · Hemn');
     // Seeded AFTER load so addInitScript cannot wipe it, and flushed via the 'online' event, which is
     // exactly how a reconnecting phone triggers it.
-    await page.evaluate(`
-      localStorage.setItem('cortex.couch.outbox', JSON.stringify([
-        { id: 'sara1', action: 'edit', text: 'هی سارا', reviewer: 'Sara' },
-        { id: 'hemn1', action: 'edit', text: 'هی هێمن', reviewer: 'Hemn' },
-      ]));
-      dispatchEvent(new Event('online'));
-    `);
+    await seedOperationOutbox(page, [
+      {
+        operationId: '00000000-0000-4000-8000-000000000011',
+        id: 'sara1',
+        action: 'edit',
+        text: 'هی سارا',
+        reviewer: 'Sara',
+        rowVersion: '1',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+      {
+        operationId: '00000000-0000-4000-8000-000000000012',
+        id: 'hemn1',
+        action: 'edit',
+        text: 'هی هێمن',
+        reviewer: 'Hemn',
+        rowVersion: '2',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+    ]);
+    await page.evaluate(`dispatchEvent(new Event('online'))`);
     await expect.poll(async () => page.evaluate(`window.__sent.length`)).toBe(1);
 
     const sent = (await page.evaluate(`window.__sent`)) as string[];
     expect(sent[0]).toContain('hemn1');
     expect(sent.join(' ')).not.toContain('sara1');
     // Sara's decision is still waiting for Sara — held, not sent, and not thrown away either.
-    const left = (await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
-    )) as Array<{ id: string }>;
+    const left = await readOperationOutbox(page);
     expect(left.map((q) => q.id)).toEqual(['sara1']);
   });
 
@@ -371,7 +466,18 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           const st = (window as unknown as { __q: { n: number } }).__q;
           const items =
-            st.n === 0 ? [{ id: 'z1', text: 'تاکە پارچە', durationMs: 1000, speakerId: null }] : [];
+            st.n === 0
+              ? [
+                  {
+                    id: 'z1',
+                    text: 'تاکە پارچە',
+                    durationMs: 1000,
+                    speakerId: null,
+                    rowVersion: '1',
+                    pilotAfterReviewEventId: null,
+                  },
+                ]
+              : [];
           st.n += 1;
           return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
             status: 200,
@@ -416,7 +522,18 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           const st = (window as unknown as { __q: { n: number } }).__q;
           const items =
-            st.n === 0 ? [{ id: 'w1', text: 'کۆتا پارچە', durationMs: 1000, speakerId: null }] : [];
+            st.n === 0
+              ? [
+                  {
+                    id: 'w1',
+                    text: 'کۆتا پارچە',
+                    durationMs: 1000,
+                    speakerId: null,
+                    rowVersion: '1',
+                    pilotAfterReviewEventId: null,
+                  },
+                ]
+              : [];
           st.n += 1;
           return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
             status: 200,
@@ -456,8 +573,22 @@ test.describe('Couch Review phone page', () => {
             JSON.stringify({
               reviewer: 'Sara',
               items: [
-                { id: 'broken', text: 'پارچەی تێکچوو', durationMs: 1000, speakerId: null },
-                { id: 'fine', text: 'پارچەی باش', durationMs: 1000, speakerId: null },
+                {
+                  id: 'broken',
+                  text: 'پارچەی تێکچوو',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'fine',
+                  text: 'پارچەی باش',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
             }),
@@ -516,7 +647,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'p1', text: 'دەق', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'p1',
+                  text: 'دەق',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -552,8 +692,22 @@ test.describe('Couch Review phone page', () => {
             JSON.stringify({
               reviewer: 'Sara',
               items: [
-                { id: 't1', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 't2', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 't1',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 't2',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
             }),
@@ -577,11 +731,7 @@ test.describe('Couch Review phone page', () => {
 
     await page.locator('#accept').click();
     // HELD in the outbox, and the reviewer is moved on rather than stranded re-submitting.
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
     await expect(page.locator('#text')).toHaveValue('دووەم');
     // Not reported as saved — it is queued, which is the truth.
     await expect(page.locator('#toast')).toHaveText(
@@ -592,11 +742,7 @@ test.describe('Couch Review phone page', () => {
 
     // The limiter refills; the held decision lands on the next flush.
     await page.evaluate(`window.__throttle = false; dispatchEvent(new Event('online'))`);
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
     await expect(page.locator('#err')).toBeHidden();
   });
 
@@ -614,7 +760,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'g1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'g1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -638,10 +793,20 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
 
     // Seed a refusal through the real flush path, then confirm the banner is up.
-    await page.evaluate(`
-      localStorage.setItem('cortex.couch.outbox', JSON.stringify([{ id: 'g1', action: 'edit', text: 'x', reviewer: 'Sara' }]));
-      dispatchEvent(new Event('online'));
-    `);
+    await seedOperationOutbox(page, [
+      {
+        operationId: '00000000-0000-4000-8000-000000000021',
+        id: 'g1',
+        action: 'edit',
+        text: 'x',
+        reviewer: 'Sara',
+        rowVersion: '1',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+    ]);
+    await page.evaluate(`dispatchEvent(new Event('online'))`);
     await expect(page.locator('#err')).toBeVisible();
     await expect(page.locator('#err')).toContainText('1 بڕیار');
 
@@ -665,7 +830,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'h1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'h1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -715,7 +889,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'k1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'k1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -739,21 +922,13 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
 
     await page.locator('#accept').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
     // The throttle clears. NOTHING else happens: no reload, no online event, no batch drain.
     await page.evaluate(`window.__throttle = false`);
     await page.clock.runFor(31_000);
 
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
     const sent = (await page.evaluate(`window.__sent`)) as string[];
     expect(sent.join(' ')).toContain('k1');
   });
@@ -792,19 +967,27 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
 
     // One queued decision, then every flush trigger fired at once while the first is still in flight.
+    await seedOperationOutbox(page, [
+      {
+        operationId: '00000000-0000-4000-8000-000000000031',
+        id: 'x9',
+        action: 'edit',
+        text: 'y',
+        reviewer: 'Sara',
+        rowVersion: '1',
+        pilotAfterReviewEventId: null,
+        heardMs: 1000,
+        clipDurationMs: 1000,
+      },
+    ]);
     await page.evaluate(`
-      localStorage.setItem('cortex.couch.outbox', JSON.stringify([{ id: 'x9', action: 'edit', text: 'y', reviewer: 'Sara' }]));
       window.__posts = [];
       dispatchEvent(new Event('online'));
       dispatchEvent(new Event('online'));
       dispatchEvent(new Event('online'));
       void load();
     `);
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(0);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(0);
 
     const posts = (await page.evaluate(`window.__posts`)) as string[];
     const forX9 = posts.filter((b) => b.includes('x9'));
@@ -839,11 +1022,7 @@ test.describe('Couch Review phone page', () => {
     // Offline: the decision is held.
     await page.evaluate(`localStorage.setItem('__netmode', 'offline')`);
     await page.locator('#accept').click();
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
     // Back online, but the owner restarted the server meanwhile — the token is dead.
     await page.evaluate(`localStorage.setItem('__netmode', 'expired')`);
@@ -853,9 +1032,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#err')).toBeVisible();
     await expect(page.locator('#err')).toContainText('بەسەرچووە');
     // ...and their unsent decision is STILL THERE, waiting for a working link.
-    expect(
-      await page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-    ).toBe(1);
+    expect(await operationOutboxCount(page)).toBe(1);
   });
 
   test('a decision made after the link dies is HELD, not just toasted away', async ({ page }) => {
@@ -881,14 +1058,8 @@ test.describe('Couch Review phone page', () => {
     await page.locator('#accept').click();
 
     // The verdict is held for the next working link...
-    await expect
-      .poll(async () =>
-        page.evaluate(`JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]').length`),
-      )
-      .toBe(1);
-    const held = (await page.evaluate(
-      `JSON.parse(localStorage.getItem('cortex.couch.outbox') || '[]')`,
-    )) as Array<{ id: string; action: string }>;
+    await expect.poll(async () => operationOutboxCount(page)).toBe(1);
+    const held = await readOperationOutbox(page);
     expect(held[0]).toMatchObject({ id: 's1', action: 'accept' });
 
     // ...the reviewer is told why, persistently rather than in a toast that vanishes...
@@ -991,7 +1162,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'c1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'c1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -1103,8 +1283,22 @@ test.describe('Couch Review phone page', () => {
             JSON.stringify({
               reviewer: 'Sara',
               items: [
-                { id: 'q1', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 'q2', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 'q1',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'q2',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
               pendingTotal: 407, // a real backlog behind a 2-clip batch
@@ -1142,7 +1336,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'q1', text: 'یەکەم', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'q1',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
@@ -1187,7 +1390,16 @@ test.describe('Couch Review phone page', () => {
           return new Response(
             JSON.stringify({
               reviewer: 'Sara',
-              items: [{ id: 'r1', text: 'پارچە', durationMs: 1000, speakerId: null }],
+              items: [
+                {
+                  id: 'r1',
+                  text: 'پارچە',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+              ],
               heldByOthers: 0,
               pendingTotal: 1,
             }),
@@ -1246,8 +1458,22 @@ test.describe('Couch Review phone page', () => {
             JSON.stringify({
               reviewer: 'Sara',
               items: [
-                { id: 'one', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 'two', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 'one',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'two',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
               pendingTotal: 2,
@@ -1290,8 +1516,22 @@ test.describe('Couch Review phone page', () => {
             JSON.stringify({
               reviewer: 'Sara',
               items: [
-                { id: 'one', text: 'یەکەم', durationMs: 1000, speakerId: null },
-                { id: 'two', text: 'دووەم', durationMs: 1000, speakerId: null },
+                {
+                  id: 'one',
+                  text: 'یەکەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '1',
+                  pilotAfterReviewEventId: null,
+                },
+                {
+                  id: 'two',
+                  text: 'دووەم',
+                  durationMs: 1000,
+                  speakerId: null,
+                  rowVersion: '2',
+                  pilotAfterReviewEventId: null,
+                },
               ],
               heldByOthers: 0,
               pendingTotal: 2,

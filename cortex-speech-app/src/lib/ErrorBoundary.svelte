@@ -54,7 +54,5 @@
     </div>
   {/if}
 {:else}
-  <svelte:boundary onerror={fail}>
-    {@render children()}
-  </svelte:boundary>
+  <svelte:boundary onerror={fail}>{@render children()}</svelte:boundary>
 {/if}

@@ -358,9 +358,11 @@ fn test_health_check() {
     assert!(health.get("segment_count").and_then(|v| v.as_i64()).is_some(), "segment_count should be present");
     assert_eq!(health["segment_count"], 0, "Fresh DB should have 0 segments");
     assert_eq!(health["missing_models"].as_array().map(Vec::len), Some(0));
+    let optional = health["missing_optional_models"].as_array().expect("optional support inventory is always an array");
+    assert!(optional.iter().all(serde_json::Value::is_string));
     assert!(
-        health["missing_optional_models"].as_array().map(|items| !items.is_empty()).unwrap_or(false),
-        "Optional model inventory should still report missing optional files"
+        optional.iter().filter_map(serde_json::Value::as_str).all(|name| !name.contains("OmniASR CTC")),
+        "production health must never advertise retired 300M/1B diagnostic ASR artifacts"
     );
 }
 

@@ -52,6 +52,14 @@ UNREVIEWED_SORANI = {
     # one reads well: reviewers are paid per hour of audio reviewed, so this is the number they will
     # check against their own count.
     "audioDone",
+    # Reviewer compensation accounting. These labels intentionally distinguish lifetime earned,
+    # externally paid, still due, legacy reconciliation, and an unavailable ledger. New Sorani,
+    # NOT natively reviewed — owner read required before claiming language perfection.
+    "earned",
+    "paid",
+    "outstanding",
+    "earlierPayPending",
+    "accountingUnavailable",
     # Dialect routing (owner instruction 2026-08-16): shown to a reviewer restricted to a dialect
     # that currently has no clips. New Sorani, NOT natively reviewed — on the owner's read list.
     "noDialectWork",

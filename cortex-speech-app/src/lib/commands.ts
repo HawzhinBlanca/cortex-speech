@@ -84,36 +84,6 @@ export async function transcribeSegment(
   });
 }
 
-/**
- * Opt-in: transcribe with the CONSTRAINED Kurdish-token CTC decode (guaranteed Kurdish-script
- * output) via the ort raw-logits path, instead of the default sherpa-onnx decode.
- */
-export async function transcribeSegmentConstrained(
-  audioPath: string,
-  alignmentJson?: string | null,
-): Promise<{ text: string; rawTranscript: string }> {
-  // Pass alignmentJson so constrained decode transcribes only THIS segment's clip, not the whole file.
-  return invoke('transcribe_segment_constrained', {
-    audioPath,
-    alignmentJson: alignmentJson ?? null,
-  });
-}
-
-/**
- * Opt-in: transcribe with the embedded fine-tuned Kurdish Wav2Vec2-CTC model (measured 21.0% CER
- * [19.93, 22.04] N=900 vs stock OmniASR 29.4%). Falls back with an error if the model is not installed.
- */
-export async function transcribeSegmentFinetuned(
-  audioPath: string,
-  alignmentJson?: string | null,
-): Promise<{ text: string; rawTranscript: string }> {
-  // Pass alignmentJson so the fine-tuned model transcribes only THIS segment's clip, not the whole file.
-  return invoke('transcribe_segment_finetuned', {
-    audioPath,
-    alignmentJson: alignmentJson ?? null,
-  });
-}
-
 export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
   return invoke('batch_transcribe', { ids });
 }
@@ -154,8 +124,8 @@ export interface SegmentConsensus {
   models: string[];
 }
 
-/** Map a recorded ASR engine id to a short, honest human label. Unknown ids show verbatim (never
- * invented) so the review badge always names exactly what produced the draft. */
+/** Render read-only historical provenance. These labels are not selectable engines; unknown ids show
+ * verbatim (never invented) so the review badge always names exactly what produced the stored draft. */
 export function engineLabel(modelId: string): string {
   const id = (modelId || '').toLowerCase();
   if (id.includes('wsl-7b') || id.includes('omniasr-7b') || id === 'omniasr-llm-7b')
@@ -164,7 +134,6 @@ export function engineLabel(modelId: string): string {
     return 'Fine-tuned MMS-1B';
   if (id.includes('ctc-1b') || id.includes('ctc_1b')) return 'OmniASR-CTC 1B (base)';
   if (id.includes('ctc-300m') || id.includes('ctc_300m')) return 'OmniASR-CTC 300M (base)';
-  if (id.includes('scribe')) return 'ElevenLabs Scribe (cloud)';
   if (id.startsWith('unknown@') || id === 'unknown') return 'unknown (pre-registry)';
   return modelId;
 }
@@ -457,7 +426,7 @@ export async function getMediaAssetUrl(id: string): Promise<string> {
 
 /**
  * Lowercase names of cloud providers whose API key is present in `secrets.env`
- * (e.g. "elevenlabs", "gemini", "openrouter"). Returns names only — never key
+ * ("gemini" and/or "openrouter"). Returns names only — never key
  * values — so it is safe to surface in the UI.
  */
 export async function getConfiguredProviders(): Promise<string[]> {
@@ -469,10 +438,7 @@ export async function getConfiguredProviders(): Promise<string[]> {
  * straight to the backend and is never logged or echoed back; the resolved list of configured
  * provider NAMES is returned so the UI can refresh its set/unset badges.
  */
-export async function setApiKey(
-  provider: 'gemini' | 'elevenlabs' | 'openrouter',
-  key: string,
-): Promise<string[]> {
+export async function setApiKey(provider: 'gemini' | 'openrouter', key: string): Promise<string[]> {
   return invoke<string[]>('set_api_key', { provider, key });
 }
 
@@ -573,7 +539,6 @@ export interface ModelVersion {
   family: string;
   model_card_name: string | null;
   checkpoint_sha256: string;
-  checkpoint_path: string;
   source: string;
   license: string;
   /** "candidate" or "champion". */
@@ -591,7 +556,6 @@ export async function listModelVersions(): Promise<ModelVersion[]> {
  */
 export async function importModelCheckpoint(args: {
   id: string;
-  family: string;
   checkpointPath: string;
   source: string;
   license: string;
@@ -599,7 +563,6 @@ export async function importModelCheckpoint(args: {
 }): Promise<string> {
   return invoke<string>('import_model_checkpoint', {
     id: args.id,
-    family: args.family,
     checkpointPath: args.checkpointPath,
     source: args.source,
     license: args.license,
@@ -705,29 +668,6 @@ export async function getRecentSpans(count?: number): Promise<TracingSpan[]> {
 
 export async function clearTracingSpans(): Promise<void> {
   return invoke('clear_tracing_spans');
-}
-
-/**
- * Transcribe one audio clip with ElevenLabs Scribe (cloud STT). Consent-gated server-side: errors
- * unless cloud-STT opt-in is enabled. Returns the transcription text.
- */
-export async function transcribeWithScribe(
-  audioPath: string,
-  alignmentJson?: string | null,
-): Promise<string> {
-  // Pass alignmentJson so Scribe transcribes only THIS segment's clip, not the whole source file.
-  return invoke<string>('transcribe_audio_with_scribe', {
-    audioPath,
-    alignmentJson: alignmentJson ?? null,
-  });
-}
-
-/**
- * Add an independent ElevenLabs Scribe hypothesis (jury vote) for the given segments. Consent-gated
- * server-side. Skips segments that already have a Scribe vote; returns the number of votes added.
- */
-export async function addScribeVotes(ids: string[]): Promise<number> {
-  return invoke<number>('add_scribe_votes', { ids });
 }
 
 export async function getWaveform(
@@ -1228,14 +1168,9 @@ export async function getActiveLearningQueue(
 
 import type { EvalRun, EvalRunResult, EscalationTrendPoint, LabelQualityLift } from './types';
 
-/** The honest-CER entrypoint: runs the real ASR over the gold set (no caller-supplied hypotheses). */
-export async function runGoldEvalAsr(modelId?: string | null): Promise<EvalRunResult> {
-  return invoke<EvalRunResult>('run_gold_eval_asr', { modelId: modelId ?? null });
-}
-
-/** Run the gold eval against the local pipeline for a specific model id. */
-export async function runGoldEvalLocal(modelId: string): Promise<EvalRunResult> {
-  return invoke<EvalRunResult>('run_gold_eval_local', { modelId });
+/** Run the real pinned champion over the gold set; the renderer cannot supply a model label. */
+export async function runGoldEvalAsr(): Promise<EvalRunResult> {
+  return invoke<EvalRunResult>('run_gold_eval_asr');
 }
 
 /** Create gold-eval segments from a verified file. Returns the number created. */
@@ -1277,12 +1212,6 @@ export interface FinetunePackResult {
 /** M5.1 / P5.1: export a fine-tune training pack from verified segments (holdout-excluded) under outDir. */
 export async function exportFinetunePack(outDir: string): Promise<FinetunePackResult> {
   return invoke<FinetunePackResult>('export_finetune_pack', { outDir });
-}
-
-/** P3.4: on-demand full-SHA integrity check of the bundled fine-tuned model + vocab. Resolves to a
- *  "verified: <path>" message; rejects with a mismatch message if the model is corrupt/replaced. */
-export async function verifyFinetunedModelIntegrity(): Promise<string> {
-  return invoke<string>('verify_finetuned_model_integrity');
 }
 
 /** P0.2: the git SHA the running binary was built from (baked at build time). Used for build-info display. */

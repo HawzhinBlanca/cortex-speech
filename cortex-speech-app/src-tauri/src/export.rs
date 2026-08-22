@@ -38,7 +38,7 @@ pub struct DatasetMetadata {
 }
 
 /// One recording's declaration that its audio is not the original, and how many clips it contributed.
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct ProcessedAudioNotice {
     pub audio_path: String,
     pub segments: usize,
@@ -73,12 +73,13 @@ pub(crate) fn processed_audio_notices(
         .filter_map(|(path, segments)| {
             let record = declared.get(path)?;
             Some(ProcessedAudioNotice {
-                audio_path: record.audio_path.clone(),
+                // Shared/public metadata never carries the curator's absolute filesystem layout.
+                audio_path: export_audio_ref(&record.audio_path).to_string(),
                 segments,
                 processing: record.processing.clone(),
                 separator_model: record.separator_model.clone(),
                 timeline_preserved: record.timeline_preserved,
-                manifest_path: record.manifest_path.clone(),
+                manifest_path: record.manifest_path.as_deref().map(export_audio_ref).map(str::to_string),
             })
         })
         .collect();
@@ -212,9 +213,12 @@ impl ExportSegmentRecord {
         let speaker_turn =
             segment.speaker_change_score.map(|s| (s as f32) < crate::diarization::SPEAKER_CHANGE_THRESHOLD);
         // Privacy: never publish the curator's absolute filesystem path — it embeds the
-        // OS username and drive layout. Emit only the basename, like the HF exporter.
+        // OS username and drive layout. Emit only the basename, like the HF exporter. Reviewer
+        // identity is operational/private attribution kept in the database; public/shared dataset
+        // rows need the decision provenance, not the worker's name.
         let mut sanitized = segment.clone();
         sanitized.audio_path = export_audio_ref(&segment.audio_path).to_string();
+        sanitized.reviewed_by = None;
         Self {
             segment: sanitized,
             // Canonicalize the SHIPPED training text (fold ك/ک, ي/ی, heh forms, ZWNJ/tatweel; digits
@@ -480,11 +484,6 @@ pub(crate) fn exclude_unexportable_segments(
 }
 
 pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportFormat) -> AppResult<()> {
-    // Telemetry (Week-1 "measure first"): real export wall-clock. The guard records on return; metadata
-    // carries the format so the owner can compare JSON/JSONL/CSV/Parquet costs via get_recent_spans /
-    // get_tracing_stats. Mirrors the asr.transcribe / decode / normalizer guards.
-    let _span = crate::telemetry::TRACER
-        .start_span("export.dataset", crate::telemetry::Tracer::metadata(vec![("format", format!("{format:?}"))]));
     // Drop held-out gold segments BEFORE counting or writing any format, so the training tables
     // (JSON/JSONL/CSV/Parquet) — including the production bundle that delegates through here — never
     // publish the eval set's reference transcripts; closes the eval-on-train leak the HF export
@@ -522,11 +521,42 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     if revoked_excluded > 0 {
         tracing::warn!("dataset export excluded {revoked_excluded} segment(s) whose consent was withdrawn");
     }
+
+    export_dataset_from_segments(db, path, format, &segments)
+}
+
+/// Write one tabular dataset format from an already-selected immutable row snapshot.
+///
+/// The production bundle deliberately calls this for all four formats with the SAME preflight
+/// snapshot. Calling [`export_dataset`] four times would query the live database four times, allowing
+/// a concurrent insert/re-accept/edit to enter only some files after rights/source checks had already
+/// run. This helper performs no row query and no policy selection; callers must pass the exact rows
+/// they intend to describe.
+pub(crate) fn export_dataset_from_segments(
+    db: &Database,
+    path: &std::path::Path,
+    format: &ExportFormat,
+    segments: &[SpeechSegment],
+) -> AppResult<()> {
+    let processed_audio = processed_audio_notices(db, segments)?;
+    export_dataset_from_snapshot(path, format, segments, &processed_audio)
+}
+
+pub(crate) fn export_dataset_from_snapshot(
+    path: &std::path::Path,
+    format: &ExportFormat,
+    segments: &[SpeechSegment],
+    processed_audio: &[ProcessedAudioNotice],
+) -> AppResult<()> {
+    // Telemetry (Week-1 "measure first"): real export wall-clock. The guard records on return; metadata
+    // carries the format so the owner can compare JSON/JSONL/CSV/Parquet costs via get_recent_spans /
+    // get_tracing_stats. Mirrors the asr.transcribe / decode / normalizer guards.
+    let _span = crate::telemetry::TRACER
+        .start_span("export.dataset", crate::telemetry::Tracer::metadata(vec![("format", format!("{format:?}"))]));
     let total_duration: i64 = segments.iter().map(|s| s.duration_ms).sum();
     let verified = segments.iter().filter(|s| s.verified).count();
     // Say which recordings were processed before import. Computed AFTER every exclusion above, so the
     // counts describe what this file actually contains.
-    let processed_audio = processed_audio_notices(db, &segments)?;
     if !processed_audio.is_empty() {
         let clips: usize = processed_audio.iter().map(|n| n.segments).sum();
         tracing::info!(
@@ -543,9 +573,9 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
         total_segments: segments.len(),
         total_duration_ms: total_duration,
         verified_segments: verified,
-        training_grade_summary: quality::training_grade_summary(&segments),
-        composition: compute_composition(&segments),
-        processed_audio,
+        training_grade_summary: quality::training_grade_summary(segments),
+        composition: compute_composition(segments),
+        processed_audio: processed_audio.to_vec(),
         exported_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -554,10 +584,10 @@ pub fn export_dataset(db: &Database, path: &std::path::Path, format: &ExportForm
     }
 
     match format {
-        ExportFormat::Json => export_json(path, &metadata, &segments),
-        ExportFormat::Jsonl => export_jsonl(path, &segments),
-        ExportFormat::Csv => export_csv(path, &segments),
-        ExportFormat::Parquet => export_parquet(path, &segments),
+        ExportFormat::Json => export_json(path, &metadata, segments),
+        ExportFormat::Jsonl => export_jsonl(path, segments),
+        ExportFormat::Csv => export_csv(path, segments),
+        ExportFormat::Parquet => export_parquet(path, segments),
     }
 }
 

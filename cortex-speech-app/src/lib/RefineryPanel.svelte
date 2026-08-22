@@ -19,7 +19,6 @@
 
   // Eval-action state (legacy reactivity — this component is not in runes mode).
   const tauriAvailable = isTauriRuntime();
-  let evalModelId = '';
   let evalResult: EvalRunResult | null = null;
   let scorecardMd = '';
   let evalBusy = false;
@@ -44,30 +43,13 @@
     evalBusy = true;
     scorecardMd = '';
     try {
-      evalResult = await api.runGoldEvalAsr(evalModelId.trim() || null);
+      evalResult = await api.runGoldEvalAsr();
       await refreshRuns();
       notifications.success(
         `Honest-CER eval done: CER ${metric(evalResult.run.cer, evalResult.run.numSegs)} (N=${evalResult.run.numSegs}).`,
       );
     } catch (e) {
       notifications.error('Honest-CER eval failed', { detail: String(e) });
-    } finally {
-      evalBusy = false;
-    }
-  }
-
-  async function runLocalEval() {
-    if (evalBusy || !tauriAvailable || !evalModelId.trim()) return;
-    evalBusy = true;
-    scorecardMd = '';
-    try {
-      evalResult = await api.runGoldEvalLocal(evalModelId.trim());
-      await refreshRuns();
-      notifications.success(
-        `Local eval done: CER ${metric(evalResult.run.cer, evalResult.run.numSegs)} (N=${evalResult.run.numSegs}).`,
-      );
-    } catch (e) {
-      notifications.error('Local eval failed', { detail: String(e) });
     } finally {
       evalBusy = false;
     }
@@ -184,16 +166,10 @@
       {/if}
     </div>
 
-    <!-- Eval actions (honest-CER / local eval, scorecard, gold-from-file) -->
+    <!-- Champion eval, scorecard, and gold import. Auxiliary-engine eval stays offline-only. -->
     {#if tauriAvailable}
       <div class="card" data-testid="refinery-eval-actions">
         <h3 class="card-title">Run evaluation</h3>
-        <input
-          class="input eval-input"
-          placeholder="model id (optional for honest-CER)"
-          aria-label="Eval model id"
-          bind:value={evalModelId}
-        />
         <div class="action-row">
           <button
             class="btn btn-secondary"
@@ -202,14 +178,6 @@
             data-testid="eval-honest-cer"
           >
             {evalBusy ? 'Running…' : 'Run honest-CER eval'}
-          </button>
-          <button
-            class="btn btn-secondary"
-            onclick={runLocalEval}
-            disabled={evalBusy || !evalModelId.trim()}
-            data-testid="eval-local"
-          >
-            {evalBusy ? 'Running…' : 'Run local-pipeline eval'}
           </button>
           <button
             class="btn btn-secondary"
@@ -387,10 +355,6 @@
   .trend-val {
     width: 120px;
     text-align: right;
-  }
-  .eval-input {
-    width: 100%;
-    margin-bottom: 8px;
   }
   .action-row {
     display: flex;

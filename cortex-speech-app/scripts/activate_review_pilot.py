@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""Atomically arm the strict Hawzhin/Pavel paid-review certification pilot.
+
+This is the only supported writer for ``review_pilot_policy.json``. It requires Couch, the desktop
+app, importer, and watchdog to be offline; takes SQLite's write reservation; compares the caller's
+event-id precondition; revokes auto-resume; backs up the remembered session/policy; narrows durable
+pairing, cookie, and outstanding hidden-check state to Hawzhin + Pavel without decrypting or changing
+their DPAPI tokens; writes the same policy snapshot into the session; rechecks the event-id; then
+promotes both files. The revocation marker is removed last. Any crash after mutation begins therefore
+leaves Couch unable to resume, never unrestricted.
+
+For a pre-v58 library, establish durable revocation before the offline maintenance migration.  Once
+schema 58 and foreign keys are clean, inspect and activate with the printed event id::
+
+    python scripts/activate_review_pilot.py --prepare-maintenance-revocation
+    python scripts/activate_review_pilot.py --inspect
+    python scripts/activate_review_pilot.py --expected-max-review-event-id 863
+
+Do not hand-edit the policy file. A replacement additionally requires its current SHA-256 via
+``--expected-policy-sha256``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
+from check_reviewer_links_live import strict_json_loads, validate_saved_session_shape
+from pilot_focus_contract import verify_controlled_pilot_focus
+
+POLICY_FILE = "review_pilot_policy.json"
+SESSION_FILE = "couch_session.json"
+REVOCATION_FILE = "couch_session.revoked"
+POLICY_VERSION = "review-iqd-v1-2026-08-21"
+REVIEWERS = ("Hawzhin", "Pavel")
+CAP_PER_REVIEWER = 10
+TOTAL_CAP = 20
+HIDDEN_QC_PER_REVIEWER = 2
+TOTAL_HIDDEN_QC = len(REVIEWERS) * HIDDEN_QC_PER_REVIEWER
+MAX_COMPENSATED_UI_ACTIONS = TOTAL_CAP + TOTAL_HIDDEN_QC
+COUCH_PORT = 8737
+REQUIRED_SCHEMA = 58
+
+
+def default_data_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise RuntimeError("APPDATA is unavailable; pass --data-dir")
+    return Path(appdata) / "cortex-speech"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        with temp.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class CortexInstanceLock:
+    """Exclusive owner of the same ``cortex.lock`` used by the GUI and importer."""
+
+    def __init__(self, path: Path, handle: object) -> None:
+        self.path = path
+        self.handle = handle
+
+    def close(self) -> None:
+        if self.handle is None:
+            return
+        handle, self.handle = self.handle, None
+        if os.name == "nt":
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def __enter__(self) -> "CortexInstanceLock":
+        return self
+
+    def __exit__(self, *_error: object) -> None:
+        self.close()
+
+
+def acquire_cortex_lock(data_dir: Path) -> CortexInstanceLock:
+    """Acquire the app/importer's cross-process lock, recovering only a provably stale file."""
+    path = data_dir / "cortex.lock"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        invalid = wintypes.HANDLE(-1).value
+        for attempt in range(5):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                if attempt == 4:
+                    raise RuntimeError(f"cannot acquire {path}; the app or importer still owns it")
+                time.sleep(0.08)
+                continue
+            handle = kernel32.CreateFileW(
+                str(path),
+                0xC0000000,  # GENERIC_READ | GENERIC_WRITE
+                0,           # share_mode(0), exactly as Rust's InstanceLock
+                None,
+                1,           # CREATE_NEW
+                0x80,        # FILE_ATTRIBUTE_NORMAL
+                None,
+            )
+            if handle != invalid:
+                return CortexInstanceLock(path, handle)
+            if attempt < 4:
+                time.sleep(0.08)
+        raise RuntimeError(f"cannot acquire {path}; the app or importer may still be running")
+
+    import fcntl
+
+    handle = path.open("a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        handle.close()
+        raise RuntimeError(f"cannot acquire {path}; the app or importer may still be running") from error
+    return CortexInstanceLock(path, handle)
+
+
+def _windows_process_names() -> set[str]:
+    if os.name != "nt":
+        return set()
+    output = subprocess.check_output(
+        ["tasklist", "/FO", "CSV", "/NH"], text=True, encoding="utf-8", errors="replace"
+    )
+    return {row[0].strip().lower() for row in csv.reader(output.splitlines()) if row}
+
+
+def require_runtime_offline() -> None:
+    names = _windows_process_names()
+    forbidden = sorted(names.intersection({"cortex-speech-app.exe", "batch_importer.exe"}))
+    if forbidden:
+        raise RuntimeError("activation requires the app/importer offline; running: " + ", ".join(forbidden))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        if probe.connect_ex(("127.0.0.1", COUCH_PORT)) == 0:
+            raise RuntimeError(f"activation requires Couch port {COUCH_PORT} offline")
+    if os.name == "nt":
+        try:
+            state = subprocess.check_output(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-ScheduledTask -TaskName 'CortexWatchdog' -ErrorAction Stop).State.ToString()",
+                ],
+                text=True,
+                stderr=subprocess.STDOUT,
+                timeout=15,
+            ).strip()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError(f"cannot prove CortexWatchdog is disabled: {error}") from error
+        if state.lower() != "disabled":
+            raise RuntimeError(f"activation requires CortexWatchdog disabled; current state is {state!r}")
+
+
+def validate_pilot_policy(value: object, source: str = POLICY_FILE) -> dict[str, object]:
+    """Validate exactly the typed JSON contract Rust deserializes; bool is never an integer here."""
+    policy_keys = {"schema_version", "after_review_event_id", "max_total_corpus_actions", "reviewers"}
+    if not isinstance(value, dict) or set(value) != policy_keys:
+        raise RuntimeError(f"{source} fields do not exactly match the controlled-pilot contract")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise RuntimeError(f"{source} schema must be integer version 1")
+    if type(value["after_review_event_id"]) is not int or value["after_review_event_id"] < 0:
+        raise RuntimeError(f"{source} review-event baseline must be a non-negative integer")
+    if type(value["max_total_corpus_actions"]) is not int or value["max_total_corpus_actions"] != TOTAL_CAP:
+        raise RuntimeError(f"{source} must cap exactly {TOTAL_CAP} corpus actions")
+    reviewers = value["reviewers"]
+    if not isinstance(reviewers, list) or len(reviewers) != len(REVIEWERS):
+        raise RuntimeError(f"{source} must contain exactly {len(REVIEWERS)} reviewer objects")
+    expected = sorted((name.lower(), CAP_PER_REVIEWER) for name in REVIEWERS)
+    actual: list[tuple[str, int]] = []
+    for entry in reviewers:
+        if not isinstance(entry, dict) or set(entry) != {"name", "max_corpus_actions"}:
+            raise RuntimeError(f"{source} reviewer fields do not exactly match the server contract")
+        name = entry["name"]
+        cap = entry["max_corpus_actions"]
+        if not isinstance(name, str) or not name.strip() or type(cap) is not int:
+            raise RuntimeError(f"{source} reviewer values have invalid types")
+        actual.append((name.strip().lower(), cap))
+    if sorted(actual) != expected:
+        raise RuntimeError(f"{source} must contain exactly Hawzhin and Pavel at 10 corpus actions each")
+    return value
+
+
+def pilot_policy(after_review_event_id: int) -> dict[str, object]:
+    return validate_pilot_policy({
+        "schema_version": 1,
+        "after_review_event_id": after_review_event_id,
+        "max_total_corpus_actions": TOTAL_CAP,
+        "reviewers": [
+            {"name": name, "max_corpus_actions": CAP_PER_REVIEWER} for name in REVIEWERS
+        ],
+    })
+
+
+def _canonical_path(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def narrow_session(session: dict[str, object], db_path: Path, policy: dict[str, object]) -> dict[str, object]:
+    if not isinstance(session, dict):
+        raise RuntimeError(f"{SESSION_FILE} root must be an object")
+    validate_saved_session_shape(session)
+    recorded_db = session.get("db_path")
+    if not isinstance(recorded_db, str) or _canonical_path(Path(recorded_db)) != _canonical_path(db_path):
+        raise RuntimeError(f"{SESSION_FILE} belongs to a different database")
+    pairing = session.get("reviewers")
+    if not isinstance(pairing, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in pairing.items()):
+        raise RuntimeError(f"{SESSION_FILE} has invalid durable pairing state")
+    targets = {name.lower(): name for name in REVIEWERS}
+    kept_pairing = {token: name for token, name in pairing.items() if name.strip().lower() in targets}
+    for target in REVIEWERS:
+        matches = [name for name in kept_pairing.values() if name.strip().lower() == target.lower()]
+        if len(matches) != 1:
+            raise RuntimeError(f"{SESSION_FILE} must contain exactly one durable pairing token for {target}")
+
+    sessions = session.get("sessions", [])
+    if not isinstance(sessions, list) or not all(isinstance(entry, dict) for entry in sessions):
+        raise RuntimeError(f"{SESSION_FILE} has invalid cookie-session state")
+    kept_sessions = [
+        entry for entry in sessions
+        if isinstance(entry.get("reviewer"), str) and entry["reviewer"].strip().lower() in targets
+    ]
+    def filtered_checks(field: str) -> list[object]:
+        checks = session.get(field, [])
+        if not isinstance(checks, list):
+            raise RuntimeError(f"{SESSION_FILE} has invalid {field} state")
+        kept: list[object] = []
+        for entry in checks:
+            if not isinstance(entry, list) or len(entry) != 2 or not all(isinstance(value, str) for value in entry):
+                raise RuntimeError(f"{SESSION_FILE} has invalid {field} entry")
+            if entry[1].strip().lower() in targets:
+                kept.append(entry)
+        return kept
+
+    narrowed = dict(session)  # preserve fields added by newer binaries; change only authorization state
+    narrowed["reviewers"] = kept_pairing
+    narrowed["sessions"] = kept_sessions
+    narrowed["spot_checks"] = filtered_checks("spot_checks")
+    # Missing in pre-pilot sessions is valid.  On a CAS replacement, preserving the target
+    # reviewers' distinct served-key budget prevents a policy rewrite from minting extra checks.
+    narrowed["pilot_spot_checks"] = filtered_checks("pilot_spot_checks")
+    narrowed["pilot_policy"] = policy
+    return narrowed
+
+
+def database_preflight(conn: sqlite3.Connection) -> int:
+    quick = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
+    full = [str(row[0]) for row in conn.execute("PRAGMA integrity_check")]
+    if quick != ["ok"] or full != ["ok"]:
+        raise RuntimeError(f"database integrity is not clean: quick={quick!r}, full={full!r}")
+    try:
+        actual_migrations = [
+            (int(version), str(description))
+            for version, description in conn.execute(
+                "SELECT version, description FROM schema_migrations ORDER BY version"
+            )
+        ]
+        required_migrations = source_migrations(DEFAULT_MIGRATIONS)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        raise RuntimeError(f"migration history cannot be proven: {error}") from error
+    schema = actual_migrations[-1][0] if actual_migrations else 0
+    if actual_migrations != required_migrations:
+        actual_by_version = dict(actual_migrations)
+        required_by_version = dict(required_migrations)
+        missing = sorted(set(required_by_version) - set(actual_by_version))
+        unknown = sorted(set(actual_by_version) - set(required_by_version))
+        mismatched = sorted(
+            version
+            for version in set(actual_by_version) & set(required_by_version)
+            if actual_by_version[version] != required_by_version[version]
+        )
+        raise RuntimeError(
+            "migration history does not exactly equal this release: "
+            f"schema {schema}/{REQUIRED_SCHEMA}, missing={missing}, unknown={unknown}, "
+            f"descriptionMismatch={mismatched}"
+        )
+    foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_keys:
+        raise RuntimeError(f"database has {len(foreign_keys)} foreign-key violation(s); pilot activation is refused")
+    try:
+        present = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM review_compensation_policies WHERE policy_version = ?)",
+            (POLICY_VERSION,),
+        ).fetchone()[0]
+    except sqlite3.Error as error:
+        raise RuntimeError(f"compensation policy table is unavailable: {error}") from error
+    if not present:
+        raise RuntimeError(f"database has no immutable compensation policy {POLICY_VERSION}")
+    return int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM review_events").fetchone()[0])
+
+
+def inspect(data_dir: Path, db_path: Path) -> dict[str, object]:
+    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=30)
+    try:
+        maximum = database_preflight(conn)
+    finally:
+        conn.close()
+    session_path = data_dir / SESSION_FILE
+    return {
+        "database": str(db_path.resolve()),
+        "maxReviewEventId": maximum,
+        "sessionPresent": session_path.is_file(),
+        "policyPresent": (data_dir / POLICY_FILE).is_file(),
+    }
+
+
+def prepare_maintenance_revocation(data_dir: Path, *, check_runtime: bool = True) -> dict[str, object]:
+    """Block auto-resume before schema/FK maintenance; deliberately independent of DB health."""
+    resolved = data_dir.resolve()
+    with acquire_cortex_lock(resolved):
+        if check_runtime:
+            require_runtime_offline()
+        session_path = resolved / SESSION_FILE
+        if not session_path.is_file():
+            raise RuntimeError(f"remembered reviewer state is missing: {session_path}")
+        marker = resolved / REVOCATION_FILE
+        if marker.exists() and not marker.is_file():
+            raise RuntimeError(f"revocation authority is not a regular file: {marker}")
+        if not marker.exists():
+            atomic_write(
+                marker,
+                (
+                    json.dumps(
+                        {"reason": "review_pilot_schema_maintenance", "createdUnix": int(time.time())}
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+        return {"revocation": str(marker), "session": str(session_path), "autoResumeBlocked": True}
+
+
+def _activate_locked(
+    data_dir: Path,
+    db_path: Path,
+    *,
+    expected_max_review_event_id: int,
+    expected_policy_sha256: str | None = None,
+    check_runtime: bool = True,
+    fail_after_revocation_for_test: bool = False,
+) -> dict[str, object]:
+    data_dir = data_dir.resolve()
+    db_path = db_path.resolve()
+    if check_runtime:
+        require_runtime_offline()
+    # Public ``activate`` holds Cortex's process lock across this proof and every mutation below.
+    # The active policy must never be armed against a merely similar or accidentally narrowed set.
+    initial_focus = verify_controlled_pilot_focus(data_dir)
+    session_path = data_dir / SESSION_FILE
+    policy_path = data_dir / POLICY_FILE
+    marker_path = data_dir / REVOCATION_FILE
+    if not session_path.is_file():
+        raise RuntimeError(f"remembered reviewer state is missing: {session_path}")
+    if policy_path.is_file():
+        if expected_policy_sha256 is None:
+            raise RuntimeError("policy already exists; replacement requires --expected-policy-sha256")
+        actual = sha256_file(policy_path)
+        if actual != expected_policy_sha256.lower():
+            raise RuntimeError(f"policy CAS mismatch: expected {expected_policy_sha256}, found {actual}")
+    elif expected_policy_sha256 is not None:
+        raise RuntimeError("policy CAS expected an existing file, but none exists")
+
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    marker_written = False
+    temp_policy = policy_path.with_name(f".{POLICY_FILE}.prepared.{uuid.uuid4().hex}")
+    temp_session = session_path.with_name(f".{SESSION_FILE}.prepared.{uuid.uuid4().hex}")
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("BEGIN IMMEDIATE")
+        maximum = database_preflight(conn)
+        if maximum != expected_max_review_event_id:
+            raise RuntimeError(
+                f"review-event CAS mismatch: expected {expected_max_review_event_id}, found {maximum}"
+            )
+        policy = pilot_policy(maximum)
+        original_session = strict_json_loads(session_path.read_text(encoding="utf-8"))
+        narrowed = narrow_session(original_session, db_path, policy)
+
+        # Authority first. From this point until both replacements verify, every restart is denied.
+        atomic_write(
+            marker_path,
+            (json.dumps({"reason": "review_pilot_activation", "eventId": maximum}) + "\n").encode("utf-8"),
+        )
+        marker_written = True
+        if fail_after_revocation_for_test:
+            raise RuntimeError("injected activation failure after durable revocation")
+
+        stamp = f"{int(time.time())}_{uuid.uuid4().hex[:12]}"
+        backup = data_dir / "pilot_activation_backups" / stamp
+        backup.mkdir(parents=True, exist_ok=False)
+        shutil.copy2(session_path, backup / SESSION_FILE)
+        if policy_path.is_file():
+            shutil.copy2(policy_path, backup / POLICY_FILE)
+        else:
+            (backup / f"{POLICY_FILE}.ABSENT").write_text("absent before activation\n", encoding="utf-8")
+        backup_manifest = {
+            "schema": 1,
+            "maxReviewEventId": maximum,
+            "sessionSha256": sha256_file(backup / SESSION_FILE),
+            "policySha256": sha256_file(backup / POLICY_FILE) if (backup / POLICY_FILE).is_file() else None,
+        }
+        atomic_write(
+            backup / "ACTIVATION_BACKUP.json",
+            (json.dumps(backup_manifest, indent=2) + "\n").encode("utf-8"),
+        )
+
+        policy_bytes = (json.dumps(policy, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        session_bytes = (json.dumps(narrowed, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        atomic_write(temp_policy, policy_bytes)
+        atomic_write(temp_session, session_bytes)
+        if database_preflight(conn) != maximum:
+            raise RuntimeError("review-event CAS changed while activation held the database reservation")
+
+        # Re-read the live focus at the last safe point before either operating file is promoted.
+        # The app/importer cannot race the held Cortex lock; an external/manual edit still fails here.
+        pre_promotion_focus = verify_controlled_pilot_focus(data_dir)
+        if pre_promotion_focus != initial_focus:
+            raise RuntimeError("controlled-pilot voice focus changed during activation")
+
+        os.replace(temp_policy, policy_path)
+        os.replace(temp_session, session_path)
+        if policy_path.read_bytes() != policy_bytes or session_path.read_bytes() != session_bytes:
+            raise RuntimeError("promoted pilot state failed byte verification")
+        reloaded_policy = validate_pilot_policy(
+            strict_json_loads(policy_path.read_text(encoding="utf-8")), "promoted pilot policy"
+        )
+        reloaded = strict_json_loads(session_path.read_text(encoding="utf-8"))
+        if not isinstance(reloaded, dict):
+            raise RuntimeError("promoted remembered session is not an object")
+        validate_saved_session_shape(reloaded)
+        remembered_policy = validate_pilot_policy(reloaded.get("pilot_policy"), "remembered pilot policy")
+        if reloaded_policy != policy or remembered_policy != policy:
+            raise RuntimeError("remembered session policy differs from the promoted operating policy")
+        pre_commit_focus = verify_controlled_pilot_focus(data_dir)
+        if pre_commit_focus != initial_focus:
+            raise RuntimeError("controlled-pilot voice focus changed before activation commit")
+        conn.execute("COMMIT")
+        marker_path.unlink()  # removed LAST; failure leaves the safely narrowed session paused
+        marker_written = False
+        return {
+            "policy": str(policy_path),
+            "policySha256": sha256_file(policy_path),
+            "session": str(session_path),
+            "sessionSha256": sha256_file(session_path),
+            "backup": str(backup),
+            "afterReviewEventId": maximum,
+            "reviewers": list(REVIEWERS),
+            "maxCorpusActions": TOTAL_CAP,
+            "maxHiddenQcActions": TOTAL_HIDDEN_QC,
+            "maxCompensatedUiActions": MAX_COMPENSATED_UI_ACTIONS,
+            "controlledPilotFocusCount": initial_focus.segment_id_count,
+            "controlledPilotFocusDigest": initial_focus.sorted_unique_segment_ids_sha256,
+        }
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        if marker_written:
+            # Deliberately retained. The operator may repair from the backup, but the old unrestricted
+            # session cannot resume after an interrupted activation.
+            pass
+        raise
+    finally:
+        conn.close()
+        for temp in (temp_policy, temp_session):
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def activate(
+    data_dir: Path,
+    db_path: Path,
+    *,
+    expected_max_review_event_id: int,
+    expected_policy_sha256: str | None = None,
+    check_runtime: bool = True,
+    fail_after_revocation_for_test: bool = False,
+) -> dict[str, object]:
+    """Hold Cortex's process authority across offline proof, DB CAS and both promotions."""
+    resolved_data_dir = data_dir.resolve()
+    with acquire_cortex_lock(resolved_data_dir):
+        return _activate_locked(
+            resolved_data_dir,
+            db_path.resolve(),
+            expected_max_review_event_id=expected_max_review_event_id,
+            expected_policy_sha256=expected_policy_sha256,
+            check_runtime=check_runtime,
+            fail_after_revocation_for_test=fail_after_revocation_for_test,
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument("--db", type=Path, default=None)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--inspect", action="store_true")
+    mode.add_argument("--prepare-maintenance-revocation", action="store_true")
+    parser.add_argument("--expected-max-review-event-id", type=int)
+    parser.add_argument("--expected-policy-sha256")
+    args = parser.parse_args()
+    data_dir = (args.data_dir or default_data_dir()).resolve()
+    db_path = (args.db or data_dir / "cortex-speech.db").resolve()
+    try:
+        if args.prepare_maintenance_revocation:
+            print(json.dumps(prepare_maintenance_revocation(data_dir), indent=2))
+            return 0
+        if args.inspect:
+            print(json.dumps(inspect(data_dir, db_path), indent=2))
+            return 0
+        if args.expected_max_review_event_id is None or args.expected_max_review_event_id < 0:
+            raise RuntimeError("activation requires --expected-max-review-event-id from a fresh --inspect")
+        result = activate(
+            data_dir,
+            db_path,
+            expected_max_review_event_id=args.expected_max_review_event_id,
+            expected_policy_sha256=args.expected_policy_sha256,
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+    except Exception as error:
+        print(f"REFUSED: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

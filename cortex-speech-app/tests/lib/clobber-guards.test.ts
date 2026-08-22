@@ -31,7 +31,7 @@ describe('whole-row clobber guards (P2.3 / audit F2)', () => {
     expect(body).toContain('if ($isProcessing) return;');
   });
 
-  it('the 4 ReviewMode mutators are clobber-safe: submit/markBad/go use targeted field updates; doRetranscribe refuses a batch (P2.3b)', () => {
+  it('ReviewMode mutators are clobber-safe and champion re-transcribe reloads the atomic backend commit', () => {
     const src = read('../../src/lib/ReviewMode.svelte');
     const region = (fn: string, next: string) => {
       const s = src.indexOf(fn);
@@ -43,7 +43,9 @@ describe('whole-row clobber guards (P2.3 / audit F2)', () => {
     // submit / markBad / go persist only whitelisted fields via the targeted update — never a whole-row
     // upsert of the batch-stale store row.
     const submit = region('async function submit(', 'function advance(');
-    expect(submit).toContain('updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true })');
+    expect(submit).toContain(
+      'updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true })',
+    );
     expect(submit).not.toMatch(/api\.updateSegment\(/);
     const markBad = region('async function markBad(', 'async function submit(');
     expect(markBad).toContain('updateSegmentFields(seg.id, { verified: true })');
@@ -51,9 +53,16 @@ describe('whole-row clobber guards (P2.3 / audit F2)', () => {
     const go = region('async function go(', 'function resetToOriginal(');
     expect(go).toContain('updateSegmentFields(seg.id, { annotatedTranscript: text })');
     expect(go).not.toMatch(/api\.updateSegment\(/);
-    // doRetranscribe writes rawTranscript (not whitelisted) so it stays a whole-row upsert, but must be
-    // refused during a batch/import.
+    // Re-transcribe is champion-only: the backend commits transcript + provenance atomically, then the
+    // UI reloads that authoritative row. It must never whole-row upsert a stale frontend snapshot.
     const doRetranscribe = region('async function doRetranscribe(', 'async function markBad(');
     expect(doRetranscribe).toMatch(/if \(!seg[^)]*\$isProcessing\) return;/);
+    expect(doRetranscribe).toContain(
+      'api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id)',
+    );
+    expect(doRetranscribe).toContain('const updated = await api.getSegment(seg.id)');
+    expect(doRetranscribe).toContain('updated.modelVersionId');
+    expect(doRetranscribe).not.toMatch(/api\.updateSegment\(/);
+    expect(doRetranscribe).not.toContain('transcribeSegmentFinetuned');
   });
 });

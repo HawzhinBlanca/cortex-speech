@@ -441,21 +441,6 @@
     }
   }
 
-  // P3.4: full-SHA integrity check of the bundled fine-tuned model (a few seconds — hashes 970 MB).
-  // Surfaces the on-demand backend guard so the owner can confirm the champion is intact/uncorrupted.
-  async function verifyModelIntegrity() {
-    if (!tauriAvailable || toolBusy) return;
-    toolBusy = 'verify';
-    try {
-      const message = await api.verifyFinetunedModelIntegrity();
-      notifications.success($t('stats.verifyModelOk'), { detail: message });
-    } catch (e) {
-      notifications.error($t('stats.verifyModelFailed'), { detail: String(e) });
-    } finally {
-      toolBusy = null;
-    }
-  }
-
   async function fetchInferenceStats() {
     if (!tauriAvailable) {
       inferenceStats = null;
@@ -971,9 +956,8 @@
                 <!-- The reason nothing certified is that NOTHING HAS A CONFIDENCE, not that too few clips are
                  verified. Saying "verify at least 10 segments" here sends the owner to do work that cannot
                  help: measured 2026-08-04, his library has 67 verified clips and 0/144 carry a confidence
-                 or a ctc_score, because the cloud engine returns none (pipeline.rs: "Scribe returns no
-                 per-segment confidence"). Naming the real cause is the difference between an honest empty
-                 state and a wild goose chase. -->
+                 or a ctc_score. Legacy hypotheses may legitimately lack posterior confidence; naming the real
+                 cause is the difference between an honest empty state and a wild goose chase. -->
                 <p
                   class="text-[9px] text-amber-400/90 leading-tight"
                   data-testid="conformal-no-confidence"
@@ -1180,15 +1164,6 @@
               <button
                 type="button"
                 class="btn btn-secondary !text-xs !justify-start"
-                data-testid="verify-model-btn"
-                disabled={toolBusy !== null}
-                onclick={verifyModelIntegrity}
-              >
-                {toolBusy === 'verify' ? $t('stats.toolWorking') : $t('stats.verifyModel')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
                 data-testid="backup-db-btn"
                 disabled={toolBusy !== null}
                 onclick={backupToFolder}
@@ -1234,8 +1209,12 @@
                     <div
                       class="flex items-center gap-2 text-xs bg-cortex-800/30 rounded-lg px-2 py-1"
                     >
-                      <span class="text-cortex-300 font-mono flex-1">
-                        {new Date(snap.timestamp * 1000).toLocaleString()}
+                      <span class="text-cortex-300 font-mono flex-1 min-w-0">
+                        <span class="block">{new Date(snap.timestamp * 1000).toLocaleString()}</span
+                        >
+                        <span class="block text-[9px] text-cortex-500 truncate" title={snap.name}>
+                          {snap.name}
+                        </span>
                       </span>
                       <span class="text-cortex-400">
                         {snap.segmentCount === null ? '?' : snap.segmentCount}

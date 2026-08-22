@@ -1,4 +1,4 @@
-//! Local API-key store for the cloud engines (Gemini, ElevenLabs Scribe, OpenRouter).
+//! Local API-key store for the supported cloud engines (Gemini and OpenRouter).
 //!
 //! Keys live ONLY on the user's machine: read from `{app_data_dir}/secrets.env` (`KEY=VALUE` lines)
 //! or, as an override, environment variables. They are NEVER logged (the `Debug` impl masks values),
@@ -13,14 +13,13 @@ use std::path::Path;
 pub const SECRETS_FILE: &str = "secrets.env";
 
 /// The keys Cortex looks for.
-pub const KEY_NAMES: [&str; 3] = ["GEMINI_API_KEY", "ELEVENLABS_API_KEY", "OPENROUTER_API_KEY"];
+pub const KEY_NAMES: [&str; 2] = ["GEMINI_API_KEY", "OPENROUTER_API_KEY"];
 
 /// API keys, loaded from the local secrets file / environment. Optional — a provider with no key is
 /// simply not used.
 #[derive(Clone, Default)]
 pub struct ApiKeys {
     pub gemini: Option<String>,
-    pub elevenlabs: Option<String>,
     pub openrouter: Option<String>,
 }
 
@@ -30,7 +29,6 @@ impl std::fmt::Debug for ApiKeys {
         let mark = |o: &Option<String>| if o.is_some() { "set" } else { "unset" };
         f.debug_struct("ApiKeys")
             .field("gemini", &mark(&self.gemini))
-            .field("elevenlabs", &mark(&self.elevenlabs))
             .field("openrouter", &mark(&self.openrouter))
             .finish()
     }
@@ -52,11 +50,7 @@ impl ApiKeys {
                 }
             }
         }
-        Self {
-            gemini: map.remove("GEMINI_API_KEY"),
-            elevenlabs: map.remove("ELEVENLABS_API_KEY"),
-            openrouter: map.remove("OPENROUTER_API_KEY"),
-        }
+        Self { gemini: map.remove("GEMINI_API_KEY"), openrouter: map.remove("OPENROUTER_API_KEY") }
     }
 
     /// The provider names that have a key configured — for an honest "what's connected" status. This
@@ -65,9 +59,6 @@ impl ApiKeys {
         let mut providers = Vec::new();
         if self.gemini.is_some() {
             providers.push("gemini");
-        }
-        if self.elevenlabs.is_some() {
-            providers.push("elevenlabs");
         }
         if self.openrouter.is_some() {
             providers.push("openrouter");
@@ -106,10 +97,10 @@ impl ApiKeys {
         // a sharing violation from an AV scanner or the search indexer, a permission error, a
         // transient IO fault — must abort the write.
         //
-        // The template carries BLANK placeholders for all three providers, so treating an unreadable
+        // The template carries blank placeholders for every supported provider, so treating an unreadable
         // file as an absent one rewrites secrets.env with every OTHER provider's key erased, and
         // then returns Ok(()) so the Settings UI reports the save succeeded. Saving the Gemini key
-        // would silently unset ElevenLabs and OpenRouter, which surface later only as
+        // would silently unset OpenRouter, which surfaces later only as
         // "not configured".
         let existing = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -144,7 +135,6 @@ impl ApiKeys {
          # logged, and are never committed to git. Leave a line blank to disable that provider.\n\
          \n\
          GEMINI_API_KEY=\n\
-         ELEVENLABS_API_KEY=\n\
          OPENROUTER_API_KEY=\n"
             .to_string()
     }
@@ -237,7 +227,6 @@ mod tests {
         ApiKeys::write_key_line(tmp.path(), "GEMINI_API_KEY", "abc".to_string()).unwrap();
         let written = std::fs::read_to_string(tmp.path().join(SECRETS_FILE)).unwrap();
         assert!(written.contains("GEMINI_API_KEY=abc"));
-        assert!(written.contains("ELEVENLABS_API_KEY="), "the other providers keep their lines");
         assert!(written.contains("OPENROUTER_API_KEY="));
     }
 
@@ -246,17 +235,14 @@ mod tests {
         // The regression the read-error branch exists to protect, stated directly.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        std::fs::write(
-            dir.join(SECRETS_FILE),
-            "GEMINI_API_KEY=gem\nELEVENLABS_API_KEY=eleven\nOPENROUTER_API_KEY=router\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join(SECRETS_FILE), "GEMINI_API_KEY=gem\nLEGACY_KEY=preserved\nOPENROUTER_API_KEY=router\n")
+            .unwrap();
 
         ApiKeys::write_key_line(dir, "GEMINI_API_KEY", "newgem".to_string()).unwrap();
 
         let written = std::fs::read_to_string(dir.join(SECRETS_FILE)).unwrap();
         assert!(written.contains("GEMINI_API_KEY=newgem"));
-        assert!(written.contains("ELEVENLABS_API_KEY=eleven"), "other keys must survive: {written}");
+        assert!(written.contains("LEGACY_KEY=preserved"), "unrelated lines must survive: {written}");
         assert!(written.contains("OPENROUTER_API_KEY=router"), "other keys must survive: {written}");
     }
 
@@ -266,12 +252,12 @@ mod tests {
         let p = tmp.path().join("s.env");
         std::fs::write(
             &p,
-            "# my keys\nGEMINI_API_KEY = abc123 \n\nELEVENLABS_API_KEY=\"xyz\"\nEMPTY=\n# OPENROUTER_API_KEY=nope\n",
+            "# my keys\nGEMINI_API_KEY = abc123 \n\nQUOTED=\"xyz\"\nEMPTY=\n# OPENROUTER_API_KEY=nope\n",
         )
         .unwrap();
         let m = parse_env_file(&p);
         assert_eq!(m.get("GEMINI_API_KEY").map(String::as_str), Some("abc123"), "whitespace trimmed");
-        assert_eq!(m.get("ELEVENLABS_API_KEY").map(String::as_str), Some("xyz"), "quotes stripped");
+        assert_eq!(m.get("QUOTED").map(String::as_str), Some("xyz"), "quotes stripped");
         assert!(!m.contains_key("EMPTY"), "blank value dropped");
         assert!(!m.contains_key("OPENROUTER_API_KEY"), "commented-out line not parsed");
     }
@@ -283,20 +269,20 @@ mod tests {
 
     #[test]
     fn configured_providers_lists_only_set_keys_never_values() {
-        let keys = ApiKeys { gemini: Some("g".into()), elevenlabs: None, openrouter: Some("o".into()) };
+        let keys = ApiKeys { gemini: Some("g".into()), openrouter: Some("o".into()) };
         assert_eq!(keys.configured_providers(), vec!["gemini", "openrouter"]);
     }
 
     #[test]
     fn debug_never_leaks_key_values() {
-        let keys = ApiKeys { gemini: Some("super-secret-key".into()), elevenlabs: None, openrouter: None };
+        let keys = ApiKeys { gemini: Some("super-secret-key".into()), openrouter: None };
         let rendered = format!("{keys:?}");
         assert!(!rendered.contains("super-secret-key"), "Debug must never print a key value");
         assert!(rendered.contains("set") && rendered.contains("unset"));
     }
 
     #[test]
-    fn template_has_all_three_empty_placeholders() {
+    fn template_has_every_supported_empty_placeholder() {
         let t = ApiKeys::template();
         for name in KEY_NAMES {
             assert!(t.contains(&format!("{name}=")), "template must include {name}");

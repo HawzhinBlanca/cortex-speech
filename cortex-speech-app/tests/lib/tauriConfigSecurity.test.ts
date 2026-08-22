@@ -6,8 +6,6 @@ import { resolve } from 'node:path';
 // standalone src/lib/app.config.ts file itself removed (zero production importers) in round 2.
 const APP_CONFIG = {
   models: {
-    omniasrModel: 'models/omniasr-ctc-300m/model.int8.onnx',
-    omniasrTokens: 'models/omniasr-ctc-300m/tokens.txt',
     vadPath: 'models/silero_vad_v4.onnx',
   },
 };
@@ -55,20 +53,15 @@ describe('Tauri config security boundaries', () => {
     expect(JSON.stringify(permissions)).not.toContain('$APPDATA/**');
   });
 
-  it('bundles required runtime model resources explicitly', () => {
+  it('bundles runtime support but no optional ASR engine', () => {
     const configPath = resolve(process.cwd(), 'src-tauri', 'tauri.conf.json');
     const config = JSON.parse(readFileSync(configPath, 'utf-8')) as TauriConfig;
-    const rustModelsPath = resolve(process.cwd(), 'src-tauri', 'src', 'models.rs');
-    const rustModelsSource = readFileSync(rustModelsPath, 'utf-8');
 
     const requiredResources = [
       { path: 'models/silero_vad_v4.onnx', minBytes: 1_000_000 },
-      { path: 'models/omniasr-ctc-300m/model.int8.onnx', minBytes: 50_000_000 },
-      { path: 'models/omniasr-ctc-300m/tokens.txt', minBytes: 100 },
       { path: 'models/onnxruntime.dll/onnxruntime.dll', minBytes: 10_000_000 },
       { path: 'models/onnxruntime.dll/onnxruntime_providers_shared.dll', minBytes: 1_000 },
     ];
-    const finetunedPaths = ['models/finetuned-mms-ckb/model.onnx', 'models/finetuned-mms-ckb/vocab.json'];
     // The champion's WSL server/client scripts ship BESIDE the exe so an installed build satisfies
     // `SERVER_SCRIPT_RELATIVE_TO_EXE[0]` in engine_runtime.rs without any environment variable — the
     // outage that fallback exists for. Unlike the models these are repo-tracked, so they never break
@@ -77,12 +70,8 @@ describe('Tauri config security boundaries', () => {
     const basePaths = requiredResources.map((resource) => resource.path);
     const resources = config.bundle?.resources ?? [];
 
-    // The DEFAULT bundle lists only the base models that scripts/fetch_models.py can download +
-    // SHA-256-verify, so hosted CI (ci.yml) and hosted release (release.yml) can build from a fresh
-    // checkout. The USER-PROVIDED fine-tuned model is NOT publicly fetchable, so it is intentionally
-    // absent here and added only via the local-build override (asserted below). tauri.windows.conf.json
-    // must stay in lock-step with the default, or a Windows build would demand a resource the default
-    // omits.
+    // Standard builds carry VAD/runtime support and the WSL7B client/server scripts, never a smaller
+    // ASR model. tauri.windows.conf.json must stay byte-for-byte aligned at the resource-list level.
     expect(resources).toEqual([...basePaths, ...scriptPaths]);
     const windowsConfig = JSON.parse(
       readFileSync(resolve(process.cwd(), 'src-tauri', 'tauri.windows.conf.json'), 'utf-8'),
@@ -91,24 +80,22 @@ describe('Tauri config security boundaries', () => {
     expect(resources).not.toContain('models/*');
     expect(resources).not.toContain('models/**');
     expect(resources).toContain(APP_CONFIG.models.vadPath);
-    expect(resources).toContain(APP_CONFIG.models.omniasrModel);
-    expect(resources).toContain(APP_CONFIG.models.omniasrTokens);
-    expect(rustModelsSource).toContain(
-      `OMNIASR_CTC_300M_MODEL: &str = "${stripModelsPrefix(APP_CONFIG.models.omniasrModel)}"`,
-    );
-    expect(rustModelsSource).toContain(
-      `OMNIASR_CTC_300M_TOKENS: &str = "${stripModelsPrefix(APP_CONFIG.models.omniasrTokens)}"`,
-    );
-
-    // The fine-tuned model is bundled ONLY through the explicit local-build override
-    // (tauri.finetuned.conf.json, passed via `tauri build --config`). Assert that override still
-    // DECLARES the full set (base + fine-tuned) so the opt-in engine can never be silently dropped from
-    // a real installer, and stays a strict superset of the default.
-    const finetunedConfig = JSON.parse(
-      readFileSync(resolve(process.cwd(), 'src-tauri', 'tauri.finetuned.conf.json'), 'utf-8'),
-    ) as TauriConfig;
-    const finetunedResources = finetunedConfig.bundle?.resources ?? [];
-    expect(finetunedResources).toEqual([...basePaths, ...finetunedPaths, ...scriptPaths]);
+    const serializedResources = JSON.stringify(resources).toLowerCase();
+    for (const forbidden of ['omniasr-ctc-300m', 'omniasr-ctc-1b', 'finetuned-mms', 'scribe', 'elevenlabs']) {
+      expect(serializedResources).not.toContain(forbidden);
+    }
+    // MMS remains available only through a deliberately named diagnostic override; standard CI,
+    // release and verify commands never pass it. The override itself must not smuggle in 300M/1B or
+    // any cloud model.
+    const diagnosticPath = resolve(process.cwd(), 'src-tauri', 'tauri.finetuned.conf.json');
+    const diagnosticSource = readFileSync(diagnosticPath, 'utf-8');
+    const diagnosticConfig = JSON.parse(diagnosticSource) as TauriConfig;
+    const mmsPaths = ['models/finetuned-mms-ckb/model.onnx', 'models/finetuned-mms-ckb/vocab.json'];
+    expect(diagnosticSource).toContain('EXPLICIT DIAGNOSTIC-ONLY');
+    expect(diagnosticConfig.bundle?.resources ?? []).toEqual([...basePaths, ...mmsPaths, ...scriptPaths]);
+    for (const forbidden of ['omniasr-ctc-300m', 'omniasr-ctc-1b', 'scribe', 'elevenlabs']) {
+      expect(diagnosticSource.toLowerCase()).not.toContain(forbidden);
+    }
 
     // STRICTER than before, not looser: every NON-model bundled resource must actually exist in the
     // checkout. The models are gitignored and only size-checked when present, but a script declared
@@ -118,7 +105,7 @@ describe('Tauri config security boundaries', () => {
       expect(existsSync(resolve(process.cwd(), 'src-tauri', script))).toBe(true);
     }
 
-    // The base ONNX models (silero/omniasr/onnxruntime DLLs) are large and gitignored; hosted CI
+    // Runtime support assets are large and gitignored; hosted CI
     // runners deliberately don't carry them until `npm run fetch-models` runs — same design as the
     // e2e:real gate, which only runs where the models exist (see ci.yml). The bundle DECLARATION is
     // asserted unconditionally above (a dropped model fails `toEqual`). This loop additionally
@@ -133,18 +120,8 @@ describe('Tauri config security boundaries', () => {
       }
     }
 
-    for (const p of finetunedPaths) {
-      const fp = resolve(process.cwd(), 'src-tauri', p);
-      if (existsSync(fp)) {
-        expect(statSync(fp).size).toBeGreaterThan(0);
-      }
-    }
   });
 });
-
-function stripModelsPrefix(path: string): string {
-  return path.replace(/^models\//, '');
-}
 
 type TauriConfig = {
   app?: { security?: { assetProtocol?: { enable?: boolean; scope?: string[] } } };

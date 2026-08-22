@@ -175,6 +175,37 @@ pub fn recover_interrupted_replace(final_path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Remove only replacement backups belonging to `final_path`.
+///
+/// This is used when ABSENCE is itself the committed state (for example a snapshot explicitly says
+/// there is no paid-review pilot policy). Deleting the canonical file without deleting its known
+/// `.replace-bak-*` siblings would let the next load's crash recovery resurrect stale state.
+pub fn remove_replacement_backups(final_path: &Path) -> io::Result<usize> {
+    let Some(parent) = final_path.parent().filter(|path| !path.as_os_str().is_empty()) else {
+        return Ok(0);
+    };
+    let Some(file_name) = final_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(0);
+    };
+    let prefix = format!("{file_name}.replace-bak-");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|name| name.starts_with(&prefix)) || !entry.path().is_file() {
+            continue;
+        }
+        fs::remove_file(entry.path())?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 pub fn remove_file_on_error<T, E>(path: &Path, result: Result<T, E>) -> Result<T, E> {
     if result.is_err() {
         match fs::remove_file(path) {
@@ -280,6 +311,22 @@ mod tests {
         let final_path = tmp_dir.path().join("settings.json");
         assert!(!recover_interrupted_replace(&final_path).expect("recover"));
         assert!(!final_path.exists());
+    }
+
+    #[test]
+    fn explicit_absence_cleanup_removes_only_the_targets_replacement_backups() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let final_path = tmp_dir.path().join("review_pilot_policy.json");
+        let first = tmp_dir.path().join("review_pilot_policy.json.replace-bak-10");
+        let second = tmp_dir.path().join("review_pilot_policy.json.replace-bak-20");
+        let unrelated = tmp_dir.path().join("settings.json.replace-bak-10");
+        fs::write(&first, "old pilot one").unwrap();
+        fs::write(&second, "old pilot two").unwrap();
+        fs::write(&unrelated, "settings").unwrap();
+
+        assert_eq!(remove_replacement_backups(&final_path).unwrap(), 2);
+        assert!(!first.exists() && !second.exists());
+        assert!(unrelated.exists(), "cleanup must never widen beyond the exact target file");
     }
 
     #[test]

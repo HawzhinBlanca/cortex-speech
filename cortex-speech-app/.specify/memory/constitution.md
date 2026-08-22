@@ -19,9 +19,10 @@ The project's entire credibility rests on real, never fabricated, results.
   verification that did not happen.
 
 ### II. Offline-First, Consent-Gated Cloud (NON-NEGOTIABLE)
-- The default path is **fully offline** (local OmniASR CTC + Silero VAD). Cloud LLM (OpenRouter) and cloud
-  STT (ElevenLabs Scribe) are **off by default** and require explicit opt-in
-  (`cloud_llm_opt_in` / `cloud_stt_opt_in` / `jury_cloud_opt_in`).
+- The production transcription path is **fully local**: OmniASR-7B Champion + Silero VAD. There is no
+  cloud ASR runtime or fallback. The only approved cloud model is the fixed, advisory
+  `gemini-2.5-pro`, and it requires the relevant explicit opt-in
+  (`cloud_llm_opt_in` / `jury_cloud_opt_in`).
 - Never send audio or a transcript to a provider without acknowledged consent. Never make cloud
   load-bearing in the default path. `settings.effective_llm_mode()` downgrades cloud → none when not
   opted in; `pipeline.rs` enforces it in both `llm_refinement_permitted()` and `build_refiner()`.
@@ -54,7 +55,7 @@ The project's entire credibility rests on real, never fabricated, results.
 
 - Stack: **Tauri v2 + Svelte 5 (runes: `$state`/`$derived`/`$effect`/`$props`/`$bindable`) + Rust**,
   SQLite (WAL) + FTS5, ~105 IPC commands, EN/CKB (RTL) localized UI.
-- Pipeline: import → VAD chunk → ASR (OmniASR 7B / CTC / fine-tuned MMS-CTC) → optional consent-gated
+- Pipeline: import → VAD chunk → ASR (OmniASR-7B Champion only) → optional consent-gated
   refine → review/annotate → validate → verify → export (JSON/JSONL/CSV/Parquet/HF/WAV).
 - Scope is **personal daily use** by the owner (local Sorani transcription + dataset curation), not public
   product distribution. "Highest grade" = reliability + accuracy for daily use, NOT code-signing / store

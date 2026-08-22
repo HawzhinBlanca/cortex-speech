@@ -25,7 +25,8 @@
  *
  * Env: CORTEX_APP_EXE, CORTEX_DEBUG_PORT (default 9355), CORTEX_LATENCY_SAMPLES (default 12),
  *      CORTEX_AUDIO (the clip to import; default the committed CC-BY fixture),
- *      CORTEX_LATENCY_PACE_MS (default 250; see "PACE BETWEEN SAMPLES" below).
+ *      CORTEX_LATENCY_PACE_MS (default 250; see "PACE BETWEEN SAMPLES" below),
+ *      CORTEX_ASR_ENGINE (optional explicit diagnostic override; default WSL7B).
  */
 const { spawn, execSync } = require('child_process');
 const { chromium } = require('@playwright/test');
@@ -137,7 +138,8 @@ async function run() {
   // the profile it kept for diagnosis showed the truth: zero segments, and jobs rows for exports only.
   // That looked exactly like "import silently does nothing", which would have been a serious and
   // WRONG bug report.
-  await provisionEngine(page, process.env.CORTEX_ASR_ENGINE || 'CTC300M');
+  const engine = process.env.CORTEX_GATE === '1' ? 'WSL7B' : (process.env.CORTEX_ASR_ENGINE || 'WSL7B');
+  await provisionEngine(page, DATA_DIR, engine);
 
   const measured = await page.evaluate(
     async ({ audio, samples, out, pace }) => {

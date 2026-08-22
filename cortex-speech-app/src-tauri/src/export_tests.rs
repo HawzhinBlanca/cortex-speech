@@ -131,7 +131,8 @@ fn an_export_declares_which_recordings_were_processed_before_import() {
     let notices = card["metadata"]["processed_audio"].as_array().expect("processed_audio array");
 
     assert_eq!(notices.len(), 1, "only the processed recording is declared, not the original beside it");
-    assert_eq!(notices[0]["audio_path"], "/cleaned/01.wav");
+    assert_eq!(notices[0]["audio_path"], "01.wav");
+    assert_eq!(notices[0]["manifest_path"], "manifest.json");
     assert_eq!(notices[0]["segments"], 1, "the notice counts the clips this export actually contains");
     assert_eq!(notices[0]["separator_model"], "melband_roformer_big_beta4.ckpt");
     assert_eq!(
@@ -192,7 +193,7 @@ fn insert_machine_silver_segment_with_hf_coverage(
     segment.snr_db = Some(20.0);
     db.insert_segment_full(&segment).unwrap();
     let evidence_json = serde_json::json!({
-        "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
+        "referenceModelId": "source-reference:gemini-2.5-pro",
         "selectedModelId": "omniasr-wsl-7b",
         "selectedTranscript": "reference candidate",
         "shouldCommit": true
@@ -236,7 +237,7 @@ fn record_ready_agent_report(db: &Database, audio_path: &str, segment_id: &str, 
             agentic_readiness: Some(serde_json::json!({
                 "status": "ready",
                 "ready": true,
-                "sourceReferenceModels": ["gemini-2.5-pro", "gemini-2.5-flash"],
+                "sourceReferenceModels": ["gemini-2.5-pro"],
                 "availableHypothesisModels": ["omniasr-wsl-7b", "omniasr-ctc-300m"],
                 "requiredHypothesisModels": 2,
                 "checks": [{
@@ -1671,7 +1672,9 @@ fn export_huggingface_skips_machine_ready_rows_missing_configured_source_referen
     let wav_path = tmp_dir.path().join("hf-missing-source-reference-model.wav");
     write_silent_wav(&wav_path);
     let segment = insert_machine_silver_segment_with_hf_coverage(&db, &wav_path, "hf-missing-source-reference-model");
-    insert_source_reference_with_identity(&db, segment.audio_path.as_str(), "gemini-2.5-pro");
+    // A current record for a retired/noncanonical model is deliberately insufficient: the export
+    // must require the one owner-approved advisory source model, Gemini 2.5 Pro.
+    insert_source_reference_with_identity(&db, segment.audio_path.as_str(), "gemini-2.5-flash");
     record_ready_agent_report(
         &db,
         segment.audio_path.as_str(),

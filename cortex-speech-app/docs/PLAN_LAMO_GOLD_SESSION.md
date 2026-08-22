@@ -3,12 +3,22 @@
 **Written 2026-08-21.** Every number below was measured on the live database or the live audio, not
 estimated. Where something is an owner decision it says **OWNER**.
 
+> **Owner amendment, 2026-08-21:** compensation canon revision 2 is FINAL and prospective under
+> immutable policy id `review-iqd-v1-2026-08-21`:
+> **18,000 IQD per full-equivalent audio hour; edit 100%, unchanged accept 10%, valid reject 10%,
+> skip 0%.** The owner also authorized adding all 6,922 final Lamo ids to the existing 1,352-id
+> focus, an exact 8,274-id union. Neither decision opens serving: release, provenance, playback and
+> hidden-check capacity continue to fail closed until independently green.
+>
+> Documentation provenance: repository HEAD `8cbe84dd7795c9e6db45b4d9a22da503a223b9e9`,
+> dirty shared implementation worktree; no certified compensation-v2 release SHA exists yet.
+
 ---
 
 ## The one thing to read if you read nothing else
 
-Pay is **per hour of work**, which removes the speed exploits by construction (§1). Two things still
-have to be true before the panel ships, and neither is about money:
+Pay is **weighted by the durable semantic action**, not page-open time or generic event rows (§1).
+Two things still have to be true before the panel ships, and neither is optional:
 
 1. **The counter must measure ACTIVE work, not page-open time** (§1) — otherwise the optimal
    strategy becomes leaving the phone open on a table.
@@ -33,43 +43,49 @@ everything sorts to the **top** of the trust list. That is backwards regardless 
 | clip duration p10 / median / p90 | 6.45 s / 8.45 s / 10.45 s |
 | Lamo gold set | 6,922 clips / 15.20 h, 0 duplicates, 0 clipping, SNR median 34.7 dB |
 
-### The pay rule — FINAL, owner-stated 2026-08-21
+### The pay rule — FINAL owner amendment, prospective v2
 
-> *"18K per hour of audio corrected, excluding the rejected ones. Reviewers get paid to correct the
-> sentences; the ones that are bad they reject and they don't get paid. The corrected seconds do not
-> measure the rejected ones."*
+The owner authorized policy `review-iqd-v1-2026-08-21` in his own words:
 
-**Pay = 18,000 IQD per hour of audio whose transcript they CORRECTED.**
+> `change canon: edit 100%, accept 10%, reject 10%, skip 0%; activate Lamo focus`
 
-| action | counts toward pay? | why |
-|---|---|---|
-| `edit` | **yes** | the transcript was corrected — the work product |
-| `accept` | **yes** | the draft was verified as already correct — also work |
-| `reject` | **no** | the clip is discarded; there is no corrected transcript |
-| `skip` | **no** | already excluded, explicitly declined |
+The retained rate is **18,000 IQD per full-equivalent audio hour**.
 
-**The code does not implement this today.** `Database::reviewed_audio_ms` sums
-`action IN ('accept','edit','reject')` — it pays for rejects. The fix is removing one word from one
-SQL string, and it is now owner-confirmed, not my inference.
+| durable semantic action | weight | dataset meaning |
+|---|---:|---|
+| `edit` | **100%** | retained human correction; counts as corrected audio |
+| unchanged `accept` | **10%** | verification work; reviewed, but not corrected audio |
+| valid `reject` | **10%** | judgement work; never enters the corrected dataset |
+| `skip` | **0%** | no judgement and no credit |
+
+An action string in `review_events` is not sufficient pay provenance. A payable action must be the
+revision-bound, playback-evidenced semantic result that actually committed. The policy starts at a
+recorded deployment cutoff; it does not silently reprice older events or guess values for events whose
+duration/provenance is missing.
+
+**Do not implement this by changing one SQL whitelist.** Keep three projections: full reviewed
+activity, edit-only corrected audio, and exact policy-versioned payable credit. Credits need canonical
+work identity, decision identity, idempotency, and explicit reversals/adjustments.
 
 #### What this pay rule gets right, and the one thing it leaves open
 
-It kills the worst exploit by construction. **Reject-blasting no longer pays** — which matters
-because rejecting is the one action that destroys corpus permanently, and (see the headline) the
-trust report currently *rewards* it. Excluding rejects from pay removes the money motive entirely.
+It removes the old full-value incentive: a valid reject earns only 10%, never corrected-audio status,
+and a wrong reject on a hidden check still fails quality scoring. This reduces the money motive; the
+playback, semantic-action and hidden-check gates remain necessary.
 
 It leaves **blind accept** as the dominant remaining exploit, and this is the one to defend against:
 
-* Accept is the fastest paid action — one tap, no keystrokes, full clip value.
-* At ~3 s/clip that is **50,000+ IQD/hour** against ~7,000 for honest work: a **7x arbitrage**.
+* Accept is the fastest paid action — one tap and no keystrokes — but now carries 10%, not full value.
+* The former 50,000+ IQD/hour / 7x estimate assumed full-value accepts and is superseded. Do not
+  replace it with a new forecast until the v2 serving path is measured.
 * The corpus damage is the subtle part. `training_transcript_with_source` returns
   `(raw_transcript, "human_verified")` for a bare accept, so a blind accept **stamps champion output
   at 7.03 % CER as human gold**. Fine-tuning on that is self-distillation on our own errors, and every
   CER measured against it understates true error — the model graded against its own transcripts.
 * Today's only defence is the spot-check pool, which is **26 keys** and exhausts in about an hour.
 
-So the pay rule is sound; the *measurement* behind it is not yet. §2.3 and §2.4 are the prerequisites,
-not optional polish.
+The owner decision is complete; the *implementation and measurement* are not. §2.3 and §2.4 remain
+prerequisites, not optional polish.
 
 ### Measured pace, for sizing the work
 
@@ -81,8 +97,9 @@ not optional polish.
 | Lamo | 32 | 26.7 | 16 % | 0.50 |
 | Roza | 6 | 18.2 | 57 % | 0.00 |
 
-Honest review runs about **2.5× realtime**. 15.2 h of corrected audio pays **273,600 IQD** in total
-and costs roughly **38 person-hours** — under five hours each across eight reviewers.
+Honest review measured about **2.5× realtime**. **273,600 IQD is now only the all-edit upper bound**
+for 15.2 full-equivalent hours, not a payout forecast; the actual prospective total follows the
+recorded v2 action mix. The earlier roughly 38-person-hour sizing remains a workload observation.
 
 ### The measurement capacity nobody knows is exhausted
 
@@ -110,18 +127,16 @@ AND the human text differs from the draft             →   26     ← the entir
 
 Ordered by (damage prevented ÷ effort). The first three are one-line changes.
 
-### 2.1 Stop counting rejects as paid audio — **one word**, owner-confirmed
+### 2.1 Separate reviewed, corrected and payable state — **required for v2**
 
-`reviewed_audio_ms` sums `action IN ('accept','edit','reject')`. The owner's rule pays only for
-audio **corrected**, so a reject must not accrue. The same function already excludes `skip` for
-exactly this reasoning — *"counting those would credit somebody for work they explicitly did not do"* —
-and a reject makes the same claim: no transcript was produced.
+`reviewed_audio_ms` cannot be both an activity counter and a weighted payroll ledger. Preserve full
+accept/edit/reject duration as reviewed activity; project corrected audio from retained edits only;
+and append exact `review_compensation_ledger.delta_micro_iqd` under `review-iqd-v1-2026-08-21`.
 
-→ Remove `'reject'` from the whitelist, and correct the doc comment, which still says reviewers are
-paid *"per hour of audio reviewed."* They are paid per hour of audio **corrected**.
-
-Rejecting stays the right thing to do for a bad clip — it is simply unpaid, which is the owner's
-intent and removes any motive to reject-blast.
+At 18,000 IQD/full-equivalent hour, integer credit is exact: edit contributes 5,000 micro-IQD per
+source millisecond, unchanged accept/reject contribute 500, and skip contributes zero. Snapshot the
+action, duration, weight, rate, policy, decision and canonical work identity in the verdict transaction.
+Retries do not mint twice; undo/redecision appends a reversal or adjustment instead of deleting history.
 
 ### 2.2 A reject on a spot check is WRONG, not right — **one boolean**
 
@@ -129,8 +144,8 @@ A served spot check is by construction a clip with a real human transcript. Reje
 answer. Today `action == "reject"` sets `noticed = 1` unconditionally, so a 100 %-rejector scores
 perfect and sorts to the top of the trust report.
 
-→ On a served spot check, a reject scores `noticed = 0`. With rejects also unpaid (§2.1) the money
-motive is gone, but the *scoring* must still be right or the trust report keeps promoting rejectors.
+→ On a served spot check, a reject scores `noticed = 0`. Its 10% action weight never turns a wrong
+answer into a correct one; scoring and compensation remain separate facts.
 
 ### 2.3 `noticed` must mean "found the error", not "typed something" — **small**
 
@@ -149,8 +164,9 @@ the draft was**. Anything else is not noticing.
   query already honours it (`is_gold = 1 OR reviewed_by IS NULL`).
 * **Plant known-answer clips from the Lamo set itself** as the owner reviews the first tranche.
 
-Target: **≥ 200 keys before review opens**, and an **alert when the pool runs dry** instead of today's
-silence. Without this, everything downstream is unmeasured.
+Target: the live capacity gate's exact per-reviewer requirement for the activated focus, never a
+remembered global number, plus fail-closed exhaustion instead of silence. The earlier **≥ 200** target
+predated the enforced 25-work/every-eighth cadence and is not launch evidence for an 8,274-id union.
 
 ### 2.5 Close the blind-accept laundering path — **important, subtle**
 
@@ -180,8 +196,9 @@ addressed by `id`; keep that convention.
 
 ```
   ⏱  اسکەکان: 12m 40s        ← time worked this session (wall clock, live)
-  🎧  دەنگ: 1h 12m            ← audio reviewed (reviewedMs — already sent by the server)
-  🪙  ٥٤,٠٠٠ IQD              ← earnings, from the same number the owner pays on
+  🎧  دەنگ: 1h 12m            ← full audio reviewed (activity, not payroll)
+  ✍  چاککراوە: 48m            ← edit-only corrected audio
+  🪙  ٥٤,٠٠٠ IQD              ← exact prospective ledger credit
   ▓▓▓▓▓▓▓░░  85%             ← listening progress for THIS clip
 ```
 
@@ -190,9 +207,9 @@ Four deliberate choices:
 1. **Seconds worked is wall clock, session-local.** The server has no wall-clock notion of a session
    and should not grow one; the phone can measure it honestly and it resets on reload. Label it
    "this session" so it is never mistaken for a payroll record.
-2. **Earnings derive from `reviewed_audio_ms`, the exact number the owner pays on.** No second
-   accounting. `reviewedMs` already arrives on every queue fetch, decision reply and undo — the panel
-   needs **no new endpoint**.
+2. **Earnings never derive from `reviewed_audio_ms`.** That remains honest activity. Corrected audio
+   and the policy-versioned payable balance come from their own server projections so the UI cannot
+   describe a 10%-weight accept/reject as a fully corrected minute.
 3. **The listening bar is the important part and it is new value, not decoration.** The 0.85 playback
    gate is currently *invisible until it refuses*: the reviewer taps accept, gets a 428, and sees
    "you must listen" with no idea how close they were. Showing progress toward the bar converts a
@@ -298,15 +315,18 @@ Our set is already 24 kHz / 16-bit / mono / −20 LUFS with zero clipping — go
 1. **Purge the old-path Lamo rows.** The gold clips are byte-identical copies at a new path (verified
    400/400). Leaving both means reviewers are served the same audio twice. **Hard prerequisite.**
 2. Finish the champion draft of the 6,922 gold clips (running).
-3. Land §2.1–2.3 (three tiny changes) and §2.5's accounting column.
-4. Build the trap pool to ≥ 200 keys (§2.4) — **the gate on paying anyone by results**.
+3. Land §2.1's versioned ledger plus §2.2–2.3 and §2.5's semantic-action accounting.
+4. Satisfy the live per-reviewer hidden-capacity gate for the exact 8,274-id focus (§2.4); never waive
+   or replace the measured requirement with the obsolete ≥200 global estimate.
 5. Ship the panel (§3) with its rolling-score gate.
-6. **OWNER**: decide the pay basis (§1) and the focus (below).
+6. **OWNER — RESOLVED 2026-08-21:** prospective v2 pay and additive Lamo focus are authorized.
 7. Open review to all eight reviewers with the brief from §4.2/§4.4.
 8. Export: verbatim human transcripts + 24 kHz masters + the normalization function's output.
 
-**OWNER — the focus.** The Kawa_Hawleri focus narrows every queue to 1,352 ids; no Lamo clip reaches
-anyone until Lamo's ids join it or it is retired. Nothing in §5 past step 6 can start without this.
+**OWNER — focus RESOLVED.** Add the 6,922 final Lamo ids to the existing 1,352 ids: exact union
+**8,274**, with no replacement and no hand edit. Activation must use a validated atomic tool and then
+re-run real queue/hidden-capacity gates. Authorization is not launch approval: if genuine hidden keys,
+release identity, playback evidence or serving supervision is insufficient, every queue stays fail closed.
 
 ---
 

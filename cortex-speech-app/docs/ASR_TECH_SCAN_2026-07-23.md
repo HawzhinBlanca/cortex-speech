@@ -1,5 +1,11 @@
 # Central Kurdish ASR — Tech Scan, 2026-07-23
 
+> [!WARNING]
+> **Historical research snapshot, not a production runbook.** Later owner canon removed Scribe and
+> pinned all production drafting to the OmniASR-7B WSL champion. References below to approved cloud
+> ASR, stock-model fallbacks, or model swaps are superseded; retain them only as dated research
+> provenance. See [`../../docs/OWNER_CANON.md`](../../docs/OWNER_CANON.md).
+
 A brutally-honest, evidence-first scan of the *actual* mid-2026 state of Central Kurdish (Sorani, `ckb`)
 ASR, run to ground the Accuracy & Usefulness Loop ([ACCURACY_USEFULNESS_LOOP.md](ACCURACY_USEFULNESS_LOOP.md)).
 Five parallel researchers did real web searches + source fetches on 2026-07-23. **Every number here is

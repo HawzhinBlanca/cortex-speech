@@ -288,33 +288,11 @@
     }
   }
 
-  // The engine id (matching api.engineLabel) that the champion re-transcribe ACTUALLY runs: the
-  // configured primary model, read from settings — never assumed. Keeps the provenance badge honest
-  // if the user switched the primary away from the default 7B.
-  function primaryEngineId(): string {
-    const s = get(settings);
-    // Champion supremacy matches the Rust router: WSL7B always outranks the optional embedded MMS
-    // toggle. Only a non-champion local selection may be overridden by MMS.
-    if (s.asrModel === 'wsl-7b') return 'omniasr-wsl-7b';
-    if (s.useFinetuned) return 'finetuned-mms-ckb';
-    const map: Record<string, string> = {
-      'wsl-7b': 'omniasr-wsl-7b',
-      'ctc-1b': 'omniasr-ctc-1b',
-      'ctc-300m': 'omniasr-ctc-300m',
-    };
-    return map[s.asrModel] ?? 'omniasr-wsl-7b';
-  }
-
-  // Re-transcribe THIS clip with a chosen engine when the current draft is wrong. 'champion' routes
-  // through the configured primary engine (the OmniASR-7B Champion by default — needs its server up);
-  // 'finetuned' runs the embedded fine-tuned MMS-1B only in an explicitly selected non-champion mode.
+  // Re-transcribe this clip only through the production champion. The backend commits the new text
+  // and exact model/cloud provenance atomically; this UI only reloads that authoritative row.
   let retranscribing = $state(false);
-  function retranscribe(engine: 'champion' | 'finetuned') {
+  function retranscribe() {
     const seg = current;
-    // P2.3b: refuse while a batch/import is running. doRetranscribe writes rawTranscript, which is NOT
-    // in the targeted field-update whitelist, so it must whole-row upsert — and the store row is stale
-    // vs the DB during a batch, so it would revert the batch's writes. Re-transcribe is itself a machine
-    // op, so refusing it during another machine run is correct (matches the curate transcribe handlers).
     if (!seg || retranscribing || saving || aligning || $isProcessing) return;
     // Human review is authoritative. Reopen/undo it first; an ASR request never doubles as an implicit
     // destructive undo, even behind a confirmation dialog that could become stale during inference.
@@ -322,38 +300,18 @@
       notifications.info($t('asr.reopenBeforeRetranscribe'));
       return;
     }
-    void doRetranscribe(engine);
+    void doRetranscribe();
   }
-  async function doRetranscribe(engine: 'champion' | 'finetuned') {
+  async function doRetranscribe() {
     const seg = current;
-    // `aligning` too: the clip-load background align persists fresh CTC timings mid-flight; an
-    // upsert built from the pre-align snapshot would revert them (stale-spread clobber). `$isProcessing`
-    // (P2.3b): rawTranscript is not field-update-whitelisted so this must whole-row upsert, which would
-    // revert a concurrent batch's writes (the store is stale vs the DB during a batch) — refuse instead.
     if (!seg || retranscribing || saving || aligning || $isProcessing) return;
     retranscribing = true;
     try {
-      const result =
-        engine === 'finetuned'
-          ? await api.transcribeSegmentFinetuned(seg.audioPath, seg.alignmentJson)
-          : await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
+      const result = await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
       const text = result.text;
-      let updated: SpeechSegment;
-      if (engine === 'champion') {
-        // The champion command commits server-side after all enabled refinement succeeds. Reload that
-        // authoritative row; never spread/upsert the UI snapshot captured before a long GPU call.
-        updated = await api.getSegment(seg.id);
-      } else {
-        // Optional non-champion tools are explicit local experiments and still return a draft for the
-        // existing update path. They are hidden entirely while production champion mode is selected.
-        updated = {
-          ...freshRow(seg.id, seg),
-          rawTranscript: result.rawTranscript,
-          normalizedTranscript: null,
-          verified: false,
-        };
-        await api.updateSegment(updated);
-      }
+      // The champion command commits server-side after all enabled refinement succeeds. Reload that
+      // authoritative row; never spread/upsert the UI snapshot captured before a long GPU call.
+      const updated = await api.getSegment(seg.id);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       reviewRows = reviewRows.map((s) => (s.id === seg.id ? updated : s));
       notifications.success($t('review.retranscribed'));
@@ -370,24 +328,18 @@
       // the clip id is unchanged, so the load effect must stay a no-op; resetting it would re-run
       // loadConsensus and wipe the provenance badge we set just below.
       lastLoadedOriginal = text;
-      // The owner just produced this draft with the chosen engine, so name it on the provenance badge
-      // immediately (honest — it's exactly what was used). A single-engine re-transcribe has no
-      // The fine-tuned button always runs the MMS-1B; the
-      // champion button runs the CONFIGURED primary engine (pipeline.transcribe), so read it from
-      // settings rather than assuming the 7B — otherwise a user who switched the primary would get a
-      // badge naming a model that never ran.
-      draftModels = [engine === 'finetuned' ? 'finetuned-mms-ckb' : primaryEngineId()];
+      // Use the provenance committed by the backend, never a UI-side model assumption.
+      draftModels = updated.modelVersionId ? [updated.modelVersionId] : [];
       await ensureWordTimings(updated);
     } catch (e) {
-      // Champion (7B) down: fail closed and retry only the champion. Optional engines require an
-      // explicit non-champion selection in Settings, never an in-flow downgrade prompt.
-      if (engine === 'champion' && api.is7bUnavailableError(e)) {
+      // Champion down: fail closed and retry only the champion. There is no in-flow downgrade.
+      if (api.is7bUnavailableError(e)) {
         showConfirmDialog.set({
           title: $t('asr.championUnavailableTitle'),
           message: $t('asr.championUnavailableMessage'),
           confirmLabel: $t('asr.tryAgain'),
           danger: false,
-          onConfirm: () => void doRetranscribe('champion'),
+          onConfirm: () => void doRetranscribe(),
         });
       } else {
         notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
@@ -414,8 +366,8 @@
     saving = true;
     try {
       undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
-      // recordHumanDecision FIRST so a validation failure aborts before updateSegment commits (same
-      // ordering rationale as submit()). freshRow AFTER it: same stale-spread rationale as submit().
+      // recordHumanDecision FIRST so a validation failure aborts before the targeted row update
+      // commits (same ordering rationale as submit()).
       // Same receipt the submit() path posts, for the same reason. A reject permanently removes
       // a clip from the corpus, so it is a verdict on the audio exactly as much as an accept is.
       try {
@@ -444,7 +396,8 @@
       }
     } catch (e) {
       undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
-      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
+      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
+        notifications.error($t('review.mustListen'));
       else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
     } finally {
       saving = false;
@@ -591,15 +544,6 @@
     return seg.annotatedTranscript ?? seg.rawTranscript ?? '';
   }
 
-  // Rebuild an upsert payload from the FRESHEST store copy of the row. update_segment writes the
-  // WHOLE row (insert_segment ON CONFLICT — including alignment_json and alignment_quality), so
-  // spreading a segment captured before a multi-second await lets the background aligner's freshly
-  // persisted CTC timings be silently reverted by the stale copy. ensureWordTimings reloads the
-  // store right after it persists, so re-reading by id at persist time carries those columns.
-  function freshRow(id: string, fallback: SpeechSegment): SpeechSegment {
-    return get(segments).find((s) => s.id === id) ?? fallback;
-  }
-
   // Plain (non-reactive) cache of in-progress edits keyed by segment id, so switching clips — via
   // prev/next OR a queue reorder from a concurrent store reload — never silently discards an unsaved
   // correction. Cleared per id on a successful save.
@@ -719,7 +663,7 @@
       // ms) from the freshest store row: update_segment writes the whole row, so a pre-await spread
       // would revert timings the background aligner persisted inside that window.
       // P2.3b (audit F2 completeness): persist ONLY the whitelisted fields via the targeted field
-      // update — never a whole-row updateSegment of freshRow (the STORE row), which is stale vs the DB
+      // update — never a whole-row updateSegment of the store row, which is stale vs the DB
       // while a background batch (normalize/transcribe/rediarize) writes this segment on its own
       // connection, so the upsert reverted the batch's freshly-written columns. A field update touches
       // only annotatedTranscript + verified (both whitelisted), so it is clobber-safe vs a batch AND an
@@ -754,7 +698,8 @@
       advance();
     } catch (e) {
       undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
-      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
+      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
+        notifications.error($t('review.mustListen'));
       else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
     } finally {
       saving = false;
@@ -797,8 +742,9 @@
           s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
         );
       } catch (e) {
-        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
-      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
+          notifications.error($t('review.mustListen'));
+        else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       } finally {
         saving = false;
       }
@@ -846,8 +792,9 @@
       // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
       // this component — so a lost draft is never silent.
       api.updateSegmentFields(seg.id, { annotatedTranscript: text }).catch((e) => {
-        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE')) notifications.error($t('review.mustListen'));
-      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
+          notifications.error($t('review.mustListen'));
+        else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
       });
     };
   });
@@ -1461,7 +1408,7 @@
       <!-- Consensus draft: an offline best-of-N vote across this clip's ASR models. Contested words
            (the models disagreed) are highlighted so the eye lands on likely errors first; "Use draft"
            starts the edit from a transcript better than any single model. -->
-      <!-- Fix-the-draft tools: the current transcript is wrong -> re-transcribe with a better engine,
+      <!-- Fix-the-draft tools: the current transcript is wrong -> re-transcribe with the champion,
            or flag the clip bad (excluded from export, kept + reversible). -->
       <div class="flex flex-wrap items-center gap-2">
         <span class="text-[11px] uppercase tracking-wider text-subtle"
@@ -1470,23 +1417,12 @@
         <button
           type="button"
           class="btn btn-secondary !text-xs"
-          onclick={() => retranscribe('champion')}
+          onclick={retranscribe}
           disabled={retranscribing || saving}
           title={$t('review.retranscribeChampionTitle')}
         >
           {retranscribing ? $t('review.retranscribing') : $t('review.retranscribeChampion')}
         </button>
-        {#if $settings.asrModel !== 'wsl-7b'}
-          <button
-            type="button"
-            class="btn btn-secondary !text-xs"
-            onclick={() => retranscribe('finetuned')}
-            disabled={retranscribing || saving}
-            title={$t('review.retranscribeFinetunedTitle')}
-          >
-            {$t('review.retranscribeFinetuned')}
-          </button>
-        {/if}
         {#if $settings.juryCloudOptIn}
           <button
             type="button"

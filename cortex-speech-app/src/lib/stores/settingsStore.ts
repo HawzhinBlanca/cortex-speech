@@ -2,7 +2,9 @@ import { writable } from 'svelte/store';
 
 export type Theme = 'dark' | 'light' | 'system';
 export type ExportFormat = 'json' | 'jsonl' | 'csv' | 'parquet';
-export type AsrModel = 'ctc-300m' | 'ctc-1b' | 'wsl-7b';
+export type AsrModel = 'wsl-7b';
+export const ADVISORY_CLOUD_MODEL = 'gemini-2.5-pro' as const;
+export type AdvisoryCloudModel = typeof ADVISORY_CLOUD_MODEL;
 
 export interface AppSettings {
   theme: Theme;
@@ -11,7 +13,7 @@ export interface AppSettings {
   autoAlign: boolean;
   exportFormat: ExportFormat;
   asrModel: AsrModel;
-  /** Optional embedded MMS-CTC engine; it never overrides the selected 7B champion. */
+  /** Production invariant mirrored from the backend; retained in the wire shape for compatibility. */
   useFinetuned: boolean;
   vadThreshold: number;
   minSegmentSec: number;
@@ -38,16 +40,15 @@ export interface AppSettings {
   llmApiKey: string;
   llmApiKeyConfigured: boolean;
   cloudLlmOptIn: boolean;
-  cloudSttOptIn: boolean;
   llmSystemPrompt: string;
   llmModel: string;
   externalAsrScriptPath: string;
   // Listening Jury settings
   juryCloudOptIn: boolean;
-  juryModel: string;
+  juryModel: AdvisoryCloudModel;
   /** T2 judge transport: direct Gemini REST, or OpenRouter (same Gemini 2.5 Pro model, OR quota/key). */
   juryProvider: 'gemini' | 'openrouter';
-  sourceReferenceModels: string[];
+  sourceReferenceModels: AdvisoryCloudModel[];
   jurySelfConsistencyN: number;
   juryAutonomyLevel: 'observe' | 'propose' | 'act_confirm' | 'act_auto';
   juryT1Threshold: number;
@@ -62,7 +63,7 @@ export const defaultSettings: AppSettings = {
   // Accuracy-first factory contract: the fine-tuned OmniASR-7B + LoRA champion is the sole default.
   // If it is unavailable, the app fails closed and asks; it never silently selects a smaller model.
   asrModel: 'wsl-7b',
-  // Off by default here (mirrors Rust); this is the optional embedded MMS engine, not the 7B champion.
+  // Compatibility-only wire field; production adapters and the Rust backend both force it off.
   useFinetuned: false,
   vadThreshold: 0.5,
   minSegmentSec: 3,
@@ -89,16 +90,15 @@ export const defaultSettings: AppSettings = {
   llmApiKey: '',
   llmApiKeyConfigured: false,
   cloudLlmOptIn: false,
-  cloudSttOptIn: false,
   llmSystemPrompt:
     'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
   llmModel: 'heretic-final:latest',
   externalAsrScriptPath: '',
   // Listening Jury defaults
   juryCloudOptIn: false,
-  juryModel: 'gemini-2.5-pro',
+  juryModel: ADVISORY_CLOUD_MODEL,
   juryProvider: 'gemini',
-  sourceReferenceModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+  sourceReferenceModels: [ADVISORY_CLOUD_MODEL],
   jurySelfConsistencyN: 3,
   juryAutonomyLevel: 'propose',
   juryT1Threshold: 0.75,

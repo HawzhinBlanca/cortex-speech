@@ -1,9 +1,5 @@
-//! Gold-set + gold-eval IPC commands — slice 5 of the Week-4 `commands.rs` decomposition.
-//!
-//! Behaviour and command NAMES unchanged: `commands.rs` re-exports this module (`pub use gold_eval::*;`),
-//! so `lib.rs`'s invoke_handler still names `commands::run_gold_eval` and the frontend invokes are
-//! untouched. Same functions, only relocated. (The eval-adjacent list_eval_runs / build_scorecard stay
-//! in commands.rs for now.)
+//! Gold-set + shipped champion-eval IPC commands. Auxiliary-engine evaluation remains available to
+//! explicit offline diagnostic code and is deliberately not registered with the desktop renderer.
 //!
 //! Gold-set imports + the WER/CER eval runs are whole-dataset/model work, so the heavy ones run via
 //! `run_blocking` to keep the UI thread free.
@@ -55,31 +51,20 @@ pub async fn run_gold_eval(
     .await
 }
 
-/// Closed-loop gold eval: runs the real local ASR over the gold set's audio and scores
-/// the produced hypotheses (no caller-supplied text). This is the honest-CER entrypoint.
-/// `model_id` defaults to the active local model when omitted.
+/// Closed-loop gold eval: runs the exact registered WSL7B champion over gold audio and scores the
+/// produced hypotheses. The renderer supplies neither text nor a model label.
 #[tauri::command]
-pub async fn run_gold_eval_asr(
-    state: State<'_, AppState>,
-    model_id: Option<String>,
-) -> Result<crate::eval::EvalRunResult, String> {
+pub async fn run_gold_eval_asr(state: State<'_, AppState>) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_asr")?;
+    let mutation = super::begin_mutation()?;
     // Clone the pipeline so the (potentially long) ASR loop does not hold the pipeline lock, and run
     // it OFF the main thread.
     let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || pipeline.run_gold_eval_asr(model_id.as_deref()).map_err(|e| e.to_string())).await
-}
-
-#[tauri::command]
-pub async fn run_gold_eval_local(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<crate::eval::EvalRunResult, String> {
-    RATE_LIMITER.check("run_gold_eval_local")?;
-    // Clone the pipeline and let it open its own DB connection, so neither global mutex is held
-    // across the multi-segment ASR eval loop, and run it OFF the main thread (was minutes of freeze).
-    let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || pipeline.run_gold_eval_local(&model_id).map_err(|e| e.to_string())).await
+    run_blocking(move || {
+        let _mutation = mutation;
+        pipeline.run_gold_eval_asr().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Turn the human-corrected segments of one source file into a holdout GOLD benchmark entry. Run it

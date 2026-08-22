@@ -83,12 +83,26 @@ def test_cookie_sessions_survive_a_restart() -> None:
         "every save site uses the same durable-link map": "fn durable_pairing_codes(",
         # The behaviour itself: a restored cookie must authenticate a REAL request over HTTP.
         "the restart is proven end to end": "fn a_restored_session_authenticates_a_real_request_after_a_restart()",
-        "a fresh claim is durable immediately": "persist_session_state(state);",
+        "claim persistence failure is proven to return no cookie or partial eviction": (
+            "fn failed_claim_persistence_returns_no_cookie_and_preserves_every_evicted_session()"
+        ),
         "expiry uses the wall clock, which is the only clock that crosses a restart": "issued_unix",
         "a refused reviewer is visible in the log": "Couch Review refused an unauthenticated request",
     }
     for why, needle in required.items():
         assert needle in source, f"couch.rs lost the anchor for: {why} ({needle!r})"
+    claim_start = source.find("fn api_claim(body:")
+    claim_end = source.find("\n#[derive(", claim_start)
+    assert claim_start != -1 and claim_end > claim_start, "could not isolate api_claim for its durability-order proof"
+    claim = source[claim_start:claim_end]
+    saved = claim.find("save_session_snapshot")
+    refused = claim.find("if let Err(error) = saved")
+    committed = claim.find("guard.reviewers = proposed_reviewers")
+    cookie = claim.find("Some(format!(\"{COUCH_COOKIE}={session_token}")
+    assert -1 not in {saved, refused, committed, cookie}, "api_claim lost a durability-order stage"
+    assert saved < refused < committed < cookie, (
+        "a claim must persist its staged snapshot, refuse save failure, commit memory, and only then mint the cookie"
+    )
     assert "session_issued: HashMap<String, SystemTime>" in source, (
         "session issue times must be wall-clock; an Instant cannot survive the restart it is saved for"
     )

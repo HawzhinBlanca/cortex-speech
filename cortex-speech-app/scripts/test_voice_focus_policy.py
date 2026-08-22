@@ -10,6 +10,8 @@ verdict activates), and that the tracked sources carry no speaker name.
 from __future__ import annotations
 
 import json
+import hashlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -126,6 +128,94 @@ def test_an_empty_candidate_list_is_refused_not_activated() -> None:
         r = _run(tmp, "--name", "TestVoice", "--host", "1,2,4,5")  # a PERFECT verdict
         assert r.returncode == 1, "zero candidates must refuse: activating would 503 every queue"
         assert not (tmp / "voice_focus.json").is_file(), "and write nothing"
+
+
+def _import_job_fixture(tmp: Path) -> tuple[str, str, str]:
+    """A completed two-file champion import plus an unrelated existing focus."""
+    source = tmp / "lamo-final" / "wavs"
+    source.mkdir(parents=True)
+    champion_id = "omniasr-7b-test"
+    (tmp / "champion.json").write_text(
+        json.dumps({"champions": {"omniasr-7b": {"modelVersionId": champion_id}}}), encoding="utf-8"
+    )
+    (tmp / "voice_focus.json").write_text(
+        json.dumps({"name": "Existing", "segment_ids": ["old-a", "old-b"]}, indent=2), encoding="utf-8"
+    )
+    con = sqlite3.connect(tmp / "cortex-speech.db")
+    con.executescript(
+        """
+        CREATE TABLE import_jobs(id TEXT PRIMARY KEY, dir TEXT, total_files INTEGER, status TEXT);
+        CREATE TABLE import_job_files(job_id TEXT, path TEXT, PRIMARY KEY(job_id,path));
+        CREATE TABLE speech_segments(
+          id TEXT PRIMARY KEY, audio_path TEXT, raw_transcript TEXT, verified INTEGER,
+          human_decision TEXT, reviewed_by TEXT, cloud_call INTEGER, model_version_id TEXT
+        );
+        CREATE TABLE segment_hypotheses(segment_id TEXT, model_version_id TEXT, transcript TEXT);
+        CREATE TABLE review_events(segment_id TEXT);
+        """
+    )
+    job = "job-1"
+    con.execute("INSERT INTO import_jobs VALUES(?,?,2,'completed')", (job, str(source)))
+    selected = []
+    for idx in range(2):
+        path = source / f"clip-{idx}.wav"
+        path.write_bytes(b"RIFF")
+        seg_id = f"new-{idx}"
+        text = f"text {idx}"
+        selected.append(seg_id)
+        con.execute("INSERT INTO import_job_files VALUES(?,?)", (job, str(path)))
+        con.execute("INSERT INTO speech_segments VALUES(?,?,?,0,'','',0,?)", (seg_id, str(path), text, champion_id))
+        con.execute("INSERT INTO segment_hypotheses VALUES(?,?,?)", (seg_id, champion_id, text))
+    con.commit()
+    con.close()
+    digest = hashlib.sha256(("\n".join(sorted(selected)) + "\n").encode()).hexdigest()
+    current_sha = hashlib.sha256((tmp / "voice_focus.json").read_bytes()).hexdigest()
+    return job, digest, current_sha
+
+
+def _merge_job_args(tmp: Path, job: str, digest: str, current_sha: str, *extra: str) -> list[str]:
+    return [
+        "--merge-import-job", job,
+        "--label", "Lamo",
+        "--expected-count", "2",
+        "--expected-source-dir", str(tmp / "lamo-final" / "wavs"),
+        "--expected-selection-sha256", digest,
+        "--expected-current-sha256", current_sha,
+        *extra,
+    ]
+
+
+def test_import_job_merge_is_additive_atomic_and_recoverable() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        job, digest, current_sha = _import_job_fixture(tmp)
+        dry = _run(tmp, *_merge_job_args(tmp, job, digest, current_sha, "--dry-run"))
+        assert dry.returncode == 0, dry.stdout + dry.stderr
+        assert not list(tmp.glob("voice_focus.pre-import-merge-*.json")), "dry-run writes nothing"
+        assert set(json.loads((tmp / "voice_focus.json").read_text())["segment_ids"]) == {"old-a", "old-b"}
+
+        applied = _run(tmp, *_merge_job_args(tmp, job, digest, current_sha))
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        focus = json.loads((tmp / "voice_focus.json").read_text(encoding="utf-8"))
+        assert focus["segment_ids"] == ["new-0", "new-1", "old-a", "old-b"]
+        backups = list(tmp.glob("voice_focus.pre-import-merge-*.json"))
+        assert len(backups) == 1
+        assert set(json.loads(backups[0].read_text())["segment_ids"]) == {"old-a", "old-b"}
+
+
+def test_import_job_merge_refuses_stale_focus_and_nonchampion_rows() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        job, digest, current_sha = _import_job_fixture(tmp)
+        stale = _run(tmp, *_merge_job_args(tmp, job, digest, "0" * 64))
+        assert stale.returncode == 1 and "SHA-256 changed" in stale.stdout
+        con = sqlite3.connect(tmp / "cortex-speech.db")
+        con.execute("UPDATE speech_segments SET cloud_call=1 WHERE id='new-0'")
+        con.commit()
+        con.close()
+        bad = _run(tmp, *_merge_job_args(tmp, job, digest, current_sha))
+        assert bad.returncode == 1 and "matching local champion" in bad.stdout
+        assert not list(tmp.glob("voice_focus.pre-import-merge-*.json"))
 
 
 def test_tracked_sources_carry_no_speaker_name() -> None:

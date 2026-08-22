@@ -91,6 +91,7 @@ pub fn update_segment(segment: SpeechSegment, state: State<'_, AppState>) -> Res
     if let Some(ref aj) = segment.alignment_json {
         validate::validate_alignment_json(aj)?;
     }
+    let _mutation = super::begin_mutation()?;
     let db = state.lock_db();
     let path_changed = match db.get_segment_by_id(&segment.id) {
         Ok(Some(existing)) => existing.audio_path != segment.audio_path,
@@ -200,6 +201,7 @@ pub fn update_segment_fields(
 pub fn delete_segment(id: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("delete_segment")?;
     validate::validate_identifier(&id)?;
+    let _mutation = super::begin_mutation()?;
     let db = state.lock_db();
     let previous = db.get_segment_by_id(&id).map_err(|e| e.to_string())?;
     db.delete_segment(&id).map_err(|e| e.to_string())?;
@@ -220,6 +222,7 @@ pub fn delete_segments_batch(ids: Vec<String>, state: State<'_, AppState>) -> Re
     for id in &ids {
         validate::validate_identifier(id)?;
     }
+    let _mutation = super::begin_mutation()?;
     let db = state.lock_db();
     // Single batch-SELECT instead of N individual get_segment_by_id calls (O(1) SQL round trip).
     let segments = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;

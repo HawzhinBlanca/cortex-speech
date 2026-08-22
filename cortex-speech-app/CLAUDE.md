@@ -15,22 +15,23 @@ changes: if it is in the canon, the discussion is over.
 Cortex Speech is an **offline-first desktop app** (Tauri v2 + Svelte 5 + Rust) for
 **Central Kurdish (Sorani)** speech transcription, transcript curation, and dataset export.
 
-- Local ASR: **Meta OmniASR CTC** via **sherpa-onnx** + **Silero VAD** (no cloud needed).
-- Optional, **consent-gated** cloud: ElevenLabs Scribe (STT) and OpenRouter (LLM refine, reaches Gemini-class models).
-- **Cloud-ASR policy (owner, strict):** the ONLY approved cloud ASR/judge for Central Kurdish is
-  **Gemini 2.5 Pro** (`gemini-2.5-pro` direct or `google/gemini-2.5-pro` via OpenRouter); ElevenLabs
-  **Scribe** is the only other approved cloud STT. **Never use or suggest Qwen-family ASR for ckb** —
+- Production ASR: pinned **OmniASR-7B + Kurdish LoRA** WSL service; unavailable means a hard stop.
+- Optional, **consent-gated** cloud: Gemini 2.5 Pro/OpenRouter for advisory judging or refinement only.
+- **Cloud-audio policy (owner, strict):** There is no shipped cloud-ASR drafting path. Gemini 2.5 Pro
+  (`gemini-2.5-pro` direct or `google/gemini-2.5-pro` via OpenRouter) may be used only as the
+  consent-gated advisory audio judge; it is never a draft fallback. ElevenLabs Scribe is removed
+  from the shipped runtime/UI. **Never use or suggest
+  Qwen-family ASR for ckb** —
   it has no Sorani support (measured). Any new cloud judge requires a measured ckb CER on the frozen
   gold set before it may be configured.
-- Storage: SQLite + FTS5 search. ~102 Tauri IPC commands. EN/CKB (RTL) localized UI.
+- Storage: SQLite + FTS5 search. Tauri IPC backend. EN/CKB (RTL) localized UI.
 - Workflow: import -> VAD chunk -> ASR -> (optional refine) -> review/annotate -> validate -> verify -> export (JSON/JSONL/CSV/Parquet/HuggingFace/WAV).
 
 ## Model lock (owner rule, 2026-08-06 — CRUCIAL)
 
-**Never change the AI models.** The Sorani-adapted **OmniASR-7B champion** and the embedded
-**fine-tuned MMS-1B** are fixed infrastructure. Do NOT propose replacing either because a newer model
-exists — small, Kurdish-ADAPTED models do Sorani well, while the headline general models do not
-support `ckb` at all.
+**Never change the production AI model.** The Sorani-adapted **OmniASR-7B champion** is fixed
+infrastructure. Do NOT propose replacing it because a newer model exists. Smaller/MMS models are
+offline diagnostics only; they are not production alternatives.
 
 Verified by the owner 2026-08-06 and explicitly killed: **Qwen3-ASR** (30 languages, Kurdish not among
 them) and **Voxtral Transcribe 2** (13 languages, Kurdish not among them). A swap also invalidates
@@ -38,22 +39,19 @@ every measured CER on the frozen eval set, so it is never a cheap experiment.
 
 Exactly two things are permitted, and nothing else without the owner raising it first:
 
-1. Benchmarking Meta **OmniASR v2's 300M/1B CTC variants** as faster LOCAL FALLBACKS — same family,
-   not a replacement for the champion.
+1. Benchmarking Meta **OmniASR v2's 300M/1B CTC variants** in explicit offline diagnostics — same
+   family, never a production fallback or replacement for the champion.
 2. Keeping **VibeVoice/BitNet** on a research watchlist; there is no published `ckb` evidence yet.
 
-Cloud judge/STT is locked separately: Gemini 2.5 Pro only, plus ElevenLabs Scribe for STT (see the
-cloud-ASR policy above).
+Cloud judging is locked separately: Gemini 2.5 Pro only (see the policy above).
 
 ## The champion is not optional — and failure is a HARD STOP (owner rule, 2026-08-11)
 
 Two rules, one purpose: never let the app quietly produce a worse result than it claims.
 
-**1. The champion drafts everything.** When `asr_model_size = WSL7B`, the **OmniASR-7B champion**
-transcribes EVERY clip. Nothing may divert it to a smaller model — not `use_finetuned_asr`, not a
-decode error, not a busy server. The smaller engines (fine-tuned MMS, CTC-300M/1B) are **explicit
-optional extras**: the owner may select one deliberately, and they may serve as *hypotheses* for the
-jury. They are never an automatic substitute.
+**1. The champion drafts everything.** The **OmniASR-7B champion** transcribes EVERY production clip.
+Nothing may divert it to a smaller model — not stale settings, `use_finetuned_asr`, a decode error,
+or a busy server. Fine-tuned MMS and CTC-300M/1B remain offline diagnostic/evaluation engines only.
 
 *Why this is a rule:* measured 2026-08-10, a 494-clip review queue was drafted **494/494 by
 `finetuned-mms-ckb`** while `asr_model_size` said WSL7B and the champion sat up and idle on both GPUs.
@@ -120,7 +118,7 @@ After a run, present results **both** ways so the user can approve 100%:
 
 ## Privacy + consent (hard guardrails)
 
-- Default is **fully offline**. Cloud LLM and cloud STT are **off by default** and require explicit opt-in (`cloud_llm_opt_in`, `cloud_stt_opt_in`, `jury_cloud_opt_in`). `settings.effective_llm_mode()` downgrades cloud -> none when not opted in; `pipeline.rs` enforces it in both `llm_refinement_permitted()` and `build_refiner()`. **Never** send audio/transcript to a provider without acknowledged consent, and never make cloud load-bearing in the default path.
+- Default is **fully offline**. There is no shipped cloud-ASR path. Optional cloud LLM refinement and Gemini advisory judging are **off by default** and require explicit opt-in (`cloud_llm_opt_in`, `jury_cloud_opt_in`). `settings.effective_llm_mode()` downgrades cloud -> none when not opted in; `pipeline.rs` enforces it in both `llm_refinement_permitted()` and `build_refiner()`. **Never** send audio/transcript to a provider without acknowledged consent, and never make cloud load-bearing in the default path.
 - Treat **voice as biometric** (GDPR Art. 9): enforce consent + license + attribution before any publish/train/redistribute step.
 - **Owner's rights declaration (2026-08-14, standing and FINAL).** Every audio and voice recording the
   owner supplies carries **full permission and total authority**, including **public use**. All

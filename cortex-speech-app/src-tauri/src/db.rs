@@ -15,11 +15,12 @@ pub enum PendingWork {
     SignalAnomaly,
 }
 use base64::Engine as _;
-use rusqlite::{backup, params, types::Value, Connection};
+use rusqlite::{backup, params, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
 
 /// One row of the `jobs` table as read: (id, kind, state, progress, completed, total, error_code).
@@ -112,6 +113,233 @@ pub struct ReviewerThroughput {
     pub median_seconds: Option<f64>,
     /// How many gaps that median is drawn from — a median over two samples is not a rate.
     pub samples: usize,
+}
+
+/// Owner-authorized reviewer compensation policy (2026-08-21).
+///
+/// Money is deliberately NOT derived from `reviewed_audio_ms`: that is full activity progress,
+/// while compensation is action-weighted.  Integer micro-IQD keeps every millisecond exact at this
+/// rate (edit = 5,000 micro-IQD/ms; accept/reject = 500) and postpones whole-IQD rounding until an
+/// actual settlement is produced.
+pub const REVIEW_PAY_POLICY_VERSION: &str = "review-iqd-v1-2026-08-21";
+pub const REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR: i64 = 18_000_000_000;
+pub const REVIEW_PAY_EDIT_BPS: i64 = 10_000;
+pub const REVIEW_PAY_ACCEPT_BPS: i64 = 1_000;
+pub const REVIEW_PAY_REJECT_BPS: i64 = 1_000;
+pub const REVIEW_PAY_SKIP_BPS: i64 = 0;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCompensationSummary {
+    pub policy_version: String,
+    /// Exact signed total under the active policy. Divide only for display; never round per clip.
+    pub earned_micro_iqd: i64,
+    /// Full-equivalent duration whose currently active semantic action is `edit` (100%).
+    /// This is correction work, distinct from all judged activity and from money.
+    pub corrected_audio_ms: i64,
+    /// Exact ledger credit already allocated to immutable external payout references.
+    pub settled_micro_iqd: i64,
+    /// Exact earned credit not yet allocated. May be negative after a post-settlement reversal and
+    /// therefore must be carried into the next settlement rather than hidden.
+    pub outstanding_micro_iqd: i64,
+    /// Pre-policy events remain outside this total until separately reconciled and authorized.
+    pub legacy_events_pending_reconciliation: usize,
+    /// Entries that had to fall back to row identity because canonical audio identity was absent.
+    /// The production readiness gate requires zero inside an active paid campaign.
+    pub fallback_identity_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCompensationSettlement {
+    pub settlement_id: String,
+    pub policy_version: String,
+    pub reviewer: String,
+    pub from_ledger_id_exclusive: i64,
+    pub through_ledger_id_inclusive: i64,
+    pub allocated_micro_iqd: i64,
+    pub payout_reference: String,
+}
+
+/// Durable receipt for one client-authored review operation. The payload hash lets the HTTP layer
+/// distinguish a safe retry from accidental/malicious reuse of the same UUID for different work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewOperationReceipt {
+    pub operation_id: String,
+    pub operation_payload_hash: String,
+    pub review_event_id: i64,
+    pub segment_id: String,
+    pub reviewer: String,
+    pub action: String,
+    pub compensation_action: String,
+}
+
+/// Database-enforced boundary for one controlled Couch pilot.
+///
+/// The HTTP layer also narrows queues for usability, but this object enters the SAME immediate
+/// transaction as the verdict and pay-ledger append. That is the authority: two reviewer threads or
+/// two processes racing the final slot cannot both commit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDecisionLimit {
+    after_review_event_id: i64,
+    max_total_review_actions: i64,
+    reviewer_caps: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDecisionProgress {
+    pub total_review_actions: i64,
+    pub by_reviewer: HashMap<String, i64>,
+}
+
+pub const REVIEW_PILOT_LIMIT_REACHED: &str = "E_REVIEW_PILOT_LIMIT_REACHED";
+
+impl ReviewDecisionLimit {
+    pub fn new(
+        after_review_event_id: i64,
+        max_total_review_actions: i64,
+        reviewer_caps: Vec<(String, i64)>,
+    ) -> AppResult<Self> {
+        if after_review_event_id < 0 || max_total_review_actions <= 0 || reviewer_caps.is_empty() {
+            return Err(AppError::Validation("invalid controlled-review decision limit".into()));
+        }
+        let mut canonical: Vec<(String, i64)> = Vec::with_capacity(reviewer_caps.len());
+        let mut sum = 0_i64;
+        for (raw_name, cap) in reviewer_caps {
+            let name = raw_name.trim();
+            if name.is_empty() || cap <= 0 {
+                return Err(AppError::Validation("invalid controlled-review reviewer limit".into()));
+            }
+            if canonical.iter().any(|(existing, _)| existing.eq_ignore_ascii_case(name)) {
+                return Err(AppError::Validation("duplicate controlled-review reviewer".into()));
+            }
+            sum =
+                sum.checked_add(cap).ok_or_else(|| AppError::Validation("controlled-review limits overflow".into()))?;
+            canonical.push((name.to_string(), cap));
+        }
+        if sum != max_total_review_actions {
+            return Err(AppError::Validation("controlled-review reviewer limits must sum to the total limit".into()));
+        }
+        canonical.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+        Ok(Self { after_review_event_id, max_total_review_actions, reviewer_caps: canonical })
+    }
+
+    pub fn after_review_event_id(&self) -> i64 {
+        self.after_review_event_id
+    }
+
+    pub fn max_total_review_actions(&self) -> i64 {
+        self.max_total_review_actions
+    }
+
+    pub fn reviewer_names(&self) -> Vec<String> {
+        self.reviewer_caps.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    pub fn cap_for(&self, reviewer: &str) -> Option<i64> {
+        self.reviewer_caps.iter().find(|(name, _)| name.eq_ignore_ascii_case(reviewer.trim())).map(|(_, cap)| *cap)
+    }
+}
+
+fn review_decision_progress_on(conn: &Connection, limit: &ReviewDecisionLimit) -> AppResult<ReviewDecisionProgress> {
+    let mut by_reviewer: HashMap<String, i64> = limit.reviewer_caps.iter().map(|(name, _)| (name.clone(), 0)).collect();
+    let mut statement = conn.prepare(
+        "SELECT reviewer, COUNT(*)
+           FROM review_events
+          WHERE id > ?1 AND source = 'couch'
+            AND action IN ('accept','edit','reject','skip')
+          GROUP BY LOWER(TRIM(reviewer))",
+    )?;
+    let rows = statement
+        .query_map(params![limit.after_review_event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    let mut total = 0_i64;
+    for row in rows {
+        let (actual_name, count) = row?;
+        let Some((canonical_name, cap)) =
+            limit.reviewer_caps.iter().find(|(allowed, _)| allowed.eq_ignore_ascii_case(actual_name.trim()))
+        else {
+            return Err(AppError::Validation(format!(
+                "controlled-review history contains unauthorized reviewer {actual_name:?}"
+            )));
+        };
+        if count < 0 || count > *cap {
+            return Err(AppError::Validation(format!(
+                "controlled-review history exceeds the limit for {canonical_name}"
+            )));
+        }
+        by_reviewer.insert(canonical_name.clone(), count);
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| AppError::Validation("controlled-review history count overflow".into()))?;
+    }
+    if total > limit.max_total_review_actions {
+        return Err(AppError::Validation("controlled-review history exceeds the total limit".into()));
+    }
+    Ok(ReviewDecisionProgress { total_review_actions: total, by_reviewer })
+}
+
+fn enforce_review_action_limit_on(conn: &Connection, reviewer: &str, limit: &ReviewDecisionLimit) -> AppResult<()> {
+    let current_max: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))?;
+    if limit.after_review_event_id > current_max {
+        return Err(AppError::Validation("controlled-review baseline is ahead of durable review history".into()));
+    }
+    let reviewer_cap = limit.cap_for(reviewer).ok_or_else(|| {
+        AppError::Validation(format!("controlled-review policy does not authorize reviewer {reviewer:?}"))
+    })?;
+    let progress = review_decision_progress_on(conn, limit)?;
+    let reviewer_count = progress
+        .by_reviewer
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(reviewer.trim()))
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+    if progress.total_review_actions >= limit.max_total_review_actions || reviewer_count >= reviewer_cap {
+        return Err(AppError::Validation(format!(
+            "{REVIEW_PILOT_LIMIT_REACHED}: controlled review pilot is complete for {reviewer}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_review_operation_identity(operation_id: &str, payload_hash: &str) -> AppResult<()> {
+    let parsed = uuid::Uuid::parse_str(operation_id)
+        .map_err(|_| AppError::Validation("review operation id must be a canonical UUID".into()))?;
+    if parsed.hyphenated().to_string() != operation_id {
+        return Err(AppError::Validation("review operation id must be a lowercase hyphenated UUID".into()));
+    }
+    if payload_hash.len() != 64
+        || !payload_hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::Validation("review operation payload hash must be canonical lowercase SHA-256".into()));
+    }
+    Ok(())
+}
+
+fn review_pay_basis_points(action: &str) -> AppResult<i64> {
+    match action {
+        "edit" => Ok(REVIEW_PAY_EDIT_BPS),
+        "accept" => Ok(REVIEW_PAY_ACCEPT_BPS),
+        "reject" => Ok(REVIEW_PAY_REJECT_BPS),
+        "skip" | "undo" => Ok(REVIEW_PAY_SKIP_BPS),
+        other => Err(AppError::Validation(format!("unsupported compensation action {other:?}"))),
+    }
+}
+
+fn review_pay_entitlement_micro_iqd(duration_ms: i64, basis_points: i64) -> AppResult<i64> {
+    if duration_ms < 0 || !(0..=10_000).contains(&basis_points) {
+        return Err(AppError::Validation("invalid compensation duration or basis points".into()));
+    }
+    let numerator = i128::from(duration_ms)
+        .checked_mul(i128::from(REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR))
+        .and_then(|value| value.checked_mul(i128::from(basis_points)))
+        .ok_or_else(|| AppError::Other("review compensation arithmetic overflow".into()))?;
+    let denominator = 3_600_000_i128 * 10_000_i128;
+    if numerator % denominator != 0 {
+        return Err(AppError::Other("review compensation policy does not produce exact integer micro-IQD".into()));
+    }
+    i64::try_from(numerator / denominator)
+        .map_err(|_| AppError::Other("review compensation exceeds the supported integer range".into()))
 }
 
 /// A two-rater agreement sample, ready for `scripts/agreement_kappa.py`.
@@ -346,6 +574,83 @@ pub struct SourceTranscriptRecord {
 pub struct Database {
     conn: Connection,
     path: String,
+}
+
+type SchemaObjectContract = (String, String, String, String);
+
+static CURRENT_SCHEMA_CONTRACT: OnceLock<Result<Vec<SchemaObjectContract>, String>> = OnceLock::new();
+
+fn normalized_schema_sql(name: &str, sql: Option<String>) -> String {
+    // FTS5's shadow-table DDL is generated by the bundled SQLite engine rather than by Cortex. Its
+    // spelling can change across SQLite patch releases while its required names/relationships stay
+    // stable, so bind those internal objects by name/type/table and bind every Cortex-authored object
+    // by normalized SQL as well.
+    if name.starts_with("segments_fts_") {
+        return "<sqlite-fts5-shadow>".to_string();
+    }
+    sql.unwrap_or_default()
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn read_schema_contract(conn: &Connection) -> AppResult<Vec<SchemaObjectContract>> {
+    let mut statement = conn.prepare(
+        "SELECT type, name, tbl_name, sql
+           FROM sqlite_schema
+          WHERE name NOT LIKE 'sqlite_%'
+          ORDER BY type, name",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            let kind: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let table: String = row.get(2)?;
+            let sql: Option<String> = row.get(3)?;
+            Ok((kind, name.clone(), table, normalized_schema_sql(&name, sql)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn expected_schema_contract() -> AppResult<&'static Vec<SchemaObjectContract>> {
+    CURRENT_SCHEMA_CONTRACT
+        .get_or_init(|| -> Result<Vec<SchemaObjectContract>, String> {
+            let reference = Database::open(":memory:").map_err(|error| error.to_string())?;
+            reference.initialize_inner(false).map_err(|error| error.to_string())?;
+            read_schema_contract(reference.connection()).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| AppError::Other(format!("cannot construct current schema contract: {error}")))
+}
+
+fn validate_current_schema_contract(conn: &Connection) -> AppResult<()> {
+    let expected = expected_schema_contract()?;
+    let actual = read_schema_contract(conn)?;
+    if actual == *expected {
+        return Ok(());
+    }
+
+    let expected_by_name: std::collections::BTreeMap<&str, &SchemaObjectContract> =
+        expected.iter().map(|row| (row.1.as_str(), row)).collect();
+    let actual_by_name: std::collections::BTreeMap<&str, &SchemaObjectContract> =
+        actual.iter().map(|row| (row.1.as_str(), row)).collect();
+    let missing: Vec<&str> =
+        expected_by_name.keys().filter(|name| !actual_by_name.contains_key(**name)).copied().collect();
+    let unknown: Vec<&str> =
+        actual_by_name.keys().filter(|name| !expected_by_name.contains_key(**name)).copied().collect();
+    let changed: Vec<&str> = expected_by_name
+        .iter()
+        .filter_map(|(name, expected_row)| {
+            actual_by_name.get(name).filter(|actual_row| *actual_row != expected_row).map(|_| *name)
+        })
+        .collect();
+    Err(AppError::Other(format!(
+        "database schema does not match this release: missing={missing:?}, unknown={unknown:?}, changed={changed:?}"
+    )))
 }
 
 fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str> {
@@ -628,6 +933,39 @@ fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String
 }
 
 impl Database {
+    /// Open a frozen SQLite artifact without creating `-wal`/`-shm` sidecars beside it. Plain
+    /// `SQLITE_OPEN_READ_ONLY` can still open WAL shared memory; that mutates a manifest-bound
+    /// snapshot and makes its final exact-inventory verification fail. SQLite's `immutable=1` URI
+    /// promises the bytes cannot change and suppresses all journal/shared-memory creation.
+    pub(crate) fn open_immutable_connection(path: &Path) -> AppResult<Connection> {
+        let absolute = std::fs::canonicalize(path)?;
+        let mut normalized = absolute.to_string_lossy().replace('\\', "/");
+        if let Some(stripped) = normalized.strip_prefix("//?/UNC/") {
+            normalized = format!("//{stripped}");
+        } else if let Some(stripped) = normalized.strip_prefix("//?/") {
+            normalized = stripped.to_string();
+        }
+        let mut encoded = String::with_capacity(normalized.len());
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for byte in normalized.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+        let uri = format!("file:{encoded}?immutable=1");
+        Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(Into::into)
+    }
+
     pub fn open(path: &str) -> AppResult<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
@@ -702,6 +1040,17 @@ impl Database {
     }
 
     pub fn initialize(&self) -> AppResult<()> {
+        self.initialize_inner(true)
+    }
+
+    fn initialize_inner(&self, enforce_schema_contract: bool) -> AppResult<()> {
+        // Capture freshness before creating any base-schema object. Migration history may be empty
+        // only for this proven-pristine case; an existing database with deleted/tampered history must
+        // fail closed instead of replaying migrations against live data.
+        let was_pristine = crate::migrations::database_is_pristine(&self.conn)?;
+        if !was_pristine {
+            crate::migrations::validate_applied_history(&self.conn)?;
+        }
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS speech_segments (
                 id TEXT PRIMARY KEY,
@@ -755,7 +1104,10 @@ impl Database {
             END;"
         )?;
         self.conn.execute_batch("INSERT INTO segments_fts(segments_fts) VALUES('rebuild');")?;
-        crate::migrations::run_migrations(self)?;
+        crate::migrations::run_migrations_after_pristine_initialize(self, was_pristine)?;
+        if enforce_schema_contract {
+            validate_current_schema_contract(&self.conn)?;
+        }
         Ok(())
     }
 
@@ -1682,12 +2034,283 @@ impl Database {
         Ok(out)
     }
 
+    fn compensation_audio_identity_tx(
+        tx: &rusqlite::Transaction<'_>,
+        segment_id: &str,
+    ) -> AppResult<(String, &'static str, i64)> {
+        let (content_hash, alignment_json, duration_ms): (Option<String>, Option<String>, i64) = tx.query_row(
+            "SELECT audio_content_hash, alignment_json, duration_ms FROM speech_segments WHERE id = ?1",
+            params![segment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if duration_ms <= 0 {
+            return Err(AppError::Validation(format!(
+                "review compensation refused: segment {segment_id} has non-positive duration {duration_ms}"
+            )));
+        }
+        if let (Some(hash), Some(alignment)) = (content_hash.filter(|value| !value.trim().is_empty()), alignment_json) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&alignment) {
+                let start = value.get("source_start_ms").and_then(serde_json::Value::as_i64);
+                let end = value.get("source_end_ms").and_then(serde_json::Value::as_i64);
+                if let (Some(start), Some(end)) = (start, end) {
+                    if start >= 0 && end > start {
+                        return Ok((
+                            format!("audio-segment-v1:{}:{start}:{end}", hash.trim()),
+                            "audio_content_hash+source_span",
+                            duration_ms,
+                        ));
+                    }
+                }
+            }
+        }
+        // Legacy/test rows can predate canonical PCM identity. Keep the ledger honest about the
+        // weaker key; the production readiness gate requires this count to be zero inside the live
+        // paid focus, so a fallback can never be silently described as duplicate-safe.
+        Ok((format!("segment-id-v1:{segment_id}"), "segment_id_fallback", duration_ms))
+    }
+
+    fn verify_review_pay_policy_tx(tx: &rusqlite::Transaction<'_>) -> AppResult<i64> {
+        let row: (i64, i64, i64, i64, i64, i64) = tx.query_row(
+            "SELECT effective_after_event_id, base_rate_micro_iqd_per_hour,
+                    edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points
+               FROM review_compensation_policies WHERE policy_version = ?1",
+            params![REVIEW_PAY_POLICY_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+        let expected = (
+            REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR,
+            REVIEW_PAY_EDIT_BPS,
+            REVIEW_PAY_ACCEPT_BPS,
+            REVIEW_PAY_REJECT_BPS,
+            REVIEW_PAY_SKIP_BPS,
+        );
+        if (row.1, row.2, row.3, row.4, row.5) != expected {
+            return Err(AppError::Other(format!(
+                "review compensation policy row disagrees with certified binary {}",
+                REVIEW_PAY_POLICY_VERSION
+            )));
+        }
+        Ok(row.0)
+    }
+
+    /// Look up the immutable receipt for a client operation. Used before and after a write attempt:
+    /// before, to acknowledge a lost-response replay; after a UNIQUE race, to distinguish the same
+    /// request (safe success) from UUID reuse with a different payload (hard conflict).
+    pub fn review_operation(&self, operation_id: &str) -> AppResult<Option<ReviewOperationReceipt>> {
+        use rusqlite::OptionalExtension;
+
+        let parsed = uuid::Uuid::parse_str(operation_id)
+            .map_err(|_| AppError::Validation("review operation id must be a canonical UUID".into()))?;
+        if parsed.hyphenated().to_string() != operation_id {
+            return Err(AppError::Validation("review operation id must be a lowercase hyphenated UUID".into()));
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT operation_id, operation_payload_hash, id, segment_id, reviewer, action,
+                        compensation_action
+                   FROM review_events WHERE operation_id = ?1",
+                params![operation_id],
+                |row| {
+                    Ok(ReviewOperationReceipt {
+                        operation_id: row.get(0)?,
+                        operation_payload_hash: row.get(1)?,
+                        review_event_id: row.get(2)?,
+                        segment_id: row.get(3)?,
+                        reviewer: row.get(4)?,
+                        action: row.get(5)?,
+                        compensation_action: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_review_compensation_tx(
+        tx: &rusqlite::Transaction<'_>,
+        review_event_id: i64,
+        segment_id: &str,
+        reviewer: &str,
+        source: &str,
+        compensation_action: &str,
+        effective_decision: &str,
+        decision_revision: Option<i64>,
+    ) -> AppResult<()> {
+        let cutoff = Self::verify_review_pay_policy_tx(tx)?;
+        if review_event_id <= cutoff {
+            return Err(AppError::Other(format!(
+                "new review event {review_event_id} did not fall after policy cutoff {cutoff}"
+            )));
+        }
+        let basis_points = review_pay_basis_points(compensation_action)?;
+        let (audio_work_id, identity_kind, duration_ms) = Self::compensation_audio_identity_tx(tx, segment_id)?;
+        let reviewer_key = reviewer.trim().to_lowercase();
+        if reviewer_key.is_empty() {
+            return Err(AppError::Validation("review compensation requires a named reviewer".into()));
+        }
+        let canonical_work_id = format!("reviewer-work-v1:{}:{reviewer_key}:{audio_work_id}", reviewer_key.len());
+        let (prior_entitlement, prior_corrected_ms): (i64, i64) = tx.query_row(
+            "SELECT COALESCE(SUM(delta_micro_iqd), 0),
+                    COALESCE(SUM(delta_corrected_ms), 0)
+               FROM review_compensation_ledger
+              WHERE policy_version = ?1 AND canonical_work_id = ?2",
+            params![REVIEW_PAY_POLICY_VERSION, canonical_work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if prior_corrected_ms < 0 {
+            return Err(AppError::Other(format!(
+                "review compensation corrected-audio balance is negative for {canonical_work_id}"
+            )));
+        }
+        let entitlement = review_pay_entitlement_micro_iqd(duration_ms, basis_points)?;
+        // Skip is an explicit no-verdict. It must neither mint money nor retract a previous valid
+        // entitlement if a strange legacy/replay path reaches the same work identity.
+        let delta = if compensation_action == "skip" {
+            0
+        } else {
+            entitlement
+                .checked_sub(prior_entitlement)
+                .ok_or_else(|| AppError::Other("review compensation adjustment overflow".into()))?
+        };
+        // Correction time is its own signed entitlement, not inferred from a money balance. A skip
+        // leaves the active state untouched; accept/reject clear correction entitlement; edit owns
+        // the exact duration snapshot used by this ledger entry.
+        let corrected_entitlement_ms = match compensation_action {
+            "edit" => duration_ms,
+            "accept" | "reject" => 0,
+            "skip" => prior_corrected_ms,
+            other => return Err(AppError::Validation(format!("unsupported corrected-audio action {other:?}"))),
+        };
+        let delta_corrected_ms = corrected_entitlement_ms
+            .checked_sub(prior_corrected_ms)
+            .ok_or_else(|| AppError::Other("corrected-audio adjustment overflow".into()))?;
+        let entry_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO review_compensation_ledger
+                (entry_id, entry_key, policy_version, review_event_id, canonical_work_id,
+                 canonical_identity_kind, reviewer, segment_id, source, compensation_action,
+                 effective_decision, decision_revision, duration_ms, rate_basis_points,
+                 entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
+                 delta_corrected_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18)",
+            params![
+                entry_id,
+                format!("review-event:{review_event_id}"),
+                REVIEW_PAY_POLICY_VERSION,
+                review_event_id,
+                canonical_work_id,
+                identity_kind,
+                reviewer,
+                segment_id,
+                source,
+                compensation_action,
+                effective_decision,
+                decision_revision,
+                duration_ms,
+                basis_points,
+                entitlement,
+                delta,
+                corrected_entitlement_ms,
+                delta_corrected_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn append_review_compensation_reversal_tx(
+        tx: &rusqlite::Transaction<'_>,
+        segment_id: &str,
+        reviewer: &str,
+        operation_id: &str,
+        decision_revision: i64,
+    ) -> AppResult<()> {
+        use rusqlite::OptionalExtension;
+
+        Self::verify_review_pay_policy_tx(tx)?;
+        let (audio_work_id, identity_kind, duration_ms) = Self::compensation_audio_identity_tx(tx, segment_id)?;
+        let reviewer_key = reviewer.trim().to_lowercase();
+        let canonical_work_id = format!("reviewer-work-v1:{}:{reviewer_key}:{audio_work_id}", reviewer_key.len());
+        // Undo reverses THIS decision's exact signed adjustment, not the work's whole current
+        // entitlement. That distinction matters after a genuine re-decision: undoing edit→reject
+        // must restore the prior 100% edit entitlement by reversing the -90% adjustment, not erase
+        // all pay. A zero-delta re-decision must likewise reverse zero rather than reaching past it
+        // to an older nonzero entry.
+        let target: Option<(String, i64, i64)> = tx
+            .query_row(
+                "SELECT entry_id, delta_micro_iqd, delta_corrected_ms
+                   FROM review_compensation_ledger
+                  WHERE policy_version = ?1 AND canonical_work_id = ?2
+                    AND segment_id = ?3 AND reviewer = ?4 COLLATE NOCASE
+                    AND decision_revision = ?5 AND compensation_action <> 'undo'
+                  ORDER BY id DESC LIMIT 1",
+                params![REVIEW_PAY_POLICY_VERSION, canonical_work_id, segment_id, reviewer, decision_revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let reversal_delta = target
+            .as_ref()
+            .map(|(_, delta, _)| delta.checked_neg().ok_or_else(|| AppError::Other("review reversal overflow".into())))
+            .transpose()?
+            .unwrap_or(0);
+        let current_corrected_ms: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(delta_corrected_ms), 0)
+               FROM review_compensation_ledger
+              WHERE policy_version = ?1 AND canonical_work_id = ?2",
+            params![REVIEW_PAY_POLICY_VERSION, canonical_work_id],
+            |row| row.get(0),
+        )?;
+        let reversal_corrected_delta = target
+            .as_ref()
+            .map(|(_, _, delta)| {
+                delta.checked_neg().ok_or_else(|| AppError::Other("corrected-audio reversal overflow".into()))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let corrected_entitlement_ms = current_corrected_ms
+            .checked_add(reversal_corrected_delta)
+            .ok_or_else(|| AppError::Other("corrected-audio reversal balance overflow".into()))?;
+        if corrected_entitlement_ms < 0 {
+            return Err(AppError::Other("corrected-audio reversal would produce a negative entitlement".into()));
+        }
+        let reverses = target.map(|(entry_id, _, _)| entry_id);
+        let entry_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO review_compensation_ledger
+                (entry_id, entry_key, policy_version, canonical_work_id, canonical_identity_kind,
+                 reviewer, segment_id, source, compensation_action, effective_decision,
+                 decision_revision, duration_ms, rate_basis_points, entitlement_micro_iqd,
+                 delta_micro_iqd, corrected_entitlement_ms, delta_corrected_ms,
+                 reverses_entry_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'couch_undo', 'undo', 'undo',
+                     ?8, ?9, 0, 0, ?10, ?11, ?12, ?13)",
+            params![
+                entry_id,
+                format!("undo:{operation_id}"),
+                REVIEW_PAY_POLICY_VERSION,
+                canonical_work_id,
+                identity_kind,
+                reviewer,
+                segment_id,
+                decision_revision,
+                duration_ms,
+                reversal_delta,
+                corrected_entitlement_ms,
+                reversal_corrected_delta,
+                reverses,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Record how a reviewer answered one spot check. The FIRST answer is immutable: a network retry
     /// cannot inflate the score, and a reviewer cannot improve a failed hidden check by submitting a
     /// different answer later. `ON CONFLICT DO NOTHING` still makes a lost-response replay idempotent.
     ///
-    /// Writes ONLY to `spot_checks`. Grading a reviewer must never be able to alter the corpus it
-    /// grades against, so the segment itself is left completely untouched.
+    /// The score, audit event, and compensation consequence share one transaction. Grading never
+    /// alters the corpus row, but losing the pay event after accepting a score would still lose real
+    /// reviewer work and make a dropped-response retry impossible to reconcile.
     pub fn record_spot_check(
         &self,
         segment_id: &str,
@@ -1695,6 +2318,41 @@ impl Database {
         action: &str,
         submitted: &str,
         expected: &str,
+    ) -> AppResult<()> {
+        self.record_spot_check_inner(segment_id, reviewer, action, submitted, expected, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_spot_check_with_operation(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        submitted: &str,
+        expected: &str,
+        operation_id: &str,
+        operation_payload_hash: &str,
+    ) -> AppResult<()> {
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        self.record_spot_check_inner(
+            segment_id,
+            reviewer,
+            action,
+            submitted,
+            expected,
+            Some((operation_id, operation_payload_hash)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_spot_check_inner(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        submitted: &str,
+        expected: &str,
+        operation: Option<(&str, &str)>,
     ) -> AppResult<()> {
         let submitted_nfc = to_nfc(submitted.trim());
         let expected_nfc = to_nfc(expected.trim());
@@ -1704,13 +2362,54 @@ impl Database {
         // used to score as attentive and sort a reject-spammer to the top of the trust report.
         let noticed = action != "reject" && learning_text_key(&submitted_nfc) == learning_text_key(&expected_nfc);
         let cer = crate::wer::compute_cer(&expected_nfc, &submitted_nfc);
-        self.conn.execute(
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "INSERT INTO spot_checks
                  (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(segment_id, reviewer) DO NOTHING",
             params![segment_id, reviewer, action, submitted_nfc, expected_nfc, noticed as i32, cer],
         )?;
+        if changed > 0 {
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+            tx.execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
+                     duration_ms, operation_id, operation_payload_hash)
+                 VALUES (?1, ?2, ?3, ?3, 'couch_spot_check', ?4,
+                         (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?5, ?6)",
+                params![
+                    segment_id,
+                    reviewer,
+                    action,
+                    timestamp_ms,
+                    operation.map(|value| value.0),
+                    operation.map(|value| value.1)
+                ],
+            )?;
+            let event_id = tx.last_insert_rowid();
+            let revision: Option<i64> = tx
+                .query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![segment_id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            Self::append_review_compensation_tx(
+                &tx,
+                event_id,
+                segment_id,
+                reviewer,
+                "couch_spot_check",
+                action,
+                action,
+                revision,
+            )?;
+        }
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         self.track_write()?;
         Ok(())
     }
@@ -1727,10 +2426,7 @@ impl Database {
         )?)
     }
 
-    /// Append one row to the audit trail (Migration v45). Never updates, never deletes.
-    ///
-    /// Best-effort by contract: the caller logs a failure and carries on. Losing an audit row must
-    /// never cost a reviewer their decision — the decision is the work, this is the record of it.
+    /// Append one non-corpus review act (currently skip) and its compensation consequence atomically.
     pub fn record_review_event(
         &self,
         segment_id: &str,
@@ -1739,16 +2435,124 @@ impl Database {
         source: &str,
         timestamp_ms: i64,
     ) -> AppResult<()> {
-        // v56: the event snapshots the clip's length at the moment of the act, because
-        // `reviewed_audio_ms` is the basis the owner PAYS on and must survive the clip later being
-        // deleted — the audit trail always did; the pay metric silently lost the row's duration.
-        self.conn.execute(
-            "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms, duration_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, (SELECT duration_ms FROM speech_segments WHERE id = ?1))",
-            params![segment_id, reviewer, action, source, timestamp_ms],
+        self.record_review_event_inner(segment_id, reviewer, action, source, timestamp_ms, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_event_with_operation(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        source: &str,
+        timestamp_ms: i64,
+        operation_id: &str,
+        operation_payload_hash: &str,
+    ) -> AppResult<()> {
+        self.record_review_event_with_operation_limit(
+            segment_id,
+            reviewer,
+            action,
+            source,
+            timestamp_ms,
+            operation_id,
+            operation_payload_hash,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_event_with_operation_limit(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        source: &str,
+        timestamp_ms: i64,
+        operation_id: &str,
+        operation_payload_hash: &str,
+        action_limit: Option<&ReviewDecisionLimit>,
+    ) -> AppResult<()> {
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        self.record_review_event_inner(
+            segment_id,
+            reviewer,
+            action,
+            source,
+            timestamp_ms,
+            Some((operation_id, operation_payload_hash)),
+            action_limit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_review_event_inner(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        source: &str,
+        timestamp_ms: i64,
+        operation: Option<(&str, &str)>,
+        action_limit: Option<&ReviewDecisionLimit>,
+    ) -> AppResult<()> {
+        if action != "skip" {
+            return Err(AppError::Validation(
+                "record_review_event is restricted to the zero-credit skip audit path".into(),
+            ));
+        }
+        if action_limit.is_some() && source != "couch" {
+            return Err(AppError::Validation("controlled-review limits are valid only for Couch actions".into()));
+        }
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        let tx = if action_limit.is_some() {
+            rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            self.conn.unchecked_transaction()?
+        };
+        if let Some(limit) = action_limit {
+            enforce_review_action_limit_on(&tx, reviewer, limit)?;
+        }
+        tx.execute(
+            "INSERT INTO review_events
+                (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
+                 duration_ms, operation_id, operation_payload_hash)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5,
+                     (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?6, ?7)",
+            params![
+                segment_id,
+                reviewer,
+                action,
+                source,
+                timestamp_ms,
+                operation.map(|value| value.0),
+                operation.map(|value| value.1)
+            ],
         )?;
+        let event_id = tx.last_insert_rowid();
+        let revision: Option<i64> = tx
+            .query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![segment_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Self::append_review_compensation_tx(&tx, event_id, segment_id, reviewer, source, action, action, revision)?;
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         self.track_write()?;
         Ok(())
+    }
+
+    /// Highest durable audit-event identity currently present. A pilot policy records this value
+    /// before links are opened; a value in the future is refused at Couch startup rather than
+    /// silently granting free decisions until the sequence catches up.
+    pub fn max_review_event_id(&self) -> AppResult<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))?)
+    }
+
+    /// Read the controlled-pilot counter with the same event predicate the write transaction uses.
+    /// Unauthorized names and already-overrun history are errors, never ignored rows.
+    pub fn review_decision_progress(&self, limit: &ReviewDecisionLimit) -> AppResult<ReviewDecisionProgress> {
+        review_decision_progress_on(&self.conn, limit)
     }
 
     /// Per-reviewer throughput from the audit trail, busiest first.
@@ -1767,28 +2571,19 @@ impl Database {
     /// would credit somebody for work they explicitly did not do and inflate the one number that says
     /// how fast the corpus is really being reviewed. A WHITELIST, not `action <> 'skip'`: the next
     /// non-decision event added to this trail must not silently re-open the hole.
-    /// Total AUDIO this reviewer has completed, in ms — what the phone shows them as progress, and
-    /// the basis the owner pays on (reviewers are paid per hour of audio reviewed, not per hour at
-    /// the desk).
+    /// Total AUDIO this reviewer has judged, in ms — activity progress only, never money.
     ///
     /// DISTINCT segment_id, so a network retry or a re-decision of the same clip cannot inflate it —
     /// the same reason `ReviewerThroughput::clips` counts distinct. Scoped to ONE reviewer rather
     /// than reusing `reviewer_throughput`, which walks every event of every reviewer: this runs on
     /// each queue fetch from a phone, so it stays a single aggregate.
     pub fn reviewed_audio_ms(&self, reviewer: &str) -> AppResult<i64> {
-        // Audio CORRECTED — the basis the owner pays on at 18,000 IQD/hour, owner-stated 2026-08-21:
-        // "18K per hour of audio corrected, excluding the rejected ones ... the ones that are bad they
-        // reject and they don't get paid." So `reject` is NOT summed: a rejected clip yields no
-        // corrected transcript, which is exactly the reasoning that already excludes `skip`. It also
-        // leaves no money motive to reject-blast — the one action that destroys corpus permanently.
-        // Current owner canon counts a distinct clip after any real review verdict: accept, edit, or
-        // reject. A reject remains excluded from corrected datasets, but the reviewer still listened
-        // to the clip in order to judge it. `skip` is different: it explicitly records no judgement.
-        // Keep payout-policy changes out of this aggregate until they are authorized and implemented
-        // as a versioned ledger rather than silently changing the meaning of an existing counter.
+        // Full activity and payable credit are deliberately separate. Accept/edit/reject all mean the
+        // reviewer judged the clip, so all count here once. The versioned compensation ledger applies
+        // 10%/100%/10%; `skip` is neither activity nor pay.
         // LEFT JOIN + the event's own duration snapshot (v56): an INNER JOIN silently shrank this
-        // total whenever the owner deleted a reviewed clip — real paid work vanishing from the one
-        // number reviewers are paid on. The event's snapshot wins; the live row backfills events
+        // total whenever the owner deleted a reviewed clip — real judged activity vanishing from the
+        // progress history. The event's snapshot wins; the live row backfills events
         // that predate v56; an event whose clip is gone AND predates the snapshot stays 0 rather
         // than invented.
         Ok(self.conn.query_row(
@@ -1796,11 +2591,211 @@ impl Database {
                FROM (SELECT MAX(COALESCE(e.duration_ms, s.duration_ms, 0)) AS d
                        FROM review_events e
                        LEFT JOIN speech_segments s ON s.id = e.segment_id
-                      WHERE e.reviewer = ?1 AND e.action IN ('accept', 'edit')
+                      WHERE e.reviewer = ?1 AND e.action IN ('accept', 'edit', 'reject')
                       GROUP BY e.segment_id)",
             params![reviewer],
             |row| row.get(0),
         )?)
+    }
+
+    /// Exact money projection under the active immutable policy. Legacy events are intentionally
+    /// reported, not repriced: they do not preserve the semantic action needed for the new schedule.
+    pub fn review_compensation_summary(&self, reviewer: &str) -> AppResult<ReviewCompensationSummary> {
+        let (cutoff, base_rate, edit, accept, reject, skip): (i64, i64, i64, i64, i64, i64) = self.conn.query_row(
+            "SELECT effective_after_event_id, base_rate_micro_iqd_per_hour,
+                        edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points
+                   FROM review_compensation_policies WHERE policy_version = ?1",
+            params![REVIEW_PAY_POLICY_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+        if (base_rate, edit, accept, reject, skip)
+            != (
+                REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR,
+                REVIEW_PAY_EDIT_BPS,
+                REVIEW_PAY_ACCEPT_BPS,
+                REVIEW_PAY_REJECT_BPS,
+                REVIEW_PAY_SKIP_BPS,
+            )
+        {
+            return Err(AppError::Other(format!(
+                "review compensation policy row disagrees with certified binary {}",
+                REVIEW_PAY_POLICY_VERSION
+            )));
+        }
+        let earned_micro_iqd: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(delta_micro_iqd), 0)
+               FROM review_compensation_ledger
+              WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE",
+            params![REVIEW_PAY_POLICY_VERSION, reviewer],
+            |row| row.get(0),
+        )?;
+        let legacy_events_pending_reconciliation: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM review_events
+              WHERE id <= ?1 AND reviewer = ?2 COLLATE NOCASE
+                AND action IN ('accept','edit','reject')",
+            params![cutoff, reviewer],
+            |row| row.get(0),
+        )?;
+        let fallback_identity_entries: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM review_compensation_ledger
+              WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE
+                AND canonical_identity_kind = 'segment_id_fallback'",
+            params![REVIEW_PAY_POLICY_VERSION, reviewer],
+            |row| row.get(0),
+        )?;
+        let settled_micro_iqd: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(allocated_micro_iqd), 0)
+               FROM review_compensation_settlements
+              WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE",
+            params![REVIEW_PAY_POLICY_VERSION, reviewer],
+            |row| row.get(0),
+        )?;
+        let outstanding_micro_iqd = earned_micro_iqd
+            .checked_sub(settled_micro_iqd)
+            .ok_or_else(|| AppError::Other("review compensation outstanding balance overflow".into()))?;
+        // Correction time is a first-class signed projection. Keeping it separate from money means
+        // duration repairs, skip audit entries, and later rate changes cannot make an active edit
+        // disappear merely because its monetary balance no longer equals a freshly recomputed value.
+        let (corrected_audio_ms, minimum_work_balance): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(corrected_ms), 0), COALESCE(MIN(corrected_ms), 0)
+               FROM (
+                    SELECT canonical_work_id, SUM(delta_corrected_ms) AS corrected_ms
+                      FROM review_compensation_ledger
+                     WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE
+                     GROUP BY canonical_work_id
+               )",
+            params![REVIEW_PAY_POLICY_VERSION, reviewer],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if minimum_work_balance < 0 || corrected_audio_ms < 0 {
+            return Err(AppError::Other("review compensation corrected-audio ledger has a negative balance".into()));
+        }
+        Ok(ReviewCompensationSummary {
+            policy_version: REVIEW_PAY_POLICY_VERSION.to_string(),
+            earned_micro_iqd,
+            corrected_audio_ms,
+            settled_micro_iqd,
+            outstanding_micro_iqd,
+            legacy_events_pending_reconciliation: usize::try_from(legacy_events_pending_reconciliation)
+                .map_err(|_| AppError::Other("legacy review-event count exceeds usize".into()))?,
+            fallback_identity_entries: usize::try_from(fallback_identity_entries)
+                .map_err(|_| AppError::Other("fallback identity count exceeds usize".into()))?,
+        })
+    }
+
+    /// Allocate the next contiguous ledger interval to one immutable external payout reference.
+    ///
+    /// This does not send money. It is the durable exactly-once boundary an owner records only after
+    /// the corresponding external payout/adjustment exists. The database trigger independently
+    /// recomputes the range and amount, so even a future caller bug cannot overlap or forge it.
+    pub fn record_review_compensation_settlement(
+        &self,
+        reviewer: &str,
+        through_ledger_id_inclusive: i64,
+        payout_reference: &str,
+    ) -> AppResult<ReviewCompensationSettlement> {
+        use rusqlite::OptionalExtension;
+
+        let reviewer = reviewer.trim();
+        let payout_reference = payout_reference.trim();
+        if reviewer.is_empty() || payout_reference.is_empty() {
+            return Err(AppError::Validation(
+                "review compensation settlement requires reviewer and payout reference".into(),
+            ));
+        }
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        let tx = self.conn.unchecked_transaction()?;
+        Self::verify_review_pay_policy_tx(&tx)?;
+        // A payout provider can succeed while its HTTP response is lost. Retrying the same durable
+        // reference must return the original allocation, not fail the now-advanced boundary or mint
+        // another settlement. Reusing a reference for different parameters is a hard error.
+        let existing: Option<ReviewCompensationSettlement> = tx
+            .query_row(
+                "SELECT settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                        through_ledger_id_inclusive, allocated_micro_iqd, payout_reference
+                   FROM review_compensation_settlements WHERE payout_reference = ?1",
+                params![payout_reference],
+                |row| {
+                    Ok(ReviewCompensationSettlement {
+                        settlement_id: row.get(0)?,
+                        policy_version: row.get(1)?,
+                        reviewer: row.get(2)?,
+                        from_ledger_id_exclusive: row.get(3)?,
+                        through_ledger_id_inclusive: row.get(4)?,
+                        allocated_micro_iqd: row.get(5)?,
+                        payout_reference: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            tx.rollback()?;
+            self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+            if existing.policy_version == REVIEW_PAY_POLICY_VERSION
+                && existing.reviewer.eq_ignore_ascii_case(reviewer)
+                && existing.through_ledger_id_inclusive == through_ledger_id_inclusive
+            {
+                return Ok(existing);
+            }
+            return Err(AppError::Validation(format!(
+                "payout reference {payout_reference:?} is already bound to a different settlement"
+            )));
+        }
+        let from_ledger_id_exclusive: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(through_ledger_id_inclusive), 0)
+               FROM review_compensation_settlements
+              WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE",
+            params![REVIEW_PAY_POLICY_VERSION, reviewer],
+            |row| row.get(0),
+        )?;
+        if through_ledger_id_inclusive <= from_ledger_id_exclusive {
+            tx.rollback()?;
+            self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+            return Err(AppError::Validation(format!(
+                "settlement boundary {through_ledger_id_inclusive} must exceed prior boundary {from_ledger_id_exclusive}"
+            )));
+        }
+        let (entry_count, allocated_micro_iqd): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(delta_micro_iqd), 0)
+               FROM review_compensation_ledger
+              WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE
+                AND id > ?3 AND id <= ?4",
+            params![REVIEW_PAY_POLICY_VERSION, reviewer, from_ledger_id_exclusive, through_ledger_id_inclusive],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if entry_count == 0 {
+            tx.rollback()?;
+            self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+            return Err(AppError::Validation("settlement range contains no ledger entries for this reviewer".into()));
+        }
+        let settlement_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO review_compensation_settlements
+                (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                 through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                settlement_id,
+                REVIEW_PAY_POLICY_VERSION,
+                reviewer,
+                from_ledger_id_exclusive,
+                through_ledger_id_inclusive,
+                allocated_micro_iqd,
+                payout_reference,
+            ],
+        )?;
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        self.track_write()?;
+        Ok(ReviewCompensationSettlement {
+            settlement_id,
+            policy_version: REVIEW_PAY_POLICY_VERSION.to_string(),
+            reviewer: reviewer.to_string(),
+            from_ledger_id_exclusive,
+            through_ledger_id_inclusive,
+            allocated_micro_iqd,
+            payout_reference: payout_reference.to_string(),
+        })
     }
 
     pub fn reviewer_throughput(&self) -> AppResult<Vec<ReviewerThroughput>> {
@@ -2576,46 +3571,75 @@ impl Database {
         Ok(())
     }
 
-    pub fn restore<P: AsRef<Path>>(&mut self, src: P) -> AppResult<()> {
-        let src_conn = Connection::open(src.as_ref())?;
-        // Verify the SOURCE snapshot is a healthy database BEFORE overwriting the live one, so a corrupt
-        // snapshot fails fast with a clear error instead of part-way through the backup copy.
-        let integrity: String = src_conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-        if integrity.trim() != "ok" {
-            return Err(AppError::Other(format!("snapshot database failed its integrity check: {integrity}")));
+    /// Fully validate, copy, migrate, and integrity-check a restore source in isolation. The returned
+    /// in-memory database is safe to publish; this phase never touches the live connection. Named
+    /// restore uses the split explicitly so its durable cross-file barrier can be written immediately
+    /// before (not before source validation, and not after) the live page swap.
+    pub(crate) fn stage_restore_source<P: AsRef<Path>>(src: P) -> AppResult<Self> {
+        let src_conn = Self::open_immutable_connection(src.as_ref())?;
+        // Validate the complete, description-bound history before overwriting one live page. A lone
+        // high version row is not evidence that its 57 predecessors ran, and restore must not discover
+        // that only after the healthy live database has already been replaced.
+        crate::migrations::validate_applied_history(&src_conn)?;
+
+        // Restore is two-phase. First copy the source into an isolated in-memory database, run the
+        // exact current startup/migration path there, and prove the resulting HEAD database healthy.
+        // Only then copy it over the live connection. Previously an old-but-drifted snapshot could
+        // overwrite the healthy live pages and fail its pending migration afterwards, returning Err
+        // with the library already clobbered.
+        let mut staged = Database::open(":memory:")?;
+        {
+            let backup = backup::Backup::new(&src_conn, &mut staged.conn)?;
+            backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
         }
-        // Forward-compatibility fence: refuse a snapshot whose schema is NEWER than this build supports.
-        // Restore copies the source's pages directly into the live DB, bypassing run_migrations' startup
-        // guard — so without this check, restoring a snapshot made by a newer Cortex Speech would leave
-        // this build silently operating a future schema with stale semantics (the same data-integrity
-        // hazard run_migrations refuses at open). A missing schema_migrations table reads as version 0
-        // (an old/fresh snapshot is safe to restore); a genuine read error propagates.
-        let snap_version: i64 =
-            match src_conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |r| r.get(0)) {
-                Ok(v) => v,
-                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg))) if msg.contains("no such table") => 0,
-                Err(e) => return Err(e.into()),
-            };
-        let max_known = crate::migrations::max_supported_version();
-        if snap_version > max_known {
+        // Run integrity on the isolated copy, not the frozen read-only source. SQLite's FTS5
+        // integrity command may use temporary writes and can report "attempt to write a readonly
+        // database" even when the source bytes are healthy; the copied pages are identical and this
+        // remains strictly before any live mutation.
+        let source_integrity: String = staged.conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if source_integrity.trim() != "ok" {
+            return Err(AppError::Other(format!("snapshot database failed its integrity check: {source_integrity}")));
+        }
+        staged.initialize()?;
+
+        let staged_quick: String = staged.conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if staged_quick.trim() != "ok" {
+            return Err(AppError::Other(format!("staged restore failed quick_check: {staged_quick}")));
+        }
+        let staged_integrity: String = staged.conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if staged_integrity.trim() != "ok" {
+            return Err(AppError::Other(format!("staged restore failed integrity_check: {staged_integrity}")));
+        }
+        let foreign_key_violations: i64 =
+            staged.conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
+        if foreign_key_violations != 0 {
             return Err(AppError::Other(format!(
-                "this snapshot is at schema v{snap_version}, newer than this build supports (v{max_known}) \
-                 — it was created by a newer version of Cortex Speech. Update the app before restoring it. \
-                 Refusing so the current library is not overwritten with a database this build cannot safely read."
+                "staged restore has {foreign_key_violations} foreign-key violation(s)"
             )));
         }
-        let backup = backup::Backup::new(&src_conn, &mut self.conn)?;
-        // Same pacing as `backup`, and for the same reason: a restore is the recovery path, where
-        // 18 minutes of apparent hang is when someone concludes it is broken and interrupts it.
+        let staged_version = crate::migrations::validate_applied_history(&staged.conn)?;
+        let expected_version = crate::migrations::max_supported_version();
+        if staged_version != expected_version {
+            return Err(AppError::Other(format!(
+                "staged restore stopped at schema v{staged_version}; this build requires v{expected_version}"
+            )));
+        }
+
+        Ok(staged)
+    }
+
+    /// Publish a source already proven by [`Self::stage_restore_source`]. SQLite's backup API holds
+    /// the destination transaction until completion, so a copy error rolls the destination back
+    /// instead of exposing a partially-restored database.
+    pub(crate) fn commit_staged_restore(&mut self, staged: &Database) -> AppResult<()> {
+        let backup = backup::Backup::new(&staged.conn, &mut self.conn)?;
         backup.run_to_completion(Self::BACKUP_PAGES_PER_STEP, Self::BACKUP_STEP_PAUSE, None)?;
-        drop(backup); // release the &mut self.conn borrow before re-migrating self
-                      // Bring the restored DB up to the current schema IN PLACE. The newer-schema case was refused
-                      // above, so the source is at an OLDER (or equal) version; without this, a restored old snapshot
-                      // would sit at a stale schema — missing columns/tables a later migration added — and the running
-                      // app (new code) would hit "no such column" errors until the next startup re-migrated it. Equal
-                      // is a no-op; each migration is CREATE/ALTER ... guarded and applied in its own transaction.
-        crate::migrations::run_migrations(self)?;
         Ok(())
+    }
+
+    pub fn restore<P: AsRef<Path>>(&mut self, src: P) -> AppResult<()> {
+        let staged = Self::stage_restore_source(src)?;
+        self.commit_staged_restore(&staged)
     }
 
     pub fn vacuum(&self) -> AppResult<()> {
@@ -4187,10 +5211,15 @@ impl Database {
         previous: &SpeechSegment,
         reviewer: &str,
         expected_revision: i64,
+        operation_id: &str,
     ) -> AppResult<Option<i64>> {
         validate_segment(previous)?;
+        if operation_id.trim().is_empty() {
+            return Err(AppError::Validation("undo requires a durable operation id".into()));
+        }
         let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(previous);
         let verdict_transcript_nfc = previous.verdict_transcript.as_deref().map(to_nfc);
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
         let tx = self.conn.unchecked_transaction()?;
         let changed = tx.execute(
             "UPDATE speech_segments SET
@@ -4296,7 +5325,11 @@ impl Database {
             "INSERT INTO playback_receipts (segment_id, segment_revision, audio_fingerprint, reviewer,                                             session_id, started_at_ms, played_ms, clip_duration_ms,                                             coverage_ratio, policy_version)              SELECT segment_id, ?3, audio_fingerprint, reviewer, session_id, started_at_ms,                     played_ms, clip_duration_ms, coverage_ratio, policy_version              FROM playback_receipts              WHERE segment_id = ?1 AND reviewer IS ?2                AND audio_fingerprint = (SELECT COALESCE(NULLIF(TRIM(COALESCE(audio_fingerprint, '')), ''),                                                          'id:' || id)                                          FROM speech_segments WHERE id = ?1)                AND NOT EXISTS (SELECT 1 FROM playback_receipts p2                                 WHERE p2.segment_id = ?1 AND p2.reviewer IS ?2                                   AND p2.segment_revision = ?3)              ORDER BY coverage_ratio DESC LIMIT 1",
             params![previous.id, reviewer, restored_revision],
         )?;
+        // Corpus undo and money undo are one state transition. A failure to append the signed
+        // reversal rolls the row restore back too; no successful Undo can leave stale payable credit.
+        Self::append_review_compensation_reversal_tx(&tx, &previous.id, reviewer, operation_id, expected_revision)?;
         tx.commit()?;
+        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         self.track_write()?;
         Ok(Some(restored_revision))
     }
@@ -4409,6 +5442,8 @@ impl Database {
             None,
             false,
             None,
+            None,
+            None,
         )?;
         Ok(())
     }
@@ -4461,6 +5496,62 @@ impl Database {
             true,
             // The phone's pay-bearing audit row commits WITH the decision (2026-08-20 hunt).
             Some("couch"),
+            None,
+            None,
+        )
+    }
+
+    /// Production phone write with a client-authored idempotency identity committed in the same
+    /// transaction as verdict, event, and compensation. HTTP retries must use this variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_phone_human_decision_by_at_revision_with_operation(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        annotator: &str,
+        expected_revision: i64,
+        operation_id: &str,
+        operation_payload_hash: &str,
+    ) -> AppResult<Option<i64>> {
+        self.record_phone_human_decision_by_at_revision_with_operation_limit(
+            segment_id,
+            decision,
+            corrected_transcript,
+            annotator,
+            expected_revision,
+            operation_id,
+            operation_payload_hash,
+            None,
+        )
+    }
+
+    /// The controlled-pilot production variant. The limit is checked under an IMMEDIATE SQLite
+    /// transaction before the segment, audit event, or compensation ledger can change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_phone_human_decision_by_at_revision_with_operation_limit(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        annotator: &str,
+        expected_revision: i64,
+        operation_id: &str,
+        operation_payload_hash: &str,
+        decision_limit: Option<&ReviewDecisionLimit>,
+    ) -> AppResult<Option<i64>> {
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        self.record_human_decision_by_with_finalize(
+            segment_id,
+            decision,
+            corrected_transcript,
+            None,
+            Some(annotator),
+            Some(expected_revision),
+            true,
+            Some("couch"),
+            Some((operation_id, operation_payload_hash)),
+            decision_limit,
         )
     }
 
@@ -4485,6 +5576,8 @@ impl Database {
             annotator,
             None,
             true,
+            None,
+            None,
             None,
         )
         .map(|_| ())
@@ -4604,6 +5697,36 @@ impl Database {
             "segment {segment_id}: accept reclassified as edit — the approved text matches none of              this segment's ASR hypotheses, so it is human-authored, not an engine transcript"
         );
         Ok(("edit".to_string(), Some(approved_text)))
+    }
+
+    /// Re-derive the payable phone action from the exact text the Couch surface serves.
+    ///
+    /// The request's button/action is not financial provenance. A client can send `edit` for an NFC
+    /// or whitespace-only rewrite; both are a no-op under the same key that suppresses degenerate
+    /// learning pairs. Classifying again in the database boundary keeps every direct/replayed phone
+    /// call on the 10% accept rate unless the retained words materially changed.
+    fn phone_compensation_action(
+        &self,
+        segment_id: &str,
+        requested: &str,
+        submitted: Option<&str>,
+    ) -> AppResult<String> {
+        match requested {
+            "accept" | "edit" => {
+                let served: String = self.conn.query_row(
+                    "SELECT COALESCE(NULLIF(TRIM(annotated_transcript), ''), raw_transcript)
+                       FROM speech_segments WHERE id = ?1",
+                    [segment_id],
+                    |row| row.get(0),
+                )?;
+                let approved = submitted.unwrap_or(&served);
+                let served_key = learning_text_key(&to_nfc(served.trim()));
+                let approved_key = learning_text_key(&to_nfc(approved.trim()));
+                Ok(if served_key == approved_key { "accept" } else { "edit" }.to_string())
+            }
+            "reject" => Ok("reject".to_string()),
+            other => Err(AppError::Validation(format!("unsupported phone compensation action {other:?}"))),
+        }
     }
 
     /// The stored content fingerprint of a segment's audio, if one has been computed.
@@ -4840,7 +5963,7 @@ impl Database {
         Ok(best.unwrap_or(0.0) >= MIN_PLAYBACK_COVERAGE)
     }
 
-    // Nine parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
+    // Ten parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
     // what verdict, whose text, when, who, at which revision, whether this call finalizes, and which
     // surface audits it). Bundling them into a struct would move the width rather than remove it,
     // and this is a private helper with three call sites — all in this file.
@@ -4861,7 +5984,14 @@ impl Database {
         expected_revision: Option<i64>,
         finalize: bool,
         audit_source: Option<&str>,
+        audit_operation: Option<(&str, &str)>,
+        decision_limit: Option<&ReviewDecisionLimit>,
     ) -> AppResult<Option<i64>> {
+        if decision_limit.is_some() && (audit_source != Some("couch") || annotator.is_none()) {
+            return Err(AppError::Validation(
+                "controlled-review limits are valid only for attributed Couch decisions".into(),
+            ));
+        }
         // `finalize` and `expected_revision` are INDEPENDENT, and conflating them cost real work.
         // Until 2026-08-20 finalize was derived as `expected_revision.is_some()` — a CAS token only
         // the phone supplies — so no desktop decision ever set `verified`. ReviewMode hid it behind a
@@ -4885,6 +6015,15 @@ impl Database {
         // 82681df2: five humans edited it (Rubar, Lamo, Sewa, Rubar, Roza), the sixth pressed
         // Accept, and the row then claimed the champion had written a name and punctuation that
         // appear in none of its four hypotheses.
+        // Pay follows the semantic action against the text actually served. Keep it BEFORE
+        // `authoritative_decision`: that function may reclassify an unchanged accept of earlier
+        // human-authored text to `edit` solely to preserve corpus provenance, which must not turn a
+        // 10% accept into a 100% correction.
+        let compensation_action = if audit_source == Some("couch") {
+            self.phone_compensation_action(segment_id, decision, corrected_transcript)?
+        } else {
+            decision.to_string()
+        };
         let (decision_owned, resolved_text) =
             self.authoritative_decision(segment_id, decision, corrected_transcript)?;
         let decision = decision_owned.as_str();
@@ -5025,7 +6164,20 @@ impl Database {
 
         // The human's verdict, the learning pair, and the audit-ledger row commit together as one
         // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
-        let tx = self.conn.unchecked_transaction()?;
+        // A pilot slot is a cross-connection invariant. BEGIN IMMEDIATE takes SQLite's write
+        // reservation before the counter read, so two reviewers racing decision 20 cannot both see
+        // 19 and commit 20+21. Ordinary writes retain their existing deferred transaction.
+        let tx = if decision_limit.is_some() {
+            rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            self.conn.unchecked_transaction()?
+        };
+        if let Some(limit) = decision_limit {
+            let Some(reviewer) = annotator else {
+                return Err(AppError::Validation("controlled-review decision has no reviewer".into()));
+            };
+            enforce_review_action_limit_on(&tx, reviewer, limit)?;
+        }
         let changed = tx.execute(
             "UPDATE speech_segments
              SET human_decision     = ?2,
@@ -5196,9 +6348,32 @@ impl Database {
                     .unwrap_or(0)
             });
             tx.execute(
-                "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms, duration_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT duration_ms FROM speech_segments WHERE id = ?1))",
-                params![segment_id, who, decision, source, event_ts],
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
+                     duration_ms, operation_id, operation_payload_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                         (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?7, ?8)",
+                params![
+                    segment_id,
+                    who,
+                    decision,
+                    compensation_action,
+                    source,
+                    event_ts,
+                    audit_operation.map(|value| value.0),
+                    audit_operation.map(|value| value.1)
+                ],
+            )?;
+            let event_id = tx.last_insert_rowid();
+            Self::append_review_compensation_tx(
+                &tx,
+                event_id,
+                segment_id,
+                who,
+                source,
+                &compensation_action,
+                decision,
+                Some(decided_revision),
             )?;
         }
 

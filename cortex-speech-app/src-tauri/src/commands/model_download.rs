@@ -1,13 +1,6 @@
-//! Model-download IPC commands — slice 2 of the Week-4 `commands.rs` decomposition.
-//!
-//! Behaviour and command NAMES are unchanged: `commands.rs` re-exports this module
-//! (`pub use model_download::*;`), so `lib.rs`'s invoke_handler still names `commands::models_download`
-//! and the frontend's `invoke('models_download')` is untouched. These are the same functions that
-//! lived in `commands.rs`, only relocated. (The module is named `model_download`, not `models`, to
-//! avoid shadowing the top-level `crate::models` that `commands.rs` still references.)
-//!
-//! `models_download` / `models_download_all` are `async` + `run_blocking`: a multi-hundred-MB HTTP
-//! fetch would otherwise freeze the UI thread. Progress is streamed via `emit_or_log`.
+//! Shipped model-management IPC. The production ASR is the separately provisioned WSL7B champion;
+//! this surface manages only its supporting Silero/CAM++/denoiser artifacts. Optional ASR models
+//! remain available solely to explicit offline diagnostic tools.
 
 use super::{emit_or_log, run_blocking, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::AppState;
@@ -17,29 +10,7 @@ use tauri::State;
 pub fn models_status(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     RATE_LIMITER.check("models_status")?;
     let mm = state.lock_model_manager();
-    Ok(mm.status())
-}
-
-#[tauri::command]
-pub async fn models_download(filename: String, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("models_download")?;
-    let model = crate::models::MODELS
-        .iter()
-        .find(|m| m.filename == filename)
-        .ok_or_else(|| format!("Unknown model filename: {filename}"))?;
-    // Clone the manager (just a models_dir PathBuf) and DROP the AppState lock before the
-    // multi-hundred-MB blocking download, so the model panel's status poll and the readiness /
-    // acoustic-score checks aren't starved on lock_model_manager() for the whole download. The
-    // download itself runs on the blocking pool (run_blocking) so it never freezes the UI thread.
-    // `model` is a &'static ModelInfo (crate::models::MODELS is a const &'static slice), so it moves into
-    // the task freely.
-    let mm = state.lock_model_manager().clone();
-    run_blocking(move || {
-        mm.download_model(model, |progress| {
-            tracing::debug!("Download {} progress: {:.0}%", model.name, progress * 100.0);
-        })
-    })
-    .await
+    Ok(mm.production_status())
 }
 
 #[tauri::command]
@@ -55,8 +26,8 @@ pub async fn models_download_all(
     // run_blocking so it never freezes the UI thread; `missing` borrows `mm` only INSIDE the task.
     let mm = state.lock_model_manager().clone();
     run_blocking(move || {
-        let all_missing_count = mm.missing_models().len();
-        let missing = mm.downloadable_missing_models();
+        let all_missing_count = mm.missing_production_models().len();
+        let missing = mm.downloadable_missing_production_models();
         let total = missing.len();
         let skipped = all_missing_count.saturating_sub(total);
 

@@ -70,7 +70,17 @@ def main() -> None:
     assert "agent_import_reports" in migrations, "agent import reports migration is required"
     assert "agent_stage_events" in migrations, "agent stage event persistence migration is required"
     assert "source_reference_models" in settings, "settings must expose source reference model list"
-    assert "gemini-2.5-flash" in settings, "default source references should include a second Gemini model"
+    settings_production = settings.split("#[cfg(test)]", 1)[0]
+    assert 'pub const ADVISORY_CLOUD_MODEL: &str = "gemini-2.5-pro";' in settings_production, (
+        "the one owner-approved cloud advisor must remain Gemini 2.5 Pro"
+    )
+    assert "fn default_source_reference_models() -> Vec<String>" in settings_production
+    assert "vec![ADVISORY_CLOUD_MODEL.to_string()]" in settings_production, (
+        "source-reference defaults must be the canonical singleton, not a second/fast model"
+    )
+    assert '"gemini-2.5-flash"' not in settings_production, (
+        "Gemini Flash must not re-enter production defaults or runtime policy"
+    )
     assert "sourceReferenceModels" in settings_store, "frontend settings must expose source reference model list"
     assert "get_latest_source_transcript_for_audio" in db, "jury must be able to reuse latest source reference"
     assert "get_source_transcripts_for_audio" in db, "jury must score against all stored source references"
@@ -111,8 +121,8 @@ def main() -> None:
     assert "configured_source_reference_failure_is_fatal_before_chunking" in pipeline, (
         "source-reference fail-closed behavior needs a Rust regression"
     )
-    assert "partial_source_reference_failure_is_fatal_before_chunking" in pipeline, (
-        "partial source-reference failures must not silently downgrade multi-reference evidence"
+    assert "stale_source_reference_failure_is_fatal_before_chunking" in pipeline, (
+        "stale canonical source-reference evidence must fail before chunking"
     )
     assert "refusing to continue with incomplete source-reference evidence" in pipeline, (
         "partial source-reference failures must be explicit before chunking"
@@ -434,7 +444,7 @@ def main() -> None:
         "learning_manifest.json",
         "learning_preferences.jsonl",
         "write_learning_artifacts",
-        "build_dpo_dataset(db)",
+        "build_dpo_dataset_for_segment_ids(db, &selected_segment_ids)",
         "draft_export_includes_self_learning_preference_artifacts",
         "agent_provenance.json",
         "long_file_dossiers.json",
@@ -454,7 +464,8 @@ def main() -> None:
         "list_agent_import_reports(db, Some(agent_import_report_limit))",
         "draft_export_preserves_agent_import_provenance",
         "bundle_path_label",
-        "sanitize_bundle_path_fields",
+        "sanitize_bundle_public_fields",
+        "sensitive_reviewer_identity_key",
         "sanitized_bundle_value",
         '"audioPath" | "transcriptPath" | "originalTranscriptPath" | "file"',
         '"audioPaths"',

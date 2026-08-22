@@ -9,6 +9,7 @@ fixtures, so a regression of either fails here rather than on a reviewer's phone
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -24,6 +25,7 @@ from check_reviewer_queues_live import (  # noqa: E402
     load_roster,
     may_judge,
     source_dialects,
+    wrong_dialect_decisions,
 )
 
 # Plain strings, not r"" — a Python raw string may not END in a backslash, and these fragments all do
@@ -39,6 +41,60 @@ TABLE = [
 # (test_windows_repo_hygiene), and the matcher looks at the KBHP fragment, not the prefix.
 HAWLERI_CLIP = (r"D:\corpora\_batch_remaining\KBHP-EP01_0007.wav", 9000)
 SORANI_CLIP = (r"D:\Kurdish Corpora\sorani\ZarPodcast\2\A1-0050.wav", 7000)
+
+
+def test_wrong_dialect_gate_reads_current_attribution_not_superseded_history() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "queue.db"
+        con = sqlite3.connect(db_path)
+        try:
+            con.executescript(
+                """
+                CREATE TABLE speech_segments (
+                    id TEXT PRIMARY KEY,
+                    audio_path TEXT NOT NULL,
+                    verified INTEGER NOT NULL,
+                    human_decision TEXT,
+                    reviewed_by TEXT
+                );
+                CREATE TABLE review_events (
+                    reviewer TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    action TEXT NOT NULL
+                );
+                """
+            )
+            # Historical Alle edit, now superseded by an unattributed legacy reject: it is neither
+            # current attribution nor downstream training data and must not accuse Alle today.
+            con.execute(
+                "INSERT INTO speech_segments VALUES (?, ?, 1, 'reject', NULL)",
+                ("superseded", HAWLERI_CLIP[0]),
+            )
+            con.execute("INSERT INTO review_events VALUES ('Alle', 'superseded', 'edit')")
+
+            # Current attribution is authoritative. Both a usable accept and an excluded reject are
+            # routing violations when a Sorani-only reviewer judges Hawleri.
+            con.execute(
+                "INSERT INTO speech_segments VALUES (?, ?, 1, 'accept', 'Alle')",
+                ("current-accept", HAWLERI_CLIP[0]),
+            )
+            con.execute(
+                "INSERT INTO speech_segments VALUES (?, ?, 1, 'reject', 'Alle')",
+                ("current-reject", HAWLERI_CLIP[0]),
+            )
+            con.execute(
+                "INSERT INTO speech_segments VALUES (?, ?, 1, 'edit', 'Hawzhin')",
+                ("allowed", HAWLERI_CLIP[0]),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        assert wrong_dialect_decisions(
+            db_path,
+            {"Alle": ["sorani"], "Hawzhin": ["hawleri"]},
+            TABLE,
+        ) == {"Alle": 2}
 
 
 def test_the_real_incident_a_sorani_only_reviewer_with_no_sorani_clips_fails() -> None:
@@ -101,6 +157,8 @@ def test_sorani_hawleri_never_matches_the_sorani_folder() -> None:
     assert dialect_of(r"D:\Kurdish Corpora\sorani-hawleri\KBHP\ep1.wav", TABLE) == "hawleri"
     assert dialect_of(r"D:\Kurdish Corpora\sorani\ZarPodcast\a.wav", TABLE) == "sorani"
     assert dialect_of("D:/Kurdish Corpora/sorani/ZarPodcast/a.wav", TABLE) == "sorani"
+    assert dialect_of(r"d:\KURDISH CORPORA\SORANI\zarpodcast\a.wav", TABLE) == "sorani"
+    assert dialect_of(r"d:\kurdish corpora\SORANI-HAWLERI\kbhp\ep1.wav", TABLE) == "hawleri"
 
 
 def test_a_comment_key_does_not_empty_the_roster() -> None:
@@ -161,6 +219,23 @@ def test_a_roster_key_binds_across_case_and_whitespace_and_duplicates_are_broken
             raise AssertionError("case-colliding keys are one broken file")
         except PolicyBroken:
             pass
+
+
+def test_roster_values_are_normalized_and_unknown_or_empty_dialects_are_broken() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "reviewer_dialects.json").write_text(
+            json.dumps({"Roza": [" Sorani ", "SORANI", "Hawleri"]}), encoding="utf-8"
+        )
+        assert load_roster(Path(tmp)) == {"Roza": ["sorani", "hawleri"]}
+
+    for invalid in ({"Roza": ["soranii"]}, {"Roza": []}):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "reviewer_dialects.json").write_text(json.dumps(invalid), encoding="utf-8")
+            try:
+                load_roster(Path(tmp))
+                raise AssertionError(f"invalid dialect roster must raise PolicyBroken: {invalid!r}")
+            except PolicyBroken:
+                pass
 
 
 def test_nonfinite_json_is_broken_exactly_as_the_server_sees_it() -> None:

@@ -309,6 +309,19 @@ pub(crate) struct Wsl7bResult {
     pub deployment_sha256: String,
 }
 
+fn require_exact_champion_result(
+    result: &Wsl7bResult,
+    expected: &crate::registry::DeploymentIdentity,
+) -> AppResult<()> {
+    if result.model_version_id != expected.model_version_id || result.deployment_sha256 != expected.deployment_sha256 {
+        return Err(AppError::Validation(format!(
+            "{ASR_7B_UNAVAILABLE_TAG}: transcription reply identity {}/{} does not match registry champion {}/{}",
+            result.model_version_id, result.deployment_sha256, expected.model_version_id, expected.deployment_sha256
+        )));
+    }
+    Ok(())
+}
+
 /// The clip's source window from alignment metadata, mirroring the WSL client's rule exactly:
 /// ABSENT alignment = whole file (the file IS the clip); PRESENT but offsetless or inverted = a
 /// clobbered chunk and a hard error — transcribing the whole source as if it were the clip would
@@ -1027,7 +1040,6 @@ fn multi_model_hypothesis_stage(
 #[derive(Debug, Default)]
 pub struct LiveConsent {
     cloud_llm: AtomicBool,
-    cloud_stt: AtomicBool,
     jury_cloud: AtomicBool,
 }
 
@@ -1042,15 +1054,11 @@ impl LiveConsent {
         // SeqCst, not Relaxed: this is a safety stop, and the cost is irrelevant next to a network
         // call. A worker must never read a stale `true` after the user has switched cloud off.
         self.cloud_llm.store(settings.cloud_llm_opt_in, Ordering::SeqCst);
-        self.cloud_stt.store(settings.cloud_stt_opt_in, Ordering::SeqCst);
         self.jury_cloud.store(settings.jury_cloud_opt_in, Ordering::SeqCst);
     }
 
     fn cloud_llm(&self) -> bool {
         self.cloud_llm.load(Ordering::SeqCst)
-    }
-    pub fn cloud_stt(&self) -> bool {
-        self.cloud_stt.load(Ordering::SeqCst)
     }
     fn jury_cloud(&self) -> bool {
         self.jury_cloud.load(Ordering::SeqCst)
@@ -1121,20 +1129,9 @@ impl ProcessingPipeline {
         if !next.cloud_llm_opt_in {
             self.consent.cloud_llm.store(false, Ordering::SeqCst);
         }
-        if !next.cloud_stt_opt_in {
-            self.consent.cloud_stt.store(false, Ordering::SeqCst);
-        }
         if !next.jury_cloud_opt_in {
             self.consent.jury_cloud.store(false, Ordering::SeqCst);
         }
-    }
-
-    /// The shared live-consent handle, for work that runs on a blocking thread and therefore cannot
-    /// hold `AppState`. A long-running upload loop must re-read consent per item: withdrawing it is a
-    /// STOP instruction, and a batch that checked once at its start keeps uploading after the user
-    /// has switched cloud off (audit 2026-08-06; the same shape recurred in the Scribe vote batch).
-    pub fn consent_handle(&self) -> Arc<LiveConsent> {
-        Arc::clone(&self.consent)
     }
 
     pub fn update_settings(&mut self, settings: AppSettings) {
@@ -1262,8 +1259,8 @@ impl ProcessingPipeline {
     /// transcripts. Measured gap on identical FLEURS ckb clips: 7.03% CER vs 9.32% (and the app runs
     /// the int8 build, whose own baseline is 21.00%).
     ///
-    /// The smaller engines remain available as EXPLICIT choices (pick CTC300M/CTC1B, or call
-    /// `transcribe_segment_finetuned`) — they are optional extras, never an automatic substitute.
+    /// The desktop trust boundary clamps production to WSL7B. Smaller engines remain available only
+    /// to explicit offline diagnostic/evaluation code, never as an interactive substitute.
     fn should_use_wsl_primary_asr(&self) -> bool {
         self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B
             && resolve_wsl_7b_client(self.settings.external_asr_script_path()).is_some()
@@ -1347,8 +1344,7 @@ impl ProcessingPipeline {
         AppError::Validation(format!(
             "{ASR_7B_UNAVAILABLE_TAG}: OmniASR-7B is selected but the bundled WSL client could not be \
              resolved. Repair/reinstall the app resources (or configure an explicit verified client \
-             path), then retry — or deliberately choose an offline model in Settings. Refusing to \
-             silently downgrade to a smaller model you did not select."
+             path), then retry. Refusing to silently downgrade to a smaller model."
         ))
     }
 
@@ -1368,50 +1364,27 @@ impl ProcessingPipeline {
         self.asr_pool.with_service(&model_dir, &self.asr_config(), f)
     }
 
-    /// Run the permanent gold-set eval end-to-end against the live local ASR engine.
-    ///
-    /// Unlike the model-agnostic [`crate::eval::run_gold_eval`] (which trusts caller
-    /// hypotheses), this loads each gold clip, decodes + resamples it exactly like the
-    /// import path, runs the pooled OmniASR CTC recognizer, and scores the *raw* ASR
-    /// output against the gold reference — the only way a published WER/CER is
-    /// reproducible from audio rather than asserted. Opens its own DB connection so no
-    /// `AppState` lock is held across the (slow) ASR loop.
-    pub fn run_gold_eval_asr(&self, model_id: Option<&str>) -> AppResult<crate::eval::EvalRunResult> {
-        let db = self.open_db()?;
-        let active_id = self.local_asr_model_id();
-        // HONESTY GUARD (true-10 audit 2026-07-09): this entrypoint always transcribes with the
-        // ACTIVE pooled local engine (transcribe_audio_file_raw → with_asr → asr_config), so a
-        // caller-supplied label that names a DIFFERENT engine would persist a mislabeled WER/CER
-        // row. Refuse the mismatch instead of recording it.
-        if let Some(requested) = model_id {
-            if requested != active_id {
-                return Err(AppError::Validation(format!(
-                    "run_gold_eval_asr transcribes with the active local engine '{active_id}', but \
-                     the run was requested under the label '{requested}'. Eval rows are persisted \
-                     under that label, so it must match the engine that actually runs — switch the \
-                     active model or drop the label."
-                )));
-            }
+    /// Run the shipped gold-set eval against the exact registered OmniASR-7B champion. The renderer
+    /// supplies no model label, and every reply is checked against the durable registry identity
+    /// before its text can enter an eval row.
+    pub fn run_gold_eval_asr(&self) -> AppResult<crate::eval::EvalRunResult> {
+        if self.selected_asr_model_size() != crate::settings::AsrModelSize::WSL7B {
+            return Err(AppError::Validation(
+                "Production gold evaluation requires the pinned OmniASR-7B champion; use an explicit offline diagnostic tool for auxiliary engines."
+                    .into(),
+            ));
         }
-        let model_id = active_id.to_string();
+        self.preflight_primary_engine()?;
+        let db = self.open_db()?;
+        let expected =
+            crate::registry::champion_identity(&db, crate::deployment::OMNIASR_7B_FAMILY)?.ok_or_else(|| {
+                AppError::Validation("No registered OmniASR-7B champion is available for evaluation".into())
+            })?;
+        let model_id = expected.model_version_id.clone();
         crate::eval::run_gold_eval_with_transcriber(&db, &model_id, |seg| {
-            self.transcribe_audio_file_raw(&seg.audio_path)
-        })
-    }
-
-    /// Decode an audio file and return the *raw* local-ASR transcript — no LLM
-    /// refinement, no normalization — i.e. the exact hypothesis used for gold WER/CER.
-    pub fn transcribe_audio_file_raw(&self, audio_path: &str) -> AppResult<String> {
-        let (sample_rate, pcm) = audio::decode_to_pcm(audio_path)?;
-        let (_sr, pcm16) = audio::ensure_pcm_16khz(sample_rate, pcm)?;
-        let f32_pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
-        self.with_asr(|asr| {
-            if !asr.is_available() {
-                return Err(AppError::Other("ASR model not loaded".into()));
-            }
-            asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-                .map(|(text, _confidence, _source)| text)
-                .map_err(AppError::Other)
+            let result = self.run_wsl_segment_transcript(&seg.audio_path, None, None)?;
+            require_exact_champion_result(&result, &expected)?;
+            Ok(result.raw_transcript)
         })
     }
 
@@ -1474,8 +1447,7 @@ impl ProcessingPipeline {
     /// Measured 2026-08-10: an import of three files failed 3/3 on exactly that error while
     /// secrets.env held a working OpenRouter key and an EMPTY GEMINI_API_KEY.
     ///
-    /// `secrets.env` via ApiKeys is where every other cloud path already looks (scribe_api_key_if_enabled
-    /// above, the jury, OpenRouter), so this makes the reference transcript agree with the rest of the
+    /// `secrets.env` via ApiKeys is where the jury and OpenRouter paths already look, so this makes the reference transcript agree with the rest of the
     /// crate instead of being the one caller reading a field that is guaranteed empty.
     ///
     /// The in-memory settings field is still honoured as a fallback: within the single session where
@@ -3680,18 +3652,16 @@ impl ProcessingPipeline {
     /// Resolve the embedded fine-tuned MMS-CTC model (`finetuned-mms-ckb/{model.onnx,vocab.json}`)
     /// from the active (user) models dir, then the bundled one. `None` if it is not present.
     fn finetuned_model_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        // The search itself now lives in `models.rs`, because this reasoning had been applied HERE
-        // and not to the identical lookup behind the `transcribe_segment_finetuned` IPC command —
-        // which consequently could not find the model at all. One implementation, two callers.
+        // The search itself lives in `models.rs` so the offline diagnostic/evaluation callers share
+        // one coherent root-selection rule.
         crate::models::finetuned_model_paths()
     }
 
     /// Transcribe one decoded chunk (16 kHz mono i16) with the fine-tuned engine. The fine-tuned
     /// model is trained on short utterances, so a single >~15 s pass can duplicate text — sub-split a
     /// long chunk into balanced ~15 s windows and join the per-window transcripts.
-    // pub(crate): the transcribe_segment_finetuned IPC must share this windowing instead of calling
-    // run_wav2vec2 directly — a single unbounded pass over >15 s audio duplicates text on this model
-    // (true-10 audit 2026-07-09: same engine, two call paths, different quality).
+    // Shared by offline diagnostic/evaluation paths: a single unbounded pass over >15 s audio
+    // duplicates text on this model, so every such path uses the same windowing.
     pub(crate) fn transcribe_chunk_finetuned(onnx: &Path, vocab: &Path, chunk_pcm: &[i16]) -> Result<String, String> {
         const MAX_WIN: usize = 15 * 16000;
         let f32_pcm: Vec<f32> = chunk_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
@@ -3785,6 +3755,7 @@ impl ProcessingPipeline {
         }
     }
 
+    /// Explicit offline diagnostic evaluation. This is intentionally not registered as shipped IPC.
     pub fn run_gold_eval_local(&self, model_id: &str) -> AppResult<crate::eval::EvalRunResult> {
         // HONESTY GUARD (true-10 audit 2026-07-09): the eval row is persisted under `model_id`, so
         // the engine that transcribes MUST be derived from that id. Previously this always ran the

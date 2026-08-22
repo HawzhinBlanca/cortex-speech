@@ -65,7 +65,14 @@ pub fn health_check(
     let db_size = info["sizeBytes"].as_i64().unwrap_or(0);
     let uptime = INSTANT.elapsed().as_secs();
     let missing_required = model_mgr.missing_required_model_names_for(&settings.asr_model_size);
-    let missing_optional = model_mgr.missing_optional_model_names();
+    // The shipped health response must not advertise diagnostic ASR artifacts. Report only missing
+    // production support models not already covered by the required Silero list.
+    let missing_optional = model_mgr
+        .missing_production_models()
+        .into_iter()
+        .filter(|model| model.filename != "silero_vad_v4.onnx")
+        .map(|model| model.name)
+        .collect::<Vec<_>>();
     // True-10 audit: the auto-snapshot safety net could silently stop for months (warn-only in a
     // detached thread) and disk exhaustion was checked nowhere. Both are now health signals.
     let snapshot_health = crate::snapshot::snapshot_health();

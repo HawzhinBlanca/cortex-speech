@@ -45,6 +45,11 @@
   "en": {
     "progress": "Clip {n} of {total}",
     "audioDone": "{t} of audio done",
+    "earned": "Earned: {amount}",
+    "paid": "Paid: {amount}",
+    "outstanding": "Due: {amount}",
+    "earlierPayPending": "Earlier reviews pending payment reconciliation: {n}",
+    "accountingUnavailable": "Payment accounting unavailable",
     "accept": "Looks good",
     "bad": "Reject",
     "save": "Save & next",
@@ -74,6 +79,11 @@
   "ckb": {
     "progress": "پارچەی {n} لە {total}",
     "audioDone": "{t} دەنگ تەواو بووە",
+    "earned": "بەدەستهێنراوە: {amount}",
+    "paid": "دراوە: {amount}",
+    "outstanding": "ماوە بۆ پارەدان: {amount}",
+    "earlierPayPending": "پێداچوونەوەکانی پێشوو چاوەڕێی یەکلایی‌کردنەوەی پارەدانن: {n}",
+    "accountingUnavailable": "ژمێریاری پارەدان بەردەست نییە",
     "accept": "دروستە",
     "bad": "ڕەتکردنەوە",
     "save": "پاشەکەوت و دواتر",
@@ -103,6 +113,11 @@
   "source": {
     "progress": "review.progress",
     "audioDone": null,
+    "earned": null,
+    "paid": null,
+    "outstanding": null,
+    "earlierPayPending": null,
+    "accountingUnavailable": null,
     "accept": "review.acceptAsIs",
     "bad": "inbox.reject",
     "save": "review.saveNext",
@@ -187,6 +202,8 @@
   h1 { font-size: 15px; color: var(--brand); }
   #who { font-size: 11px; color: var(--dim); font-weight: 600; }
   #progress { font-size: 12px; color: var(--dim); }
+  #accounting { min-height: 16px; font-size: 11px; color: var(--dim); text-align: center; }
+  #accounting.pending { color: var(--warn); }
   /* The language and text-size controls mirror the desktop `locale-toggle`. Language labels are the
      language's own endonym, so each reads correctly whichever locale is active. */
   .chip { flex: 0 0 auto; padding: 4px 10px; font-size: 11px; font-weight: 600; border-radius: 999px;
@@ -273,6 +290,7 @@
   <button id="textsize" class="chip" type="button" title="A±">A±</button>
   <button id="lang" class="chip" type="button"></button>
 </header>
+<div id="accounting" aria-live="polite" hidden></div>
 <div id="card" hidden>
   <audio id="player" controls preload="auto"></audio>
   <canvas id="wave" aria-hidden="true"></canvas>
@@ -465,9 +483,15 @@
   let doneThisSession = 0;
   // The whole pending backlog as of the last load (R1.5), or 0 from a server that does not send it.
   let pendingTotal = 0;
-  // Total AUDIO this reviewer has completed, from the server (they are paid per hour of audio
-  // reviewed, so this is the number that matters to them). Session counts reset; this does not.
-  let reviewedMs = 0;
+  // Full judged-audio progress and weighted compensation are separate server-owned quantities.
+  // `null` means unknown/unavailable — never turn a failed accounting query into a believable zero.
+  let reviewedMs = null;
+  let correctedMs = null;
+  let earnedMicroIqd = null;
+  let settledMicroIqd = null;
+  let outstandingMicroIqd = null;
+  let legacyPayPending = null;
+  let accountingAvailable = null;
   // Restricted to a dialect that currently has no clips — NOT the same as finishing the corpus.
   let noDialectWork = false;
   function fmtDuration(ms) {
@@ -476,6 +500,52 @@
     const m = Math.floor(s / 60);
     if (m < 60) return `${m}m ${s % 60}s`;
     return `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
+  // Exact integer formatting: the API deliberately sends micro-IQD as a decimal string so a large
+  // lifetime balance cannot be rounded by JavaScript's floating-point Number type.
+  function fmtMicroIqd(value) {
+    try {
+      const amount = BigInt(value);
+      const negative = amount < 0n;
+      const absolute = negative ? -amount : amount;
+      const whole = absolute / 1000000n;
+      const fraction = (absolute % 1000000n).toString().padStart(6, '0').replace(/0+$/, '');
+      const grouped = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      return `${negative ? '-' : ''}${grouped}${fraction ? `.${fraction}` : ''} IQD`;
+    } catch { return '—'; }
+  }
+  function applyAccounting(payload) {
+    if (!payload || payload.accountingAvailable == null) return; // compatible with an older server
+    accountingAvailable = payload.accountingAvailable === true;
+    if (!accountingAvailable) {
+      reviewedMs = null;
+      correctedMs = null;
+      earnedMicroIqd = null;
+      settledMicroIqd = null;
+      outstandingMicroIqd = null;
+      legacyPayPending = null;
+      return;
+    }
+    const measured = Number(payload.reviewedMs);
+    reviewedMs = Number.isFinite(measured) && measured >= 0 ? measured : null;
+    const corrected = Number(payload.correctedMs);
+    correctedMs = Number.isFinite(corrected) && corrected >= 0 ? corrected : null;
+    try {
+      earnedMicroIqd = BigInt(payload.earnedMicroIqd).toString();
+      settledMicroIqd = BigInt(payload.settledMicroIqd).toString();
+      outstandingMicroIqd = BigInt(payload.outstandingMicroIqd).toString();
+      const legacy = Number(payload.legacyEventsPendingReconciliation);
+      if (!Number.isSafeInteger(legacy) || legacy < 0) throw new Error('invalid legacy reconciliation count');
+      legacyPayPending = legacy;
+    } catch {
+      accountingAvailable = false;
+      reviewedMs = null;
+      correctedMs = null;
+      earnedMicroIqd = null;
+      settledMicroIqd = null;
+      outstandingMicroIqd = null;
+      legacyPayPending = null;
+    }
   }
   function renderProgress() {
     // Count against the BACKLOG, not the batch. "Clip 7 of 25" was true of the clips in hand and
@@ -495,8 +565,31 @@
     const thisClip = clipMs ? ` (${fmtDuration(clipMs)})` : '';
     // Clamped: once the batch drains `i` is one PAST the end, and the header read "Clip 26 of 25".
     const pos = queue.length ? t('progress', { n: Math.min(i + 1, total), total }) + thisClip : '';
-    const audio = reviewedMs > 0 ? ` · ${t('audioDone', { t: fmtDuration(reviewedMs) })}` : '';
-    $('progress').textContent = (doneThisSession ? `${pos} · ✓${doneThisSession}` : pos) + audio;
+    const audio = reviewedMs != null && reviewedMs > 0 ? ` · ${t('audioDone', { t: fmtDuration(reviewedMs) })}` : '';
+    const corrected = correctedMs != null && correctedMs > 0 ? ` · ✍ ${fmtDuration(correctedMs)}` : '';
+    $('progress').textContent = (doneThisSession ? `${pos} · ✓${doneThisSession}` : pos) + audio + corrected;
+    // Lifetime earned, externally settled, and still due are different facts. Label all three so a
+    // completed payout can never leave the lifetime total looking like the amount still owed.
+    const accounting = $('accounting');
+    if (accountingAvailable === false) {
+      accounting.textContent = `💰 ${t('accountingUnavailable')}`;
+      accounting.classList.add('pending');
+      accounting.hidden = false;
+    } else if (earnedMicroIqd != null && settledMicroIqd != null && outstandingMicroIqd != null) {
+      const balances = [
+        t('earned', { amount: fmtMicroIqd(earnedMicroIqd) }),
+        t('paid', { amount: fmtMicroIqd(settledMicroIqd) }),
+        t('outstanding', { amount: fmtMicroIqd(outstandingMicroIqd) }),
+      ].join(' · ');
+      const legacy = legacyPayPending > 0 ? ` · ⚠ ${t('earlierPayPending', { n: legacyPayPending })}` : '';
+      accounting.textContent = `💰 ${balances}${legacy}`;
+      accounting.classList.toggle('pending', legacyPayPending > 0);
+      accounting.hidden = false;
+    } else {
+      accounting.textContent = '';
+      accounting.classList.remove('pending');
+      accounting.hidden = true;
+    }
     // Something to take back = the button is reachable, whether or not a card is on screen.
     $('after').hidden = doneThisSession === 0;
   }
@@ -531,7 +624,7 @@
   // get a new link; must survive everything), and the refused-work banner (retracted only when that
   // clip is re-reviewed). Clearing it by guessing wiped the refused banner on the next refetch, and
   // comparing textContent was a fragile stand-in for this variable.
-  let errKind = ''; // '' | 'load' | 'expired' | 'refused'
+  let errKind = ''; // '' | 'load' | 'expired' | 'refused' | 'outbox'
   function showErr(kind, text, withRetry) {
     errKind = kind;
     $('err').hidden = false;
@@ -572,14 +665,217 @@
   // ── unsent decisions, so a dropped request is not a lost decision ───────────
   // Kept in localStorage rather than memory: the most likely way to lose a submit is the reviewer
   // giving up on a frozen page and reloading it. Flushed on load and whenever the phone reconnects.
-  // Safe to replay because the server answers an identical re-submit as already-recorded.
+  // Safe to replay because every operation has a durable UUID and the server treats only an exact
+  // replay of that UUID as success. The UUID is written HERE before the first POST, so a dropped
+  // response, page crash, or process restart cannot turn one human act into two paid decisions.
   // Clips THIS page decided successfully this session. A stale outbox replay of one of these can
   // be refused (its rowVersion predates the re-decision) — that is not lost work, the newer verdict
   // landed, and the refused banner must not say otherwise (2026-08-20 hunt).
   const decidedHere = new Set();
+  // OUTBOX is the one-release legacy ARRAY key. Every current operation owns a different key, so
+  // two tabs can interleave read/write/remove freely without either tab rewriting the other's work.
   const OUTBOX = 'cortex.couch.outbox';
-  const readOutbox = () => { try { return JSON.parse(localStorage.getItem(OUTBOX)) || []; } catch { return []; } };
-  const writeOutbox = (v) => localStorage.setItem(OUTBOX, JSON.stringify(v));
+  const OUTBOX_OPERATION_PREFIX = OUTBOX + '.operation.';
+  const OUTBOX_MIGRATION_LOCK = 'cortex.couch.outbox.migration.v2';
+  const OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const outboxOperationKey = (operationId) => OUTBOX_OPERATION_PREFIX + operationId;
+  function newOperationId() {
+    // `Math.random()` is not an operation identity: collisions here can alias two people's money.
+    // randomUUID is ideal; getRandomValues keeps older embedded WebViews safe without weakening it.
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID();
+    }
+    if (!globalThis.crypto || typeof globalThis.crypto.getRandomValues !== 'function') {
+      throw new Error('secure operation UUID generation is unavailable');
+    }
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0'));
+    return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`;
+  }
+  function showOutboxIdentityFailure() {
+    // Persistent and translated: this is work that exists locally but cannot yet be given a safe
+    // financial identity. Never call it queued/saved and never let a transient toast hide it.
+    showErr('outbox', t('saveFailed', { err: '—' }), false);
+  }
+  // Submission objects are flat today, but sorting their keys makes dedupe independent of JSON
+  // property order. A duplicate UUID with different bytes is corruption/reuse and is never guessed.
+  const stableSubmission = (submission) => JSON.stringify(
+    Object.keys(submission)
+      // JSON storage and the decision wire body both omit undefined object properties. Treating an
+      // explicit `undefined` as different from an absent property made the post-write verification
+      // reject the exact value it had just persisted, even though both serialize identically.
+      .filter((key) => submission[key] !== undefined)
+      .sort()
+      .map((key) => [key, submission[key]])
+  );
+  const sameSubmission = (left, right) => stableSubmission(left) === stableSubmission(right);
+  function decodeOperationRecord(key, raw) {
+    const parsed = JSON.parse(raw);
+    const wrapped = parsed && parsed.version === 1;
+    const submission = wrapped ? parsed.submission : parsed;
+    const operationId = key.slice(OUTBOX_OPERATION_PREFIX.length);
+    if (!submission || typeof submission !== 'object' || Array.isArray(submission)
+        || submission.operationId !== operationId || !OPERATION_ID_PATTERN.test(operationId)) {
+      throw new Error('invalid operation outbox record');
+    }
+    return {
+      submission,
+      queuedAtMs: wrapped && Number.isSafeInteger(parsed.queuedAtMs) ? parsed.queuedAtMs : 0,
+      legacyOrder: wrapped && Number.isSafeInteger(parsed.legacyOrder) ? parsed.legacyOrder : 0,
+    };
+  }
+  function encodeOperationRecord(submission, queuedAtMs, legacyOrder) {
+    return JSON.stringify({ version: 1, queuedAtMs, legacyOrder, submission });
+  }
+  function writeOperationRecord(submission, queuedAtMs, legacyOrder) {
+    if (!submission || !OPERATION_ID_PATTERN.test(submission.operationId || '')) {
+      throw new Error('operation UUID is required');
+    }
+    const key = outboxOperationKey(submission.operationId);
+    const existingRaw = localStorage.getItem(key);
+    if (existingRaw !== null) {
+      const existing = decodeOperationRecord(key, existingRaw).submission;
+      if (!sameSubmission(existing, submission)) {
+        throw new Error('operation UUID is already bound to another decision');
+      }
+      return; // exact record already durable; never rewrite its ordering metadata
+    }
+    localStorage.setItem(key, encodeOperationRecord(submission, queuedAtMs, legacyOrder));
+    const persistedRaw = localStorage.getItem(key);
+    if (persistedRaw === null || !sameSubmission(decodeOperationRecord(key, persistedRaw).submission, submission)) {
+      throw new Error('operation outbox persistence verification failed');
+    }
+  }
+  function readLegacyOutbox() {
+    const raw = localStorage.getItem(OUTBOX);
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error('legacy outbox is not an array');
+    return parsed;
+  }
+  const legacyFingerprint = (items) => JSON.stringify(items.map((item) => stableSubmission(item)));
+  function readOutbox() {
+    const records = new Map(), conflicts = new Set(), unidentified = [];
+    let unreadable = false;
+    const compareRecords = (left, right) => left.queuedAtMs - right.queuedAtMs
+      || left.legacyOrder - right.legacyOrder
+      || left.submission.operationId.localeCompare(right.submission.operationId);
+    const add = (record) => {
+      const operationId = record.submission.operationId;
+      if (conflicts.has(operationId)) return;
+      const existing = records.get(operationId);
+      if (!existing) { records.set(operationId, record); return; }
+      if (!sameSubmission(existing.submission, record.submission)) {
+        records.delete(operationId);
+        conflicts.add(operationId);
+        unreadable = true;
+        return;
+      }
+      if (compareRecords(record, existing) < 0) records.set(operationId, record);
+    };
+    try {
+      const keys = [];
+      for (let index = 0; index < localStorage.length; index++) {
+        const key = localStorage.key(index);
+        if (key && key.startsWith(OUTBOX_OPERATION_PREFIX)) keys.push(key);
+      }
+      keys.sort(); // deterministic snapshot regardless of localStorage's implementation order
+      for (const key of keys) {
+        const raw = localStorage.getItem(key);
+        if (raw !== null) add(decodeOperationRecord(key, raw));
+      }
+      const legacy = readLegacyOutbox();
+      if (legacy) {
+        legacy.forEach((item, legacyOrder) => {
+          if (!item || typeof item !== 'object' || Array.isArray(item) || !item.operationId) {
+            unidentified.push(item || { operationId: null });
+          } else if (!OPERATION_ID_PATTERN.test(item.operationId)) {
+            unreadable = true;
+          } else {
+            add({ submission: item, queuedAtMs: 0, legacyOrder });
+          }
+        });
+      }
+    } catch {
+      unreadable = true;
+    }
+    if (unreadable || conflicts.size) {
+      showOutboxIdentityFailure();
+      unidentified.unshift({ operationId: null }); // stop flush before it can guess around corruption
+    }
+    const identified = [...records.values()].sort(compareRecords).map((record) => record.submission);
+    if (!unidentified.length && errKind === 'outbox') clearErr('outbox');
+    return [...unidentified, ...identified];
+  }
+  function migrateLegacyOutboxLocked(mayAssignIds) {
+    const legacy = readLegacyOutbox();
+    if (legacy === null) return true;
+    if (legacy.some((item) => !item || typeof item !== 'object' || Array.isArray(item))) {
+      throw new Error('legacy outbox contains an invalid item');
+    }
+    let identified = legacy;
+    if (legacy.some((item) => !item.operationId)) {
+      if (!mayAssignIds) return false; // no cross-tab lock: preserve and wait; never mint two IDs
+      identified = legacy.map((item) => item.operationId ? item : { ...item, operationId: newOperationId() });
+      // Identity assignment is persisted as ONE atomic legacy-array value before any per-key copy.
+      // A crash can therefore duplicate the SAME UUID during recovery, never invent a second one.
+      localStorage.setItem(OUTBOX, JSON.stringify(identified));
+      const persisted = readLegacyOutbox();
+      if (!persisted || legacyFingerprint(persisted) !== legacyFingerprint(identified)) {
+        throw new Error('legacy operation identity persistence verification failed');
+      }
+    }
+    identified.forEach((submission, legacyOrder) => {
+      writeOperationRecord(submission, 0, legacyOrder);
+    });
+    // Verify the shared legacy value did not change under an older, non-lock-aware page before
+    // deleting it. If it did, retain both representations; deterministic read dedupe is replay-safe.
+    const current = readLegacyOutbox();
+    if (!current || legacyFingerprint(current) !== legacyFingerprint(identified)) {
+      throw new Error('legacy outbox changed during migration');
+    }
+    localStorage.removeItem(OUTBOX);
+    return localStorage.getItem(OUTBOX) === null;
+  }
+  async function migrateLegacyOutbox() {
+    try {
+      if (localStorage.getItem(OUTBOX) === null) return true;
+      if (navigator.locks && typeof navigator.locks.request === 'function') {
+        return await navigator.locks.request(
+          OUTBOX_MIGRATION_LOCK,
+          { mode: 'exclusive' },
+          () => migrateLegacyOutboxLocked(true),
+        );
+      }
+      // Existing UUIDs can be copied concurrently without ambiguity. A UUID-less legacy array waits
+      // visibly for a modern Web Locks-capable browser instead of risking two tabs minting two IDs.
+      return migrateLegacyOutboxLocked(false);
+    } catch {
+      showOutboxIdentityFailure();
+      return false;
+    }
+  }
+  function queueSubmission(submission) {
+    if (!OPERATION_ID_PATTERN.test(submission.operationId || '')) throw new Error('operation UUID is required');
+    const queued = readOutbox();
+    if (queued.some((item) => !item || !item.operationId)) {
+      throw new Error('existing outbox work needs safe migration');
+    }
+    const existing = queued.find((item) => item && item.operationId === submission.operationId);
+    // Never let a programming error silently mutate the meaning of an already-durable UUID. The
+    // server independently enforces this across browsers/process restarts.
+    if (existing && !sameSubmission(existing, submission)) {
+      throw new Error('operation UUID is already bound to another decision');
+    }
+    if (!existing) writeOperationRecord(submission, Date.now(), 0);
+  }
+  function removeSubmission(operationId) {
+    if (!OPERATION_ID_PATTERN.test(operationId || '')) return;
+    localStorage.removeItem(outboxOperationKey(operationId));
+  }
   // Decisions the server REFUSED on replay. Kept so the reviewer can be told, once, that specific work
   // did not land — silently discarding it after having toasted "Saved" is how a corpus quietly loses
   // human labour nobody can account for afterwards.
@@ -623,7 +919,7 @@
     // Persistent, not a toast: this needs the reviewer to go back and re-do specific clips, and a
     // message that disappears in three seconds cannot ask that. Never overwrites a link-expired
     // verdict — that one needs an action from the reviewer and outranks this.
-    if (errKind === 'expired') return;
+    if (errKind === 'expired' || errKind === 'outbox') return;
     showErr('refused', t('refused', { n }), false);
   }
   // FOLLOW THROUGH ON WHAT THE BANNER ASKS (R4.3). The message says "find those clips and review them
@@ -656,7 +952,11 @@
     }
   }
   async function flushOutboxOnce() {
+    if (!await migrateLegacyOutbox()) { showOutboxIdentityFailure(); return; }
     for (const item of readOutbox()) {
+      // A legacy decision that could not obtain AND persist a secure UUID is real work, but it is not
+      // safe to transmit. Leave it untouched and make the persistent banner above the visible state.
+      if (!item || !item.operationId) { showOutboxIdentityFailure(); return; }
       // Not mine to send. A decision names its author, and flushing someone else's under this cookie
       // would attribute their judgement to this reviewer. Left queued for whoever actually made it.
       // (Items with no author predate this field; sending them is still better than dropping work,
@@ -697,10 +997,10 @@
         // destroyed the one copy of a correction they had already been told was saved. Keep it, and
         // say what happened.
         if (!decidedHere.has(item.id)) noteRefused(item.id);
-        writeOutbox(readOutbox().filter((q) => q.id !== item.id));
+        removeSubmission(item.operationId);
         continue;
       }
-      writeOutbox(readOutbox().filter((q) => q.id !== item.id));
+      removeSubmission(item.operationId);
       // A SKIP is not a landing, so neither of these applies to it — the same rule the online path in
       // decide() follows, and it has to hold here too or the offline route quietly breaks it. Removing
       // the draft would delete a correction the reviewer typed before giving up on the clip: they were
@@ -836,8 +1136,7 @@
       // progress line falls back to per-batch counting when it is.
       pendingTotal = Number(res.pendingTotal) || 0;
       noDialectWork = res.noWorkInYourDialect === true;
-      // Absent on an older server -> keep the last known value rather than flashing back to zero.
-      if (res.reviewedMs != null) reviewedMs = Number(res.reviewedMs) || 0;
+      applyAccounting(res);
       // Recomputed on EVERY load: a fetch that brings work back re-arms the refetch, so a reviewer who
       // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.
       exhausted = queue.length === 0;
@@ -918,18 +1217,31 @@
     // heardMs travels WITH the decision: the server mints the receipt for the clip it served, and
     // resolves the revision and audio fingerprint itself, so a client cannot claim to have heard
     // a clip it never loaded.
-    const submission = { id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion,
-                         heardMs: Math.max(0, Math.round(heardMs)),
-                         clipDurationMs: Math.max(0, Math.round((($('player') || {}).duration || 0) * 1000)) };
+    let submission;
+    try {
+      submission = { operationId: newOperationId(), id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion,
+                     pilotAfterReviewEventId: queue[i].pilotAfterReviewEventId,
+                     heardMs: Math.max(0, Math.round(heardMs)),
+                     clipDurationMs: Math.max(0, Math.round((($('player') || {}).duration || 0) * 1000)) };
+      // The durable write MUST precede the first network byte. If localStorage is unavailable/full,
+      // do not submit: a server commit followed by a dropped response would otherwise have no stable
+      // identity to replay, which is exactly the double-pay window this outbox closes.
+      queueSubmission(submission);
+    } catch {
+      // A persistence failure is NOT an offline/queued decision. Stay on the clip, keep the draft,
+      // and never tell the reviewer work is durable when no outbox entry exists.
+      toast(t('saveFailed', { err: '—' }), true);
+      busy = false;
+      btns.forEach(b => b.disabled = false);
+      return;
+    }
     try {
       const saved = await api('/api/decision', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(submission),
       });
-      // The audio total comes back WITH the decision, so the badge moves on every save instead of
-      // only when a batch refills. A reviewer paid per hour of audio watched that number sit still
-      // through twenty clips, which reads as work not being counted. Guarded so an older server that
-      // does not send it leaves the last known value alone rather than flashing back to zero.
-      if (saved && saved.reviewedMs != null) reviewedMs = Number(saved.reviewedMs) || 0;
+      removeSubmission(submission.operationId);
+      // Both judged-audio progress and weighted earnings come back WITH the committed decision.
+      applyAccounting(saved);
       if (!isSkip) {
         sessionStorage.removeItem(draftKey(submission.id));
         clearRefused(submission.id); // re-reviewing a refused clip must retract the warning about it
@@ -958,7 +1270,6 @@
       //   5xx        — the server is unwell, not disagreeing.
       // Held decisions replay on the next working link, so the reviewer can keep going meanwhile.
       if (e.status === undefined || e.status === 401 || e.status === 429 || e.status >= 500) {
-        writeOutbox([...readOutbox().filter((q) => q.id !== submission.id), submission]);
         if (e.status === 401) {
           // Say it once, persistently — a toast about a dead link vanishes before it is understood,
           // and this one needs an action from the reviewer (ask for a new link).
@@ -989,11 +1300,14 @@
         // its author's stamp for the flush that runs when their link is current again, instead of
         // discarding a judgement over a cookie race (2026-08-20 hunt).
         if (e.status === 409 && submission.reviewer && /was made by/.test(e.message || '')) {
-          writeOutbox([...readOutbox().filter((q) => q.id !== submission.id), submission]);
           toast(t('queued'));
           i += 1; show();
           return;
         }
+        // The server gave a final answer about this operation. It did not commit, so retire this UUID;
+        // keeping it would replay a known refusal forever. Retryable/attribution failures returned
+        // above and deliberately leave the exact durable entry intact.
+        removeSubmission(submission.operationId);
         if (e.status === 428) toast(t('mustListen'), true);
         else toast(t('saveFailed', { err: e.status || '—' }), true);
         // The server refused because someone else has this clip (409). Staying here would keep

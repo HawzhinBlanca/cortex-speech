@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "segment_id_count": 8274,
+  "sorted_unique_segment_ids_sha256": "bd5ecab6ee15e2ac15ad247e8fa90e79bf1fc7550ae8fb47db00ee757989528c",
+  "canonicalization": "utf8_sorted_unique_ids_lf_join_final_lf_v1"
+}

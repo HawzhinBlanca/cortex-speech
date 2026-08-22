@@ -49,25 +49,37 @@ def _matching_brace(src: str, opening: int) -> int:
     return -1
 
 
-def test_retranscribe_guards_editor_writes_against_navigation() -> None:
-    """ReviewMode.doRetranscribe(): after the multi-second ASR await, the DB/store write targets the
-    captured seg by id (correct even if the reviewer navigated away), but the editor-state writes
-    (editText/lastLoadedOriginal/draftModels) belong to the CURRENT clip. Without a current-vs-seg
-    recheck, navigating mid-await puts seg's MACHINE text into another clip's editor, and a subsequent
-    Save persists it as that clip's human-verified gold — a wrong-segment gold corruption (THE ONE LAW).
-    The guard `if (current?.id !== seg.id) return;` must sit between the store write and the editor write."""
+def test_retranscribe_uses_authoritative_champion_row_and_guards_editor_writes() -> None:
+    """ReviewMode.doRetranscribe() must use the champion's atomic backend commit, reload that exact row,
+    and only then update the local store. It may never recreate the removed alternative-engine whole-row
+    upsert: that path combined a stale UI snapshot with guessed provenance after a multi-second ASR await.
+
+    The editor state still belongs to the CURRENT clip, so navigation during the awaits requires a
+    current-vs-captured-segment guard between the store update and ``editText``. Without it, one clip's
+    machine draft can be saved as another clip's human gold (THE ONE LAW).
+    """
     body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function doRetranscribe(")
-    store_write = body.find("await api.updateSegment(updated);")
+    champion_call = body.find("await api.transcribeSegment(")
+    authoritative_reload = body.find("await api.getSegment(seg.id)", champion_call)
+    store_write = body.find("segments.update(", authoritative_reload)
     editor_write = body.find("editText = text;")
     guard = body.find("if (current?.id !== seg.id) return;")
-    if store_write == -1 or editor_write == -1:
-        raise AssertionError("doRetranscribe structure changed (store/editor write markers missing) — gate vacuous")
-    if guard == -1 or not (store_write < guard < editor_write):
+    if -1 in (champion_call, authoritative_reload, store_write, guard, editor_write):
         raise AssertionError(
-            "doRetranscribe writes editText without a current-vs-seg guard between the store write and the "
-            "editor write: navigating during the ASR await would put seg's machine text into another clip's "
-            "editor and Save it as that clip's human gold. Add `if (current?.id !== seg.id) return;`."
+            "doRetranscribe must call the champion, reload its authoritative committed row, update the store, "
+            "and then update the editor — one or more source markers are missing"
         )
+    if not (champion_call < authoritative_reload < store_write < guard < editor_write):
+        raise AssertionError(
+            "doRetranscribe must reload/store the champion row before a current-vs-seg guard, and the guard "
+            "must precede editText; otherwise navigation during ASR can put one clip's draft in another editor"
+        )
+    for forbidden in ("api.updateSegment(", "transcribeSegmentFinetuned"):
+        if forbidden in body:
+            raise AssertionError(
+                f"doRetranscribe still contains {forbidden!r}; production re-transcribe must use only the "
+                "champion's atomic backend commit, never a frontend whole-row alternative-engine write"
+            )
 
 
 def test_submit_guards_editor_writes_against_navigation() -> None:
@@ -146,16 +158,16 @@ def test_inbox_undo_bails_while_a_decision_is_in_flight() -> None:
 
 
 def test_app_normalize_uses_freshrow_not_a_stale_spread() -> None:
-    """App.svelte handleNormalize persists a whole-row updateSegment AFTER `await api.normalizeText`. Like
-    every sibling transcribe handler, it must build the row from the FRESH store row by id, never spread the
-    pre-await `{ ...seg }` snapshot — which reverts any verify/edit/align stamp that landed on the segment
-    during the normalize await (the update-segment-whole-row-upsert clobber class)."""
+    """App.svelte handleNormalize persists a whole-row updateSegment AFTER `await api.normalizeText`. It
+    must build the row from the FRESH store row by id, never spread the pre-await `{ ...seg }` snapshot —
+    which reverts any verify/edit/align stamp that landed during the normalize await (the
+    update-segment-whole-row-upsert clobber class)."""
     body = _function_body(_read("src/App.svelte"), "async function handleNormalize(")
     if "$segments.find((s) => s.id === seg.id)" not in body:
         raise AssertionError(
             "handleNormalize spreads a pre-await snapshot into updateSegment instead of the fresh store row "
             "— a concurrent write during the normalize await is silently reverted (whole-row clobber class). "
-            "Use `...($segments.find((s) => s.id === seg.id) ?? seg)` like the transcribe handlers."
+            "Use `...($segments.find((s) => s.id === seg.id) ?? seg)`."
         )
     if "{ ...seg, normalizedTranscript }" in body:
         raise AssertionError("handleNormalize still spreads the stale `{ ...seg }` whole row; use freshRow-by-id")

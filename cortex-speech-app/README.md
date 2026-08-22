@@ -3,13 +3,13 @@
 Desktop app for Kurdish (Sorani) speech transcription, transcript curation, and dataset export.
 Built with **Tauri v2**, **Svelte 5**, and Rust. The quality-first default is the separately
 provisioned local **OmniASR-7B Champion** server under WSL and fails closed when it is unavailable;
-the bundled **Meta OmniASR CTC 300M** engine via sherpa-onnx is an explicit fallback selection.
+smaller CTC/MMS engines are explicit offline diagnostics and are not selectable production fallbacks.
 
 ## Production features
 
 | Feature | Details |
 |---------|---------|
-| **ASR engines** | WSL OmniASR-7B Champion by default; pooled bundled CTC 300M fallback |
+| **Production ASR** | WSL OmniASR-7B Champion only; unavailable means a hard stop |
 | **Streaming decode** | 90s windows for long files - no full 2hr load into RAM |
 | **Background jobs** | Import, single-file open, batch transcribe - UI stays responsive |
 | **VAD chunking** | Podcasts/audiobooks -> many annotatable segments |
@@ -55,16 +55,16 @@ All audio is resampled to 16 kHz mono PCM for ASR and VAD.
 # Install frontend dependencies
 npm install
 
-# Fetch + SHA-256-verify the ONNX models into src-tauri/models/ (required to build from source,
-# since the models are gitignored). Skips files already present + verified. See Model Placement.
+# Fetch + SHA-256-verify required VAD/ONNX Runtime support into src-tauri/models/.
+# Production ASR remains the external pinned WSL7B champion; no smaller ASR is fetched here.
 npm run fetch-models
 
 # Run in dev mode
 npm run tauri dev
 ```
 
-Verify models are present and unmodified at any time with `npm run verify-models` (offline SHA-256
-check). The release installer already bundles the models, so end users do not run this.
+`npm run verify-models` verifies required support and any optional ASR artifacts already present.
+Absent optional models are healthy; partial or hash-mismatched optional installations fail.
 
 Other useful scripts:
 
@@ -88,22 +88,22 @@ The user-podcast guard requires `-UserPodcastFile` or `CORTEX_USER_PODCAST_FILE`
 
 ## Model Placement
 
-Building from source? The simplest path is **`npm run fetch-models`** (downloads + SHA-256-verifies
-every model into `src-tauri/models/`). The options below cover the bundled, in-app, and manual paths.
+Building from source? **`npm run fetch-models`** provisions only required runtime support. OmniASR-7B
+is served by the pinned WSL deployment and is never silently replaced by a bundled model.
 
 ### From source (recommended) — `npm run fetch-models`
 
-Runs `scripts/fetch_models.py`: downloads the OmniASR archive, Silero VAD, and the ONNX Runtime
-DLLs from their pinned upstreams, verifies each against a pinned SHA-256 (a mismatch is rejected — no
-unverifiable artifact is placed), and writes them to `src-tauri/models/`. Re-run anytime; it skips
-files already present + verified. `npm run verify-models` does the offline integrity check only.
+Runs `scripts/fetch_models.py`: provisions Silero VAD and ONNX Runtime from pinned sources. Optional
+diagnostics require an explicit flag, for example `npm run fetch-models -- --include-optional-asr
+300m`; 1B uses `1b`, while owner-supplied MMS can only be verified with `mms`. Standard CI, release,
+and verify commands pass no optional flag.
 
-### Fine-tuned Kurdish model (optional, embedded) — the **Fine-tuned** button
+### Fine-tuned Kurdish model (explicit offline diagnostic only)
 
 Cortex can run a **fine-tuned MMS-CTC-1B** Sorani model that roughly **halves CER** vs the stock
 OmniASR (~19% vs ~42% on a matched sample — see [docs/EVAL.md](docs/EVAL.md)) and always emits Kurdish
-script. It is an opt-in engine (the per-segment **Fine-tuned** button / `transcribe_segment_finetuned`
-IPC command); the default Transcribe path is unchanged.
+script. It is retained for offline evaluation/diagnostics only; no production per-segment command or
+review button can route dataset work through it.
 
 To enable it, place the int8 ONNX export + vocab at **`src-tauri/models/finetuned-mms-ckb/`**:
 
@@ -116,34 +116,31 @@ models/finetuned-mms-ckb/
 Export from a fine-tuned HF `Wav2Vec2ForCTC` with `CORTEX_FINETUNED_MODEL=<hf-dir>
 CORTEX_FINETUNED_ONNX=<out.onnx> python scripts/export_finetuned_onnx.py`, then int8-quantize
 (`onnxruntime.quantization.quantize_dynamic`). The file is gitignored and **not publicly fetchable**,
-so it is intentionally **excluded from the default bundle** — that keeps hosted CI and the hosted
-release able to build from a fresh checkout with only `npm run fetch-models`. To bundle it into an
-installer, build on a machine that has the file and pass the opt-in override:
+so it is intentionally **excluded from every standard bundle**. An isolated diagnostic build may
+include it only by deliberately passing the diagnostic override:
 
 ```
 npm run tauri build -- --config src-tauri/tauri.finetuned.conf.json
 ```
 
-Without the override (or the file), the installer simply omits this one optional engine and the
-**Fine-tuned** button reports the model is not installed — the stock engines keep working either way.
-At runtime the app resolves the model from the app-data or bundled `models/` dir and degrades
+This override is never referenced by standard CI/release/verify. Without it, the installer omits MMS
+and production drafting remains WSL7B-only.
+Offline diagnostic code resolves the model from the app-data or bundled `models/` dir and degrades
 gracefully when it is absent.
 
 ### Bundled (release installer)
 
-The packaged Windows installer ships the OmniASR weights, Silero VAD, and the ONNX Runtime
-DLLs inside the app — a user who installs the release does **not** need to download anything.
+The packaged Windows installer ships Silero VAD, ONNX Runtime, and the tracked WSL7B client/server
+scripts. It ships no 300M/1B/MMS/Scribe ASR weights. Production requires the separately pinned,
+already-running OmniASR-7B deployment.
 
-### Automatic (in-app, partial)
+### Automatic (in-app support models only)
 
-In the app, open **Settings -> AI Models** and click **Download All**. This fetches **Silero VAD**
-(and other optional models with pinned hashes) into your app-data `models/` directory. The core
-**OmniASR CTC 300M** archive is **not** auto-downloaded yet — its release archive SHA-256 is not
-pinned, and the app refuses to fetch an unverifiable artifact — so install it via **Manual install**
-below or use the bundled release. (Pinning the archive hash to re-enable OmniASR auto-download is
-tracked as a release item.)
+The in-app model manager exposes and downloads only Silero VAD, CAM++ speaker embedding, and the
+denoiser. It never exposes, fetches, or selects 300M/1B/MMS/Scribe ASR artifacts; optional ASR remains
+available only through the explicit offline diagnostic instructions below.
 
-### Manual install
+### Optional 300M diagnostic install
 
 Download the archive from the [sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12.tar.bz2), extract it, and copy these files into **`src-tauri/models/omniasr-ctc-300m/`** (or `%APPDATA%/cortex-speech/models/omniasr-ctc-300m/` at runtime):
 
@@ -184,9 +181,9 @@ Review the Meta Omnilingual ASR license in the upstream bundle before shipping i
 
 Transcription, normalization, search, and export can run entirely on-device. No cloud API is
 required. The default 7B path is not self-provisioning: configure and start the WSL Champion server
-before importing, or explicitly select the bundled CTC engine in Settings.
+before importing. The production Settings UI does not offer a smaller-engine selector.
 
-**Exception:** the app can download **Silero VAD v4** and **Meta OmniASR CTC 300M** over HTTPS on first use (or via the model download UI). Disable network access after those files are cached if you need a fully air-gapped setup.
+**Exception:** the app can download **Silero VAD v4** over HTTPS on first use. Optional CTC artifacts are installed only by explicit diagnostic tooling. Disable network access after required support is cached if you need a fully air-gapped setup.
 
 ## Logging
 

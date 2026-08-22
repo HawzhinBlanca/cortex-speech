@@ -203,15 +203,12 @@ fn build_agentic_readiness(
             "blocked",
             "Gemini API key is not loaded in this session, so source-reference transcription would fail before chunking.",
         ));
-    } else if source_reference_models.len() < 2 {
+    } else if source_reference_models.is_empty() {
         checks.push(readiness_check(
             "source_reference",
             "Whole-file source references",
-            "degraded",
-            format!(
-                "Only {} source-reference model is configured; use at least two models for multi-reference agreement.",
-                source_reference_models.len()
-            ),
+            "blocked",
+            "No owner-approved source-reference model is configured.",
         ));
     } else {
         checks.push(readiness_check(
@@ -784,6 +781,32 @@ pub fn import_audio_file(
                     // leaves the adjudication stage settled (blocked + refresh) rather than stuck
                     // "running". Import already emitted its terminal events before this thread spawned.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        // The import fence is already down and this child uses a dedicated WAL
+                        // connection. Register the entire adjudication/report mutation BEFORE its
+                        // first stage-event write or DB open. A restore that won the same admission
+                        // mutex makes this enrichment stop cleanly; otherwise restore sees the active
+                        // mutation and refuses until the child finishes.
+                        let _mutation = match begin_mutation() {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                emit_or_log(
+                                    &app_clone,
+                                    "pipeline-error",
+                                    serde_json::json!({ "file": &post_import_file, "error": error }),
+                                );
+                                let done_payload = serde_json::json!({
+                                    "total": 1,
+                                    "succeeded": 1,
+                                    "failed": 0,
+                                    "segmentCount": seg_count,
+                                    "segmentIds": segment_ids.clone(),
+                                    "source": "file",
+                                });
+                                emit_or_log(&app_clone, "import-complete", done_payload.clone());
+                                emit_or_log(&app_clone, "pipeline-complete", done_payload);
+                                return;
+                            }
+                        };
                         emit_or_log(&app_clone, "pipeline-phase", serde_json::json!({ "phase": "adjudicating" }));
                         let adjudication_detail = format!("Adjudicating {} imported segment(s)", segment_ids.len());
                         emit_agent_stage_event(
@@ -1057,74 +1080,6 @@ pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, Strin
     health::health_check(&db, &mm, &settings, data_dir.as_deref()).map_err(|e| e.to_string())
 }
 
-/// Decode ONLY a segment's clip window to 16 kHz mono PCM without loading the whole (possibly
-/// multi-hour) source file. Reads just the [source_start_ms, source_end_ms] span via the incremental
-/// window decoder, early-stopping once past the window. Falls back to a whole-file decode when there is
-/// no window (a single-segment file, which is small). Fixes the per-clip fine-tuned re-transcribe
-/// failing with "audio too large to decode in one pass" on long recordings.
-pub(crate) fn decode_finetuned_clip_16k(
-    audio_path: &str,
-    alignment_json: Option<&str>,
-    // ALIGNMENT PRESENT BUT OFFSET-LESS is ambiguous: a legitimately-aligned SINGLE-segment file
-    // carries `{"words":[...]}` with no source offsets (whole-file decode is CORRECT), while a
-    // clobbered CHUNK of a multi-segment source carries the same shape (whole-file decode ships the
-    // entire recording as one "clip" — the true-10 audit's training-data-corruption major, the exact
-    // shape the HF/audio exporters refuse). Only the CALLER can tell them apart, by whether the
-    // source has sibling segments in the DB — so it must say whether whole-file is permitted.
-    allow_whole_file_without_offsets: bool,
-) -> Result<Vec<i16>, String> {
-    let whole_file = || -> Result<Vec<i16>, String> {
-        let (rate, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
-        let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, pcm).map_err(|e| e.to_string())?;
-        Ok(pcm16)
-    };
-    let Some(alignment) = alignment_json.map(str::trim).filter(|a| !a.is_empty()) else {
-        // Truly absent alignment: a single-segment import — whole file is the clip.
-        return whole_file();
-    };
-    let Some(meta) = crate::chunking::SegmentSourceMeta::from_alignment_json(alignment) else {
-        if allow_whole_file_without_offsets {
-            return whole_file();
-        }
-        return Err("alignment_json is present but carries no source offsets (a legacy/clobbered \
-                    word-array blob) on a multi-segment source — refusing the whole-file fallback; \
-                    re-import the file through the current build to regenerate its slice offsets"
-            .to_string());
-    };
-    let start_ms = meta.source_start_ms.max(0);
-    let end_ms = meta.source_end_ms.max(start_ms);
-    let mut native: Vec<i16> = Vec::new();
-    let mut rate = crate::audio::TARGET_SAMPLE_RATE;
-    const CLIP_DONE: &str = "__clip_window_done__";
-    let res = crate::audio::decode_pcm_windows(audio_path, 30_000, |win| {
-        rate = win.sample_rate.max(1);
-        let win_start = win.offset_ms;
-        let dur_ms = (win.pcm.len() as i64 * 1000) / rate as i64;
-        let win_end = win_start + dur_ms;
-        if win_end > start_ms && win_start < end_ms {
-            let a_ms = (start_ms.max(win_start) - win_start).max(0);
-            let b_ms = (end_ms.min(win_end) - win_start).max(0);
-            let a = ((a_ms * rate as i64) / 1000) as usize;
-            let b = (((b_ms * rate as i64) / 1000) as usize).min(win.pcm.len());
-            if b > a {
-                native.extend_from_slice(&win.pcm[a..b]);
-            }
-        }
-        // Past the clip window — stop early rather than decode the rest of a long file (sentinel Err).
-        if win_start >= end_ms {
-            return Err(crate::error::AppError::Other(CLIP_DONE.to_string()));
-        }
-        Ok(())
-    });
-    match res {
-        Ok(()) => {}
-        Err(crate::error::AppError::Other(m)) if m == CLIP_DONE => {}
-        Err(e) => return Err(e.to_string()),
-    }
-    let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, native).map_err(|e| e.to_string())?;
-    Ok(pcm16)
-}
-
 /// One clip to slice out of a source recording during a grouped decode. `end_ms == i64::MAX` means
 /// "to the end of the file" — the whole-file case expressed as a span, so one walk covers both kinds.
 pub(crate) struct ClipSpan {
@@ -1135,8 +1090,8 @@ pub(crate) struct ClipSpan {
 
 /// Decode MANY clips out of ONE source recording in a SINGLE streaming pass.
 ///
-/// `decode_finetuned_clip_16k` walks the file from byte zero to the clip's end. That is right for one
-/// clip and QUADRATIC for a pack: this library keeps 416 verified clips inside a single podcast FLAC,
+/// A per-clip decoder walks the file from byte zero to the clip's end. That is right for one clip and
+/// QUADRATIC for a pack: this library keeps 416 verified clips inside a single podcast FLAC,
 /// so exporting it re-decoded that FLAC 416 times, each walk longer than the last. Measured
 /// 2026-08-18 on the live library: **87 rows in 56 minutes (~36 s/row)**, which puts a full pack in
 /// the hours and makes the challenger loop's "zero manual steps" unreachable in practice.
@@ -1224,37 +1179,6 @@ where
         finish(idx, Vec::new(), rate, &mut on_clip)?;
     }
     Ok(())
-}
-
-/// Resolve the fine-tuned model + vocab paths: `CORTEX_FINETUNED_ONNX`/`CORTEX_FINETUNED_VOCAB`
-/// (dev/testing) or `finetuned-mms-ckb/{model.onnx,vocab.json}` in the active then bundled models dir.
-fn resolve_finetuned_paths() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
-    if let (Ok(o), Ok(v)) = (std::env::var("CORTEX_FINETUNED_ONNX"), std::env::var("CORTEX_FINETUNED_VOCAB")) {
-        return Ok((std::path::PathBuf::from(o), std::path::PathBuf::from(v)));
-    }
-    // EVERY model root, not the all-or-nothing active/bundled pair this used to walk. That pair is
-    // keyed on OmniASR-CTC presence, so a partial copy beside the exe wins the root and orphans the
-    // fine-tuned model even when it is sitting in the full repo models dir — which is exactly what it
-    // did here: this command reported "not found" for a 970 MB model that was present, while the
-    // import path (which had already been fixed) loaded it fine. Same search as `pipeline.rs` now,
-    // because it IS the same function.
-    crate::models::finetuned_model_paths()
-        .ok_or_else(|| "fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})".to_string())
-}
-
-/// P3.4: verify the bundled fine-tuned model's integrity — the DEFINITIVE full model.onnx + vocab.json
-/// SHA-256 (hashes the full ~970 MB, so it is on demand, not per-load). The fast size+vocab guard runs
-/// at every model load. Returns a confirmation string or a mismatch error.
-#[tauri::command]
-pub async fn verify_finetuned_model_integrity() -> Result<String, String> {
-    STRICT_RATE_LIMITER.check("verify_finetuned_model_integrity")?;
-    // SHA-256 over a ~970 MB ONNX — off the main thread. No state needed.
-    run_blocking(move || {
-        let (onnx, vocab) = resolve_finetuned_paths()?;
-        crate::wav2vec2_asr::verify_finetuned_full(&onnx, &vocab)?;
-        Ok(format!("verified: {}", onnx.display()))
-    })
-    .await
 }
 
 /// Record the FIRST failure only, so the reported cause is the one that actually stopped the run.
@@ -1943,12 +1867,47 @@ pub struct EngineStatus {
     pub reason: Option<String>,
 }
 
+/// Renderer-safe registry row. The durable checkpoint path remains backend-only; the UI needs the
+/// content identity and provenance, never a local filesystem location.
+#[derive(serde::Serialize)]
+pub struct ModelVersionSummary {
+    pub id: String,
+    pub family: String,
+    pub model_card_name: Option<String>,
+    pub checkpoint_sha256: String,
+    pub source: String,
+    pub license: String,
+    pub status: String,
+}
+
+impl From<crate::registry::ModelVersion> for ModelVersionSummary {
+    fn from(version: crate::registry::ModelVersion) -> Self {
+        Self {
+            id: version.id,
+            family: version.family,
+            model_card_name: version.model_card_name,
+            checkpoint_sha256: version.checkpoint_sha256,
+            source: version.source,
+            license: version.license,
+            status: version.status,
+        }
+    }
+}
+
 /// The model registry, newest-first within each family — what a registry panel lists.
 #[tauri::command]
-pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<crate::registry::ModelVersion>, String> {
+pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<ModelVersionSummary>, String> {
     RATE_LIMITER.check("list_model_versions")?;
     let db = state.lock_db();
-    crate::registry::list_model_versions(&db).map_err(|e| e.to_string())
+    crate::registry::list_model_versions(&db)
+        .map(|versions| {
+            versions
+                .into_iter()
+                .filter(|version| version.family == crate::deployment::OMNIASR_7B_FAMILY)
+                .map(ModelVersionSummary::from)
+                .collect()
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Import an externally fine-tuned checkpoint into the registry as a gated candidate. The SHA is
@@ -1958,7 +1917,6 @@ pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<crate::regi
 #[tauri::command]
 pub async fn import_model_checkpoint(
     id: String,
-    family: String,
     checkpoint_path: String,
     source: String,
     license: String,
@@ -1967,7 +1925,6 @@ pub async fn import_model_checkpoint(
 ) -> Result<String, String> {
     STRICT_RATE_LIMITER.check("import_model_checkpoint")?;
     validate::validate_identifier(&id)?;
-    validate::validate_identifier(&family)?;
     validate::validate_identifier(&source)?;
     validate::validate_identifier(&license)?;
     if let Some(ref card) = model_card_name {
@@ -1976,6 +1933,9 @@ pub async fn import_model_checkpoint(
     let checkpoint_path = validate::validate_file_path(&checkpoint_path)?;
     let db = state.db_arc();
     run_blocking(move || {
+        // Own the restore fence in the worker itself. Cancelling the async IPC must not detach the
+        // multi-GB hash from the generation it will eventually mutate.
+        let _mutation = begin_mutation()?;
         // Hash the (potentially multi-GB) checkpoint off the main thread AND before taking the DB lock
         // — holding the global db mutex across the full-file SHA-256 would starve every UI DB poll.
         let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
@@ -1983,7 +1943,7 @@ pub async fn import_model_checkpoint(
         crate::registry::register_checkpoint(
             &db,
             &id,
-            &family,
+            crate::deployment::OMNIASR_7B_FAMILY,
             &checkpoint_path,
             &source,
             &license,
@@ -2007,7 +1967,7 @@ pub async fn import_model_deployment(
     license: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<crate::registry::ModelVersion, String> {
+) -> Result<ModelVersionSummary, String> {
     STRICT_RATE_LIMITER.check("import_model_deployment")?;
     validate::validate_identifier(&source)?;
     validate::validate_identifier(&license)?;
@@ -2022,6 +1982,9 @@ pub async fn import_model_deployment(
     }
     let db = state.db_arc();
     run_blocking(move || {
+        // Manifest verification can take ten minutes. It and the final registry write are one
+        // generation-bound mutation, and the guard must outlive cancellation of the async caller.
+        let _mutation = begin_mutation()?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -2050,6 +2013,7 @@ pub async fn import_model_deployment(
         };
         let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::registry::register_verified_deployment_record(&db, &verified, &source, &license)
+            .map(ModelVersionSummary::from)
             .map_err(|error| error.to_string())
     })
     .await
@@ -2066,7 +2030,7 @@ pub async fn bootstrap_legacy_champion(
     license: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<crate::registry::ModelVersion, String> {
+) -> Result<ModelVersionSummary, String> {
     STRICT_RATE_LIMITER.check("bootstrap_legacy_champion")?;
     validate::validate_identifier(&expected_model_id)?;
     validate::validate_identifier(&license)?;
@@ -2082,6 +2046,9 @@ pub async fn bootstrap_legacy_champion(
     let data_dir =
         state.lock_data_dir().clone().ok_or_else(|| "application data directory is unavailable".to_string())?;
     run_blocking(move || {
+        // Champion publication spans external verification, a registry transaction, and an atomic
+        // pointer update. Never allow a restore to split those across database generations.
+        let _mutation = begin_mutation()?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -2109,7 +2076,7 @@ pub async fn bootstrap_legacy_champion(
         let model = crate::registry::bootstrap_verified_legacy_deployment(&db, &verified, &license)
             .map_err(|error| error.to_string())?;
         crate::registry::sync_champion_pointer(&db, &data_dir).map_err(|error| error.to_string())?;
-        Ok(model)
+        Ok(ModelVersionSummary::from(model))
     })
     .await
 }
@@ -2189,47 +2156,422 @@ pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde
     .await
 }
 
-/// P1.3b (audit): set for the whole DB restore (prepare_restore → page swap complete). `writers_active`
-/// is the FENCE (refuse a restore while a writer is already running); this is the RESERVATION (refuse a
-/// NEW writer while a restore is pending). Together they close the check-then-act window where a writer
-/// could start between prepare_restore's `writers_active()` check and the swap.
-pub(crate) static RESTORE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// One admission boundary for every AppState DB lock and every restore reservation. A normal caller
+/// takes `admission` through the point where it owns the DB mutex. A restore takes `admission`, wins
+/// the pending flag with compare-exchange, then keeps the reservation until its DB, history, settings,
+/// and pipeline work is complete. Therefore a caller is ordered either wholly before the mandatory
+/// pre-restore snapshot or after the complete restore; it cannot be stranded in between.
+struct RestoreAdmission {
+    pending: std::sync::atomic::AtomicBool,
+    admission: std::sync::Mutex<RestoreAdmissionState>,
+    complete: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct RestoreAdmissionState {
+    captures_active: usize,
+    mutations_active: usize,
+    generation: u64,
+    phase: RestorePhase,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum RestorePhase {
+    #[default]
+    Idle,
+    ActiveNew,
+    ActiveArmed,
+    Parked,
+}
+
+impl RestoreAdmission {
+    const fn new() -> Self {
+        Self {
+            pending: std::sync::atomic::AtomicBool::new(false),
+            admission: std::sync::Mutex::new(RestoreAdmissionState {
+                captures_active: 0,
+                mutations_active: 0,
+                generation: 0,
+                phase: RestorePhase::Idle,
+            }),
+            complete: std::sync::Condvar::new(),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn try_reserve(&self) -> Result<RestoreReservation<'_>, String> {
+        self.reserve(false)
+    }
+
+    fn claim_recovery(&self) -> Result<RestoreReservation<'_>, String> {
+        self.reserve(true)
+    }
+
+    fn reserve(&self, recovery_required: bool) -> Result<RestoreReservation<'_>, String> {
+        let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match admission.phase {
+            RestorePhase::Idle => {
+                self.pending
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .map_err(|_| "Database restore admission is inconsistent; restart before retrying.".to_string())?;
+                admission.phase = if recovery_required { RestorePhase::ActiveArmed } else { RestorePhase::ActiveNew };
+            }
+            RestorePhase::Parked if recovery_required => {
+                // Exact retry reclaims the parked state; `pending` deliberately stayed true while no
+                // command-local token existed.
+                self.pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                admission.phase = RestorePhase::ActiveArmed;
+            }
+            RestorePhase::Parked => {
+                return Err("An interrupted database restore is recovery-required; retry its exact recorded snapshot."
+                    .to_string());
+            }
+            RestorePhase::ActiveNew | RestorePhase::ActiveArmed => {
+                return Err("A database restore is already in progress — wait for it to finish.".to_string());
+            }
+        }
+        admission.generation = admission.generation.wrapping_add(1);
+        let generation = admission.generation;
+        // Setting pending first prevents a new capture from entering while an already-active capture
+        // drains. The returned token contains only a shared reference, so it remains Send across await.
+        while admission.captures_active > 0 {
+            admission = self.complete.wait(admission).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if admission.mutations_active > 0 {
+            if admission.phase == RestorePhase::ActiveArmed {
+                admission.phase = RestorePhase::Parked;
+                self.pending.store(true, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                admission.phase = RestorePhase::Idle;
+                self.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.complete.notify_all();
+            }
+            return Err(
+                "A database or configuration mutation is already in progress — let it finish before restoring."
+                    .to_string(),
+            );
+        }
+        Ok(RestoreReservation { admission: self, generation })
+    }
+
+    fn begin_capture(&self) -> Result<SnapshotCaptureReservation<'_>, String> {
+        let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_pending() {
+            return Err("snapshot refused because a database restore is reserved/in progress".to_string());
+        }
+        admission.captures_active = admission.captures_active.saturating_add(1);
+        Ok(SnapshotCaptureReservation { admission: self })
+    }
+
+    fn begin_mutation(&self) -> Result<MutationGuard<'_>, String> {
+        let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission.phase != RestorePhase::Idle || self.is_pending() {
+            return Err(RESTORE_IN_PROGRESS_MSG.to_string());
+        }
+        admission.mutations_active = admission.mutations_active.saturating_add(1);
+        Ok(MutationGuard { admission: self })
+    }
+
+    fn lock<'a, T>(&self, mutex: &'a std::sync::Mutex<T>) -> std::sync::LockResult<std::sync::MutexGuard<'a, T>> {
+        let mut admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while self.is_pending() {
+            admission = self.complete.wait(admission).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        // Keep admission until the caller OWNS the DB mutex. Otherwise a caller already queued here
+        // could lose the race to a new reservation, run after its snapshot, and be overwritten.
+        let database = mutex.lock();
+        drop(admission);
+        database
+    }
+}
+
+static RESTORE_ADMISSION: RestoreAdmission = RestoreAdmission::new();
+
+/// Fence a full mutation that can release AppState's DB mutex, write through a dedicated connection,
+/// or change dataset-coupled configuration. The guard must live from before the first read/inference
+/// until after the final DB/config publication.
+pub(crate) fn begin_mutation() -> Result<MutationGuard<'static>, String> {
+    RESTORE_ADMISSION.begin_mutation()
+}
+
+/// Admit one complete rotating/offsite snapshot capture. The returned guard must span DB backup,
+/// config/policy capture, manifest verification, and promotion. A durable marker from a crashed
+/// named restore is a hard stop: capturing that mixed generation would create a plausible-looking
+/// artifact that can never be trusted.
+pub(crate) fn begin_snapshot_capture(primary_data_dir: &Path) -> Result<SnapshotCaptureReservation<'static>, String> {
+    let capture = RESTORE_ADMISSION.begin_capture()?;
+    let pending = primary_data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE);
+    match std::fs::symlink_metadata(&pending) {
+        Ok(_) => Err(format!(
+            "snapshot refused while interrupted restore barrier {} exists; complete or repair that restore first",
+            pending.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(capture),
+        Err(error) => Err(format!("snapshot could not inspect restore barrier {}: {error}", pending.display())),
+    }
+}
+
+/// Send-safe RAII token for a complete snapshot capture. It owns no mutex guard across long I/O.
+pub(crate) struct SnapshotCaptureReservation<'a> {
+    admission: &'a RestoreAdmission,
+}
+
+/// Send-safe full-operation mutation token. Restore admission checks this count after publishing its
+/// pending state, so an existing long operation makes restore fail and a new one cannot start after
+/// restore publication.
+pub(crate) struct MutationGuard<'a> {
+    admission: &'a RestoreAdmission,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.mutations_active = state.mutations_active.saturating_sub(1);
+        self.admission.complete.notify_all();
+    }
+}
+
+impl Drop for SnapshotCaptureReservation<'_> {
+    fn drop(&mut self) {
+        let mut state = self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.captures_active = state.captures_active.saturating_sub(1);
+        self.admission.complete.notify_all();
+    }
+}
 
 /// True while a DB restore is reserved/in progress — consulted by every writer-START path.
 pub(crate) fn restore_pending() -> bool {
-    RESTORE_PENDING.load(std::sync::atomic::Ordering::SeqCst)
+    RESTORE_ADMISSION.is_pending()
+}
+
+/// The only ordinary AppState DB-lock entry point. Both `AppState::lock_db` and its clonable blocking
+/// handle delegate here, so queued foreground writes cannot cross a restore boundary.
+pub(crate) fn lock_app_db<'a>(
+    db: &'a std::sync::Mutex<crate::db::Database>,
+) -> std::sync::LockResult<std::sync::MutexGuard<'a, crate::db::Database>> {
+    RESTORE_ADMISSION.lock(db)
 }
 
 /// The uniform error a writer-start returns while a restore is pending.
 pub(crate) const RESTORE_IN_PROGRESS_MSG: &str =
     "A database restore is in progress — wait for it to finish before starting this operation.";
 
-/// RAII reservation: sets [`RESTORE_PENDING`] on construction, clears it on drop, so the reservation is
-/// released even if the restore errors or panics. Held by db_restore / restore_db_from_snapshot for the
-/// whole restore, and (crucially) dropped on prepare_restore's own early-return if a writer is active.
-pub(crate) struct RestoreReservation;
-impl RestoreReservation {
-    fn new() -> Self {
-        RESTORE_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
-        Self
+/// Exclusive RAII reservation. Drop releases an unarmed restore, but parks an armed named restore so
+/// a surviving durable marker can never reopen ordinary DB/config writes.
+pub(crate) struct RestoreReservation<'a> {
+    admission: &'a RestoreAdmission,
+    generation: u64,
+}
+
+impl RestoreReservation<'_> {
+    /// Prove that this exact reservation still owns its admission boundary. Snapshot helpers accept
+    /// the reservation explicitly instead of consulting process-global state, so tests can exercise
+    /// the production ownership protocol without blocking unrelated parallel tests.
+    pub(crate) fn is_active(&self) -> bool {
+        let state = self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation == self.generation
+            && matches!(state.phase, RestorePhase::ActiveNew | RestorePhase::ActiveArmed)
+    }
+
+    /// Arm fail-closed parking BEFORE attempting the durable marker write. If the write fails cleanly
+    /// the caller may disarm; if it panics or leaves uncertain bytes, Drop parks rather than reopening.
+    fn arm_named_restore(&self) -> Result<(), String> {
+        let mut state = self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != self.generation {
+            return Err("restore reservation lost ownership before durable transaction arm".to_string());
+        }
+        match state.phase {
+            RestorePhase::ActiveNew => {
+                state.phase = RestorePhase::ActiveArmed;
+                Ok(())
+            }
+            RestorePhase::ActiveArmed => Ok(()),
+            RestorePhase::Idle | RestorePhase::Parked => {
+                Err("restore reservation is not active while arming durable transaction".to_string())
+            }
+        }
+    }
+
+    fn disarm_named_restore_if_safe(&self) {
+        let mut state = self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation == self.generation && state.phase == RestorePhase::ActiveArmed {
+            state.phase = RestorePhase::ActiveNew;
+        }
+    }
+
+    fn commit_named_restore(&self) -> Result<(), String> {
+        let mut state = self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != self.generation || state.phase != RestorePhase::ActiveArmed {
+            return Err("restore transaction lost its exclusive admission before commit".to_string());
+        }
+        state.phase = RestorePhase::Idle;
+        self.admission.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.admission.complete.notify_all();
+        Ok(())
     }
 }
-impl Drop for RestoreReservation {
+
+impl Drop for RestoreReservation<'_> {
     fn drop(&mut self) {
-        RESTORE_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut state = self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != self.generation {
+            return;
+        }
+        match state.phase {
+            RestorePhase::ActiveNew => {
+                state.phase = RestorePhase::Idle;
+                self.admission.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.admission.complete.notify_all();
+            }
+            RestorePhase::ActiveArmed => {
+                state.phase = RestorePhase::Parked;
+                tracing::error!(
+                    "named restore remains incomplete; database admission is parked until exact recovery completes"
+                );
+            }
+            RestorePhase::Idle | RestorePhase::Parked => {}
+        }
     }
 }
 
 fn take_mandatory_pre_restore_snapshot(
+    reservation: &RestoreReservation<'_>,
     db: &crate::db::Database,
     data_dir: &Path,
 ) -> Result<std::path::PathBuf, String> {
-    crate::snapshot::take_pinned_snapshot(db, data_dir, "prerestore", 3).map_err(|e| {
-        format!(
-            "Database restore refused because the mandatory pre-restore safety snapshot failed: {e}. \
-             The current library has not been overwritten. Free disk space or fix the destination permissions, then retry."
-        )
-    })
+    crate::snapshot::take_pinned_snapshot_during_restore(reservation, db, data_dir, "prerestore", 3).map_err(
+        |e| {
+            format!(
+                "Database restore refused because the mandatory pre-restore safety snapshot failed: {e}. \
+                 The current library has not been overwritten. Free disk space or fix the destination permissions, then retry."
+            )
+        },
+    )
+}
+
+/// With ONE caller-owned DB mutex guard, pin the current live database and then replace it. Keeping
+/// both operations in this helper prevents a queued write from landing after the safety snapshot and
+/// being silently discarded by the restore.
+fn restore_with_mandatory_snapshot(
+    reservation: &RestoreReservation<'_>,
+    db: &mut crate::db::Database,
+    data_dir: &Path,
+    source: &Path,
+) -> Result<std::path::PathBuf, String> {
+    // Prove and fully migrate the source in isolation first. A bad source creates neither a safety
+    // pin nor a durable review barrier and cannot touch a live page.
+    let staged = crate::db::Database::stage_restore_source(source).map_err(|error| error.to_string())?;
+    let pinned = take_mandatory_pre_restore_snapshot(reservation, db, data_dir)?;
+    tracing::info!("pre-restore snapshot pinned at {}", pinned.display());
+    db.commit_staged_restore(&staged).map_err(|error| error.to_string())?;
+    Ok(pinned)
+}
+
+fn pin_selector(data_dir: &Path, pin: &Path) -> Result<String, String> {
+    let relative = pin
+        .strip_prefix(data_dir.join("snapshots"))
+        .map_err(|_| format!("pre-restore pin {} is outside the snapshot tree", pin.display()))?;
+    let parts = relative
+        .components()
+        .map(|component| component.as_os_str().to_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "pre-restore pin path is not UTF-8".to_string())?;
+    if parts.len() != 2 || parts[0] != "pinned" {
+        return Err(format!("pre-restore pin {} has an unexpected path", pin.display()));
+    }
+    Ok(format!("pinned/{}", parts[1]))
+}
+
+/// Reuse the original safety pin for every retry of an interrupted named restore. Creating a new
+/// `keep=3` pin per retry could evict the only copy of the true pre-restore generation.
+fn begin_named_restore_transaction(
+    reservation: &RestoreReservation<'_>,
+    db: &crate::db::Database,
+    data_dir: &Path,
+    source_selector: &str,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(pending) = load_named_restore_pending(data_dir)? {
+        if let Some(completed) = pending.completed_selector.as_deref() {
+            return Err(format!(
+                "restore generation '{completed}' is already complete; only durable barrier cleanup may run"
+            ));
+        }
+        if pending.source_selector != source_selector {
+            return Err(format!(
+                "an interrupted restore of '{}' is pending; retry that exact snapshot before selecting '{}'",
+                pending.source_selector, source_selector
+            ));
+        }
+        let pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector)?;
+        if !crate::snapshot::verify_snapshot_manifest_for_restore(&pin)? {
+            return Err(
+                "the pending restore's original safety pin is legacy/unverifiable; refusing to continue".to_string()
+            );
+        }
+        tracing::info!("reusing interrupted restore safety pin at {}", pin.display());
+        return Ok(pin);
+    }
+    let pin = take_mandatory_pre_restore_snapshot(reservation, db, data_dir)?;
+    let pending = NamedRestorePending {
+        schema: NAMED_RESTORE_PENDING_SCHEMA,
+        source_selector: source_selector.to_string(),
+        pre_restore_pin_selector: pin_selector(data_dir, &pin)?,
+        completed_selector: None,
+    };
+    // This is the commit boundary: source/config preflight and the safety pin already succeeded;
+    // the durable fail-closed marker lands immediately before the live SQLite page transaction.
+    reservation.arm_named_restore()?;
+    if let Err(error) = write_named_restore_pending(data_dir, &pending) {
+        if !named_restore_barrier_may_exist(data_dir) {
+            reservation.disarm_named_restore_if_safe();
+        }
+        return Err(error);
+    }
+    Ok(pin)
+}
+
+fn prepare_named_restore_artifacts<F>(
+    snapshot_dir: &Path,
+    source: &Path,
+    before_final_verify: F,
+) -> Result<(SnapshotRestorePlan, crate::db::Database), String>
+where
+    F: FnOnce(),
+{
+    let manifest_verified = crate::snapshot::verify_snapshot_manifest_for_restore(snapshot_dir)?;
+    let plan = inspect_snapshot_restore_plan(snapshot_dir, source, manifest_verified)?;
+    let staged = crate::db::Database::stage_restore_source(source).map_err(|error| error.to_string())?;
+    before_final_verify();
+    // Re-hash after BOTH config-plan capture and DB staging. From this point onward commit uses only
+    // owned plan bytes + the staged in-memory DB, so a promoted-source mutation cannot cross the
+    // manifest boundary or create a mixed DB/config generation.
+    let reverified = crate::snapshot::verify_snapshot_manifest_for_restore(snapshot_dir)?;
+    if reverified != manifest_verified {
+        return Err("snapshot manifest presence changed during restore preflight".to_string());
+    }
+    Ok((plan, staged))
+}
+
+fn prepare_and_restore_named_transaction(
+    reservation: &RestoreReservation<'_>,
+    db: &mut crate::db::Database,
+    data_dir: &Path,
+    snapshot_dir: &Path,
+    source: &Path,
+    source_selector: &str,
+) -> Result<SnapshotRestorePlan, String> {
+    let (plan, staged) = prepare_named_restore_artifacts(snapshot_dir, source, || {})?;
+    let _pin = begin_named_restore_transaction(reservation, db, data_dir, source_selector)?;
+    db.commit_staged_restore(&staged).map_err(|error| error.to_string())?;
+    Ok(plan)
 }
 
 /// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
@@ -2237,34 +2579,38 @@ fn take_mandatory_pre_restore_snapshot(
 /// wrong snapshot is itself recoverable (previously only from a ≤10-min rolling snapshot that
 /// rotated out within ~100 minutes). Returns a RestoreReservation the caller MUST hold across the
 /// restore so no new writer can start mid-restore (P1.3b).
-fn prepare_restore(state: &State<'_, AppState>) -> Result<RestoreReservation, String> {
+fn prepare_restore(state: &State<'_, AppState>) -> Result<(RestoreReservation<'static>, std::path::PathBuf), String> {
     // Reserve FIRST: set RESTORE_PENDING before checking writers_active, so a writer racing this check
     // observes the reservation and refuses. THEN verify none is already running (the fence). The
     // reservation is closed by ONE OF TWO airtight mechanisms per writer, NOT a single shared lock:
     //   • import/batch and couch::start check restore_pending() UNDER the same mutex writers_active()
     //     reads (import_state / batch_state / COUCH), so their check+register is totally ordered against
     //     the fence read — a concurrent restore either sees them registered or is seen by them.
-    //   • the atomic-flag writers (WSL refine, Scribe votes, jury via BG_DB_WRITERS) use publish-then-
+    //   • the atomic/counter writers (WSL refine and jury via BG_DB_WRITERS) use publish-then-
     //     recheck: they SET their flag, then RE-READ the reservation and roll back if set. Under SeqCst
     //     the fence's {store RESTORE_PENDING; load flag} and the writer's {store flag; load RESTORE_PENDING}
     //     can't both read stale, so one side always refuses.
-    // If a writer IS already running, the reservation drops on this early return.
-    let reservation = RestoreReservation::new();
-    if state.writers_active() {
-        return Err("A background write is in progress (import, batch, 7B refinement, jury, Scribe \
-                    votes, or the Couch Review server) — cancel it, let it finish, or stop Couch \
-                    Review before restoring. Restoring mid-write would mix pre-restore rows into the \
-                    restored library and re-arm stale undo history."
-            .to_string());
-    }
+    // Resolve only immutable process state before reserving. The race is closed by publishing the
+    // reservation BEFORE writers_active(), not by reading data_dir first.
     let data_dir = state
         .lock_data_dir()
         .clone()
         .ok_or_else(|| "Database restore refused: the app data directory is unavailable, so a mandatory pre-restore safety snapshot cannot be created.".to_string())?;
-    let db = state.lock_db();
-    let pinned = take_mandatory_pre_restore_snapshot(&db, &data_dir)?;
-    tracing::info!("pre-restore snapshot pinned at {}", pinned.display());
-    Ok(reservation)
+    // An earlier post-swap failure parks admission with the durable marker still present. Exact retry
+    // reclaims that state; an ordinary restore can only reserve from Idle.
+    let reservation = if named_restore_barrier_may_exist(&data_dir) {
+        RESTORE_ADMISSION.claim_recovery()?
+    } else {
+        RESTORE_ADMISSION.try_reserve()?
+    };
+    if state.writers_active() {
+        return Err("A background write is in progress (import, batch, 7B refinement, jury, or the \
+                    Couch Review server) — cancel it, let it finish, or stop Couch \
+                    Review before restoring. Restoring mid-write would mix pre-restore rows into the \
+                    restored library and re-arm stale undo history."
+            .to_string());
+    }
+    Ok((reservation, data_dir))
 }
 
 #[tauri::command]
@@ -2275,24 +2621,23 @@ pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), S
     let validated = validate::validate_file_path(&src)?;
     // Hold the reservation across the whole restore: RESTORE_PENDING stays set until this guard drops
     // (after the page swap + history clear), so no new writer can start mid-restore (P1.3b).
-    let _restore_reservation = prepare_restore(&state)?;
-    // Heavy DB file-copy + reopen — off the main thread. The lock is taken INSIDE the task (never
-    // across the await); prepare_restore already refused if writers are active.
-    let db = state.db_arc();
-    let restore_result = run_blocking(move || {
+    let (restore_reservation, data_dir) = prepare_restore(&state)?;
+    refuse_bare_restore_during_controlled_pilot(&data_dir)?;
+    // Heavy snapshot + DB file-copy + reopen run off the main thread under ONE uninterrupted raw DB
+    // mutex guard. Ordinary raw access is not exposed; every other AppState handle is restore-gated.
+    let db = state.db_arc_for_restore();
+    let history = state.history_arc_for_restore();
+    let restore_reservation = run_blocking(move || {
         let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-        guard.restore(&validated).map_err(|e| e.to_string())
+        restore_with_mandatory_snapshot(&restore_reservation, &mut guard, &data_dir, Path::new(&validated))?;
+        // Clear old-row undo commands in the same worker, before its reservation can be dropped. A
+        // cancelled Tauri future detaches spawn_blocking; cleanup after `.await` would then be lost
+        // even though the page publication completed successfully.
+        history.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        Ok(restore_reservation)
     })
-    .await;
-    // The in-memory undo/redo stack holds Commands (DeleteSegments, BatchTranscribe, ...) that
-    // reference rows from the PRE-restore database. Replaying one via Undo after the restore would
-    // apply a stale mutation to a different dataset — resurrecting or corrupting rows. Clear it on ANY
-    // restore attempt that reached the swap: restore() can return Err AFTER the pages were already
-    // copied (e.g. a forward-migration failure post-copy), so clearing only on Ok would leave a stale
-    // Undo able to cross the restore boundary. Clearing on a pre-swap rejection (bad/newer snapshot)
-    // too is harmless — the library is unchanged, only the undo stack resets.
-    state.lock_history().clear();
-    restore_result?;
+    .await?;
+    drop(restore_reservation);
     Ok(())
 }
 
@@ -2361,96 +2706,552 @@ fn preserve_live_asr_runtime_controls(restored: &mut AppSettings, live: &AppSett
     restored.champion_supervision_enabled = live.champion_supervision_enabled;
 }
 
-/// B2: restore the live database from a named auto-snapshot. The name must be a bare
-/// `snapshot_<digits>` component (no separators — cannot traverse), and the snapshot must contain a
-/// DB file. Restore goes through the same SQLite online-backup path as `db_restore`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SnapshotPilotPolicyRestore {
+    Install(Vec<u8>),
+    ExplicitlyAbsent,
+    /// Snapshots made before explicit absence markers preserve the current live policy. This keeps
+    /// historical DB recovery possible without ever interpreting missing legacy state as permission
+    /// to delete/relax a live paid-review cap.
+    PreserveLegacy,
+}
+
+fn refuse_bare_restore_during_controlled_pilot(data_dir: &Path) -> Result<(), String> {
+    match crate::review_pilot::load(data_dir) {
+        Ok(None) => match crate::couch::durable_controlled_pilot_state(data_dir) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(
+                "Bare database restore is refused because the durable Couch session retains a controlled paid-review baseline. Use a policy-bearing named snapshot restore instead."
+                    .to_string(),
+            ),
+            Err(error) => Err(format!(
+                "Bare database restore is refused because durable Couch pilot state is not provably safe: {error}"
+            )),
+        },
+        Ok(Some(_)) => Err(
+            "Bare database restore is refused while a controlled paid-review pilot is active: its external baseline/policy would no longer match review_events. Use a policy-bearing named snapshot restore instead."
+                .to_string(),
+        ),
+        Err(error) => Err(format!(
+            "Bare database restore is refused because controlled paid-review state is not provably safe: {error}"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NamedRestorePending {
+    schema: u32,
+    source_selector: String,
+    pre_restore_pin_selector: String,
+    /// Written only after DB + every required config/settings file has committed. If marker cleanup
+    /// then fails or the process crashes, startup clears the barrier without replaying or rolling
+    /// back an already-coherent generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_selector: Option<String>,
+}
+
+const NAMED_RESTORE_PENDING_SCHEMA: u32 = 2;
+
+fn atomic_write_restore_state(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            return Err(format!("restore destination {} must be a regular file or absent", path.display()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect restore destination {}: {error}", path.display())),
+    }
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("restore-state");
+    let temp = path.with_file_name(format!(".{file_name}.restore-{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    if let Err(error) = std::fs::write(&temp, bytes) {
+        return Err(format!("could not stage {}: {error}", path.display()));
+    }
+    if let Err(error) = crate::atomic_file::replace_file(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("could not atomically install {}: {error}", path.display()));
+    }
+    Ok(())
+}
+
+fn remove_live_restore_state(destination: &Path) -> Result<(), String> {
+    crate::atomic_file::recover_interrupted_replace(destination)
+        .map_err(|error| format!("could not recover {} before explicit removal: {error}", destination.display()))?;
+    // Remove recoverable backups FIRST while the canonical file still exists. If cleanup is blocked
+    // by an antivirus/indexer lock, returning here leaves the old committed state intact; deleting
+    // canonical first could let a leftover backup resurrect it after we had reported absence.
+    crate::atomic_file::remove_replacement_backups(destination)
+        .map_err(|error| format!("could not remove stale backups for {}: {error}", destination.display()))?;
+    match std::fs::remove_file(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not remove {}: {error}", destination.display())),
+    }
+    Ok(())
+}
+
+fn restore_required_snapshot_state_atomic(
+    plan: &[(crate::snapshot::OptionalSnapshotState, crate::snapshot::OptionalSnapshotRestore)],
+    data_dir: &Path,
+) -> Result<(), String> {
+    for (state, action) in plan {
+        if state.live_file == "settings.json" {
+            continue;
+        }
+        let destination = data_dir.join(state.live_file);
+        match action {
+            crate::snapshot::OptionalSnapshotRestore::Install(bytes) => {
+                atomic_write_restore_state(&destination, bytes).map_err(|error| {
+                    format!("required snapshot state {} could not be installed atomically: {error}", state.live_file)
+                })?;
+            }
+            crate::snapshot::OptionalSnapshotRestore::ExplicitlyAbsent => {
+                remove_live_restore_state(&destination).map_err(|error| {
+                    format!("required snapshot state {} could not be made explicitly absent: {error}", state.live_file)
+                })?;
+            }
+            crate::snapshot::OptionalSnapshotRestore::PreserveLegacy => {}
+        }
+    }
+    Ok(())
+}
+
+fn inspect_snapshot_pilot_policy(
+    snapshot_dir: &Path,
+    snapshot_db: &Path,
+    manifest_verified: bool,
+) -> Result<SnapshotPilotPolicyRestore, String> {
+    let policy_path = snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE);
+    let absent_path = snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE);
+    let read_optional = |path: &Path| -> Result<Option<Vec<u8>>, String> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("snapshot state {} is unreadable: {error}", path.display())),
+        }
+    };
+    match (read_optional(&policy_path)?, read_optional(&absent_path)?) {
+        (Some(_), Some(_)) => Err(format!(
+            "snapshot is ambiguous: it contains both {} and {}",
+            crate::review_pilot::REVIEW_PILOT_FILE,
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+        )),
+        (Some(bytes), None) => {
+            if !manifest_verified {
+                return Err(
+                    "policy-bearing named snapshot restore requires a verified manifest that cryptographically binds its database, policy, and exact voice focus"
+                        .to_string(),
+                );
+            }
+            let raw = std::str::from_utf8(&bytes).map_err(|error| {
+                format!("snapshot {} is not UTF-8: {error}", crate::review_pilot::REVIEW_PILOT_FILE)
+            })?;
+            let policy = crate::review_pilot::parse(raw)?;
+            // A policy-bearing artifact is one indivisible DB + policy + exact-focus generation.
+            // This applies equally to manifestless legacy snapshots: preserving or inferring a
+            // missing focus would turn a bounded campaign into a different paid workload.
+            crate::review_pilot::validate_controlled_focus(snapshot_dir)
+                .map_err(|error| format!("snapshot controlled-pilot focus is invalid: {error}"))?;
+            let source = crate::db::Database::open_immutable_connection(snapshot_db)
+                .map_err(|error| format!("snapshot pilot policy could not bind to its database: {error}"))?;
+            let max_event_id: i64 = source
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
+                .map_err(|error| format!("snapshot pilot baseline could not be verified: {error}"))?;
+            if policy.after_review_event_id > max_event_id {
+                return Err(format!(
+                    "snapshot pilot baseline {} is ahead of its database review-event maximum {max_event_id}",
+                    policy.after_review_event_id
+                ));
+            }
+            let mut canonical = serde_json::to_vec_pretty(&policy)
+                .map_err(|error| format!("snapshot pilot policy could not be canonicalized: {error}"))?;
+            canonical.push(b'\n');
+            Ok(SnapshotPilotPolicyRestore::Install(canonical))
+        }
+        (None, Some(marker)) => {
+            if marker != crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES {
+                return Err(format!(
+                    "snapshot {} has invalid contents",
+                    crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+                ));
+            }
+            Ok(SnapshotPilotPolicyRestore::ExplicitlyAbsent)
+        }
+        (None, None) => {
+            if manifest_verified {
+                return Err(format!(
+                    "manifest-bearing snapshot is missing both {} and {}",
+                    crate::review_pilot::REVIEW_PILOT_FILE,
+                    crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+                ));
+            }
+            tracing::warn!(
+                "LEGACY MANIFEST-LESS SNAPSHOT: neither {} nor {} is present; preserving the current live paid-review policy exactly",
+                crate::review_pilot::REVIEW_PILOT_FILE,
+                crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+            );
+            Ok(SnapshotPilotPolicyRestore::PreserveLegacy)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotRestorePlan {
+    pilot: SnapshotPilotPolicyRestore,
+    optional: Vec<(crate::snapshot::OptionalSnapshotState, crate::snapshot::OptionalSnapshotRestore)>,
+}
+
+fn inspect_snapshot_restore_plan(
+    snapshot_dir: &Path,
+    snapshot_db: &Path,
+    manifest_verified: bool,
+) -> Result<SnapshotRestorePlan, String> {
+    let pilot = inspect_snapshot_pilot_policy(snapshot_dir, snapshot_db, manifest_verified)?;
+    let optional = crate::snapshot::OPTIONAL_SNAPSHOT_STATE
+        .iter()
+        .copied()
+        .map(|state| {
+            crate::snapshot::inspect_optional_state_for_restore(snapshot_dir, state, manifest_verified)
+                .map(|action| (state, action))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SnapshotRestorePlan { pilot, optional })
+}
+
+fn load_named_restore_pending(data_dir: &Path) -> Result<Option<NamedRestorePending>, String> {
+    let pending = data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE);
+    crate::atomic_file::recover_interrupted_replace(&pending)
+        .map_err(|error| format!("could not recover the paid-review restore barrier: {error}"))?;
+    let bytes = match std::fs::read(&pending) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not read restore transaction {}: {error}", pending.display())),
+    };
+    let state: NamedRestorePending = serde_json::from_slice(&bytes).map_err(|error| {
+        format!("restore transaction {} is invalid and paid review remains blocked: {error}", pending.display())
+    })?;
+    if !matches!(state.schema, 1 | NAMED_RESTORE_PENDING_SCHEMA) {
+        return Err(format!("unsupported restore transaction schema {}", state.schema));
+    }
+    if state.schema == 1 && state.completed_selector.is_some() {
+        return Err("legacy restore transaction cannot claim a completed generation".to_string());
+    }
+    if let Some(completed) = state.completed_selector.as_deref() {
+        if completed != state.source_selector && completed != state.pre_restore_pin_selector {
+            return Err("restore transaction completion selector is not its target or original pin".to_string());
+        }
+    }
+    Ok(Some(state))
+}
+
+/// Conservatively decide whether dropping a restore command must keep the process-wide admission
+/// fence parked. Invalid/unreadable marker state is recovery-required too: uncertainty can never be
+/// interpreted as permission to resume writes.
+fn named_restore_barrier_may_exist(data_dir: &Path) -> bool {
+    match load_named_restore_pending(data_dir) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::error!("restore barrier is invalid or unreadable; keeping database fenced: {error}");
+            true
+        }
+    }
+}
+
+fn write_named_restore_pending(data_dir: &Path, state: &NamedRestorePending) -> Result<(), String> {
+    if let Some(existing) = load_named_restore_pending(data_dir)? {
+        return (existing == *state).then_some(()).ok_or_else(|| {
+            format!(
+                "another interrupted restore transaction is pending for '{}'; retry that exact snapshot before selecting '{}'",
+                existing.source_selector, state.source_selector
+            )
+        });
+    }
+    let mut bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| format!("could not serialize restore transaction: {error}"))?;
+    bytes.push(b'\n');
+    atomic_write_restore_state(&data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), &bytes)
+}
+
+fn mark_named_restore_completed(data_dir: &Path, completed_selector: &str) -> Result<(), String> {
+    let mut pending = load_named_restore_pending(data_dir)?
+        .ok_or_else(|| "restore completion cannot be recorded because its durable marker is missing".to_string())?;
+    if completed_selector != pending.source_selector && completed_selector != pending.pre_restore_pin_selector {
+        return Err("restore completion selector is not the recorded target or original pin".to_string());
+    }
+    if let Some(existing) = pending.completed_selector.as_deref() {
+        return (existing == completed_selector)
+            .then_some(())
+            .ok_or_else(|| format!("restore was already completed with a different generation '{existing}'"));
+    }
+    pending.schema = NAMED_RESTORE_PENDING_SCHEMA;
+    pending.completed_selector = Some(completed_selector.to_string());
+    let mut bytes = serde_json::to_vec_pretty(&pending)
+        .map_err(|error| format!("could not serialize completed restore transaction: {error}"))?;
+    bytes.push(b'\n');
+    atomic_write_restore_state(&data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), &bytes)
+}
+
+fn apply_snapshot_pilot_policy(plan: &SnapshotPilotPolicyRestore, data_dir: &Path) -> Result<(), String> {
+    let live = data_dir.join(crate::review_pilot::REVIEW_PILOT_FILE);
+    match plan {
+        SnapshotPilotPolicyRestore::Install(bytes) => atomic_write_restore_state(&live, bytes),
+        SnapshotPilotPolicyRestore::ExplicitlyAbsent => remove_live_restore_state(&live)
+            .map_err(|error| format!("could not apply explicit no-pilot snapshot state: {error}")),
+        SnapshotPilotPolicyRestore::PreserveLegacy => Ok(()),
+    }
+}
+
+fn clear_review_pilot_restore_pending(data_dir: &Path) -> Result<(), String> {
+    let pending = data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE);
+    // Canonical marker removal is the FINAL commit point. Backups must disappear first; otherwise a
+    // cleanup failure after canonical removal could let load-time atomic recovery resurrect a barrier
+    // after the in-process admission guard had already been released.
+    crate::atomic_file::remove_replacement_backups(&pending).map_err(|error| {
+        format!("restore completed, but a stale paid-review restore-barrier backup could not be removed: {error}")
+    })?;
+    std::fs::remove_file(&pending).map_err(|error| {
+        format!(
+            "restore completed, but paid review remains fail-closed because {} could not be removed: {error}",
+            pending.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn strict_live_settings_for_restore(path: &Path) -> Result<AppSettings, String> {
+    crate::atomic_file::recover_interrupted_replace(path)
+        .map_err(|error| format!("could not recover live settings before restore: {error}"))?;
+    let mut settings = match std::fs::read(path) {
+        Ok(bytes) => crate::settings::AppSettings::parse_recovery_bytes(&bytes)
+            .map_err(|error| format!("live settings are invalid; restore remains blocked: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AppSettings::default(),
+        Err(error) => return Err(format!("live settings are unreadable; restore remains blocked: {error}")),
+    };
+    settings.enforce_production_canon();
+    Ok(settings)
+}
+
+fn install_snapshot_restore_plan(
+    restore_plan: &SnapshotRestorePlan,
+    data_dir: &Path,
+    live_controls: &AppSettings,
+) -> Result<AppSettings, String> {
+    // Dataset-routing state must agree with the restored DB before paid review can resume. Install
+    // every required file atomically; settings is typed and handled separately so historical cloud
+    // consent and machine routing never touch live disk.
+    restore_required_snapshot_state_atomic(&restore_plan.optional, data_dir)?;
+    apply_snapshot_pilot_policy(&restore_plan.pilot, data_dir)?;
+
+    let settings_action = restore_plan
+        .optional
+        .iter()
+        .find(|(state, _)| state.live_file == "settings.json")
+        .map(|(_, action)| action)
+        .ok_or_else(|| "snapshot restore plan omitted settings state".to_string())?;
+    let mut restored = match settings_action {
+        crate::snapshot::OptionalSnapshotRestore::Install(bytes) => {
+            crate::settings::AppSettings::parse_recovery_bytes(bytes)?
+        }
+        crate::snapshot::OptionalSnapshotRestore::ExplicitlyAbsent => crate::settings::AppSettings::default(),
+        crate::snapshot::OptionalSnapshotRestore::PreserveLegacy => live_controls.clone(),
+    };
+    // Consent and ASR/GPU controls are live operator decisions, never historical dataset state.
+    restored.cloud_llm_opt_in = live_controls.cloud_llm_opt_in;
+    restored.jury_cloud_opt_in = live_controls.jury_cloud_opt_in;
+    preserve_live_asr_runtime_controls(&mut restored, live_controls);
+    restored.enforce_production_canon();
+    let live_settings_path = data_dir.join("settings.json");
+    restored.save(&live_settings_path).map_err(|error| {
+        format!(
+            "snapshot database was restored, but live-control-preserving settings could not be installed; paid review remains blocked: {error}"
+        )
+    })?;
+    Ok(restored)
+}
+
+fn restore_snapshot_generation_offline(
+    data_dir: &Path,
+    selector: &str,
+    live_controls: &AppSettings,
+) -> Result<(), String> {
+    let snapshot_dir = crate::snapshot::resolve_snapshot_dir(data_dir, selector)?;
+    let source = snapshot_dir.join("cortex-speech.db");
+    let source_metadata = std::fs::symlink_metadata(&source)
+        .map_err(|error| format!("snapshot '{selector}' has no readable database file: {error}"))?;
+    if !source_metadata.file_type().is_file() || source_metadata.file_type().is_symlink() {
+        return Err(format!("snapshot '{selector}' has no regular database file"));
+    }
+    let (restore_plan, staged) = prepare_named_restore_artifacts(&snapshot_dir, &source, || {})?;
+    let db_path = data_dir.join("cortex-speech.db");
+    let mut live = crate::db::Database::open_with_retry(db_path.to_string_lossy().as_ref())
+        .map_err(|error| format!("could not open live database for recovery: {error}"))?;
+    live.commit_staged_restore(&staged)
+        .map_err(|error| format!("could not publish recovered database generation: {error}"))?;
+    let integrity =
+        live.integrity_check().map_err(|error| format!("recovered live database could not be verified: {error}"))?;
+    if integrity.trim() != "ok" {
+        return Err(format!("recovered live database failed integrity_check: {integrity}"));
+    }
+    drop(live);
+    install_snapshot_restore_plan(&restore_plan, data_dir, live_controls)?;
+    Ok(())
+}
+
+/// Complete an interrupted cross-file restore before normal startup performs ANY DB/config write,
+/// snapshot, Couch resume, or background work. The intended target is retried first. If that target
+/// cannot be made coherent, the manifest-verified original pre-restore generation is restored in
+/// full. Both paths keep the durable marker until DB + all required config have committed.
+fn recover_interrupted_named_restore_with_admission(
+    data_dir: &Path,
+    admission: &RestoreAdmission,
+) -> Result<bool, String> {
+    let Some(pending) = load_named_restore_pending(data_dir)? else {
+        return Ok(false);
+    };
+    let reservation = admission.claim_recovery()?;
+    if let Some(completed_selector) = pending.completed_selector.as_deref() {
+        // The completion marker is written only after every DB/config/settings leg is durable. Verify
+        // the live DB and typed settings without mutating them, then finish the interrupted marker
+        // cleanup. Never roll back a generation already recorded as coherent merely because its
+        // original source was later moved or pruned.
+        let db_path = data_dir.join("cortex-speech.db");
+        // Stage into writable memory: FTS5's integrity path may use temporary writes and therefore
+        // reports a false "attempt to write a readonly database" against an otherwise healthy file.
+        // The shared staging primitive performs immutable-source copy, full integrity, FK and exact
+        // migration-history validation without touching the live artifact.
+        crate::db::Database::stage_restore_source(&db_path)
+            .map_err(|error| format!("completed restore live database could not be verified: {error}"))?;
+        strict_live_settings_for_restore(&data_dir.join("settings.json"))?;
+        clear_review_pilot_restore_pending(data_dir)?;
+        reservation.commit_named_restore()?;
+        tracing::warn!(
+            "finished durable marker cleanup for already-completed restore '{completed_selector}' before startup"
+        );
+        return Ok(true);
+    }
+    let original_pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector)
+        .map_err(|error| format!("interrupted restore has no usable original safety pin: {error}"))?;
+    if !crate::snapshot::verify_snapshot_manifest_for_restore(&original_pin)? {
+        return Err(
+            "interrupted restore's original safety pin is legacy/unverifiable; refusing normal startup".to_string()
+        );
+    }
+    let original_plan = inspect_snapshot_restore_plan(&original_pin, &original_pin.join("cortex-speech.db"), true)?;
+    if matches!(original_plan.pilot, SnapshotPilotPolicyRestore::PreserveLegacy)
+        || original_plan
+            .optional
+            .iter()
+            .any(|(_, action)| matches!(action, crate::snapshot::OptionalSnapshotRestore::PreserveLegacy))
+    {
+        return Err("interrupted restore's original safety pin does not explicitly bind every required config state"
+            .to_string());
+    }
+
+    let settings_path = data_dir.join("settings.json");
+    let live_controls = strict_live_settings_for_restore(&settings_path)?;
+    let target_result = restore_snapshot_generation_offline(data_dir, &pending.source_selector, &live_controls);
+    let completed_selector = match target_result {
+        Ok(()) => pending.source_selector.clone(),
+        Err(target_error) => {
+            tracing::error!(
+                "interrupted target restore '{}' could not complete ({target_error}); rolling back verified original '{}'",
+                pending.source_selector,
+                pending.pre_restore_pin_selector
+            );
+            restore_snapshot_generation_offline(data_dir, &pending.pre_restore_pin_selector, &live_controls).map_err(
+                |rollback_error| {
+                    format!(
+                        "interrupted restore could not complete target '{}' ({target_error}) and could not roll back verified original '{}' ({rollback_error}); normal startup is blocked",
+                        pending.source_selector, pending.pre_restore_pin_selector
+                    )
+                },
+            )?;
+            pending.pre_restore_pin_selector.clone()
+        }
+    };
+    // Marker deletion is outside the fallback branch: failure here means the selected generation is
+    // already coherent, so rolling it back would be an unnecessary second data transition. Stay fatal
+    // and retry marker cleanup idempotently on the next launch.
+    mark_named_restore_completed(data_dir, &completed_selector)?;
+    clear_review_pilot_restore_pending(data_dir)?;
+    reservation.commit_named_restore()?;
+    tracing::warn!("completed interrupted restore recovery using '{completed_selector}' before normal startup");
+    Ok(true)
+}
+
+pub(crate) fn recover_interrupted_named_restore_at_startup(data_dir: &Path) -> Result<bool, String> {
+    recover_interrupted_named_restore_with_admission(data_dir, &RESTORE_ADMISSION)
+}
+
+/// Restore a verified rotating or pinned recovery artifact. The selector comes only from
+/// `list_db_snapshots`; `resolve_snapshot_dir` rejects arbitrary paths/traversal. Both Rust schema-1
+/// and headless schema-2 manifests use this same transaction path.
 #[tauri::command]
 pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("restore_db_from_snapshot")?;
-    let valid =
-        name.strip_prefix("snapshot_").is_some_and(|ts| !ts.is_empty() && ts.bytes().all(|b| b.is_ascii_digit()));
-    if !valid {
-        return Err(format!("invalid snapshot name '{name}'"));
-    }
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let src = data_dir.join("snapshots").join(&name).join("cortex-speech.db");
-    if !src.is_file() {
+    let snap_dir = crate::snapshot::resolve_snapshot_dir(&data_dir, &name)?;
+    let src = snap_dir.join("cortex-speech.db");
+    let source_metadata = std::fs::symlink_metadata(&src)
+        .map_err(|error| format!("snapshot '{name}' has no readable database file: {error}"))?;
+    if !source_metadata.file_type().is_file() || source_metadata.file_type().is_symlink() {
         return Err(format!("snapshot '{name}' has no database file"));
     }
     // Hold the reservation across the whole restore: RESTORE_PENDING stays set until this guard drops
-    // (after the page swap + history clear), so no new writer can start mid-restore (P1.3b).
-    let _restore_reservation = prepare_restore(&state)?;
-    // Heavy DB file-copy + reopen — off the main thread; the lock is taken INSIDE the task.
-    let restore_result = {
-        let db = state.db_arc();
+    // and every snapshot capture already in progress drains before preflight. This prevents rotating
+    // prune/promotion from racing the selected source while it is being verified.
+    let (restore_reservation, restore_data_dir) = prepare_restore(&state)?;
+    if let Some(pending) = load_named_restore_pending(&data_dir)? {
+        if let Some(completed_selector) = pending.completed_selector.as_deref() {
+            if completed_selector != name {
+                return Err(format!(
+                    "restore '{}' already completed and only its barrier cleanup remains; refusing selector '{}'",
+                    completed_selector, name
+                ));
+            }
+            clear_review_pilot_restore_pending(&data_dir)?;
+            restore_reservation.commit_named_restore()?;
+            tracing::info!("completed pending restore-barrier cleanup for auto-snapshot {name}");
+            return Ok(());
+        }
+    }
+    // Source staging, one reusable safety pin, the durable transaction marker, and the page swap run
+    // under ONE uninterrupted DB guard. Bad source staging happens before the pin/marker; retries of a
+    // post-swap config failure reuse the original pin instead of evicting it.
+    let (restore_plan, restore_reservation) = {
+        let db = state.db_arc_for_restore();
         let restore_src = src.clone();
+        let restore_snapshot_dir = snap_dir.clone();
+        let restore_selector = name.clone();
         run_blocking(move || {
             let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-            guard.restore(&restore_src).map_err(|e| e.to_string())
+            let restore_plan = prepare_and_restore_named_transaction(
+                &restore_reservation,
+                &mut guard,
+                &restore_data_dir,
+                &restore_snapshot_dir,
+                &restore_src,
+                &restore_selector,
+            )?;
+            Ok((restore_plan, restore_reservation))
         })
         .await
-    }; // release the db lock before touching the settings/pipeline locks
-       // Clear the undo/redo stack on ANY restore attempt that reached the swap: restore() can return Err
-       // AFTER the pages were copied (e.g. a forward-migration failure post-copy), and a stale Undo would
-       // then corrupt the restored dataset (see db_restore). Do it BEFORE propagating the error so it runs
-       // even on that post-swap-failure path.
+    }?; // release the db lock before touching the settings/pipeline locks
+        // The staged source was fully proven before its atomic page publication; only a successful commit
+        // crosses dataset identity, so only then discard undo/redo commands tied to the old rows.
     state.lock_history().clear();
-    restore_result?;
 
-    // Restore the snapshot's captured config (settings.json / champion.json) so the app returns to a
-    // CONSISTENT known-good state — not a rolled-back library sitting beside post-disaster settings, or
-    // silently-defaulted settings if the live settings.json was corrupted alongside the DB. Best-effort
-    // per file (the DB is already restored; a config-copy failure only warns).
-    // Restore exactly the set the snapshot saved (crate::snapshot::EXTRA_STATE) — single source of truth,
-    // so save-side and restore-side can never drift out of sync.
-    let snap_dir = data_dir.join("snapshots").join(&name);
-    for &extra in crate::snapshot::EXTRA_STATE {
-        // settings.json is NOT plain-copied here — it is loaded from the snapshot, consent-narrowed, and
-        // saved below, so the snapshot's cloud opt-ins NEVER touch disk. A plain fs::copy would write the
-        // snapshot's (possibly cloud-ON) opt-ins to data_dir/settings.json first, and if the consent-narrowing
-        // re-save then failed or was interrupted (disk full during disaster recovery, or a process kill in the
-        // window), the revoked consent would silently come back on the next launch. Every OTHER extra copies.
-        if extra == "settings.json" {
-            continue;
-        }
-        let from = snap_dir.join(extra);
-        if from.is_file() {
-            if let Err(e) = std::fs::copy(&from, data_dir.join(extra)) {
-                tracing::warn!("snapshot restore: could not restore {extra}: {e}");
-            }
-        }
-    }
-    // Apply the restored settings to memory AND the running pipeline (mirrors update_settings) so the
-    // engine / thresholds / consent flags take effect immediately, not only on the next launch. Load the
-    // SNAPSHOT's settings (it was intentionally not copied above), never the snapshot value straight to disk.
-    let snapshot_settings_path = snap_dir.join("settings.json");
-    let live_settings_path = data_dir.join("settings.json");
-    let mut restored = crate::settings::AppSettings::load(if snapshot_settings_path.is_file() {
-        &snapshot_settings_path
-    } else {
-        &live_settings_path
-    });
-    // LIVE CONTROLS: a DB snapshot restore must NEVER silently re-grant cloud consent or change the selected
-    // ASR runtime. Consent, engine routing, the champion client path, and 30 GB server supervision are current
-    // operator decisions, not dataset state. Carry them across instead of adopting the snapshot's values.
-    {
-        let live = state.lock_settings();
-        restored.cloud_llm_opt_in = live.cloud_llm_opt_in;
-        restored.cloud_stt_opt_in = live.cloud_stt_opt_in;
-        restored.jury_cloud_opt_in = live.jury_cloud_opt_in;
-        preserve_live_asr_runtime_controls(&mut restored, &live);
-    }
-    // Persist the live-control-preserving settings as the FIRST and ONLY write of settings.json to disk (the
-    // snapshot's file was deliberately NOT copied above). data_dir/settings.json still holds the PRE-restore
-    // settings until this write lands, so if it fails or is interrupted (disk full during recovery, or a kill
-    // in the window) the on-disk consent stays the user's current REVOKED value — a consent-safe partial
-    // restore — never the snapshot's cloud-ON opt-ins. AppSettings::load does NOT reset opt-ins, so this is
-    // exactly what the next launch reads. Best-effort: the DB is already restored and consent fails SAFE.
-    if let Err(e) = restored.save(&live_settings_path) {
-        tracing::warn!("snapshot restore: could not persist live-control-preserving settings to disk: {e}");
-    }
+    let live_controls = state.lock_settings().clone();
+    let restored = install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?;
     *state.lock_settings() = restored.clone();
     state.update_pipeline_settings(restored);
+    // Commit marker LAST: only now do DB, policy, history, settings, and the running pipeline agree.
+    mark_named_restore_completed(&data_dir, &name)?;
+    clear_review_pilot_restore_pending(&data_dir)?;
+    restore_reservation.commit_named_restore()?;
+    drop(restore_reservation);
     // (undo/redo history was already cleared above, right after the DB swap.)
     tracing::info!("database and config restored from auto-snapshot {name}");
     Ok(())
@@ -2914,6 +3715,7 @@ pub fn cancel_wsl_refinement() -> Result<(), String> {
 #[tauri::command]
 pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_acoustic_scores")?;
+    let mutation = begin_mutation()?;
     let settings_gpu = {
         let s = state.lock_settings();
         s.enable_gpu
@@ -2921,6 +3723,7 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
     let models_dir = state.lock_model_manager().models_dir.clone();
     let db = state.db_arc();
     run_blocking(move || {
+        let _mutation = mutation;
         // P1.3: `WHERE ctc_score IS NULL` instead of reading the whole library and `continue`-ing past
         // every row that already has one. After the first pass this returns nothing at all.
         let segments = {
@@ -2997,9 +3800,11 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
 #[tauri::command]
 pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_signal_anomaly_scores")?;
+    let mutation = begin_mutation()?;
     let models_dir = state.lock_model_manager().models_dir.clone();
     let db = state.db_arc();
     run_blocking(move || {
+        let _mutation = mutation;
         // P1.3: `WHERE signal_anomaly_score IS NULL` — see the CTC sibling above.
         let segments = {
             let db = db.lock().unwrap_or_else(|p| p.into_inner());
@@ -3161,17 +3966,6 @@ pub fn export_agreement_sample(state: State<'_, AppState>) -> Result<Option<crat
     Ok(Some(sample))
 }
 
-/// Consent gate for any ElevenLabs Scribe upload. Voice is biometric data (GDPR Art. 9), so audio
-/// must NEVER be sent to a provider without the user's explicit cloud-STT opt-in. The pipeline path
-/// enforces this; the direct Scribe IPC commands must too, or they silently bypass consent.
-pub(crate) fn require_cloud_stt_consent(state: &AppState) -> Result<(), String> {
-    if state.lock_settings().cloud_stt_opt_in {
-        Ok(())
-    } else {
-        Err("Cloud STT opt-in is required to use ElevenLabs Scribe. Enable it in Settings.".into())
-    }
-}
-
 /// Consent gate for outbound cloud-LLM channels that POST private, transcript-derived data (e.g. the
 /// DPO preference-pair export). Same explicit opt-in the LLM-refine path requires — never ship the
 /// user's data to a cloud endpoint without it, even though the endpoint is also allow-list-validated.
@@ -3183,78 +3977,12 @@ pub(crate) fn require_cloud_llm_consent(state: &AppState) -> Result<(), String> 
     }
 }
 
-/// Scribe-transcribe ONLY this segment's clip. Every VAD chunk shares the WHOLE-source audio_path (the
-/// per-segment range lives in alignment_json), so uploading `audio_path` directly would send the entire
-/// recording to ElevenLabs — billing for the whole file and returning the whole-recording transcript for
-/// one short segment. Decode, slice the clip by alignment, write a temp 16 kHz WAV, transcribe that, and
-/// delete the temp. `alignment_json` None (a single-segment file) sends the whole file, which is correct.
-fn scribe_transcribe_clip(audio_path: &str, alignment_json: Option<&str>, key: &str) -> Result<String, String> {
-    let (sr, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
-    let (clip, _suffix) =
-        crate::chunking::slice_pcm_by_alignment(&pcm, sr, alignment_json).map_err(|e| e.to_string())?;
-    let tmp = std::env::temp_dir().join(format!("cortex-scribe-{}.wav", uuid::Uuid::new_v4()));
-    crate::export::write_wav_atomic(&tmp, sr, &clip).map_err(|e| e.to_string())?;
-    let result =
-        crate::scribe_api::transcribe(tmp.to_string_lossy().as_ref(), key, crate::scribe_api::DEFAULT_MODEL, "kur");
-    let _ = std::fs::remove_file(&tmp); // best-effort cleanup
-    result.map_err(|e| e.to_string())
-}
-
-/// Transcribe ONE imported segment's clip with ElevenLabs Scribe (verified working for Sorani). Uses the
-/// locally configured ELEVENLABS_API_KEY; errors clearly if it is absent. Returns the transcription text.
-#[tauri::command]
-pub async fn transcribe_audio_with_scribe(
-    audio_path: String,
-    alignment_json: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    STRICT_RATE_LIMITER.check("transcribe_audio_with_scribe")?;
-    // Enforce the cloud-STT privacy gate at the IPC trust boundary: audio must never leave the device
-    // for ElevenLabs unless the user explicitly opted in — require_cloud_stt_consent mirrors
-    // pipeline::scribe_api_key_if_enabled so every Scribe egress path honors the same toggle, not just
-    // the import path.
-    require_cloud_stt_consent(&state)?;
-    // Only audio already imported into THIS dataset may be uploaded to the cloud — never an
-    // arbitrary local file path handed in by the (untrusted) webview. ensure_imported both
-    // validates the path and confirms DB membership.
-    let audio_path = {
-        let db = state.lock_db();
-        crate::media::MediaRegistry::ensure_imported(&db, &audio_path)?
-    };
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let key = crate::api_keys::ApiKeys::load(&data_dir)
-        .elevenlabs
-        .ok_or_else(|| "No ElevenLabs API key configured — add ELEVENLABS_API_KEY to secrets.env".to_string())?;
-    // The blocking ElevenLabs upload+POST runs on the blocking pool so the UI thread stays responsive.
-    // Every privacy/validation gate above (STT consent, DB-membership via ensure_imported, key present)
-    // already ran EAGERLY on the caller thread, so an un-opted-in or unvalidated request is rejected
-    // before any audio is offloaded or leaves the device.
-    run_blocking(move || scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key)).await
-}
-
-/// Model id for the independent ElevenLabs Scribe vote. Scribe is architecturally INDEPENDENT of the
-/// OmniASR-CTC family, so (unlike the kin 300M/1B) its vote genuinely corroborates or contradicts the
-/// local consensus — the highest-value escalation signal and training pair per the research.
-///
-/// Round-23 #9: this label is stored as the hypothesis' provenance AND shown to the T2 judge, so it
-/// MUST name the model version ACTUALLY transmitted to ElevenLabs (`scribe_api::DEFAULT_MODEL`,
-/// currently `scribe_v1`) — never a version that was never invoked. The
-/// `scribe_vote_model_id_matches_the_model_actually_sent` test fails if the two ever drift.
-const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v1";
-
-/// Serializes `add_scribe_votes` batches. The old sync command was physically serialized by the main
-/// thread; the async version could self-overlap (two rapid calls both passing the gather-time
-/// existing-vote check and double-POSTing the same consented audio — duplicate Scribe COST, never
-/// duplicate data: the (segment_id, model_id) upsert keeps one scribe-v1 row). This flag restores the
-/// old one-at-a-time behavior explicitly.
-pub(crate) static SCRIBE_VOTES_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Count of in-flight BACKGROUND DB writers that use their OWN dedicated connection (NOT the global db
 /// Mutex) and may run OUTSIDE the import/batch guards — so they escape the db-Mutex serialization the
 /// restore relies on, and `AppState::writers_active` must consult this to fence a restore while any is
 /// mid-write (R3). Registrants: the jury writers (run_jury_pipeline / run_t2_for_segment /
 /// run_dpo_update + the post-import adjudication thread) and the detached background-alignment thread.
-/// A COUNTER, not a bool: unlike the WSL/Scribe flags (which reject overlap), these may legitimately
+/// A COUNTER, not a bool: these writers may legitimately
 /// overlap, and a bool would clear the fence when the FIRST of two concurrent writers finished. This is
 /// the one place a NEW dedicated-connection writer registers — extend by taking a guard, not by growing
 /// the writers_active() || chain (the recurring "forgot the new writer" bug this closes twice over).
@@ -3727,7 +4455,7 @@ fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) ->
 /// the fallback. Same semantics as `with_jury_db` — it IS `with_jury_db`'s implementation.
 struct JuryDbSource {
     db_path: String,
-    shared: Arc<std::sync::Mutex<crate::db::Database>>,
+    shared: crate::AppDatabaseHandle,
 }
 
 fn jury_db_source(app_state: &AppState) -> JuryDbSource {
@@ -4241,19 +4969,6 @@ pub fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn scribe_vote_model_id_matches_the_model_actually_sent() {
-        // Round-23 #9: the stored provenance label must name the model VERSION actually transmitted to
-        // ElevenLabs, never a version that was never invoked. If DEFAULT_MODEL ever changes (e.g. to a
-        // real scribe_v2), this fails until SCRIBE_VOTE_MODEL_ID is updated to match.
-        let sent = crate::scribe_api::DEFAULT_MODEL; // e.g. "scribe_v1"
-        let version = sent.rsplit('_').next().unwrap_or(sent); // "v1"
-        assert!(
-            SCRIBE_VOTE_MODEL_ID.contains(version),
-            "Scribe vote label '{SCRIBE_VOTE_MODEL_ID}' must reflect the sent model version '{version}' (from '{sent}')"
-        );
-    }
-
     fn test_segment(id: &str, audio_path: &str, raw_transcript: &str) -> crate::db::SpeechSegment {
         crate::db::SpeechSegment {
             id: id.to_string(),
@@ -4279,6 +4994,8 @@ mod tests {
 
     #[test]
     fn mandatory_pre_restore_snapshot_failure_aborts_before_live_data_can_change() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().expect("local restore reservation");
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         let segment = test_segment("restore-safety", "restore-safety.wav", "still live");
@@ -4288,14 +5005,462 @@ mod tests {
         let invalid_data_dir = temp.path().join("not-a-directory");
         std::fs::write(&invalid_data_dir, b"blocks snapshot directory creation").unwrap();
 
-        let err = take_mandatory_pre_restore_snapshot(&db, &invalid_data_dir).unwrap_err();
+        let err = take_mandatory_pre_restore_snapshot(&reservation, &db, &invalid_data_dir).unwrap_err();
         assert!(err.contains("mandatory pre-restore safety snapshot failed"), "{err}");
         assert!(err.contains("has not been overwritten"), "{err}");
+        assert!(
+            !err.contains("requires an active exclusive restore reservation"),
+            "the capability must let this test reach the injected filesystem failure: {err}"
+        );
         assert_eq!(
             db.get_segment_by_id(&segment.id).unwrap().unwrap().raw_transcript,
             "still live",
             "a failed safety pin must leave the live library untouched"
         );
+    }
+
+    #[test]
+    fn restore_admission_is_exclusive_and_releases_waiters_after_error_and_panic() {
+        let admission = RestoreAdmission::new();
+
+        let first = admission.try_reserve().expect("first restore owns the reservation");
+        assert!(admission.try_reserve().is_err(), "overlapping restores must fail instead of sharing a flag");
+        drop(first);
+        assert!(!admission.is_pending());
+
+        let failed: Result<(), &str> = {
+            let _reservation = admission.try_reserve().expect("reservation for failing restore");
+            Err("injected restore error")
+        };
+        assert_eq!(failed, Err("injected restore error"));
+        assert!(!admission.is_pending(), "an error path must release the restore reservation");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reservation = admission.try_reserve().expect("reservation for panicking restore");
+            panic!("injected restore panic");
+        }));
+        assert!(panicked.is_err());
+        assert!(!admission.is_pending(), "an unwind must release the restore reservation");
+
+        let capture = admission.begin_capture().expect("snapshot capture enters while no restore is pending");
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let admission_ref = &admission;
+            scope.spawn(move || {
+                let _ = started_tx.send(());
+                let reservation = admission_ref.try_reserve().expect("restore waits for active capture to drain");
+                let _ = acquired_tx.send(());
+                let _ = release_rx.recv();
+                drop(reservation);
+            });
+            started_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("restore waiter thread started");
+            let pending_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !admission.is_pending() && std::time::Instant::now() < pending_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(admission.is_pending(), "restore must publish pending before waiting for the capture");
+            assert!(admission.begin_capture().is_err(), "no new snapshot may cross a pending restore generation");
+            assert!(
+                acquired_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+                "restore publication must wait until the complete capture token drops"
+            );
+            drop(capture);
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("restore proceeds after the snapshot capture drains");
+            release_tx.send(()).unwrap();
+        });
+        assert!(!admission.is_pending());
+
+        let database = std::sync::Mutex::new(());
+        let reservation = admission.try_reserve().expect("reservation that fences a queued writer");
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let admission_ref = &admission;
+            let database_ref = &database;
+            scope.spawn(move || {
+                let _db = admission_ref.lock(database_ref).unwrap_or_else(|poisoned| poisoned.into_inner());
+                entered_tx.send(()).unwrap();
+            });
+            assert!(
+                entered_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+                "an ordinary AppState DB caller must remain fenced through the complete restore"
+            );
+            // Models the point after DB pages are restored but before history/config/pipeline work ends.
+            // The waiter must still be blocked until the outer command drops its reservation.
+            assert!(admission.is_pending());
+            drop(reservation);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the queued caller resumes after the complete restore");
+        });
+    }
+
+    #[test]
+    fn armed_restore_parks_on_error_and_exact_recovery_is_the_only_reentry() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().expect("new restore reservation");
+        reservation.arm_named_restore().expect("durable transaction arm");
+        drop(reservation); // models any error/unwind after the marker commit boundary
+
+        assert!(admission.is_pending(), "an armed error must keep ordinary DB/config work fenced");
+        assert!(admission.begin_mutation().is_err(), "no mutation may start in recovery-required state");
+        assert!(admission.try_reserve().is_err(), "an unrelated restore cannot claim a parked transaction");
+
+        let recovery = admission.claim_recovery().expect("the exact recovery path reclaims parked admission");
+        recovery.commit_named_restore().expect("coherent generation commit releases the fence");
+        let next = admission.try_reserve().expect("normal restore admission resumes after recovery commit");
+        drop(recovery); // a stale generation token must not clear the newer reservation
+        assert!(admission.is_pending(), "stale guard drop must not release a newer restore generation");
+        drop(next);
+        assert!(!admission.is_pending());
+    }
+
+    #[test]
+    fn full_operation_mutation_and_restore_admission_are_race_closed() {
+        let admission = RestoreAdmission::new();
+        let mutation = admission.begin_mutation().expect("mutation starts while idle");
+        assert!(admission.try_reserve().is_err(), "restore must refuse an already-running long mutation");
+        assert!(!admission.is_pending(), "a refused new restore must not strand the admission flag");
+        drop(mutation);
+
+        let restore = admission.try_reserve().expect("restore starts after mutation ends");
+        assert!(admission.begin_mutation().is_err(), "new long mutation must refuse a published restore");
+        drop(restore);
+        assert!(admission.begin_mutation().is_ok(), "mutations resume after an unarmed restore ends");
+    }
+
+    #[test]
+    fn restore_helper_pins_the_old_live_db_before_swapping_to_the_source() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().expect("local restore reservation");
+        let temp = tempfile::TempDir::new().unwrap();
+        let live_path = temp.path().join("live.db");
+        let source_path = temp.path().join("source.db");
+        let data_dir = temp.path().join("app-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let live = crate::db::Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("old-live", "old.wav", "must be recoverable")).unwrap();
+
+        let source = crate::db::Database::open(source_path.to_string_lossy().as_ref()).unwrap();
+        source.initialize().unwrap();
+        source.insert_segment(&test_segment("restored", "restored.wav", "from snapshot")).unwrap();
+        // A manifest-bound snapshot is a frozen, self-contained DB file. Immutable restore staging
+        // intentionally ignores live WAL sidecars, so finish this fixture like snapshot promotion
+        // does instead of asking raw-file verification to read an open writer's uncheckpointed WAL.
+        source.wal_checkpoint().unwrap();
+        drop(source);
+
+        let shared = std::sync::Mutex::new(live);
+        let pinned = {
+            // This is the exact production ownership shape: one DB mutex guard is held while the
+            // helper first snapshots and then restores. Rust cannot release/reacquire it in between.
+            let mut guard = shared.lock().unwrap();
+            restore_with_mandatory_snapshot(&reservation, &mut guard, &data_dir, &source_path).unwrap()
+        };
+
+        let restored = shared.lock().unwrap();
+        assert!(restored.get_segment_by_id("restored").unwrap().is_some());
+        assert!(restored.get_segment_by_id("old-live").unwrap().is_none());
+
+        assert!(
+            crate::snapshot::verify_snapshot_manifest_for_restore(&pinned).unwrap(),
+            "the mandatory pre-restore pin must be self-verifying"
+        );
+        let pinned_db = pinned.join("cortex-speech.db");
+        let read_only = rusqlite::Connection::open_with_flags(
+            pinned_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let old_rows: i64 = read_only
+            .query_row("SELECT COUNT(*) FROM speech_segments WHERE id = 'old-live'", [], |row| row.get(0))
+            .unwrap();
+        let new_rows: i64 = read_only
+            .query_row("SELECT COUNT(*) FROM speech_segments WHERE id = 'restored'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((old_rows, new_rows), (1, 0), "the mandatory pin must contain the exact pre-restore library");
+        // A WAL-mode read-only connection may keep transient -shm/-wal siblings open. Production
+        // staging closes its source before the final manifest re-verification; model that boundary.
+        drop(read_only);
+    }
+
+    #[test]
+    fn named_restore_reuses_original_transaction_pin_and_bad_source_creates_no_barrier() {
+        let admission = RestoreAdmission::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let mut live = crate::db::Database::open(":memory:").unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("before-source", "before.wav", "source generation")).unwrap();
+        let source_dir = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 1000).unwrap().unwrap();
+        let source = source_dir.join("cortex-speech.db");
+        live.insert_segment(&test_segment("pre-restore-only", "later.wav", "must remain in original pin")).unwrap();
+
+        let reservation = admission.try_reserve().unwrap();
+        let first = prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &source_dir,
+            &source,
+            "snapshot_0000001000",
+        )
+        .unwrap();
+        assert_eq!(first.optional.len(), crate::snapshot::OPTIONAL_SNAPSHOT_STATE.len());
+        let pending = load_named_restore_pending(data_dir).unwrap().unwrap();
+        let original_pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector).unwrap();
+        let pin_db = rusqlite::Connection::open_with_flags(
+            original_pin.join("cortex-speech.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let original_only: i64 = pin_db
+            .query_row("SELECT COUNT(*) FROM speech_segments WHERE id='pre-restore-only'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(original_only, 1, "the transaction pin is the exact generation before the first page swap");
+
+        prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &source_dir,
+            &source,
+            "snapshot_0000001000",
+        )
+        .unwrap();
+        let pins = std::fs::read_dir(data_dir.join("snapshots").join("pinned"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("prerestore_"))
+            .count();
+        assert_eq!(pins, 1, "a retry must reuse, never rotate out, the original pre-restore generation");
+        assert_eq!(load_named_restore_pending(data_dir).unwrap().unwrap(), pending);
+        clear_review_pilot_restore_pending(data_dir).unwrap();
+        reservation.commit_named_restore().unwrap();
+        drop(reservation);
+
+        let broken_dir = data_dir.join("snapshots").join("snapshot_0000002000");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(broken_dir.join("cortex-speech.db"), b"not sqlite").unwrap();
+        let reservation = admission.try_reserve().unwrap();
+        let error = prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &broken_dir,
+            &broken_dir.join("cortex-speech.db"),
+            "snapshot_0000002000",
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let pins_after = std::fs::read_dir(data_dir.join("snapshots").join("pinned"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("prerestore_"))
+            .count();
+        assert_eq!(pins_after, 1, "invalid source validation happens before any new pin or barrier");
+        drop(reservation);
+    }
+
+    fn snapshot_selector(path: &Path, pinned: bool) -> String {
+        let name = path.file_name().and_then(|name| name.to_str()).expect("snapshot directory name");
+        if pinned {
+            format!("pinned/{name}")
+        } else {
+            name.to_string()
+        }
+    }
+
+    #[test]
+    fn startup_recovery_completes_the_recorded_target_before_any_normal_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("original", "original.wav", "original generation")).unwrap();
+        let original_pin =
+            crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "startup-original", 3, 1000).unwrap();
+        live.insert_segment(&test_segment("target", "target.wav", "target generation")).unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 2000).unwrap().unwrap();
+        live.delete_segment("target").unwrap(); // prove recovery publishes the target snapshot, not current pages
+        drop(live);
+
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: snapshot_selector(&target, false),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            completed_selector: None,
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+        assert!(!admission.is_pending());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(recovered.get_segment_by_id("original").unwrap().is_some());
+        assert!(recovered.get_segment_by_id("target").unwrap().is_some());
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_the_verified_full_original_when_target_preflight_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("original", "original.wav", "original generation")).unwrap();
+        let original_pin =
+            crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "startup-rollback", 3, 3000).unwrap();
+        live.insert_segment(&test_segment("target", "target.wav", "must be rolled back")).unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 4000).unwrap().unwrap();
+        drop(live);
+        std::fs::write(target.join("settings.json"), b"tampered after manifest").unwrap();
+
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: snapshot_selector(&target, false),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            completed_selector: None,
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+        assert!(!admission.is_pending());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(recovered.get_segment_by_id("original").unwrap().is_some());
+        assert!(recovered.get_segment_by_id("target").unwrap().is_none());
+    }
+
+    #[test]
+    fn completed_restore_marker_cleanup_never_replays_or_rolls_back_missing_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("committed", "committed.wav", "already coherent")).unwrap();
+        drop(live);
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: "snapshot_0000009999".to_string(),
+            pre_restore_pin_selector: "pinned/missing_0000009998".to_string(),
+            completed_selector: Some("snapshot_0000009999".to_string()),
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+        assert!(!admission.is_pending());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(recovered.get_segment_by_id("committed").unwrap().is_some());
+    }
+
+    #[test]
+    fn named_restore_rehashes_after_plan_and_staging_and_never_mutates_invalid_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&test_segment("source", "source.wav", "source")).unwrap();
+        let source_dir = crate::snapshot::take_snapshot_at(&db, temp.path(), 5, 1000).unwrap().unwrap();
+        let source_db = source_dir.join("cortex-speech.db");
+        let settings = source_dir.join("settings.json");
+        let original = std::fs::read(&settings).unwrap();
+        let error = prepare_named_restore_artifacts(&source_dir, &source_db, || {
+            std::fs::write(&settings, b"tampered after plan capture").unwrap();
+        })
+        .err()
+        .expect("post-capture mutation must be rejected");
+        assert!(error.contains("mismatch"), "{error}");
+
+        // Restore the exact source, then make malformed settings honestly match the manifest. This
+        // reaches semantic preflight and proves it rejects without AppSettings::load renaming/mutating
+        // the frozen source or touching a live DB.
+        std::fs::write(&settings, &original).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source_dir.join(crate::snapshot::MANIFEST_FILE)).unwrap()).unwrap();
+        let invalid = b"{}";
+        std::fs::write(&settings, invalid).unwrap();
+        let row =
+            manifest["files"].as_array_mut().unwrap().iter_mut().find(|row| row["path"] == "settings.json").unwrap();
+        row["sizeBytes"] = serde_json::json!(invalid.len());
+        row["sha256"] = serde_json::json!(crate::models::compute_file_sha256(&settings).unwrap());
+        std::fs::write(source_dir.join(crate::snapshot::MANIFEST_FILE), serde_json::to_vec_pretty(&manifest).unwrap())
+            .unwrap();
+        let semantic = prepare_named_restore_artifacts(&source_dir, &source_db, || {})
+            .err()
+            .expect("correctly hashed malformed config must fail semantic preflight");
+        assert!(semantic.contains("settings.json is invalid"), "{semantic}");
+        assert_eq!(std::fs::read(&settings).unwrap(), invalid);
+        assert!(
+            std::fs::read_dir(&source_dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains("corrupt")),
+            "strict recovery parsing must not rename or repair the frozen source"
+        );
+    }
+
+    #[test]
+    fn required_snapshot_routing_state_is_atomic_and_failure_keeps_review_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let payloads = [
+            ("champion.json", b"snapshot champion".as_slice()),
+            ("reviewer_dialects.json", b"snapshot dialects".as_slice()),
+            ("voice_focus.json", b"snapshot focus".as_slice()),
+        ];
+        let plan = crate::snapshot::OPTIONAL_SNAPSHOT_STATE
+            .iter()
+            .copied()
+            .filter(|state| state.live_file != "settings.json")
+            .map(|state| {
+                let bytes = payloads.iter().find(|(name, _)| *name == state.live_file).unwrap().1.to_vec();
+                (state, crate::snapshot::OptionalSnapshotRestore::Install(bytes))
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+
+        // A non-file destination is an injected install failure. The helper must fail, and the
+        // command-level commit marker remains authoritative because only the successful tail clears it.
+        std::fs::create_dir(live.join("champion.json")).unwrap();
+        let error = restore_required_snapshot_state_atomic(&plan, &live).unwrap_err();
+        assert!(error.contains("champion.json") && error.contains("regular file or absent"), "{error}");
+        assert!(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE).is_file());
+
+        std::fs::remove_dir(live.join("champion.json")).unwrap();
+        restore_required_snapshot_state_atomic(&plan, &live).unwrap();
+        assert_eq!(std::fs::read(live.join("champion.json")).unwrap(), b"snapshot champion");
+        assert_eq!(std::fs::read(live.join("reviewer_dialects.json")).unwrap(), b"snapshot dialects");
+        assert_eq!(std::fs::read(live.join("voice_focus.json")).unwrap(), b"snapshot focus");
+        assert!(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE).is_file());
+
+        let stale = live.join("voice_focus.json.replace-bak-99999");
+        std::fs::write(&stale, b"stale focus").unwrap();
+        let absent = plan
+            .iter()
+            .map(|(state, _)| (*state, crate::snapshot::OptionalSnapshotRestore::ExplicitlyAbsent))
+            .collect::<Vec<_>>();
+        restore_required_snapshot_state_atomic(&absent, &live).unwrap();
+        for (state, _) in &absent {
+            assert!(!live.join(state.live_file).exists(), "{} must restore as explicit absence", state.live_file);
+        }
+        assert!(!stale.exists(), "explicit absence must not allow an atomic-recovery backup to resurrect old policy");
+        assert!(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE).is_file());
     }
 
     #[test]
@@ -4326,6 +5491,139 @@ mod tests {
         assert_eq!(restored.external_asr_script_path, live.external_asr_script_path);
         assert!(!restored.champion_supervision_enabled, "a restore must not auto-load the 30 GB server");
         assert_eq!(restored.vad_threshold, 0.77, "ordinary snapshot configuration should still restore");
+    }
+
+    #[test]
+    fn snapshot_pilot_policy_is_exact_atomic_and_fail_closed_during_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot_dir = temp.path().join("snapshot_1");
+        let live_dir = temp.path().join("live");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let snapshot_db = snapshot_dir.join("cortex-speech.db");
+        let source = crate::db::Database::open(snapshot_db.to_string_lossy().as_ref()).unwrap();
+        source.initialize().unwrap();
+        source.wal_checkpoint().unwrap();
+        drop(source);
+
+        let policy = br#"{
+          "schema_version": 1,
+          "after_review_event_id": 0,
+          "max_total_corpus_actions": 20,
+          "reviewers": [
+            {"name": "Pavel", "max_corpus_actions": 10},
+            {"name": "Hawzhin", "max_corpus_actions": 10}
+          ]
+        }"#;
+        std::fs::write(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE), policy).unwrap();
+        let legacy_policy = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap_err();
+        assert!(
+            legacy_policy.contains("requires a verified manifest"),
+            "a manifestless policy-bearing tree can never authorize a named restore: {legacy_policy}"
+        );
+        crate::review_pilot::install_test_focus(&snapshot_dir, ["snapshot-focus"]);
+        std::fs::write(
+            snapshot_dir.join(crate::voice_focus::VOICE_FOCUS_FILE),
+            br#"{"segment_ids":["snapshot-wrong"]}"#,
+        )
+        .unwrap();
+        let wrong_focus = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).unwrap_err();
+        assert!(wrong_focus.contains("digest mismatch"), "{wrong_focus}");
+        crate::review_pilot::install_test_focus(&snapshot_dir, ["snapshot-focus"]);
+        let install = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).unwrap();
+        assert!(matches!(install, SnapshotPilotPolicyRestore::Install(_)));
+        crate::review_pilot::install_test_focus(&live_dir, ["snapshot-focus"]);
+
+        // Both representations are ambiguous and must fail before any DB swap.
+        std::fs::write(
+            snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE),
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
+        )
+        .unwrap();
+        assert!(inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).is_err());
+        std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)).unwrap();
+
+        std::fs::write(live_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+        assert!(
+            crate::review_pilot::load(&live_dir).unwrap_err().contains("restore did not finish"),
+            "an interrupted cross-file restore must block paid review"
+        );
+        apply_snapshot_pilot_policy(&install, &live_dir).unwrap();
+        assert!(
+            crate::review_pilot::load(&live_dir).is_err(),
+            "installing policy is not the commit point; the pending barrier remains authoritative"
+        );
+        clear_review_pilot_restore_pending(&live_dir).unwrap();
+        assert_eq!(crate::review_pilot::load(&live_dir).unwrap().unwrap().reviewer_names(), vec!["Hawzhin", "Pavel"]);
+
+        // Explicit absence removes an existing policy only under the same fail-closed marker.
+        std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE)).unwrap();
+        std::fs::write(
+            snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE),
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
+        )
+        .unwrap();
+        let absent = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap();
+        assert_eq!(absent, SnapshotPilotPolicyRestore::ExplicitlyAbsent);
+        std::fs::write(live_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+        let stale_policy_backup =
+            live_dir.join(format!("{}.replace-bak-99999", crate::review_pilot::REVIEW_PILOT_FILE));
+        std::fs::write(&stale_policy_backup, policy).unwrap();
+        apply_snapshot_pilot_policy(&absent, &live_dir).unwrap();
+        assert!(!stale_policy_backup.exists(), "explicit absence must remove recoverable stale policy bytes");
+        assert!(crate::review_pilot::load(&live_dir).is_err());
+        let stale_barrier_backup =
+            live_dir.join(format!("{}.replace-bak-99999", crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE));
+        std::fs::write(&stale_barrier_backup, b"stale pending").unwrap();
+        clear_review_pilot_restore_pending(&live_dir).unwrap();
+        assert!(!stale_barrier_backup.exists(), "a completed restore must not resurrect its barrier");
+        assert_eq!(crate::review_pilot::load(&live_dir), Ok(None));
+
+        // Legacy snapshots remain recoverable but can never delete or replace a current live policy.
+        std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)).unwrap();
+        assert!(
+            inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).is_err(),
+            "manifest-bearing snapshots can never infer unrestricted state from missing files"
+        );
+        assert_eq!(
+            inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap(),
+            SnapshotPilotPolicyRestore::PreserveLegacy
+        );
+    }
+
+    #[test]
+    fn bare_database_restore_refuses_active_or_uncertain_controlled_pilot_state() {
+        let live = tempfile::tempdir().unwrap();
+        assert!(refuse_bare_restore_during_controlled_pilot(live.path()).is_ok());
+
+        let policy = br#"{
+          "schema_version": 1,
+          "after_review_event_id": 0,
+          "max_total_corpus_actions": 20,
+          "reviewers": [
+            {"name": "Hawzhin", "max_corpus_actions": 10},
+            {"name": "Pavel", "max_corpus_actions": 10}
+          ]
+        }"#;
+        crate::review_pilot::install_test_focus(live.path(), ["live-focus"]);
+        std::fs::write(live.path().join(crate::review_pilot::REVIEW_PILOT_FILE), policy).unwrap();
+        let active = refuse_bare_restore_during_controlled_pilot(live.path()).unwrap_err();
+        assert!(active.contains("policy-bearing named snapshot"), "{active}");
+
+        std::fs::remove_file(live.path().join(crate::review_pilot::REVIEW_PILOT_FILE)).unwrap();
+        let remembered = serde_json::json!({
+            "reviewers": {},
+            "db_path": "remembered.db",
+            "pilot_policy": serde_json::from_slice::<serde_json::Value>(policy).unwrap(),
+        });
+        std::fs::write(live.path().join("couch_session.json"), serde_json::to_vec(&remembered).unwrap()).unwrap();
+        let durable = refuse_bare_restore_during_controlled_pilot(live.path()).unwrap_err();
+        assert!(durable.contains("durable Couch session"), "{durable}");
+        std::fs::remove_file(live.path().join("couch_session.json")).unwrap();
+
+        std::fs::write(live.path().join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+        let uncertain = refuse_bare_restore_during_controlled_pilot(live.path()).unwrap_err();
+        assert!(uncertain.contains("not provably safe"), "{uncertain}");
     }
 
     fn insert_hypothesis(
@@ -4669,7 +5967,7 @@ mod tests {
             jury_cloud_opt_in: true,
             llm_api_key: "session-key".to_string(),
             external_asr_script_path: "/root/cortex_env/omniasr.py".to_string(),
-            source_reference_models: vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+            source_reference_models: vec!["gemini-2.5-pro".to_string()],
             ..crate::settings::AppSettings::default()
         };
         let model_status = vec![
@@ -5043,7 +6341,9 @@ mod tests {
         db.insert_segment(&segment).unwrap();
         insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "correct reference phrase", 0.99);
         insert_hypothesis(&db, &segment.id, "omniasr-ctc-1b", "wrong local consensus", 0.98);
-        insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "correct reference phrase");
+        // The sole canonical advisory model exists but has no usable text: coverage must fail closed
+        // without inventing a second cloud model merely to exercise the guard.
+        insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "");
 
         let report = run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
         let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
@@ -5056,7 +6356,7 @@ mod tests {
         assert_eq!(fresh.verdict.as_deref(), Some("escalated"));
         let rationale = fresh.rationale.as_deref().unwrap_or("");
         assert!(rationale.contains("Source-reference coverage guard blocked automatic adjudication"));
-        assert!(rationale.contains("gemini-2.5-flash"));
+        assert!(rationale.contains("gemini-2.5-pro"));
         assert!(rationale.contains("T2 disabled"));
     }
 

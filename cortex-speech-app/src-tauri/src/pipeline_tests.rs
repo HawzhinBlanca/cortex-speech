@@ -14,6 +14,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[test]
+fn champion_eval_accepts_only_the_exact_registry_identity() {
+    let expected = crate::registry::DeploymentIdentity {
+        model_version_id: "champion-v1".into(),
+        deployment_sha256: "a".repeat(64),
+    };
+    let exact = super::Wsl7bResult {
+        raw_transcript: "draft".into(),
+        confidence: None,
+        model_version_id: expected.model_version_id.clone(),
+        deployment_sha256: expected.deployment_sha256.clone(),
+    };
+    assert!(super::require_exact_champion_result(&exact, &expected).is_ok());
+
+    let wrong_model = super::Wsl7bResult { model_version_id: "other".into(), ..exact.clone() };
+    assert!(super::require_exact_champion_result(&wrong_model, &expected).is_err());
+    let wrong_deployment = super::Wsl7bResult { deployment_sha256: "b".repeat(64), ..exact };
+    assert!(super::require_exact_champion_result(&wrong_deployment, &expected).is_err());
+}
+
+#[test]
 fn champion_selection_disables_auxiliary_models_even_for_legacy_true_setting() {
     let champion_with_legacy_flag =
         AppSettings { asr_model_size: AsrModelSize::WSL7B, multi_engine_hypotheses: true, ..AppSettings::default() };
@@ -901,7 +921,7 @@ fn configured_source_reference_failure_is_fatal_before_chunking() {
     let settings = AppSettings {
         jury_cloud_opt_in: true,
         llm_api_key: "test-key".to_string(),
-        source_reference_models: vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+        source_reference_models: vec!["gemini-2.5-pro".to_string()],
         ..AppSettings::default()
     };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
@@ -917,15 +937,15 @@ fn configured_source_reference_failure_is_fatal_before_chunking() {
     let message = err.to_string();
     assert!(message.contains("All whole-file reference transcript models failed"));
     assert!(message.contains("gemini-2.5-pro"));
-    assert!(message.contains("gemini-2.5-flash"));
+    assert!(!message.contains("gemini-2.5-flash"), "the retired Flash route must never be attempted: {message}");
 }
 
 #[test]
-fn partial_source_reference_failure_is_fatal_before_chunking() {
+fn stale_source_reference_failure_is_fatal_before_chunking() {
     let settings = AppSettings {
         jury_cloud_opt_in: true,
         llm_api_key: "test-key".to_string(),
-        source_reference_models: vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+        source_reference_models: vec!["gemini-2.5-pro".to_string()],
         ..AppSettings::default()
     };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
@@ -954,7 +974,7 @@ fn partial_source_reference_failure_is_fatal_before_chunking() {
     assert!(message.contains("All whole-file reference transcript models failed before chunking"));
     assert!(message.contains("incomplete source-reference evidence"));
     assert!(message.contains("gemini-2.5-pro"));
-    assert!(message.contains("gemini-2.5-flash"));
+    assert!(!message.contains("gemini-2.5-flash"), "the retired Flash route must never be attempted: {message}");
 }
 
 #[test]
@@ -1212,7 +1232,7 @@ fn pipeline_with(settings: AppSettings) -> super::ProcessingPipeline {
 }
 
 fn all_cloud_on() -> AppSettings {
-    AppSettings { cloud_llm_opt_in: true, cloud_stt_opt_in: true, jury_cloud_opt_in: true, ..AppSettings::default() }
+    AppSettings { cloud_llm_opt_in: true, jury_cloud_opt_in: true, ..AppSettings::default() }
 }
 
 #[test]
@@ -1225,17 +1245,13 @@ fn revoking_cloud_consent_reaches_an_import_already_in_flight() {
     let mut stored = pipeline_with(all_cloud_on());
     let in_flight = stored.clone(); // the worker's copy, taken BEFORE the user changes anything
 
-    assert!(in_flight.consent.cloud_stt(), "precondition: the clone starts with consent granted");
-
     // The user switches every cloud toggle OFF mid-import.
     let mut off = all_cloud_on();
     off.cloud_llm_opt_in = false;
-    off.cloud_stt_opt_in = false;
     off.jury_cloud_opt_in = false;
     stored.update_settings(off);
 
-    // The WORKER's clone must observe it. Before the fix all three of these still said "allowed".
-    assert!(!in_flight.consent.cloud_stt(), "cloud STT consent must reach the in-flight clone");
+    // The WORKER's clone must observe it.
     assert!(!in_flight.consent.cloud_llm(), "cloud LLM consent must reach the in-flight clone");
     assert!(!in_flight.consent.jury_cloud(), "jury cloud consent must reach the in-flight clone");
 }
@@ -1249,7 +1265,8 @@ fn granting_consent_mid_run_does_not_retroactively_enable_a_run_started_without_
     let in_flight = stored.clone();
     stored.update_settings(all_cloud_on());
 
-    assert!(!in_flight.consent.cloud_stt(), "a run begun without consent must stay offline");
+    assert!(!in_flight.consent.cloud_llm(), "a run begun without consent must stay offline");
+    assert!(!in_flight.consent.jury_cloud(), "a run begun without consent must stay offline");
 }
 
 #[test]
@@ -1284,21 +1301,17 @@ fn revocation_takes_effect_even_when_the_settings_save_fails() {
     // lock without a mutable borrow — update_settings needs &mut, a withdrawal does not.
     let stored = pipeline_with(all_cloud_on());
     let in_flight = stored.clone();
-    assert!(in_flight.consent.cloud_stt(), "precondition: consent granted");
-
     let mut off = all_cloud_on();
     off.cloud_llm_opt_in = false;
-    off.cloud_stt_opt_in = false;
     off.jury_cloud_opt_in = false;
     stored.revoke_consent_now(&off); // ... and then the save fails, so update_settings is NOT called.
 
-    assert!(!in_flight.consent.cloud_stt(), "a withdrawal must not wait for a successful disk write");
-    assert!(!in_flight.consent.cloud_llm());
+    assert!(!in_flight.consent.cloud_llm(), "a withdrawal must not wait for a successful disk write");
     assert!(!in_flight.consent.jury_cloud());
     // The divergence is one-directional: the SNAPSHOT still says opted-in (disk and get_settings
     // report the old value, and the user is shown the save error), while egress is off. Safer than
     // displayed — never the reverse.
-    assert!(stored.settings.cloud_stt_opt_in, "the un-saved snapshot legitimately still reads opted-in");
+    assert!(stored.settings.cloud_llm_opt_in, "the un-saved snapshot legitimately still reads opted-in");
 }
 
 #[test]
@@ -1308,8 +1321,7 @@ fn revoke_consent_now_never_grants() {
     // session and silently vanish on the next launch.
     let stored = pipeline_with(AppSettings::default()); // all cloud OFF
     stored.revoke_consent_now(&all_cloud_on());
-    assert!(!stored.consent.cloud_stt(), "revoke_consent_now must never turn consent ON");
-    assert!(!stored.consent.cloud_llm());
+    assert!(!stored.consent.cloud_llm(), "revoke_consent_now must never turn consent ON");
     assert!(!stored.consent.jury_cloud());
 }
 

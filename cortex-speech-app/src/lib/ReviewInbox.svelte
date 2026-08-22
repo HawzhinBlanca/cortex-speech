@@ -567,8 +567,8 @@
     </button>
     {#if settings && !settings.juryCloudOptIn}
       <!-- Consent affordance: the jury's T2 tier can send audio to Gemini, but cloud T2 is opt-in.
-           The backend hard-refuses T2 egress when the opt-in is off (the run stays local) — surface
-           that state here so it's not silent, mirroring the gated Scribe buttons. -->
+           The backend hard-refuses T2 egress when the opt-in is off (the run stays local), so surface
+           that state here rather than making the privacy boundary silent. -->
       <span
         class="local-only-badge"
         data-testid="jury-local-only"

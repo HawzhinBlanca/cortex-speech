@@ -16,17 +16,15 @@
  *   CORTEX_DEBUG_PORT  (optional) WebView2 remote-debug port; default 9271 (private, see below)
  *   CORTEX_LOCALE      (optional) 'en' | 'ckb'; default 'en'
  *   CORTEX_ASR_ENGINE  (optional) engine to provision in the DISPOSABLE profile before import:
- *                       'CTC300M' (default: fully offline, runnable on any dev box), 'CTC1B',
- *                       'WSL7B' (needs the owner's warm 7B server + a seeded client script path —
- *                       the fresh profile's WSL7B default otherwise fail-hards the import BEFORE
- *                       any decode, and this harness would blame VAD), or 'keep' to leave the
- *                       profile's settings untouched.
+ *                       'WSL7B' (default; requires the already-running pinned champion), or an
+ *                       explicitly requested diagnostic engine ('CTC300M' / 'CTC1B'). There is no
+ *                       automatic smaller-model fallback. 'keep' leaves profile settings untouched.
  *   CORTEX_SKIP_DB_CLEAR (optional) '1' to keep existing DB rows (default: clear for a clean run)
  *
  * Exit code 0 only when: the app launched, VAD produced >=1 segment, the first segment
  * transcribed to NON-EMPTY text, and run.jsonl was written. Anything else is a hard failure.
  */
-const { spawn, execSync } = require('child_process');
+const { spawn, execFileSync, execSync } = require('child_process');
 const { chromium } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
@@ -271,12 +269,14 @@ async function run() {
   await page.evaluate((loc) => { localStorage.setItem('cortex-locale', loc); window.location.reload(); }, LOCALE);
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 30000 });
 
-  // Provision a RUNNABLE engine in the disposable profile. A fresh profile boots with the
-  // WSL7B default + no client script, so import fail-hards at the engine-unresolved gate BEFORE
-  // any decode — and this harness would then poll get_segments for 12 minutes and misreport the
-  // failure as "VAD produced 0 segments" (2026-07-11 root-cause). Round-trip the real settings
-  // object so only the engine field changes.
-  const ENGINE = process.env.CORTEX_ASR_ENGINE || 'CTC300M';
+  // Standard release proof is the production champion. A caller may name a smaller diagnostic
+  // engine explicitly, but absence/busyness of WSL7B never changes this selection.
+  // verify_10 sets CORTEX_GATE=1 globally. In that mode an inherited shell override must not turn a
+  // production proof into a small-model benchmark; manual runs retain the explicit diagnostic flag.
+  const ENGINE = process.env.CORTEX_GATE === '1' ? 'WSL7B' : (process.env.CORTEX_ASR_ENGINE || 'WSL7B');
+  if (!new Set(['WSL7B', 'CTC300M', 'CTC1B', 'keep']).has(ENGINE)) {
+    throw new Error(`Unsupported CORTEX_ASR_ENGINE ${JSON.stringify(ENGINE)}`);
+  }
   if (ENGINE !== 'keep') {
     console.log(`==> Provisioning ASR engine '${ENGINE}' in the disposable profile...`);
     // WSL7B (2026-08-20, external review blocker #8): the CHAMPION path is now a first-class E2E
@@ -289,6 +289,12 @@ async function run() {
       // Refinement off, same rationale as e2e_profile.cjs::provisionEngine: a configured refiner
       // that fails hard-stops the clip by design, and this gate is about the ASR engine.
       s.llm_mode = 'None';
+      s.multi_engine_hypotheses = false;
+      s.use_finetuned_asr = false;
+      s.cloud_stt_opt_in = false;
+      s.cloud_llm_opt_in = false;
+      s.jury_cloud_opt_in = false;
+      s.champion_supervision_enabled = false;
       if (cfg.engine === 'WSL7B') s.external_asr_script_path = cfg.script;
       await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
     }, { engine: ENGINE, script: championScript }).catch((e) => { throw new Error('Could not provision the ASR engine: ' + e.message); });
@@ -298,21 +304,38 @@ async function run() {
       // hang or refuse (measured 2026-08-20: the import sat in source_reference forever). Register
       // the LIVE machine's champion identity, exactly as the Rust preflight test does.
       console.log('==> Registering the live champion identity in the disposable registry...');
-      const pointer = JSON.parse(
-        require('fs').readFileSync(path.join(process.env.APPDATA, 'cortex-speech', 'champion.json'), 'utf-8'),
-      ).champions['omniasr-7b'];
-      const regPy = path.join(OUT_DIR, 'register_champion.py');
-      const q = String.fromCharCode(34);
-      require('fs').writeFileSync(regPy, [
-        'import sqlite3',
-        'con = sqlite3.connect(r' + q + path.join(DATA_DIR, 'cortex-speech.db') + q + ')',
-        'sql = ' + q + 'INSERT OR REPLACE INTO model_versions (id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status) VALUES (?, ' + String.fromCharCode(39) + 'omniasr-7b' + String.fromCharCode(39) + ', ' + String.fromCharCode(39) + 'soranivoice_omniASR_LLM_7B_v2_local' + String.fromCharCode(39) + ', ?, ?, ' + String.fromCharCode(39) + 'user-finetuned' + String.fromCharCode(39) + ', ' + String.fromCharCode(39) + 'owner-full-rights' + String.fromCharCode(39) + ', ' + String.fromCharCode(39) + 'champion' + String.fromCharCode(39) + ')' + q,
-        'con.execute(sql, (' + q + pointer.modelVersionId + q + ', ' + q + pointer.deploymentSha256 + q + ', ' + q + pointer.deploymentManifestPath + q + '))',
-        'con.commit()',
-        'con.close()',
-        'print(' + q + 'registered' + q + ')',
-      ].join(String.fromCharCode(10)), 'utf-8');
-      console.log('   ' + execSync('python ' + JSON.stringify(regPy), { cwd: REPO }).toString().trim());
+      const pointerPath = process.env.CORTEX_CHAMPION_POINTER ||
+        (process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech', 'champion.json') : '');
+      if (!pointerPath || !fs.existsSync(pointerPath)) {
+        throw new Error('WSL7B proof requires champion.json (set CORTEX_CHAMPION_POINTER)');
+      }
+      const pointer = JSON.parse(fs.readFileSync(pointerPath, 'utf-8')).champions?.['omniasr-7b'];
+      for (const key of ['modelVersionId', 'deploymentSha256', 'deploymentManifestPath']) {
+        if (!pointer || typeof pointer[key] !== 'string' || !pointer[key].trim()) {
+          throw new Error(`champion.json has no valid champions.omniasr-7b.${key}`);
+        }
+      }
+      const registerCode = [
+        'import sqlite3, sys',
+        'db, model_id, deployment_sha, manifest = sys.argv[1:]',
+        'con = sqlite3.connect(db, timeout=30)',
+        'con.execute("PRAGMA busy_timeout=30000")',
+        'try:',
+        '    con.execute("BEGIN IMMEDIATE")',
+        "    con.execute(\"UPDATE model_versions SET status = 'rolled_back' WHERE family = 'omniasr-7b' AND status = 'champion' AND id <> ?\", (model_id,))",
+        "    con.execute(\"INSERT OR REPLACE INTO model_versions (id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status) VALUES (?, 'omniasr-7b', 'soranivoice_omniASR_LLM_7B_v2_local', ?, ?, 'user-finetuned', 'owner-full-rights', 'champion')\", (model_id, deployment_sha, manifest))",
+        '    con.commit()',
+        'except:',
+        '    con.rollback()',
+        '    raise',
+        'finally:',
+        '    con.close()',
+      ].join('\n');
+      execFileSync(process.env.PYTHON || 'python', [
+        '-c', registerCode, path.join(DATA_DIR, 'cortex-speech.db'), pointer.modelVersionId,
+        pointer.deploymentSha256, pointer.deploymentManifestPath,
+      ], { stdio: 'pipe' });
+      console.log('   registered the pinned live champion in the disposable registry');
     }
   }
 
@@ -345,7 +368,7 @@ async function run() {
     throw new Error(
       'no segments appeared within the 12-min window (backend get_segments empty) — the import ' +
         'failed or never persisted. Check the [App] log above for the import error; a fresh ' +
-        "profile needs a runnable engine (see CORTEX_ASR_ENGINE, default 'CTC300M').",
+        "profile needs the pinned WSL7B champion (or an explicitly requested diagnostic CORTEX_ASR_ENGINE).",
     );
   }
   console.log(`==> VAD produced ${backendSegs.length} segment(s) (backend). Reloading UI to render from DB...`);
@@ -355,7 +378,7 @@ async function run() {
   const segCount = await page.locator('[data-testid="segment-card"]').count();
   console.log(`==> UI rendered ${segCount} segment-card(s).`);
 
-  console.log('==> Selecting first segment and running local ASR (OmniASR CTC)...');
+  console.log(`==> Selecting first segment and running ASR (${ENGINE})...`);
   await page.locator('[data-testid="segment-card"]').first().click();
   await page.waitForTimeout(800);
 

@@ -34,6 +34,7 @@ from pathlib import Path
 # A reviewer this far from running dry is fine; below it, they will be idle within a sitting and the
 # owner should know while there is still time to import more of that dialect.
 RUNWAY_WARN_CLIPS = 100
+VALID_DIALECTS = {"hawleri", "sorani", "badini"}
 
 
 def _reject_nonfinite(token: str):
@@ -91,9 +92,10 @@ def source_dialects(dialect_rs: str) -> list[tuple[str, str]]:
 
 def dialect_of(audio_path: str, table: list[tuple[str, str]]) -> str | None:
     """Mirror of `dialect::dialect_of`."""
-    normalized = audio_path.replace("/", "\\")
+    normalized = audio_path.replace("/", "\\").lower()
     name = normalized.rsplit("\\", 1)[-1]
     for fragment, dialect in table:
+        fragment = fragment.lower()
         if fragment in name or fragment in normalized:
             return dialect
     return None
@@ -104,7 +106,8 @@ def may_judge(allowed: list[str] | None, audio_path: str, table: list[tuple[str,
     if allowed is None:
         return True
     dialect = dialect_of(audio_path, table)
-    return dialect in allowed if dialect is not None else False
+    normalized_allowed = {value.strip().lower() for value in allowed}
+    return dialect in normalized_allowed if dialect is not None else False
 
 
 def load_roster(data_dir: Path) -> dict[str, list[str]]:
@@ -125,10 +128,22 @@ def load_roster(data_dir: Path) -> dict[str, list[str]]:
         if name.startswith("_"):
             continue
         if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            if not value:
+                raise PolicyBroken(f'reviewer_dialects.json entry "{name}" must name at least one dialect')
+            normalized = []
+            for dialect in value:
+                canonical = dialect.strip().lower()
+                if canonical not in VALID_DIALECTS:
+                    raise PolicyBroken(
+                        f'reviewer_dialects.json entry "{name}" contains unknown dialect "{dialect}" '
+                        f'(allowed: {sorted(VALID_DIALECTS)})'
+                    )
+                if canonical not in normalized:
+                    normalized.append(canonical)
             dupe = next((k for k in roster if k.strip().lower() == name.strip().lower()), None)
             if dupe is not None:
                 raise PolicyBroken(f'reviewer_dialects.json: "{name}" and "{dupe}" name the same reviewer')
-            roster[name] = value
+            roster[name] = normalized
         else:
             raise PolicyBroken(f'reviewer_dialects.json entry "{name}" is not a list of dialect names')
     return roster
@@ -232,18 +247,26 @@ def servable_clips(
 
 
 def wrong_dialect_decisions(db_path: Path, roster: dict[str, list[str]], table: list[tuple[str, str]]) -> dict[str, int]:
-    """Verified decisions made by a reviewer on a dialect they are not allowed to judge.
+    """Current, attributed decisions outside the reviewer's present dialect scope.
 
-    Reported, never failed: the 12 that exist predate the roster, and a gate that stays RED on
-    unfixable history buries the signal it was written to carry. It is here because the count should
-    only ever go DOWN — a NEW one means the routing broke again, and this is where that shows up.
+    ``review_events`` is append-only history, not the authority for the row's current verdict: an
+    undo, redo, later reviewer, or owner decision may supersede an older event.  Reading historical
+    events here previously blamed an old reviewer even when the segment was now rejected and
+    excluded downstream.  ``speech_segments.reviewed_by`` and ``human_decision`` are written
+    atomically by the current review path, so they are the only honest current-state attribution.
+
+    This remains a warning rather than a hard failure because tightening a roster can reveal legacy
+    work that predates the restriction.  A new warning after activation is nevertheless a routing
+    regression that must be investigated.
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = con.execute(
-            "SELECT DISTINCT e.reviewer, e.segment_id, s.audio_path FROM review_events e "
-            "  JOIN speech_segments s ON s.id = e.segment_id "
-            " WHERE e.action IN ('accept','edit','reject') AND s.verified = 1"
+            "SELECT reviewed_by, id, audio_path FROM speech_segments "
+            " WHERE verified = 1 "
+            "   AND TRIM(COALESCE(reviewed_by, '')) <> '' "
+            "   AND LOWER(COALESCE(human_decision, '')) IN "
+            "       ('accept','human_accept','edit','human_edit','reject','human_reject')"
         ).fetchall()
     finally:
         con.close()
@@ -318,9 +341,9 @@ def main() -> int:
         total = sum(offenders.values())
         detail = ", ".join(f"{who} {n}" for who, n in sorted(offenders.items()))
         warnings.append(
-            f"{total} verified decision(s) were made on a dialect the reviewer may not judge ({detail}). "
-            f"These predate the roster; they are still verified and carry weight downstream, so they "
-            f"need re-reviewing. This count must only ever go DOWN."
+            f"{total} current attributed decision(s) are outside the reviewer's present dialect scope "
+            f"({detail}). Accepted/edited rows may influence downstream data; rejected rows remain "
+            f"excluded but still indicate a routing-policy breach. Investigate before export."
         )
 
     for w in warnings:

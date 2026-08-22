@@ -68,6 +68,10 @@ def test_champion_is_the_factory_default_and_auxiliary_models_default_off() -> N
     assert re.search(r"\bfalse\b", multi_default), (
         "auxiliary 300M/1B/MMS hypotheses must default off so only the champion runs"
     )
+    assert "champion_supervision_enabled: false" in default_body, (
+        "starting the app must not auto-allocate the champion's GPUs; lifecycle supervision is an "
+        "explicit owner action"
+    )
 
 
 def test_legacy_auxiliary_flag_cannot_run_smaller_models_beside_champion() -> None:

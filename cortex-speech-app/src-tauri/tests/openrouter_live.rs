@@ -23,7 +23,6 @@ fn read_key(name: &str) -> Option<String> {
     match name {
         "OPENROUTER_API_KEY" => keys.openrouter,
         "GEMINI_API_KEY" => keys.gemini,
-        "ELEVENLABS_API_KEY" => keys.elevenlabs,
         _ => None,
     }
 }

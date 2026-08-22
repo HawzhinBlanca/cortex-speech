@@ -1,5 +1,11 @@
 <script lang="ts">
-  import { settings, showSettings, settingsTab, type AppSettings } from './stores/settingsStore';
+  import {
+    ADVISORY_CLOUD_MODEL,
+    settings,
+    showSettings,
+    settingsTab,
+    type AppSettings,
+  } from './stores/settingsStore';
   import { focusTrap } from './actions/focusTrap';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
@@ -24,8 +30,7 @@
   // Seeded ONCE from the store here (like localSettings above). It must NOT be re-mirrored from
   // $settings on every store change — see the removed $effect: saveQuietly()/toggles write the store
   // mid-edit, and re-seeding would revert whatever the user is currently typing (silent data loss).
-  let sourceReferenceModelsInput = $state(($settings.sourceReferenceModels ?? []).join(', '));
-  // Lowercase provider names whose key is present in secrets.env (e.g. "elevenlabs").
+  // Lowercase provider names whose key is present in secrets.env (Gemini/OpenRouter).
   // Read-only signal so cloud opt-ins can warn when their key is missing; never holds key values.
   let configuredProviders = $state<string[]>([]);
   const tauriAvailable = isTauriRuntime();
@@ -209,7 +214,6 @@
     // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
     if (cancelled) return;
     void flushPendingKeys();
-    applySourceReferenceModelsInput();
     // Close-to-save for theme/sliders (they have no per-field auto-save). Route through saveQuietly so
     // this path gets the SAME NaN coercion + rollback-on-failure + error toast as every other persist.
     // The old bare fire-and-forget updateSettings here skipped coerceSettingsForRuntime: clearing a
@@ -231,9 +235,10 @@
     const finite = (v: number, fallback: number): number => (Number.isFinite(v) ? v : fallback);
     localSettings = {
       ...localSettings,
-      // A stale optional-model toggle must not travel beside the selected champion. Rust already
-      // gives WSL7B precedence; normalize the persisted UI state too so it never claims otherwise.
-      useFinetuned: localSettings.asrModel === 'wsl-7b' ? false : localSettings.useFinetuned,
+      // Production is champion-only. Clamp stale local state too; the Rust trust boundary repeats
+      // this check before persistence so a forged webview payload cannot bypass it.
+      asrModel: 'wsl-7b',
+      useFinetuned: false,
       vadThreshold: finite(localSettings.vadThreshold, prev.vadThreshold),
       minSegmentSec: finite(localSettings.minSegmentSec, prev.minSegmentSec),
       maxSegmentSec: finite(localSettings.maxSegmentSec, prev.maxSegmentSec),
@@ -250,14 +255,13 @@
   // instantly while Cancel skipped the save — so cancelling left cloud consent ON with no way back,
   // misleading transaction behaviour for a privacy-sensitive permission (external audit 2026-08-17).
   // Strictly LESS persistence than before, so it cannot introduce a surprise write.
-  function consentToggled(field: 'cloudSttOptIn' | 'cloudLlmOptIn' | 'juryCloudOptIn') {
+  function consentToggled(field: 'cloudLlmOptIn' | 'juryCloudOptIn') {
     const wasGranted = get(settings)[field];
     if (wasGranted && !localSettings[field]) void saveQuietly();
   }
   // Named, not inline arrows in the markup: SettingsLocalizationPolicy scrapes these sections for
   // visible Latin text, and an inline `consentToggled('cloudLlmOptIn')` reads to it as untranslated
   // prose. Named handlers keep the markup free of quoted strings — and read better.
-  const sttConsentToggled = () => consentToggled('cloudSttOptIn');
   const llmConsentToggled = () => consentToggled('cloudLlmOptIn');
   const juryConsentToggled = () => consentToggled('juryCloudOptIn');
 
@@ -298,8 +302,8 @@
   // lands HERE, and only a confirmed write moves it.
   let lastPersisted: AppSettings = { ...get(settings) };
 
-  // The three cloud-consent PERMISSIONS, clamped by autosavable() below.
-  const CONSENT_FIELDS = ['cloudSttOptIn', 'cloudLlmOptIn', 'juryCloudOptIn'] as const;
+  // The two cloud-consent permissions, clamped by autosavable() below.
+  const CONSENT_FIELDS = ['cloudLlmOptIn', 'juryCloudOptIn'] as const;
 
   // What an AUTO-save may publish and persist: everything the panel holds, except that a consent
   // GRANT stays at its last-persisted value until the user presses Save. The consent transaction
@@ -309,7 +313,8 @@
   // (false) always goes through immediately: `local && persisted` can only ever clamp toward OFF.
   function autosavable(): AppSettings {
     const clamped = { ...localSettings };
-    for (const field of CONSENT_FIELDS) clamped[field] = localSettings[field] && lastPersisted[field];
+    for (const field of CONSENT_FIELDS)
+      clamped[field] = localSettings[field] && lastPersisted[field];
     return clamped;
   }
 
@@ -330,7 +335,7 @@
         console.error('Auto-save settings failed:', e);
         if (persistPending > 1) return; // superseded — the queued save re-asserts current intent (see enqueuePersist)
         // Roll BACK so the UI can't show a consent toggle (or any setting) as applied when the backend
-        // REJECTED the write. A silent consent mismatch — the user believes cloud STT/LLM is on (or off)
+        // REJECTED the write. A silent consent mismatch — the user believes advisory cloud work is on (or off)
         // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
         // to the last-persisted state and surface the failure instead of only logging it.
         rollbackTo(prev);
@@ -353,32 +358,7 @@
   // the app can never keep running on values that were never saved.
   function rollbackTo(prev: AppSettings) {
     localSettings = { ...prev };
-    sourceReferenceModelsInput = (prev.sourceReferenceModels ?? []).join(', ');
     settings.set({ ...prev });
-  }
-
-  function parseSourceReferenceModels(value: string): string[] {
-    const seen = new Set<string>();
-    const models = value
-      .split(',')
-      .map((model) => model.trim())
-      .filter((model) => model.length > 0)
-      .filter((model) => {
-        if (seen.has(model)) return false;
-        seen.add(model);
-        return true;
-      });
-    return models.length > 0 ? models : ['gemini-2.5-pro'];
-  }
-
-  function saveSourceReferenceModels() {
-    applySourceReferenceModelsInput();
-    saveQuietly();
-  }
-
-  function applySourceReferenceModelsInput() {
-    localSettings.sourceReferenceModels = parseSourceReferenceModels(sourceReferenceModelsInput);
-    sourceReferenceModelsInput = localSettings.sourceReferenceModels.join(', ');
   }
 
   const tabs = [
@@ -400,7 +380,6 @@
       await enqueuePersist(async () => {
         const prev = { ...lastPersisted }; // the true last-persisted state, never an optimistic store value
         try {
-          applySourceReferenceModelsInput();
           coerceSettingsForRuntime();
           settings.set(publishable());
           if (!tauriAvailable) {
@@ -752,26 +731,10 @@
             {/if}
           </div>
         {:else if activeTab === 'asr'}
-          <label class="flex items-center gap-3">
+          <div class="flex items-center gap-3" data-testid="production-asr-model">
             <span class="text-sm text-muted w-32">{$t('asrModel')}</span>
-            <select class="input flex-1" bind:value={localSettings.asrModel}>
-              <option value="ctc-300m">Meta OmniASR CTC 300M</option>
-              <option value="ctc-1b">Meta OmniASR CTC 1B</option>
-              <option value="wsl-7b">Meta OmniASR 7B Champion + LoRA (WSL GPU)</option>
-            </select>
-          </label>
-          {#if localSettings.asrModel !== 'wsl-7b'}
-            <label class="flex items-center gap-3 cursor-pointer">
-              <input
-                type="checkbox"
-                bind:checked={localSettings.useFinetuned}
-                class="accent-cortex-500"
-                data-testid="use-finetuned-toggle"
-              />
-              <span class="text-sm text-muted">{$t('settings.useFinetuned')}</span>
-            </label>
-            <p class="-mt-1 ms-8 text-xs text-subtle">{$t('settings.useFinetunedHint')}</p>
-          {/if}
+            <span class="input flex-1">Meta OmniASR 7B Champion + LoRA</span>
+          </div>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('threads')}</span>
             <input
@@ -831,33 +794,6 @@
             />
             <span class="text-xs text-cortex-400">{$t('seconds')}</span>
           </label>
-          <label
-            class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3 cursor-pointer"
-          >
-            <input
-              type="checkbox"
-              class="mt-1 accent-cortex-500"
-              bind:checked={localSettings.cloudSttOptIn}
-              onchange={sttConsentToggled}
-            />
-            <!-- Consent copy MUST be in the user's language (true-10 audit): voice is biometric,
-                 and the opt-in text is where clarity matters most. -->
-            <span class="text-xs text-amber-100">
-              {$t('settings.cloudSttConsent')}
-            </span>
-          </label>
-          {#if tauriAvailable && localSettings.cloudSttOptIn}
-            {#if configuredProviders.includes('elevenlabs')}
-              <p class="text-[10px] text-emerald-300 -mt-1" data-testid="elevenlabs-key-status">
-                ✓ ElevenLabs key detected in secrets.env.
-              </p>
-            {:else}
-              <p class="text-[10px] text-amber-300 -mt-1" data-testid="elevenlabs-key-status">
-                ⚠ No ElevenLabs key found in secrets.env — cloud transcription will fail until you
-                add one.
-              </p>
-            {/if}
-          {/if}
           <label class="flex items-center gap-3 cursor-pointer">
             <input
               type="checkbox"
@@ -987,7 +923,11 @@
             </label>
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-32">{$t('settings.llmEngine')}</span>
-              <select class="input flex-1" bind:value={localSettings.llmMode}>
+              <select
+                data-testid="llm-engine-select"
+                class="input flex-1"
+                bind:value={localSettings.llmMode}
+              >
                 <option value="None">{$t('settings.llmDisabledOption')}</option>
                 <option value="Local">{$t('settings.llmLocalOption')}</option>
                 <option value="Gemini">{$t('settings.llmCloudOption')}</option>
@@ -1086,36 +1026,23 @@
                 </div>
                 <span class="text-[10px] text-subtle">{$t('settings.apiKeyStorageHint')}</span>
               </label>
-              <label class="flex flex-col gap-1 mt-2">
+              <div class="flex flex-col gap-1 mt-2">
                 <span class="text-sm text-muted">{$t('settings.geminiModel')}</span>
-                <input
-                  type="text"
-                  class="input w-full"
-                  bind:value={localSettings.llmModel}
-                  onblur={saveQuietly}
-                  onchange={saveQuietly}
-                  placeholder="gemini-2.5-pro"
-                />
-                <span class="text-[10px] text-subtle">
-                  {$t('settings.quickSelect')}
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => {
-                      localSettings.llmModel = 'gemini-2.5-pro';
-                      saveQuietly();
-                    }}>{$t('settings.geminiProRecommended')}</button
+                <div
+                  data-testid="cloud-llm-model-fixed"
+                  class="rounded-md border border-cortex-700/50 bg-cortex-900/40 px-3 py-2"
+                >
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="text-sm font-medium text-default"
+                      >{$t('settings.advisoryModelName')}</span
+                    >
+                    <span class="text-[10px] text-subtle">{$t('settings.modelFixedByPolicy')}</span>
+                  </div>
+                  <span class="mt-0.5 block font-mono text-[10px] text-cortex-400"
+                    >{ADVISORY_CLOUD_MODEL}</span
                   >
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => {
-                      localSettings.llmModel = 'gemini-2.5-flash';
-                      saveQuietly();
-                    }}>{$t('settings.geminiFlash')}</button
-                  >
-                </span>
-              </label>
+                </div>
+              </div>
             {/if}
 
             <label class="flex flex-col gap-1 mt-4">
@@ -1139,6 +1066,7 @@
               class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3"
             >
               <input
+                data-testid="jury-cloud-opt-in"
                 type="checkbox"
                 class="mt-1 accent-cortex-500"
                 bind:checked={localSettings.juryCloudOptIn}
@@ -1199,66 +1127,26 @@
 
             <!-- T2 model + self-consistency -->
             {#if localSettings.juryCloudOptIn}
-              <label class="flex flex-col gap-1">
+              <div class="flex flex-col gap-1">
                 <span class="text-sm text-muted">{$t('settings.juryModelLabel')}</span>
-                <input
-                  type="text"
-                  class="input w-full"
-                  bind:value={localSettings.juryModel}
-                  onblur={saveQuietly}
-                  placeholder="gemini-2.5-pro"
-                />
+                <div
+                  data-testid="jury-model-fixed"
+                  class="rounded-md border border-cortex-700/50 bg-cortex-900/40 px-3 py-2"
+                >
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="text-sm font-medium text-default"
+                      >{$t('settings.advisoryModelName')}</span
+                    >
+                    <span class="text-[10px] text-subtle">{$t('settings.modelFixedByPolicy')}</span>
+                  </div>
+                  <span class="mt-0.5 block font-mono text-[10px] text-cortex-400"
+                    >{ADVISORY_CLOUD_MODEL}</span
+                  >
+                </div>
                 <span class="text-[10px] text-subtle">
-                  {$t('settings.quickSelect')}
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => {
-                      localSettings.juryModel = 'gemini-2.5-pro';
-                      saveQuietly();
-                    }}>{$t('settings.modelProRecommended')}</button
-                  >
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => {
-                      localSettings.juryModel = 'gemini-2.5-flash';
-                      saveQuietly();
-                    }}>{$t('settings.modelFlashFaster')}</button
-                  >
+                  {$t('settings.sourceReferenceFixedHint')}
                 </span>
-              </label>
-
-              <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">{$t('settings.sourceReferenceModels')}</span>
-                <input
-                  type="text"
-                  class="input w-full"
-                  bind:value={sourceReferenceModelsInput}
-                  onblur={saveSourceReferenceModels}
-                  onchange={saveSourceReferenceModels}
-                  placeholder="gemini-2.5-pro, gemini-2.5-flash"
-                />
-                <span class="text-[10px] text-subtle">
-                  {$t('settings.quickSelect')}
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => {
-                      sourceReferenceModelsInput = 'gemini-2.5-pro, gemini-2.5-flash';
-                      saveSourceReferenceModels();
-                    }}>{$t('settings.sourceModelsBoth')}</button
-                  >
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => {
-                      sourceReferenceModelsInput = 'gemini-2.5-pro';
-                      saveSourceReferenceModels();
-                    }}>{$t('settings.sourceModelsProOnly')}</button
-                  >
-                </span>
-              </label>
+              </div>
 
               <label class="flex items-center gap-3">
                 <span class="text-sm text-muted w-36">{$t('settings.selfConsistencyLabel')}</span>

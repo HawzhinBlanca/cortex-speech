@@ -493,15 +493,12 @@ def _probe_real_e2e():
     # back "22 PASS, 0 FAIL" with it reported SKIP-ENV. The harness now defaults to the committed
     # FLEURS ckb fixture, so the only honest reason left to skip is that fixture being absent.
     # CORTEX_AUDIO still overrides it, and the harness prints whichever path it used.
-    if os.environ.get("CORTEX_AUDIO"):
-        return None
-    if not (SRC_TAURI / "tests" / "fixtures" / "fleurs_ckb_sample.wav").exists():
+    if not os.environ.get("CORTEX_AUDIO") and not (
+        SRC_TAURI / "tests" / "fixtures" / "fleurs_ckb_sample.wav"
+    ).exists():
         return "committed audio fixture missing - set CORTEX_AUDIO=<absolute wav path> instead"
-    return None
+    return _probe_champion_7b()
 
-
-# Every place a model can legitimately live, mirroring models.rs::model_root_candidates.
-_MODEL_ROOTS = [SRC_TAURI / "models", SRC_TAURI / "target" / "release" / "models"]
 
 def _probe_bench():
     if not (SRC_TAURI / "benches").is_dir():
@@ -511,25 +508,22 @@ def _probe_bench():
     return None
 
 
-def _probe_ipc_harness(extra=None):
-    """Shared probe for the IPC e2e harnesses: the exe, the committed fixture, and any extra model.
+def _probe_ipc_harness():
+    """Shared executable/fixture probe for disposable-profile IPC harnesses.
 
     They now default to that fixture and run against a DISPOSABLE profile (e2e_profile.cjs), so the
-    only honest reasons left to skip are a missing binary or a missing model — not a forgotten env var.
+    only generic reasons to skip are a missing binary or fixture — not a forgotten env var.
     """
     if not EXE.exists():
         return "release exe missing - run `make build-app`"
     if not (SRC_TAURI / "tests" / "fixtures" / "fleurs_ckb_sample.wav").exists():
         return "committed audio fixture missing"
-    if extra is not None and not any((root / extra).exists() for root in _MODEL_ROOTS):
-        return f"{extra} not present in any model root"
     return None
 
 
-def _probe_silero():
-    if (SRC_TAURI / "models" / "silero_vad_v4.onnx").exists():
-        return None
-    return "models missing - run `cd cortex-speech-app && npm run fetch-models`"
+def _probe_champion_ipc_harness():
+    reason = _probe_ipc_harness()
+    return reason or _probe_champion_7b()
 
 
 def _probe_champion_7b():
@@ -567,7 +561,7 @@ def _probe_champion_7b():
     except (ValueError, UnicodeDecodeError) as exc:
         return f"7B server answered on {port} but its health reply is unparseable ({exc}) — NOT the champion protocol"
     if reply.get("code") == "BUSY":
-        return None  # every replica mid-decode IS a ready champion under load
+        return "7B server is saturated and returned BUSY without identity — retry when health can prove the champion pin"
     if reply.get("status") != "ready":
         return f"7B server on {port} is not ready: {reply.get('error') or reply.get('status')!r}"
     appdata = _os.environ.get("APPDATA")
@@ -586,22 +580,11 @@ def _probe_champion_7b():
     return None
 
 
-def _probe_rtf():
-    if (SRC_TAURI / "models" / "omniasr-ctc-300m" / "model.int8.onnx").exists():
-        return None
-    return "OmniASR CTC-300M model missing - run fetch-models"
-
-
 def _probe_egress():
     if not EXE.exists():
         return "release exe missing - run `make build-app`"
     if sys.platform != "win32":
         return "egress probe samples Windows TCP (Get-NetTCPConnection); runs on the owner Windows rig"
-    # Require the CTC model the transcribe leg needs — the SAME location the app resolves it from and
-    # every other model gate checks (src-tauri/models). Without this the gate would run browse-only yet
-    # its charter advertises ASR-path coverage: SKIP-ENV honestly (INCOMPLETE) instead of a false GREEN.
-    if not (SRC_TAURI / "models" / "omniasr-ctc-300m" / "model.int8.onnx").exists():
-        return "OmniASR CTC-300M model missing (transcribe leg requires it) - run fetch-models"
     return None
 
 
@@ -720,31 +703,30 @@ GATES = [
     ("lint-js", 1, "cmd", "npm run lint", APP, None, "eslint"),
     ("clippy", 1, "cmd", f'cargo clippy --manifest-path "{MANIFEST}" --all-targets -- -D warnings', REPO_ROOT, None, "Engineering rigor: clippy -D warnings"),
     ("fmt-check", 1, "cmd", f'cargo fmt --manifest-path "{MANIFEST}" --all -- --check', REPO_ROOT, None, "rustfmt"),
-    ("model-integrity", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fetch_models.py"}" --check', APP, None, "Model integrity: SHA-256 of every PINNED model file. fetch_models.py calls --check 'the CI/dev integrity gate' in its own docstring and nothing ran it - a swapped or truncated model still LOADS and decodes to wrong graphemes, which is the silent-corruption class the runtime pin in asr.rs exists for. Offline, so it is a tier-1 gate, not env-dependent."),
+    ("runtime-asset-integrity", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fetch_models.py"}" --check', APP, None, "SHA-256 of every required runtime-support asset plus every optional ASR artifact already present. Missing optional 300M/1B/MMS is healthy; a partial or mismatched optional installation is RED. The externally served WSL7B identity is proven separately at the serving path."),
     ("test-frontend", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "assert_ran.py"}" --min 200 --kind vitest -- npm test', APP, None, "vitest, with a floor. MEASURED 2026-08-03: vitest exits 0 when it matches ZERO tests, so broken discovery (a stray -t, an include pattern that stops matching) would have read as a clean pass. Floor 200 against a real 217; assert_ran also FAILS if it cannot find the count line at all, because a guard that silently stops understanding its input is worse than none."),
     ("test-rust", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "assert_ran.py"}" --min 1100 --kind cargo -- cargo test --manifest-path "{MANIFEST}" --jobs 4', REPO_ROOT, None, "Sorani goldens, wer-vs-jiwer, holdout hash, ONNX manifest, proof-metadata. MEASURED 2026-08-03: `cargo test` exits 0 on 'test result: ok. 0 passed; 1105 filtered out', so a cfg or filter that silently excluded the test tree would have read as a clean pass on the LARGEST leg. Floor 1100 against a real 1193 across 35 binaries."),
     ("audit", 1, "cmd", "npm audit --omit=dev && npm ls --all", APP, None, "npm supply chain. `npm ls --all` is the second half deliberately: MEASURED 2026-08-06, `npm audit` reported 0 vulnerabilities while the INSTALLED tree was structurally invalid (ELSPROBLEMS: a hoisted picomatch@2 could not satisfy the `^3 || ^4` peer fdir asks for). A clean audit says 'no KNOWN CVE in what resolved'; it says nothing about whether the tree resolved correctly at all. Both halves, or the gate only proves half of supply chain."),
     ("deny", 1, "cmd", f'cargo deny --manifest-path "{MANIFEST}" check', REPO_ROOT, _probe_deny, "cargo supply chain"),
     ("test-e2e+a11y", 1, "cmd", "npm run test:e2e", APP, None, "A11y: axe WCAG 2.2 AA en+ckb/RTL (coverage assertion: WS2 follow-up)"),
     # Tier 2 — real binary on this machine (the personal-use core)
+    ("database-integrity-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_database_integrity.py"}" --require-production-v58-repair', APP, None, "Whole LIVE SQLite truth, read-only and unskippable: quick_check and full integrity_check must each return exactly ok, foreign_key_check must return zero rows across every table, migration history must be exact, and the immutable v58 archives must prove the authorized 2,104+2,104 production repair by identity digest and provenance. Feature-specific gates cannot certify a database that is structurally healthy but missing its repair evidence."),
+    ("review-compensation-readiness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_compensation_readiness.py"}"', APP, None, "Paid-review money truth on the LIVE database and active focus: the immutable policy must be exactly review-iqd-v1-2026-08-21 (edit 100%, unchanged accept 10%, valid reject 10%, skip 0% at 18,000 IQD/full-equivalent hour); every post-cutoff Couch event must have one exact durable ledger consequence; signed revisions, settlements, operation UUIDs, and canonical focused-work identities must balance. Missing migration/schema/evidence is RED, never skipped — source code containing migration 57 is not proof that the live database actually runs it."),
+    ("reviewer-links-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_reviewer_links_live.py"}" --funnel --port 8737 --require-links --require-pilot', APP, None, "The exact Hawzhin and Pavel pilot credentials must authenticate through the advertised Tailscale Funnel and bind to the intended identities, database and fixed production port. The dedicated probe is read-only: it mints no cookie, evicts no phone session, leases no work and consumes no hidden-check key. Queue eligibility is independently proven by reviewer-queues-live. Public TLS verification remains enabled; missing Funnel/session/policy/links is RED, never skipped."),
     ("exe-freshness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_exe_freshness.py"}"', REPO_ROOT, _probe_exe, "Truth-in-advertising: exe compiled from HEAD"),
     ("playback-enforcement-readiness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_playback_enforcement_readiness.py"}" --exe "{EXE}"', APP, None, "Paid-review listening proof for the EXACT deployed binary: the build contains the refusal guard, at least 20 post-build phone decisions cover at least two reviewer browsers, and every landed decision carries >=85% playback evidence. No env probe and no --since override: a missing binary/database or an empty current-build window is RED, never skipped or backdated into a pass."),
     ("supervision-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_supervision_live.py"}"', REPO_ROOT, None, "Fitness to SERVE, not just to compile: the watchdog is enabled, every live reviewer link answers on 8737, and the data drive has room to write. MEASURED 2026-08-15: all three were false at once — CortexWatchdog left `Disabled` by the rebuild procedure, the app exited so five sent links were dead, and C: at 0 bytes had already broken the 10-minute DB snapshot ('periodic DB snapshot failed'). Every source-level gate was still capable of GREEN, because none of them looks at the machine."),
-    ("real-app-e2e", 2, "cmd", f'node "{APP / "e2e_real_app.cjs"}"', APP, _probe_real_e2e, "THE daily-use reliability gate: real exe, real audio, real transcript"),
+    ("real-app-e2e", 2, "cmd", f'node "{APP / "e2e_real_app.cjs"}"', APP, _probe_real_e2e, "Daily-use proof on a disposable profile: real exe + real audio + the exact pinned WSL7B champion + real transcript. CORTEX_GATE forces WSL7B, so an inherited diagnostic-engine override cannot weaken this gate."),
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)
-    ("egress-runtime", 3, "cmd", f'node "{APP / "scripts" / "egress_probe.cjs"}"', APP, _probe_egress, "Privacy: zero outbound sockets at runtime — egress_probe.cjs proves ZERO external TCP from the backend PID across startup + browse + a REAL offline transcription (import->VAD->CTC ASR, the path where cloud STT/LLM would fire if consent leaked), with an in-run POSITIVE CONTROL that fails loud if the sampler is dead (no vacuous pass). Poll-sampled (200ms) + TCP-only; an airtight kernel/ETW socket trace is a further stretch. SKIP-ENV off the Windows rig / without the exe. Static test_cloud_privacy_policy.py is belt-and-braces."),
-    ("ignored-real-model", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored --skip live_transcribe_segments --skip refinery_lift --skip wsl_7b_preflight', REPO_ROOT, _probe_silero, "WS3a: the 37 #[ignore] real-model gates (cloud-key test excluded; refinery_lift benchmark+diag excluded — the benchmark has its own dedicated leg; the 7B preflight excluded — it needs an external WSL server and has its own leg, so its absence cannot red the six tests that run on models in this tree)"),
+    ("egress-runtime", 3, "cmd", f'node "{APP / "scripts" / "egress_probe.cjs"}"', APP, _probe_egress, "Privacy: zero outbound TCP from the backend PID during startup + browse, with a positive-control sampler. Standard coverage makes no ASR-path claim and never auto-runs an installed smaller model. An explicit CORTEX_EGRESS_TRANSCRIBE=1 diagnostic adds WSL7B transcription coverage on a disposable profile."),
     ("champion-7b-preflight", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored wsl_7b_preflight', REPO_ROOT, _probe_champion_7b, "The champion's preflight against the REAL OmniASR-7B server. The champion drafts every clip (owner rule 2026-08-11), so the check that it is reachable before an import starts is the difference between a halt and a library half-drafted by a weaker engine."),
     # Deliberately count-agnostic: the gate enumerates targets with `cargo fuzz list` and fails loud on an
     # empty list, so hardcoding a number here only creates a second place to go stale. It said "5" until
     # the `features` target was removed with the dead FbankExtractor module it fuzzed (iteration 231).
     ("fuzz-smoke", 3, "fn", _fn_fuzz_smoke, None, _probe_fuzz, "Engineering rigor: every fuzz target, 0 crashes"),
-    ("rtf-bench", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test real_audio -- --ignored omniasr_rtf_on_committed_fleurs_ckb_fixture --nocapture', REPO_ROOT, _probe_rtf, "Latency: RTF on this rig (baseline-regression gate: WS4)"),
     ("refinery-lift", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --test refinery_lift -- --ignored refinery_lift_injected_error_benchmark --nocapture', REPO_ROOT, None, "Refinery: >=30% CER reduction at <=15% escalation (fixed-seed injected-error benchmark, offline T0 path)"),
     ("fairness-gender-age", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "fairness_gate.py"}"', REPO_ROOT, None, "WS4: gender/age CER disparity budget on committed corpus metadata (CORDI dialect leg owner-gated)"),
-    ("pipeline-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_pipeline_ipc.cjs"}"', APP, _probe_ipc_harness, "Import->VAD->ASR over the REAL IPC on a disposable profile, independent of webview rendering"),
-    ("constrained-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_constrained_ipc.cjs"}"', APP, _probe_ipc_harness, "transcribe_segment_constrained on the real exe: non-blank Kurdish, no Latin leak"),
-    ("finetuned-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_finetuned_ipc.cjs"}"', APP, lambda: _probe_ipc_harness("finetuned-mms-ckb"), "transcribe_segment_finetuned resolves + loads + decodes the embedded champion model"),
+    ("pipeline-ipc-e2e", 3, "cmd", f'node "{APP / "e2e_pipeline_ipc.cjs"}"', APP, _probe_champion_ipc_harness, "Import -> VAD -> exact pinned WSL7B -> persisted transcript over real IPC on a disposable profile, independent of webview rendering."),
     ("heartbeat-runtime", 3, "cmd", f'node "{APP / "scripts" / "heartbeat_probe.cjs"}"', APP, _probe_ipc_harness, "Main-thread safety PROVEN AT RUNTIME: get_settings latency while slow commands run concurrently. The static test_command_main_thread_policy/test_ui_thread_blocking_audit pin the source shape; this measures the actual UI responsiveness they exist to protect."),
     ("bench-budget", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "bench_gate.py"}"', APP, _probe_bench, "Criterion wall-clock regression budget against a COMMITTED baseline (docs/bench_baseline.json). The charter asks for this via github-action-benchmark on every PR; that CI clause is NOT satisfied here and stays open - this enforces the budget on the reference machine, where the charter's latency numbers are defined. Per-bench thresholds derived from measured run-to-run noise, and benches too noisy to gate are NAMED every run rather than given a pass-anything limit."),
     ("jobs-runtime", 3, "cmd", f'node "{APP / "scripts" / "jobs_probe.cjs"}"', APP, _probe_exe, "Durable Job Supervisor at runtime: a REAL export_dataset run is recorded in get_jobs and reaches 'succeeded' - the run_tracked bracketing proven end to end, not only in unit tests."),

@@ -25,7 +25,6 @@ export async function installTauriMock(page: Page): Promise<void> {
       asr_model_size: 'WSL7B',
       multi_engine_hypotheses: false,
       use_finetuned_asr: false,
-      cloud_stt_opt_in: false,
       external_asr_script_path: '/root/cortex_env/cortex_7b_client.py',
       vad_threshold: 0.5,
       min_segment_duration_ms: 3000,
@@ -177,10 +176,10 @@ export async function installTauriMock(page: Page): Promise<void> {
             };
           case 'get_configured_providers':
             // Names only, never key values — matches the real configured_providers() contract.
-            return ['elevenlabs'];
+            return ['gemini'];
           case 'set_api_key':
             // Echo the post-save provider-NAMES list (never a key value), like the real command.
-            return ['elevenlabs', args?.provider ?? 'openrouter'];
+            return ['gemini', args?.provider ?? 'openrouter'];
           case 'update_segment_fields':
             // F10 partial autosave: true = the fresh row existed and the fields were applied.
             return true;
@@ -238,10 +237,6 @@ export async function installTauriMock(page: Page): Promise<void> {
             ];
           case 'clear_tracing_spans':
             return null;
-          case 'transcribe_audio_with_scribe':
-            return 'سکرایب کوردی';
-          case 'add_scribe_votes':
-            return 1;
           case 'import_model_checkpoint':
             return args?.id ?? 'imported-candidate';
           case 'plugin:dialog|open':
@@ -304,28 +299,64 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'list_model_versions':
             return [
               {
-                id: 'finetuned-mms-ckb',
-                family: 'mms-ckb',
-                model_card_name: 'MMS-CTC-1B (ckb)',
+                id: 'omniasr-7b-champion',
+                family: 'omniasr-7b',
+                model_card_name: 'Pinned Kurdish champion deployment',
                 checkpoint_sha256:
                   'a1b2c3d4e5f600112233445566778899aabbccddeeff00112233445566778899',
-                checkpoint_path: '',
-                source: 'fine-tune',
-                license: 'CC-BY-NC-4.0',
+                source: 'owner-finetune',
+                license: 'Apache-2.0',
                 status: 'champion',
               },
               {
-                id: 'omniasr-ctc-300m',
-                family: 'omniasr',
+                id: 'omniasr-7b-challenger',
+                family: 'omniasr-7b',
                 model_card_name: null,
                 checkpoint_sha256:
                   '00112233445566778899aabbccddeeffa1b2c3d4e5f6000000000000deadbeef',
-                checkpoint_path: '',
-                source: 'bundled',
-                license: 'CC-BY-4.0',
+                source: 'owner-finetune',
+                license: 'Apache-2.0',
                 status: 'candidate',
               },
             ];
+          case 'models_status':
+            return [
+              {
+                name: 'Silero VAD v4',
+                filename: 'silero_vad_v4.onnx',
+                downloaded: true,
+                exists: true,
+                size_bytes: 2_000_000,
+                min_size_bytes: 1_000_000,
+                version: '4.0',
+                source: 'bundled',
+                downloadable: true,
+              },
+              {
+                name: 'CAM++ Speaker Embedding',
+                filename: 'campp/model.onnx',
+                downloaded: true,
+                exists: true,
+                size_bytes: 12_000_000,
+                min_size_bytes: 10_000_000,
+                version: '1.0',
+                source: 'bundled',
+                downloadable: true,
+              },
+              {
+                name: 'AI Audio Denoiser',
+                filename: 'denoiser/model.onnx',
+                downloaded: true,
+                exists: true,
+                size_bytes: 500_000,
+                min_size_bytes: 400_000,
+                version: '1.0',
+                source: 'bundled',
+                downloadable: true,
+              },
+            ];
+          case 'models_download_all':
+            return { downloaded: 0, failed: 0, total: 0, skipped: 0 };
           case 'get_inference_stats':
             return {
               vad: { calls: 0, failures: 0, p50_ms: 0, p99_ms: 0 },

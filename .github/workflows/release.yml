@@ -51,12 +51,12 @@ jobs:
         run: npx playwright install --with-deps chromium
       - if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: npx playwright install chromium
-      # Base models AND a built dist/ must exist BEFORE any cargo step: build.rs -> tauri-build
+      # Runtime support AND a built dist/ must exist BEFORE any cargo step: build.rs -> tauri-build
       # validates bundle.resources (models/silero_vad_v4.onnx, ...) and tauri::generate_context!
       # (compiled by clippy and cargo test below) requires build.frontendDist ("../dist"). This is
       # the same provisioning ci.yml uses - without it the tag gate failed by construction (the
       # 2026-07-09 nightly red was exactly this class; true-10 audit).
-      - name: Fetch + verify models (bundle.resources)
+      - name: Fetch + verify runtime support (bundle.resources)
         run: npm run fetch-models
       - name: Build frontend (generate_context needs ../dist)
         run: npm run build

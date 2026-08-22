@@ -884,30 +884,16 @@ fn v35_repairs_divergent_segments_fts_so_segment_writes_succeed() {
         "a 4-column segments_fts under audio_path triggers must reject segment inserts (the real bug)"
     );
 
-    // Re-apply the repair migration (rewind past v35 so run_migrations re-runs it). v36's
-    // proof-metadata ALTERs are not idempotent, so undo them first (its down_sql) or the
-    // re-run fails on "duplicate column name". Same for v39's RENAME COLUMN — re-running it on an
-    // already-renamed schema fails with "no such column: ood_score" — so undo it too. And the same for
-    // v52's rename: the replay passes back through v40, whose INSERT…SELECT names `agent_confidence`
-    // explicitly, so the column has to be under its pre-v52 name for that leg exactly as it would be
-    // during a real upgrade. v52 re-runs at the end of the replay and restores the HEAD name.
-    db.connection()
-        .execute_batch(
-            "DROP INDEX IF EXISTS idx_segments_confidence_source;
-                 DROP INDEX IF EXISTS idx_segments_cloud_call;
-                 ALTER TABLE speech_segments DROP COLUMN normalizer_version;
-                 ALTER TABLE speech_segments DROP COLUMN decoder_config_hash;
-                 ALTER TABLE speech_segments DROP COLUMN cloud_call;
-                 ALTER TABLE speech_segments DROP COLUMN confidence_source;
-                 ALTER TABLE speech_segments RENAME COLUMN signal_anomaly_score TO ood_score;
-                 ALTER TABLE speech_segments RENAME COLUMN agreement_score TO agent_confidence;
-                 -- v56 must be hand-reverted like the columns above: replaying from v34 re-runs its
-                 -- ADD COLUMN, and a real v34 database has no review_events.duration_ms either.
-                 ALTER TABLE review_events DROP COLUMN duration_ms;",
-        )
-        .unwrap();
-    db.connection().execute("DELETE FROM schema_migrations WHERE version >= 35", []).unwrap();
-    crate::migrations::run_migrations(&db).unwrap();
+    // Exercise v35's exact repair SQL, not a synthetic half-rewind of every later migration. Deleting
+    // only history rows from a HEAD database leaves later schema (for example v57's compensation
+    // columns) in place and is not a state a real upgrade can produce; replaying v35..HEAD over that
+    // hybrid correctly fails on duplicate later DDL and obscures this regression's actual contract.
+    let repair = crate::migrations::MIGRATIONS.iter().find(|migration| migration.version == 35).unwrap();
+    db.connection().execute_batch(repair.up_sql).unwrap();
+    assert!(
+        crate::migrations::run_migrations(&db).unwrap().is_empty(),
+        "repairing FTS directly must not alter the already-complete migration history"
+    );
 
     // After v35, the write the import path depends on succeeds again.
     db.insert_segment(&make_segment("fixed", "/b.wav"))
@@ -2619,6 +2605,28 @@ fn restore_rejects_a_corrupt_source_before_overwriting_the_live_db() {
 }
 
 #[test]
+fn restore_staging_does_not_create_sidecars_beside_a_frozen_snapshot() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let snapshot_path = tmp.path().join("manifest-bound snapshot ڕ.db");
+    {
+        let snapshot = Database::open(snapshot_path.to_str().unwrap()).unwrap();
+        snapshot.initialize().unwrap();
+        snapshot.insert_segment(&make_segment("frozen-source", "/frozen.wav")).unwrap();
+        snapshot.wal_checkpoint().unwrap();
+    }
+    let wal = sqlite_sidecar_path(&snapshot_path, "-wal");
+    let shm = sqlite_sidecar_path(&snapshot_path, "-shm");
+    let _ = std::fs::remove_file(&wal);
+    let _ = std::fs::remove_file(&shm);
+    assert!(!wal.exists() && !shm.exists(), "fixture must start as one manifest-bound DB file");
+
+    let staged = Database::stage_restore_source(&snapshot_path).expect("frozen snapshot stages");
+    assert!(staged.get_segment_by_id("frozen-source").unwrap().is_some());
+    assert!(!wal.exists(), "read-only restore preflight must not create a WAL beside its source");
+    assert!(!shm.exists(), "read-only restore preflight must not create shared memory beside its source");
+}
+
+#[test]
 fn restore_refuses_a_snapshot_from_a_newer_schema_without_clobbering_the_live_db() {
     // Restore copies pages directly, bypassing run_migrations' startup forward-compat guard. A
     // snapshot at a schema NEWER than this build must be refused, or the app would silently operate a
@@ -2667,6 +2675,105 @@ fn restore_refuses_a_snapshot_from_a_newer_schema_without_clobbering_the_live_db
 }
 
 #[test]
+fn restore_refuses_incomplete_migration_history_without_clobbering_the_live_db() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let live_path = tmp.path().join("live-history.db");
+    let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
+    live.initialize().unwrap();
+    live.insert_segment(&make_segment("keep-history", "/keep.wav")).unwrap();
+
+    let damaged_path = tmp.path().join("damaged-history.db");
+    {
+        let damaged = Database::open(damaged_path.to_str().unwrap()).unwrap();
+        damaged.initialize().unwrap();
+        damaged.connection().execute("DELETE FROM schema_migrations WHERE version = 23", []).unwrap();
+    }
+
+    let error = live.restore(&damaged_path).expect_err("an incomplete snapshot history must be refused");
+    assert!(error.to_string().contains("missing=[23]"), "unexpected restore error: {error}");
+    assert!(
+        live.get_segment_by_id("keep-history").unwrap().is_some(),
+        "restore preflight must reject before overwriting any live page"
+    );
+}
+
+#[test]
+fn restore_stages_pending_migrations_and_foreign_keys_before_overwriting_live_data() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let live_path = tmp.path().join("live-staged.db");
+    let mut live = Database::open(live_path.to_str().unwrap()).unwrap();
+    live.initialize().unwrap();
+    live.insert_segment(&make_segment("keep-staged", "/keep.wav")).unwrap();
+
+    // A valid v57 history with an unauthorized orphan makes pending v58 fail. That failure must
+    // happen in the isolated candidate, before a single live page is replaced.
+    let migration_fail_path = tmp.path().join("migration-fail.db");
+    {
+        let candidate = Database::open(migration_fail_path.to_str().unwrap()).unwrap();
+        candidate.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&candidate, 1).unwrap(), vec![58]);
+        candidate
+            .connection()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 INSERT INTO segment_hypotheses
+                    (segment_id, model_id, transcript, model_version_id)
+                 VALUES ('unauthorized-orphan', 'unknown-model', 'x', 'unknown-model');
+                 PRAGMA foreign_keys=ON;",
+            )
+            .unwrap();
+    }
+    let migration_error =
+        live.restore(&migration_fail_path).expect_err("a candidate whose pending migration fails must be refused");
+    assert!(
+        migration_error.to_string().contains("migration v58 source set"),
+        "unexpected staged migration error: {migration_error}"
+    );
+    assert!(live.get_segment_by_id("keep-staged").unwrap().is_some());
+
+    // A HEAD snapshot has no pending migration to expose an invalid FK, so the staged post-migration
+    // foreign-key check is independently load-bearing.
+    let fk_fail_path = tmp.path().join("fk-fail.db");
+    {
+        let candidate = Database::open(fk_fail_path.to_str().unwrap()).unwrap();
+        candidate.initialize().unwrap();
+        candidate
+            .connection()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 INSERT INTO segment_hypotheses
+                    (segment_id, model_id, transcript, model_version_id)
+                 VALUES ('head-orphan', 'unknown-model', 'x', 'unknown-model');
+                 PRAGMA foreign_keys=ON;",
+            )
+            .unwrap();
+    }
+    let fk_error = live.restore(&fk_fail_path).expect_err("a HEAD candidate with broken FKs must be refused");
+    assert!(fk_error.to_string().contains("foreign-key violation"), "unexpected FK error: {fk_error}");
+    assert!(
+        live.get_segment_by_id("keep-staged").unwrap().is_some(),
+        "every failed staged restore must preserve the original live database"
+    );
+
+    // Exact migration rows are still not a schema: a required table can be dropped while SQLite
+    // integrity and FK checks remain green. The current-release schema contract must catch that too.
+    let schema_fail_path = tmp.path().join("schema-fail.db");
+    {
+        let candidate = Database::open(schema_fail_path.to_str().unwrap()).unwrap();
+        candidate.initialize().unwrap();
+        candidate.connection().execute("DROP TABLE jobs", []).unwrap();
+    }
+    let schema_error =
+        live.restore(&schema_fail_path).expect_err("a HEAD candidate missing a required schema object must be refused");
+    let schema_message = schema_error.to_string();
+    assert!(
+        schema_message.contains("missing=") && schema_message.contains("\"jobs\""),
+        "unexpected schema error: {schema_error}"
+    );
+    assert!(live.get_segment_by_id("keep-staged").unwrap().is_some());
+}
+
+#[test]
 fn restore_of_an_older_snapshot_migrates_it_forward_to_head() {
     // Restore copies pages directly, so an OLDER snapshot would leave the live DB behind HEAD and the
     // running app would hit "no such column/table" until the next startup. restore() must re-migrate.
@@ -2695,6 +2802,15 @@ fn restore_of_an_older_snapshot_migrates_it_forward_to_head() {
     {
         let old = Database::open(old_path.to_str().unwrap()).unwrap();
         old.initialize().unwrap();
+        // First use the real reversible down paths for every schema newer than v56. Merely deleting
+        // their version rows leaves v57's compensation columns/tables and v58's evidence archives in
+        // place, which is not an old snapshot at all: replay then (correctly) fails on duplicate schema.
+        // These migrations are safely reversible on this intentionally empty fixture. v56 is handled
+        // explicitly in the pre-v37 schema synthesis below, alongside the older rename migrations.
+        let post_v56 = crate::migrations::MIGRATIONS.iter().filter(|migration| migration.version > 56).count();
+        let reverted = crate::migrations::rollback(&old, post_v56).unwrap();
+        assert_eq!(reverted, vec![58, 57]);
+        assert_eq!(crate::migrations::get_current_version(&old).unwrap(), 56);
         old.connection()
             .execute_batch(&format!(
                 // Same reasoning as the ood_score rename directly above, for v52: a genuine pre-v37
@@ -4044,30 +4160,32 @@ fn a_snapshot_of_a_real_sized_library_does_not_take_minutes() {
 
 #[test]
 fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
-    // This is what the phone shows a reviewer as progress AND what the current owner canon pays on
-    // (per hour of audio reviewed, not per hour at the desk). A network retry or re-decision of the
-    // same clip must not inflate it, while a reject still counts as reviewed audio because the human
-    // listened in order to decide. Rejected clips remain excluded from corrected datasets.
+    // This is full AUDIO-ACTIVITY progress, not money. A network retry or re-decision of the same
+    // clip must not inflate it; accept/edit/reject all mean the reviewer judged the clip. Weighted
+    // compensation is a separate immutable projection.
     let db = make_db();
     for (id, ms) in [("a", 9000), ("b", 21000)] {
         let mut seg = make_segment(id, &format!("/audio/{id}.wav"));
         seg.duration_ms = ms;
         db.insert_segment(&seg).unwrap();
     }
-    let mut ts = 1_700_000_000_000i64;
-    let mut ev = |seg: &str, who: &str, action: &str| {
-        ts += 1000;
-        db.record_review_event(seg, who, action, "phone", ts).unwrap();
-    };
-    ev("a", "Rubar", "accept");
-    ev("a", "Rubar", "edit"); // same clip again — a retry, not new work
-    ev("b", "Rubar", "reject"); // discarded: no corrected transcript exists, so it is UNPAID
-    ev("a", "Sewa", "accept"); // another reviewer on the same clip counts for HER
+    let revision = db.segment_review_revision("a").unwrap().unwrap();
+    let revision =
+        db.record_phone_human_decision_by_at_revision("a", "accept", Some("test"), "Rubar", revision).unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("a", "edit", Some("دەقی دەستکاریکراو"), "Rubar", revision)
+        .unwrap()
+        .unwrap(); // same clip again — a re-decision, not new activity
+    let revision = db.segment_review_revision("b").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("b", "reject", None, "Rubar", revision).unwrap().unwrap(); // judged activity; payable credit is separately weighted to 10%
+    let revision = db.segment_review_revision("a").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("a", "accept", Some("دەقی دەستکاریکراو"), "Sewa", revision)
+        .unwrap()
+        .unwrap(); // another reviewer on the same clip counts for HER
 
     assert_eq!(
         db.reviewed_audio_ms("Rubar").unwrap(),
-        9_000,
-        "only the CORRECTED 9s pays: the 21s reject is excluded, and the repeat on clip a is not double-counted"
+        30_000,
+        "both judged clips count as activity; the repeat on clip a is not double-counted"
     );
     assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000);
     assert_eq!(db.reviewed_audio_ms("Nobody").unwrap(), 0, "a reviewer with no work owes no rows");
@@ -4076,8 +4194,830 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
     // the total for work that was genuinely done — the event snapshots the duration it was paid
     // against (v56), so the number the owner pays on is append-only in practice.
     db.delete_segment("a").unwrap();
-    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 9_000, "clip 'a' is gone; Rubar's reviewed-audio total is not");
+    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "clip 'a' is gone; Rubar's reviewed-audio total is not");
     assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000, "hers neither");
+}
+
+fn record_payable_edit(db: &Database, segment_id: &str, reviewer: &str, duration_ms: i64) -> i64 {
+    let mut segment = make_segment(segment_id, &format!("/{segment_id}.wav"));
+    segment.raw_transcript = "هەڵە".into();
+    segment.duration_ms = duration_ms;
+    db.insert_segment(&segment).unwrap();
+    let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision(segment_id, "edit", Some("ڕاست"), reviewer, revision)
+        .unwrap()
+        .unwrap();
+    db.connection()
+        .query_row(
+            "SELECT id FROM review_compensation_ledger WHERE segment_id = ?1 ORDER BY id DESC LIMIT 1",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn review_compensation_policy_arithmetic_and_action_weights_are_exact() {
+    assert_eq!(review_pay_basis_points("edit").unwrap(), 10_000);
+    assert_eq!(review_pay_basis_points("accept").unwrap(), 1_000);
+    assert_eq!(review_pay_basis_points("reject").unwrap(), 1_000);
+    assert_eq!(review_pay_basis_points("skip").unwrap(), 0);
+    assert_eq!(review_pay_basis_points("undo").unwrap(), 0);
+    assert!(review_pay_basis_points("Accept").is_err(), "action names are a closed, case-sensitive contract");
+
+    // At 18,000 IQD/hour the authorized policy is exact down to one millisecond: 5,000
+    // micro-IQD for an edit and 500 for accept/reject. Nothing is rounded per clip.
+    assert_eq!(review_pay_entitlement_micro_iqd(1, 10_000).unwrap(), 5_000);
+    assert_eq!(review_pay_entitlement_micro_iqd(1, 1_000).unwrap(), 500);
+    assert_eq!(review_pay_entitlement_micro_iqd(3_600_000, 10_000).unwrap(), 18_000_000_000);
+    assert_eq!(review_pay_entitlement_micro_iqd(3_600_000, 1_000).unwrap(), 1_800_000_000);
+    assert_eq!(review_pay_entitlement_micro_iqd(3_600_000, 0).unwrap(), 0);
+
+    assert!(review_pay_entitlement_micro_iqd(-1, 1_000).is_err());
+    assert!(review_pay_entitlement_micro_iqd(1, -1).is_err());
+    assert!(review_pay_entitlement_micro_iqd(1, 10_001).is_err());
+    assert!(
+        review_pay_entitlement_micro_iqd(1, 1).is_err(),
+        "a future policy that cannot represent one millisecond exactly must fail closed"
+    );
+    assert!(
+        review_pay_entitlement_micro_iqd(i64::MAX, 10_000).is_err(),
+        "an entitlement outside the persisted i64 domain must never wrap"
+    );
+}
+
+#[test]
+fn review_compensation_records_the_owner_authorized_action_schedule() {
+    let db = make_db();
+    let mut edit = make_segment("pay-edit", "/edit.wav");
+    edit.raw_transcript = "هەڵە".into();
+    db.insert_segment(&edit).unwrap();
+    let revision = db.segment_review_revision("pay-edit").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("pay-edit", "edit", Some("ڕاست"), "Sara", revision).unwrap().unwrap();
+
+    seed_for_provenance(&db, "pay-accept", "دەقی مۆدێل");
+    let revision = db.segment_review_revision("pay-accept").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("pay-accept", "accept", Some("دەقی مۆدێل"), "Sara", revision)
+        .unwrap()
+        .unwrap();
+
+    db.insert_segment(&make_segment("pay-reject", "/reject.wav")).unwrap();
+    let revision = db.segment_review_revision("pay-reject").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("pay-reject", "reject", None, "Sara", revision).unwrap().unwrap();
+
+    db.insert_segment(&make_segment("pay-skip", "/skip.wav")).unwrap();
+    db.record_review_event("pay-skip", "Sara", "skip", "test", 1_700_000_000_000).unwrap();
+
+    let rows: Vec<(String, i64, i64, i64)> = db
+        .connection()
+        .prepare(
+            "SELECT compensation_action, rate_basis_points, entitlement_micro_iqd, delta_micro_iqd
+               FROM review_compensation_ledger WHERE reviewer = 'Sara' ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("edit".into(), 10_000, 5_000_000, 5_000_000),
+            ("accept".into(), 1_000, 500_000, 500_000),
+            ("reject".into(), 1_000, 500_000, 500_000),
+            ("skip".into(), 0, 0, 0),
+        ]
+    );
+    let summary = db.review_compensation_summary("sara").unwrap();
+    assert_eq!(summary.policy_version, REVIEW_PAY_POLICY_VERSION);
+    assert_eq!(summary.earned_micro_iqd, 6_000_000);
+    assert_eq!(summary.legacy_events_pending_reconciliation, 0);
+}
+
+#[test]
+fn provenance_reclassification_never_changes_the_semantic_accept_rate() {
+    let db = make_db();
+    seed_for_provenance(&db, "pay-reclass", "دەقی مۆدێل");
+    let human_text = "دەقی مرۆڤ کە هیچ مۆدێلێک نەنووسیویەتی";
+    // This is the real re-review case: the phone serves a previous human's text and this reviewer
+    // accepts it unchanged. It is semantically an accept for pay, but still human-authored corpus
+    // provenance because no ASR hypothesis contains it.
+    db.connection()
+        .execute("UPDATE speech_segments SET annotated_transcript = ?1 WHERE id = 'pay-reclass'", [human_text])
+        .unwrap();
+    let served_revision = db.segment_review_revision("pay-reclass").unwrap().unwrap();
+
+    db.record_phone_human_decision_by_at_revision("pay-reclass", "accept", Some(human_text), "Sara", served_revision)
+        .unwrap()
+        .expect("fresh phone decision must win its CAS");
+
+    let event: (String, String) = db
+        .connection()
+        .query_row(
+            "SELECT action, compensation_action FROM review_events WHERE segment_id = 'pay-reclass'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(event, ("edit".into(), "accept".into()), "corpus provenance and performed action stay distinct");
+
+    let ledger: (String, String, i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT compensation_action, effective_decision, rate_basis_points,
+                    entitlement_micro_iqd, delta_micro_iqd
+               FROM review_compensation_ledger WHERE segment_id = 'pay-reclass'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(ledger, ("accept".into(), "edit".into(), 1_000, 500_000, 500_000));
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
+}
+
+#[test]
+fn redecisions_adjust_to_one_current_entitlement_and_skip_never_retracts_it() {
+    let db = make_db();
+    let mut segment = make_segment("pay-redecision", "/pay-redecision.wav");
+    segment.duration_ms = 2_000;
+    segment.raw_transcript = "دەقی مۆدێل".into();
+    db.insert_segment(&segment).unwrap();
+    db.insert_hypothesis(&SegmentHypothesis {
+        segment_id: "pay-redecision".into(),
+        model_id: "omniasr-wsl-7b".into(),
+        transcript: "دەقی مۆدێل".into(),
+        confidence: None,
+    })
+    .unwrap();
+    let revision = db.segment_review_revision("pay-redecision").unwrap().unwrap();
+    let revision = db
+        .record_phone_human_decision_by_at_revision("pay-redecision", "accept", Some("دەقی مۆدێل"), "Sara", revision)
+        .unwrap()
+        .unwrap();
+    let revision = db
+        .record_phone_human_decision_by_at_revision(
+            "pay-redecision",
+            "edit",
+            Some("دەقی دەستکاریکراوی یەکەم"),
+            "SARA",
+            revision,
+        )
+        .unwrap()
+        .unwrap();
+    let revision = db
+        .record_phone_human_decision_by_at_revision("pay-redecision", "reject", None, "sara", revision)
+        .unwrap()
+        .unwrap();
+    db.record_phone_human_decision_by_at_revision(
+        "pay-redecision",
+        "edit",
+        Some("دەقی دەستکاریکراوی دووەم"),
+        "Sara",
+        revision,
+    )
+    .unwrap()
+    .unwrap();
+    db.record_review_event("pay-redecision", "Sara", "skip", "test", 1_700_000_000_000).unwrap();
+
+    let deltas: Vec<(i64, i64)> = db
+        .connection()
+        .prepare("SELECT delta_micro_iqd, delta_corrected_ms FROM review_compensation_ledger ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(deltas, vec![(1_000_000, 0), (9_000_000, 2_000), (-9_000_000, -2_000), (9_000_000, 2_000), (0, 0)]);
+    let summary = db.review_compensation_summary("SaRa").unwrap();
+    assert_eq!(summary.earned_micro_iqd, 10_000_000, "redecisions project one current money entitlement");
+    assert_eq!(
+        summary.corrected_audio_ms, 2_000,
+        "the ledger projects the latest payable decision, never the sum of every retry"
+    );
+}
+
+#[test]
+fn a_spot_check_retry_cannot_mint_a_second_event_or_change_the_first_action() {
+    let db = make_db();
+    let mut segment = make_segment("pay-spot-retry", "/pay-spot-retry.wav");
+    segment.duration_ms = 2_000;
+    db.insert_segment(&segment).unwrap();
+
+    db.record_spot_check("pay-spot-retry", "Sara", "edit", "ڕاست", "ڕاست").unwrap();
+    db.record_spot_check("pay-spot-retry", "Sara", "reject", "جیاواز", "ڕاست").unwrap();
+
+    let persisted_action: String = db
+        .connection()
+        .query_row(
+            "SELECT action FROM spot_checks WHERE segment_id = 'pay-spot-retry' AND reviewer = 'Sara'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_action, "edit", "the immutable first answer wins");
+    let counts: (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM review_events WHERE segment_id = 'pay-spot-retry'),
+                    (SELECT COUNT(*) FROM review_compensation_ledger WHERE segment_id = 'pay-spot-retry')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (1, 1));
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 10_000_000);
+}
+
+#[test]
+fn compensation_failure_rolls_back_its_review_event() {
+    let db = make_db();
+    let mut segment = make_segment("pay-atomic", "/pay-atomic.wav");
+    segment.raw_transcript = "هەڵە".into();
+    db.insert_segment(&segment).unwrap();
+    let served_revision = db.segment_review_revision("pay-atomic").unwrap().unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_compensation_insert
+             BEFORE INSERT ON review_compensation_ledger
+             BEGIN SELECT RAISE(ABORT, 'injected compensation failure'); END;",
+        )
+        .unwrap();
+
+    assert!(db
+        .record_phone_human_decision_by_at_revision("pay-atomic", "edit", Some("ڕاست"), "Sara", served_revision,)
+        .is_err());
+    let event_count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_events WHERE segment_id = 'pay-atomic'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(event_count, 0, "pay and its audit event are one commit");
+    let unchanged = db.get_segment_by_id("pay-atomic").unwrap().unwrap();
+    assert!(unchanged.human_decision.is_none());
+    assert!(!unchanged.verified);
+    assert_eq!(db.segment_review_revision("pay-atomic").unwrap(), Some(served_revision));
+
+    db.connection().execute_batch("DROP TRIGGER fail_compensation_insert;").unwrap();
+    db.record_phone_human_decision_by_at_revision("pay-atomic", "edit", Some("ڕاست"), "Sara", served_revision)
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
+}
+
+#[test]
+fn review_operation_receipt_exactly_identifies_the_committed_phone_work() {
+    let db = make_db();
+    let mut segment = make_segment("pay-operation", "/pay-operation.wav");
+    segment.raw_transcript = "هەڵە".into();
+    db.insert_segment(&segment).unwrap();
+    let revision = db.segment_review_revision("pay-operation").unwrap().unwrap();
+    let operation_id = "123e4567-e89b-42d3-a456-426614174000";
+    let payload_hash = "a".repeat(64);
+    db.record_phone_human_decision_by_at_revision_with_operation(
+        "pay-operation",
+        "edit",
+        Some("ڕاست"),
+        "Sara",
+        revision,
+        operation_id,
+        &payload_hash,
+    )
+    .unwrap()
+    .unwrap();
+
+    let receipt = db.review_operation(operation_id).unwrap().expect("committed operation has a durable receipt");
+    assert_eq!(receipt.operation_id, operation_id);
+    assert_eq!(receipt.operation_payload_hash, payload_hash);
+    assert_eq!(receipt.segment_id, "pay-operation");
+    assert_eq!(receipt.reviewer, "Sara");
+    assert_eq!(receipt.action, "edit");
+    assert_eq!(receipt.compensation_action, "edit");
+    let ledger_event_id: i64 = db
+        .connection()
+        .query_row(
+            "SELECT review_event_id FROM review_compensation_ledger WHERE segment_id = 'pay-operation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipt.review_event_id, ledger_event_id);
+    assert!(
+        db.review_operation("123e4567-e89b-42d3-a456-426614174999").unwrap().is_none(),
+        "a valid but unknown UUID is an exact miss"
+    );
+}
+
+#[test]
+fn duplicate_review_operation_uuid_is_rejected_and_rolls_back_the_other_payload() {
+    let db = make_db();
+    for id in ["pay-operation-first", "pay-operation-second"] {
+        let mut segment = make_segment(id, &format!("/{id}.wav"));
+        segment.raw_transcript = "هەڵە".into();
+        db.insert_segment(&segment).unwrap();
+    }
+    let operation_id = "223e4567-e89b-42d3-a456-426614174000";
+    let first_hash = "a".repeat(64);
+    let revision = db.segment_review_revision("pay-operation-first").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision_with_operation(
+        "pay-operation-first",
+        "edit",
+        Some("ڕاستی یەکەم"),
+        "Sara",
+        revision,
+        operation_id,
+        &first_hash,
+    )
+    .unwrap()
+    .unwrap();
+
+    let second_revision = db.segment_review_revision("pay-operation-second").unwrap().unwrap();
+    let second_hash = "b".repeat(64);
+    assert!(
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "pay-operation-second",
+            "edit",
+            Some("ڕاستی دووەم"),
+            "Sara",
+            second_revision,
+            operation_id,
+            &second_hash,
+        )
+        .is_err(),
+        "one UUID can name exactly one immutable payload"
+    );
+    let second = db.get_segment_by_id("pay-operation-second").unwrap().unwrap();
+    assert!(second.human_decision.is_none(), "the conflicting verdict must roll back with its event");
+    assert!(!second.verified);
+    assert_eq!(db.segment_review_revision("pay-operation-second").unwrap(), Some(second_revision));
+    let second_events: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_events WHERE segment_id = 'pay-operation-second'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(second_events, 0);
+    let receipt = db.review_operation(operation_id).unwrap().unwrap();
+    assert_eq!(receipt.segment_id, "pay-operation-first");
+    assert_eq!(receipt.operation_payload_hash, first_hash);
+}
+
+#[test]
+fn invalid_review_operation_uuid_or_hash_fails_before_any_write() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pay-operation-invalid", "/pay-operation-invalid.wav")).unwrap();
+    let revision = db.segment_review_revision("pay-operation-invalid").unwrap().unwrap();
+    let valid_id = "323e4567-e89b-42d3-a456-426614174000";
+    let valid_hash = "a".repeat(64);
+    for (operation_id, payload_hash) in [
+        ("not-a-uuid", valid_hash.as_str()),
+        ("323E4567-E89B-42D3-A456-426614174000", valid_hash.as_str()),
+        (valid_id, "short"),
+        (valid_id, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        (valid_id, "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"),
+    ] {
+        assert!(
+            db.record_phone_human_decision_by_at_revision_with_operation(
+                "pay-operation-invalid",
+                "accept",
+                Some("test"),
+                "Sara",
+                revision,
+                operation_id,
+                payload_hash,
+            )
+            .is_err(),
+            "invalid identity must fail: {operation_id} / {payload_hash}"
+        );
+    }
+    assert!(db.review_operation("not-a-uuid").is_err());
+    let event_count: i64 =
+        db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+    assert_eq!(event_count, 0);
+    let row = db.get_segment_by_id("pay-operation-invalid").unwrap().unwrap();
+    assert!(row.human_decision.is_none());
+    assert_eq!(db.segment_review_revision("pay-operation-invalid").unwrap(), Some(revision));
+}
+
+#[test]
+fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensation() {
+    let db = make_db();
+    for id in ["pilot-sara-1", "pilot-sara-2", "pilot-hemn-skip", "pilot-hemn-2"] {
+        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+    }
+    let limit = ReviewDecisionLimit::new(0, 2, vec![("Sara".into(), 1), ("Hemn".into(), 1)]).unwrap();
+    let sara_revision = db.segment_review_revision("pilot-sara-1").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision_with_operation_limit(
+        "pilot-sara-1",
+        "accept",
+        Some("test"),
+        "Sara",
+        sara_revision,
+        "423e4567-e89b-42d3-a456-426614174001",
+        &"a".repeat(64),
+        Some(&limit),
+    )
+    .unwrap()
+    .unwrap();
+
+    let refused_revision = db.segment_review_revision("pilot-sara-2").unwrap().unwrap();
+    let refused = db
+        .record_phone_human_decision_by_at_revision_with_operation_limit(
+            "pilot-sara-2",
+            "edit",
+            Some("different"),
+            "Sara",
+            refused_revision,
+            "423e4567-e89b-42d3-a456-426614174002",
+            &"b".repeat(64),
+            Some(&limit),
+        )
+        .unwrap_err();
+    assert!(refused.to_string().contains(REVIEW_PILOT_LIMIT_REACHED));
+    let untouched = db.get_segment_by_id("pilot-sara-2").unwrap().unwrap();
+    assert!(!untouched.verified && untouched.human_decision.is_none());
+    assert!(db.review_operation("423e4567-e89b-42d3-a456-426614174002").unwrap().is_none());
+
+    db.record_review_event_with_operation_limit(
+        "pilot-hemn-skip",
+        "Hemn",
+        "skip",
+        "couch",
+        1,
+        "423e4567-e89b-42d3-a456-426614174003",
+        &"c".repeat(64),
+        Some(&limit),
+    )
+    .unwrap();
+    let hemn_revision = db.segment_review_revision("pilot-hemn-2").unwrap().unwrap();
+    let refused = db
+        .record_phone_human_decision_by_at_revision_with_operation_limit(
+            "pilot-hemn-2",
+            "accept",
+            Some("test"),
+            "Hemn",
+            hemn_revision,
+            "423e4567-e89b-42d3-a456-426614174004",
+            &"d".repeat(64),
+            Some(&limit),
+        )
+        .unwrap_err();
+    assert!(refused.to_string().contains(REVIEW_PILOT_LIMIT_REACHED));
+
+    let progress = db.review_decision_progress(&limit).unwrap();
+    assert_eq!(progress.total_review_actions, 2);
+    assert_eq!(progress.by_reviewer.get("Sara"), Some(&1));
+    assert_eq!(progress.by_reviewer.get("Hemn"), Some(&1));
+    let (events, ledger): (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM review_events), (SELECT COUNT(*) FROM review_compensation_ledger)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((events, ledger), (2, 2), "each authorized action and pay consequence commits once");
+}
+
+#[test]
+fn controlled_review_cap_serializes_the_last_slot_across_database_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pilot-race.db");
+    let path_text = path.to_string_lossy().to_string();
+    let setup = Database::open(&path_text).unwrap();
+    setup.initialize().unwrap();
+    for id in ["pilot-race-a", "pilot-race-b"] {
+        setup.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+    }
+    drop(setup);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for (index, id) in ["pilot-race-a", "pilot-race-b"].into_iter().enumerate() {
+        let barrier = barrier.clone();
+        let path_text = path_text.clone();
+        workers.push(std::thread::spawn(move || {
+            let db = Database::open(&path_text).unwrap();
+            let revision = db.segment_review_revision(id).unwrap().unwrap();
+            let limit = ReviewDecisionLimit::new(0, 1, vec![("Sara".into(), 1)]).unwrap();
+            barrier.wait();
+            db.record_phone_human_decision_by_at_revision_with_operation_limit(
+                id,
+                "accept",
+                Some("test"),
+                "Sara",
+                revision,
+                &format!("523e4567-e89b-42d3-a456-42661417400{index}"),
+                &format!("{:064x}", index + 1),
+                Some(&limit),
+            )
+        }));
+    }
+    barrier.wait();
+    let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_ref().is_err_and(|error| error.to_string().contains(REVIEW_PILOT_LIMIT_REACHED)))
+            .count(),
+        1,
+        "BEGIN IMMEDIATE must make exactly one racing connection lose the final slot"
+    );
+    let db = Database::open(&path_text).unwrap();
+    let events: i64 = db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+    assert_eq!(events, 1);
+}
+
+#[test]
+fn undo_and_its_signed_reversal_are_atomic_and_idempotent() {
+    let db = make_db();
+    let mut previous = make_segment("pay-undo", "/pay-undo.wav");
+    previous.raw_transcript = "هەڵە".into();
+    db.insert_segment(&previous).unwrap();
+    let served_revision = db.segment_review_revision("pay-undo").unwrap().unwrap();
+    let decided_revision = db
+        .record_phone_human_decision_by_at_revision("pay-undo", "edit", Some("ڕاست"), "Sara", served_revision)
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
+
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_compensation_undo
+             BEFORE INSERT ON review_compensation_ledger
+             WHEN new.compensation_action = 'undo'
+             BEGIN SELECT RAISE(ABORT, 'injected reversal failure'); END;",
+        )
+        .unwrap();
+    assert!(db.undo_phone_human_decision(&previous, "Sara", decided_revision, "pay-undo-operation").is_err());
+    let still_decided = db.get_segment_by_id("pay-undo").unwrap().unwrap();
+    assert_eq!(still_decided.human_decision.as_deref(), Some("edit"));
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
+
+    db.connection().execute_batch("DROP TRIGGER fail_compensation_undo;").unwrap();
+    db.undo_phone_human_decision(&previous, "Sara", decided_revision, "pay-undo-operation")
+        .unwrap()
+        .expect("the rolled-back operation remains retryable");
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 0);
+
+    let entries: Vec<(String, i64, i64, Option<String>, String)> = db
+        .connection()
+        .prepare(
+            "SELECT compensation_action, delta_micro_iqd, delta_corrected_ms, reverses_entry_id, entry_id
+               FROM review_compensation_ledger WHERE segment_id = 'pay-undo' ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0, "edit");
+    assert_eq!(entries[0].1, 5_000_000);
+    assert_eq!(entries[0].2, 1_000);
+    assert_eq!(entries[1].0, "undo");
+    assert_eq!(entries[1].1, -5_000_000);
+    assert_eq!(entries[1].2, -1_000);
+    assert_eq!(entries[1].3.as_deref(), Some(entries[0].4.as_str()));
+
+    assert!(
+        db.undo_phone_human_decision(&previous, "Sara", decided_revision, "pay-undo-operation").unwrap().is_none(),
+        "a replayed undo loses the revision CAS and cannot append another reversal"
+    );
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_compensation_ledger WHERE segment_id = 'pay-undo'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn undo_of_a_redecision_reverses_only_that_decisions_delta() {
+    let db = make_db();
+    seed_for_provenance(&db, "pay-undo-redecision", "دەقی مۆدێل");
+    let initial_revision = db.segment_review_revision("pay-undo-redecision").unwrap().unwrap();
+    let accept_revision = db
+        .record_phone_human_decision_by_at_revision(
+            "pay-undo-redecision",
+            "accept",
+            Some("دەقی مۆدێل"),
+            "Sara",
+            initial_revision,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
+
+    let before_edit = db.get_segment_by_id("pay-undo-redecision").unwrap().unwrap();
+    let edit_revision = db
+        .record_phone_human_decision_by_at_revision(
+            "pay-undo-redecision",
+            "edit",
+            Some("دەقی دەستکاریکراو"),
+            "Sara",
+            accept_revision,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
+    let restored_accept_revision =
+        db.undo_phone_human_decision(&before_edit, "Sara", edit_revision, "undo-accept-to-edit").unwrap().unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
+
+    // Exercise the opposite signed adjustment too: undoing edit -> reject must add back the 90%
+    // reduction, not erase the earlier edit entitlement.
+    let edit_revision = db
+        .record_phone_human_decision_by_at_revision(
+            "pay-undo-redecision",
+            "edit",
+            Some("دەقی دەستکاریکراو"),
+            "Sara",
+            restored_accept_revision,
+        )
+        .unwrap()
+        .unwrap();
+    let before_reject = db.get_segment_by_id("pay-undo-redecision").unwrap().unwrap();
+    let reject_revision = db
+        .record_phone_human_decision_by_at_revision("pay-undo-redecision", "reject", None, "Sara", edit_revision)
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
+    db.undo_phone_human_decision(&before_reject, "Sara", reject_revision, "undo-edit-to-reject").unwrap().unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
+
+    let entries: Vec<(String, i64, i64, Option<String>, String)> = db
+        .connection()
+        .prepare(
+            "SELECT compensation_action, delta_micro_iqd, delta_corrected_ms, reverses_entry_id, entry_id
+               FROM review_compensation_ledger WHERE segment_id = 'pay-undo-redecision' ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let actions_and_deltas: Vec<(&str, i64)> = entries.iter().map(|entry| (entry.0.as_str(), entry.1)).collect();
+    assert_eq!(
+        actions_and_deltas,
+        vec![
+            ("accept", 500_000),
+            ("edit", 4_500_000),
+            ("undo", -4_500_000),
+            ("edit", 4_500_000),
+            ("reject", -4_500_000),
+            ("undo", 4_500_000),
+        ]
+    );
+    let corrected_deltas: Vec<i64> = entries.iter().map(|entry| entry.2).collect();
+    assert_eq!(corrected_deltas, vec![0, 1_000, -1_000, 1_000, -1_000, 1_000]);
+    assert_eq!(entries[2].3.as_deref(), Some(entries[1].4.as_str()));
+    assert_eq!(entries[5].3.as_deref(), Some(entries[4].4.as_str()));
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().corrected_audio_ms, 1_000);
+}
+
+#[test]
+fn compensation_survives_live_duration_changes_and_segment_deletion() {
+    let db = make_db();
+    let mut segment = make_segment("pay-delete", "/pay-delete.wav");
+    segment.duration_ms = 1_234;
+    segment.raw_transcript = "هەڵە".into();
+    db.insert_segment(&segment).unwrap();
+    let revision = db.segment_review_revision("pay-delete").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("pay-delete", "edit", Some("ڕاست"), "Sara", revision)
+        .unwrap()
+        .unwrap();
+    let earned = 1_234 * 5_000;
+    let summary = db.review_compensation_summary("Sara").unwrap();
+    assert_eq!(summary.earned_micro_iqd, earned);
+    assert_eq!(summary.corrected_audio_ms, 1_234);
+
+    db.connection().execute("UPDATE speech_segments SET duration_ms = 999999 WHERE id = 'pay-delete'", []).unwrap();
+    assert_eq!(
+        db.review_compensation_summary("Sara").unwrap().earned_micro_iqd,
+        earned,
+        "later metadata repair must not rewrite a paid duration snapshot"
+    );
+    db.delete_segment("pay-delete").unwrap();
+    let summary = db.review_compensation_summary("Sara").unwrap();
+    assert_eq!(summary.earned_micro_iqd, earned);
+    assert_eq!(summary.corrected_audio_ms, 1_234);
+    let snapshots: (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT duration_ms FROM review_events WHERE segment_id = 'pay-delete'),
+                    (SELECT duration_ms FROM review_compensation_ledger WHERE segment_id = 'pay-delete')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(snapshots, (1_234, 1_234));
+}
+
+#[test]
+fn settlement_is_exact_case_insensitive_and_retry_idempotent() {
+    let db = make_db();
+    let through = record_payable_edit(&db, "pay-settle-once", "Sara", 1_234);
+    let exact = 1_234 * 5_000;
+
+    let first = db.record_review_compensation_settlement("  Sara  ", through, "  payout-001  ").unwrap();
+    assert_eq!(first.reviewer, "Sara");
+    assert_eq!(first.from_ledger_id_exclusive, 0);
+    assert_eq!(first.through_ledger_id_inclusive, through);
+    assert_eq!(first.allocated_micro_iqd, exact);
+    assert_eq!(first.payout_reference, "payout-001");
+    let summary = db.review_compensation_summary("sARA").unwrap();
+    assert_eq!(summary.earned_micro_iqd, exact);
+    assert_eq!(summary.settled_micro_iqd, exact);
+    assert_eq!(summary.outstanding_micro_iqd, 0);
+
+    let retry = db.record_review_compensation_settlement("sARA", through, "payout-001").unwrap();
+    assert_eq!(retry, first, "a lost-response retry returns the durable settlement it already created");
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_compensation_settlements", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let later = record_payable_edit(&db, "pay-settle-later", "Sara", 1_000);
+    assert!(
+        db.record_review_compensation_settlement("Sara", later, "payout-001").is_err(),
+        "reusing a payout reference for a different boundary is a mismatch, never a retry"
+    );
+    assert!(
+        db.record_review_compensation_settlement("Hemn", through, "payout-001").is_err(),
+        "the same external reference cannot be rebound to another reviewer"
+    );
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_compensation_settlements", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn settlement_rejects_overlap_and_the_database_recomputes_every_amount() {
+    let db = make_db();
+    let first_through = record_payable_edit(&db, "pay-settle-range-1", "Sara", 1_000);
+    db.record_review_compensation_settlement("Sara", first_through, "payout-range-1").unwrap();
+    assert!(
+        db.record_review_compensation_settlement("Sara", first_through, "payout-overlap").is_err(),
+        "a second reference cannot allocate an already-settled interval"
+    );
+
+    let second_through = record_payable_edit(&db, "pay-settle-range-2", "Sara", 1_000);
+    let second = db.record_review_compensation_settlement("sara", second_through, "payout-range-2").unwrap();
+    assert_eq!(second.from_ledger_id_exclusive, first_through);
+    assert_eq!(second.allocated_micro_iqd, 5_000_000);
+
+    let third_through = record_payable_edit(&db, "pay-settle-range-3", "Sara", 2_000);
+    let forged = db.connection().execute(
+        "INSERT INTO review_compensation_settlements
+            (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+             through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
+         VALUES ('forged-settlement', ?1, 'SARA', ?2, ?3, 1, 'forged-payout')",
+        rusqlite::params![REVIEW_PAY_POLICY_VERSION, second_through, third_through],
+    );
+    assert!(forged.is_err(), "the SQL trigger must reject even a direct forged amount");
+    let third = db.record_review_compensation_settlement("Sara", third_through, "payout-range-3").unwrap();
+    assert_eq!(third.allocated_micro_iqd, 10_000_000);
+    let summary = db.review_compensation_summary("SARA").unwrap();
+    assert_eq!(summary.settled_micro_iqd, 20_000_000);
+    assert_eq!(summary.outstanding_micro_iqd, 0);
+}
+
+#[test]
+fn a_negative_redecision_adjustment_is_settled_exactly() {
+    let db = make_db();
+    let edit_through = record_payable_edit(&db, "pay-negative-settlement", "Sara", 1_000);
+    let initial = db.record_review_compensation_settlement("Sara", edit_through, "payout-positive").unwrap();
+    assert_eq!(initial.allocated_micro_iqd, 5_000_000);
+
+    let revision = db.segment_review_revision("pay-negative-settlement").unwrap().unwrap();
+    db.record_phone_human_decision_by_at_revision("pay-negative-settlement", "reject", None, "sARA", revision)
+        .unwrap()
+        .unwrap();
+    let reject_through: i64 = db
+        .connection()
+        .query_row(
+            "SELECT id FROM review_compensation_ledger
+              WHERE segment_id = 'pay-negative-settlement' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let before_adjustment = db.review_compensation_summary("Sara").unwrap();
+    assert_eq!(before_adjustment.earned_micro_iqd, 500_000);
+    assert_eq!(before_adjustment.corrected_audio_ms, 0);
+    assert_eq!(before_adjustment.settled_micro_iqd, 5_000_000);
+    assert_eq!(before_adjustment.outstanding_micro_iqd, -4_500_000);
+
+    let adjustment =
+        db.record_review_compensation_settlement("SARA", reject_through, "payout-negative-adjustment").unwrap();
+    assert_eq!(adjustment.from_ledger_id_exclusive, edit_through);
+    assert_eq!(adjustment.allocated_micro_iqd, -4_500_000);
+    let after_adjustment = db.review_compensation_summary("sara").unwrap();
+    assert_eq!(after_adjustment.earned_micro_iqd, 500_000);
+    assert_eq!(after_adjustment.settled_micro_iqd, 500_000);
+    assert_eq!(after_adjustment.outstanding_micro_iqd, 0);
 }
 
 #[test]
@@ -4366,7 +5306,7 @@ fn phone_undo_rolls_back_the_row_if_learning_retraction_fails_then_retries_clean
              BEGIN SELECT RAISE(ABORT, 'injected undo failure'); END;",
         )
         .unwrap();
-    assert!(db.undo_phone_human_decision(&previous, "Sara", decided_revision).is_err());
+    assert!(db.undo_phone_human_decision(&previous, "Sara", decided_revision, "undo-stale").is_err());
 
     let still_decided = db.get_segment_by_id("undo-atomic").unwrap().unwrap();
     assert!(still_decided.verified, "the row update must roll back with the failed delete");
@@ -4380,7 +5320,7 @@ fn phone_undo_rolls_back_the_row_if_learning_retraction_fails_then_retries_clean
 
     db.connection().execute_batch("DROP TRIGGER fail_undo_learning_delete;").unwrap();
     let restored_revision = db
-        .undo_phone_human_decision(&previous, "Sara", decided_revision)
+        .undo_phone_human_decision(&previous, "Sara", decided_revision, "undo-success")
         .unwrap()
         .expect("the same undo token remains repairable after rollback");
     assert!(restored_revision > decided_revision);

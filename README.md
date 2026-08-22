@@ -2,8 +2,8 @@
 
 Desktop app for **Central Kurdish (Sorani)** speech transcription, transcript curation, and dataset
 export. Tauri v2 + Svelte 5 + Rust. The quality-first default is the local **OmniASR-7B Champion**
-server under WSL; bundled **Meta OmniASR CTC** via sherpa-onnx is an explicitly selected fallback.
-Neither path requires a cloud service.
+server under WSL. Smaller 300M/1B/MMS models remain explicitly installed diagnostics; standard
+release builds never bundle or select them as production fallbacks. No path requires a cloud service.
 
 > The desktop application lives in **[`cortex-speech-app/`](cortex-speech-app/)**.
 > Start there: [`cortex-speech-app/README.md`](cortex-speech-app/README.md) has setup, model
@@ -15,14 +15,14 @@ Neither path requires a cloud service.
   validate → verify → export (JSON/JSONL/CSV/Parquet/HuggingFace/WAV). The default Champion path
   requires its separately provisioned WSL model server to be healthy before import; it fails closed
   instead of silently downgrading.
-- **Measured accuracy (not estimated):** first reproducible Sorani scorecard is **29.40% CER**
-  (95% CI [26.29, 32.54], N=400, seed=42) on the stock OmniASR-CTC-300M model — see
-  [`cortex-speech-app/docs/EVAL.md`](cortex-speech-app/docs/EVAL.md) for the full breakdown,
-  fairness slice, and reproduction command. The model is a generalist (1600 languages), not yet
-  Sorani-fine-tuned; published Sorani SOTA is ~7.8% CER, so this is an honest starting line, and
-  the app is designed around **human-in-the-loop review** of the AI draft.
-- **Privacy by default:** cloud LLM/STT are off unless explicitly opted in; voice is treated as
-  biometric data (see [`DATA_GOVERNANCE.md`](DATA_GOVERNANCE.md)).
+- **Historical diagnostic accuracy (not production-champion evidence):** the first reproducible
+  Sorani scorecard measured **29.40% CER** (95% CI [26.29, 32.54], N=400, seed=42) on stock
+  OmniASR-CTC-300M. It is retained in [`cortex-speech-app/docs/EVAL.md`](cortex-speech-app/docs/EVAL.md)
+  for reproducibility, but it does **not** measure the current OmniASR-7B production champion and
+  does not authorize the 300M model as a runtime fallback.
+- **Privacy by default:** there is no shipped cloud-ASR/STT path. Cloud LLM and advisory Listening
+  Jury audio egress are separate, explicit opt-ins; voice is treated as biometric data (see
+  [`DATA_GOVERNANCE.md`](DATA_GOVERNANCE.md)).
 
 ## Governance & process
 

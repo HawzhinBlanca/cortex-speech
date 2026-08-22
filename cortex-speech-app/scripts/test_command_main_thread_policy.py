@@ -5,13 +5,14 @@ Tauri runs SYNC `#[tauri::command]`s on the main/UI thread; a slow one there fre
 off the main thread) and offload their blocking body via `run_blocking`/`spawn_blocking`.
 
 This is a RATCHET: the list grows as the migration proceeds, and a command may only be added once it
-is genuinely async. Regressing any listed command back to sync fails the gate.
+is genuinely async. Regressing any listed command back to sync fails the gate. A deliberately retired
+IPC leaves the list only when a separate release-surface policy proves that command remains absent.
 
 READ THIS BEFORE DELETING ANY COMMAND NAMED BELOW (iteration 233). A dead-code audit found 17 IPC
 commands with no frontend `invoke(...)` caller and proposed cutting all of them — ~597 lines. That was
 WRONG for 11 of the 17, and this file is why: the lists here PIN command names, and the gate asserts each
-one exists and is async. Deleting such a command either fails this gate or, worse, gets "fixed" by
-trimming the list — which silently shrinks a ratchet that exists precisely to never shrink.
+one exists and is async. Deleting such a command either fails this gate or must be paired with an
+explicit source-absence contract. Trimming the list without that proof silently weakens the ratchet.
 
 So "no frontend caller" does NOT mean "dead" in this repo. A command can be load-bearing for a gate, for
 `test_ui_thread_blocking_audit.py`'s freezer worklist, or as the sole caller of real logic. Before cutting
@@ -36,8 +37,9 @@ COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
 # lives, or it would silently stop checking it the moment it moved, which is a vacuous pass.
 COMMANDS_DIR = REPO_ROOT / "src-tauri" / "src" / "commands"
 
-# Slow commands proven moved OFF the main thread. GROW this list as the migration continues; never
-# shrink it (that would be a UI-freeze regression).
+# Slow commands proven moved OFF the main thread. Grow this list as the migration continues. A command
+# leaves it only when the command itself is deliberately removed from the shipped IPC surface (with an
+# explicit absence policy), never merely to silence a main-thread regression.
 ASYNC_SLOW_COMMANDS = [
     "open_audio_file",  # non-blocking native picker (crash fix f01ab66)
     "import_directory",  # non-blocking native folder picker (crash fix f01ab66)
@@ -59,23 +61,19 @@ ASYNC_SLOW_COMMANDS = [
     "relink_audio",
     "db_vacuum",
     "merge_dataset_json",
-    # Eval / quality / calibration compute over the whole dataset + a model-integrity hash.
+    # Eval / quality / calibration compute over the whole dataset.
     "get_dataset_certificate",
     "run_gold_eval",
     "get_label_quality_lift",
     "validate_dataset_cmd",
     "get_dataset_quality",
-    "verify_finetuned_model_integrity",
     # Active-learning compute + pipeline-clone ASR/decode reads (audio decode + ONNX inference).
     "get_active_learning_queue",
     "get_waveform",
-    "transcribe_segment_constrained",
     "rediarize_segments",
     "run_gold_eval_asr",
-    "run_gold_eval_local",
     # Per-segment ASR/alignment (decode + ONNX/WSL inference, some with a brief db write).
     "transcribe_segment",
-    "transcribe_segment_finetuned",
     "align_segment",
     "check_audio",
     # Jury gate + gold imports + model-checkpoint hash (audio reads / DB writes / multi-GB SHA-256).
@@ -100,13 +98,9 @@ ASYNC_SLOW_COMMANDS = [
     # Audio-duration watchdog: probe thread + 30s recv_timeout — the whole watchdog now runs on the
     # blocking pool so the recv no longer blocks the UI thread (bound preserved).
     "get_audio_duration",
-    # Model downloads: multi-hundred-MB blocking HTTP fetch (single + download-all loop) — moved to
-    # run_blocking so the model panel doesn't freeze for the whole download.
-    "models_download",
+    # Model downloads: the retained support-asset download-all command is a multi-hundred-MB blocking
+    # HTTP fetch, so it remains off the main thread. The old single-model ASR IPC is retired.
     "models_download_all",
-    # Cloud STT: the blocking ElevenLabs Scribe upload+POST moved to run_blocking; the consent + key +
-    # DB-membership gates stay EAGER on the caller thread (never offload before the privacy check).
-    "transcribe_audio_with_scribe",
     # T2 Gemini audio judge: eager consent/key checks + a brief-locked DB gather, then the N-sample
     # cloud round-trip runs on run_blocking; the verdict write re-locks briefly after the await.
     "run_t2_for_segment",
@@ -114,9 +108,6 @@ ASYNC_SLOW_COMMANDS = [
     # connection, shared-handle fallback) so neither the UI thread nor the global db Mutex is held
     # across the cloud round-trips.
     "run_jury_pipeline",
-    # Scribe vote batch: per-segment decode/slice + ElevenLabs POST loop on run_blocking; consent/key
-    # gates + the to-vote gather stay eager; per-insert brief db_arc lock inside the task.
-    "add_scribe_votes",
     # DPO preference-pair upload: the ~120s blocking outbound HTTP POST moved to run_blocking on a
     # separate WAL connection; the cloud-LLM consent gate stays EAGER (never offload before opt-in).
     "run_dpo_update",

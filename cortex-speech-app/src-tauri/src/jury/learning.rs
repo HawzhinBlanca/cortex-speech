@@ -63,6 +63,23 @@ struct LearningRow {
 /// Excludes examples linked to `is_gold = 1` segments so the permanent
 /// holdout is never used for training.
 pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
+    build_dpo_dataset_filtered(db, None)
+}
+
+/// Build preference pairs only for the immutable segment selection owned by a bundle snapshot.
+/// This prevents a revoked/private/unvalidated row elsewhere in the live library from hitchhiking in
+/// a production bundle whose tabular rows and rights gate never selected it.
+pub(crate) fn build_dpo_dataset_for_segment_ids(
+    db: &Database,
+    allowed_segment_ids: &BTreeSet<String>,
+) -> AppResult<DpoExportResult> {
+    build_dpo_dataset_filtered(db, Some(allowed_segment_ids))
+}
+
+fn build_dpo_dataset_filtered(
+    db: &Database,
+    allowed_segment_ids: Option<&BTreeSet<String>>,
+) -> AppResult<DpoExportResult> {
     // Holdout exclusion — never train on the permanent gold holdout (shared helpers). Hash catches
     // the same content at any path (when the file is present); path catches it fail-closed even when
     // the training file is gone.
@@ -110,6 +127,9 @@ pub fn build_dpo_dataset(db: &Database) -> AppResult<DpoExportResult> {
     let mut pairs: Vec<DpoPair> = Vec::new();
     for r in rows {
         let row = r?;
+        if allowed_segment_ids.is_some_and(|allowed| !allowed.contains(&row.segment_id)) {
+            continue;
+        }
         let wrong = row.wrong_transcript.trim();
         let fix = row.human_fix.trim();
         if wrong.is_empty() || fix.is_empty() || learning_text_key(wrong) == learning_text_key(fix) {

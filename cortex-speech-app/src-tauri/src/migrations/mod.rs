@@ -1,6 +1,7 @@
 use crate::db::Database;
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Schema migration for the database.
 /// Each migration has a version number and an up/down script.
@@ -22,20 +23,21 @@ pub fn max_supported_version() -> i64 {
 
 /// Run all pending migrations on the database.
 pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
-    ensure_migrations_table(db)?;
-    let current_version = get_current_version(db)?;
+    run_migrations_inner(db, false)
+}
 
-    // Forward-compatibility guard: refuse to run when the DB schema is NEWER than this build supports,
-    // rather than silently operating on it with stale semantics. (A migration only ever moves the
-    // schema FORWARD, so a lower-version binary has no way to correctly read a higher-version DB.)
-    let max_known = max_supported_version();
-    if current_version > max_known {
-        return Err(crate::error::AppError::Other(format!(
-            "This library is at schema v{current_version}, newer than this build understands (v{max_known}). \
-             It was created by a newer version of Cortex Speech. Update the app before opening this database \
-             — refusing to run to avoid corrupting data under a schema this build does not understand."
-        )));
-    }
+/// The only entry point allowed to bootstrap an empty migration history. `Database::initialize`
+/// proves the SQLite file had no user objects *before* it creates the authoritative base tables,
+/// then passes that proof here. Keeping the proof out of the public runner matters: otherwise an
+/// existing database whose `schema_migrations` rows were deleted would be mistaken for a new file
+/// and every migration would be replayed against live data.
+pub(crate) fn run_migrations_after_pristine_initialize(db: &Database, was_pristine: bool) -> AppResult<Vec<i64>> {
+    run_migrations_inner(db, was_pristine)
+}
+
+fn run_migrations_inner(db: &Database, allow_empty_bootstrap: bool) -> AppResult<Vec<i64>> {
+    ensure_migrations_table(db)?;
+    let current_version = validate_applied_history_inner(db.connection(), allow_empty_bootstrap)?;
 
     let mut applied = Vec::new();
 
@@ -48,6 +50,89 @@ pub fn run_migrations(db: &Database) -> AppResult<Vec<i64>> {
     }
 
     Ok(applied)
+}
+
+/// A fresh SQLite file has no application-owned objects. This check must run before the base schema
+/// is created; afterwards a new file and a damaged old file can have superficially similar tables.
+pub(crate) fn database_is_pristine(conn: &rusqlite::Connection) -> AppResult<bool> {
+    let objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema
+          WHERE name NOT LIKE 'sqlite_%'
+            AND type IN ('table', 'view', 'trigger', 'index')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(objects == 0)
+}
+
+/// Prove that `schema_migrations` is the exact, description-bound prefix of this binary's history.
+///
+/// `MAX(version)` alone is not history: a damaged table containing only row 58 would make every older
+/// migration look applied even though none of its schema exists. This validation is shared by startup,
+/// rollback/list operations, and restore preflight so no path can silently trust that false maximum.
+fn validate_applied_history_inner(conn: &rusqlite::Connection, allow_empty_bootstrap: bool) -> AppResult<i64> {
+    let mut statement = match conn.prepare("SELECT version, description FROM schema_migrations ORDER BY version") {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref message))) if message.contains("no such table") => {
+            return Err(crate::error::AppError::Other(
+                "schema_migrations is missing; refusing to infer migration history from table shape".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let actual = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual.is_empty() {
+        if allow_empty_bootstrap {
+            // `Database::initialize` creates the authoritative base + FTS tables before migration 1,
+            // then calls `run_migrations`. This is the sole legitimate empty-history context.
+            return Ok(0);
+        }
+        return Err(crate::error::AppError::Other(
+            "schema_migrations is empty; refusing an external database with unprovable history".into(),
+        ));
+    }
+
+    let current_version = actual.last().map(|(version, _)| *version).unwrap_or(0);
+    let max_known = max_supported_version();
+    if current_version > max_known {
+        return Err(crate::error::AppError::Other(format!(
+            "This library is at schema v{current_version}, newer than this build supports (v{max_known}). \
+             Update the app before opening or restoring it — refusing to operate on unknown history."
+        )));
+    }
+    let expected: Vec<(i64, String)> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= current_version)
+        .map(|migration| (migration.version, migration.description.to_string()))
+        .collect();
+    if actual != expected {
+        let actual_versions: std::collections::BTreeSet<i64> = actual.iter().map(|(version, _)| *version).collect();
+        let expected_versions: std::collections::BTreeSet<i64> = expected.iter().map(|(version, _)| *version).collect();
+        let missing: Vec<i64> = expected_versions.difference(&actual_versions).copied().collect();
+        let unknown: Vec<i64> = actual_versions.difference(&expected_versions).copied().collect();
+        let description_mismatch: Vec<i64> = actual
+            .iter()
+            .filter_map(|(version, description)| {
+                expected
+                    .iter()
+                    .find(|(expected_version, _)| expected_version == version)
+                    .filter(|(_, expected_description)| expected_description != description)
+                    .map(|_| *version)
+            })
+            .collect();
+        return Err(crate::error::AppError::Other(format!(
+            "schema migration history is incomplete or altered: missing={missing:?}, unknown={unknown:?}, \
+             description_mismatch={description_mismatch:?}"
+        )));
+    }
+    Ok(current_version)
+}
+
+/// Strict external-database form used before restore overwrites any live page.
+pub fn validate_applied_history(conn: &rusqlite::Connection) -> AppResult<i64> {
+    validate_applied_history_inner(conn, false)
 }
 
 /// Get the current schema version. A missing `schema_migrations` table (a genuinely fresh database)
@@ -93,6 +178,13 @@ fn ensure_migrations_table(db: &Database) -> AppResult<()> {
 /// (SQLite's canonical 12-step recreate). Keyed by version so the pre-existing migration literals stay
 /// untouched. See docs/STRICT_SPEECH_SEGMENTS_PLAN.md.
 const FK_OFF_MIGRATIONS: &[i64] = &[40];
+
+/// Migrations whose purpose is to leave the *entire* database FK-clean even though they do not
+/// rebuild an FK parent table. The normal migration path deliberately does not reject pre-existing
+/// violations: older migrations must still be able to advance a legacy database. A targeted repair,
+/// however, must prove that it removed exactly the damage it claims to repair and must fail closed if
+/// any unrelated violation remains. Both apply and rollback run the check inside their transaction.
+const FK_CLEANUP_MIGRATIONS: &[i64] = &[58];
 
 /// Run `body` with `foreign_keys` OFF, VERIFYING it actually took effect and restoring it on every path.
 ///
@@ -154,6 +246,157 @@ fn reject_foreign_key_violations(tx: &rusqlite::Transaction<'_>, version: i64) -
     Ok(())
 }
 
+/// Exact source identity for the one production orphan repair authorized in v58.
+///
+/// The digest is SHA-256 over the 2,104 missing-parent segment ids in bytewise sorted order, each
+/// encoded as UTF-8 followed by `\n`.  Counts, one-to-one membership, and the abandoned-import row
+/// shape are checked in the SAME transaction below.  This prevents v58 from becoming a generic
+/// "delete every orphan in these tables" migration if another writer or another installation has a
+/// different failure with superficially similar foreign keys.
+const V58_ORPHAN_IDS: usize = 2_104;
+const V58_ORPHAN_IDS_SHA256: &str = "b4d84377b75f493383a8acbb63bea39482597f95060c32cf88eda6011fa0aec9";
+const V58_ORPHAN_FULL_TUPLE_SHA256: &str = "5776c4a205e843bc7d7550242b1542a3640427089a2af4876744667db24cb2e0";
+#[cfg(test)]
+const V58_TEST_ORPHAN_IDS_SHA256: &str = "fa888791a05c370e2b54a25c548f3e7a1a3db19260d4d526d71e320bd12e5aee";
+#[cfg(test)]
+const V58_TEST_ORPHAN_FULL_TUPLE_SHA256: &str = "05c72a200038a81071368c0788abe2ed0c2714a18516bee2cc9657a01fe64240";
+
+fn v58_orphan_ids(tx: &rusqlite::Transaction<'_>, table: &str) -> AppResult<Vec<String>> {
+    let sql = match table {
+        "segment_hypotheses" => {
+            "SELECT h.segment_id
+               FROM segment_hypotheses h
+              WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+              ORDER BY h.segment_id"
+        }
+        "loop0_shadow_log" => {
+            "SELECT l.segment_id
+               FROM loop0_shadow_log l
+              WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = l.segment_id)
+              ORDER BY l.segment_id"
+        }
+        _ => return Err(crate::error::AppError::Other("invalid v58 orphan source table".into())),
+    };
+    let mut statement = tx.prepare(sql)?;
+    let ids = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    Ok(ids)
+}
+
+fn validate_v58_orphan_source(tx: &rusqlite::Transaction<'_>) -> AppResult<()> {
+    let hypothesis_ids = v58_orphan_ids(tx, "segment_hypotheses")?;
+    let loop0_ids = v58_orphan_ids(tx, "loop0_shadow_log")?;
+    if hypothesis_ids.is_empty() && loop0_ids.is_empty() {
+        // Normal for every fresh/healthy installation: v58 still creates the empty immutable evidence
+        // tables and records its schema version, but has no data to repair.
+        return Ok(());
+    }
+    let unique = |ids: &[String]| ids.windows(2).all(|pair| pair[0] != pair[1]);
+    if hypothesis_ids.len() != V58_ORPHAN_IDS
+        || loop0_ids.len() != V58_ORPHAN_IDS
+        || !unique(&hypothesis_ids)
+        || !unique(&loop0_ids)
+        || hypothesis_ids != loop0_ids
+    {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 source set is not the authorized {V58_ORPHAN_IDS}+{V58_ORPHAN_IDS} abandoned-import cohort"
+        )));
+    }
+
+    // All 2,104 ids must be represented by exactly one row on each side and retain the measured
+    // abandoned OmniASR-7B import shape.  This is intentionally much narrower than merely sharing the
+    // two affected table names.
+    let shaped: i64 = tx.query_row(
+        "SELECT COUNT(*)
+           FROM segment_hypotheses h
+           JOIN loop0_shadow_log l ON l.segment_id = h.segment_id
+          WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+            AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+            AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+            AND h.confidence IS NULL
+            AND h.transcript <> ''
+            AND l.memory_fired = 0
+            AND l.created_at IS NOT NULL
+            AND h.rowid - l.id = 2555
+            AND length(h.segment_id) = 36
+            AND substr(h.segment_id, 9, 1) = '-'
+            AND substr(h.segment_id, 14, 1) = '-'
+            AND substr(h.segment_id, 19, 1) = '-'
+            AND substr(h.segment_id, 24, 1) = '-'
+            AND length(replace(h.segment_id, '-', '')) = 32
+            AND replace(h.segment_id, '-', '') NOT GLOB '*[^0-9a-f]*'",
+        [],
+        |row| row.get(0),
+    )?;
+    if shaped != V58_ORPHAN_IDS as i64 {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 source rows do not match the authorized abandoned-import shape ({shaped}/{V58_ORPHAN_IDS})"
+        )));
+    }
+
+    let mut digest = Sha256::new();
+    for segment_id in &hypothesis_ids {
+        digest.update(segment_id.as_bytes());
+        digest.update(b"\n");
+    }
+    let actual: String = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    #[cfg(test)]
+    let accepted = actual == V58_ORPHAN_IDS_SHA256 || actual == V58_TEST_ORPHAN_IDS_SHA256;
+    #[cfg(not(test))]
+    let accepted = actual == V58_ORPHAN_IDS_SHA256;
+    if !accepted {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 source identity digest is not authorized (got {actual})"
+        )));
+    }
+
+    // Bind every byte of the evidence that will be archived, including the transcript. The ID/shape
+    // proof above prevents a generic cleanup; this second digest prevents the authorized IDs from
+    // carrying altered transcription/timestamps/row identities while still looking structurally
+    // plausible. Canonical form is one compact UTF-8 JSON line per sorted segment ID:
+    // [[hypothesis source columns],[loop0 source columns]]\n.
+    let mut statement = tx.prepare(
+        "SELECT h.rowid, h.segment_id, h.model_id, h.transcript, h.confidence, h.created_at,
+                h.model_version_id, l.id, l.segment_id, l.memory_fired, l.created_at
+           FROM segment_hypotheses h
+           JOIN loop0_shadow_log l ON l.segment_id = h.segment_id
+          WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+          ORDER BY h.segment_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            (
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ),
+            (row.get::<_, i64>(7)?, row.get::<_, String>(8)?, row.get::<_, i64>(9)?, row.get::<_, String>(10)?),
+        ))
+    })?;
+    let mut full_digest = Sha256::new();
+    for row in rows {
+        let encoded = serde_json::to_vec(&row?).map_err(|error| {
+            crate::error::AppError::Other(format!("migration v58 could not encode source evidence: {error}"))
+        })?;
+        full_digest.update(encoded);
+        full_digest.update(b"\n");
+    }
+    let actual_full: String = full_digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    #[cfg(test)]
+    let full_accepted = actual_full == V58_ORPHAN_FULL_TUPLE_SHA256 || actual_full == V58_TEST_ORPHAN_FULL_TUPLE_SHA256;
+    #[cfg(not(test))]
+    let full_accepted = actual_full == V58_ORPHAN_FULL_TUPLE_SHA256;
+    if !full_accepted {
+        return Err(crate::error::AppError::Other(format!(
+            "migration v58 full source-evidence digest is not authorized (got {actual_full})"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_migration(db: &Database, migration: &Migration) -> AppResult<()> {
     let conn = db.connection();
     if FK_OFF_MIGRATIONS.contains(&migration.version) {
@@ -170,18 +413,24 @@ fn apply_migration(db: &Database, migration: &Migration) -> AppResult<()> {
         });
     }
     let tx = conn.unchecked_transaction()?;
+    if migration.version == 58 {
+        validate_v58_orphan_source(&tx)?;
+    }
     tx.execute_batch(migration.up_sql)?;
     tx.execute(
         "INSERT INTO schema_migrations (version, description) VALUES (?1, ?2)",
         rusqlite::params![migration.version, migration.description],
     )?;
+    if FK_CLEANUP_MIGRATIONS.contains(&migration.version) {
+        reject_foreign_key_violations(&tx, migration.version)?;
+    }
     tx.commit()?;
     Ok(())
 }
 
 /// Rollback the last N migrations.
 pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
-    let current = get_current_version(db)?;
+    let current = validate_applied_history(db.connection())?;
     let mut reverted = Vec::new();
 
     for migration in MIGRATIONS.iter().rev() {
@@ -221,6 +470,9 @@ pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
                         "DELETE FROM schema_migrations WHERE version = ?1",
                         rusqlite::params![migration.version],
                     )?;
+                    if FK_CLEANUP_MIGRATIONS.contains(&migration.version) {
+                        reject_foreign_key_violations(&tx, migration.version)?;
+                    }
                     tx.commit()?;
                 }
                 reverted.push(migration.version);
@@ -233,7 +485,7 @@ pub fn rollback(db: &Database, count: usize) -> AppResult<Vec<i64>> {
 
 /// List all migrations and their status.
 pub fn list_migrations(db: &Database) -> AppResult<Vec<MigrationStatus>> {
-    let current = get_current_version(db)?;
+    let current = validate_applied_history(db.connection())?;
     Ok(MIGRATIONS
         .iter()
         .map(|m| MigrationStatus {
@@ -1623,12 +1875,452 @@ pub static MIGRATIONS: &[Migration] = &[
                  WHERE duration_ms IS NULL;",
         down_sql: Some("ALTER TABLE review_events DROP COLUMN duration_ms;"),
     },
+    Migration {
+        version: 57,
+        description: "Version reviewer compensation and append immutable signed ledger entries",
+        // Owner authorization 2026-08-21: edit 100%, unchanged accept 10%, valid reject 10%, skip 0%
+        // at the existing 18,000 IQD/full-equivalent-hour rate. The policy starts AFTER the last
+        // legacy event present when this migration lands: historical rows do not preserve the
+        // semantic action the reviewer performed, and silently repricing them would invent payroll.
+        //
+        // `review_events.action` remains the effective CORPUS/provenance decision. The new column
+        // snapshots the distinct compensation action (e.g. an unchanged accept can be provenance-
+        // reclassified to edit, while still earning the authorized accept rate).
+        up_sql: "ALTER TABLE review_events ADD COLUMN compensation_action TEXT;
+                 ALTER TABLE review_events ADD COLUMN operation_id TEXT;
+                 ALTER TABLE review_events ADD COLUMN operation_payload_hash TEXT;
+                 CREATE UNIQUE INDEX idx_review_events_operation_id
+                     ON review_events(operation_id) WHERE operation_id IS NOT NULL;
+                 CREATE TRIGGER review_event_operation_validate_insert
+                 BEFORE INSERT ON review_events
+                 WHEN (NEW.operation_id IS NULL) <> (NEW.operation_payload_hash IS NULL)
+                   OR (NEW.operation_id IS NOT NULL AND (
+                          TRIM(NEW.operation_id) = ''
+                          OR LENGTH(NEW.operation_payload_hash) <> 64
+                          OR NEW.operation_payload_hash GLOB '*[^0-9a-f]*'
+                      ))
+                 BEGIN SELECT RAISE(ABORT, 'review operation id/hash must be paired and canonical'); END;
+                 CREATE TRIGGER review_event_operation_immutable_update
+                 BEFORE UPDATE OF operation_id, operation_payload_hash ON review_events
+                 WHEN NEW.operation_id IS NOT OLD.operation_id
+                   OR NEW.operation_payload_hash IS NOT OLD.operation_payload_hash
+                 BEGIN SELECT RAISE(ABORT, 'review operation identity is immutable'); END;
+
+                 CREATE TABLE review_compensation_policies (
+                     policy_version                 TEXT PRIMARY KEY,
+                     effective_after_event_id       INTEGER NOT NULL CHECK(effective_after_event_id >= 0),
+                     base_rate_micro_iqd_per_hour   INTEGER NOT NULL CHECK(base_rate_micro_iqd_per_hour > 0),
+                     edit_basis_points              INTEGER NOT NULL CHECK(edit_basis_points BETWEEN 0 AND 10000),
+                     accept_basis_points            INTEGER NOT NULL CHECK(accept_basis_points BETWEEN 0 AND 10000),
+                     reject_basis_points            INTEGER NOT NULL CHECK(reject_basis_points BETWEEN 0 AND 10000),
+                     skip_basis_points              INTEGER NOT NULL CHECK(skip_basis_points BETWEEN 0 AND 10000),
+                     created_at                     TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 INSERT INTO review_compensation_policies
+                     (policy_version, effective_after_event_id, base_rate_micro_iqd_per_hour,
+                      edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points)
+                 SELECT 'review-iqd-v1-2026-08-21', COALESCE(MAX(id), 0), 18000000000,
+                        10000, 1000, 1000, 0
+                   FROM review_events;
+
+                 CREATE TABLE review_compensation_ledger (
+                     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     entry_id                   TEXT NOT NULL UNIQUE,
+                     entry_key                  TEXT NOT NULL UNIQUE,
+                     policy_version             TEXT NOT NULL,
+                     review_event_id            INTEGER,
+                     canonical_work_id          TEXT NOT NULL,
+                     canonical_identity_kind    TEXT NOT NULL,
+                     reviewer                   TEXT NOT NULL,
+                     segment_id                 TEXT NOT NULL,
+                     source                     TEXT NOT NULL,
+                     compensation_action        TEXT NOT NULL
+                                                    CHECK(compensation_action IN ('accept','edit','reject','skip','undo')),
+                     effective_decision         TEXT NOT NULL,
+                     decision_revision          INTEGER,
+                     duration_ms                INTEGER NOT NULL CHECK(duration_ms >= 0),
+                     rate_basis_points          INTEGER NOT NULL CHECK(rate_basis_points BETWEEN 0 AND 10000),
+                     entitlement_micro_iqd      INTEGER NOT NULL CHECK(entitlement_micro_iqd >= 0),
+                     delta_micro_iqd            INTEGER NOT NULL,
+                     corrected_entitlement_ms   INTEGER NOT NULL CHECK(corrected_entitlement_ms >= 0),
+                     delta_corrected_ms          INTEGER NOT NULL,
+                     reverses_entry_id          TEXT,
+                     created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY(policy_version) REFERENCES review_compensation_policies(policy_version),
+                     FOREIGN KEY(review_event_id) REFERENCES review_events(id),
+                     FOREIGN KEY(reverses_entry_id) REFERENCES review_compensation_ledger(entry_id)
+                 ) STRICT;
+                 CREATE UNIQUE INDEX idx_review_compensation_one_entry_per_event
+                     ON review_compensation_ledger(review_event_id) WHERE review_event_id IS NOT NULL;
+                 CREATE INDEX idx_review_compensation_reviewer
+                     ON review_compensation_ledger(reviewer, policy_version, id);
+                 CREATE INDEX idx_review_compensation_work
+                     ON review_compensation_ledger(canonical_work_id, reviewer, policy_version, id);
+
+                 CREATE TABLE review_compensation_settlements (
+                     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     settlement_id              TEXT NOT NULL UNIQUE,
+                     policy_version             TEXT NOT NULL,
+                     reviewer                   TEXT NOT NULL CHECK(TRIM(reviewer) <> ''),
+                     from_ledger_id_exclusive   INTEGER NOT NULL CHECK(from_ledger_id_exclusive >= 0),
+                     through_ledger_id_inclusive INTEGER NOT NULL
+                                                    CHECK(through_ledger_id_inclusive > from_ledger_id_exclusive),
+                     allocated_micro_iqd        INTEGER NOT NULL,
+                     payout_reference           TEXT NOT NULL UNIQUE CHECK(TRIM(payout_reference) <> ''),
+                     created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY(policy_version) REFERENCES review_compensation_policies(policy_version)
+                 ) STRICT;
+                 CREATE UNIQUE INDEX idx_review_compensation_settlement_boundary
+                     ON review_compensation_settlements(policy_version, reviewer COLLATE NOCASE,
+                                                        through_ledger_id_inclusive);
+
+                 -- A settlement allocates one reviewer's next contiguous global-ledger interval.
+                 -- The exact amount is recomputed from immutable entries at INSERT time, so retrying
+                 -- or widening a payout range can neither pay the same delta twice nor invent money.
+                 CREATE TRIGGER review_compensation_settlement_validate_insert
+                 BEFORE INSERT ON review_compensation_settlements
+                 WHEN NEW.from_ledger_id_exclusive <> COALESCE((
+                          SELECT MAX(through_ledger_id_inclusive)
+                            FROM review_compensation_settlements
+                           WHERE policy_version = NEW.policy_version
+                             AND reviewer = NEW.reviewer COLLATE NOCASE
+                      ), 0)
+                   OR NEW.through_ledger_id_inclusive > COALESCE((
+                          SELECT MAX(id) FROM review_compensation_ledger
+                           WHERE policy_version = NEW.policy_version
+                      ), 0)
+                   OR NOT EXISTS (
+                          SELECT 1 FROM review_compensation_ledger
+                           WHERE policy_version = NEW.policy_version
+                             AND reviewer = NEW.reviewer COLLATE NOCASE
+                             AND id > NEW.from_ledger_id_exclusive
+                             AND id <= NEW.through_ledger_id_inclusive
+                      )
+                   OR NEW.allocated_micro_iqd <> COALESCE((
+                          SELECT SUM(delta_micro_iqd) FROM review_compensation_ledger
+                           WHERE policy_version = NEW.policy_version
+                             AND reviewer = NEW.reviewer COLLATE NOCASE
+                             AND id > NEW.from_ledger_id_exclusive
+                             AND id <= NEW.through_ledger_id_inclusive
+                      ), 0)
+                 BEGIN SELECT RAISE(ABORT, 'review compensation settlement range/amount is invalid'); END;
+                 CREATE TRIGGER review_compensation_settlement_immutable_update
+                 BEFORE UPDATE ON review_compensation_settlements
+                 BEGIN SELECT RAISE(ABORT, 'review compensation settlement is immutable'); END;
+                 CREATE TRIGGER review_compensation_settlement_immutable_delete
+                 BEFORE DELETE ON review_compensation_settlements
+                 BEGIN SELECT RAISE(ABORT, 'review compensation settlement is immutable'); END;
+
+                 CREATE TRIGGER review_compensation_policy_immutable_update
+                 BEFORE UPDATE ON review_compensation_policies
+                 BEGIN SELECT RAISE(ABORT, 'review compensation policy is immutable'); END;
+                 CREATE TRIGGER review_compensation_policy_immutable_delete
+                 BEFORE DELETE ON review_compensation_policies
+                 BEGIN SELECT RAISE(ABORT, 'review compensation policy is immutable'); END;
+                 CREATE TRIGGER review_compensation_ledger_immutable_update
+                 BEFORE UPDATE ON review_compensation_ledger
+                 BEGIN SELECT RAISE(ABORT, 'review compensation ledger is append-only'); END;
+                 CREATE TRIGGER review_compensation_ledger_immutable_delete
+                 BEFORE DELETE ON review_compensation_ledger
+                 BEGIN SELECT RAISE(ABORT, 'review compensation ledger is append-only'); END;",
+        down_sql: Some(
+            "CREATE TEMP TABLE review_compensation_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_compensation_rollback_guard(must_be_zero)
+             SELECT 1
+              WHERE EXISTS (SELECT 1 FROM review_compensation_ledger)
+                 OR EXISTS (SELECT 1 FROM review_compensation_settlements)
+                 OR EXISTS (
+                    SELECT 1 FROM review_events
+                     WHERE id > (SELECT effective_after_event_id
+                                   FROM review_compensation_policies
+                                  WHERE policy_version = 'review-iqd-v1-2026-08-21')
+                 );
+             DROP TABLE review_compensation_rollback_guard;
+             DROP TRIGGER IF EXISTS review_compensation_ledger_immutable_delete;
+             DROP TRIGGER IF EXISTS review_compensation_ledger_immutable_update;
+             DROP TRIGGER IF EXISTS review_compensation_settlement_immutable_delete;
+             DROP TRIGGER IF EXISTS review_compensation_settlement_immutable_update;
+             DROP TRIGGER IF EXISTS review_compensation_settlement_validate_insert;
+             DROP TRIGGER IF EXISTS review_compensation_policy_immutable_delete;
+             DROP TRIGGER IF EXISTS review_compensation_policy_immutable_update;
+             DROP TRIGGER IF EXISTS review_event_operation_immutable_update;
+             DROP TRIGGER IF EXISTS review_event_operation_validate_insert;
+             DROP INDEX IF EXISTS idx_review_compensation_work;
+             DROP INDEX IF EXISTS idx_review_compensation_reviewer;
+             DROP INDEX IF EXISTS idx_review_compensation_one_entry_per_event;
+             DROP INDEX IF EXISTS idx_review_compensation_settlement_boundary;
+             DROP INDEX IF EXISTS idx_review_events_operation_id;
+             DROP TABLE IF EXISTS review_compensation_settlements;
+             DROP TABLE IF EXISTS review_compensation_ledger;
+             DROP TABLE IF EXISTS review_compensation_policies;
+             ALTER TABLE review_events DROP COLUMN operation_payload_hash;
+             ALTER TABLE review_events DROP COLUMN operation_id;
+             ALTER TABLE review_events DROP COLUMN compensation_action;",
+        ),
+    },
+    Migration {
+        version: 58,
+        description: "Archive and remove only abandoned-import child rows whose speech segment is missing",
+        // Production preflight 2026-08-21 found exactly two FK-violation classes left by deletion of an
+        // abandoned import: segment_hypotheses and loop0_shadow_log rows whose speech_segments parent no
+        // longer exists. Never manufacture a parent and never discard the evidence. This migration copies
+        // every source column plus the original SQLite row identity and explicit repair provenance into
+        // immutable archive tables before deleting a child. Each DELETE is additionally gated on the exact
+        // archive key/rowid existing. `apply_migration` runs a whole-database foreign_key_check before commit
+        // for v58, so an unexpected third violation class aborts and restores both source tables atomically.
+        up_sql: "CREATE TABLE orphan_segment_hypotheses_archive_v58 (
+                     original_rowid            INTEGER NOT NULL UNIQUE,
+                     segment_id                 TEXT NOT NULL,
+                     model_id                   TEXT NOT NULL,
+                     transcript                 TEXT NOT NULL,
+                     confidence                 REAL,
+                     created_at                 TEXT NOT NULL,
+                     model_version_id           TEXT NOT NULL,
+                     source_table               TEXT NOT NULL
+                                                    CHECK(source_table = 'segment_hypotheses'),
+                     archive_reason             TEXT NOT NULL
+                                                    CHECK(archive_reason = 'missing speech_segments parent'),
+                     archive_migration_version  INTEGER NOT NULL CHECK(archive_migration_version = 58),
+                     archived_at                TEXT NOT NULL,
+                     PRIMARY KEY(segment_id, model_id)
+                 );
+                 CREATE TABLE orphan_loop0_shadow_log_archive_v58 (
+                     id                         INTEGER PRIMARY KEY,
+                     segment_id                 TEXT NOT NULL,
+                     memory_fired               BOOLEAN,
+                     created_at                 TEXT,
+                     source_table               TEXT NOT NULL
+                                                    CHECK(source_table = 'loop0_shadow_log'),
+                     archive_reason             TEXT NOT NULL
+                                                    CHECK(archive_reason = 'missing speech_segments parent'),
+                     archive_migration_version  INTEGER NOT NULL CHECK(archive_migration_version = 58),
+                     archived_at                TEXT NOT NULL
+                 );
+
+                 -- Plain CREATE/INSERT are deliberate. If evidence tables already exist while the schema
+                 -- version says v58 is pending, their provenance is ambiguous; fail instead of accepting or
+                 -- overwriting potentially tampered evidence.
+                 INSERT INTO orphan_segment_hypotheses_archive_v58
+                     (original_rowid, segment_id, model_id, transcript, confidence, created_at,
+                      model_version_id, source_table, archive_reason, archive_migration_version, archived_at)
+                 SELECT h.rowid, h.segment_id, h.model_id, h.transcript, h.confidence, h.created_at,
+                        h.model_version_id, 'segment_hypotheses', 'missing speech_segments parent', 58,
+                        datetime('now')
+                   FROM segment_hypotheses h
+                   WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id)
+                     AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                     AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                     AND h.confidence IS NULL
+                     AND EXISTS (
+                           SELECT 1 FROM loop0_shadow_log l
+                            WHERE l.segment_id = h.segment_id
+                              AND h.rowid - l.id = 2555
+                              AND l.memory_fired = 0
+                              AND l.created_at IS NOT NULL
+                         );
+                 INSERT INTO orphan_loop0_shadow_log_archive_v58
+                     (id, segment_id, memory_fired, created_at, source_table, archive_reason,
+                      archive_migration_version, archived_at)
+                 SELECT l.id, l.segment_id, l.memory_fired, l.created_at,
+                        'loop0_shadow_log', 'missing speech_segments parent', 58, datetime('now')
+                   FROM loop0_shadow_log l
+                   WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = l.segment_id)
+                     AND l.memory_fired = 0
+                     AND l.created_at IS NOT NULL
+                     AND EXISTS (
+                           SELECT 1 FROM segment_hypotheses h
+                            WHERE h.segment_id = l.segment_id
+                              AND h.rowid - l.id = 2555
+                              AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                              AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                              AND h.confidence IS NULL
+                         );
+
+                 DELETE FROM segment_hypotheses
+                  WHERE NOT EXISTS (
+                            SELECT 1 FROM speech_segments s
+                             WHERE s.id = segment_hypotheses.segment_id
+                         )
+                    AND segment_hypotheses.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                    AND segment_hypotheses.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                    AND segment_hypotheses.confidence IS NULL
+                    AND EXISTS (
+                            SELECT 1 FROM loop0_shadow_log l
+                             WHERE l.segment_id = segment_hypotheses.segment_id
+                               AND segment_hypotheses.rowid - l.id = 2555
+                               AND l.memory_fired = 0
+                               AND l.created_at IS NOT NULL
+                        )
+                    AND EXISTS (
+                            SELECT 1 FROM orphan_segment_hypotheses_archive_v58 a
+                             WHERE a.original_rowid = segment_hypotheses.rowid
+                               AND a.segment_id = segment_hypotheses.segment_id
+                               AND a.model_id = segment_hypotheses.model_id
+                               AND a.transcript IS segment_hypotheses.transcript
+                               AND a.confidence IS segment_hypotheses.confidence
+                               AND a.created_at IS segment_hypotheses.created_at
+                               AND a.model_version_id IS segment_hypotheses.model_version_id
+                        );
+                 DELETE FROM loop0_shadow_log
+                  WHERE NOT EXISTS (
+                            SELECT 1 FROM speech_segments s
+                             WHERE s.id = loop0_shadow_log.segment_id
+                         )
+                    AND loop0_shadow_log.memory_fired = 0
+                    AND loop0_shadow_log.created_at IS NOT NULL
+                    -- The live hypothesis row was deleted immediately above. Bind this second DELETE
+                    -- to its exact immutable archive twin instead of querying an already-empty source.
+                    AND EXISTS (
+                            SELECT 1 FROM orphan_segment_hypotheses_archive_v58 h
+                             WHERE h.segment_id = loop0_shadow_log.segment_id
+                               AND h.original_rowid - loop0_shadow_log.id = 2555
+                               AND h.model_id = 'omniasr-7b-legacy-c348ade8a816'
+                               AND h.model_version_id = 'omniasr-7b-legacy-c348ade8a816'
+                               AND h.confidence IS NULL
+                        )
+                    AND EXISTS (
+                            SELECT 1 FROM orphan_loop0_shadow_log_archive_v58 a
+                             WHERE a.id = loop0_shadow_log.id
+                               AND a.segment_id = loop0_shadow_log.segment_id
+                               AND a.memory_fired IS loop0_shadow_log.memory_fired
+                               AND a.created_at IS loop0_shadow_log.created_at
+                        );
+
+                 CREATE TRIGGER orphan_segment_hypotheses_archive_v58_immutable_insert
+                 BEFORE INSERT ON orphan_segment_hypotheses_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_segment_hypotheses_archive_v58_immutable_update
+                 BEFORE UPDATE ON orphan_segment_hypotheses_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_segment_hypotheses_archive_v58_immutable_delete
+                 BEFORE DELETE ON orphan_segment_hypotheses_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_insert
+                 BEFORE INSERT ON orphan_loop0_shadow_log_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_update
+                 BEFORE UPDATE ON orphan_loop0_shadow_log_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;
+                 CREATE TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_delete
+                 BEFORE DELETE ON orphan_loop0_shadow_log_archive_v58
+                 BEGIN SELECT RAISE(ABORT, 'v58 orphan archive is immutable'); END;",
+        // Downgrade is deliberately conditional. Reintroducing the archived children while their parent is
+        // still absent would recreate the corruption v58 repaired; overwriting a same-key or same-rowid row
+        // created later would destroy newer work. The guard fails inside rollback's transaction and leaves
+        // v58, both archives, and all live tables unchanged. If the exact parents have been recovered and no
+        // identity conflicts exist, rollback restores every original value/rowid before dropping the archive.
+        down_sql: Some(
+            "CREATE TEMP TABLE orphan_repair_v58_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM orphan_segment_hypotheses_archive_v58 a
+                  WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = a.segment_id)
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1 FROM orphan_loop0_shadow_log_archive_v58 a
+                  WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = a.segment_id)
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1
+                   FROM orphan_segment_hypotheses_archive_v58 a
+                   JOIN segment_hypotheses h
+                     ON (h.segment_id = a.segment_id AND h.model_id = a.model_id)
+                     OR h.rowid = a.original_rowid
+             );
+             INSERT INTO orphan_repair_v58_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1
+                   FROM orphan_loop0_shadow_log_archive_v58 a
+                   JOIN loop0_shadow_log l ON l.id = a.id
+             );
+             DROP TABLE orphan_repair_v58_rollback_guard;
+
+             DROP TRIGGER orphan_segment_hypotheses_archive_v58_immutable_insert;
+             DROP TRIGGER orphan_segment_hypotheses_archive_v58_immutable_update;
+             DROP TRIGGER orphan_segment_hypotheses_archive_v58_immutable_delete;
+             DROP TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_insert;
+             DROP TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_update;
+             DROP TRIGGER orphan_loop0_shadow_log_archive_v58_immutable_delete;
+
+             INSERT INTO segment_hypotheses
+                 (rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id)
+             SELECT original_rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+               FROM orphan_segment_hypotheses_archive_v58
+              ORDER BY original_rowid;
+             INSERT INTO loop0_shadow_log(id, segment_id, memory_fired, created_at)
+             SELECT id, segment_id, memory_fired, created_at
+               FROM orphan_loop0_shadow_log_archive_v58
+              ORDER BY id;
+
+             DROP TABLE orphan_segment_hypotheses_archive_v58;
+             DROP TABLE orphan_loop0_shadow_log_archive_v58;",
+        ),
+    },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    fn database_at_v57() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![58], "fixture must stop immediately before v58");
+        assert_eq!(get_current_version(&db).unwrap(), 57);
+        db
+    }
+
+    fn v58_fixture_id(index: i64) -> String {
+        format!("00000000-0000-4000-8000-{index:012x}")
+    }
+
+    /// Deterministic test twin of the measured production cohort. Its sorted-id digest is the
+    /// cfg(test)-only value accepted by `validate_v58_orphan_source`; every other shape remains red.
+    fn seed_v58_authorized_cohort(db: &Database) {
+        run_with_foreign_keys_off(db.connection(), || {
+            let tx = db.connection().unchecked_transaction()?;
+            {
+                let mut insert_hypothesis = tx.prepare(
+                    "INSERT INTO segment_hypotheses
+                        (rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id)
+                     VALUES (?1, ?2, 'omniasr-7b-legacy-c348ade8a816', ?3, NULL, ?4,
+                             'omniasr-7b-legacy-c348ade8a816')",
+                )?;
+                let mut insert_loop0 = tx.prepare(
+                    "INSERT INTO loop0_shadow_log(id, segment_id, memory_fired, created_at)
+                     VALUES (?1, ?2, 0, ?3)",
+                )?;
+                for index in 0..V58_ORPHAN_IDS as i64 {
+                    let segment_id = v58_fixture_id(index);
+                    let hypothesis_rowid = 2_000_000 + index;
+                    let loop0_id = hypothesis_rowid - 2_555;
+                    let transcript = if index == 0 { "دەقی یەکەم\nبە وردی" } else { "دەق" };
+                    let created_at = format!("2026-08-21 01:{:02}:{:02}", (index / 60) % 60, index % 60);
+                    insert_hypothesis.execute(rusqlite::params![
+                        hypothesis_rowid,
+                        segment_id,
+                        transcript,
+                        created_at,
+                    ])?;
+                    insert_loop0.execute(rusqlite::params![loop0_id, segment_id, created_at])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn foreign_key_violation_count(conn: &rusqlite::Connection) -> usize {
+        conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |_| Ok(())).unwrap().count()
+    }
 
     #[test]
     fn test_migrations_run() {
@@ -1693,11 +2385,13 @@ mod tests {
             .expect("the FK-off recreate must succeed");
         }
 
-        // A live upgrade applies v40 and THEN every later migration; re-running v40's recreate in
-        // isolation leaves the table at v40's 34-column shape (its INSERT…SELECT copies only those 34),
-        // dropping any column a post-v40 migration added. Re-apply everything after v40 so HEAD-schema
-        // readers (get_segment_by_id below) see the real current shape — future-proof against v42+.
-        for later in MIGRATIONS.iter().filter(|m| m.version > 40) {
+        // A live upgrade applies v40 and THEN the later migrations which extend speech_segments.
+        // Re-running v40's recreate in isolation leaves the table at v40's 34-column shape, so restore
+        // exactly those table/index/trigger changes before HEAD-schema readers run below. Unrelated
+        // migrations survive the v40 recreate and must not be replayed: in particular, v58 deliberately
+        // uses plain CREATE for immutable repair evidence and MUST reject a second application.
+        const POST_V40_SPEECH_SEGMENT_MIGRATIONS: &[i64] = &[41, 42, 43, 47, 48, 49, 50, 51, 52, 53];
+        for later in MIGRATIONS.iter().filter(|m| POST_V40_SPEECH_SEGMENT_MIGRATIONS.contains(&m.version)) {
             if let Err(e) = db.connection().execute_batch(later.up_sql) {
                 // "duplicate column" here is the GOOD outcome for a table v40's recreate never
                 // touched (v56 alters review_events): the column survived, there is nothing to
@@ -2037,6 +2731,77 @@ mod tests {
         let again = run_migrations(&db).unwrap();
         assert!(again.is_empty());
         assert_eq!(get_current_version(&db).unwrap(), max_version);
+    }
+
+    #[test]
+    fn exact_history_accepts_only_the_description_bound_complete_prefix() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(validate_applied_history(db.connection()).unwrap(), max_supported_version());
+
+        db.connection().execute("DELETE FROM schema_migrations WHERE version = 23", []).unwrap();
+        let missing = validate_applied_history(db.connection()).expect_err("a missing middle row must fail");
+        assert!(missing.to_string().contains("missing=[23]"), "unexpected history error: {missing}");
+
+        let description = MIGRATIONS.iter().find(|migration| migration.version == 23).unwrap().description;
+        db.connection()
+            .execute(
+                "INSERT INTO schema_migrations(version, description) VALUES (23, ?1)",
+                rusqlite::params![description],
+            )
+            .unwrap();
+        db.connection()
+            .execute("UPDATE schema_migrations SET description = 'tampered' WHERE version = 31", [])
+            .unwrap();
+        let drift = validate_applied_history(db.connection()).expect_err("description drift must fail");
+        assert!(drift.to_string().contains("description_mismatch=[31]"), "unexpected history error: {drift}");
+    }
+
+    #[test]
+    fn a_lone_maximum_or_empty_existing_history_never_bootstraps() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "history-sentinel".into(),
+            audio_path: "/sentinel.wav".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let head = max_supported_version();
+        db.connection().execute("DELETE FROM schema_migrations WHERE version <> ?1", rusqlite::params![head]).unwrap();
+        let lone = run_migrations(&db).expect_err("MAX(version) without its prefix must fail");
+        assert!(lone.to_string().contains("missing="), "unexpected history error: {lone}");
+
+        db.connection().execute("DELETE FROM schema_migrations", []).unwrap();
+        let empty = db.initialize().expect_err("an existing database with empty history must fail closed");
+        assert!(empty.to_string().contains("schema_migrations is empty"), "unexpected bootstrap error: {empty}");
+        assert!(
+            db.get_segment_by_id("history-sentinel").unwrap().is_some(),
+            "refusing damaged history must preserve live data"
+        );
+    }
+
+    #[test]
+    fn restart_refuses_a_missing_history_table_or_required_schema_object() {
+        let missing_history = Database::open(":memory:").unwrap();
+        missing_history.initialize().unwrap();
+        missing_history.connection().execute("DROP TABLE schema_migrations", []).unwrap();
+        let history_error = missing_history.initialize().expect_err("missing history must fail before startup");
+        assert!(
+            history_error.to_string().contains("schema_migrations is missing"),
+            "unexpected error: {history_error}"
+        );
+
+        let missing_object = Database::open(":memory:").unwrap();
+        missing_object.initialize().unwrap();
+        missing_object.connection().execute("DROP TABLE jobs", []).unwrap();
+        let schema_error = missing_object.initialize().expect_err("exact history cannot hide a dropped required table");
+        let schema_message = schema_error.to_string();
+        assert!(
+            schema_message.contains("missing=") && schema_message.contains("\"jobs\""),
+            "unexpected error: {schema_error}"
+        );
     }
 
     #[test]
@@ -2554,6 +3319,702 @@ mod tests {
             2,
             "deleting the clip must not rewrite the history of who reviewed it honestly"
         );
+    }
+
+    #[test]
+    fn v57_starts_prospectively_after_the_last_legacy_event() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 2).unwrap(), vec![58, 57], "fixture must return to the v56 schema");
+
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "pay-cutoff".into(),
+            audio_path: "/pay-cutoff.wav".into(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms)
+                 VALUES ('pay-cutoff', 'Sara', 'accept', 'legacy', 1, 1000)",
+                [],
+            )
+            .unwrap();
+        let legacy_event_id = db.connection().last_insert_rowid();
+
+        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58]);
+        let cutoff: i64 = db
+            .connection()
+            .query_row(
+                "SELECT effective_after_event_id FROM review_compensation_policies
+                  WHERE policy_version = 'review-iqd-v1-2026-08-21'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cutoff, legacy_event_id);
+        let legacy_compensation_action: Option<String> = db
+            .connection()
+            .query_row("SELECT compensation_action FROM review_events WHERE id = ?1", [legacy_event_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(legacy_compensation_action.is_none(), "v57 must not invent a semantic action for history");
+
+        let before = db.review_compensation_summary("Sara").unwrap();
+        assert_eq!(before.earned_micro_iqd, 0, "legacy activity is reported, never silently repriced");
+        assert_eq!(before.legacy_events_pending_reconciliation, 1);
+
+        let revision = db.segment_review_revision("pay-cutoff").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision("pay-cutoff", "edit", Some("دەقی ڕاست"), "Sara", revision)
+            .unwrap()
+            .unwrap();
+        let after = db.review_compensation_summary("Sara").unwrap();
+        assert_eq!(after.earned_micro_iqd, 5_000_000);
+        assert_eq!(after.legacy_events_pending_reconciliation, 1);
+        let priced_event_id: i64 = db
+            .connection()
+            .query_row("SELECT review_event_id FROM review_compensation_ledger", [], |row| row.get(0))
+            .unwrap();
+        assert!(priced_event_id > cutoff, "only events strictly after the captured cutoff are payable");
+    }
+
+    #[test]
+    fn v57_policy_and_ledger_rows_are_physically_immutable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "pay-immutable".into(),
+            audio_path: "/pay-immutable.wav".into(),
+            raw_transcript: "دەق".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let revision = db.segment_review_revision("pay-immutable").unwrap().unwrap();
+        let operation_id = "423e4567-e89b-42d3-a456-426614174000";
+        let operation_hash = "a".repeat(64);
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "pay-immutable",
+            "edit",
+            Some("دەقی ڕاست"),
+            "Sara",
+            revision,
+            operation_id,
+            &operation_hash,
+        )
+        .unwrap()
+        .unwrap();
+        let ledger_id: i64 =
+            db.connection().query_row("SELECT id FROM review_compensation_ledger", [], |row| row.get(0)).unwrap();
+        db.record_review_compensation_settlement("Sara", ledger_id, "immutable-payout").unwrap();
+
+        let policy_update = db
+            .connection()
+            .execute("UPDATE review_compensation_policies SET edit_basis_points = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(policy_update.contains("policy is immutable"), "unexpected policy UPDATE error: {policy_update}");
+        let policy_delete =
+            db.connection().execute("DELETE FROM review_compensation_policies", []).unwrap_err().to_string();
+        assert!(policy_delete.contains("policy is immutable"), "unexpected policy DELETE error: {policy_delete}");
+
+        let ledger_update = db
+            .connection()
+            .execute("UPDATE review_compensation_ledger SET delta_micro_iqd = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(ledger_update.contains("ledger is append-only"), "unexpected ledger UPDATE error: {ledger_update}");
+        let ledger_delete =
+            db.connection().execute("DELETE FROM review_compensation_ledger", []).unwrap_err().to_string();
+        assert!(ledger_delete.contains("ledger is append-only"), "unexpected ledger DELETE error: {ledger_delete}");
+
+        let settlement_update = db
+            .connection()
+            .execute("UPDATE review_compensation_settlements SET allocated_micro_iqd = 0", [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            settlement_update.contains("settlement is immutable"),
+            "unexpected settlement UPDATE error: {settlement_update}"
+        );
+        let settlement_delete =
+            db.connection().execute("DELETE FROM review_compensation_settlements", []).unwrap_err().to_string();
+        assert!(
+            settlement_delete.contains("settlement is immutable"),
+            "unexpected settlement DELETE error: {settlement_delete}"
+        );
+
+        let operation_update = db
+            .connection()
+            .execute(
+                "UPDATE review_events
+                    SET operation_id = '523e4567-e89b-42d3-a456-426614174000'
+                  WHERE operation_id = ?1",
+                [operation_id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            operation_update.contains("operation identity is immutable"),
+            "unexpected operation UPDATE error: {operation_update}"
+        );
+        let hash_update = db
+            .connection()
+            .execute(
+                "UPDATE review_events SET operation_payload_hash = ?1 WHERE operation_id = ?2",
+                rusqlite::params!["b".repeat(64), operation_id],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            hash_update.contains("operation identity is immutable"),
+            "unexpected operation hash UPDATE error: {hash_update}"
+        );
+        let stored_operation: (String, String) = db
+            .connection()
+            .query_row(
+                "SELECT operation_id, operation_payload_hash FROM review_events WHERE operation_id = ?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_operation, (operation_id.into(), operation_hash));
+
+        let policy: (i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points
+                   FROM review_compensation_policies",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(policy, (10_000, 1_000, 1_000, 0));
+        let ledger: (i64, i64) = db
+            .connection()
+            .query_row("SELECT COUNT(*), SUM(delta_micro_iqd) FROM review_compensation_ledger", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ledger, (1, 5_000_000));
+        let settlements: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_compensation_settlements", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(settlements, 1);
+    }
+
+    #[test]
+    fn v57_refuses_rollback_after_any_post_cutoff_financial_history() {
+        // Both branches matter. A normal paid write has a ledger row; a post-cutoff event without
+        // one signals interrupted/corrupt accounting and is even less safe to erase by downgrade.
+        for history_kind in ["ledger", "unledgered-event"] {
+            let db = Database::open(":memory:").unwrap();
+            db.initialize().unwrap();
+            assert_eq!(rollback(&db, 1).unwrap(), vec![58], "fixture must target v57 rollback semantics");
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: format!("pay-no-rollback-{history_kind}"),
+                audio_path: format!("/pay-no-rollback-{history_kind}.wav"),
+                raw_transcript: "دەق".into(),
+                duration_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+
+            if history_kind == "ledger" {
+                let revision = db.segment_review_revision("pay-no-rollback-ledger").unwrap().unwrap();
+                db.record_phone_human_decision_by_at_revision(
+                    "pay-no-rollback-ledger",
+                    "edit",
+                    Some("دەقی ڕاست"),
+                    "Sara",
+                    revision,
+                )
+                .unwrap()
+                .unwrap();
+            } else {
+                db.connection()
+                    .execute(
+                        "INSERT INTO review_events
+                            (segment_id, reviewer, action, compensation_action, source, timestamp_ms, duration_ms)
+                         VALUES ('pay-no-rollback-unledgered-event', 'Sara', 'edit', 'edit', 'test', 1, 1000)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let event_count_before: i64 =
+                db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+            let ledger_count_before: i64 = db
+                .connection()
+                .query_row("SELECT COUNT(*) FROM review_compensation_ledger", [], |row| row.get(0))
+                .unwrap();
+
+            let error = rollback(&db, 1).expect_err("financial history makes v57 irreversible").to_string();
+            assert!(error.contains("CHECK constraint failed"), "unexpected {history_kind} guard error: {error}");
+            assert_eq!(get_current_version(&db).unwrap(), 57, "failed rollback must retain its version row");
+            let compensation_column: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('review_events') WHERE name='compensation_action'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(compensation_column, 1, "failed rollback must retain the entire v57 schema");
+            let counts_after: (i64, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM review_events),
+                            (SELECT COUNT(*) FROM review_compensation_ledger)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(counts_after, (event_count_before, ledger_count_before));
+            let leaked_guard: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master
+                      WHERE type='table' AND name='review_compensation_rollback_guard'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(leaked_guard, 0, "the failed transactional guard must not poison later connections");
+        }
+    }
+
+    #[test]
+    fn v58_archives_and_removes_exact_known_4208_orphans_idempotently() {
+        let db = database_at_v57();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "v58-valid-parent".into(),
+            audio_path: "/v58-valid-parent.wav".into(),
+            raw_transcript: "دەقی دروست".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO segment_hypotheses
+                    (segment_id, model_id, transcript, confidence, created_at, model_version_id)
+                 VALUES ('v58-valid-parent', 'champion', 'valid hypothesis', 0.99,
+                         '2026-08-21 00:00:00', 'omniasr-7b-test')",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO loop0_shadow_log(id, segment_id, memory_fired, created_at)
+                 VALUES (900000, 'v58-valid-parent', 1, '2026-08-21 00:00:01')",
+                [],
+            )
+            .unwrap();
+
+        // Reproduce the cryptographically bound production shape: 2,104 missing-parent hypotheses
+        // and the same 2,104 missing-parent LOOP-0 rows, for 4,208 violations total.
+        seed_v58_authorized_cohort(&db);
+        assert_eq!(foreign_key_violation_count(db.connection()), 4_208);
+        db.connection()
+            .execute_batch(
+                "CREATE TEMP TABLE expected_v58_hypotheses AS
+                     SELECT rowid AS original_rowid, segment_id, model_id, transcript, confidence,
+                            created_at, model_version_id
+                       FROM segment_hypotheses h
+                      WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = h.segment_id);
+                 CREATE TEMP TABLE expected_v58_loop0 AS
+                     SELECT id, segment_id, memory_fired, created_at
+                       FROM loop0_shadow_log l
+                      WHERE NOT EXISTS (SELECT 1 FROM speech_segments s WHERE s.id = l.segment_id);",
+            )
+            .unwrap();
+
+        let expected_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM segment_hypotheses WHERE segment_id = '00000000-0000-4000-8000-000000000000'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let expected_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at
+                   FROM loop0_shadow_log WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+        let archive_counts: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archive_counts, (2_104, 2_104), "every one of the 4,208 violations must be archived");
+        let live_child_counts: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM segment_hypotheses),
+                        (SELECT COUNT(*) FROM loop0_shadow_log)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live_child_counts, (1, 1), "valid-parent children must be untouched");
+
+        let archived_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT original_rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM orphan_segment_hypotheses_archive_v58
+                  WHERE segment_id = '00000000-0000-4000-8000-000000000000'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let archived_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at
+                   FROM orphan_loop0_shadow_log_archive_v58 WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(archived_hypothesis, expected_hypothesis, "every hypothesis value and rowid must be exact");
+        assert_eq!(archived_loop0, expected_loop0, "every LOOP-0 value and id must be exact");
+        let full_archive_symmetric_difference: i64 = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM (
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM orphan_segment_hypotheses_archive_v58
+                        EXCEPT
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM expected_v58_hypotheses
+                    ))
+                  + (SELECT COUNT(*) FROM (
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM expected_v58_hypotheses
+                        EXCEPT
+                        SELECT original_rowid, segment_id, model_id, transcript, confidence,
+                               created_at, model_version_id
+                          FROM orphan_segment_hypotheses_archive_v58
+                    ))
+                  + (SELECT COUNT(*) FROM (
+                        SELECT id, segment_id, memory_fired, created_at
+                          FROM orphan_loop0_shadow_log_archive_v58
+                        EXCEPT
+                        SELECT id, segment_id, memory_fired, created_at FROM expected_v58_loop0
+                    ))
+                  + (SELECT COUNT(*) FROM (
+                        SELECT id, segment_id, memory_fired, created_at FROM expected_v58_loop0
+                        EXCEPT
+                        SELECT id, segment_id, memory_fired, created_at
+                          FROM orphan_loop0_shadow_log_archive_v58
+                    ))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            full_archive_symmetric_difference, 0,
+            "all 4,208 archived rows must match the pre-migration source snapshot in both directions"
+        );
+        let bad_provenance: i64 = db
+            .connection()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58
+                      WHERE source_table <> 'segment_hypotheses'
+                         OR archive_reason <> 'missing speech_segments parent'
+                         OR archive_migration_version <> 58
+                         OR archived_at = '')
+                  + (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58
+                      WHERE source_table <> 'loop0_shadow_log'
+                         OR archive_reason <> 'missing speech_segments parent'
+                         OR archive_migration_version <> 58
+                         OR archived_at = '')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_provenance, 0);
+
+        // The migration runner is the idempotency boundary: the second pass is a true no-op and
+        // cannot duplicate the archive. The evidence itself is physically immutable afterwards.
+        assert!(run_migrations(&db).unwrap().is_empty());
+        let archive_counts_after: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archive_counts_after, archive_counts);
+        for sql in [
+            "UPDATE orphan_segment_hypotheses_archive_v58 SET transcript = transcript",
+            "DELETE FROM orphan_segment_hypotheses_archive_v58",
+            "INSERT INTO orphan_segment_hypotheses_archive_v58 SELECT * FROM orphan_segment_hypotheses_archive_v58 LIMIT 1",
+            "UPDATE orphan_loop0_shadow_log_archive_v58 SET memory_fired = memory_fired",
+            "DELETE FROM orphan_loop0_shadow_log_archive_v58",
+        ] {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("v58 orphan archive is immutable"), "unexpected archive guard error: {error}");
+        }
+    }
+
+    #[test]
+    fn v58_refuses_an_altered_identity_or_full_source_tuple() {
+        let altered_id = database_at_v57();
+        seed_v58_authorized_cohort(&altered_id);
+        run_with_foreign_keys_off(altered_id.connection(), || {
+            altered_id.connection().execute(
+                "UPDATE segment_hypotheses SET segment_id='ffffffff-ffff-4fff-8fff-ffffffffffff'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            altered_id.connection().execute(
+                "UPDATE loop0_shadow_log SET segment_id='ffffffff-ffff-4fff-8fff-ffffffffffff'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let identity_error = run_migrations(&altered_id).expect_err("one changed ID must fail the digest");
+        assert!(identity_error.to_string().contains("identity digest is not authorized"));
+        assert_eq!(get_current_version(&altered_id).unwrap(), 57);
+
+        let altered_tuple = database_at_v57();
+        seed_v58_authorized_cohort(&altered_tuple);
+        run_with_foreign_keys_off(altered_tuple.connection(), || {
+            altered_tuple.connection().execute(
+                "UPDATE segment_hypotheses SET transcript = transcript || ' altered'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let tuple_error = run_migrations(&altered_tuple).expect_err("changed transcript evidence must fail");
+        assert!(tuple_error.to_string().contains("full source-evidence digest is not authorized"));
+        assert_eq!(get_current_version(&altered_tuple).unwrap(), 57);
+    }
+
+    #[test]
+    fn v58_refuses_wrong_source_shape_and_preexisting_archive_objects() {
+        let wrong_shape = database_at_v57();
+        seed_v58_authorized_cohort(&wrong_shape);
+        run_with_foreign_keys_off(wrong_shape.connection(), || {
+            wrong_shape.connection().execute(
+                "UPDATE segment_hypotheses SET model_id='different-model'
+                  WHERE segment_id='00000000-0000-4000-8000-000000000000'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let shape_error = run_migrations(&wrong_shape).expect_err("wrong source shape must fail closed");
+        assert!(shape_error.to_string().contains("do not match the authorized abandoned-import shape"));
+        assert_eq!(get_current_version(&wrong_shape).unwrap(), 57);
+
+        let preexisting = database_at_v57();
+        preexisting
+            .connection()
+            .execute("CREATE TABLE orphan_segment_hypotheses_archive_v58(tampered TEXT)", [])
+            .unwrap();
+        let object_error = run_migrations(&preexisting).expect_err("preexisting archive provenance is ambiguous");
+        assert!(object_error.to_string().contains("already exists"), "unexpected error: {object_error}");
+        assert_eq!(get_current_version(&preexisting).unwrap(), 57);
+        let columns: i64 = preexisting
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('orphan_segment_hypotheses_archive_v58')
+                  WHERE name='tampered'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1, "failed v58 must not overwrite or drop ambiguous evidence");
+    }
+
+    #[test]
+    fn v58_refuses_unrelated_fk_damage_and_rolls_back_the_entire_repair() {
+        let db = database_at_v57();
+        seed_v58_authorized_cohort(&db);
+        run_with_foreign_keys_off(db.connection(), || {
+            db.connection().execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                     started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version)
+                 VALUES ('v58-unrelated-orphan', 1, 'fingerprint', 'Sara', 'session',
+                         1, 1000, 1000, 1.0, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(foreign_key_violation_count(db.connection()), 4_209);
+
+        let error = run_migrations(&db).expect_err("an unrecognized FK violation must fail closed").to_string();
+        assert!(error.contains("migration v58 left 1 foreign-key violation"), "unexpected v58 error: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 57, "failed repair must not record v58");
+        assert_eq!(
+            foreign_key_violation_count(db.connection()),
+            4_209,
+            "the unrelated row and the entire authorized cohort must roll back intact"
+        );
+        let archive_tables: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name IN
+                        ('orphan_segment_hypotheses_archive_v58', 'orphan_loop0_shadow_log_archive_v58')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_tables, 0, "a failed transaction must leave no half-created archive");
+
+        // Once an operator separately resolves the unknown class, the same pending migration can
+        // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
+        db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+        let archived: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived, V58_ORPHAN_IDS as i64);
+    }
+
+    #[test]
+    fn v58_rollback_refuses_missing_parents_then_restores_exact_rows_when_parents_exist() {
+        let db = database_at_v57();
+        seed_v58_authorized_cohort(&db);
+        let expected_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM segment_hypotheses WHERE rowid = 2000000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let expected_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at FROM loop0_shadow_log WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+
+        let rollback_error = rollback(&db, 1)
+            .expect_err("rollback must not recreate children while their parents are still missing")
+            .to_string();
+        assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback guard: {rollback_error}");
+        assert_eq!(get_current_version(&db).unwrap(), 58);
+        let preserved_archives: (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved_archives,
+            (V58_ORPHAN_IDS as i64, V58_ORPHAN_IDS as i64),
+            "failed rollback must preserve the complete immutable cohort"
+        );
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+
+        for index in 0..V58_ORPHAN_IDS as i64 {
+            let segment_id = v58_fixture_id(index);
+            db.insert_segment(&crate::db::SpeechSegment {
+                id: segment_id.clone(),
+                audio_path: format!("/{segment_id}.wav"),
+                raw_transcript: "recovered parent".into(),
+                duration_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        assert_eq!(rollback(&db, 1).unwrap(), vec![58]);
+        assert_eq!(get_current_version(&db).unwrap(), 57);
+        assert_eq!(foreign_key_violation_count(db.connection()), 0);
+        let archive_tables: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name IN
+                        ('orphan_segment_hypotheses_archive_v58', 'orphan_loop0_shadow_log_archive_v58')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_tables, 0, "successful exact restoration may now remove the archive tables");
+        let restored_hypothesis: (i64, String, String, String, Option<f64>, String, String) = db
+            .connection()
+            .query_row(
+                "SELECT rowid, segment_id, model_id, transcript, confidence, created_at, model_version_id
+                   FROM segment_hypotheses WHERE rowid = 2000000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .unwrap();
+        let restored_loop0: (i64, String, Option<i64>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT id, segment_id, memory_fired, created_at FROM loop0_shadow_log WHERE id = 1997445",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(restored_hypothesis, expected_hypothesis);
+        assert_eq!(restored_loop0, expected_loop0);
+
+        // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
+        // restored children in place. This pins the full up/down/up round trip.
+        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+        let reapply_counts: (i64, i64, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM segment_hypotheses
+                          WHERE segment_id LIKE '00000000-0000-4000-8000-%'),
+                        (SELECT COUNT(*) FROM loop0_shadow_log
+                          WHERE segment_id LIKE '00000000-0000-4000-8000-%'),
+                        (SELECT COUNT(*) FROM orphan_segment_hypotheses_archive_v58),
+                        (SELECT COUNT(*) FROM orphan_loop0_shadow_log_archive_v58)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(reapply_counts, (V58_ORPHAN_IDS as i64, V58_ORPHAN_IDS as i64, 0, 0));
     }
 
     #[test]

@@ -1,13 +1,8 @@
-"""P1.3b restore-pending RESERVATION gate — source policy.
+"""Durable restore-generation admission policy.
 
-`AppState::writers_active` is the FENCE: db_restore refuses while a writer is ALREADY running. But that
-is check-then-act — a NEW writer could start between prepare_restore's writers_active() check and the
-page swap. The RESERVATION closes that window: prepare_restore sets RESTORE_PENDING (via a RAII
-RestoreReservation held across the whole restore), and EVERY writer-start refuses while restore_pending().
-
-This policy pins the invariant at every writer-start site so a future writer cannot silently reopen the
-window (the same "an added writer forgets the guard" class the P1.3 fence + BgDbWriterGuard closed on the
-fence side). Deterministic source scan — no global-flag mutation, so it can't flake concurrent tests.
+Pins the state machine, cancellation-safe cleanup, startup recovery ordering, long-operation mutation
+guards, and cross-process writer locks. This is a deterministic source scan: it does not mutate the
+global admission state and cannot flake concurrent Rust tests.
 """
 
 from pathlib import Path
@@ -28,30 +23,217 @@ def _fn_body(src: str, signature_start: str, span: int = 1400) -> str:
 
 
 def test_prepare_restore_reserves_before_the_fence_and_returns_the_guard() -> None:
-    body = _fn_body(_read("commands.rs"), "fn prepare_restore(")
-    if "-> Result<RestoreReservation, String>" not in body:
+    body = _fn_body(_read("commands.rs"), "fn prepare_restore(", span=5000)
+    if "RestoreReservation<'static>" not in body:
         raise AssertionError("prepare_restore must return a RestoreReservation the caller holds across the restore")
-    reserve = body.find("RestoreReservation::new()")
+    durable = body.find("named_restore_barrier_may_exist(&data_dir)")
+    recover = body.find("RESTORE_ADMISSION.claim_recovery()")
+    reserve = body.find("RESTORE_ADMISSION.try_reserve()")
     fence = body.find("state.writers_active()")
-    if reserve == -1 or fence == -1 or not (reserve < fence):
+    if -1 in (durable, recover, reserve, fence) or not (durable < recover < fence and reserve < fence):
         raise AssertionError(
-            "prepare_restore must RESERVE (RestoreReservation::new) BEFORE checking writers_active(), so a "
-            "writer racing the check observes RESTORE_PENDING and refuses (the reservation drops on the "
-            "early-return if a writer is already active)."
+            "prepare_restore must reclaim a durable recovery marker or reserve a new generation BEFORE "
+            "checking writers_active(), so a racing writer cannot cross the boundary"
         )
 
 
 def test_both_restore_callers_hold_the_reservation() -> None:
     commands = _read("commands.rs")
-    # Not `prepare_restore(&state)?;` bare (which would drop the guard immediately) — it must be bound.
-    if "let _restore_reservation = prepare_restore(&state)?;" not in commands:
+    binding = "let (restore_reservation,"
+    if commands.count(binding) != 2:
         raise AssertionError(
-            "db_restore / restore_db_from_snapshot must bind the RestoreReservation (let _restore_reservation "
-            "= prepare_restore(...)?) so RESTORE_PENDING stays set across the swap; a bare prepare_restore()? "
-            "drops it immediately and reopens the window."
+            "db_restore and restore_db_from_snapshot must each bind the RestoreReservation so the admission "
+            "gate stays closed through DB, history, settings, policy, and pipeline completion."
         )
-    if "prepare_restore(&state)?;\n" in commands.replace("let _restore_reservation = prepare_restore(&state)?;\n", ""):
-        raise AssertionError("a restore path calls prepare_restore without binding the reservation (guard dropped early)")
+    bare = _fn_body(commands, "pub async fn db_restore(", span=3500)
+    history_handle = bare.find("state.history_arc_for_restore()")
+    worker = bare.find("run_blocking(move ||")
+    publish = bare.find("restore_with_mandatory_snapshot(")
+    clear = bare.find("history.lock().unwrap_or_else")
+    return_guard = bare.find("Ok(restore_reservation)")
+    if -1 in (history_handle, worker, publish, clear, return_guard) or not (
+        history_handle < worker < publish < clear < return_guard
+    ):
+        raise AssertionError(
+            "bare restore must clear old-generation history inside the detachable blocking worker before "
+            "its reservation can leave or drop"
+        )
+    if "state.lock_history().clear()" in bare:
+        raise AssertionError("bare restore cleanup regressed to post-await code that cancellation can skip")
+    lib = _read("lib.rs")
+    if "type HistKeyMgr = Arc<Mutex<HistoryManager>>;" not in lib or "history_arc_for_restore" not in lib:
+        raise AssertionError("restore worker needs a clonable history handle for cancellation-safe cleanup")
+
+
+def test_restore_admission_is_exclusive_and_all_appstate_handles_delegate() -> None:
+    commands = _read("commands.rs")
+    for phase in ("Idle", "ActiveNew", "ActiveArmed", "Parked"):
+        if phase not in _fn_body(commands, "enum RestorePhase", span=700):
+            raise AssertionError(f"restore state machine lost phase {phase}")
+    reserve = _fn_body(commands, "fn reserve(", span=4300)
+    for needle in (".compare_exchange(", "admission.generation", "RestorePhase::Parked if recovery_required"):
+        if needle not in reserve:
+            raise AssertionError(f"restore reservation lost ownership/recovery primitive: {needle}")
+    drop = _fn_body(commands, "impl Drop for RestoreReservation", span=1700)
+    if "RestorePhase::ActiveArmed" not in drop or "state.phase = RestorePhase::Parked" not in drop:
+        raise AssertionError("dropping an armed named restore must park admission, never reopen writers")
+    commit = _fn_body(commands, "fn commit_named_restore", span=1200)
+    for needle in ("state.phase = RestorePhase::Idle", "pending.store(false", "complete.notify_all()"):
+        if needle not in commit:
+            raise AssertionError(f"coherent restore commit lost release step: {needle}")
+    for regression in (
+        "armed_restore_parks_on_error_and_exact_recovery_is_the_only_reentry",
+        "full_operation_mutation_and_restore_admission_are_race_closed",
+    ):
+        if regression not in commands:
+            raise AssertionError(f"missing deterministic restore-admission regression: {regression}")
+    if "while self.is_pending()" not in _fn_body(commands, "fn lock<'a, T>(", span=1400):
+        raise AssertionError("ordinary AppState DB locks must wait behind the restore admission barrier")
+
+    lib = _read("lib.rs")
+    if "crate::commands::lock_app_db(&self.db)" not in _fn_body(lib, "pub(crate) fn lock_db(", span=500):
+        raise AssertionError("AppState::lock_db bypasses the restore admission barrier")
+    handle = _fn_body(lib, "impl AppDatabaseHandle", span=700)
+    if "crate::commands::lock_app_db(&self.inner)" not in handle:
+        raise AssertionError("the clonable AppState DB handle bypasses the restore admission barrier")
+
+
+def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
+    commands = _read("commands.rs")
+    production = commands.split("#[cfg(test)]\nmod tests", 1)[0]
+    helper = _fn_body(commands, "fn restore_with_mandatory_snapshot(", span=1100)
+    stage = helper.find("Database::stage_restore_source(source)")
+    snapshot = helper.find("take_mandatory_pre_restore_snapshot(reservation, db, data_dir)?")
+    restore = helper.find("db.commit_staged_restore(&staged)")
+    if -1 in (stage, snapshot, restore) or not (stage < snapshot < restore):
+        raise AssertionError("bare restore must stage/validate first, then pin the live DB, then atomically publish")
+    named = _fn_body(commands, "fn prepare_and_restore_named_transaction(", span=2600)
+    if "prepare_named_restore_artifacts(" not in named or "begin_named_restore_transaction(" not in named:
+        raise AssertionError("named restore must bind verified artifacts to its reusable safety-pin transaction")
+    if "db.commit_staged_restore(&staged)" not in named:
+        raise AssertionError("named restore no longer publishes only the isolated, verified staged database")
+    if production.count("restore_with_mandatory_snapshot(&restore_reservation, &mut guard") != 1:
+        raise AssertionError("db_restore must call the one-guard bare snapshot+restore helper exactly once")
+    if production.count("prepare_and_restore_named_transaction(") < 2:
+        raise AssertionError("restore_db_from_snapshot must call the named one-guard transaction helper")
+    if production.count("state.db_arc_for_restore()") != 2:
+        raise AssertionError("only the two restore commands may use the reservation-protected raw DB handle")
+    db = _read("db.rs")
+    stage = _fn_body(db, "pub(crate) fn stage_restore_source", span=3000)
+    if "open_immutable_connection" not in stage:
+        raise AssertionError("restore preflight must not create WAL/SHM sidecars beside a manifest-bound source")
+    if "restore_staging_does_not_create_sidecars_beside_a_frozen_snapshot" not in _read("db_tests.rs"):
+        raise AssertionError("immutable restore-source admission needs a sidecar regression")
+
+
+def test_every_production_database_entrypoint_requires_the_shared_pre_migration_pin() -> None:
+    helper = _fn_body(_read("snapshot.rs"), "pub fn initialize_with_required_pre_migration_pin(", span=1800)
+    pin = helper.find("take_pinned_snapshot(")
+    initialize = helper.find("db.initialize()?")
+    if pin == -1 or initialize == -1 or pin >= initialize:
+        raise AssertionError("the central initialization guard must promote the pre-migration pin before initialize")
+    if "current > 0 && current < max_known" not in helper:
+        raise AssertionError("the central initialization guard no longer distinguishes established pending schemas")
+
+    lib = _read("lib.rs")
+    desktop = _fn_body(lib, "let db_path = data_dir.join(\"cortex-speech.db\");", span=3000)
+    shared_call = "initialize_with_required_pre_migration_pin(&db, &data_dir)"
+    if shared_call not in desktop or "db.initialize()" in desktop:
+        raise AssertionError("desktop startup must initialize only through the fail-closed pre-migration pin guard")
+    if "pre-migration snapshot failed (continuing)" in desktop:
+        raise AssertionError("desktop startup has regressed to warn-and-continue after a failed migration safety pin")
+
+    importer = _read("bin/batch_importer.rs")
+    if "initialize_with_required_pre_migration_pin(&db, &app_data_dir)" not in importer:
+        raise AssertionError("batch_importer bypasses the shared pre-migration safety pin")
+    if "db.initialize()" in importer:
+        raise AssertionError("batch_importer still has a direct migration path that can bypass the safety pin")
+
+
+def test_named_snapshot_restore_commits_config_only_after_atomic_required_state_and_settings() -> None:
+    commands = _read("commands.rs")
+    body = _fn_body(commands, "pub async fn restore_db_from_snapshot(", span=14_000)
+    history = body.find("state.lock_history().clear();")
+    install = body.find("install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?")
+    runtime = body.find("*state.lock_settings() = restored.clone();")
+    completed = body.find("mark_named_restore_completed(&data_dir, &name)?;")
+    clear = body.find("clear_review_pilot_restore_pending(&data_dir)?;", completed)
+    commit = body.find("restore_reservation.commit_named_restore()?;", completed)
+    if -1 in (history, install, runtime, completed, clear, commit) or not (
+        history < install < runtime < completed < clear < commit
+    ):
+        raise AssertionError(
+            "named restore must install all config/runtime state, durably mark the completed generation, "
+            "then clear the marker and release admission in that exact order"
+        )
+    install_helper = _fn_body(commands, "fn install_snapshot_restore_plan(", span=4200)
+    routing = install_helper.find("restore_required_snapshot_state_atomic")
+    pilot = install_helper.find("apply_snapshot_pilot_policy")
+    settings = install_helper.find("restored.save(&live_settings_path)")
+    if -1 in (routing, pilot, settings) or not (routing < pilot < settings):
+        raise AssertionError("restore-plan installation must atomically bind routing, pilot policy, then typed settings")
+    marker = _fn_body(commands, "fn begin_named_restore_transaction(", span=3800)
+    if not (0 <= marker.find("reservation.arm_named_restore()?") < marker.find("write_named_restore_pending")):
+        raise AssertionError("named admission must arm fail-closed parking before writing its durable marker")
+
+    lib = _read("lib.rs")
+    recovery = lib.find("recover_interrupted_named_restore_at_startup(&data_dir)")
+    open_db = lib.find("Database::open_with_retry(db_path.to_string_lossy().as_ref())")
+    if recovery == -1 or open_db == -1 or recovery >= open_db:
+        raise AssertionError("startup must recover a durable restore transaction before opening/initializing the live DB")
+
+
+def test_long_prework_publishers_hold_full_operation_mutation_guards() -> None:
+    commands = _read("commands.rs")
+    for signature, final_publish in (
+        ("pub async fn import_model_checkpoint(", "register_checkpoint("),
+        ("pub async fn import_model_deployment(", "register_verified_deployment_record("),
+        ("pub async fn bootstrap_legacy_champion(", "sync_champion_pointer("),
+    ):
+        body = _fn_body(commands, signature, span=7500)
+        worker = body.find("run_blocking(move ||")
+        mutation = body.find("let _mutation = begin_mutation()?;")
+        publish = body.find(final_publish)
+        if -1 in (worker, mutation, publish) or not (worker < mutation < publish):
+            raise AssertionError(f"{signature} must own mutation admission inside its detachable worker through publish")
+
+    integration = _read("integration_runner.rs")
+    body = _fn_body(integration, "pub fn run(", span=3500)
+    mutation = body.find("crate::commands::begin_mutation()?")
+    first_import = body.find("pipeline.import_directory(")
+    if mutation == -1 or first_import == -1 or mutation >= first_import:
+        raise AssertionError("registered integration/audiobook lifecycle must fence its complete write lifetime")
+
+
+def test_external_writers_share_the_desktop_instance_lock() -> None:
+    checks = (
+        ("bin/export_pack.rs", "InstanceLock::try_lock", "Database::open_with_retry"),
+        ("bin/realign_segments.rs", "InstanceLock::try_lock", "Database::open("),
+        ("bin/backfill_fingerprints.rs", "InstanceLock::try_lock", "Database::open("),
+        ("bin/reject_speaker_change_clips.rs", "InstanceLock::try_lock", "Database::open("),
+        ("bin/speaker_change_probe.rs", "InstanceLock::try_lock", "Connection::open_with_flags"),
+    )
+    for rel, lock_token, open_token in checks:
+        src = _read(rel)
+        lock = src.find(lock_token)
+        opened = src.find(open_token)
+        if lock == -1 or opened == -1 or lock >= opened:
+            raise AssertionError(f"{rel} must acquire cortex.lock before opening the generation it may mutate")
+
+    scripts = REPO_ROOT / "scripts"
+    for name in ("repair_unfinalized_reviews.py", "requeue_unheard_decisions.py"):
+        src = (scripts / name).read_text(encoding="utf-8")
+        branch = src.find("if args.apply:")
+        lock = src.find("with acquire_cortex_lock", branch)
+        dispatch = src.find("return run(args)", lock)
+        if -1 in (branch, lock, dispatch) or not (branch < lock < dispatch):
+            raise AssertionError(f"{name} must lock the live generation for every apply path")
+    focus = (scripts / "activate_voice_focus.py").read_text(encoding="utf-8")
+    condition = focus.find("if not (args.merge_import_job and args.dry_run):")
+    lock = focus.find("with acquire_cortex_lock(args.data_dir):", condition)
+    dispatch = focus.find("return run(args, parser)", lock)
+    if -1 in (condition, lock, dispatch) or not (condition < lock < dispatch):
+        raise AssertionError("every mutating voice-focus mode must hold cortex.lock across validation and publication")
 
 
 def _assert_guarded(src: str, signature_start: str, who: str, token: str = "restore_pending()") -> None:
@@ -72,18 +254,46 @@ def test_every_writer_start_checks_restore_pending() -> None:
     _assert_guarded(commands, 'RATE_LIMITER.check("run_wsl_refinement")', "run_wsl_refinement (7B refine)")
 
     jury = _read("commands/jury.rs")
-    _assert_guarded(jury, "pub async fn add_scribe_votes(", "add_scribe_votes", "super::restore_pending()")
     _assert_guarded(jury, "pub async fn run_dpo_update(", "run_dpo_update", "super::restore_pending()")
     _assert_guarded(jury, "pub async fn run_jury_pipeline(", "run_jury_pipeline", "super::restore_pending()")
     _assert_guarded(jury, "pub async fn run_t2_for_segment(", "run_t2_for_segment", "super::restore_pending()")
 
     couch = _read("couch.rs")
-    # `start_on_port`, NOT `start`. `start` is a one-line delegate that injects the production port;
-    # the guard must stay in the function that takes the COUCH lock, because the whole argument for it
-    # being airtight is that the check and the `*guard = Some(handle)` register are serialized by the
-    # SAME mutex the restore fence reads. Hoisting it into `start` would satisfy a naive scan while
-    # moving the check OUTSIDE the lock and reopening the race this gate exists to close.
-    _assert_guarded(couch, "fn start_on_port(", "couch::start_on_port", "restore_pending()")
+    # `start_on_port` is now the production-only adapter that supplies the durable-session lifecycle
+    # callbacks. Pin its exact delegation so the restore assertion below follows the function that
+    # ACTUALLY takes the COUCH lock instead of going stale whenever this seam is refactored.
+    start_on_port = _fn_body(couch, "fn start_on_port(", span=900)
+    lifecycle_delegate = """start_on_port_with_session_lifecycle(
+        db_path,
+        reviewers,
+        port,
+        data_dir,
+        save_session_snapshot,
+        clear_session_revocation,
+    )"""
+    if lifecycle_delegate not in start_on_port:
+        raise AssertionError(
+            "couch::start_on_port must delegate directly to start_on_port_with_session_lifecycle with "
+            "the production session callbacks; otherwise this gate may inspect a helper production no longer calls."
+        )
+
+    # The lifecycle helper owns the check+register critical section. The lock MUST be acquired before
+    # restore_pending() is read and held until the handle is registered; checking in either adapter
+    # would reopen the race between the reservation and the background writer becoming visible.
+    lifecycle = _fn_body(couch, "fn start_on_port_with_session_lifecycle", span=12_000)
+    lock = lifecycle.find("let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());")
+    pending = lifecycle.find("if crate::commands::restore_pending()")
+    register = lifecycle.find("*guard = Some(handle);")
+    if -1 in (lock, pending, register) or not (lock < pending < register):
+        raise AssertionError(
+            "couch::start_on_port_with_session_lifecycle must acquire COUCH, refuse while "
+            "restore_pending(), and register the server handle under that same lock."
+        )
+    if "drop(guard)" in lifecycle[lock:register]:
+        raise AssertionError(
+            "couch::start_on_port_with_session_lifecycle drops COUCH before registering the handle, "
+            "reopening the restore reservation race."
+        )
     # Must match `start`'s ACTUAL one-line body. This literal was written against the pre-`data_dir`
     # signature and silently stopped matching when durable sessions added that parameter — so the gate
     # raised on every run instead of checking anything, which is a broken gate, not a strict one. Keep
@@ -92,7 +302,7 @@ def test_every_writer_start_checks_restore_pending() -> None:
     # `configured_port()` replaced the bare `COUCH_PORT` when CORTEX_COUCH_PORT was added so an
     # end-to-end harness could drive the real server without fighting the owner's own for 8737. The
     # literal is updated to the new body EXACTLY, which is what the note below instructs — `start` is
-    # still a one-line delegate and the guard still lives inside `start_on_port`, under the lock.
+    # still a one-line delegate and the guarded lifecycle helper remains its only production route.
     if "start_on_port(db_path, reviewers, configured_port(), data_dir)" not in couch:
         raise AssertionError(
             "couch::start must delegate to start_on_port so the guarded path is the only way in; if it "
@@ -114,6 +324,12 @@ def test_every_writer_start_checks_restore_pending() -> None:
 def main() -> None:
     test_prepare_restore_reserves_before_the_fence_and_returns_the_guard()
     test_both_restore_callers_hold_the_reservation()
+    test_restore_admission_is_exclusive_and_all_appstate_handles_delegate()
+    test_snapshot_and_restore_share_one_mutex_guard_in_both_commands()
+    test_every_production_database_entrypoint_requires_the_shared_pre_migration_pin()
+    test_named_snapshot_restore_commits_config_only_after_atomic_required_state_and_settings()
+    test_long_prework_publishers_hold_full_operation_mutation_guards()
+    test_external_writers_share_the_desktop_instance_lock()
     test_every_writer_start_checks_restore_pending()
     print("restore-reservation gate source policy passed")
 

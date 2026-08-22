@@ -13,10 +13,12 @@ The law this gate enforces, on the LIVE database, at the serving path's own prec
 
   1. ``annotated_transcript`` is human-only: a non-empty value requires human evidence on that row
      (a review event, a recorded human_decision, or verified=1).
-  2. Every clip with NO human evidence must fall back to text the champion actually produced:
-     its ``raw_transcript`` must byte-match (modulo surrounding whitespace) the stored
-     ``omniasr-wsl-7b`` hypothesis for that segment. No champion hypothesis on file = FAIL
-     (hard-stop law: an undrafted clip may not sit in the queue looking drafted).
+  2. Every clip with NO human evidence must fall back to text the CURRENT registry champion
+     actually produced: its ``raw_transcript`` must byte-match (modulo surrounding whitespace) a
+     stored hypothesis carrying that champion's content-addressed id. The one pre-registry id is
+     accepted only while the registry points at the exact deployment it historically aliases. No
+     champion hypothesis on file = FAIL (hard-stop law: an undrafted clip may not sit in the queue
+     looking drafted).
   3. An ACCEPT may only freeze text some engine actually produced. "Accept" means *this draft is
      what the audio says* — the reviewer typed nothing — so the stored text must match one of the
      segment's own ASR hypotheses. Text matching none of them was authored by a model that is not an
@@ -39,7 +41,77 @@ import os
 import sqlite3
 import sys
 
-CHAMPION_MODEL_ID = "omniasr-wsl-7b"
+ASR_CHAMPION_FAMILY = "omniasr-7b"
+
+# Historical recognition, never model selection. Before the registry existed, this exact incumbent
+# wrote hypotheses under the generic engine id below. The bootstrap later content-addressed the SAME
+# measured deployment. Admit the old id only while BOTH immutable identity pins are the current
+# registry champion; a promotion, a changed deployment, or an empty/broken registry drops the alias.
+LEGACY_ALIAS_MODEL_ID = "omniasr-wsl-7b"
+PROVEN_LEGACY_CANONICAL_MODEL_ID = "omniasr-7b-legacy-c348ade8a816"
+PROVEN_LEGACY_DEPLOYMENT_SHA256 = "ae33143ec8b25f45e393f4aa484c3a3d165850f0dc15e95254dd6e4cb4c05cbf"
+
+
+class ChampionRegistryError(RuntimeError):
+    """The current ASR champion cannot be resolved to one canonical, pinned identity."""
+
+
+def _valid_model_id(value: object) -> bool:
+    """Mirror the app's identifier boundary: bounded alphanumeric plus ``_.-`` only."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 256
+        and all(character.isalnum() or character in "_.-" for character in value)
+    )
+
+
+def _valid_sha256(value: object) -> bool:
+    """Deployment identities are canonical lowercase SHA-256, never an unpinned label."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def current_champion_model_ids(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Resolve the one current ASR champion and its narrowly proven pre-registry alias.
+
+    The model registry is authoritative. ``champion.json`` is only its startup mirror and can be
+    between syncs, so this database invariant must not silently fall back to that file or to a fixed
+    engine label. Every malformed/ambiguous state raises and therefore fails the gate closed.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, checkpoint_sha256
+            FROM model_versions
+            WHERE family = ? AND status = 'champion'
+            ORDER BY id
+            """,
+            (ASR_CHAMPION_FAMILY,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ChampionRegistryError(f"could not read model registry: {exc}") from exc
+
+    if len(rows) != 1:
+        raise ChampionRegistryError(
+            f"expected exactly one {ASR_CHAMPION_FAMILY} champion, found {len(rows)}"
+        )
+
+    model_id, deployment_sha256 = rows[0]
+    if not _valid_model_id(model_id):
+        raise ChampionRegistryError("current ASR champion has an invalid model id")
+    if not _valid_sha256(deployment_sha256):
+        raise ChampionRegistryError("current ASR champion has no canonical deployment SHA-256")
+
+    allowed = [model_id]
+    if (model_id, deployment_sha256) == (
+        PROVEN_LEGACY_CANONICAL_MODEL_ID,
+        PROVEN_LEGACY_DEPLOYMENT_SHA256,
+    ):
+        allowed.append(LEGACY_ALIAS_MODEL_ID)
+    return tuple(allowed)
 
 
 def default_db_path() -> str:
@@ -68,13 +140,23 @@ def human_field_violations(conn: sqlite3.Connection) -> list:
     ).fetchall()
 
 
-def non_champion_fallbacks(conn: sqlite3.Connection) -> list:
+def non_champion_fallbacks(conn: sqlite3.Connection, champion_model_ids: tuple[str, ...]) -> list:
     """Untouched rows whose served fallback text is not the champion's own output."""
+    if not champion_model_ids:
+        raise ChampionRegistryError("current ASR champion resolved to an empty model-id set")
+    placeholders = ",".join("?" for _ in champion_model_ids)
     rows = conn.execute(
-        """
+        f"""
         SELECT s.id, s.raw_transcript,
-               (SELECT h.transcript FROM segment_hypotheses h
-                WHERE h.segment_id = s.id AND h.model_id = ?) AS champion
+               EXISTS (
+                   SELECT 1 FROM segment_hypotheses h
+                   WHERE h.segment_id = s.id AND h.model_id IN ({placeholders})
+               ) AS has_champion,
+               EXISTS (
+                   SELECT 1 FROM segment_hypotheses h
+                   WHERE h.segment_id = s.id AND h.model_id IN ({placeholders})
+                     AND TRIM(COALESCE(h.transcript, '')) = TRIM(COALESCE(s.raw_transcript, ''))
+               ) AS champion_matches_raw
         FROM speech_segments s
         WHERE COALESCE(s.human_decision, '') = ''
           AND s.verified = 0
@@ -84,12 +166,12 @@ def non_champion_fallbacks(conn: sqlite3.Connection) -> list:
                 WHERE d.segment_id = s.id AND COALESCE(d.human_decision, '') <> ''
           )
         """,
-        (CHAMPION_MODEL_ID,),
+        (*champion_model_ids, *champion_model_ids),
     ).fetchall()
     bad = []
-    for seg_id, raw, champion in rows:
-        if champion is None or (raw or "").strip() != champion.strip():
-            bad.append((seg_id, "no champion hypothesis" if champion is None else "raw != champion"))
+    for seg_id, _raw, has_champion, champion_matches_raw in rows:
+        if not champion_matches_raw:
+            bad.append((seg_id, "raw != champion" if has_champion else "no champion hypothesis"))
     return bad
 
 
@@ -131,12 +213,13 @@ def laundered_accepts(conn: sqlite3.Connection) -> list:
     return bad
 
 
-def main() -> int:
-    db_path = sys.argv[1] if len(sys.argv) > 1 else default_db_path()
-    if not os.path.exists(db_path):
-        print(f"FAIL: database not found: {db_path}")
+def _run_checks(conn: sqlite3.Connection) -> int:
+    try:
+        champion_model_ids = current_champion_model_ids(conn)
+    except ChampionRegistryError as exc:
+        print(f"FAIL [champion-registry]: {exc}")
+        print("REVIEW SERVING PROVENANCE: 1 invariant(s) violated")
         return 1
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
     failures = 0
 
@@ -151,7 +234,7 @@ def main() -> int:
     else:
         print("PASS [human-field]: every populated annotated_transcript has human evidence")
 
-    drifted = non_champion_fallbacks(conn)
+    drifted = non_champion_fallbacks(conn, champion_model_ids)
     if drifted:
         failures += 1
         print(f"FAIL [champion-fallback]: {len(drifted)} untouched rows would serve non-champion text")
@@ -178,6 +261,18 @@ def main() -> int:
         return 1
     print("REVIEW SERVING PROVENANCE: all invariants hold")
     return 0
+
+
+def main() -> int:
+    db_path = sys.argv[1] if len(sys.argv) > 1 else default_db_path()
+    if not os.path.exists(db_path):
+        print(f"FAIL: database not found: {db_path}")
+        return 1
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return _run_checks(conn)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

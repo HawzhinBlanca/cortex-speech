@@ -15,7 +15,6 @@
   let importing = $state(false);
   let form = $state({
     id: '',
-    family: '',
     source: '',
     license: '',
     modelCardName: '',
@@ -50,7 +49,6 @@
 
   const canSubmit = $derived(
     form.id.trim() !== '' &&
-      form.family.trim() !== '' &&
       form.source.trim() !== '' &&
       form.license.trim() !== '' &&
       form.checkpointPath.trim() !== '' &&
@@ -63,14 +61,13 @@
     try {
       const newId = await importModelCheckpoint({
         id: form.id.trim(),
-        family: form.family.trim(),
         checkpointPath: form.checkpointPath.trim(),
         source: form.source.trim(),
         license: form.license.trim(),
         modelCardName: form.modelCardName.trim() || null,
       });
       notifications.success(`Imported checkpoint "${newId}" as a candidate.`);
-      form = { id: '', family: '', source: '', license: '', modelCardName: '', checkpointPath: '' };
+      form = { id: '', source: '', license: '', modelCardName: '', checkpointPath: '' };
       showImport = false;
       await load();
     } catch (e: unknown) {
@@ -87,7 +84,7 @@
     <p class="text-xs text-muted">Loading registry…</p>
   {:else if models.length === 0}
     <p class="text-xs text-muted" data-testid="model-registry-empty">
-      No models are registered yet. An imported fine-tuned checkpoint appears here with its license
+      No models are registered yet. An imported OmniASR-7B candidate appears here with its license
       and checkpoint checksum so its provenance stays auditable.
     </p>
   {:else}
@@ -129,15 +126,9 @@
           <div class="grid grid-cols-2 gap-2">
             <input
               class="input text-xs"
-              placeholder="id (e.g. mms-ckb-v2)"
+              placeholder="id (e.g. omniasr-7b-challenger)"
               aria-label="Model id"
               bind:value={form.id}
-            />
-            <input
-              class="input text-xs"
-              placeholder="family (e.g. mms-ckb)"
-              aria-label="Model family"
-              bind:value={form.family}
             />
             <input
               class="input text-xs"
@@ -166,8 +157,8 @@
             >
               Choose file…
             </button>
-            <span class="text-[10px] text-muted truncate flex-1" title={form.checkpointPath}>
-              {form.checkpointPath || 'No checkpoint selected'}
+            <span class="text-[10px] text-muted truncate flex-1">
+              {form.checkpointPath ? 'Checkpoint selected' : 'No checkpoint selected'}
             </span>
           </div>
           <button

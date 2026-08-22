@@ -58,9 +58,9 @@ pub mod normalizer;
 pub mod pipeline;
 pub mod quality;
 pub mod registry;
+pub mod review_pilot;
 pub mod runs;
 pub mod scorecard;
-pub mod scribe_api;
 pub mod secret_redaction;
 pub mod session;
 pub mod settings;
@@ -101,6 +101,23 @@ use settings::AppSettings;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Clonable access to the AppState database for blocking worker tasks.
+///
+/// Unlike exposing the raw `Arc<Mutex<Database>>`, every lock acquisition passes through the
+/// restore admission gate. This matters for work queued before a restore: it must not acquire the
+/// database between the mandatory safety snapshot / page swap and the snapshot restore's final
+/// configuration + history updates.
+#[derive(Clone)]
+pub(crate) struct AppDatabaseHandle {
+    inner: Arc<Mutex<Database>>,
+}
+
+impl AppDatabaseHandle {
+    pub(crate) fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, Database>> {
+        crate::commands::lock_app_db(&self.inner)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportState {
     Idle,
@@ -138,7 +155,7 @@ pub struct AppState {
     pub media_registry: Mutex<MediaRegistry>,
 }
 
-type HistKeyMgr = Mutex<HistoryManager>;
+type HistKeyMgr = Arc<Mutex<HistoryManager>>;
 
 impl AppState {
     fn lock_import_state(&self) -> MutexGuard<'_, ImportState> {
@@ -211,6 +228,13 @@ impl AppState {
         })
     }
 
+    /// Raw history access for restore publication only. A restore worker must clear old-generation
+    /// undo/redo entries before its reservation can leave that worker: if the async IPC future is
+    /// cancelled after SQLite publication, command-local cleanup will never run.
+    pub(crate) fn history_arc_for_restore(&self) -> Arc<Mutex<HistoryManager>> {
+        Arc::clone(&self.history)
+    }
+
     pub(crate) fn lock_session(&self) -> MutexGuard<'_, SessionManager> {
         self.session.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned session lock");
@@ -219,15 +243,20 @@ impl AppState {
     }
 
     pub(crate) fn lock_db(&self) -> MutexGuard<'_, Database> {
-        self.db.lock().unwrap_or_else(|poisoned| {
+        crate::commands::lock_app_db(&self.db).unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned database lock");
             poisoned.into_inner()
         })
     }
 
-    /// A clonable handle to the DB, for moving blocking work into `spawn_blocking`. Lock it the same
-    /// poison-tolerant way `lock_db` does: `db.lock().unwrap_or_else(|p| p.into_inner())`.
-    pub(crate) fn db_arc(&self) -> Arc<Mutex<Database>> {
+    /// A clonable, restore-gated DB handle for moving blocking work into `spawn_blocking`.
+    pub(crate) fn db_arc(&self) -> AppDatabaseHandle {
+        AppDatabaseHandle { inner: Arc::clone(&self.db) }
+    }
+
+    /// Raw DB access for the restore implementation only. The caller must already own the exclusive
+    /// RestoreReservation; ordinary commands must use `lock_db` / `db_arc` so they cannot pass it.
+    pub(crate) fn db_arc_for_restore(&self) -> Arc<Mutex<Database>> {
         Arc::clone(&self.db)
     }
 
@@ -362,16 +391,11 @@ impl AppState {
             // The WSL-7B refinement loop is a background DB WRITER too (update_asr_transcript_if_unreviewed),
             // tracked by its own atomic — restoring a snapshot while it writes tears the DB (round-26 hunt).
             || crate::commands::WSL_REFINE_RUNNING.load(SeqCst)
-            // R3: the OTHER background writers that use dedicated connections (or land a write after a
-            // lock-free cloud window) and so also escape the db-Mutex serialization the restore relies on:
-            //   - Scribe vote batches (add_scribe_votes) — SCRIBE_VOTES_IN_FLIGHT,
-            //   - every dedicated-connection background writer that registers a BgDbWriterGuard: the jury
-            //     pipeline / T2 / DPO / post-import adjudication writers AND the detached background-
-            //     alignment thread (which outlives the import guard) — one BG_DB_WRITERS counter,
-            //   - the Couch phone-review server — a running server can persist a decision on submit.
+            // R3: other background writers can escape the db-Mutex serialization the restore relies
+            // on. Dedicated jury/alignment writers register one shared BgDbWriterGuard counter; the
+            // Couch phone-review server is fenced separately because it can persist on submit.
             // Each was a real "restore mixes late writes into the just-restored library" hole. New
             // dedicated-connection writers register a BgDbWriterGuard rather than growing this chain.
-            || crate::commands::SCRIBE_VOTES_IN_FLIGHT.load(SeqCst)
             || crate::commands::bg_db_writers_active()
             || crate::couch::is_running()
     }
@@ -490,34 +514,32 @@ pub fn run() {
         }
     };
 
+    // A named snapshot restore spans SQLite plus several dataset-coupled files. If a crash or a
+    // post-page-swap error left its durable marker, recover that exact transaction synchronously
+    // under the single-instance lock BEFORE schema initialization, the startup job reaper, snapshots,
+    // Couch resume, or any background writer can observe/mutate a mixed generation. The recovery path
+    // retries the recorded target and falls back to the verified full pre-restore pin; uncertainty is
+    // fatal rather than permission to start normally.
+    match crate::commands::recover_interrupted_named_restore_at_startup(&data_dir) {
+        Ok(true) => tracing::warn!("interrupted database/config restore was recovered before startup"),
+        Ok(false) => {}
+        Err(error) => {
+            fatal_app_error(format!("Recovery-required database restore could not be completed safely: {error}"))
+        }
+    }
+
     let db_path = data_dir.join("cortex-speech.db");
     let db = match Database::open_with_retry(db_path.to_string_lossy().as_ref()) {
         Ok(db) => db,
         Err(e) => fatal_app_error(format!("Failed to open database at {:?}: {e}", db_path)),
     };
-    // PRE-MIGRATION pinned snapshot (true-10 audit 2026-07-09): a semantically-buggy migration (a
-    // wrong UPDATE predicate, a lossy rewrite) commits cleanly — the all-or-nothing transaction only
-    // protects against SQL errors — and the post-migration startup snapshot then rotates every
-    // pre-upgrade copy out within ~90 minutes of first launch, exactly when the user is most
-    // exposed. Before running any pending migration on a NON-empty library, pin a rotation-exempt
-    // copy under snapshots/pinned/. Best-effort: a pin failure warns, never blocks startup.
-    {
-        let current = crate::migrations::get_current_version(&db).unwrap_or(0);
-        let max_known = crate::migrations::max_supported_version();
-        if current > 0 && current < max_known {
-            match crate::snapshot::take_pinned_snapshot(
-                &db,
-                &data_dir,
-                &format!("premigration_v{current}_to_v{max_known}"),
-                3,
-            ) {
-                Ok(path) => tracing::info!("pre-migration snapshot pinned at {}", path.display()),
-                Err(e) => tracing::warn!("pre-migration snapshot failed (continuing): {e}"),
-            }
-        }
-    }
-    if let Err(e) = db.initialize() {
-        fatal_app_error(format!("Failed to initialize database schema: {e}"));
+    // Any pending migration on an established profile is allowed only after a rotation-exempt copy
+    // of the exact pre-upgrade DB has been promoted successfully. This is fail-closed because a
+    // semantically wrong migration can commit cleanly; SQL atomicity cannot make that data recoverable.
+    match crate::snapshot::initialize_with_required_pre_migration_pin(&db, &data_dir) {
+        Ok(Some(path)) => tracing::info!("pre-migration snapshot pinned at {}", path.display()),
+        Ok(None) => {}
+        Err(e) => fatal_app_error(format!("Failed to safely initialize database schema: {e}")),
     }
 
     // P0 #3 Job Supervisor: any durable job still `running` at startup is a crash residue (a clean run
@@ -588,9 +610,10 @@ pub fn run() {
     }
 
     let settings_path = data_dir.join("settings.json");
-    // `mut` is used only by the debug-only integration override below; releases see it unused.
+    // Clamp stale/on-disk alternatives before any warm-up or pipeline construction. The debug-only
+    // integration override below remains the one explicit desktop diagnostic escape hatch.
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-    let mut settings = AppSettings::load(&settings_path);
+    let mut settings = AppSettings::load_production(&settings_path);
     // Test-only override: a release process must never be able to downgrade the champion through an
     // inherited environment variable. Integration binaries are debug builds and still get their
     // explicitly requested local fixture engine.
@@ -678,7 +701,7 @@ pub fn run() {
             normalizer,
             cache,
             fingerprint,
-            history: Mutex::new(history),
+            history: Arc::new(Mutex::new(history)),
             session: Mutex::new(session),
             settings: Mutex::new(settings),
             data_dir: Mutex::new(Some(data_dir)),
@@ -700,9 +723,6 @@ pub fn run() {
             commands::discard_interrupted_import,
             commands::import_audio_file,
             commands::transcribe_segment,
-            commands::transcribe_segment_constrained,
-            commands::transcribe_segment_finetuned,
-            commands::verify_finetuned_model_integrity,
             commands::batch_transcribe,
             commands::normalize_text,
             commands::align_segment,
@@ -743,8 +763,6 @@ pub fn run() {
             commands::spot_check_report,
             commands::reviewer_throughput,
             commands::export_agreement_sample,
-            commands::transcribe_audio_with_scribe,
-            commands::add_scribe_votes,
             commands::register_media_asset,
             commands::get_media_asset_url,
             commands::check_agentic_readiness,
@@ -790,7 +808,6 @@ pub fn run() {
             commands::get_audio_health,
             commands::relink_audio,
             commands::models_status,
-            commands::models_download,
             commands::models_download_all,
             commands::cancel_operation,
             commands::get_inference_stats,
@@ -803,7 +820,6 @@ pub fn run() {
             // Phase 1 — Gold-Set Eval Harness
             commands::import_gold_segments,
             commands::run_gold_eval,
-            commands::run_gold_eval_local,
             commands::run_gold_eval_asr,
             commands::build_scorecard,
             commands::list_eval_runs,
@@ -877,28 +893,38 @@ pub fn run() {
                         // every engine start until the background recovery and final pointer sync pass.
                         crate::engine_runtime::set_promotion_recovery_blocked(true);
                         let recovery_app = app.handle().clone();
-                        std::thread::spawn(move || {
-                            match crate::champion_promotion_runtime::recover_running_promotions(
-                                &recovery_app,
-                                db_path.clone(),
-                                dir.clone(),
-                            ) {
-                                Ok(recovered) => match Database::open(&db_path)
-                                    .and_then(|db| crate::registry::sync_champion_pointer(&db, &dir))
-                                {
-                                    Ok(_) => {
-                                        tracing::info!("recovered {recovered} interrupted champion promotion");
-                                        crate::engine_runtime::set_promotion_recovery_blocked(false);
+                        match crate::commands::begin_mutation() {
+                            Ok(mutation) => {
+                                std::thread::spawn(move || {
+                                    let _mutation = mutation;
+                                    match crate::champion_promotion_runtime::recover_running_promotions(
+                                        &recovery_app,
+                                        db_path.clone(),
+                                        dir.clone(),
+                                    ) {
+                                        Ok(recovered) => match Database::open(&db_path)
+                                            .and_then(|db| crate::registry::sync_champion_pointer(&db, &dir))
+                                        {
+                                            Ok(_) => {
+                                                tracing::info!(
+                                                    "recovered {recovered} interrupted champion promotion"
+                                                );
+                                                crate::engine_runtime::set_promotion_recovery_blocked(false);
+                                            }
+                                            Err(error) => tracing::error!(
+                                                "champion pointer publication failed after recovery; engine remains blocked: {error}"
+                                            ),
+                                        },
+                                        Err(error) => tracing::error!(
+                                            "champion promotion recovery is unverified; engine remains blocked: {error}"
+                                        ),
                                     }
-                                    Err(error) => tracing::error!(
-                                        "champion pointer publication failed after recovery; engine remains blocked: {error}"
-                                    ),
-                                },
-                                Err(error) => tracing::error!(
-                                    "champion promotion recovery is unverified; engine remains blocked: {error}"
-                                ),
+                                });
                             }
-                        });
+                            Err(error) => tracing::error!(
+                                "champion promotion recovery could not acquire the mutation fence; engine remains blocked: {error}"
+                            ),
+                        }
                     }
                     (None, _) => {
                         crate::engine_runtime::set_promotion_recovery_blocked(true);
@@ -1046,9 +1072,8 @@ fn is_headless_mode() -> bool {
         || matches!(std::env::var("CORTEX_AUDIOBOOK_PIPELINE").ok().as_deref(), Some("1"))
 }
 
-/// The explicit `CORTEX_APP_DATA_DIR` override, if set. Shared with the `bin/*` CLI tools
-/// (batch_importer/batch_processor/download_model/test_file) so the app and its batch utilities ALWAYS
-/// resolve to the SAME data dir — they share the live DB and the single-instance lock. Pure for testing.
+/// The explicit `CORTEX_APP_DATA_DIR` override, if set. Shared with supported `bin/*` CLI tools so
+/// the app and its batch utilities resolve to the same data dir and single-instance lock. Pure for testing.
 fn data_dir_override(env_val: Option<std::ffi::OsString>) -> Option<PathBuf> {
     env_val.map(PathBuf::from) // matches the bin/*.rs override exactly (no empty-string filtering)
 }
@@ -1154,7 +1179,7 @@ mod tests {
             normalizer,
             cache,
             fingerprint,
-            history: Mutex::new(HistoryManager::new(10)),
+            history: Arc::new(Mutex::new(HistoryManager::new(10))),
             session: Mutex::new(SessionManager::new(data_dir.join("session"))),
             settings: Mutex::new(settings),
             data_dir: Mutex::new(Some(data_dir)),
@@ -1173,22 +1198,6 @@ mod tests {
         // and the batch importer onto different databases (they share the live DB + single-instance lock).
         assert_eq!(data_dir_override(Some("D:/cortex-data".into())), Some(PathBuf::from("D:/cortex-data")));
         assert_eq!(data_dir_override(None), None, "unset -> fall through to headless/platform resolution");
-    }
-
-    #[test]
-    fn scribe_commands_require_cloud_stt_consent() {
-        // Regression: the Scribe IPC commands (transcribe_audio_with_scribe, add_scribe_votes) upload
-        // raw audio (biometric) to ElevenLabs. They MUST refuse without explicit cloud-STT opt-in —
-        // this guards the shared gate both call before any key load or network request.
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = test_app_state(dir.path().to_path_buf());
-        // Default settings: cloud_stt_opt_in = false → consent gate refuses.
-        let denied = commands::require_cloud_stt_consent(&state);
-        assert!(denied.is_err(), "biometric audio egress must be refused without opt-in");
-        assert!(denied.unwrap_err().contains("opt-in"), "error should name the missing consent");
-        // After explicit opt-in, the gate allows it.
-        state.settings.lock().unwrap().cloud_stt_opt_in = true;
-        assert!(commands::require_cloud_stt_consent(&state).is_ok(), "opt-in permits Scribe egress");
     }
 
     #[test]

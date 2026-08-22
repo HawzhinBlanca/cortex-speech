@@ -5,6 +5,7 @@ use crate::error::{AppError, AppResult};
 use crate::validation::input as validate;
 use flacenc::error::Verify;
 use serde::{Deserialize, Serialize};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,9 @@ pub struct AudioExportOptions {
     pub output_dir: String,
     pub format: AudioExportFormat,
     pub sample_rate: u32,
+    /// Add a spreadsheet-safe CSV view. The exact, machine-readable `metadata.jsonl` is mandatory
+    /// whenever any reviewed audio is written, because audio without its approved label/revision is
+    /// not a recoverable dataset artifact.
     pub include_metadata: bool,
 }
 
@@ -41,12 +45,50 @@ pub struct AudioExportResult {
 struct ExportedAudioFile {
     filename: String,
     segment: SpeechSegment,
+    /// The exact label the human approved. This is deliberately NOT normalized/canonicalized: the
+    /// shared audio sidecar is the durable audio↔verbatim-text pairing, not a derived ASR view.
+    effective_transcript: String,
+    /// The database-owned revision read in the same statement as `segment`, so the sidecar says
+    /// exactly which reviewed row snapshot supplied the label.
+    review_revision: i64,
     /// Duration of the clip ACTUALLY written to disk, not the segment's stored duration_ms. The
     /// two drift when slice_for_export clamps an over-long window to the decoded length (source
     /// re-encoded/shortened after import, or relink_audio pointing at a shorter file) and on the
     /// no-alignment whole-file fallback. metadata.csv must describe the bytes on disk — same
     /// invariant the HF exporter already enforces (export.rs clip_dur_ms).
     clip_duration_ms: i64,
+}
+
+/// Resolve the real human decision that makes a clip eligible for this shared, reviewed-audio
+/// export. `verified` is intentionally absent: bulk verification and rejected rows can both carry
+/// that flag, so it is not evidence that a person accepted the audio↔text pair.
+fn human_decision_for_export(seg: &SpeechSegment) -> Option<&str> {
+    let is_accept_or_edit = |value: &str| {
+        ["accept", "edit", "human_accept", "human_edit"].iter().any(|candidate| value.eq_ignore_ascii_case(candidate))
+    };
+    match seg.human_decision.as_deref() {
+        // Any present current decision is authoritative. A reject/unknown value must fail closed;
+        // it must never fall through to an older `human_accept`/`human_edit` verdict.
+        Some(value) => is_accept_or_edit(value).then_some(value),
+        // Legacy reviewed rows may predate `human_decision` while still carrying the authoritative
+        // human verdict. Preserve their exact stored decision code rather than inventing one.
+        None => seg.verdict.as_deref().filter(|value| is_accept_or_edit(value)),
+    }
+}
+
+fn human_export_label(seg: &SpeechSegment) -> Option<(&str, &str)> {
+    // `is_gold` rows are hidden answer keys/evaluation material. They have their own eval export and
+    // must never leak into a reviewed training-audio bundle even when their audio fingerprint is not
+    // also registered in the separate gold_segments holdout table.
+    if seg.is_gold || crate::quality::is_human_rejected(seg) {
+        return None;
+    }
+    let decision = human_decision_for_export(seg)?;
+    let transcript = crate::quality::human_verified_text(seg)?;
+    if transcript.trim().is_empty() || crate::quality::is_placeholder_transcript(transcript) {
+        return None;
+    }
+    Some((transcript, decision))
 }
 
 /// Export audio segments from a dataset.
@@ -75,28 +117,32 @@ pub fn export_audio_segments(
             .map_err(|e| AppError::Other(format!("Failed to create output dir: {e}")))?;
     }
 
-    // Fail-closed: never export held-out gold eval audio, exactly like export_dataset / HF / bundle.
-    // Resolve the requested ids to segments, run the shared holdout filter, and skip any requested id
-    // that loaded but is held out. Ids that don't load are NOT excluded here, so export_single_segment
-    // still runs and reports their not-found error (preserving the original failure accounting).
+    // Fail-closed: never export held-out, withdrawn, rejected, or placeholder audio, exactly like
+    // export_dataset / HF / bundle. Then require a REAL human accept/edit. `verified` alone is not a
+    // review decision: bulk verification can set it without anyone approving this audio↔text pair.
+    // Unknown ids are deliberately not put in `policy_excluded`, so export_single_segment still
+    // reports their not-found error and preserves the existing per-file failure accounting.
     let requested: Vec<SpeechSegment> =
         segment_ids.iter().filter_map(|id| db.get_segment_by_id(id).ok().flatten()).collect();
     let loaded_ids: std::collections::HashSet<String> = requested.iter().map(|s| s.id.clone()).collect();
-    let allowed_ids: std::collections::HashSet<String> =
-        crate::export::exclude_unexportable_segments(db, requested)?.into_iter().map(|s| s.id).collect();
-    let holdout_excluded: std::collections::HashSet<String> = loaded_ids.difference(&allowed_ids).cloned().collect();
+    let allowed_ids: std::collections::HashSet<String> = crate::export::exclude_unexportable_segments(db, requested)?
+        .into_iter()
+        .filter(|seg| human_export_label(seg).is_some())
+        .map(|seg| seg.id)
+        .collect();
+    let policy_excluded: std::collections::HashSet<String> = loaded_ids.difference(&allowed_ids).cloned().collect();
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
-    let mut skipped_holdout = 0usize;
+    let mut skipped_policy = 0usize;
     let mut files = Vec::new();
     let mut errors = Vec::new();
     let mut exported = Vec::new();
 
     for id in segment_ids {
-        if holdout_excluded.contains(id) {
+        if policy_excluded.contains(id) {
             // Intentional fail-closed exclusion; exclude_unexportable_segments already logged the reason.
-            skipped_holdout += 1;
+            skipped_policy += 1;
             continue;
         }
         match export_single_segment(db, id, &options) {
@@ -112,8 +158,18 @@ pub fn export_audio_segments(
         }
     }
 
-    if skipped_holdout > 0 {
-        tracing::warn!("Audio export: skipped {skipped_holdout} held-out gold segment(s) — not exported (fail-closed)");
+    if skipped_policy > 0 {
+        tracing::warn!(
+            "Audio export: skipped {skipped_policy} segment(s) without an exportable current human accept/edit — not exported (fail-closed)"
+        );
+    }
+
+    // The JSONL sidecar is the authoritative audio↔exact-label pairing and is never optional. CSV
+    // escaping must prefix formula-like cells for spreadsheet safety, so CSV cannot honestly be the
+    // byte-exact transcript record for every possible human label.
+    if !exported.is_empty() {
+        write_metadata_jsonl(output_dir, &exported, &options)?;
+        files.push("metadata.jsonl".to_string());
     }
 
     if options.include_metadata && !exported.is_empty() {
@@ -148,8 +204,17 @@ fn export_single_segment(
     segment_id: &str,
     options: &AudioExportOptions,
 ) -> AppResult<ExportedAudioFile> {
-    let seg =
-        db.get_segment_by_id(segment_id)?.ok_or_else(|| AppError::Other(format!("Segment not found: {segment_id}")))?;
+    let (seg, review_revision) = db
+        .get_segment_by_id_with_revision(segment_id)?
+        .ok_or_else(|| AppError::Other(format!("Segment not found: {segment_id}")))?;
+    // Defense in depth against a future caller bypassing export_audio_segments' batch filter. It
+    // also guarantees write_metadata_csv never has to guess which transcript or decision was human.
+    let (effective_transcript, _) = human_export_label(&seg).ok_or_else(|| {
+        AppError::Validation(format!(
+            "Segment {segment_id}: no current human accept/edit with a non-empty, non-placeholder transcript"
+        ))
+    })?;
+    let effective_transcript = effective_transcript.to_string();
 
     let source_path = Path::new(&seg.audio_path);
     if !source_path.exists() {
@@ -255,7 +320,60 @@ fn export_single_segment(
         }
     }
 
-    Ok(ExportedAudioFile { filename: output_filename, segment: seg, clip_duration_ms })
+    Ok(ExportedAudioFile {
+        filename: output_filename,
+        segment: seg,
+        effective_transcript,
+        review_revision,
+        clip_duration_ms,
+    })
+}
+
+fn write_metadata_jsonl(
+    output_dir: &Path,
+    exported: &[ExportedAudioFile],
+    options: &AudioExportOptions,
+) -> AppResult<()> {
+    let metadata_path = output_dir.join("metadata.jsonl");
+    let tmp_path = metadata_path.with_extension("jsonl.tmp");
+    remove_file_on_error(
+        &tmp_path,
+        (|| -> AppResult<()> {
+            let file = std::fs::File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            let export_format = match options.format {
+                AudioExportFormat::Wav => "wav",
+                AudioExportFormat::Flac => "flac",
+            };
+
+            for item in exported {
+                let decision = human_decision_for_export(&item.segment).ok_or_else(|| {
+                    AppError::Other("audio export lost its required human-decision invariant".to_string())
+                })?;
+                // Intentionally serialize a narrow public record, not SpeechSegment: the latter
+                // contains absolute paths, reviewer identity, and internal model/quality fields.
+                let record = serde_json::json!({
+                    "file_name": item.filename.as_str(),
+                    "segment_id": item.segment.id.as_str(),
+                    "source_audio_path": crate::export::export_audio_ref(&item.segment.audio_path),
+                    "effective_transcript": item.effective_transcript.as_str(),
+                    "transcript_source": "human_verified",
+                    "human_decision": decision,
+                    "review_revision": item.review_revision,
+                    "duration_ms": item.clip_duration_ms,
+                    "export_sample_rate": options.sample_rate,
+                    "export_format": export_format,
+                });
+                serde_json::to_writer(&mut writer, &record)?;
+                writer.write_all(b"\n")?;
+            }
+            writer.flush()?;
+            drop(writer);
+            replace_file(&tmp_path, &metadata_path)
+                .map_err(|e| AppError::Other(format!("Failed to promote audio export metadata: {e}")))?;
+            Ok(())
+        })(),
+    )
 }
 
 fn write_metadata_csv(
@@ -276,6 +394,8 @@ fn write_metadata_csv(
                 "raw_transcript",
                 "normalized_transcript",
                 "annotated_transcript",
+                "effective_transcript",
+                "transcript_source",
                 "duration_ms",
                 "speaker_id",
                 "verified",
@@ -287,6 +407,8 @@ fn write_metadata_csv(
                 "split",
                 "signal_anomaly_score",
                 "verdict",
+                "human_decision",
+                "review_revision",
                 "alignment_quality",
                 "export_sample_rate",
                 "export_format",
@@ -315,8 +437,14 @@ fn write_metadata_csv(
                 let raw_t = crate::export::csv_safe_cell(seg.raw_transcript.as_str());
                 let norm_t = crate::export::csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
                 let annot_t = crate::export::csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
+                let effective_t = crate::export::csv_safe_cell(item.effective_transcript.as_str());
                 let speaker_t = crate::export::csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                 let verdict_t = crate::export::csv_safe_cell(seg.verdict.as_deref().unwrap_or(""));
+                let human_decision = human_decision_for_export(seg).ok_or_else(|| {
+                    AppError::Other("audio export lost its required human-decision invariant".to_string())
+                })?;
+                let human_decision_t = crate::export::csv_safe_cell(human_decision);
+                let review_revision = item.review_revision.to_string();
                 wtr.write_record([
                     item.filename.as_str(),
                     seg.id.as_str(),
@@ -329,6 +457,8 @@ fn write_metadata_csv(
                     raw_t.as_ref(),
                     norm_t.as_ref(),
                     annot_t.as_ref(),
+                    effective_t.as_ref(),
+                    "human_verified",
                     duration_ms.as_str(),
                     speaker_t.as_ref(),
                     if seg.verified { "1" } else { "0" },
@@ -340,6 +470,8 @@ fn write_metadata_csv(
                     seg.split.as_deref().unwrap_or(""),
                     signal_anomaly_score.as_str(),
                     verdict_t.as_ref(),
+                    human_decision_t.as_ref(),
+                    review_revision.as_str(),
                     seg.alignment_quality.as_deref().unwrap_or(""),
                     export_sample_rate.as_str(),
                     export_format,
@@ -410,7 +542,7 @@ mod tests {
             alignment_json: None,
             duration_ms: 1000,
             speaker_id: None,
-            verified: false,
+            verified: true,
             confidence: None,
             ctc_score: None,
             clipping_ratio: None,
@@ -421,6 +553,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
+        db.record_human_decision_by(id, "accept", Some("hello"), None, Some("test-reviewer")).unwrap();
     }
 
     fn output_wav_info(path: &Path) -> (u32, u32) {
@@ -578,14 +711,235 @@ mod tests {
             // export.rs::exports_never_leak_absolute_paths already uses.
             audio_path: "C:\\Recordings\\studio_user\\private_clips\\clip_001.wav".to_string(),
             raw_transcript: "hello".to_string(),
+            verified: true,
+            verdict: Some("human_accept".to_string()),
+            verdict_transcript: Some("hello".to_string()),
+            human_decision: Some("accept".to_string()),
+            reviewed_by: Some("test-reviewer".to_string()),
             ..SpeechSegment::default()
         };
-        let exported = vec![ExportedAudioFile { filename: "ep_s1.wav".to_string(), segment: seg, clip_duration_ms: 0 }];
+        let exported = vec![ExportedAudioFile {
+            filename: "ep_s1.wav".to_string(),
+            segment: seg,
+            effective_transcript: "hello".to_string(),
+            review_revision: 0,
+            clip_duration_ms: 0,
+        }];
         write_metadata_csv(tmp.path(), &exported, &AudioExportOptions::default()).unwrap();
         let csv = fs::read_to_string(tmp.path().join("metadata.csv")).unwrap();
         assert!(!csv.contains("studio_user"), "absolute path leaked the OS username:\n{csv}");
         assert!(!csv.contains("private_clips"), "absolute path leaked the directory layout:\n{csv}");
         assert!(csv.contains("clip_001.wav"), "the source basename must be published as provenance:\n{csv}");
+    }
+
+    #[test]
+    fn jsonl_preserves_a_formula_like_human_label_while_csv_remains_spreadsheet_safe() {
+        let tmp = TempDir::new().unwrap();
+        let exact = "=SUM(1,2)";
+        let seg = SpeechSegment {
+            id: "formula-label".to_string(),
+            audio_path: r"C:\Recordings\clip.wav".to_string(),
+            raw_transcript: "machine".to_string(),
+            verified: true,
+            verdict: Some("human_edit".to_string()),
+            verdict_transcript: Some(exact.to_string()),
+            human_decision: Some("edit".to_string()),
+            reviewed_by: Some("private-reviewer".to_string()),
+            ..SpeechSegment::default()
+        };
+        let exported = vec![ExportedAudioFile {
+            filename: "clip_formula-label.wav".to_string(),
+            segment: seg,
+            effective_transcript: exact.to_string(),
+            review_revision: 7,
+            clip_duration_ms: 900,
+        }];
+        let options = AudioExportOptions::default();
+
+        write_metadata_jsonl(tmp.path(), &exported, &options).unwrap();
+        write_metadata_csv(tmp.path(), &exported, &options).unwrap();
+
+        let line = fs::read_to_string(tmp.path().join("metadata.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(record["effective_transcript"], exact, "JSONL is the byte-exact training label");
+        assert!(!line.contains("private-reviewer"), "reviewer identity leaked into public JSONL");
+
+        let mut reader = csv::Reader::from_path(tmp.path().join("metadata.csv")).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let row = reader.records().next().unwrap().unwrap();
+        assert_eq!(
+            metadata_value(&headers, &row, "effective_transcript"),
+            "'=SUM(1,2)",
+            "CSV remains safe to open in a spreadsheet; JSONL above is authoritative"
+        );
+    }
+
+    #[test]
+    fn verified_without_a_human_decision_is_not_exported() {
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("machine.wav");
+        make_wav_file(&wav_path);
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let seg = SpeechSegment {
+            id: "machine-only".to_string(),
+            audio_path: wav_path.to_string_lossy().to_string(),
+            raw_transcript: "machine draft".to_string(),
+            duration_ms: 1000,
+            // This flag does not prove a person accepted the audio↔text pair.
+            verified: true,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).unwrap();
+
+        let out = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            std::slice::from_ref(&seg.id),
+            &AudioExportOptions {
+                output_dir: out.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.succeeded, 0, "verified must not impersonate a human decision");
+        assert_eq!(result.failed, 0, "policy exclusion is not an encoder failure");
+        assert!(result.files.is_empty());
+        assert!(!out.join("machine_machine-only.wav").exists());
+        assert!(!out.join("metadata.csv").exists());
+        assert!(!out.join("SHA256SUMS").exists());
+    }
+
+    #[test]
+    fn an_is_gold_answer_key_is_not_exported_as_training_audio() {
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("answer-key.wav");
+        make_wav_file(&wav_path);
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let seg = SpeechSegment {
+            id: "hidden-gold".to_string(),
+            audio_path: wav_path.to_string_lossy().to_string(),
+            raw_transcript: "wrong draft".to_string(),
+            duration_ms: 1000,
+            is_gold: true,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment_full(&seg).unwrap();
+        db.record_human_decision_by(&seg.id, "edit", Some("known answer"), None, Some("Owner")).unwrap();
+
+        let out = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            &[seg.id],
+            &AudioExportOptions { output_dir: out.to_string_lossy().to_string(), ..AudioExportOptions::default() },
+        )
+        .unwrap();
+        assert_eq!((result.succeeded, result.failed), (0, 0));
+        assert!(result.files.is_empty());
+        assert!(!out.join("metadata.jsonl").exists());
+    }
+
+    #[test]
+    fn metadata_csv_carries_the_exact_human_label_and_review_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("truth.wav");
+        make_wav_file(&wav_path);
+
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let exact_correction = "ئەمە دەقی ڕاستەقینەی مرۆڤە، ١٢٣!";
+        let seg = SpeechSegment {
+            id: "human-edit".to_string(),
+            audio_path: wav_path.to_string_lossy().to_string(),
+            raw_transcript: "machine draft".to_string(),
+            normalized_transcript: Some("machine normalized".to_string()),
+            annotated_transcript: Some("older human draft".to_string()),
+            verified: true,
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        };
+        db.insert_segment(&seg).unwrap();
+        db.record_human_decision_by(&seg.id, "edit", Some(exact_correction), None, Some("Rubar")).unwrap();
+        let expected_revision = db.segment_review_revision(&seg.id).unwrap().unwrap();
+
+        let out = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            std::slice::from_ref(&seg.id),
+            &AudioExportOptions {
+                output_dir: out.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16000,
+                include_metadata: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.succeeded, 1, "a real human edit is exportable: {:?}", result.errors);
+
+        let mut reader = csv::Reader::from_path(out.join("metadata.csv")).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let row = reader.records().next().unwrap().unwrap();
+        assert_eq!(metadata_value(&headers, &row, "raw_transcript"), "machine draft");
+        assert_eq!(metadata_value(&headers, &row, "effective_transcript"), exact_correction);
+        assert_eq!(metadata_value(&headers, &row, "transcript_source"), "human_verified");
+        assert_eq!(metadata_value(&headers, &row, "human_decision"), "edit");
+        assert_eq!(metadata_value(&headers, &row, "review_revision"), expected_revision.to_string());
+        assert!(
+            !headers.iter().any(|header| header == "reviewed_by"),
+            "shared artifacts must not expose reviewer names"
+        );
+        assert!(!row.iter().any(|value| value == "Rubar"), "reviewer identity leaked into shared metadata");
+        assert!(reader.records().next().is_none());
+
+        let jsonl = fs::read_to_string(out.join("metadata.jsonl")).unwrap();
+        let exact: serde_json::Value = serde_json::from_str(jsonl.trim()).unwrap();
+        assert_eq!(exact["effective_transcript"], exact_correction);
+        assert_eq!(exact["review_revision"], expected_revision);
+        assert!(!jsonl.contains("Rubar"), "the authoritative exact-label sidecar must not expose reviewer identity");
+    }
+
+    #[test]
+    fn transcript_source_is_human_verified_only_for_a_real_or_legacy_human_decision() {
+        let annotation_only = SpeechSegment {
+            raw_transcript: "machine".to_string(),
+            annotated_transcript: Some("unapproved human draft".to_string()),
+            ..SpeechSegment::default()
+        };
+        assert!(
+            human_export_label(&annotation_only).is_none(),
+            "an annotation without accept/edit must not be stamped human_verified"
+        );
+
+        let legacy_human_accept = SpeechSegment {
+            raw_transcript: "machine".to_string(),
+            annotated_transcript: Some("legacy approved text".to_string()),
+            verdict: Some("human_accept".to_string()),
+            human_decision: None,
+            ..SpeechSegment::default()
+        };
+        let (text, decision) =
+            human_export_label(&legacy_human_accept).expect("legacy human verdict remains valid provenance");
+        assert_eq!(text, "legacy approved text");
+        assert_eq!(decision, "human_accept");
+
+        let contradictory_current_row = SpeechSegment {
+            raw_transcript: "machine".to_string(),
+            verdict_transcript: Some("stale previously approved text".to_string()),
+            verdict: Some("human_accept".to_string()),
+            human_decision: Some("unknown".to_string()),
+            ..SpeechSegment::default()
+        };
+        assert!(
+            human_export_label(&contradictory_current_row).is_none(),
+            "a present non-accept/edit decision must not fall through to a stale legacy accept"
+        );
     }
 
     #[test]
@@ -637,9 +991,11 @@ mod tests {
             raw_transcript: "short utterance".to_string(),
             duration_ms: 300,
             alignment_json: Some(meta.to_alignment_json()),
+            verified: true,
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
+        db.record_human_decision("oob1", "accept", Some("short utterance"), None).unwrap();
 
         let out_dir = tmp.path().join("out");
         let result = export_audio_segments(
@@ -686,9 +1042,11 @@ mod tests {
             raw_transcript: "clamped utterance".to_string(),
             duration_ms: 5000, // stored value claims 5 s; the decoded source only backs 1 s
             alignment_json: Some(meta.to_alignment_json()),
+            verified: true,
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
+        db.record_human_decision("clamp1", "accept", Some("clamped utterance"), None).unwrap();
 
         let out_dir = tmp.path().join("out");
         let result = export_audio_segments(
@@ -756,14 +1114,14 @@ mod tests {
         assert_eq!(src, "test.wav", "only the basename may be published");
         assert!(!src.contains('/') && !src.contains('\\'), "no directory separators may leak: {src}");
         assert_eq!(metadata_value(&headers, &row, "raw_transcript"), "hello");
-        assert_eq!(metadata_value(&headers, &row, "verified"), "0");
+        assert_eq!(metadata_value(&headers, &row, "verified"), "1");
         assert_eq!(metadata_value(&headers, &row, "export_sample_rate"), "16000");
         assert_eq!(metadata_value(&headers, &row, "export_format"), "wav");
         assert!(reader.records().next().is_none());
     }
 
     #[test]
-    fn test_export_skips_metadata_when_disabled() {
+    fn disabling_csv_still_writes_the_exact_machine_readable_label() {
         let tmp = TempDir::new().unwrap();
         let wav_path = tmp.path().join("test.wav");
         make_wav_file(&wav_path);
@@ -785,8 +1143,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.files, vec!["test_exp1.wav", "SHA256SUMS"]);
+        assert_eq!(result.files, vec!["test_exp1.wav", "metadata.jsonl", "SHA256SUMS"]);
         assert!(!out_dir.join("metadata.csv").exists());
+        let line = fs::read_to_string(out_dir.join("metadata.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(record["effective_transcript"], "hello");
+        assert_eq!(record["transcript_source"], "human_verified");
+        assert!(record["review_revision"].as_i64().is_some());
     }
 
     #[test]
@@ -850,7 +1213,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.succeeded, 1);
-        assert_eq!(result.files, vec!["test_exp1.wav", "metadata.csv", "SHA256SUMS"]);
+        assert_eq!(result.files, vec!["test_exp1.wav", "metadata.jsonl", "metadata.csv", "SHA256SUMS"]);
         assert_ne!(fs::read(&output_path).unwrap(), b"stale partial export");
         let (sample_rate, sample_count) = output_wav_info(&output_path);
         assert_eq!(sample_rate, 16000);
@@ -899,6 +1262,7 @@ mod tests {
             })
             .collect();
         assert!(entries.contains_key("test_exp1.wav"), "the exported clip must be in the manifest");
+        assert!(entries.contains_key("metadata.jsonl"), "exact-label metadata must be in the manifest");
         assert!(entries.contains_key("metadata.csv"), "metadata.csv must be in the manifest");
         assert!(!entries.contains_key("SHA256SUMS"), "the manifest must not hash itself");
 

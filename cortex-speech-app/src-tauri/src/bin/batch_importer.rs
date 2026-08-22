@@ -31,9 +31,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = app_data_dir.join("cortex-speech.db");
 
     let db = Database::open_with_retry(&db_path.to_string_lossy())?;
-    db.initialize()?;
+    if let Some(path) = cortex_speech_app_lib::snapshot::initialize_with_required_pre_migration_pin(&db, &app_data_dir)?
+    {
+        println!("Pre-migration database safety pin: {}", path.display());
+    }
 
-    let settings = AppSettings::load(&app_data_dir.join("settings.json"));
+    // This binary persists production drafts, so it must share the desktop's champion-only loader;
+    // raw `load()` is reserved for explicit offline diagnostic tools.
+    let settings = AppSettings::load_production(&app_data_dir.join("settings.json"));
 
     let normalizer = Arc::new(SoraniNormalizer::new());
     let cache = Arc::new(TranscriptCache::new(1000));

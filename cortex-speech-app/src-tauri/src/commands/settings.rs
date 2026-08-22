@@ -24,9 +24,20 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 #[tauri::command]
 pub fn update_settings(mut settings: AppSettings, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("update_settings")?;
+    // Settings is one leg of named snapshot recovery. Hold a full-operation mutation token so a
+    // concurrent restore cannot interleave its restored settings/routing files with this save and
+    // runtime pipeline update.
+    let _mutation = super::begin_mutation()?;
     // Server-side trust boundary: reject a malicious endpoint/oversized payload before it
-    // can take effect and redirect LLM requests (+ the API key) to an attacker's server.
+    // can take effect and redirect LLM requests (+ the API key) to an attacker's server. Validate
+    // BEFORE canonicalization so a tampered webview cannot submit an unapproved cloud model and
+    // receive a misleading success after the backend silently changes it. Legacy files are migrated
+    // separately by AppSettings::load(); IPC input is an untrusted request and fails closed.
     settings.validate().map_err(|e| e.to_string())?;
+    // The desktop never accepts a non-champion ASR route. Unlike the explicit cloud selectors above,
+    // the frontend no longer exposes this legacy local selector, so canonicalizing it is a safe and
+    // backwards-compatible migration for otherwise-valid older clients.
+    settings.enforce_production_canon();
     // Round-22 #7: carry the in-session secret forward and capture the on-disk path WITHOUT yet
     // overwriting the in-memory copy. Persisting BEFORE committing to memory/pipeline means a save
     // failure (full/read-only/locked disk) leaves the in-memory settings, the running pipeline, AND
@@ -89,7 +100,6 @@ pub fn set_api_key(provider: String, key: String, state: State<'_, AppState>) ->
     STRICT_RATE_LIMITER.check("set_api_key")?;
     let name = match provider.as_str() {
         "gemini" => "GEMINI_API_KEY",
-        "elevenlabs" => "ELEVENLABS_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         other => return Err(format!("unknown provider '{other}'")),
     };
@@ -107,6 +117,19 @@ pub fn set_api_key(provider: String, key: String, state: State<'_, AppState>) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_settings_rejects_noncanonical_cloud_routes_before_canonicalization_and_persistence() {
+        let src = include_str!("settings.rs");
+        let prod = src.split("mod tests").next().unwrap_or(src);
+        let validate = prod.find("settings.validate()").expect("settings validation");
+        let clamp = prod.find("settings.enforce_production_canon()").expect("production routing clamp");
+        let save = prod.find("settings.save(&path)").expect("settings persistence");
+        assert!(
+            validate < clamp && clamp < save,
+            "untrusted cloud selectors must fail validation before the champion clamp and persistence"
+        );
+    }
+
     /// P0.3 (audit H4): the sole production key-writer MUST DPAPI-encrypt at rest, never fall back to the
     /// plaintext `save_key`. Wiring `set_api_key` to `save_key` (the plaintext path) is the exact
     /// regression this guards; a source-invariant check because the command needs full AppState to call.

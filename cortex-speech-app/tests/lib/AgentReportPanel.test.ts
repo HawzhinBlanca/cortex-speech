@@ -17,7 +17,7 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
       agenticReadiness: {
         status: 'blocked',
         ready: false,
-        sourceReferenceModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+        sourceReferenceModels: ['gemini-2.5-pro'],
         availableHypothesisModels: ['omniasr-wsl-7b'],
         requiredHypothesisModels: 2,
         checks: [
@@ -25,7 +25,7 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
             id: 'source_reference',
             label: 'Whole-file source references',
             status: 'ready',
-            detail: 'Configured source-reference models: gemini-2.5-pro, gemini-2.5-flash',
+            detail: 'Configured source-reference model: gemini-2.5-pro',
           },
           {
             id: 'hypothesis_coverage',
@@ -44,13 +44,13 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
         },
       ],
       sourceReferenceRequired: true,
-      requiredSourceReferenceModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
-      sourceReferenceModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+      requiredSourceReferenceModels: ['gemini-2.5-pro'],
+      sourceReferenceModels: ['gemini-2.5-pro'],
       sourceReferenceCoverage: [
         {
           audioPath: 'C:\\audio\\long.wav',
-          requiredModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
-          presentModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+          requiredModels: ['gemini-2.5-pro'],
+          presentModels: ['gemini-2.5-pro'],
           missingModels: [],
           complete: true,
         },
@@ -70,8 +70,8 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
           ],
           sourceReferenceCoverage: {
             audioPath: 'C:\\audio\\long.wav',
-            requiredModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
-            presentModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+            requiredModels: ['gemini-2.5-pro'],
+            presentModels: ['gemini-2.5-pro'],
             missingModels: [],
             complete: true,
           },
@@ -117,7 +117,7 @@ function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportRepo
         {
           stage: 'source_reference',
           status: 'ready',
-          summary: '2 whole-file source reference transcripts recorded.',
+          summary: '1 whole-file source reference transcript recorded.',
           blockerCount: 0,
           blockers: [],
         },
@@ -202,7 +202,7 @@ describe('AgentReportPanel', () => {
     expect(screen.getByText('completed')).toBeInTheDocument();
     expect(screen.getByText('Training-ready')).toBeInTheDocument();
     expect(screen.getByTestId('agent-report-training-ready')).toHaveTextContent('1 / 50%');
-    expect(screen.getAllByText('gemini-2.5-pro, gemini-2.5-flash')).toHaveLength(3);
+    expect(screen.getAllByText('gemini-2.5-pro')).toHaveLength(4);
     expect(screen.getByText('omniasr-ctc-300m, omniasr-wsl-7b')).toBeInTheDocument();
     expect(screen.getByTestId('agent-report-agentic-readiness')).toHaveTextContent(
       'Agentic readiness',
@@ -226,7 +226,7 @@ describe('AgentReportPanel', () => {
     expect(screen.getByTestId('agent-report-source-reference-coverage')).toHaveTextContent(
       'long.wav',
     );
-    expect(screen.getByTestId('agent-report-source-reference-coverage')).toHaveTextContent('2/2');
+    expect(screen.getByTestId('agent-report-source-reference-coverage')).toHaveTextContent('1/1');
     expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('long.wav');
     expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('needs_review');
     expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('2 chunks');

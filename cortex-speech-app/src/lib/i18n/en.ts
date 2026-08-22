@@ -6,19 +6,6 @@ export const en: Record<string, string> = {
   open: 'Add file',
   openFile: 'Add file',
   transcribe: 'Transcribe',
-  transcribeConstrained: 'Kurdish-only',
-  transcribeConstrainedTitle:
-    'Transcribe with constrained Kurdish-script decode (guarantees Kurdish output)',
-  transcribeFinetuned: 'Fine-tuned',
-  transcribeFinetunedTitle:
-    'Transcribe with the fine-tuned Kurdish model (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25)',
-  'scribe.transcribe': 'Scribe (cloud)',
-  'scribe.transcribeTitle': 'Re-transcribe this segment with ElevenLabs Scribe (cloud STT)',
-  'scribe.vote': '+ Scribe vote',
-  'scribe.voteTitle': 'Add an independent ElevenLabs Scribe jury vote for this segment',
-  'scribe.voteAdded': 'Scribe vote added. Re-run the jury to fold it into consensus.',
-  'scribe.voteExists': 'This segment already has a Scribe vote.',
-  'scribe.voteFailed': 'Failed to add the Scribe vote',
   transcribing: 'Transcribing...',
   verify: 'Verify',
   unverify: 'Unverify',
@@ -86,7 +73,7 @@ export const en: Record<string, string> = {
   threads: 'Threads',
   gpuAcceleration: 'GPU acceleration (CUDA)',
   gpuAccelerationNote:
-    'Affects the local CTC fallback engines only — they run on CPU in this build. The OmniASR-7B champion always uses the GPU via WSL.',
+    'Applies only to explicit diagnostic CTC runtimes. Production transcription is fixed to the OmniASR-7B Champion on the WSL GPU; this setting cannot create a fallback.',
   vadThreshold: 'VAD Threshold',
   minSegment: 'Min segment',
   maxSegment: 'Max segment',
@@ -121,7 +108,8 @@ export const en: Record<string, string> = {
   'review.progress': 'Clip {n} of {total}',
   'review.reviewedCount': '{done} of {total} reviewed',
   'review.editHint': 'Listen, then fix the text if needed',
-  'review.mustListen': 'Not saved: play the whole clip first. A verdict on audio nobody heard is a guess.',
+  'review.mustListen':
+    'Not saved: play the whole clip first. A verdict on audio nobody heard is a guess.',
   'review.listen': 'Listen & locate',
   'review.listenHint':
     'Tap a word to hear just that word; double-tap (or F2) to fix it in place. Coloured words are lower-confidence — check those first.',
@@ -143,9 +131,6 @@ export const en: Record<string, string> = {
   'review.retranscribeChampion': 'OmniASR-7B',
   'review.retranscribeChampionTitle':
     'Re-transcribe this clip with the OmniASR-7B Champion (needs the 7B server running).',
-  'review.retranscribeFinetuned': 'Fine-tuned MMS-1B',
-  'review.retranscribeFinetunedTitle':
-    'Re-transcribe this clip with the embedded fine-tuned MMS-1B (CPU, always available).',
   'review.retranscribing': 'Re-transcribing…',
   'review.retranscribed': 'Re-transcribed.',
   'review.retranscribeFailed': 'Re-transcription failed',
@@ -506,8 +491,6 @@ export const en: Record<string, string> = {
   'stats.relinking': 'Relinking…',
   'stats.relinkDone': 'Relinked {n} file(s); {m} still missing.',
   'stats.relinkFailed': 'Relink failed',
-  'settings.cloudSttConsent':
-    'Optional manual ElevenLabs Scribe tools. When on, per-segment Scribe re-transcribe and vote actions are shown; imports still use only the OmniASR-7B champion. Using an action sends only that selected clip to ElevenLabs. Requires an ElevenLabs key in secrets.env. Leave this off if you do not need it.',
   'settings.cloudLlmConsent':
     'I understand Gemini sends transcript text to Google. Keep this disabled for fully offline dataset work.',
   'settings.juryT2ConsentLead': 'I understand',
@@ -594,9 +577,6 @@ export const en: Record<string, string> = {
   'db.quarantineAcknowledged':
     '{count} quarantined file(s) archived to the quarantine folder - snapshot pruning resumed',
   'db.quarantineAcknowledgeFailed': 'Could not archive the quarantined files',
-  'stats.verifyModel': 'Verify model integrity',
-  'stats.verifyModelOk': 'Model integrity verified — checksums match.',
-  'stats.verifyModelFailed': 'Model integrity check failed',
   'stats.buildSha': 'Build',
   // Audit 2026-08-05 #4 read "Audio fingerprints: 0" beside "Total segments: 144" and concluded
   // legacy data was never backfilled. It is not a corpus statistic at all — the fingerprint map is
@@ -804,9 +784,6 @@ export const en: Record<string, string> = {
     'Some clips in each reviewer’s queue already have a verified answer and are shown with the wrong draft. A reviewer who listens corrects them. A low first number means they may be accepting without listening.',
   'settings.couchReviewersHint':
     'Each name gets its own private link, and every decision is stored under that name. Reviewers are handed different clips, so two people never review the same one at the same time.',
-  'settings.useFinetuned': 'Use fine-tuned model',
-  'settings.useFinetunedHint':
-    'Best local Sorani accuracy (21.0% CER [19.9-22.0], N=900 gold clips, measured 2026-06-25) — runs on CPU, no setup. Overrides the engine below.',
   'settings.externalAsrScript': 'External ASR Provider Script',
   'settings.localApiEndpoint': 'Local API Endpoint',
   'settings.modelName': 'Model Name',
@@ -825,7 +802,7 @@ export const en: Record<string, string> = {
     'Required only for the WSL 7B provider. Use a path visible inside WSL.',
   'settings.llmDisabledOption': 'Disabled (fastest)',
   'settings.llmLocalOption': 'Local API (for example, LM Studio or Ollama)',
-  'settings.llmCloudOption': 'Google Gemini 3.1 Pro (cloud)',
+  'settings.llmCloudOption': 'Google Gemini 2.5 Pro (cloud)',
   'settings.localEndpointHint': 'Must be an OpenAI-compatible /v1/chat/completions endpoint.',
   'settings.quickSelect': 'Quick select:',
   'settings.apiKeySaved': 'key saved',
@@ -837,8 +814,8 @@ export const en: Record<string, string> = {
   'settings.apiKeySavedToast': '{provider} key saved to secrets.env',
   'settings.apiKeyClearedToast': '{provider} key cleared',
   'settings.apiKeySaveFailedToast': 'Failed to save {provider} key',
-  'settings.geminiProRecommended': 'Gemini 2.5 Pro (recommended)',
-  'settings.geminiFlash': 'Gemini 2.5 Flash',
+  'settings.modelFixedByPolicy': 'fixed by owner policy',
+  'settings.advisoryModelName': 'Gemini 2.5 Pro',
   'settings.systemPromptHint': 'Instructions sent to the LLM to process the transcription.',
   'settings.juryTitle': '📬 Listening Jury',
   'settings.juryDescription':
@@ -849,10 +826,8 @@ export const en: Record<string, string> = {
   'settings.juryT1ThresholdHint':
     'Segments below this combined lexicon and perplexity score escalate to T2. Raise it to reduce cloud calls.',
   'settings.juryModelLabel': 'Gemini model (T2 audio judge)',
-  'settings.modelProRecommended': '2.5 Pro (recommended)',
-  'settings.modelFlashFaster': '2.5 Flash (faster)',
-  'settings.sourceModelsBoth': '2.5 Pro + Flash',
-  'settings.sourceModelsProOnly': '2.5 Pro only',
+  'settings.sourceReferenceFixedHint':
+    'Advisory source references use this same fixed model; production transcription remains OmniASR-7B.',
   'settings.selfConsistencyLabel': 'Self-consistency N',
   'settings.selfConsistencyHint':
     'Votes per segment. 3 is a majority vote. Higher values improve reliability but use more API calls.',
@@ -863,7 +838,7 @@ export const en: Record<string, string> = {
   'settings.juryConnection': 'Judge connection',
   'settings.juryConnectionGemini': 'Google direct (Gemini API key)',
   'settings.juryConnectionOpenRouter': 'OpenRouter (same Gemini 2.5 Pro; OpenRouter key)',
-  'settings.juryPolicyLead': 'Cloud ASR judge policy:',
+  'settings.juryPolicyLead': 'Advisory cloud judge policy:',
   'settings.juryPolicyModel': 'Gemini 2.5 Pro only',
   'settings.juryPolicyDetail':
     '— the only cloud model verified usable for Sorani (Qwen and similar models are not). OpenRouter reaches the same model with its own key and quota.',

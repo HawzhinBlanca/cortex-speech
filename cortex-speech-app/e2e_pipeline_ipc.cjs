@@ -70,7 +70,9 @@ async function run() {
   const ctx = browser.contexts()[0];
   const page = ctx.pages().find((p) => p.url().includes('localhost')) || ctx.pages()[0];
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 45000 });
-  await provisionEngine(page);
+  // Standard release proof: WSL7B only. The helper binds the disposable registry to the live,
+  // content-addressed champion and never starts or substitutes a smaller engine.
+  await provisionEngine(page, DATA_DIR);
   const invoke = (cmd, args) => page.evaluate(([c, a]) => window.__TAURI_INTERNALS__.invoke(c, a), [cmd, args]);
 
   console.log('==> import_audio_file:', AUDIO);

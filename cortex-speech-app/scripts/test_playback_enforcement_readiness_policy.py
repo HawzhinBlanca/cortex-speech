@@ -14,6 +14,8 @@ close, so it is driven against a fabricated-clean database and required to refus
 
 from __future__ import annotations
 
+import importlib.util
+import os
 import re
 import sqlite3
 import subprocess
@@ -25,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE = REPO_ROOT / "scripts" / "check_playback_enforcement_readiness.py"
 DB_RS = REPO_ROOT / "src-tauri" / "src" / "db.rs"
 COUCH_RS = REPO_ROOT / "src-tauri" / "src" / "couch.rs"
+VERIFY_10 = REPO_ROOT.parent / "scripts" / "verify_10.py"
 
 sys.path.insert(0, str(GATE.parent))
 import check_playback_enforcement_readiness as gate  # noqa: E402
@@ -86,6 +89,59 @@ def test_an_empty_window_is_refused_not_passed() -> None:
         assert result.returncode == 1, f"an empty window must not read as ready:\n{result.stdout}"
         assert "NOT READY" in result.stdout
         assert "0 decision(s)" in result.stdout
+
+
+def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
+    """The real aggregator must run this proof, without a skip probe or a backdated window.
+
+    The gate's own empty-window test is necessary but insufficient: before this regression it could
+    refuse perfectly while verify-10 never called it, allowing the full sweep to become green with
+    0/20 current-build decisions. Drive the command registered in ``GATES`` through verify-10's real
+    command runner against an isolated database and binary. The executable mtime supplies the default
+    deployment cutoff; no ``--since`` is permitted in the production command or this test.
+    """
+    spec = importlib.util.spec_from_file_location("verify_10_playback_policy", VERIFY_10)
+    assert spec and spec.loader
+    verify = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = verify
+    spec.loader.exec_module(verify)
+
+    matches = [entry for entry in verify.GATES if entry[0] == "playback-enforcement-readiness"]
+    assert len(matches) == 1, "verify-10 must register exactly one deployed playback canary"
+    name, tier, kind, payload, cwd, probe, _charter = matches[0]
+    assert tier == 2 and kind == "cmd", "the canary belongs to the live/deployed-binary tier"
+    assert cwd == verify.APP
+    assert probe is None, "missing evidence is RED; an env probe must not skip the canary"
+    assert str(GATE) in payload and str(verify.EXE) in payload
+    assert "--since" not in payload, "verify-10 must use the exact binary's own build-time cutoff"
+    assert "--min-decisions" not in payload, "the gate's pinned 20-decision default must remain in force"
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        exe = tmp / "cortex-speech-app.exe"
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
+
+        # Exercise the exact registered command through the aggregator, changing only the isolated
+        # binary path and DB environment. The old event predates the just-written executable, so the
+        # current-build window is genuinely 0/20 without manufacturing or backdating any evidence.
+        isolated_payload = payload.replace(str(verify.EXE), str(exe))
+        previous_db = os.environ.get("CORTEX_DB")
+        previous_log_dir = verify.LOG_DIR
+        try:
+            os.environ["CORTEX_DB"] = str(db_path)
+            verify.LOG_DIR = tmp / "verify-logs"
+            status, _seconds, detail = verify.run_gate(name, kind, isolated_payload, cwd, probe, timeout=30)
+        finally:
+            verify.LOG_DIR = previous_log_dir
+            if previous_db is None:
+                os.environ.pop("CORTEX_DB", None)
+            else:
+                os.environ["CORTEX_DB"] = previous_db
+
+        assert status == verify.FAIL, f"verify-10 must be RED on a 0/20 current-build canary:\n{detail}"
+        assert "0 decision(s)" in detail and "need 20" in detail, detail
 
 
 def test_a_binary_that_cannot_enforce_is_refused_however_quiet_the_log() -> None:

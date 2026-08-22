@@ -200,6 +200,49 @@ $session = Join-Path $dataDir 'couch_session.json'
 $exeFull = try { (Resolve-Path $exe -ErrorAction Stop).Path } catch { $exe }
 $proc = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path -eq $exeFull })
+
+# A live batch importer deliberately owns the SAME exclusive `cortex.lock` as the GUI. Launching the
+# GUI while that lock is held cannot succeed, and repeating the attempt every five minutes turns an
+# expected long import into noisy failed starts while reviewers still see a dead link. Check the OS
+# handle, not mere file existence: a crashed process may leave a stale lockfile, but that file opens
+# successfully and the app's normal stale-lock recovery will remove it. Only a Windows sharing/lock
+# violation proves a live holder and defers; every other probe fault is operationally red. Once the
+# holder exits, the next watchdog tick resumes the ordinary launch path automatically.
+function Get-DatabaseLockState {
+    $lockPath = Join-Path $dataDir 'cortex.lock'
+    if (-not (Test-Path -LiteralPath $lockPath)) { return 'absent' }
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $lockPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        return 'free'
+    } catch [System.IO.IOException] {
+        # Only Windows sharing/lock violations prove that another live process owns the file. Treating
+        # disk faults, malformed paths or ACL damage as an ordinary importer made the watchdog report
+        # success while deferring forever. Preserve the actual fault for an actionable blocked state.
+        $win32 = $_.Exception.HResult -band 0xFFFF
+        if ($win32 -eq 32 -or $win32 -eq 33) { return 'held' }
+        throw
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+$lockState = try { Get-DatabaseLockState } catch {
+    Report 'blocked (database lock probe failed)'
+    Write-Log "database lock probe failed - refusing to launch blindly: $($_.Exception.Message)"
+    exit 1
+}
+if (-not $proc.Count -and $lockState -eq 'held') {
+    Report 'defer (live database lock held by importer/maintenance)'
+    Write-Log 'database lock is held by another process - deferring app launch without disturbing it'
+    exit 0
+}
+
 if (-not (Test-Path $session)) {
     if ($proc.Count) { Report 'leave-alone (deliberate Stop)'; exit 0 }   # the app is fine
     Report 'launch (no session, not running)'

@@ -37,8 +37,8 @@ pub const OMNIASR_CTC_1B_MODEL: &str = "omniasr-ctc-1b/model.int8.onnx";
 pub const OMNIASR_CTC_1B_TOKENS: &str = "omniasr-ctc-1b/tokens.txt";
 pub const OMNIASR_CTC_1B_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-omnilingual-asr-1600-languages-1B-ctc-int8-2025-11-12.tar.bz2";
 // Pinned from the real 786 MB archive (downloaded + extracted; the extracted model.int8.onnx/tokens
-// matched the pins below, authenticating the archive). Non-empty → the in-app CTC-1B download is
-// unblocked (model_download_supported) and the archive is hash-verified before extraction.
+// matched the pins below, authenticating the archive). Non-empty means an explicit offline diagnostic
+// download is permitted and the archive is hash-verified before extraction.
 pub const OMNIASR_CTC_1B_ARCHIVE_SHA256: &str = "27c270dfe9bc1abb35fef62c396b373577ffc55a272cb039d08487c27b0ecfaa";
 
 /// CAM++ speaker embedding model. The sherpa-onnx speaker-recognition assets are single `.onnx` files
@@ -168,14 +168,14 @@ pub fn model_root_candidates() -> Vec<PathBuf> {
 /// ONE implementation, because there were two and only one of them was fixed. `pipeline.rs` already
 /// searched every candidate root — its comment records why: the CTC-keyed bundled root (e.g.
 /// `target/release/models` holding only CTC + Silero) wins `select_bundled_models_dir` and ORPHANS
-/// every sibling that lives solely in the full repo models dir. `commands.rs::resolve_finetuned_paths`,
-/// behind the `transcribe_segment_finetuned` IPC command, was left on the all-or-nothing
-/// `active_models_dir()` / `bundled_models_dir()` pair and therefore could not find the model at all.
+/// every sibling that lives solely in the full repo models dir. The explicit integrity diagnostic's
+/// lookup was once left on the all-or-nothing `active_models_dir()` / `bundled_models_dir()` pair and
+/// therefore could not find the model at all.
 ///
 /// Measured on the owner's box, 2026-08-01: `target/release/models` holds only omniasr-ctc-300m +
 /// Silero, `%APPDATA%\cortex-speech\models` holds only the aligner, and the fine-tuned model sits in
-/// `src-tauri/models/` — so the command returned "fine-tuned model not found" for a 970 MB model that
-/// was present the whole time, while the import path using it worked.
+/// `src-tauri/models/` — so the old diagnostic lookup returned "fine-tuned model not found" for a
+/// 970 MB model that was present the whole time.
 ///
 /// Both files must come from the SAME root: a split onnx/vocab pair would be incoherent.
 pub fn finetuned_model_paths() -> Option<(PathBuf, PathBuf)> {
@@ -297,6 +297,15 @@ pub const MODELS: &[ModelInfo] = &[
         version: "1.0",
     },
 ];
+
+/// Models that the shipped desktop may manage. The production ASR is the separately provisioned
+/// OmniASR-7B WSL champion, so smaller ASR and MMS artifacts are deliberately absent here. They may
+/// still be used by explicit offline diagnostic tools through the full `MODELS` manifest.
+const PRODUCTION_RUNTIME_MODEL_FILENAMES: &[&str] = &["silero_vad_v4.onnx", CAMPP_MODEL, DENOISER_MODEL];
+
+fn is_production_runtime_model(model: &ModelInfo) -> bool {
+    PRODUCTION_RUNTIME_MODEL_FILENAMES.contains(&model.filename)
+}
 
 fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
     if expected.is_empty() {
@@ -459,6 +468,23 @@ impl ModelManager {
             .iter()
             .filter(|model| !model_available_in(&model_dir, model) && model_download_supported(model))
             .collect()
+    }
+
+    /// Missing support models the shipped desktop is allowed to manage. Resolve each file
+    /// independently so a partial user model directory cannot hide a bundled support model.
+    pub fn missing_production_models(&self) -> Vec<&ModelInfo> {
+        MODELS
+            .iter()
+            .filter(|model| is_production_runtime_model(model))
+            .filter(|model| {
+                let root = self.resolve_root_for(model.filename);
+                !model_available_in(&root, model)
+            })
+            .collect()
+    }
+
+    pub fn downloadable_missing_production_models(&self) -> Vec<&ModelInfo> {
+        self.missing_production_models().into_iter().filter(|model| model_download_supported(model)).collect()
     }
 
     pub fn all_models_present_for(&self, model_size: &AsrModelSize) -> bool {
@@ -1013,6 +1039,39 @@ impl ModelManager {
             })
             .collect()
     }
+
+    /// Sanitized model-management response for the shipped desktop. This is an explicit allowlist,
+    /// not a filtered presentation of every diagnostic artifact, and intentionally exposes no local
+    /// filesystem path.
+    pub fn production_status(&self) -> Vec<serde_json::Value> {
+        MODELS
+            .iter()
+            .filter(|model| is_production_runtime_model(model))
+            .map(|model| {
+                let root = self.resolve_root_for(model.filename);
+                let (exists, size) = model_file_state(&root, model.filename);
+                let available = size.unwrap_or(0) >= model.min_size_bytes;
+                let source = if !available {
+                    "missing"
+                } else if root == self.models_dir {
+                    "user"
+                } else {
+                    "bundled"
+                };
+                serde_json::json!({
+                    "name": model.name,
+                    "filename": model.filename,
+                    "downloaded": available,
+                    "exists": exists,
+                    "size_bytes": size,
+                    "min_size_bytes": model.min_size_bytes,
+                    "version": model.version,
+                    "source": source,
+                    "downloadable": model_download_supported(model),
+                })
+            })
+            .collect()
+    }
 }
 
 fn model_file_state(model_dir: &Path, filename: &str) -> (bool, Option<u64>) {
@@ -1404,7 +1463,7 @@ mod tests {
         // Regression for the 2026-07-13 fetch: CAM++ and the GTCRN denoiser were installed and their
         // real bytes pinned; the previous tar.bz2 URLs were dead (404) and the extracted-file pins were
         // blank (integrity check silently disabled). CTC-1B's archive pin was blank too, which blocked
-        // the in-app download. These invariants must not regress.
+        // the explicit offline downloader. These invariants must not regress.
         assert_eq!(OMNIASR_CTC_1B_ARCHIVE_SHA256.len(), 64, "CTC-1B archive pin must be populated");
 
         for (dir, url, sha) in [
@@ -1525,10 +1584,37 @@ mod tests {
         let manager = ModelManager::new(models_dir.clone());
 
         let _ = manager.status();
+        let _ = manager.production_status();
         let _ = manager.missing_models();
+        let _ = manager.missing_production_models();
         let _ = manager.all_models_present();
 
         assert!(!models_dir.exists(), "read-only model checks must not create user model directories");
+    }
+
+    #[test]
+    fn production_model_management_is_support_only_and_path_free() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = ModelManager::new(tmp.path().join("models"));
+
+        let status = manager.production_status();
+        let filenames = status.iter().map(|row| row["filename"].as_str().expect("filename")).collect::<Vec<_>>();
+
+        assert_eq!(filenames, PRODUCTION_RUNTIME_MODEL_FILENAMES);
+        for row in &status {
+            assert!(row.get("path").is_none(), "production IPC must not disclose a filesystem path: {row}");
+            let serialized = row.to_string().to_ascii_lowercase();
+            for forbidden in ["300m", "1b", "mms", "scribe", "elevenlabs"] {
+                assert!(!serialized.contains(forbidden), "production status exposed {forbidden}: {row}");
+            }
+        }
+
+        let downloadable = manager.downloadable_missing_production_models();
+        assert!(downloadable.iter().all(|model| is_production_runtime_model(model)));
+        assert!(
+            downloadable.iter().all(|model| !model.filename.starts_with("omniasr-ctc-")),
+            "bulk production download must never include an auxiliary ASR"
+        );
     }
 
     #[test]

@@ -470,9 +470,9 @@ fn write_reference_text_file(
 
 /// Decode the source file, extract ONLY this segment's audio window (via its alignment), and return
 /// it as in-memory WAV bytes. This is the single source of truth for "the audio of one segment" —
-/// any cloud egress (Gemini T2, ElevenLabs Scribe vote) must send this slice, NEVER the whole source
-/// file, or it both leaks/processes unrelated audio and (for Scribe) stores a whole-file transcript
-/// against a single segment. `decode_to_pcm` caches by content, so slicing many segments from one
+/// any cloud listener (Gemini T2) must send this slice, NEVER the whole source file, or it processes
+/// unrelated audio and stores a whole-file transcript against a single segment. `decode_to_pcm`
+/// caches by content, so slicing many segments from one
 /// source file decodes it once.
 pub fn segment_audio_as_wav_bytes(segment: &SpeechSegment) -> AppResult<Vec<u8>> {
     let path = Path::new(&segment.audio_path);
@@ -807,8 +807,8 @@ mod tests {
             "one second 16-bit PCM WAV should be about 32 KB, got {decoded_len_estimate}"
         );
 
-        // Round-21 #1: the Scribe vote path must send the sliced SEGMENT window (1 s ≈ 32 KB), never
-        // the whole 2 s source file (≈ 64 KB). Assert the raw WAV bytes are the slice, not the source.
+        // A cloud listener must receive the sliced SEGMENT window (1 s ≈ 32 KB), never the whole 2 s
+        // source file (≈ 64 KB). Assert the raw WAV bytes are the slice, not the source.
         let bytes = segment_audio_as_wav_bytes(&segment).expect("encode segment bytes");
         assert!(bytes.starts_with(b"RIFF"), "raw WAV bytes start with the RIFF header");
         assert!(
