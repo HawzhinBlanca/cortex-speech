@@ -121,7 +121,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             (root / "couch_session.json").write_text(
                 json.dumps(
                     {
-                        "reviewers": {"dpapi:protected": "Hawzhin"},
+                        "reviewers": {"dpapi:protected": "Rubar"},
                         "db_path": str(root / "cortex-speech.db"),
                     }
                 ),
@@ -195,8 +195,8 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
                 "after_review_event_id": 863,
                 "max_total_corpus_actions": 20,
                 "reviewers": [
-                    {"name": "Hawzhin", "max_corpus_actions": 10},
-                    {"name": "Pavel", "max_corpus_actions": 10},
+                    {"name": "Rubar", "max_corpus_actions": 10},
+                    {"name": "Alle", "max_corpus_actions": 10},
                 ],
             }
             (root / "review_pilot_policy.json").write_text(json.dumps(policy), encoding="utf-8")
@@ -204,7 +204,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             (root / "couch_session.json").write_text(
                 json.dumps(
                     {
-                        "reviewers": {"protected-h": "Hawzhin", "protected-p": "Pavel"},
+                        "reviewers": {"protected-h": "Rubar", "protected-p": "Alle"},
                         "db_path": str(root / "cortex-speech.db"),
                         "pilot_policy": policy,
                     }
@@ -216,7 +216,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             def probe(_base, path, body=None, **_kwargs):
                 calls.append(path)
                 token = json.loads(body)["token"]
-                reviewer = {"token-h": "Hawzhin", "token-p": "Pavel"}[token]
+                reviewer = {"token-h": "Rubar", "token-p": "Alle"}[token]
                 return 200, None, json.dumps(
                     {
                         "reviewer": reviewer,
@@ -239,7 +239,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             ]
             with (
                 mock.patch.object(sys, "argv", argv),
-                mock.patch.object(gate, "dpapi_unprotect", side_effect=["token-h", "token-p"]),
+                mock.patch.object(gate, "dpapi_unprotect", side_effect=["token-p", "token-h"]),
                 mock.patch.object(gate, "request", side_effect=probe),
             ):
                 self.assertEqual(gate.main(), 0)
@@ -259,8 +259,8 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             "after_review_event_id": 863,
             "max_total_corpus_actions": 20,
             "reviewers": [
-                {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10},
+                {"name": "Rubar", "max_corpus_actions": 10},
+                {"name": "Alle", "max_corpus_actions": 10},
             ],
         }
         for mutation in (
@@ -284,8 +284,8 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             "after_review_event_id": 863,
             "max_total_corpus_actions": 20,
             "reviewers": [
-                {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10},
+                {"name": "Rubar", "max_corpus_actions": 10},
+                {"name": "Alle", "max_corpus_actions": 10},
             ],
         }
         with tempfile.TemporaryDirectory() as raw:
@@ -299,7 +299,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 gate.required_pilot_policy(root)
             write_test_focus(root)
-            self.assertEqual(gate.required_pilot_policy(root)[1], {"Hawzhin", "Pavel"})
+            self.assertEqual(gate.required_pilot_policy(root)[1], {"Rubar", "Alle"})
 
     def test_strict_json_rejects_duplicate_fields_and_nonfinite_numbers(self):
         gate = load_gate()
@@ -317,14 +317,14 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
                 "after_review_event_id": 863,
                 "max_total_corpus_actions": 20,
                 "reviewers": [
-                    {"name": "Hawzhin", "max_corpus_actions": 10},
-                    {"name": "Pavel", "max_corpus_actions": 10},
+                    {"name": "Rubar", "max_corpus_actions": 10},
+                    {"name": "Alle", "max_corpus_actions": 10},
                 ],
             }
             (root / "review_pilot_policy.json").write_text(json.dumps(policy), encoding="utf-8")
             write_test_focus(root)
             session = {
-                "reviewers": {"protected-h": "Hawzhin", "protected-p": "Pavel"},
+                "reviewers": {"protected-h": "Rubar", "protected-p": "Alle"},
                 "db_path": str(root / "wrong.db"),
                 "pilot_policy": policy,
             }
@@ -342,7 +342,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             session_path.write_text(json.dumps(session), encoding="utf-8")
             wrong_live = json.dumps(
                 {
-                    "reviewer": "Hawzhin",
+                    "reviewer": "Rubar",
                     "pilotPolicy": policy,
                     "dbBindingSha256": hashlib.sha256(str(root / "other.db").encode()).hexdigest(),
                     "durableStateMatches": True,
@@ -367,14 +367,14 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
                 "after_review_event_id": 863,
                 "max_total_corpus_actions": 20,
                 "reviewers": [
-                    {"name": "Hawzhin", "max_corpus_actions": 10},
-                    {"name": "Pavel", "max_corpus_actions": 10},
+                    {"name": "Rubar", "max_corpus_actions": 10},
+                    {"name": "Alle", "max_corpus_actions": 10},
                 ],
             }
             (root / "review_pilot_policy.json").write_text(json.dumps(policy), encoding="utf-8")
             write_test_focus(root)
             session = {
-                "reviewers": {"protected-h": "Hawzhin", "protected-p": "Pavel"},
+                "reviewers": {"protected-h": "Rubar", "protected-p": "Alle"},
                 "db_path": str(root / "cortex-speech.db"),
                 "pilot_policy": json.loads(json.dumps(policy)),
             }
@@ -395,7 +395,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
             broken_live_policy = json.loads(json.dumps(policy))
             broken_live_policy["schema_version"] = True
             response = {
-                "reviewer": "Hawzhin",
+                "reviewer": "Rubar",
                 "pilotPolicy": broken_live_policy,
                 "dbBindingSha256": hashlib.sha256(session["db_path"].encode()).hexdigest(),
                 "durableStateMatches": True,
@@ -410,18 +410,18 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
     def test_saved_session_nested_shapes_match_rust_deserialization(self):
         gate = load_gate()
         valid = {
-            "reviewers": {"protected-h": "Hawzhin"},
+            "reviewers": {"protected-h": "Rubar"},
             "db_path": "C:/data/cortex-speech.db",
-            "spot_checks": [["segment", "Hawzhin"]],
-            "pilot_spot_checks": [["key", "Hawzhin"]],
-            "sessions": [{"token": "dpapi:AAAA", "reviewer": "Hawzhin", "issued_unix": 1}],
+            "spot_checks": [["segment", "Rubar"]],
+            "pilot_spot_checks": [["key", "Rubar"]],
+            "sessions": [{"token": "dpapi:AAAA", "reviewer": "Rubar", "issued_unix": 1}],
         }
         gate.validate_saved_session_shape(valid)
         broken_values = [
             {**valid, "spot_checks": [["only-one"]]},
             {**valid, "pilot_spot_checks": [["key", 1]]},
-            {**valid, "sessions": [{"token": "x", "reviewer": "Hawzhin", "issued_unix": True}]},
-            {**valid, "sessions": [{"token": "x", "reviewer": "Hawzhin", "issued_unix": -1}]},
+            {**valid, "sessions": [{"token": "x", "reviewer": "Rubar", "issued_unix": True}]},
+            {**valid, "sessions": [{"token": "x", "reviewer": "Rubar", "issued_unix": -1}]},
         ]
         for broken in broken_values:
             with self.assertRaises(RuntimeError):
@@ -436,15 +436,15 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
                 "after_review_event_id": 1,
                 "max_total_corpus_actions": 20,
                 "reviewers": [
-                    {"name": "Hawzhin", "max_corpus_actions": 10},
-                    {"name": "Pavel", "max_corpus_actions": 10},
+                    {"name": "Rubar", "max_corpus_actions": 10},
+                    {"name": "Alle", "max_corpus_actions": 10},
                 ],
             }
             (root / "review_pilot_policy.json").write_text(json.dumps(policy), encoding="utf-8")
             write_test_focus(root)
             db_path = str(root / "cortex-speech.db")
             session = {
-                "reviewers": {"protected-h": "Hawzhin", "protected-p": "Pavel"},
+                "reviewers": {"protected-h": "Rubar", "protected-p": "Alle"},
                 "db_path": db_path,
                 "pilot_policy": policy,
             }
@@ -474,7 +474,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
 
             malicious_key = "dpapi:SECRET\u001b[31m"
             session_path.write_text(
-                '{"reviewers":{"%s":"Hawzhin","%s":"Pavel"},"db_path":"x"}'
+                '{"reviewers":{"%s":"Rubar","%s":"Alle"},"db_path":"x"}'
                 % (malicious_key, malicious_key),
                 encoding="utf-8",
             )
@@ -562,7 +562,7 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
         gate = load_gate()
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            (root / "couch_session.json").write_text(json.dumps({"reviewers": {"x": "Hawzhin"}}), encoding="utf-8")
+            (root / "couch_session.json").write_text(json.dumps({"reviewers": {"x": "Rubar"}}), encoding="utf-8")
             argv = [str(SCRIPT), "--base-url", "https://127.0.0.1:8737", "--data-dir", raw, "--require-links"]
             original_stat = Path.stat
 

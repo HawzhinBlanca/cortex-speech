@@ -29,7 +29,7 @@ COMPENSATION_POLICY_VERSION = "review-iqd-v1-2026-08-21"
 POLICY_FILE = "review_pilot_policy.json"
 SESSION_FILE = "couch_session.json"
 POLICY_SCHEMA_VERSION = 1
-PILOT_REVIEWERS = ("Hawzhin", "Pavel")
+PILOT_REVIEWERS = ("Rubar", "Alle")
 CORPUS_ACTIONS_PER_REVIEWER = 10
 TOTAL_CORPUS_ACTIONS = 20
 HIDDEN_KEYS_PER_REVIEWER = 2
@@ -217,7 +217,8 @@ def parse_policy(value: object, source: str = POLICY_FILE) -> ReviewPilotPolicy:
     expected = {name.lower(): CORPUS_ACTIONS_PER_REVIEWER for name in PILOT_REVIEWERS}
     if actual != expected:
         raise PilotContractError(
-            f"{source} must name exactly Hawzhin and Pavel at {CORPUS_ACTIONS_PER_REVIEWER} actions each"
+            f"{source} must name exactly {' and '.join(PILOT_REVIEWERS)} at "
+            f"{CORPUS_ACTIONS_PER_REVIEWER} actions each"
         )
     return ReviewPilotPolicy(
         after_review_event_id=after,

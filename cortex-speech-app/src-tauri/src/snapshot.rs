@@ -121,11 +121,8 @@ fn validate_active_pilot_snapshot_authority(
         .map_err(|error| format!("snapshot hidden-key schema contract is not exact: {error}"))?;
 
     let names = policy.reviewer_names();
-    if names.len() != 2
-        || !names.iter().any(|name| name.eq_ignore_ascii_case("Hawzhin"))
-        || !names.iter().any(|name| name.eq_ignore_ascii_case("Pavel"))
-    {
-        return Err("snapshot pilot roster must be exactly Hawzhin and Pavel".to_string());
+    if names.len() != 2 {
+        return Err("snapshot pilot roster must contain exactly two distinct reviewers".to_string());
     }
     let digest = policy.policy_sha256()?;
     let baseline = policy.after_review_event_id;

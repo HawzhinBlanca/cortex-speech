@@ -44,6 +44,7 @@ from review_pilot_hidden_contract import (
     HIDDEN_TABLE as HIDDEN_KEY_TABLE,
     HIDDEN_TABLE_SQL,
     HIDDEN_TRIGGER_SQL,
+    PILOT_REVIEWERS,
     TOTAL_HIDDEN_KEYS,
     ReviewPilotPolicy as HiddenReviewPilotPolicy,
     normalized_sql,
@@ -305,8 +306,8 @@ def validate_review_pilot_policy(raw: bytes) -> dict[str, object]:
         normalized_names.append("".join(char.lower() if "A" <= char <= "Z" else char for char in name))
     if normalized_names[0] == normalized_names[1]:
         raise RuntimeError(f"{REVIEW_PILOT_FILE} reviewer names must be distinct")
-    if set(normalized_names) != {"hawzhin", "pavel"}:
-        raise RuntimeError(f"{REVIEW_PILOT_FILE} must name exactly Hawzhin and Pavel")
+    if set(normalized_names) != {_ascii_lower(name) for name in PILOT_REVIEWERS}:
+        raise RuntimeError(f"{REVIEW_PILOT_FILE} must name exactly {' and '.join(PILOT_REVIEWERS)}")
     return value
 
 
@@ -568,10 +569,13 @@ def validate_live_session_hidden_cache(
     paired = [
         _ascii_lower(name.strip())
         for name in pairing.values()
-        if isinstance(name, str) and _ascii_lower(name.strip()) in {"hawzhin", "pavel"}
+        if isinstance(name, str)
+        and _ascii_lower(name.strip()) in {_ascii_lower(item) for item in PILOT_REVIEWERS}
     ]
-    if sorted(paired) != ["hawzhin", "pavel"]:
-        raise RuntimeError("couch_session.json reviewer roster is not exactly Hawzhin and Pavel")
+    if sorted(paired) != sorted(_ascii_lower(name) for name in PILOT_REVIEWERS):
+        raise RuntimeError(
+            "couch_session.json reviewer roster is not exactly " + " and ".join(PILOT_REVIEWERS)
+        )
     entries = session.get("pilot_spot_checks", [])
     if not isinstance(entries, list):
         raise RuntimeError("couch_session.json has invalid pilot_spot_checks state")
@@ -601,7 +605,8 @@ def validate_live_session_hidden_cache(
             or segment_id != segment_id.strip()
             or not 1 <= len(segment_id.encode("utf-8")) <= 256
             or not all(char.isalnum() or char in "_-." for char in segment_id)
-            or canonical_reviewer not in {"hawzhin", "pavel"}
+            or canonical_reviewer
+            not in {_ascii_lower(name) for name in PILOT_REVIEWERS}
         ):
             raise RuntimeError("couch_session.json has a non-canonical pilot hidden key")
         key = (canonical_reviewer, segment_id)

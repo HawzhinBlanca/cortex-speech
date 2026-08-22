@@ -46,6 +46,7 @@ import urllib.request
 from pathlib import Path
 
 from pilot_focus_contract import verify_controlled_pilot_focus
+from review_pilot_hidden_contract import PILOT_REVIEWERS
 
 DPAPI_PREFIX = "dpapi:"
 
@@ -87,8 +88,8 @@ def validate_pilot_policy(value: object, source: str) -> tuple[dict[str, object]
         "schema_version": 1,
         "max_total_corpus_actions": 20,
         "reviewers": [
-            {"name": "Hawzhin", "max_corpus_actions": 10},
-            {"name": "Pavel", "max_corpus_actions": 10},
+            {"name": PILOT_REVIEWERS[0], "max_corpus_actions": 10},
+            {"name": PILOT_REVIEWERS[1], "max_corpus_actions": 10},
         ],
     }
     exact_policy_keys = {"schema_version", "after_review_event_id", "max_total_corpus_actions", "reviewers"}
@@ -113,9 +114,12 @@ def validate_pilot_policy(value: object, source: str) -> tuple[dict[str, object]
     if not all(isinstance(entry["name"], str) and type(entry["max_corpus_actions"]) is int for entry in reviewers):
         raise RuntimeError(f"{source} reviewer values have invalid types")
     normalized = sorted((entry["name"].strip().lower(), entry["max_corpus_actions"]) for entry in reviewers)
-    if normalized != [("hawzhin", 10), ("pavel", 10)]:
-        raise RuntimeError(f"{source} must contain exactly Hawzhin and Pavel at 10 corpus actions each")
-    return policy, {"Hawzhin", "Pavel"}
+    expected_reviewers = sorted((name.lower(), 10) for name in PILOT_REVIEWERS)
+    if normalized != expected_reviewers:
+        raise RuntimeError(
+            f"{source} must contain exactly {' and '.join(PILOT_REVIEWERS)} at 10 corpus actions each"
+        )
+    return policy, set(PILOT_REVIEWERS)
 
 
 def required_pilot_policy(root: Path) -> tuple[dict[str, object], set[str]]:
@@ -364,7 +368,7 @@ def main() -> int:
     parser.add_argument(
         "--require-pilot",
         action="store_true",
-        help="require the exact Hawzhin and Pavel controlled-pilot policy and link roster",
+        help=f"require the exact {'/'.join(PILOT_REVIEWERS)} controlled-pilot policy and link roster",
     )
     args = parser.parse_args()
     root = args.data_dir.resolve()
@@ -430,6 +434,7 @@ def main() -> int:
     if not isinstance(links, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in links.items()):
         print("REVIEWER LINKS: FAIL — the durable reviewer-link map is invalid")
         return 1
+    remembered_policy: dict[str, object] | None = None
     if args.require_pilot:
         try:
             policy, required_reviewers = required_pilot_policy(root)
@@ -452,7 +457,10 @@ def main() -> int:
         actual_reviewers = list(links.values())
         normalized = {name.strip().lower() for name in actual_reviewers}
         if len(actual_reviewers) != 2 or normalized != {name.lower() for name in required_reviewers}:
-            print("REVIEWER LINKS: FAIL — the durable links are not exactly Hawzhin and Pavel")
+            print(
+                "REVIEWER LINKS: FAIL — the durable links are not exactly "
+                + " and ".join(PILOT_REVIEWERS)
+            )
             return 1
 
     failures: list[str] = []
@@ -503,16 +511,17 @@ def main() -> int:
             failures.append(f"{name}: the server bound this link to the wrong identity")
             rows.append((name, "WRONG IDENTITY"))
             continue
-        try:
-            live_policy, _ = validate_pilot_policy(probe.get("pilotPolicy"), "running pilot policy")
-        except RuntimeError as error:
-            failures.append(f"{name}: {error}")
-            rows.append((name, "WRONG LIVE PILOT POLICY"))
-            continue
-        if live_policy != remembered_policy:
-            failures.append(f"{name}: the running server is bound to a different pilot policy")
-            rows.append((name, "WRONG LIVE PILOT POLICY"))
-            continue
+        if args.require_pilot:
+            try:
+                live_policy, _ = validate_pilot_policy(probe.get("pilotPolicy"), "running pilot policy")
+            except RuntimeError as error:
+                failures.append(f"{name}: {error}")
+                rows.append((name, "WRONG LIVE PILOT POLICY"))
+                continue
+            if live_policy != remembered_policy:
+                failures.append(f"{name}: the running server is bound to a different pilot policy")
+                rows.append((name, "WRONG LIVE PILOT POLICY"))
+                continue
         live_db_binding = probe.get("dbBindingSha256")
         expected_db_binding = hashlib.sha256(payload["db_path"].encode("utf-8")).hexdigest()
         if live_db_binding != expected_db_binding:

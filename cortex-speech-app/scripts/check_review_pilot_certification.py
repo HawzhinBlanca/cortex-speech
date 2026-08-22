@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed final certificate for the Hawzhin/Pavel paid-review canary.
+"""Fail-closed final certificate for the Rubar/Alle paid-review canary.
 
 Capacity readiness is not completion.  This read-only gate stays red until the one active schema-60
 policy proves, in one durable history, exactly ten corpus decisions and two hidden-QC decisions per

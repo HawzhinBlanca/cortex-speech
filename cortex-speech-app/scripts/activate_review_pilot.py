@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Atomically arm the strict Hawzhin and Pavel paid-review certification pilot.
+"""Atomically arm the strict Rubar and Alle paid-review certification pilot.
 
 This is the only supported writer for ``review_pilot_policy.json``. It requires Couch, the desktop
 app, importer, and watchdog to be offline; takes SQLite's write reservation; compares the caller's
 event-id precondition; revokes auto-resume; backs up the remembered session/policy; narrows durable
-pairing, cookie, and outstanding hidden-check state to Hawzhin + Pavel without decrypting or changing
+pairing, cookie, and outstanding hidden-check state to Rubar + Alle without decrypting or changing
 their DPAPI tokens; writes the same policy snapshot into the session; rechecks the event-id; then
 promotes both files. The revocation marker is removed last. Any crash after mutation begins therefore
 leaves Couch unable to resume, never unrestricted.
@@ -38,7 +38,13 @@ from pathlib import Path
 
 from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
 from check_reviewer_links_live import strict_json_loads, validate_saved_session_shape
-from pilot_focus_contract import verify_controlled_pilot_focus
+from pilot_focus_contract import (
+    VOICE_FOCUS_FILE,
+    focus_evidence,
+    load_pilot_focus_contract,
+    load_voice_focus_ids,
+    verify_controlled_pilot_focus,
+)
 from review_pilot_hidden_contract import (
     HIDDEN_KEYS_PER_REVIEWER,
     HIDDEN_TABLE,
@@ -52,7 +58,7 @@ POLICY_FILE = "review_pilot_policy.json"
 SESSION_FILE = "couch_session.json"
 REVOCATION_FILE = "couch_session.revoked"
 POLICY_VERSION = "review-iqd-v1-2026-08-21"
-REVIEWERS = ("Hawzhin", "Pavel")
+REVIEWERS = ("Rubar", "Alle")
 CAP_PER_REVIEWER = 10
 TOTAL_CAP = 20
 HIDDEN_QC_PER_REVIEWER = 2
@@ -243,8 +249,69 @@ def validate_pilot_policy(value: object, source: str = POLICY_FILE) -> dict[str,
             raise RuntimeError(f"{source} reviewer values have invalid types")
         actual.append((name.strip().lower(), cap))
     if sorted(actual) != expected:
-        raise RuntimeError(f"{source} must contain exactly Hawzhin and Pavel at 10 corpus actions each")
+        raise RuntimeError(
+            f"{source} must contain exactly {' and '.join(REVIEWERS)} at "
+            f"{CAP_PER_REVIEWER} corpus actions each"
+        )
     return value
+
+
+def validate_replaceable_existing_policy(value: object, source: str) -> dict[str, object]:
+    """Validate the old two-person policy without accepting its roster as the new canon."""
+    keys = {"schema_version", "after_review_event_id", "max_total_corpus_actions", "reviewers"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise RuntimeError(f"{source} fields do not exactly match the controlled-pilot contract")
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise RuntimeError(f"{source} schema must be integer version 1")
+    baseline = value["after_review_event_id"]
+    if type(baseline) is not int or baseline < 0:
+        raise RuntimeError(f"{source} review-event baseline must be a non-negative integer")
+    if type(value["max_total_corpus_actions"]) is not int or value["max_total_corpus_actions"] != TOTAL_CAP:
+        raise RuntimeError(f"{source} must cap exactly {TOTAL_CAP} corpus actions")
+    reviewers = value["reviewers"]
+    if not isinstance(reviewers, list) or len(reviewers) != 2:
+        raise RuntimeError(f"{source} must contain exactly two reviewer objects")
+    names: set[str] = set()
+    for entry in reviewers:
+        if not isinstance(entry, dict) or set(entry) != {"name", "max_corpus_actions"}:
+            raise RuntimeError(f"{source} reviewer fields do not exactly match the server contract")
+        name = entry["name"]
+        cap = entry["max_corpus_actions"]
+        if not isinstance(name, str) or not name.strip() or type(cap) is not int or cap != CAP_PER_REVIEWER:
+            raise RuntimeError(f"{source} reviewer values are invalid")
+        names.add(name.strip().lower())
+    if len(names) != 2:
+        raise RuntimeError(f"{source} reviewer names must be distinct")
+    return value
+
+
+def require_pristine_roster_replacement(
+    conn: sqlite3.Connection,
+    existing_policy: dict[str, object],
+    maximum: int,
+) -> None:
+    baseline = int(existing_policy["after_review_event_id"])
+    if maximum != baseline:
+        raise RuntimeError(
+            f"reviewer roster replacement is forbidden after pilot activity: baseline={baseline}, max={maximum}"
+        )
+    protected_tables = (
+        "review_pilot_hidden_keys",
+        "review_compensation_ledger",
+        "human_decision_effect_events",
+        "human_decision_effect_reversals",
+        "review_flag_effect_events",
+        "review_flag_effect_reversals",
+    )
+    nonempty = {
+        table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in protected_tables
+    }
+    nonempty = {table: count for table, count in nonempty.items() if count}
+    if nonempty:
+        raise RuntimeError(
+            f"reviewer roster replacement is forbidden after durable pilot activity: {nonempty}"
+        )
 
 
 def pilot_policy(after_review_event_id: int) -> dict[str, object]:
@@ -552,6 +619,10 @@ def _activate_locked(
     *,
     expected_max_review_event_id: int,
     expected_policy_sha256: str | None = None,
+    credential_session: Path | None = None,
+    replace_roster_before_activity: bool = False,
+    focus_additions: tuple[str, ...] = (),
+    expected_focus_sha256: str | None = None,
     check_runtime: bool = True,
     fail_after_revocation_for_test: bool = False,
 ) -> dict[str, object]:
@@ -561,7 +632,45 @@ def _activate_locked(
         require_runtime_offline()
     # Public ``activate`` holds Cortex's process lock across this proof and every mutation below.
     # The active policy must never be armed against a merely similar or accidentally narrowed set.
-    initial_focus = verify_controlled_pilot_focus(data_dir)
+    focus_path = data_dir / VOICE_FOCUS_FILE
+    focus_replacement_bytes: bytes | None = None
+    if focus_additions:
+        original_focus_sha256 = sha256_file(focus_path)
+        if not replace_roster_before_activity:
+            raise RuntimeError("focus additions are allowed only during a pristine roster replacement")
+        if expected_focus_sha256 is None:
+            raise RuntimeError("focus additions require --expected-focus-sha256")
+        if original_focus_sha256 != expected_focus_sha256.lower():
+            raise RuntimeError(
+                f"voice-focus CAS mismatch: expected {expected_focus_sha256}, found {original_focus_sha256}"
+            )
+        if len(focus_additions) != len(set(focus_additions)):
+            raise RuntimeError("focus additions contain duplicate segment ids")
+        current_ids = load_voice_focus_ids(data_dir)
+        overlap = current_ids.intersection(focus_additions)
+        if overlap:
+            raise RuntimeError(f"focus additions already exist in the active focus: {sorted(overlap)}")
+        proposed_ids = current_ids.union(focus_additions)
+        expected_contract = load_pilot_focus_contract()
+        initial_focus = focus_evidence(proposed_ids)
+        if (
+            initial_focus.segment_id_count != expected_contract.segment_id_count
+            or initial_focus.sorted_unique_segment_ids_sha256
+            != expected_contract.sorted_unique_segment_ids_sha256
+        ):
+            raise RuntimeError("active focus plus the requested additions does not match the tracked contract")
+        raw_focus = strict_json_loads(focus_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_focus, dict):
+            raise RuntimeError(f"{VOICE_FOCUS_FILE} root must be an object")
+        raw_focus["segment_ids"] = sorted(proposed_ids)
+        focus_replacement_bytes = (json.dumps(raw_focus, ensure_ascii=False, indent=2) + "\n").encode(
+            "utf-8"
+        )
+    else:
+        if expected_focus_sha256 is not None:
+            raise RuntimeError("--expected-focus-sha256 is valid only with --focus-addition")
+        initial_focus = verify_controlled_pilot_focus(data_dir)
+        original_focus_sha256 = sha256_file(focus_path)
     session_path = data_dir / SESSION_FILE
     policy_path = data_dir / POLICY_FILE
     marker_path = data_dir / REVOCATION_FILE
@@ -575,8 +684,11 @@ def _activate_locked(
         if actual != expected_policy_sha256.lower():
             raise RuntimeError(f"policy CAS mismatch: expected {expected_policy_sha256}, found {actual}")
         try:
-            existing_policy = validate_pilot_policy(
-                strict_json_loads(policy_path.read_text(encoding="utf-8")), POLICY_FILE
+            parsed_existing = strict_json_loads(policy_path.read_text(encoding="utf-8"))
+            existing_policy = (
+                validate_replaceable_existing_policy(parsed_existing, POLICY_FILE)
+                if replace_roster_before_activity
+                else validate_pilot_policy(parsed_existing, POLICY_FILE)
             )
         except OSError as error:
             raise RuntimeError(f"existing policy cannot be read: {error}") from error
@@ -587,6 +699,7 @@ def _activate_locked(
     marker_written = False
     temp_policy = policy_path.with_name(f".{POLICY_FILE}.prepared.{uuid.uuid4().hex}")
     temp_session = session_path.with_name(f".{SESSION_FILE}.prepared.{uuid.uuid4().hex}")
+    temp_focus = focus_path.with_name(f".{VOICE_FOCUS_FILE}.prepared.{uuid.uuid4().hex}")
     try:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("BEGIN IMMEDIATE")
@@ -598,9 +711,34 @@ def _activate_locked(
         # A schema-58 pilot may already have real post-baseline work.  Re-activation is a storage
         # bridge, never a fresh budget: retain its exact semantic baseline.  Only the first activation
         # starts at the current maximum.
-        policy = existing_policy if existing_policy is not None else pilot_policy(maximum)
-        original_session = strict_json_loads(session_path.read_text(encoding="utf-8"))
+        if replace_roster_before_activity:
+            if existing_policy is None or credential_session is None:
+                raise RuntimeError("roster replacement requires an existing policy and --credential-session")
+            require_pristine_roster_replacement(conn, existing_policy, maximum)
+            live_session = strict_json_loads(session_path.read_text(encoding="utf-8"))
+            if not isinstance(live_session, dict):
+                raise RuntimeError(f"{SESSION_FILE} root must be an object")
+            validate_saved_session_shape(live_session)
+            remembered_old = validate_replaceable_existing_policy(
+                live_session.get("pilot_policy"), f"{SESSION_FILE} remembered pilot policy"
+            )
+            if remembered_old != existing_policy:
+                raise RuntimeError("current remembered session is not bound to the replaceable policy")
+            source_path = credential_session.resolve()
+            if not source_path.is_file():
+                raise RuntimeError(f"credential session is missing or not a regular file: {source_path}")
+            original_session = strict_json_loads(source_path.read_text(encoding="utf-8"))
+            policy = pilot_policy(int(existing_policy["after_review_event_id"]))
+        else:
+            policy = existing_policy if existing_policy is not None else pilot_policy(maximum)
+            original_session = strict_json_loads(session_path.read_text(encoding="utf-8"))
         narrowed = narrow_session(original_session, db_path, policy)
+        if replace_roster_before_activity:
+            # Old cookies and assignments belong to the retired roster generation. Pairing links are
+            # retained, but every mutable/leased cache is reset so Rubar and Alle claim a clean batch.
+            narrowed["sessions"] = []
+            narrowed["spot_checks"] = []
+            narrowed["pilot_spot_checks"] = []
         hidden_authority = import_pilot_hidden_authority(conn, policy, narrowed)
 
         # Authority first. From this point until both replacements verify, every restart is denied.
@@ -620,11 +758,13 @@ def _activate_locked(
             shutil.copy2(policy_path, backup / POLICY_FILE)
         else:
             (backup / f"{POLICY_FILE}.ABSENT").write_text("absent before activation\n", encoding="utf-8")
+        shutil.copy2(focus_path, backup / VOICE_FOCUS_FILE)
         backup_manifest = {
             "schema": 1,
             "maxReviewEventId": maximum,
             "sessionSha256": sha256_file(backup / SESSION_FILE),
             "policySha256": sha256_file(backup / POLICY_FILE) if (backup / POLICY_FILE).is_file() else None,
+            "voiceFocusSha256": sha256_file(backup / VOICE_FOCUS_FILE),
         }
         atomic_write(
             backup / "ACTIVATION_BACKUP.json",
@@ -635,17 +775,24 @@ def _activate_locked(
         session_bytes = (json.dumps(narrowed, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         atomic_write(temp_policy, policy_bytes)
         atomic_write(temp_session, session_bytes)
+        if focus_replacement_bytes is not None:
+            atomic_write(temp_focus, focus_replacement_bytes)
         if database_preflight(conn) != maximum:
             raise RuntimeError("review-event CAS changed while activation held the database reservation")
 
         # Re-read the live focus at the last safe point before either operating file is promoted.
         # The app/importer cannot race the held Cortex lock; an external/manual edit still fails here.
-        pre_promotion_focus = verify_controlled_pilot_focus(data_dir)
-        if pre_promotion_focus != initial_focus:
+        if sha256_file(focus_path) != original_focus_sha256:
             raise RuntimeError("controlled-pilot voice focus changed during activation")
+        if focus_replacement_bytes is None:
+            pre_promotion_focus = verify_controlled_pilot_focus(data_dir)
+            if pre_promotion_focus != initial_focus:
+                raise RuntimeError("controlled-pilot voice focus changed during activation")
 
         os.replace(temp_policy, policy_path)
         os.replace(temp_session, session_path)
+        if focus_replacement_bytes is not None:
+            os.replace(temp_focus, focus_path)
         if policy_path.read_bytes() != policy_bytes or session_path.read_bytes() != session_bytes:
             raise RuntimeError("promoted pilot state failed byte verification")
         reloaded_policy = validate_pilot_policy(
@@ -673,6 +820,10 @@ def _activate_locked(
             "afterReviewEventId": policy["after_review_event_id"],
             "activationMaxReviewEventId": maximum,
             "reviewers": list(REVIEWERS),
+            "rosterReplacedBeforeActivity": replace_roster_before_activity,
+            "credentialSessionSha256": sha256_file(credential_session.resolve())
+            if credential_session is not None
+            else None,
             "maxCorpusActions": TOTAL_CAP,
             "maxHiddenQcActions": TOTAL_HIDDEN_QC,
             "maxCompensatedUiActions": MAX_COMPENSATED_UI_ACTIONS,
@@ -692,7 +843,7 @@ def _activate_locked(
         raise
     finally:
         conn.close()
-        for temp in (temp_policy, temp_session):
+        for temp in (temp_policy, temp_session, temp_focus):
             try:
                 temp.unlink()
             except FileNotFoundError:
@@ -705,6 +856,10 @@ def activate(
     *,
     expected_max_review_event_id: int,
     expected_policy_sha256: str | None = None,
+    credential_session: Path | None = None,
+    replace_roster_before_activity: bool = False,
+    focus_additions: tuple[str, ...] = (),
+    expected_focus_sha256: str | None = None,
     check_runtime: bool = True,
     fail_after_revocation_for_test: bool = False,
 ) -> dict[str, object]:
@@ -716,6 +871,10 @@ def activate(
             db_path.resolve(),
             expected_max_review_event_id=expected_max_review_event_id,
             expected_policy_sha256=expected_policy_sha256,
+            credential_session=credential_session,
+            replace_roster_before_activity=replace_roster_before_activity,
+            focus_additions=focus_additions,
+            expected_focus_sha256=expected_focus_sha256,
             check_runtime=check_runtime,
             fail_after_revocation_for_test=fail_after_revocation_for_test,
         )
@@ -730,6 +889,15 @@ def main() -> int:
     mode.add_argument("--prepare-maintenance-revocation", action="store_true")
     parser.add_argument("--expected-max-review-event-id", type=int)
     parser.add_argument("--expected-policy-sha256")
+    parser.add_argument("--replace-roster-before-activity", action="store_true")
+    parser.add_argument("--credential-session", type=Path)
+    parser.add_argument(
+        "--focus-addition",
+        action="append",
+        default=[],
+        help="exact segment id to add atomically during a pristine roster replacement (repeatable)",
+    )
+    parser.add_argument("--expected-focus-sha256")
     args = parser.parse_args()
     data_dir = (args.data_dir or default_data_dir()).resolve()
     db_path = (args.db or data_dir / "cortex-speech.db").resolve()
@@ -742,11 +910,21 @@ def main() -> int:
             return 0
         if args.expected_max_review_event_id is None or args.expected_max_review_event_id < 0:
             raise RuntimeError("activation requires --expected-max-review-event-id from a fresh --inspect")
+        if args.replace_roster_before_activity != (args.credential_session is not None):
+            raise RuntimeError(
+                "--replace-roster-before-activity and --credential-session must be supplied together"
+            )
+        if bool(args.focus_addition) != (args.expected_focus_sha256 is not None):
+            raise RuntimeError("--focus-addition and --expected-focus-sha256 must be supplied together")
         result = activate(
             data_dir,
             db_path,
             expected_max_review_event_id=args.expected_max_review_event_id,
             expected_policy_sha256=args.expected_policy_sha256,
+            credential_session=args.credential_session,
+            replace_roster_before_activity=args.replace_roster_before_activity,
+            focus_additions=tuple(args.focus_addition),
+            expected_focus_sha256=args.expected_focus_sha256,
         )
         print(json.dumps(result, indent=2))
         return 0

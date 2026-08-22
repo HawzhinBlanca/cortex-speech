@@ -389,10 +389,10 @@ mod tests {
     #[test]
     fn embedded_focus_contract_is_the_exact_owner_authorized_union() {
         let contract = parse_focus_contract(CONTROLLED_PILOT_FOCUS_CONTRACT).unwrap();
-        assert_eq!(contract.segment_id_count, 8_274);
+        assert_eq!(contract.segment_id_count, 8_278);
         assert_eq!(
             contract.sorted_unique_segment_ids_sha256,
-            "bd5ecab6ee15e2ac15ad247e8fa90e79bf1fc7550ae8fb47db00ee757989528c"
+            "9f7876c04ee7add77673f938460a5631056712b35a156c0d76b0cd7dca7ef3a7"
         );
     }
 

@@ -25,36 +25,36 @@ PILOT_EVENT_IDS = {
     "hidden-p-1",
     "hidden-p-2",
 }
-FOCUS_IDS = PILOT_EVENT_IDS | {f"focus-filler-{index}" for index in range(8250)}
+FOCUS_IDS = PILOT_EVENT_IDS | {f"focus-filler-{index}" for index in range(8254)}
 FOCUS = focus_evidence(FOCUS_IDS)
 CONTENT_HASH = "a" * 64
 
 
 def policy() -> ReviewPilotPolicy:
-    return ReviewPilotPolicy(863, 20, {"Hawzhin": 10, "Pavel": 10})
+    return ReviewPilotPolicy(863, 20, {"Rubar": 10, "Alle": 10})
 
 
 def perfect_state() -> HiddenPilotState:
     grants = {
-        "Hawzhin": {"hidden-h-1", "hidden-h-2"},
-        "Pavel": {"hidden-p-1", "hidden-p-2"},
+        "Rubar": {"hidden-h-1", "hidden-h-2"},
+        "Alle": {"hidden-p-1", "hidden-p-2"},
     }
     return HiddenPilotState(
         policy_sha256=policy_sha256(policy()),
         grants={name: set(ids) for name, ids in grants.items()},
         session_keys={name: set(ids) for name, ids in grants.items()},
         completed_keys={name: set(ids) for name, ids in grants.items()},
-        skipped_keys={"Hawzhin": set(), "Pavel": set()},
-        unresolved_keys={"Hawzhin": set(), "Pavel": set()},
-        corpus_actions={"Hawzhin": 10, "Pavel": 10},
-        hidden_actions={"Hawzhin": 2, "Pavel": 2},
+        skipped_keys={"Rubar": set(), "Alle": set()},
+        unresolved_keys={"Rubar": set(), "Alle": set()},
+        corpus_actions={"Rubar": 10, "Alle": 10},
+        hidden_actions={"Rubar": 2, "Alle": 2},
     )
 
 
 def perfect_events() -> list[gate.ReviewEventEvidence]:
     events: list[gate.ReviewEventEvidence] = []
     event_id = 864
-    for reviewer, prefix in (("Hawzhin", "h"), ("Pavel", "p")):
+    for reviewer, prefix in (("Rubar", "h"), ("Alle", "p")):
         for index in range(10):
             events.append(
                 gate.ReviewEventEvidence(
@@ -115,9 +115,9 @@ def perfect_compensation() -> dict[str, object]:
         "durableOperationReceipts": 24,
         "fallbackLedgerEntries": 0,
         "compensationForeignKeyViolations": 0,
-        "focusIds": 8274,
-        "canonicalFocusRows": 8274,
-        "uniqueCanonicalFocusWorkIds": 8274,
+        "focusIds": 8278,
+        "canonicalFocusRows": 8278,
+        "uniqueCanonicalFocusWorkIds": 8278,
         "totalEarnedMicroIqd": 1,
     }
 
@@ -169,13 +169,13 @@ def test_final_certificate_rejects_mismatched_build_and_playback_guard_provenanc
 def test_zero_of_24_is_pending_not_a_capacity_green_certificate() -> None:
     empty = HiddenPilotState(
         policy_sha256=policy_sha256(policy()),
-        grants={"Hawzhin": set(), "Pavel": set()},
-        session_keys={"Hawzhin": set(), "Pavel": set()},
-        completed_keys={"Hawzhin": set(), "Pavel": set()},
-        skipped_keys={"Hawzhin": set(), "Pavel": set()},
-        unresolved_keys={"Hawzhin": set(), "Pavel": set()},
-        corpus_actions={"Hawzhin": 0, "Pavel": 0},
-        hidden_actions={"Hawzhin": 0, "Pavel": 0},
+        grants={"Rubar": set(), "Alle": set()},
+        session_keys={"Rubar": set(), "Alle": set()},
+        completed_keys={"Rubar": set(), "Alle": set()},
+        skipped_keys={"Rubar": set(), "Alle": set()},
+        unresolved_keys={"Rubar": set(), "Alle": set()},
+        corpus_actions={"Rubar": 0, "Alle": 0},
+        hidden_actions={"Rubar": 0, "Alle": 0},
     )
     report = perfect_compensation()
     for field in (
@@ -203,7 +203,7 @@ def test_19_corpus_actions_cannot_clear_the_gate() -> None:
     events.pop(9)
     found = issues(events=events, playback_checked=23)
     assert any("23/24 required UI actions" in item for item in found)
-    assert any("Hawzhin has 9/10 corpus" in item for item in found)
+    assert any("Rubar has 9/10 corpus" in item for item in found)
 
 
 def test_any_corpus_or_hidden_skip_is_terminal_red() -> None:
@@ -223,7 +223,7 @@ def test_any_corpus_or_hidden_skip_is_terminal_red() -> None:
 
 def test_bad_or_missing_hidden_result_is_red() -> None:
     quality = perfect_quality()
-    quality[("Hawzhin", "hidden-h-1")] = (0, 0.5)
+    quality[("Rubar", "hidden-h-1")] = (0, 0.5)
     found = issues(quality=quality)
     assert any("hidden-h-1" in item and "required 1 and 0" in item for item in found)
 
@@ -267,11 +267,11 @@ def test_hidden_quality_is_rederived_without_numeric_coercion_or_tolerance() -> 
     ):
         connection = _hidden_quality_connection()
         connection.execute(
-            f"UPDATE spot_checks SET {assignment} WHERE segment_id = 'hidden-h-1' AND reviewer = 'Hawzhin'"
+            f"UPDATE spot_checks SET {assignment} WHERE segment_id = 'hidden-h-1' AND reviewer = 'Rubar'"
         )
         quality, errors = gate.read_hidden_quality(connection, perfect_state())
         connection.close()
-        assert ("Hawzhin", "hidden-h-1") not in quality
+        assert ("Rubar", "hidden-h-1") not in quality
         assert any(expected_error in error for error in errors), errors
 
 
@@ -300,8 +300,8 @@ def _playback_certificate_connection() -> sqlite3.Connection:
             '{"source_start_ms":0,"source_end_ms":1000}'
         );
         INSERT INTO review_compensation_ledger VALUES
-            (864, 'review-iqd-v1-2026-08-21', 4, 1000, 'Hawzhin', 'work-h-0', 'couch',
-             'reviewer-work-v1:7:hawzhin:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
+            (864, 'review-iqd-v1-2026-08-21', 4, 1000, 'Rubar', 'work-h-0', 'couch',
+             'reviewer-work-v1:5:rubar:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
              'audio_content_hash+source_span');
         """
     )
@@ -312,7 +312,7 @@ def _insert_certificate_receipt(
     connection: sqlite3.Connection,
     *,
     revision: int = 3,
-    reviewer: str = "Hawzhin",
+    reviewer: str = "Rubar",
     fingerprint: str = "a" * 64,
     policy_version: int = gate.PLAYBACK_POLICY_VERSION,
     started_at_ms: int = 1_700_000_000_000,
@@ -389,7 +389,7 @@ def _manifest_connection() -> sqlite3.Connection:
         );
         INSERT INTO review_effect_state VALUES (1, 863, 0, '2026-08-22 07:00:00');
         INSERT INTO review_events VALUES (
-            864, 'work-h-0', 'Hawzhin', 'accept', 'couch',
+            864, 'work-h-0', 'Rubar', 'accept', 'couch',
             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'content-hash-raw-counter-v3'
         );
         INSERT INTO speech_segments VALUES (
@@ -399,20 +399,20 @@ def _manifest_connection() -> sqlite3.Connection:
         );
         INSERT INTO review_compensation_ledger VALUES (
             1, 'entry-1', 'review-event:864', 'review-iqd-v1-2026-08-21',
-            864, 'Hawzhin', 'work-h-0', 'couch', 4, NULL, 500000
+            864, 'Rubar', 'work-h-0', 'couch', 4, NULL, 500000
         );
         INSERT INTO review_compensation_ledger VALUES (
             2, 'undo-entry-1', 'undo:22222222-2222-4222-8222-222222222222',
-            'review-iqd-v1-2026-08-21', NULL, 'Hawzhin', 'work-h-0',
+            'review-iqd-v1-2026-08-21', NULL, 'Rubar', 'work-h-0',
             'couch_undo', 4, 'entry-1', -500000
         );
         INSERT INTO playback_receipts VALUES (
-            1, 'work-h-0', 'Hawzhin', 3,
+            1, 'work-h-0', 'Rubar', 3,
             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
             1000, 1000, 1.0, 3, 1700000000000, 0, 1000
         );
         INSERT INTO human_decision_effect_events VALUES (
-            1, 864, 'work-h-0', 'Hawzhin', 'couch', 'accept', 4
+            1, 864, 'work-h-0', 'Rubar', 'couch', 'accept', 4
         );
         INSERT INTO human_decision_effect_reversals VALUES (
             1, '22222222-2222-4222-8222-222222222222', '2026-08-22 07:01:00'
@@ -476,7 +476,7 @@ def test_final_playback_proof_uses_ledger_revision_not_one_second_timestamps() -
     assert reason is not None and "after event" in reason
 
     # The exact pre-decision revision passes, and reviewer identity follows the policy's NOCASE law.
-    _insert_certificate_receipt(connection, reviewer="hawzhin")
+    _insert_certificate_receipt(connection, reviewer="rubar")
     assert gate.final_event_playback_issue(connection, event) is None
     connection.close()
 
@@ -487,8 +487,8 @@ def test_final_playback_proof_requires_one_ledger_row_across_all_policies() -> N
     _insert_certificate_receipt(connection)
     connection.execute(
         """INSERT INTO review_compensation_ledger VALUES
-             (864, 'another-policy', 4, 1000, 'Hawzhin', 'work-h-0', 'couch',
-              'reviewer-work-v1:7:hawzhin:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
+             (864, 'another-policy', 4, 1000, 'Rubar', 'work-h-0', 'couch',
+              'reviewer-work-v1:5:rubar:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
               'audio_content_hash+source_span')"""
     )
 
@@ -600,7 +600,7 @@ def test_post_decision_revision_drift_cannot_rebind_old_playback_for_corpus_or_h
         event = gate.ReviewEventEvidence(
             event_id,
             "work-h-0",
-            "Hawzhin",
+            "Rubar",
             "accept",
             source,
             template.created_at,
@@ -634,7 +634,7 @@ def test_event_outside_the_exact_active_focus_is_red() -> None:
 
 def test_all_four_hidden_actions_must_have_playback_evidence_too() -> None:
     found = issues(
-        playback_failures=["event 884 (couch_spot_check, Hawzhin) lacks exact playback evidence"],
+        playback_failures=["event 884 (couch_spot_check, Rubar) lacks exact playback evidence"],
         playback_checked=24,
     )
     assert any("couch_spot_check" in item for item in found)

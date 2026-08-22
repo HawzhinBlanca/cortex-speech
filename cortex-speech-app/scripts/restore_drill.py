@@ -35,6 +35,7 @@ from review_pilot_hidden_contract import (
     HIDDEN_TABLE_SQL,
     HIDDEN_TRIGGER_SQL,
     HIDDEN_KEY_SCHEMA_VERSION,
+    PILOT_REVIEWERS,
     TOTAL_HIDDEN_KEYS,
     ReviewPilotPolicy as HiddenReviewPilotPolicy,
     normalized_sql,
@@ -241,9 +242,9 @@ def validate_review_pilot_policy(raw: bytes) -> dict[str, Any]:
         normalized_names.append("".join(char.lower() if "A" <= char <= "Z" else char for char in name))
     if normalized_names[0] == normalized_names[1]:
         raise SnapshotValidationError(f"{REVIEW_PILOT_FILE} reviewer names must be distinct")
-    if set(normalized_names) != {"hawzhin", "pavel"}:
+    if set(normalized_names) != {_ascii_lower(name) for name in PILOT_REVIEWERS}:
         raise SnapshotValidationError(
-            f"{REVIEW_PILOT_FILE} must name exactly Hawzhin and Pavel"
+            f"{REVIEW_PILOT_FILE} must name exactly {' and '.join(PILOT_REVIEWERS)}"
         )
     return value
 

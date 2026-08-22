@@ -210,28 +210,28 @@ def test_capacity_is_per_reviewer_focus_dialect_and_prior_score() -> None:
             # A draft already correct under the Rust learning key is not a listening check.
             ("noop", str(sorani), " SAME   TEXT ", "same text"),
         ]
-        roster = {"Roza": ["sorani"], "Hawzhin": ["sorani", "hawleri"]}
+        roster = {"Roza": ["sorani"], "Rubar": ["sorani", "hawleri"]}
         table = [("Kurdish Corpora\\sorani\\", "sorani"), ("KBHP", "hawleri")]
 
         focused = available_keys_by_reviewer(
-            reviewers=["Roza", "Hawzhin"],
+            reviewers=["Roza", "Rubar"],
             roster=roster,
             focus={"haw"},
             candidates=candidates,
             already_scored=set(),
             dialect_table=table,
         )
-        assert focused == {"Roza": 0, "Hawzhin": 1}
+        assert focused == {"Roza": 0, "Rubar": 1}
 
         scored = available_keys_by_reviewer(
-            reviewers=["Hawzhin"],
+            reviewers=["Rubar"],
             roster=roster,
             focus={"haw"},
             candidates=candidates,
-            already_scored={("haw", "hawzhin")},
+            already_scored={("haw", "rubar")},
             dialect_table=table,
         )
-        assert scored == {"Hawzhin": 0}, "a previously answered key must not count as fresh capacity"
+        assert scored == {"Rubar": 0}, "a previously answered key must not count as fresh capacity"
 
 
 def test_serving_constants_are_read_from_the_rust_source() -> None:
@@ -279,14 +279,14 @@ def test_capacity_rejects_nonsensical_inputs() -> None:
 
 def test_work_capacity_is_per_reviewer_dialect() -> None:
     clips = [(r"D:\KBHP-EP01.wav", 1), (r"D:\Kurdish Corpora\sorani\ZarPodcast\z.wav", 1)]
-    roster = {"Roza": ["sorani"], "Hawzhin": ["sorani", "hawleri"]}
+    roster = {"Roza": ["sorani"], "Rubar": ["sorani", "hawleri"]}
     table = [("Kurdish Corpora\\sorani\\", "sorani"), ("KBHP", "hawleri")]
     assert work_counts_by_reviewer(
-        reviewers=["Roza", "Hawzhin"],
+        reviewers=["Roza", "Rubar"],
         roster=roster,
         clips=clips,
         dialect_table=table,
-    ) == {"Roza": 1, "Hawzhin": 2}
+    ) == {"Roza": 1, "Rubar": 2}
 
 
 def test_controlled_pilot_policy_is_exactly_two_reviewers_ten_each_twenty_total() -> None:
@@ -297,15 +297,15 @@ def test_controlled_pilot_policy_is_exactly_two_reviewers_ten_each_twenty_total(
             "after_review_event_id": 863,
             "max_total_corpus_actions": 20,
             "reviewers": [
-                {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10},
+                {"name": "Rubar", "max_corpus_actions": 10},
+                {"name": "Alle", "max_corpus_actions": 10},
             ],
         }
         path.write_text(json.dumps(valid), encoding="utf-8")
         write_test_focus(Path(tmp))
         policy = load_review_pilot_policy(Path(tmp))
         assert policy is not None
-        assert policy.reviewer_caps == {"Hawzhin": 10, "Pavel": 10}
+        assert policy.reviewer_caps == {"Rubar": 10, "Alle": 10}
 
         for mutate in (
             lambda value: value.update(max_total_corpus_actions=21),
@@ -347,8 +347,8 @@ def test_controlled_pilot_spot_gate_refuses_missing_or_wrong_focus() -> None:
         "after_review_event_id": 863,
         "max_total_corpus_actions": 20,
         "reviewers": [
-            {"name": "Hawzhin", "max_corpus_actions": 10},
-            {"name": "Pavel", "max_corpus_actions": 10},
+            {"name": "Rubar", "max_corpus_actions": 10},
+            {"name": "Alle", "max_corpus_actions": 10},
         ],
     }
     with tempfile.TemporaryDirectory() as tmp:
@@ -368,33 +368,33 @@ def test_controlled_pilot_spot_gate_refuses_missing_or_wrong_focus() -> None:
 
 
 def test_pilot_progress_and_hidden_capacity_derive_from_the_enforced_cap() -> None:
-    policy = ReviewPilotPolicy(100, 20, {"Hawzhin": 10, "Pavel": 10})
+    policy = ReviewPilotPolicy(100, 20, {"Rubar": 10, "Alle": 10})
     conn = sqlite3.connect(":memory:")
     create_v60_pilot_history(conn, 100)
-    insert_v60_event(conn, 101, "work-h-1", "Hawzhin", "accept", "couch")
-    insert_v60_event(conn, 102, "work-h-2", "Hawzhin", "skip", "couch")
-    insert_v60_event(conn, 103, "hidden-p-1", "Pavel", "edit", "couch_spot_check")
-    insert_v60_event(conn, 104, "work-p-1", "Pavel", "reject", "couch")
+    insert_v60_event(conn, 101, "work-h-1", "Rubar", "accept", "couch")
+    insert_v60_event(conn, 102, "work-h-2", "Rubar", "skip", "couch")
+    insert_v60_event(conn, 103, "hidden-p-1", "Alle", "edit", "couch_spot_check")
+    insert_v60_event(conn, 104, "work-p-1", "Alle", "reject", "couch")
     total, progress = pilot_progress(conn, policy)
-    assert total == 3 and progress == {"Hawzhin": 2, "Pavel": 1}
-    bounded = pilot_bounded_work_counts({"Hawzhin": 8_215, "Pavel": 8_215}, policy, progress)
-    assert bounded == {"Hawzhin": 8, "Pavel": 9}
+    assert total == 3 and progress == {"Rubar": 2, "Alle": 1}
+    bounded = pilot_bounded_work_counts({"Rubar": 8_215, "Alle": 8_215}, policy, progress)
+    assert bounded == {"Rubar": 8, "Alle": 9}
     # The bounded ten-action sample has an exact ceil(10/8)=2 distinct-key ceiling. The independent
     # three-key floor remains mandatory only for the unrestricted long-running campaign.
-    assert pilot_required_fresh_keys(10, bounded["Hawzhin"], 0, 25, 8) == 1
+    assert pilot_required_fresh_keys(10, bounded["Rubar"], 0, 25, 8) == 1
     assert pilot_required_fresh_keys(10, 10, 0, 25, 8) == 2
     assert pilot_required_fresh_keys(10, 10, 2, 25, 8) == 0
     conn.close()
 
 
 def test_pilot_progress_never_refunds_a_skip_shadowed_by_a_later_decision() -> None:
-    policy = ReviewPilotPolicy(0, 20, {"Hawzhin": 10, "Pavel": 10})
+    policy = ReviewPilotPolicy(0, 20, {"Rubar": 10, "Alle": 10})
     conn = sqlite3.connect(":memory:")
     create_v60_pilot_history(conn, 0)
-    insert_v60_event(conn, 1, "same-work", "Hawzhin", "skip", "couch")
-    insert_v60_event(conn, 2, "same-work", "Hawzhin", "accept", "couch")
+    insert_v60_event(conn, 1, "same-work", "Rubar", "skip", "couch")
+    insert_v60_event(conn, 2, "same-work", "Rubar", "accept", "couch")
     total, progress = pilot_progress(conn, policy)
-    assert total == 2 and progress["Hawzhin"] == 2
+    assert total == 2 and progress["Rubar"] == 2
     conn.close()
 
 
@@ -407,8 +407,8 @@ def test_pilot_hidden_budget_is_db_authoritative_and_session_is_only_a_subset() 
             "after_review_event_id": 100,
             "max_total_corpus_actions": 20,
             "reviewers": [
-                {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10},
+                {"name": "Rubar", "max_corpus_actions": 10},
+                {"name": "Alle", "max_corpus_actions": 10},
             ],
         }
         (root / "review_pilot_policy.json").write_text(json.dumps(raw_policy), encoding="utf-8")
@@ -422,36 +422,36 @@ def test_pilot_hidden_budget_is_db_authoritative_and_session_is_only_a_subset() 
         conn.executescript(HIDDEN_SCHEMA_SQL)
         conn.executemany(
             "INSERT INTO review_pilot_hidden_keys VALUES (?, 100, ?, ?)",
-            [(digest, "Hawzhin", "h1"), (digest, "Pavel", "p1")],
+            [(digest, "Rubar", "h1"), (digest, "Alle", "p1")],
         )
         conn.commit()
         (root / "couch_session.json").write_text(
             json.dumps(
                 {
                     "db_path": str(db_path),
-                    "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                    "reviewers": {"token-h": "Rubar", "token-p": "Alle"},
                     "pilot_policy": raw_policy,
                     # A restart may lag the DB; the cache is allowed to be a strict subset.
-                    "pilot_spot_checks": [["h1", "Hawzhin"]],
+                    "pilot_spot_checks": [["h1", "Rubar"]],
                 }
             ),
             encoding="utf-8",
         )
         grants, state = load_pilot_served_checks(root, policy, conn, db_path)
-        assert grants == {"Hawzhin": {"h1"}, "Pavel": {"p1"}}
-        assert state.session_keys == {"Hawzhin": {"h1"}, "Pavel": set()}
+        assert grants == {"Rubar": {"h1"}, "Alle": {"p1"}}
+        assert state.session_keys == {"Rubar": {"h1"}, "Alle": set()}
 
-        insert_v60_event(conn, 101, "h1", "Hawzhin", "accept", "couch_spot_check")
-        insert_v60_event(conn, 102, "p1", "Pavel", "skip", "couch_spot_check")
+        insert_v60_event(conn, 101, "h1", "Rubar", "accept", "couch_spot_check")
+        insert_v60_event(conn, 102, "p1", "Alle", "skip", "couch_spot_check")
         conn.executemany(
             "INSERT INTO spot_checks VALUES (?, ?, ?)",
-            [("h1", "Hawzhin", "accept"), ("p1", "Pavel", "skip")],
+            [("h1", "Rubar", "accept"), ("p1", "Alle", "skip")],
         )
         conn.commit()
         _grants, resolved = load_pilot_served_checks(root, policy, conn, db_path)
-        assert resolved.completed_keys == {"Hawzhin": {"h1"}, "Pavel": set()}
-        assert resolved.skipped_keys == {"Hawzhin": set(), "Pavel": {"p1"}}
-        assert resolved.unresolved_keys == {"Hawzhin": set(), "Pavel": set()}
+        assert resolved.completed_keys == {"Rubar": {"h1"}, "Alle": set()}
+        assert resolved.skipped_keys == {"Rubar": set(), "Alle": {"p1"}}
+        assert resolved.unresolved_keys == {"Rubar": set(), "Alle": set()}
         assert resolved.total_corpus_actions == 0
         assert resolved.total_hidden_actions == 2  # hidden skip consumes one of the two hidden slots
         assert resolved.total_ui_actions == 2
@@ -459,11 +459,11 @@ def test_pilot_hidden_budget_is_db_authoritative_and_session_is_only_a_subset() 
         # A hidden-key skip that lands through the corpus path consumes a corpus slot and resolves
         # the durable key, but remains unable to certify.
         delete_v60_event(conn, 102)
-        conn.execute("DELETE FROM spot_checks WHERE segment_id = 'p1' AND reviewer = 'Pavel'")
-        insert_v60_event(conn, 102, "p1", "Pavel", "skip", "couch")
+        conn.execute("DELETE FROM spot_checks WHERE segment_id = 'p1' AND reviewer = 'Alle'")
+        insert_v60_event(conn, 102, "p1", "Alle", "skip", "couch")
         conn.commit()
         _grants, legacy = load_pilot_served_checks(root, policy, conn, db_path)
-        assert legacy.skipped_keys == {"Hawzhin": set(), "Pavel": {"p1"}}
+        assert legacy.skipped_keys == {"Rubar": set(), "Alle": {"p1"}}
         assert legacy.total_corpus_actions == 1
         assert legacy.total_hidden_actions == 1
         assert legacy.total_ui_actions == 2
@@ -473,30 +473,30 @@ def test_pilot_hidden_budget_is_db_authoritative_and_session_is_only_a_subset() 
         conn.execute("DELETE FROM spot_checks")
         conn.executemany(
             "INSERT INTO review_pilot_hidden_keys VALUES (?, 100, ?, ?)",
-            [(digest, "Hawzhin", "h2"), (digest, "Pavel", "p2")],
+            [(digest, "Rubar", "h2"), (digest, "Alle", "p2")],
         )
         corpus_events = [
-            (101 + index, f"work-h-{index}", "Hawzhin", "accept", "couch")
+            (101 + index, f"work-h-{index}", "Rubar", "accept", "couch")
             for index in range(10)
         ] + [
-            (111 + index, f"work-p-{index}", "Pavel", "edit", "couch")
+            (111 + index, f"work-p-{index}", "Alle", "edit", "couch")
             for index in range(10)
         ]
         hidden_events = [
-            (121, "h1", "Hawzhin", "accept", "couch_spot_check"),
-            (122, "h2", "Hawzhin", "edit", "couch_spot_check"),
-            (123, "p1", "Pavel", "reject", "couch_spot_check"),
-            (124, "p2", "Pavel", "accept", "couch_spot_check"),
+            (121, "h1", "Rubar", "accept", "couch_spot_check"),
+            (122, "h2", "Rubar", "edit", "couch_spot_check"),
+            (123, "p1", "Alle", "reject", "couch_spot_check"),
+            (124, "p2", "Alle", "accept", "couch_spot_check"),
         ]
         for event in corpus_events + hidden_events:
             insert_v60_event(conn, *event)
         conn.executemany(
             "INSERT INTO spot_checks VALUES (?, ?, ?)",
             [
-                ("h1", "Hawzhin", "accept"),
-                ("h2", "Hawzhin", "edit"),
-                ("p1", "Pavel", "reject"),
-                ("p2", "Pavel", "accept"),
+                ("h1", "Rubar", "accept"),
+                ("h2", "Rubar", "edit"),
+                ("p1", "Alle", "reject"),
+                ("p2", "Alle", "accept"),
             ],
         )
         conn.commit()
@@ -504,7 +504,7 @@ def test_pilot_hidden_budget_is_db_authoritative_and_session_is_only_a_subset() 
         assert complete.total_corpus_actions == 20
         assert complete.total_hidden_actions == 4
         assert complete.total_ui_actions == 24
-        insert_v60_event(conn, 125, "work-too-many", "Hawzhin", "skip", "couch")
+        insert_v60_event(conn, 125, "work-too-many", "Rubar", "skip", "couch")
         conn.commit()
         try:
             load_pilot_served_checks(root, policy, conn, db_path)
@@ -516,7 +516,7 @@ def test_pilot_hidden_budget_is_db_authoritative_and_session_is_only_a_subset() 
         conn.commit()
 
         broken = json.loads((root / "couch_session.json").read_text(encoding="utf-8"))
-        broken["pilot_spot_checks"] = [["never-reserved", "Pavel"]]
+        broken["pilot_spot_checks"] = [["never-reserved", "Alle"]]
         (root / "couch_session.json").write_text(json.dumps(broken), encoding="utf-8")
         try:
             load_pilot_served_checks(root, policy, conn, db_path)
@@ -528,17 +528,17 @@ def test_pilot_hidden_budget_is_db_authoritative_and_session_is_only_a_subset() 
 
 
 def test_policy_digest_is_semantic_and_matches_the_rust_byte_contract() -> None:
-    canonical = ReviewPilotPolicy(863, 20, {"Hawzhin": 10, "Pavel": 10})
-    reordered_and_recased = ReviewPilotPolicy(863, 20, {"pAvEl": 10, "HAWZHIN": 10})
-    assert policy_sha256(canonical) == "cd8c93e7336e4d7f2731cd190a8cc45101498433dfee971079cb29d64d74d333"
+    canonical = ReviewPilotPolicy(863, 20, {"Rubar": 10, "Alle": 10})
+    reordered_and_recased = ReviewPilotPolicy(863, 20, {"aLlE": 10, "RUBAR": 10})
+    assert policy_sha256(canonical) == "2d5d5ce3c0344e8be93540cfd4d0ed5f229e9ece16495bca219075d305303bd2"
     assert policy_sha256(reordered_and_recased) == policy_sha256(canonical)
 
 
 def test_pilot_history_with_an_unauthorized_reviewer_fails_closed() -> None:
-    policy = ReviewPilotPolicy(0, 20, {"Hawzhin": 10, "Pavel": 10})
+    policy = ReviewPilotPolicy(0, 20, {"Rubar": 10, "Alle": 10})
     conn = sqlite3.connect(":memory:")
     create_v60_pilot_history(conn, 0)
-    insert_v60_event(conn, 1, "work-r", "Rubar", "accept", "couch")
+    insert_v60_event(conn, 1, "work-s", "Sewa", "accept", "couch")
     try:
         pilot_progress(conn, policy)
     except Exception:
@@ -549,25 +549,25 @@ def test_pilot_history_with_an_unauthorized_reviewer_fails_closed() -> None:
 
 
 def test_ten_direct_actions_with_zero_checks_are_red_until_exact_two_results_exist() -> None:
-    policy = ReviewPilotPolicy(0, 20, {"Hawzhin": 10, "Pavel": 10})
+    policy = ReviewPilotPolicy(0, 20, {"Rubar": 10, "Alle": 10})
     conn = sqlite3.connect(":memory:")
     create_v60_pilot_history(conn, 0)
     conn.execute(
         "CREATE TABLE spot_checks (segment_id TEXT, reviewer TEXT, noticed INTEGER, cer REAL)"
     )
     for index in range(1, 11):
-        insert_v60_event(conn, index, f"work-{index}", "Hawzhin", "accept", "couch")
+        insert_v60_event(conn, index, f"work-{index}", "Rubar", "accept", "couch")
     total, progress = pilot_progress(conn, policy)
-    assert total == 10 and progress["Hawzhin"] == 10
-    served = {"Hawzhin": set(), "Pavel": set()}
+    assert total == 10 and progress["Rubar"] == 10
+    served = {"Rubar": set(), "Alle": set()}
     issues = pilot_certification_issues(conn, policy, progress, served, 8)
     assert any("0/2 pilot keys" in issue for issue in issues)
     assert any("0/2 pilot results" in issue for issue in issues)
     assert pilot_required_fresh_keys(10, 0, 0, 25, 8, at_action_cap=True) == 2
 
-    served["Hawzhin"] = {"key-1", "key-2"}
+    served["Rubar"] = {"key-1", "key-2"}
     conn.executemany(
-        "INSERT INTO spot_checks VALUES (?, 'Hawzhin', 1, 0.0)",
+        "INSERT INTO spot_checks VALUES (?, 'Rubar', 1, 0.0)",
         [("key-1",), ("key-2",)],
     )
     assert pilot_certification_issues(conn, policy, progress, served, 8) == []
@@ -579,21 +579,21 @@ def test_ten_direct_actions_with_zero_checks_are_red_until_exact_two_results_exi
 
 
 def test_hidden_skip_consumes_qc_slot_but_can_never_certify() -> None:
-    policy = ReviewPilotPolicy(0, 20, {"Hawzhin": 10, "Pavel": 10})
+    policy = ReviewPilotPolicy(0, 20, {"Rubar": 10, "Alle": 10})
     conn = sqlite3.connect(":memory:")
     create_v60_pilot_history(conn, 0)
     conn.execute(
         "CREATE TABLE spot_checks (segment_id TEXT, reviewer TEXT, noticed INTEGER, cer REAL)"
     )
-    insert_v60_event(conn, 1, "hidden-skip", "Hawzhin", "skip", "couch_spot_check")
-    conn.execute("INSERT INTO spot_checks VALUES ('hidden-skip', 'Hawzhin', 0, 1.0)")
+    insert_v60_event(conn, 1, "hidden-skip", "Rubar", "skip", "couch_spot_check")
+    conn.execute("INSERT INTO spot_checks VALUES ('hidden-skip', 'Rubar', 0, 1.0)")
     total, progress = pilot_progress(conn, policy)
-    assert total == 0 and progress["Hawzhin"] == 0, "hidden QC must not consume corpus quota"
+    assert total == 0 and progress["Rubar"] == 0, "hidden QC must not consume corpus quota"
     issues = pilot_certification_issues(
         conn,
         policy,
         progress,
-        {"Hawzhin": {"hidden-skip"}, "Pavel": set()},
+        {"Rubar": {"hidden-skip"}, "Alle": set()},
         8,
     )
     assert any("skipped 1 hidden check" in issue for issue in issues), issues

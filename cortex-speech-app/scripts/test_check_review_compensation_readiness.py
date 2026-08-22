@@ -36,8 +36,8 @@ class CompensationReadinessGateTests(unittest.TestCase):
             "after_review_event_id": 0,
             "max_total_corpus_actions": 20,
             "reviewers": [
-                {"name": "Hawzhin", "max_corpus_actions": 10},
-                {"name": "Pavel", "max_corpus_actions": 10},
+                {"name": "Rubar", "max_corpus_actions": 10},
+                {"name": "Alle", "max_corpus_actions": 10},
             ],
         }
         (self.root / "review_pilot_policy.json").write_text(
@@ -47,7 +47,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
             json.dumps(
                 {
                     "db_path": str(self.db),
-                    "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                    "reviewers": {"token-h": "Rubar", "token-p": "Alle"},
                     "pilot_policy": self.pilot_policy,
                     "pilot_spot_checks": [],
                 }
@@ -184,7 +184,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
             INSERT INTO review_events
               (id, segment_id, reviewer, action, compensation_action, source, duration_ms,
                operation_id, operation_payload_hash)
-            VALUES (1, 's1', 'Hawzhin', 'edit', 'edit', 'couch', 1000,
+            VALUES (1, 's1', 'Rubar', 'edit', 'edit', 'couch', 1000,
                     '11111111-1111-4111-8111-111111111111',
                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
             INSERT INTO review_compensation_ledger
@@ -194,12 +194,12 @@ class CompensationReadinessGateTests(unittest.TestCase):
                entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
                delta_corrected_ms, reverses_entry_id)
             VALUES (1, 'entry-1', 'review-event:1', 'review-iqd-v1-2026-08-21', 1,
-                    'reviewer-work-v1:7:hawzhin:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
-                    'audio_content_hash+source_span', 'Hawzhin', 's1', 'couch', 'edit', 'edit', 1,
+                    'reviewer-work-v1:5:rubar:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
+                    'audio_content_hash+source_span', 'Rubar', 's1', 'couch', 'edit', 'edit', 1,
                     1000, 10000, 5000000, 5000000, 1000, 1000, NULL);
             INSERT INTO human_decision_effect_events
               (id, review_event_id, segment_id, reviewer, source, action, decision_revision)
-            VALUES (1, 1, 's1', 'Hawzhin', 'couch', 'edit', 1);
+            VALUES (1, 1, 's1', 'Rubar', 'couch', 'edit', 1);
             CREATE VIEW effective_review_events_v60 AS
             SELECT e.id AS review_event_id, e.segment_id, e.reviewer, e.action, e.source,
                    e.timestamp_ms, e.created_at AS review_event_created_at,
@@ -273,7 +273,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
         *,
         event_id: int,
         segment_id: str,
-        reviewer: str = "Hawzhin",
+        reviewer: str = "Rubar",
         action: str = "accept",
         source: str = "couch",
     ) -> None:
@@ -387,7 +387,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
             """INSERT INTO review_events
                    (id, segment_id, reviewer, action, compensation_action, source, duration_ms,
                     operation_id, operation_payload_hash)
-                 VALUES (2, 's1', 'Hawzhin', 'accept', 'accept', 'couch', 1000,
+                 VALUES (2, 's1', 'Rubar', 'accept', 'accept', 'couch', 1000,
                          '33333333-3333-4333-8333-333333333333', ?)""",
             ("c" * 64,),
         )
@@ -407,7 +407,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
         connection.execute(
             """INSERT INTO human_decision_effect_events
                    (id, review_event_id, segment_id, reviewer, source, action, decision_revision)
-                 VALUES (2, 2, 's1', 'Hawzhin', 'couch', 'accept', 2)"""
+                 VALUES (2, 2, 's1', 'Rubar', 'couch', 'accept', 2)"""
         )
 
     def test_valid_ledger_and_focus_pass(self):
@@ -534,7 +534,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
     def test_session_hidden_key_must_be_a_subset_of_durable_grants(self):
         session_path = self.root / "couch_session.json"
         session = json.loads(session_path.read_text(encoding="utf-8"))
-        session["pilot_spot_checks"] = [["unreserved", "Hawzhin"]]
+        session["pilot_spot_checks"] = [["unreserved", "Rubar"]]
         session_path.write_text(json.dumps(session), encoding="utf-8")
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
@@ -543,7 +543,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
     def test_session_reviewer_roster_must_exactly_match_the_policy(self):
         session_path = self.root / "couch_session.json"
         session = json.loads(session_path.read_text(encoding="utf-8"))
-        session["reviewers"] = {"token-h": "Hawzhin", "token-r": "Rubar"}
+        session["reviewers"] = {"token-r": "Rubar", "token-s": "Sewa"}
         session_path.write_text(json.dumps(session), encoding="utf-8")
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
@@ -577,7 +577,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
         connection.execute(
             """INSERT INTO human_decision_effect_events
                    (id, review_event_id, segment_id, reviewer, source, action, decision_revision)
-                 VALUES (2, 2, 'hidden-effect-forbidden', 'Hawzhin',
+                 VALUES (2, 2, 'hidden-effect-forbidden', 'Rubar',
                          'couch_spot_check', 'edit', 2)"""
         )
         connection.commit()
@@ -618,7 +618,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
         digest = policy_sha256(read_policy(self.root / "review_pilot_policy.json"))
         connection = sqlite3.connect(self.db)
         connection.execute(
-            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Hawzhin', 'hidden-a')",
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Rubar', 'hidden-a')",
             (digest,),
         )
         self.insert_paid_event(
@@ -653,7 +653,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
         digest = policy_sha256(read_policy(self.root / "review_pilot_policy.json"))
         connection = sqlite3.connect(self.db)
         connection.execute(
-            "INSERT INTO review_pilot_hidden_keys VALUES (?, 1, 'Hawzhin', 'hidden-a')",
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 1, 'Rubar', 'hidden-a')",
             (digest,),
         )
         connection.commit()
@@ -665,7 +665,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
     def test_active_baseline_cannot_use_a_noncanonical_policy_sha(self):
         connection = sqlite3.connect(self.db)
         connection.execute(
-            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Hawzhin', 'hidden-a')",
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Rubar', 'hidden-a')",
             ("f" * 64,),
         )
         connection.commit()
@@ -678,7 +678,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
         digest = policy_sha256(read_policy(self.root / "review_pilot_policy.json"))
         connection = sqlite3.connect(self.db)
         connection.execute(
-            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Hawzhin', 's1')",
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Rubar', 's1')",
             (digest,),
         )
         connection.commit()
@@ -729,8 +729,8 @@ class CompensationReadinessGateTests(unittest.TestCase):
                     rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
                     corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id)
                  VALUES (2, 'entry-2', 'review-event:1', 'other-policy', 1,
-                    'reviewer-work-v1:7:hawzhin:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
-                    'audio_content_hash+source_span', 'Hawzhin', 's1', 'couch', 'edit', 'edit', 1,
+                    'reviewer-work-v1:5:rubar:audio-segment-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:1000',
+                    'audio_content_hash+source_span', 'Rubar', 's1', 'couch', 'edit', 'edit', 1,
                     1000, 10000, 5000000, 0, 1000, 0, NULL)"""
         )
         connection.commit()

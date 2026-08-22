@@ -39,7 +39,10 @@ def _verify_test_focus(data_dir: Path):
 
 def activate(*args, **kwargs):
     """Exercise the real activator with an explicit small test contract; CLI has no override."""
-    with mock.patch.object(activator, "verify_controlled_pilot_focus", side_effect=_verify_test_focus):
+    with (
+        mock.patch.object(activator, "verify_controlled_pilot_focus", side_effect=_verify_test_focus),
+        mock.patch.object(activator, "load_pilot_focus_contract", return_value=TEST_FOCUS_CONTRACT),
+    ):
         return activator.activate(*args, **kwargs)
 
 
@@ -61,6 +64,16 @@ def seed(root: Path, *, schema: int = 60) -> tuple[Path, dict[str, object]]:
     )
     if schema >= 59:
         conn.executescript(HIDDEN_SCHEMA_SQL)
+    if schema >= 60:
+        conn.executescript(
+            """
+            CREATE TABLE review_compensation_ledger(id INTEGER PRIMARY KEY);
+            CREATE TABLE human_decision_effect_events(id INTEGER PRIMARY KEY);
+            CREATE TABLE human_decision_effect_reversals(id INTEGER PRIMARY KEY);
+            CREATE TABLE review_flag_effect_events(id INTEGER PRIMARY KEY);
+            CREATE TABLE review_flag_effect_reversals(id INTEGER PRIMARY KEY);
+            """
+        )
     conn.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         [entry for entry in source_migrations(DEFAULT_MIGRATIONS) if entry[0] <= schema],
@@ -69,17 +82,17 @@ def seed(root: Path, *, schema: int = 60) -> tuple[Path, dict[str, object]]:
     conn.close()
     session: dict[str, object] = {
         "reviewers": {
-            "dpapi-hawzhin": "Hawzhin",
-            "dpapi-pavel": "Pavel",
             "dpapi-rubar": "Rubar",
+            "dpapi-alle": "Alle",
+            "dpapi-sewa": "Sewa",
         },
         "db_path": str(db_path),
-        "spot_checks": [["h1", "Hawzhin"], ["p1", "Pavel"], ["r1", "Rubar"]],
+        "spot_checks": [["r1", "Rubar"], ["a1", "Alle"], ["s1", "Sewa"]],
         "pilot_spot_checks": [],
         "sessions": [
-            {"token": "cookie-h", "reviewer": "Hawzhin", "issued_unix": 1},
-            {"token": "cookie-p", "reviewer": "Pavel", "issued_unix": 2},
-            {"token": "cookie-r", "reviewer": "Rubar", "issued_unix": 3},
+            {"token": "cookie-r", "reviewer": "Rubar", "issued_unix": 1},
+            {"token": "cookie-a", "reviewer": "Alle", "issued_unix": 2},
+            {"token": "cookie-s", "reviewer": "Sewa", "issued_unix": 3},
         ],
     }
     (root / SESSION_FILE).write_text(json.dumps(session), encoding="utf-8")
@@ -111,11 +124,11 @@ def test_activation_preserves_target_tokens_narrows_every_session_surface_and_ba
         assert result["controlledPilotFocusCount"] == len(TEST_FOCUS_IDS)
         assert result["controlledPilotFocusDigest"] == TEST_FOCUS_CONTRACT.sorted_unique_segment_ids_sha256
         assert session["reviewers"] == {
-            "dpapi-hawzhin": "Hawzhin",
-            "dpapi-pavel": "Pavel",
+            "dpapi-rubar": "Rubar",
+            "dpapi-alle": "Alle",
         }, "protected DPAPI token bytes must be preserved exactly"
-        assert {entry["reviewer"] for entry in session["sessions"]} == {"Hawzhin", "Pavel"}
-        assert {entry[1] for entry in session["spot_checks"]} == {"Hawzhin", "Pavel"}
+        assert {entry["reviewer"] for entry in session["sessions"]} == {"Rubar", "Alle"}
+        assert {entry[1] for entry in session["spot_checks"]} == {"Rubar", "Alle"}
         assert session["pilot_spot_checks"] == []
         assert not (root / REVOCATION_FILE).exists()
         backup = Path(result["backup"])
@@ -129,7 +142,7 @@ def test_first_activation_refuses_unnamespaced_legacy_pilot_hidden_keys() -> Non
         db_path, _ = seed(root)
         session_path = root / SESSION_FILE
         session = json.loads(session_path.read_text(encoding="utf-8"))
-        session["pilot_spot_checks"] = [["ambiguous-key", "Hawzhin"]]
+        session["pilot_spot_checks"] = [["ambiguous-key", "Rubar"]]
         session_path.write_text(json.dumps(session), encoding="utf-8")
 
         try:
@@ -164,6 +177,59 @@ def test_event_id_and_existing_policy_are_compare_and_swap_guards() -> None:
         assert sha256_file(existing) == sha256_file(existing)
 
 
+def test_pristine_roster_replacement_atomically_extends_the_exact_focus() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, credential_session = seed(root)
+        credential_path = root / "credential_session.json"
+        credential_path.write_text(json.dumps(credential_session), encoding="utf-8")
+
+        old_policy = pilot_policy(863)
+        old_policy["reviewers"] = [
+            {"name": "Hawzhin", "max_corpus_actions": 10},
+            {"name": "Pavel", "max_corpus_actions": 10},
+        ]
+        policy_path = root / POLICY_FILE
+        policy_path.write_text(json.dumps(old_policy), encoding="utf-8")
+        current_session = {
+            "reviewers": {"old-h": "Hawzhin", "old-p": "Pavel"},
+            "db_path": str(db_path),
+            "spot_checks": [],
+            "pilot_spot_checks": [],
+            "sessions": [],
+            "pilot_policy": old_policy,
+        }
+        (root / SESSION_FILE).write_text(json.dumps(current_session), encoding="utf-8")
+        focus_path = root / "voice_focus.json"
+        focus_path.write_text(
+            json.dumps({"name": "test", "segment_ids": list(TEST_FOCUS_IDS[:2])}),
+            encoding="utf-8",
+        )
+        old_focus_hash = sha256_file(focus_path)
+
+        result = activate(
+            root,
+            db_path,
+            expected_max_review_event_id=863,
+            expected_policy_sha256=sha256_file(policy_path),
+            credential_session=credential_path,
+            replace_roster_before_activity=True,
+            focus_additions=(TEST_FOCUS_IDS[2],),
+            expected_focus_sha256=old_focus_hash,
+            check_runtime=False,
+        )
+
+        assert result["rosterReplacedBeforeActivity"] is True
+        assert set(json.loads((root / SESSION_FILE).read_text())["reviewers"].values()) == {
+            "Rubar",
+            "Alle",
+        }
+        assert set(json.loads(focus_path.read_text())["segment_ids"]) == set(TEST_FOCUS_IDS)
+        backup = Path(result["backup"])
+        assert sha256_file(backup / "voice_focus.json") == old_focus_hash
+        assert not (root / REVOCATION_FILE).exists()
+
+
 def test_existing_pilot_cannot_reset_its_baseline_after_any_durable_activity() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -173,7 +239,7 @@ def test_existing_pilot_cannot_reset_its_baseline_after_any_durable_activity() -
         policy_hash = sha256_file(policy_path)
         conn = sqlite3.connect(db_path)
         conn.execute(
-            "INSERT INTO review_events VALUES(864, 'corpus-work', 'Hawzhin', 'accept', 'couch')"
+            "INSERT INTO review_events VALUES(864, 'corpus-work', 'Rubar', 'accept', 'couch')"
         )
         conn.commit()
         conn.close()
@@ -201,16 +267,16 @@ def test_schema60_activation_imports_session_and_completed_hidden_keys_into_one_
         session_path = root / SESSION_FILE
         session = json.loads(session_path.read_text(encoding="utf-8"))
         session["pilot_spot_checks"] = [
-            ["hidden-h-session", "Hawzhin"],
-            ["hidden-p-session", "Pavel"],
+            ["hidden-r-session", "Rubar"],
+            ["hidden-a-session", "Alle"],
         ]
         session_path.write_text(json.dumps(session), encoding="utf-8")
         conn = sqlite3.connect(db_path)
         conn.executemany(
             "INSERT INTO review_events VALUES(?, ?, ?, ?, 'couch_spot_check')",
             [
-                (864, "hidden-h-completed", "Hawzhin", "accept"),
-                (865, "hidden-p-completed", "Pavel", "reject"),
+                (864, "hidden-r-completed", "Rubar", "accept"),
+                (865, "hidden-a-completed", "Alle", "reject"),
             ],
         )
         conn.commit()
@@ -231,10 +297,10 @@ def test_schema60_activation_imports_session_and_completed_hidden_keys_into_one_
         ).fetchall()
         conn.close()
         assert rows == [
-            (expected_digest, 863, "Hawzhin", "hidden-h-completed"),
-            (expected_digest, 863, "Hawzhin", "hidden-h-session"),
-            (expected_digest, 863, "Pavel", "hidden-p-completed"),
-            (expected_digest, 863, "Pavel", "hidden-p-session"),
+            (expected_digest, 863, "Alle", "hidden-a-completed"),
+            (expected_digest, 863, "Alle", "hidden-a-session"),
+            (expected_digest, 863, "Rubar", "hidden-r-completed"),
+            (expected_digest, 863, "Rubar", "hidden-r-session"),
         ]
         assert result["policySemanticSha256"] == expected_digest
         assert result["hiddenKeysImported"] == 4
@@ -258,7 +324,7 @@ def test_schema60_activation_rolls_back_when_hidden_history_exceeds_quota_or_sch
             conn = sqlite3.connect(db_path)
             if mutation == "over_quota":
                 conn.executemany(
-                    "INSERT INTO review_events VALUES(?, ?, 'Hawzhin', 'accept', 'couch_spot_check')",
+                    "INSERT INTO review_events VALUES(?, ?, 'Rubar', 'accept', 'couch_spot_check')",
                     [(864, "hidden-one"), (865, "hidden-two"), (866, "hidden-three")],
                 )
                 expected_max = 866
@@ -368,7 +434,7 @@ def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation(
         session_path = root / SESSION_FILE
         encoded_db = json.dumps(str(db_path))
         session_path.write_text(
-            '{"reviewers":{"dpapi-secret":"Hawzhin","dpapi-secret":"Pavel"},'
+            '{"reviewers":{"dpapi-secret":"Rubar","dpapi-secret":"Alle"},'
             f'"db_path":{encoded_db}}}',
             encoding="utf-8",
         )
@@ -499,15 +565,15 @@ def test_policy_contract_rejects_unknown_fields_and_python_bool_in_integer_slots
         raise AssertionError("Python bool was accepted as a review-event baseline")
 
 
-def test_tracked_focus_contract_and_8273_8275_wrong_id_failures_are_exact() -> None:
+def test_tracked_focus_contract_and_8277_8279_wrong_id_failures_are_exact() -> None:
     production = load_pilot_focus_contract()
-    assert production.segment_id_count == 8_274
+    assert production.segment_id_count == 8_278
     assert (
         production.sorted_unique_segment_ids_sha256
-        == "bd5ecab6ee15e2ac15ad247e8fa90e79bf1fc7550ae8fb47db00ee757989528c"
+        == "9f7876c04ee7add77673f938460a5631056712b35a156c0d76b0cd7dca7ef3a7"
     )
 
-    baseline = [f"segment-{index:05}" for index in range(8_274)]
+    baseline = [f"segment-{index:05}" for index in range(8_278)]
     contract = contract_for_ids(baseline)
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -522,8 +588,8 @@ def test_tracked_focus_contract_and_8273_8275_wrong_id_failures_are_exact() -> N
             else:
                 raise AssertionError(f"focus variation was accepted: {expected}")
 
-        expect_refusal(baseline[:-1], "8273")
-        expect_refusal([*baseline, "segment-extra"], "8275")
+        expect_refusal(baseline[:-1], "8277")
+        expect_refusal([*baseline, "segment-extra"], "8279")
         expect_refusal([*baseline[:-1], "segment-wrong"], "digest mismatch")
 
 

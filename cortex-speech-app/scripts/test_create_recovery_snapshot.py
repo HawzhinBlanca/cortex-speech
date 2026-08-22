@@ -76,8 +76,8 @@ def seed_profile(root: Path, *, schema_version: int = 59, policy: bool = True) -
     if policy:
         (root / "review_pilot_policy.json").write_text(
             '{"schema_version":1,"after_review_event_id":0,"max_total_corpus_actions":20,'
-            '"reviewers":[{"name":"Hawzhin","max_corpus_actions":10},'
-            '{"name":"Pavel","max_corpus_actions":10}]}',
+            '"reviewers":[{"name":"Rubar","max_corpus_actions":10},'
+            '{"name":"Alle","max_corpus_actions":10}]}',
             encoding="utf-8",
         )
 
@@ -550,7 +550,7 @@ def test_schema59_hidden_keys_require_exact_policy_binding_and_schema58_stays_va
         policy_sha = snapshot.review_pilot_policy_sha256(policy)
         connection = sqlite3.connect(data / snapshot.DB_FILE)
         connection.execute(
-            "INSERT INTO review_pilot_hidden_keys VALUES(?, 0, 'Hawzhin', 'hidden-1')",
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 0, 'Rubar', 'hidden-1')",
             (policy_sha,),
         )
         connection.commit()
@@ -563,9 +563,9 @@ def test_schema59_hidden_keys_require_exact_policy_binding_and_schema58_stays_va
         snapshot.verify_tree(local, expected_evidence=evidence, expected_foreign_keys=0)
 
     mismatches = (
-        ("0" * 64, 0, "Hawzhin", "disagrees with the active policy SHA/baseline"),
-        (None, 1, "Hawzhin", "disagrees with the active policy SHA/baseline"),
-        (None, 0, "Rubar", "unauthorized reviewer"),
+        ("0" * 64, 0, "Rubar", "disagrees with the active policy SHA/baseline"),
+        (None, 1, "Rubar", "disagrees with the active policy SHA/baseline"),
+        (None, 0, "Sewa", "unauthorized reviewer"),
     )
     for wrong_sha, baseline, reviewer, expected in mismatches:
         with tempfile.TemporaryDirectory() as raw:
@@ -633,9 +633,9 @@ def test_active_snapshot_requires_completed_and_live_session_hidden_keys_to_be_d
         )
         session = {
             "db_path": str(data / snapshot.DB_FILE),
-            "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+            "reviewers": {"token-h": "Rubar", "token-p": "Alle"},
             "pilot_policy": policy,
-            "pilot_spot_checks": [["remembered-hidden", "Hawzhin"]],
+            "pilot_spot_checks": [["remembered-hidden", "Rubar"]],
         }
         (data / "couch_session.json").write_text(json.dumps(session), encoding="utf-8")
         try:
@@ -654,7 +654,7 @@ def test_active_snapshot_requires_completed_and_live_session_hidden_keys_to_be_d
         seed_profile(data)
         connection = sqlite3.connect(data / snapshot.DB_FILE)
         connection.execute(
-            "INSERT INTO review_events VALUES(1, 'completed-hidden', 'Pavel', 'accept', 'couch_spot_check')"
+            "INSERT INTO review_events VALUES(1, 'completed-hidden', 'Alle', 'accept', 'couch_spot_check')"
         )
         connection.commit()
         connection.close()
@@ -702,7 +702,7 @@ def test_schema59_hidden_history_survives_policy_lifecycle_and_caps_each_namespa
         connection.executemany(
             "INSERT INTO review_pilot_hidden_keys VALUES(?, ?, ?, ?)",
             [
-                (active_sha, 0, "Hawzhin", "active-hidden"),
+                (active_sha, 0, "Rubar", "active-hidden"),
                 (historical_sha, 17, "OldReviewer", "historical-hidden"),
             ],
         )
