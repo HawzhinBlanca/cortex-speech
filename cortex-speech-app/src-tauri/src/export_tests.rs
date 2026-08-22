@@ -1810,7 +1810,7 @@ fn export_huggingface_replaces_metadata_files() {
 }
 
 #[test]
-fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
+fn hf_reexport_removes_orphan_wav_when_a_reviewed_source_becomes_unavailable() {
     // Round-12 audit (#5/#6): a re-export must remove the WAV of a segment that no longer exports
     // (so it isn't left orphaned and hashed into SHA256SUMS with no metadata row), while keeping the
     // still-exporting segments and a metadata.csv for every split. An EMPTY re-export is a separate
@@ -1820,22 +1820,18 @@ fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
     db.initialize().unwrap();
 
     let tmp_dir = tempfile::tempdir().unwrap();
-    let wav_path = tmp_dir.path().join("clip.wav");
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: 16000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
-    for _ in 0..16000 {
-        writer.write_sample(0i16).unwrap();
-    }
-    writer.finalize().unwrap();
+    let orphan_wav_path = tmp_dir.path().join("orphan.wav");
+    let keep_wav_path = tmp_dir.path().join("keep.wav");
+    write_silent_wav(&orphan_wav_path);
+    write_silent_wav(&keep_wav_path);
 
     for id in ["orphan-seg", "keep-seg"] {
         let mut seg = sample_segment(id);
-        seg.audio_path = wav_path.to_string_lossy().to_string();
+        seg.audio_path = if id == "orphan-seg" {
+            orphan_wav_path.to_string_lossy().to_string()
+        } else {
+            keep_wav_path.to_string_lossy().to_string()
+        };
         db.insert_segment_full(&seg).unwrap();
     }
 
@@ -1856,8 +1852,11 @@ fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
     export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
     assert_eq!(find_wavs(out_dir.path()).len(), 2, "run 1 exports two wavs");
 
-    // One segment no longer exports; re-export into the SAME directory.
-    db.delete_segment("orphan-seg").unwrap();
+    // Reviewed rows are append-only, so ordinary cleanup must not delete this segment or its
+    // evidence. A genuinely unavailable source still removes the clip from the next export.
+    let err = db.delete_segment("orphan-seg").expect_err("reviewed export row must refuse deletion");
+    assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
+    std::fs::remove_file(&orphan_wav_path).unwrap();
     export_huggingface_dataset(&db, out_dir.path(), &settings).unwrap();
 
     let after = find_wavs(out_dir.path());
@@ -1867,6 +1866,7 @@ fn hf_reexport_removes_orphan_wav_for_a_dropped_segment() {
     let sums = std::fs::read_to_string(out_dir.path().join("SHA256SUMS")).unwrap();
     assert!(!sums.contains("orphan-seg"), "SHA256SUMS must not list the orphan WAV:\n{sums}");
     assert!(sums.contains("keep-seg"), "SHA256SUMS must list the kept WAV:\n{sums}");
+    assert!(db.get_segment_by_id("orphan-seg").unwrap().is_some(), "source loss never deletes DB authority");
 
     // Every declared split still has a metadata.csv (header-only for the empty ones).
     for s in ["train", "validation", "test"] {

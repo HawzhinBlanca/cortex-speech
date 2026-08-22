@@ -365,9 +365,6 @@
     // window.confirm per press only broke the keyboard flow.
     saving = true;
     try {
-      undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
-      // recordHumanDecision FIRST so a validation failure aborts before the targeted row update
-      // commits (same ordering rationale as submit()).
       // Same receipt the submit() path posts, for the same reason. A reject permanently removes
       // a clip from the corpus, so it is a verdict on the audio exactly as much as an accept is.
       try {
@@ -379,11 +376,14 @@
       } catch (e) {
         console.error('playback receipt failed', e);
       }
-      await api.recordHumanDecision(seg.id, 'reject', null);
-      // P2.3b: targeted field update (verified is whitelisted) — no whole-row upsert of the batch-stale
-      // store row, which would revert a concurrent batch's writes to this segment.
-      await api.updateSegmentFields(seg.id, { verified: true });
-      segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, verified: true } : s)));
+      const commit = await api.recordHumanDecision(seg.id, 'reject', null);
+      // Undo authority is the immutable database effect id, never this renderer's pre-save row.
+      // Push only after the atomic decision commits, so a failed decision cannot create a phantom undo.
+      undoHistory = [
+        ...undoHistory,
+        { id: seg.id, effectEventId: commit.effectEventId, operationId: crypto.randomUUID() },
+      ];
+      segments.update((list) => list.map((s) => (s.id === seg.id ? commit.segment : s)));
       const visibleId = current?.id ?? null;
       reviewRows = reviewRows.filter((s) => s.id !== seg.id);
       reviewTotal = Math.max(0, reviewTotal - 1);
@@ -395,7 +395,6 @@
         if (visibleIndex >= 0) index = visibleIndex;
       }
     } catch (e) {
-      undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
       if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
         notifications.error($t('review.mustListen'));
       else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
@@ -404,10 +403,10 @@
     }
   }
 
-  // True-10 audit: in-loop undo. The global Ctrl+Z only reverts update_segment (not the human
-  // decision), leaving split state; this mirrors the inbox instead — clear the decision AND restore
-  // the pre-decision segment in one action, then re-land the cursor on the undone clip.
-  let undoHistory = $state<{ id: string; prev: SpeechSegment }[]>([]);
+  // The server owns the pre-decision snapshot. The renderer retains only the immutable effect id and
+  // one stable operation UUID, so a retry after a lost response is idempotent and cannot restore
+  // attacker-controlled or stale segment fields.
+  let undoHistory = $state<{ id: string; effectEventId: number; operationId: string }[]>([]);
 
   async function undoLast() {
     const last = undoHistory[undoHistory.length - 1];
@@ -415,19 +414,31 @@
     saving = true;
     undoHistory = undoHistory.slice(0, -1);
     try {
-      // LOSSLESS restore (2026-07-15 fix, reproduced in db::tests::redecision_undo_...): the old
-      // clearHumanDecision + updateSegment pair NULLed a PRIOR decision when undoing a REdecision,
-      // because updateSegment deliberately omits the decision columns. restoreSegmentSnapshot writes
-      // the whole pre-save snapshot — prior decision, verdict fields, escalation state and all — so
-      // undo returns the row to its exact pre-decision state in one atomic upsert.
-      await api.restoreSegmentSnapshot(last.prev);
-      segments.update((list) => list.map((s) => (s.id === last.id ? last.prev : s)));
-      if (!reviewRows.some((s) => s.id === last.id)) reviewRows = [last.prev, ...reviewRows];
-      else reviewRows = reviewRows.map((s) => (s.id === last.id ? last.prev : s));
-      hydratedReviewIds = new Set([...hydratedReviewIds, last.id]);
-      reviewTotal += 1;
-      void refreshSegmentStats();
+      const outcome = await api.undoHumanDecision(last.effectEventId, last.operationId);
+      if (outcome.status === 'conflict') {
+        notifications.error($t('review.undoFailed'), {
+          detail: 'The segment changed after this decision; Undo refused without changing it.',
+        });
+        return;
+      }
+      const restored = outcome.segment;
+      // The same segment id may re-enter the queue immediately. Force the load effect to consume the
+      // authoritative restored fields instead of treating that id as the already-loaded decided row.
       editCache.delete(last.id);
+      if (lastLoadedId === last.id) lastLoadedId = null;
+      segments.update((list) => list.map((s) => (s.id === last.id ? restored : s)));
+      const wasPending = reviewRows.some((s) => s.id === last.id);
+      if (!restored.verified) {
+        reviewRows = wasPending
+          ? reviewRows.map((s) => (s.id === last.id ? restored : s))
+          : [restored, ...reviewRows];
+        if (!wasPending) reviewTotal += 1;
+      } else if (wasPending) {
+        reviewRows = reviewRows.filter((s) => s.id !== last.id);
+        reviewTotal = Math.max(0, reviewTotal - 1);
+      }
+      hydratedReviewIds = new Set([...hydratedReviewIds, last.id]);
+      void refreshSegmentStats();
       const idx = queue.findIndex((s) => s.id === last.id);
       if (idx >= 0) index = idx;
       notifications.success($t('review.undone'));
@@ -632,21 +643,13 @@
     // no-change save is an "accept".
     const isEdit = !acceptAsIs && text !== original;
     try {
-      undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
-      // BOTH calls are required, recordHumanDecision FIRST: it validates the decision (an empty edit
-      // throws here) so a failure aborts BEFORE updateSegment commits — no split state where the clip
-      // is `verified` with no human_decision (or a blanked transcript). recordHumanDecision records the
-      // human_decision (so the jury never re-adjudicates) + feeds the learning flywheel; updateSegment
-      // marks `verified` (queue/progress advance) and writes annotated_transcript where the editor +
-      // FTS search read it. If updateSegment fails after recordHumanDecision, the clip stays unverified
-      // (in the queue) and re-review self-heals it.
       // Accept-what-you-SEE: pass the displayed text even on accept so verdict_transcript (the
       // COALESCE-preferred gold source) becomes exactly what the human approved. Passing null let an
       // UNSEEN jury verdict_transcript survive and get exported as human-verified gold. For an edit the
       // typed text is the label; for an accept the displayed original is. (Backend only captures a
       // LOOP-0 memory / ledger row on 'edit', so an accept with text stays a pure verdict overwrite.)
       // Post the listening receipt BEFORE the verdict. The backend resolves this segment's
-      // revision and audio fingerprint itself and refuses a verdict without sufficient evidence, so
+      // revision and canonical decoded-PCM content hash itself and refuses a verdict without sufficient evidence, so
       // a decision recorded on a clip nobody heard becomes impossible rather than merely discouraged.
       // Failing to record the receipt must not lose the human's work, so it is reported, not thrown.
       try {
@@ -658,22 +661,12 @@
       } catch (e) {
         console.error('playback receipt failed', e);
       }
-      await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', text);
-      // Build the upsert AFTER the slow decision call (whole-file hash on 'edit' takes hundreds of
-      // ms) from the freshest store row: update_segment writes the whole row, so a pre-await spread
-      // would revert timings the background aligner persisted inside that window.
-      // P2.3b (audit F2 completeness): persist ONLY the whitelisted fields via the targeted field
-      // update — never a whole-row updateSegment of the store row, which is stale vs the DB
-      // while a background batch (normalize/transcribe/rediarize) writes this segment on its own
-      // connection, so the upsert reverted the batch's freshly-written columns. A field update touches
-      // only annotatedTranscript + verified (both whitelisted), so it is clobber-safe vs a batch AND an
-      // aligner. The backend re-reads the fresh row under the db lock (no TOCTOU).
-      await api.updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true });
-      segments.update((list) =>
-        list.map((s) =>
-          s.id === seg.id ? { ...s, annotatedTranscript: text, verified: true } : s,
-        ),
-      );
+      const commit = await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', text);
+      undoHistory = [
+        ...undoHistory,
+        { id: seg.id, effectEventId: commit.effectEventId, operationId: crypto.randomUUID() },
+      ];
+      segments.update((list) => list.map((s) => (s.id === seg.id ? commit.segment : s)));
       // Capture navigation state BEFORE removing the saved row. Once it is filtered out, `current`
       // necessarily changes (or becomes null while the next lightweight row hydrates), which cannot
       // distinguish an ordinary successful advance from a real mid-flight user navigation.
@@ -697,7 +690,6 @@
       }
       advance();
     } catch (e) {
-      undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
       if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
         notifications.error($t('review.mustListen'));
       else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
@@ -717,38 +709,9 @@
   async function go(delta: number) {
     const target = Math.max(0, Math.min(queue.length - 1, index + delta));
     if (target === index) return;
-    // Persist any unsaved edit as a DRAFT before navigating, so the load $effect can't silently discard
-    // the reviewer's typed corrections when `current` changes. Navigation is not a verify, so the
-    // segment's `verified` state is left untouched; the edit is recoverable and Reset still discards it.
-    // A CLEARED textarea is dirty too but must NOT be drafted: persisting annotatedTranscript=''
-    // blanks the gold transcript with no undo entry (submit() refuses the same state). The cleared
-    // text survives in editCache for this session, so nothing is lost by skipping the persist.
-    // P2.3b: persist the navigation DRAFT via the targeted field update (annotatedTranscript only). The
-    // old whole-row updateSegment of the store row reverted a concurrent batch's writes to this segment
-    // (batch-stale store), and needed a `!aligning` skip to avoid reverting the aligner's timings too. A
-    // field update never touches alignmentJson, so it is clobber-safe vs BOTH a batch and an in-flight
-    // aligner — no `aligning` skip needed, and the draft is persisted immediately rather than deferred to
-    // the unmount flush / editCache.
-    if (dirty && current && !saving && editText.trim()) {
-      const seg = current;
-      const text = editText.trim();
-      saving = true;
-      try {
-        await api.updateSegmentFields(seg.id, { annotatedTranscript: text });
-        segments.update((list) =>
-          list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
-        );
-        reviewRows = reviewRows.map((s) =>
-          s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
-        );
-      } catch (e) {
-        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
-          notifications.error($t('review.mustListen'));
-        else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-      } finally {
-        saving = false;
-      }
-    }
+    // Navigation never writes review truth. The selection effect below keeps the outgoing edit in the
+    // session-local editCache and restores it when the reviewer returns; only submit() may durably
+    // commit transcript text together with its immutable human-decision effect.
     const targetRow = queue[target];
     if (targetRow) {
       try {
@@ -764,40 +727,6 @@
     if (current) editText = originalText(current);
     editedChips = {}; // revert the chip overlay too, so it can't claim a fix the reset gold lacks
   }
-
-  // Unmount flush (true-10 audit): editCache is component-local, so leaving review mode via the
-  // ActivityRail destroyed any in-progress correction with zero warning — the same data-loss class
-  // the curate autosave work eliminated. Persist the dirty edit as a DRAFT on teardown, exactly like
-  // go() does on navigation (annotatedTranscript only — never verified, so it is not a decision).
-  // Root-level $effect: its teardown runs once, on component destroy.
-  $effect(() => {
-    return () => {
-      const seg = current;
-      // The empty-edit guard mirrors go() and submit(): a cleared textarea on teardown must not
-      // persist annotatedTranscript='' and blank the gold transcript with no undo entry.
-      if (!seg || !dirty || saving || !editText.trim()) return;
-      const text = editText.trim();
-      // P2.3 (audit F2): persist ONLY annotatedTranscript via the TARGETED field update — never the
-      // whole-row updateSegment. The old whole-row draft spread the (possibly pre-align) store row, so
-      // if a background CTC alignment finished after teardown its real timings were reverted (the
-      // whole-row-clobber class). A field update never touches alignmentJson, so it is clobber-safe
-      // even mid-align and needs NO `aligning` guard — which would instead LOSE this edit, since
-      // editCache dies with the component and teardown cannot re-stash it.
-      segments.update((list) =>
-        list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
-      );
-      reviewRows = reviewRows.map((s) =>
-        s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
-      );
-      // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
-      // this component — so a lost draft is never silent.
-      api.updateSegmentFields(seg.id, { annotatedTranscript: text }).catch((e) => {
-        if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
-          notifications.error($t('review.mustListen'));
-        else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-      });
-    };
-  });
 
   // Transient word-bounded playback window. While set, the player plays exactly
   // [wordStartOverride, wordEndOverride] — so tapping a word plays THAT word (and Loop loops that

@@ -516,6 +516,29 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn record_test_phone_decision(db: &Database, segment_id: &str, decision: &str, text: Option<&str>, reviewer: &str) {
+        let content_hash = blake3::hash(segment_id.as_bytes()).to_hex().to_string();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?2,
+                        alignment_json = json_object(
+                            'source_start_ms', 0,
+                            'source_end_ms', duration_ms,
+                            'chunk_index', 0,
+                            'chunk_count', 1
+                        )
+                  WHERE id = ?1",
+                rusqlite::params![segment_id, content_hash],
+            )
+            .unwrap();
+        let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+        assert!(db
+            .record_phone_human_decision_by_at_revision(segment_id, decision, text, reviewer, revision)
+            .unwrap()
+            .is_some());
+    }
+
     fn make_wav_file(path: &Path) {
         let spec = hound::WavSpec {
             channels: 1,
@@ -553,7 +576,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
-        db.record_human_decision_by(id, "accept", Some("hello"), None, Some("test-reviewer")).unwrap();
+        record_test_phone_decision(db, id, "accept", Some("hello"), "test-reviewer");
     }
 
     fn output_wav_info(path: &Path) -> (u32, u32) {
@@ -832,7 +855,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment_full(&seg).unwrap();
-        db.record_human_decision_by(&seg.id, "edit", Some("known answer"), None, Some("Owner")).unwrap();
+        record_test_phone_decision(&db, &seg.id, "edit", Some("known answer"), "Owner");
 
         let out = tmp.path().join("out");
         let result = export_audio_segments(
@@ -866,7 +889,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
-        db.record_human_decision_by(&seg.id, "edit", Some(exact_correction), None, Some("Rubar")).unwrap();
+        record_test_phone_decision(&db, &seg.id, "edit", Some(exact_correction), "Rubar");
         let expected_revision = db.segment_review_revision(&seg.id).unwrap().unwrap();
 
         let out = tmp.path().join("out");

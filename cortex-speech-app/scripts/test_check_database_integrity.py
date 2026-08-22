@@ -37,7 +37,7 @@ def source_migrations() -> list[tuple[int, str]]:
 
 
 class DatabaseIntegrityGateTests(unittest.TestCase):
-    def test_shared_v59_contract_matches_the_actual_rust_migration(self):
+    def test_shared_hidden_key_contract_matches_the_actual_v59_rust_migration(self):
         source = MIGRATIONS.read_text(encoding="utf-8")
         match = re.search(
             r'version:\s*59,.*?up_sql:\s*"(?P<sql>.*?)",\s*// Once an assignment exists',
@@ -47,7 +47,13 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         self.assertIsNotNone(match, "could not extract migration 59 SQL")
         connection = sqlite3.connect(":memory:")
         connection.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT)")
-        connection.execute("INSERT INTO schema_migrations VALUES(59, 'fixture')")
+        # The hidden-key table is introduced by v59, while the operational contract now requires
+        # the complete v60 schema.  Give this isolated schema fixture the current frontier without
+        # pretending the hidden table moved migrations.
+        connection.executemany(
+            "INSERT INTO schema_migrations VALUES(?, 'fixture')",
+            [(59,), (60,)],
+        )
         connection.executescript(match.group("sql"))
         _evidence, errors = audit_hidden_schema(connection)
         connection.close()
@@ -135,8 +141,8 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         self.assertEqual(report["quickCheck"], ["ok"])
         self.assertEqual(report["integrityCheck"], ["ok"])
         self.assertEqual(report["foreignKeyViolations"], 0)
-        self.assertEqual(report["schemaVersion"], 59)
-        self.assertEqual(report["migrationHistoryEntries"], 59)
+        self.assertEqual(report["schemaVersion"], 60)
+        self.assertEqual(report["migrationHistoryEntries"], 60)
         self.assertEqual(report["v58HypothesisArchiveRows"], 0)
         self.assertEqual(report["v58Loop0ArchiveRows"], 0)
         self.assertEqual(report["v58ImmutableTriggers"], 6)
@@ -322,14 +328,14 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
 
     def test_clean_but_stale_schema_is_red(self):
         connection = sqlite3.connect(self.db)
-        connection.execute("DELETE FROM schema_migrations WHERE version = 59")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 60")
         connection.commit()
         connection.close()
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
-        self.assertEqual(report["schemaVersion"], 58)
-        self.assertEqual(report["requiredSchemaVersion"], 59)
-        self.assertTrue(any("missing=[59]" in error for error in report["errors"]), report)
+        self.assertEqual(report["schemaVersion"], 59)
+        self.assertEqual(report["requiredSchemaVersion"], 60)
+        self.assertTrue(any("missing=[60]" in error for error in report["errors"]), report)
 
     def test_missing_middle_history_or_wrong_description_is_red(self):
         connection = sqlite3.connect(self.db)
@@ -339,7 +345,7 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         connection.close()
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
-        self.assertEqual(report["schemaVersion"], 59, "MAX alone would falsely green this fixture")
+        self.assertEqual(report["schemaVersion"], 60, "MAX alone would falsely green this fixture")
         self.assertTrue(any("missing=[23]" in error for error in report["errors"]), report)
         self.assertTrue(any("descriptionMismatch=[31]" in error for error in report["errors"]), report)
 

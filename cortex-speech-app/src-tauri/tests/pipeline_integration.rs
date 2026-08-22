@@ -1,7 +1,7 @@
 mod fixtures;
 
 use cortex_speech_app_lib::cache::TranscriptCache;
-use cortex_speech_app_lib::db::Database;
+use cortex_speech_app_lib::db::{Database, SpeechSegment};
 use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
@@ -105,7 +105,7 @@ fn test_import_directory_with_wav_files() {
 }
 
 #[test]
-fn test_full_pipeline_import_to_delete() {
+fn test_full_pipeline_import_update_search_and_delete_boundaries() {
     let _crash_breadcrumb = fixtures::crash_breadcrumb("pipeline_integration", "test_full_pipeline_import_to_delete");
     let dir = TempDir::new().unwrap();
 
@@ -142,11 +142,28 @@ fn test_full_pipeline_import_to_delete() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, seg_440.id);
 
-    // Delete phase: remove one segment
-    db.delete_segment(&seg_660.id).unwrap();
+    // Imported processing evidence is durable authority, so deleting that segment must fail closed.
+    let err = db.delete_segment(&seg_660.id).expect_err("an imported segment with durable evidence is append-only");
+    assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
+    assert!(db.get_segment_by_id(&seg_660.id).unwrap().is_some());
+
+    // A genuinely authority-free scratch row remains deletable; the guard is precise, not a blanket
+    // ban on segment cleanup.
+    let disposable = SpeechSegment {
+        id: "authority-free-delete".to_string(),
+        audio_path: "authority-free-delete.wav".to_string(),
+        raw_transcript: "machine draft".to_string(),
+        duration_ms: 1_000,
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&disposable).unwrap();
+    db.delete_segment(&disposable.id).unwrap();
+    assert!(db.get_segment_by_id(&disposable.id).unwrap().is_none());
+
     let remaining = db.get_segments(None).unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].id, seg_440.id);
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|segment| segment.id == seg_440.id));
+    assert!(remaining.iter().any(|segment| segment.id == seg_660.id));
 }
 
 #[test]

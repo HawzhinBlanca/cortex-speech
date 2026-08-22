@@ -319,6 +319,7 @@ mod tests {
             db.insert_segment(&SpeechSegment {
                 id: id.into(),
                 audio_path: format!("/audio/{id}.wav"),
+                raw_transcript: format!("fixture transcript {id}"),
                 verified,
                 ..SpeechSegment::default()
             })

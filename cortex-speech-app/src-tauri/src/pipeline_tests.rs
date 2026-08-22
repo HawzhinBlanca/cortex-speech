@@ -13,6 +13,15 @@ use crate::settings::{AppSettings, AsrModelSize};
 use std::path::Path;
 use std::sync::Arc;
 
+fn set_test_pcm_identity(db: &Database, segment_id: &str) {
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+            rusqlite::params![segment_id, blake3::hash(segment_id.as_bytes()).to_hex().to_string()],
+        )
+        .unwrap();
+}
+
 #[test]
 fn champion_eval_accepts_only_the_exact_registry_identity() {
     let expected = crate::registry::DeploymentIdentity {
@@ -231,6 +240,7 @@ fn loop0_firing_respects_opt_in_and_fires_when_enabled() {
             ..Default::default()
         };
         db.insert_segment(&seg).unwrap();
+        set_test_pcm_identity(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
     }
     let input = "ئەو ساڵە باش بوو";
@@ -273,6 +283,7 @@ fn loop0_would_fire_is_the_shadow_signal_independent_of_the_toggle() {
             ..Default::default()
         };
         db.insert_segment(&seg).unwrap();
+        set_test_pcm_identity(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
     }
     let mems = db.load_correction_memories().unwrap();
@@ -373,6 +384,7 @@ fn fire_loop0_if_enabled_method_uses_the_pipelines_own_db() {
                 ..Default::default()
             };
             db.insert_segment(&seg).unwrap();
+            set_test_pcm_identity(&db, id);
             db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).unwrap();
         }
     }

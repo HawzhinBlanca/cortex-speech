@@ -26,6 +26,47 @@ fn persist_current_pcm_identity(db: &Database, audio_path: &str) {
     db.set_audio_identity(audio_path, &crate::fingerprint::AudioIdentity { spectral: 1, content }).unwrap();
 }
 
+fn record_test_phone_accept(db: &Database, segment_id: &str, reviewer: &str) {
+    let content_hash = blake3::hash(segment_id.as_bytes()).to_hex().to_string();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET audio_content_hash = ?2,
+                    alignment_json = json_object(
+                        'source_start_ms', 0,
+                        'source_end_ms', duration_ms,
+                        'chunk_index', 0,
+                        'chunk_count', 1
+                    )
+              WHERE id = ?1",
+            rusqlite::params![segment_id, content_hash],
+        )
+        .unwrap();
+    let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+    assert!(db
+        .record_phone_human_decision_by_at_revision(segment_id, "accept", None, reviewer, revision)
+        .unwrap()
+        .is_some());
+}
+
+fn record_test_desktop_edit(db: &Database, segment_id: &str, human_fix: &str) -> i64 {
+    let content_hash = blake3::hash(segment_id.as_bytes()).to_hex().to_string();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+            rusqlite::params![segment_id, content_hash],
+        )
+        .unwrap();
+    db.record_human_decision(segment_id, "edit", Some(human_fix), None).unwrap();
+    db.connection()
+        .query_row(
+            "SELECT id FROM human_decision_effect_events WHERE segment_id = ?1 ORDER BY id DESC LIMIT 1",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn insert_publishable_human_gold_segment(db: &Database, tmp: &TempDir, segment_id: &str) -> String {
     let audio = tmp.path().join(format!("{segment_id}.wav"));
     write_test_wav(&audio, 900);
@@ -2145,13 +2186,7 @@ fn draft_export_includes_self_learning_preference_artifacts() {
         created_at: None,
     })
     .unwrap();
-    db.connection()
-        .execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["learning-example-1", "learning-seg-1", "agent wrong text", "human corrected text"],
-        )
-        .unwrap();
+    record_test_desktop_edit(&db, "learning-seg-1", "human corrected text");
 
     // A preference pair elsewhere in the live library must not hitchhike into this bundle when its
     // source is policy-excluded. This row remains in agent_examples after revocation on purpose.
@@ -2162,16 +2197,12 @@ fn draft_export_includes_self_learning_preference_artifacts() {
     db.insert_segment_full(&private_segment).unwrap();
     db.connection()
         .execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                "revoked-learning-example",
-                "revoked-learning-seg",
-                "PRIVATE REVOKED WRONG TEXT",
-                "PRIVATE REVOKED HUMAN TEXT"
-            ],
+            "UPDATE speech_segments SET verdict_transcript = 'PRIVATE REVOKED WRONG TEXT'
+              WHERE id = 'revoked-learning-seg'",
+            [],
         )
         .unwrap();
+    record_test_desktop_edit(&db, "revoked-learning-seg", "PRIVATE REVOKED HUMAN TEXT");
     db.revoke_recording(&private_audio_path).unwrap();
 
     let models = ModelManager::new(tmp.path().join("models"));
@@ -2275,13 +2306,7 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
         created_at: None,
     })
     .unwrap();
-    db.connection()
-        .execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["learning-example-1", "learning-seg-1", "agent wrong text", "human corrected text"],
-        )
-        .unwrap();
+    let effect_id = record_test_desktop_edit(&db, "learning-seg-1", "human corrected text");
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -2291,8 +2316,12 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
     assert!(first.files.contains(&"learning_preferences.jsonl".to_string()));
     assert!(out.join("learning_preferences.jsonl").exists());
 
-    // Withdraw the human edit so the next export has zero pairs.
-    db.connection().execute("DELETE FROM agent_examples WHERE id = 'learning-example-1'", []).unwrap();
+    // Withdraw the human edit through its exact immutable effect. Raw learning history remains;
+    // the effective view retracts it from the next export.
+    assert!(matches!(
+        db.undo_human_decision(effect_id, None, "123e4567-e89b-42d3-a456-426614174055").unwrap(),
+        crate::db::HumanDecisionUndoOutcome::Applied { .. }
+    ));
 
     // Second export into the SAME directory: the stale file must be gone, not re-shipped.
     let second = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
@@ -2453,8 +2482,8 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
     // no human-decision column — correctly, since a freshly imported clip has no reviewer). Attribution
     // exists only once someone actually decides a clip, so drive it through the real decision path.
     // -> Sara=2, notAttributed=1 (s-c is undecided — the same bucket a desktop or pre-v43 decision lands in).
-    db.record_human_decision_by("s-a", "accept", None, None, Some("Sara")).unwrap();
-    db.record_human_decision_by("s-b", "accept", None, None, Some("Sara")).unwrap();
+    record_test_phone_accept(&db, "s-a", "Sara");
+    record_test_phone_accept(&db, "s-b", "Sara");
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");

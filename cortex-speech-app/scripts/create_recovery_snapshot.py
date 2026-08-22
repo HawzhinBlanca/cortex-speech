@@ -40,10 +40,10 @@ from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
 from pilot_focus_contract import verify_controlled_pilot_focus
 from review_pilot_hidden_contract import (
     HIDDEN_KEYS_PER_REVIEWER,
+    HIDDEN_KEY_SCHEMA_VERSION,
     HIDDEN_TABLE as HIDDEN_KEY_TABLE,
     HIDDEN_TABLE_SQL,
     HIDDEN_TRIGGER_SQL,
-    REQUIRED_SCHEMA as HIDDEN_KEY_SCHEMA_VERSION,
     TOTAL_HIDDEN_KEYS,
     ReviewPilotPolicy as HiddenReviewPilotPolicy,
     normalized_sql,

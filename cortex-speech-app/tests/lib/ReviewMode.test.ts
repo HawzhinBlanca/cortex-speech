@@ -13,7 +13,9 @@ const mocks = vi.hoisted(() => ({
   getDatasetStats: vi.fn(),
   getWaveform: vi.fn(),
   alignSegment: vi.fn(),
+  recordPlaybackReceipt: vi.fn(),
   recordHumanDecision: vi.fn(),
+  undoHumanDecision: vi.fn(),
   updateSegmentFields: vi.fn(),
   registerMediaAsset: vi.fn(),
   getMediaAssetUrl: vi.fn(),
@@ -44,6 +46,28 @@ function segment(): SpeechSegment {
   };
 }
 
+function decisionCommit(
+  source: SpeechSegment,
+  action: 'accept' | 'edit' | 'reject',
+  text?: string | null,
+) {
+  return {
+    effectEventId: 101,
+    segmentId: source.id,
+    effectiveAction: action,
+    priorRevision: 0,
+    decidedRevision: 1,
+    segment: {
+      ...source,
+      humanDecision: action,
+      verdict: `human_${action}`,
+      verdictTranscript: text ?? source.verdictTranscript ?? source.rawTranscript,
+      annotatedTranscript: text ?? source.annotatedTranscript,
+      verified: true,
+    },
+  };
+}
+
 describe('ReviewMode windowed queue', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -54,7 +78,16 @@ describe('ReviewMode windowed queue', () => {
     mocks.getSegmentConsensus.mockResolvedValue({ models: [], words: [] });
     mocks.getDatasetStats.mockResolvedValue({ totalSegments: 1, verifiedCount: 0 });
     mocks.getWaveform.mockResolvedValue([0.1, 0.4, 0.2]);
-    mocks.recordHumanDecision.mockResolvedValue(undefined);
+    mocks.recordPlaybackReceipt.mockResolvedValue(undefined);
+    mocks.recordHumanDecision.mockImplementation(
+      async (id: string, action: 'accept' | 'edit' | 'reject', text?: string | null) =>
+        decisionCommit({ ...segment(), id }, action, text),
+    );
+    mocks.undoHumanDecision.mockResolvedValue({
+      status: 'applied',
+      restoredRevision: 2,
+      segment: segment(),
+    });
     mocks.updateSegmentFields.mockResolvedValue(undefined);
     mocks.registerMediaAsset.mockResolvedValue({ id: 'asset-key' });
     mocks.getMediaAssetUrl.mockResolvedValue('C:\\audio\\review.wav');
@@ -111,10 +144,38 @@ describe('ReviewMode windowed queue', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: ckb['review.markBad'] }));
     await waitFor(() =>
-      expect(mocks.updateSegmentFields).toHaveBeenCalledWith('review-1', { verified: true }),
+      expect(mocks.recordHumanDecision).toHaveBeenCalledWith('review-1', 'reject', null),
     );
-    expect(mocks.recordHumanDecision).toHaveBeenCalledWith('review-1', 'reject', null);
+    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
     expect(await screen.findByTestId('review-terminal')).toBeInTheDocument();
+  });
+
+  it('undoes by immutable effect id and applies only the authoritative server row', async () => {
+    const original = segment();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...original, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+    });
+    mocks.getSegment.mockResolvedValue(original);
+    mocks.undoHumanDecision.mockResolvedValue({
+      status: 'applied',
+      restoredRevision: 2,
+      segment: { ...original, rawTranscript: 'authoritative restored text' },
+    });
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: ckb['review.markBad'] }));
+    expect(await screen.findByTestId('review-terminal')).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: 'Backspace', code: 'Backspace' });
+    await waitFor(() =>
+      expect(mocks.undoHumanDecision).toHaveBeenCalledWith(101, expect.any(String)),
+    );
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('authoritative restored text');
+    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
   });
 
   it('never exposes a lightweight row before its chunk metadata is hydrated', async () => {
@@ -203,7 +264,7 @@ describe('ReviewMode windowed queue', () => {
       rawTranscript: 'دەقی دووەم',
       audioPath: 'C:\\audio\\review-2.wav',
     };
-    let resolveDecision!: () => void;
+    let resolveDecision!: (value: ReturnType<typeof decisionCommit>) => void;
     mocks.getDatasetStats.mockResolvedValue({ totalSegments: 2, verifiedCount: 0 });
     mocks.getSegmentsPage.mockResolvedValue({
       items: [
@@ -217,7 +278,7 @@ describe('ReviewMode windowed queue', () => {
       Promise.resolve(id === first.id ? first : second),
     );
     mocks.recordHumanDecision.mockReturnValue(
-      new Promise<void>((resolve) => {
+      new Promise<ReturnType<typeof decisionCommit>>((resolve) => {
         resolveDecision = resolve;
       }),
     );
@@ -241,14 +302,48 @@ describe('ReviewMode windowed queue', () => {
     await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript));
 
-    resolveDecision();
-    await waitFor(() =>
-      expect(mocks.updateSegmentFields).toHaveBeenCalledWith(first.id, {
-        annotatedTranscript: first.rawTranscript,
-        verified: true,
-      }),
-    );
+    resolveDecision(decisionCommit(first, 'accept', first.rawTranscript));
+    await waitFor(() => expect(mocks.updateSegmentFields).not.toHaveBeenCalled());
     expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript);
+  });
+
+  it('keeps navigation drafts in session memory and never persists them without a decision', async () => {
+    const first = segment();
+    const second: SpeechSegment = {
+      ...segment(),
+      id: 'review-2',
+      rawTranscript: 'دەقی دووەم',
+      audioPath: 'C:\\audio\\review-2.wav',
+    };
+    mocks.getDatasetStats.mockResolvedValue({ totalSegments: 2, verifiedCount: 0 });
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [
+        { ...first, alignmentJson: null, evidenceJson: null },
+        { ...second, alignmentJson: null, evidenceJson: null },
+      ],
+      total: 2,
+      nextCursor: null,
+    });
+    mocks.getSegment.mockImplementation((id: string) =>
+      Promise.resolve(id === first.id ? first : second),
+    );
+
+    const view = render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    await fireEvent.input(editor, { target: { value: 'دەقی دەستکاریکراو' } });
+
+    await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript));
+    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.recordHumanDecision).not.toHaveBeenCalled();
+
+    await fireEvent.keyDown(window, { key: 'ArrowLeft', code: 'ArrowLeft' });
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('دەقی دەستکاریکراو'));
+    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+
+    view.unmount();
+    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.recordHumanDecision).not.toHaveBeenCalled();
   });
 
   it('aligns only with hydrated chunk metadata and force-refreshes the persisted result', async () => {
@@ -296,7 +391,7 @@ describe('ReviewMode windowed queue', () => {
     const seg: SpeechSegment = {
       ...segment(),
       id: 'unplayable-1',
-      audioPath: 'C:\audio\gone.wav',
+      audioPath: 'C:\\audio\\gone.wav',
     };
     mocks.getSegmentsPage.mockResolvedValue({ items: [seg], total: 1, nextCursor: null });
     mocks.getSegment.mockResolvedValue(seg);

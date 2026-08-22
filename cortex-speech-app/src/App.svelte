@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import * as api from './lib/commands';
   import { createAutosaveController } from './lib/autosave';
@@ -93,13 +93,12 @@
   import {
     parseSourceMeta,
     parseWordTimestamps,
-    mergeWordTimestamps,
     chunkPlaybackRange,
     segmentSourceFilename,
     truncateFilename,
     segmentChunkLabel,
   } from './lib/alignment';
-  import { wordPlayBounds, replaceWordToken } from './lib/wordEdit';
+  import { wordPlayBounds } from './lib/wordEdit';
 
   type HistoryPanelApi = {
     recordAction: (description: string, type: 'edit' | 'verify' | 'delete' | 'import') => void;
@@ -136,37 +135,45 @@
     localStorage.setItem('cortex.sidebarWidth', String(sidebarWidth));
     localStorage.setItem('cortex.statsWidth', String(statsWidth));
   });
-  let verifyInFlight = $state(false);
   let batchSpeakerId = $state('');
   let editorTab = $state<'interactive' | 'raw'>('interactive');
-  let editingWordIndex = $state<number | null>(null);
   let historyPanel = $state<HistoryPanelApi | null>(null);
   let latestAgentReport = $state<AgentImportReport | null>(null);
   let latestAgentStageEvents = $state<AgentStageEvent[]>([]);
 
-  let saveState = $state<'idle' | 'saving' | 'saved'>('idle');
-  // Debounced auto-save lives in a standalone, unit-tested controller (lib/autosave.ts). It keys the
-  // debounce per target segment and FLUSHES a queued edit before re-keying to a different segment, so
-  // switching segments mid-debounce can never silently drop the prior segment's edit (the round-16
-  // data-loss fix). The controller re-reads the fresh row at fire time and re-applies only the user's
-  // edited fields, so a concurrent background reload (WSL/import/batch completion) or a verify/normalize
-  // can't clobber an in-progress keystroke, and a row that has since been DELETED is never resurrected
-  // (getRow returns null -> no save). `pendingId()` lets delete/re-transcribe paths drop the queued
-  // edit for one specific segment without touching an unrelated segment's pending save.
+  type SegmentMetadataFields = Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>;
+  // The library is deliberately read-only for review truth. This controller persists only independent
+  // metadata, and its runtime key check fails closed if a future caller tries to smuggle transcript or
+  // verification fields through the generic autosave plumbing.
   const autosave = createAutosaveController<SpeechSegment>({
     targetId: () => get(selectedSegment)?.id ?? null,
     getRow: (id) => get(segments).find((s) => s.id === id) ?? null,
-    // F10 root fix: persist ONLY the edited fields via the partial-update IPC — the backend reads the
-    // FRESH row under its lock and applies just these fields, so a debounced save during a
-    // minutes-long batch can never merge a stale store row over concurrently-written columns.
-    save: (_row, fields, id) => api.updateSegmentFields(id, fields),
-    onState: (s) => {
-      saveState = s;
-      if (s === 'saved') {
-        setTimeout(() => {
-          if (saveState === 'saved') saveState = 'idle';
-        }, 2000);
+    save: (_row, fields, id) => {
+      const unexpected = Object.keys(fields).filter(
+        (key) => key !== 'speakerId' && key !== 'alignmentJson',
+      );
+      if (unexpected.length > 0) {
+        return Promise.reject(
+          new Error(`Refusing non-metadata autosave fields: ${unexpected.join(', ')}`),
+        );
       }
+
+      const metadata: SegmentMetadataFields = {};
+      if ('speakerId' in fields) {
+        const speakerId = fields.speakerId;
+        if (speakerId !== null && typeof speakerId !== 'string') {
+          return Promise.reject(new Error('Refusing invalid speakerId metadata'));
+        }
+        metadata.speakerId = speakerId;
+      }
+      if ('alignmentJson' in fields) {
+        const alignmentJson = fields.alignmentJson;
+        if (alignmentJson !== null && typeof alignmentJson !== 'string') {
+          return Promise.reject(new Error('Refusing invalid alignmentJson metadata'));
+        }
+        metadata.alignmentJson = alignmentJson;
+      }
+      return api.updateSegmentFields(id, metadata);
     },
     onError: (e) => notifications.error($t('notifications.saveFailed'), { detail: String(e) }),
   });
@@ -284,66 +291,13 @@
     return stage.replaceAll('_', ' ');
   }
 
-  // Thin delegates over the tested autosave controller (lib/autosave.ts). The controller owns the
-  // per-segment debounce, the flush-before-rekey (no dropped edit on segment switch), the fresh-row
-  // re-read + field overlay (no clobber of concurrent verify/normalize/background-reload changes), and
-  // the deleted-row guard (getRow null -> no resurrecting INSERT-ON-CONFLICT). Keeping these wrappers
-  // preserves every existing call site's intent without re-deriving that logic inline.
-
-  // Cancel a pending save WITHOUT persisting — used when the pending segment is deleted, so its
-  // debounced edit can't fire after the row is gone and resurrect it via INSERT-ON-CONFLICT.
+  // Cancel pending metadata WITHOUT persisting when its target is about to be deleted.
   function cancelPendingSave() {
     autosave.cancel();
-    if (saveState === 'saving') saveState = 'idle';
   }
 
-  function scheduleAutoSave(edits: Partial<SpeechSegment> = {}) {
+  function scheduleAutoSave(edits: SegmentMetadataFields) {
     autosave.schedule(edits);
-  }
-
-  // The interactive chip strip, so an explicit editor close (Enter/Escape) restores focus to the
-  // chip (WCAG 2.4.3). Not called on blur — a Tab/click away already moved focus correctly.
-  let interactiveStripEl = $state<HTMLElement | undefined>();
-  function refocusChip(idx: number) {
-    void tick().then(() =>
-      interactiveStripEl?.querySelector<HTMLElement>(`[data-chip="${idx}"]`)?.focus(),
-    );
-  }
-
-  function finishEditingWord(index: number, newValue: string) {
-    const fix = newValue.trim();
-    const oldWord = $wordTimestamps[index]?.word;
-    // Unchanged or empty = cancel.
-    if (!fix || fix === oldWord) {
-      editingWordIndex = null;
-      return;
-    }
-    const updatedWords = [...$wordTimestamps];
-    updatedWords[index] = { ...updatedWords[index], word: fix };
-    wordTimestamps.set(updatedWords);
-
-    const seg = $selectedSegment;
-    if (seg) {
-      const alignmentJson = mergeWordTimestamps(seg.alignmentJson, updatedWords);
-      // Apply the ONE word change into the EXISTING transcript (preserving punctuation and any
-      // text-editor-tab / LLM-refined divergence) via the strict token replace — NOT a rebuild from
-      // the bare alignment-word join, which silently drops that divergence. If the token can't be
-      // located confidently (diverged / repeated), update only the alignment word and leave the
-      // transcript untouched rather than corrupt the gold.
-      const currentText = seg.annotatedTranscript ?? '';
-      const replaced = replaceWordToken(
-        currentText,
-        index,
-        oldWord ?? '',
-        fix,
-        updatedWords.length,
-      );
-      const patch =
-        replaced !== null ? { alignmentJson, annotatedTranscript: replaced } : { alignmentJson };
-      segments.update((arr) => arr.map((s) => (s.id === seg.id ? { ...s, ...patch } : s)));
-      scheduleAutoSave(patch);
-    }
-    editingWordIndex = null;
   }
 
   // Transient word-bounded playback window: while set, the player plays exactly
@@ -393,19 +347,17 @@
         });
     }
   });
-  // Tap a word → play EXACTLY that word; with an index (double-tap / F2), also open its inline editor
-  // so the fix is typed right where the ear just confirmed the error.
-  function playWordClip(w: WordTimestamp, idx?: number) {
+  // Tap a word → play exactly that word. Human corrections belong exclusively to Review Mode.
+  function playWordClip(w: WordTimestamp) {
     const b = wordPlayBounds(w, chunkStartTime, chunkEndTime);
     // Idempotent play: a double-click dispatches click,click,dblclick — don't hard-reseek the same
-    // word 2–3× (a stutter). Still open the editor (idx) even when the reseek is skipped.
+    // word 2–3× (a stutter).
     if (!(isAudioPlaying && wordStartOverride === b.start && wordEndOverride === b.end)) {
       wordStartOverride = b.start;
       wordEndOverride = b.end;
       currentTime = b.start;
       isAudioPlaying = true;
     }
-    if (idx !== undefined) editingWordIndex = idx;
   }
 
   let chunkStartTime = $derived.by(() => {
@@ -643,8 +595,8 @@
           }
         })
         .catch((e) => console.error('crash check failed', e));
-      // Flush the debounced autosave BEFORE the native window closes so the last correction of a
-      // session is never lost — onDestroy does not reliably run on a Tauri window close. The flush is
+      // Flush pending metadata BEFORE the native window closes so the last speaker/alignment edit is
+      // not lost — onDestroy does not reliably run on a Tauri window close. The flush is
       // bounded by a 3s timeout so a stuck backend can never prevent the app from closing.
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
@@ -695,8 +647,7 @@
     globalKeyboardManager?.destroy();
     closeUnlisten?.();
     if (healthInterval) clearInterval(healthInterval);
-    // Flush (not just cancel) a pending edit on teardown so a correction typed in the last debounce
-    // window before exit is still persisted, rather than silently dropped by a bare clearTimeout.
+    // Flush (not just cancel) pending non-review metadata on teardown.
     autosave.flush();
     if (sessionSaveTimeout) clearTimeout(sessionSaveTimeout);
   });
@@ -755,14 +706,6 @@
         category: 'navigation',
       },
       {
-        key: 's',
-        ctrl: true,
-        description: 'Save annotation',
-        descriptionKey: 'saveAnnotation',
-        action: handleSaveAnnotation,
-        category: 'edit',
-      },
-      {
         key: 'z',
         ctrl: true,
         description: 'Undo',
@@ -782,14 +725,6 @@
         action: () => handleRedo(),
         category: 'edit',
         allowInReview: true, // handleRedo self-guards on review surfaces (no-op there)
-      },
-      {
-        key: 'd',
-        ctrl: true,
-        description: 'Toggle verified',
-        descriptionKey: 'toggleVerified',
-        action: handleToggleVerify,
-        category: 'edit',
       },
       {
         key: 'Delete',
@@ -896,14 +831,6 @@
         description: 'Play/pause',
         descriptionKey: 'playPause',
         action: () => (isAudioPlaying = !isAudioPlaying),
-        category: 'playback',
-      },
-      {
-        key: 'Enter',
-        ctrl: true,
-        description: 'Toggle verification',
-        descriptionKey: 'toggleVerified',
-        action: handleToggleVerify,
         category: 'playback',
       },
       {
@@ -1192,10 +1119,6 @@
       notifications.info($t('asr.reopenBeforeRetranscribe'));
       return;
     }
-    // Re-transcription replaces this segment's text with fresh MACHINE output, so drop any pending
-    // autosave for it first — otherwise the debounced pre-edit annotation fires AFTER this write and
-    // clobbers the new transcript (the same clobber the delete paths already cancel against).
-    if (autosave.pendingId() === seg.id) cancelPendingSave();
     startOperation('transcribe');
     isProcessing.set(true);
     pipelinePhase.set('transcribing');
@@ -1221,10 +1144,6 @@
         }
       }
       await loadSegments();
-      // A save armed WHILE the multi-second ASR await ran is still pending here and would fire AFTER
-      // this write, re-clobbering the fresh machine transcript — drop it too. (JS is single-threaded, so
-      // no pending debounce macrotask can interleave between the await resolving and this line.)
-      if (autosave.pendingId() === seg.id) cancelPendingSave();
       notifications.success($t('notifications.transcriptionComplete'));
     } catch (e) {
       // The champion (7B) is the production engine. If it is down, fail closed and retry only it.
@@ -1238,62 +1157,6 @@
       pipelinePhase.set('idle');
       statusMessage.set($t('ready'));
       endOperation('transcribe');
-    }
-  }
-
-  async function handleNormalize() {
-    const seg = $selectedSegment;
-    if (!seg?.rawTranscript) return;
-    if (!requireDesktopRuntime()) return;
-    // P2.3 (audit F2): refuse while a batch/import is running. normalizedTranscript is not in the
-    // targeted field-update whitelist, so this handler must upsert the whole row — and during a batch
-    // the STORE row is stale vs the DB (the batch writes on its own connection, the store is not
-    // reloaded yet), so the freshRow-by-id below re-reads a stale copy and the upsert reverts the
-    // batch's freshly-written columns for this segment. Every sibling mutator already guards $isProcessing.
-    if ($isProcessing) return;
-    try {
-      const normalizedTranscript = await api.normalizeText(seg.rawTranscript);
-      const updatedSeg = {
-        // freshRow-by-id: a concurrent verify/edit/align stamp may have updated the row during the
-        // normalize await — never upsert the stale pre-await copy (the whole-row clobber class), same
-        // guard as the transcribe handlers above.
-        ...($segments.find((s) => s.id === seg.id) ?? seg),
-        normalizedTranscript,
-      };
-      await api.updateSegment(updatedSeg);
-      // Update the store only AFTER the persist succeeds. Mutating it first left unsaved state in the
-      // UI on a failed save — which a later unrelated auto-save would then silently persist.
-      segments.update((arr) =>
-        arr.map((s) => (s.id === seg.id ? { ...s, normalizedTranscript } : s)),
-      );
-      notifications.success($t('notifications.textNormalized'));
-    } catch (e) {
-      notifications.error($t('notifications.normalizationFailed'), { detail: String(e) });
-    }
-  }
-
-  async function handleSaveAnnotation() {
-    const seg = $selectedSegment;
-    if (!seg) return;
-    if (!requireDesktopRuntime()) return;
-    try {
-      // Field-level update, NOT a whole-row updateSegment. The Save button is reachable while a background
-      // batch-verify has written verified=true to the DB but the store row is still stale (verified=false);
-      // a whole-row upsert of $selectedSegment would revert that concurrent verify — and freshRow-by-id
-      // wouldn't help because the store itself is the stale source. update_segment_fields reads the FRESH
-      // row under the DB lock, applies ONLY annotatedTranscript, and still records undo history — the same
-      // safe path the oninput autosave already uses (scheduleAutoSave({ annotatedTranscript })).
-      await api.updateSegmentFields(seg.id, { annotatedTranscript: seg.annotatedTranscript });
-      await historyStore.refresh();
-      if (historyPanel) {
-        historyPanel.recordAction(
-          `Saved annotation: "${truncateFilename(segmentSourceFilename(seg.audioPath))}"`,
-          'edit',
-        );
-      }
-      notifications.success($t('notifications.annotationSaved'));
-    } catch (e) {
-      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
     }
   }
 
@@ -1342,56 +1205,6 @@
     }
   }
 
-  async function handleToggleVerify() {
-    const seg = $selectedSegment;
-    if (!seg || verifyInFlight || $isProcessing) return;
-    if (!requireDesktopRuntime()) return;
-    verifyInFlight = true;
-
-    const originalVerified = seg.verified;
-    const nextVerified = !originalVerified;
-
-    // Optimistic Update
-    segments.update((list) =>
-      list.map((s) => (s.id === seg.id ? { ...s, verified: nextVerified } : s)),
-    );
-    if (historyPanel) {
-      historyPanel.recordAction(
-        `${nextVerified ? 'Verified' : 'Unverified'} segment: ${truncateFilename(segmentSourceFilename(seg.audioPath))}`,
-        'verify',
-      );
-    }
-
-    try {
-      // Field-level (fresh-read-by-id, verified only) — NOT a whole-row updateSegment upsert. A whole-row
-      // spread of the stale `seg` would revert any column a concurrent NO-$isProcessing writer changed on
-      // that row — notably the WSL-7B refinement loop's raw_transcript write (it runs on wsl-log events, so
-      // the Verify button stays live). Same fix the sibling save handlers already got.
-      await api.updateSegmentFields(seg.id, { verified: nextVerified });
-      // Invalidate any in-flight load so its stale pre-write data won't clobber the verified write.
-      // This closes the race window: a background load dispatched before this write will check its
-      // generation and return early rather than applying pre-write data.
-      segments.bumpLoadGeneration();
-      // Then re-apply verified state for consistency (in case a load started between optimize and bump).
-      segments.update((list) =>
-        list.map((s) => (s.id === seg.id ? { ...s, verified: nextVerified } : s)),
-      );
-      // The bump above may have cancelled a legitimate reload (e.g. a WSL batch completion refresh
-      // walking its pages) whose data would then never arrive — run a FRESH load, which reads
-      // post-write rows and so carries both the batch results and this verify.
-      void segments.load();
-      await historyStore.refresh();
-    } catch (e) {
-      // Revert Svelte store state on error
-      segments.update((list) =>
-        list.map((s) => (s.id === seg.id ? { ...s, verified: originalVerified } : s)),
-      );
-      notifications.error($t('errors.verifyFailed'), { detail: String(e) });
-    } finally {
-      verifyInFlight = false;
-    }
-  }
-
   function handleDeleteWithConfirm() {
     const seg = $selectedSegment;
     if (!seg) return;
@@ -1411,9 +1224,8 @@
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
     try {
-      // Field-level update, same reason as handleSaveAnnotation: a whole-row updateSegment of the stale
-      // $selectedSegment would revert a concurrent batch-verify's verified=true. update_segment_fields
-      // writes only speakerId onto the fresh row (and records undo history), like the oninput autosave.
+      // Speaker attribution is independent metadata. Persist only that field onto the fresh row;
+      // review transcript and verification truth remain unreachable from the library.
       await api.updateSegmentFields(seg.id, { speakerId: seg.speakerId });
       notifications.success($t('speaker.saved'));
     } catch (e) {
@@ -1611,45 +1423,6 @@
       isProcessing.set(false);
       statusMessage.set($t('ready'));
       endOperation('batch-transcribe');
-    }
-  }
-
-  async function handleBatchVerify(mode: 'pending' | 'selected') {
-    if ($isProcessing) return;
-    if (!requireDesktopRuntime()) return;
-
-    const ids =
-      mode === 'pending'
-        ? // Exclude no-content rows (placeholder "[Pending WSL 7B ASR]" / "[ASR unavailable…]" or empty):
-          // "Verify All Pending" must never mark a placeholder verified. It wouldn't ship (export excludes
-          // placeholders) but it would STRAND the row — the WSL-7B refinement loop skips verified rows
-          // (update_asr_transcript_if_unreviewed's verified=0 guard), so the placeholder could never be
-          // filled — and it dishonestly counts as verified. Root of the recurring class iter 127 only
-          // band-aided at the count. Same hasRealTranscript gate the verified tally uses.
-          await resolveViewIds('real', false, null)
-        : $selectedSegmentId
-          ? [$selectedSegmentId]
-          : [];
-    if (ids === null) return;
-
-    if (mode === 'selected' && !$selectedSegmentId) {
-      notifications.warning($t('batchVerify.noSelection'));
-      return;
-    }
-    if (ids.length === 0) {
-      notifications.info($t('batchVerify.nothingToVerify'));
-      return;
-    }
-
-    startOperation('batch-verify');
-    statusMessage.set($t('batchVerify.progress', { n: String(ids.length) }));
-    try {
-      await api.batchVerify(ids, true);
-    } catch (e) {
-      notifications.error($t('batchVerify.failed'), { detail: String(e) });
-      batchProgress.set({ status: 'idle', completed: 0, total: 0, percent: 0 });
-      statusMessage.set($t('ready'));
-      endOperation('batch-verify');
     }
   }
 
@@ -1892,11 +1665,6 @@
     const m = Math.floor(ms / 60000);
     const s = Math.floor((ms % 60000) / 1000);
     return `${m}:${s.toString().padStart(2, '0')}`;
-  }
-
-  function focusOnMount(node: HTMLInputElement) {
-    node.focus();
-    node.select();
   }
 </script>
 
@@ -2407,22 +2175,6 @@
                   : $t('desktopRuntimeRequired')}>{$t('batchTranscribe.filtered')}</button
               >
             </div>
-            <div class="flex flex-wrap gap-1">
-              <button
-                class="btn btn-secondary btn-sm !text-[10px] flex-1"
-                onclick={() => handleBatchVerify('pending')}
-                disabled={!tauriAvailable || $isProcessing || $segmentStats.pending === 0}
-                title={tauriAvailable ? $t('batchVerify.allPending') : $t('desktopRuntimeRequired')}
-                >{$t('batchVerify.allPending')}</button
-              >
-              <button
-                class="btn btn-secondary btn-sm !text-[10px] flex-1"
-                onclick={() => handleBatchVerify('selected')}
-                disabled={!tauriAvailable || $isProcessing || !$selectedSegmentId}
-                title={tauriAvailable ? $t('batchVerify.selected') : $t('desktopRuntimeRequired')}
-                >{$t('batchVerify.selected')}</button
-              >
-            </div>
             <div class="flex flex-wrap gap-1 items-center">
               <input
                 class="input !text-[10px] flex-1 !py-1 !px-2 font-mono"
@@ -2846,11 +2598,6 @@
                     >
                   {/if}
                 </button>
-                <button
-                  class="btn btn-secondary !text-xs"
-                  onclick={handleNormalize}
-                  disabled={$isProcessing}>{$t('normalize')}</button
-                >
               </div>
             </div>
 
@@ -2909,7 +2656,7 @@
                     : 'text-cortex-400 hover:text-cortex-200'}"
                   onclick={() => (editorTab = 'raw')}
                 >
-                  {$t('editorTextEditor')}
+                  {$t('annotation')}
                 </button>
               </div>
             </div>
@@ -2922,77 +2669,33 @@
                   <!-- Kurdish is RTL: this flex row of word-chips must be dir=rtl so the chips
                        lay out right-to-left; otherwise the first spoken word sits leftmost and the
                        words read reversed. -->
-                  <div
-                    class="flex flex-wrap gap-x-1.5 gap-y-2"
-                    dir="rtl"
-                    lang="ckb"
-                    bind:this={interactiveStripEl}
-                  >
-                    {#each $wordTimestamps as w, idx}
+                  <div class="flex flex-wrap gap-x-1.5 gap-y-2" dir="rtl" lang="ckb">
+                    {#each $wordTimestamps as w}
                       <!-- Word times are CLIP-relative; compare/seek against the clip offset so an
                            offset chunk highlights + seeks correctly (not at the whole-file position). -->
                       {@const isActive =
                         currentTime - chunkStartTime >= w.start &&
                         currentTime - chunkStartTime <= w.end}
-                      <!-- Single click / Enter / Space = play just this word (listen). Double-click /
-                           F2 = edit it inline. Decoupled so a listen tap never opens an input under
-                           the keyboard and silently rewrites the transcript on blur. -->
+                      <!-- Library chips are playback-only. Human corrections are committed through
+                           Review Mode's atomic decision path. -->
                       <span
-                        data-chip={idx}
                         class="relative inline-block px-1.5 py-0.5 rounded cursor-pointer transition-all duration-150 group
                         {isActive
                           ? 'bg-cortex-700 text-default font-bold border-b border-yellow-400'
                           : 'text-cortex-200 hover:bg-cortex-800 hover:text-white'}"
                         onclick={() => playWordClip(w)}
-                        ondblclick={() => playWordClip(w, idx)}
-                        title="{w.word} ({w.start.toFixed(2)}s - {w.end.toFixed(2)}s) — {$t(
-                          'review.wordChipHint',
-                        )}"
+                        title="{w.word} ({w.start.toFixed(2)}s - {w.end.toFixed(2)}s)"
                         role="button"
                         tabindex="0"
-                        aria-keyshortcuts="Enter Space F2"
+                        aria-keyshortcuts="Enter Space"
                         onkeydown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
                             playWordClip(w);
                             e.preventDefault();
-                          } else if (e.key === 'F2') {
-                            // Keyboard path into inline word-edit without playback.
-                            editingWordIndex = idx;
-                            e.preventDefault();
                           }
                         }}
                       >
-                        {#if editingWordIndex === idx}
-                          <!-- stopPropagation: the input lives INSIDE the clickable chip — without it
-                               a caret click replays the word and Space/Enter bubble into the chip's
-                               keydown (Space could never be typed into a correction). -->
-                          <input
-                            type="text"
-                            dir="rtl"
-                            lang="ckb"
-                            class="bg-cortex-800 text-white text-xs px-1 border border-cortex-500 rounded outline-none focus:ring-1 focus:ring-cortex-400 w-16 text-start"
-                            value={w.word}
-                            aria-label={$t('review.editWordAria')}
-                            onclick={(e) => e.stopPropagation()}
-                            ondblclick={(e) => e.stopPropagation()}
-                            onblur={(e) =>
-                              finishEditingWord(idx, (e.target as HTMLInputElement).value)}
-                            onkeydown={(e) => {
-                              e.stopPropagation();
-                              if (e.key === 'Enter') {
-                                finishEditingWord(idx, (e.target as HTMLInputElement).value);
-                                refocusChip(idx);
-                              }
-                              if (e.key === 'Escape') {
-                                editingWordIndex = null;
-                                refocusChip(idx);
-                              }
-                            }}
-                            use:focusOnMount
-                          />
-                        {:else}
-                          <span class="select-text">{w.word}</span>
-                        {/if}
+                        <span class="select-text">{w.word}</span>
                         <span
                           class="absolute -top-6 left-1/2 -translate-x-1/2 px-1.5 py-0.5 text-[8px] bg-cortex-950 text-cortex-400 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-10 border border-cortex-850 shadow-md"
                         >
@@ -3013,18 +2716,7 @@
                 lang="ckb"
                 class="input h-32 resize-none font-mono text-sm text-end"
                 value={$selectedSegment.annotatedTranscript ?? ''}
-                placeholder={$t('editTranscript')}
-                disabled={$isProcessing}
-                oninput={(e) => {
-                  const seg = $selectedSegment;
-                  if (seg) {
-                    const annotatedTranscript = (e.target as HTMLTextAreaElement).value;
-                    segments.update((arr) =>
-                      arr.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript } : s)),
-                    );
-                    scheduleAutoSave({ annotatedTranscript });
-                  }
-                }}
+                readonly
               ></textarea>
             {/if}
 
@@ -3044,8 +2736,7 @@
                       segments.update((arr) =>
                         arr.map((s) => (s.id === seg.id ? { ...s, speakerId } : s)),
                       );
-                      // Persist like the annotation field, so the speaker edit isn't left only in the
-                      // store (lost on reload) or silently piggybacked onto an unrelated later save.
+                      // Speaker attribution is non-review metadata and may autosave independently.
                       scheduleAutoSave({ speakerId });
                     }
                   }}
@@ -3092,52 +2783,6 @@
             {/if}
 
             <div class="flex gap-2 pt-1">
-              <button class="btn btn-primary !text-xs relative" onclick={handleSaveAnnotation}>
-                {#if saveState === 'saving'}
-                  <span class="flex items-center gap-1">
-                    <svg class="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24"
-                      ><circle
-                        class="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        stroke-width="4"
-                      /><path
-                        class="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                      /></svg
-                    >
-                    {$t('saving')}
-                  </span>
-                {:else if saveState === 'saved'}
-                  <span class="text-success">✓ {$t('saved')}</span>
-                {:else}
-                  {$t('save')}
-                {/if}
-                {#if showHotkeyOverlay}
-                  <span
-                    class="absolute -top-1.5 -right-1.5 bg-cyan-400 text-black text-[8px] font-mono font-bold px-1 rounded shadow-md border border-cyan-500 select-none z-50 pointer-events-none"
-                    >^S</span
-                  >
-                {/if}
-              </button>
-
-              <button
-                data-testid="verify-btn"
-                class="btn btn-secondary !text-xs relative"
-                onclick={handleToggleVerify}
-                disabled={verifyInFlight || $isProcessing}
-              >
-                {$selectedSegment.verified ? $t('unverify') : $t('verify')}
-                {#if showHotkeyOverlay}
-                  <span
-                    class="absolute -top-1.5 -right-1.5 bg-cyan-400 text-black text-[8px] font-mono font-bold px-1 rounded shadow-md border border-cyan-500 select-none z-50 pointer-events-none"
-                    >^D</span
-                  >
-                {/if}
-              </button>
               <button
                 class="btn btn-secondary !text-xs"
                 onclick={handleAlign}
@@ -3444,9 +3089,8 @@
 
 <KeyboardShortcuts />
 
-<!-- reviewActive filters the palette to allowInReview commands: without it, Ctrl+K re-opened the
-     exact hidden-selection hole the keyboard manager's review suppression closes (running e.g.
-     "Toggle verified" from the palette verifies the INVISIBLE curate selection — unreviewed gold). -->
+<!-- reviewActive keeps background-library commands unreachable while either dedicated review surface
+     owns the keyboard and visible selection. -->
 <CommandPalette
   open={showCommandPalette}
   reviewActive={viewMode === 'review' || $showReviewInbox}

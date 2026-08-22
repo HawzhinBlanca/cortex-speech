@@ -210,31 +210,14 @@ export async function getSignalAnomalySegments(limit = 100): Promise<SpeechSegme
   return data;
 }
 
-export async function updateSegment(segment: SpeechSegment): Promise<void> {
-  return invoke<void>('update_segment', { segment });
-}
-
 /**
- * F10 root fix — partial autosave update. Sends ONLY the edited curation fields
- * (annotatedTranscript / speakerId / alignmentJson); the backend reads the FRESH row and applies them
- * under its lock, so a debounced save during a long batch can never merge against a stale store row
- * and revert concurrently-written columns. Resolves false when the row no longer exists (deleted
- * mid-debounce — a safe no-op, never a resurrecting upsert).
+ * Partial metadata update for fields that do not own human-review truth. Transcript corrections and
+ * verification are committed only by recordHumanDecision, so they are intentionally unrepresentable
+ * in this frontend wrapper. Resolves false when the row no longer exists.
  */
-/**
- * Lossless review-undo restore: writes the WHOLE pre-decision snapshot back, including the
- * jury/decision columns that updateSegment deliberately omits — so undoing a re-decision can never
- * erase the earlier human decision (the 2026-07-14 live-test data loss, reproduced + fixed).
- */
-export async function restoreSegmentSnapshot(segment: SpeechSegment): Promise<void> {
-  return invoke<void>('restore_segment_snapshot', { segment });
-}
-
 export async function updateSegmentFields(
   segmentId: string,
-  fields: Partial<
-    Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson' | 'verified'>
-  >,
+  fields: Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>,
 ): Promise<boolean> {
   return invoke<boolean>('update_segment_fields', { segmentId, fields });
 }
@@ -933,10 +916,6 @@ export async function exportAudio(
   return invoke('export_audio', { segmentIds, options });
 }
 
-export async function batchVerify(ids: string[], verified: boolean): Promise<{ status: string }> {
-  return invoke('batch_verify', { ids, verified });
-}
-
 export async function batchAssignSpeaker(
   ids: string[],
   speakerId: string,
@@ -1273,50 +1252,85 @@ export async function recordPlaybackReceipt(args: {
   });
 }
 
+export interface HumanDecisionCommit {
+  effectEventId: number;
+  segmentId: string;
+  effectiveAction: 'accept' | 'edit' | 'reject';
+  priorRevision: number;
+  decidedRevision: number;
+  segment: SpeechSegment;
+}
+
+export type HumanDecisionUndoOutcome =
+  | { status: 'applied'; restoredRevision: number; segment: SpeechSegment }
+  | { status: 'alreadyApplied'; segment: SpeechSegment }
+  | { status: 'conflict'; segment: SpeechSegment };
+
 export async function recordHumanDecision(
   segmentId: string,
   decision: 'accept' | 'edit' | 'reject',
   correctedTranscript?: string | null,
   timestampMs: number = Date.now(),
-): Promise<void> {
-  // M2.1 / P1.1: send the decision timestamp so decision_log is actually populated (it was dead
-  // before — the backend only inserts `if let Some(ts_ms)`, and this wrapper never passed one).
-  return invoke<void>('record_human_decision', {
+): Promise<HumanDecisionCommit> {
+  // Freeze one client-authored identity and one payload across the bounded replay. If the backend
+  // committed but the WebView lost the response, the retry resolves that exact effect instead of
+  // creating a second decision. A changed payload under the same UUID is rejected server-side.
+  const operationId = crypto.randomUUID();
+  const args = {
     segmentId,
     decision,
     correctedTranscript: correctedTranscript ?? null,
     timestampMs,
-  });
+    operationId,
+  };
+  try {
+    return await invoke<HumanDecisionCommit>('record_human_decision', args);
+  } catch {
+    return invoke<HumanDecisionCommit>('record_human_decision', args);
+  }
 }
 
-/** P3-3: Revert a segment to unreviewed state. Use this for undo instead of re-recording a decision. */
-export async function clearHumanDecision(segmentId: string): Promise<void> {
-  return invoke<void>('clear_human_decision', { segmentId });
+/** Exact server-owned inverse of one committed human decision. */
+export async function undoHumanDecision(
+  effectEventId: number,
+  operationId: string,
+): Promise<HumanDecisionUndoOutcome> {
+  return invoke<HumanDecisionUndoOutcome>('undo_human_decision', { effectEventId, operationId });
 }
 
-/** Undo a review-inbox flag(): clear the escalation it set (inverse of flag, unlike clearHumanDecision). */
-export async function clearEscalation(segmentId: string): Promise<void> {
-  return invoke<void>('clear_escalation', { segmentId });
+export interface HumanFlagCommit {
+  effectEventId: number;
+  segmentId: string;
+  priorRevision: number;
+  flagRevision: number;
+  segment: SpeechSegment;
 }
 
-export async function writeSegmentVerdict(
+export type HumanFlagUndoOutcome =
+  | { status: 'applied'; restoredRevision: number; segment: SpeechSegment }
+  | { status: 'alreadyApplied'; segment: SpeechSegment }
+  | { status: 'conflict'; segment: SpeechSegment };
+
+/** Atomically flag one undecided row and retain a database-owned exact inverse. */
+export async function recordReviewFlag(
   segmentId: string,
-  verdict: string,
-  transcript?: string | null,
-  rationale?: string | null,
-  evidenceJson?: string | null,
-  agreementScore?: number | null,
-  escalated?: boolean,
-): Promise<void> {
-  return invoke<void>('write_segment_verdict', {
-    segmentId,
-    verdict,
-    transcript: transcript ?? null,
-    rationale: rationale ?? null,
-    evidenceJson: evidenceJson ?? null,
-    agreementScore: agreementScore ?? null,
-    escalated: escalated ?? false,
-  });
+  rationale: string,
+): Promise<HumanFlagCommit> {
+  const operationId = crypto.randomUUID();
+  const args = { segmentId, rationale, operationId };
+  try {
+    return await invoke<HumanFlagCommit>('record_review_flag', args);
+  } catch {
+    return invoke<HumanFlagCommit>('record_review_flag', args);
+  }
+}
+
+/** Exact server-owned inverse of one committed review flag. */
+export async function undoReviewFlag(
+  effectEventId: number,
+  operationId: string,
+): Promise<HumanFlagUndoOutcome> {
+  return invoke<HumanFlagUndoOutcome>('undo_review_flag', { effectEventId, operationId });
 }
 
 export async function getEscalationRateTrend(): Promise<EscalationTrendPoint[]> {

@@ -12,11 +12,20 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from pilot_focus_contract import PLAYBACK_GUARD_VERSION
 
-REQUIRED_SCHEMA = 59
+
+# Operational paid-review code requires the complete v60 effect graph.  The durable hidden-key
+# authority itself was introduced one migration earlier; recovery code must keep that historical
+# boundary separate so it can still verify honest v59 snapshots instead of pretending the table
+# first appeared in v60.
+REQUIRED_SCHEMA = 60
+HIDDEN_KEY_SCHEMA_VERSION = 59
+COMPENSATION_POLICY_VERSION = "review-iqd-v1-2026-08-21"
 POLICY_FILE = "review_pilot_policy.json"
 SESSION_FILE = "couch_session.json"
 POLICY_SCHEMA_VERSION = 1
@@ -90,6 +99,41 @@ class ReviewPilotPolicy:
 
 
 @dataclass(frozen=True)
+class EffectiveReviewEvent:
+    """One pilot-count event: every raw skip, or an effective non-skip decision."""
+
+    event_id: int
+    segment_id: str
+    reviewer: str
+    action: str
+    source: str
+    created_at: str
+    timestamp_ms: object
+    duration_ms: object
+    compensation_action: str
+    operation_id: str
+    operation_payload_hash: str
+    app_git_sha: str
+    playback_guard_version: str
+    ledger_id: int
+    ledger_entry_id: str
+    canonical_work_id: str
+    canonical_identity_kind: str
+    decision_revision: object
+
+
+@dataclass(frozen=True)
+class PilotReviewHistory:
+    """Audited raw append-only history and its sole authoritative safety projection."""
+
+    effective_events: tuple[EffectiveReviewEvent, ...]
+    raw_original_count: int
+    reversal_count: int
+    effect_event_count: int
+    effect_reversal_count: int
+
+
+@dataclass(frozen=True)
 class HiddenPilotState:
     policy_sha256: str
     grants: dict[str, set[str]]
@@ -99,6 +143,9 @@ class HiddenPilotState:
     unresolved_keys: dict[str, set[str]]
     corpus_actions: dict[str, int]
     hidden_actions: dict[str, int]
+    effective_events: tuple[EffectiveReviewEvent, ...] = ()
+    raw_original_count: int = 0
+    reversal_count: int = 0
 
     @property
     def total_corpus_actions(self) -> int:
@@ -330,6 +377,388 @@ def _same_path(left: str, right: Path) -> bool:
     return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
 
+def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, object]]:
+    columns = [str(item[0]) for item in cursor.description or ()]
+    return [dict(zip(columns, tuple(row), strict=True)) for row in cursor.fetchall()]
+
+
+def _is_lower_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def audit_pilot_review_history(
+    connection: sqlite3.Connection,
+    policy: ReviewPilotPolicy,
+) -> PilotReviewHistory:
+    """Audit every v60 paid original/reversal, then return only the effective projection.
+
+    Raw rows remain evidence, never authority.  A raw corpus judgement may disappear from the pilot
+    count only through one exact compensation reversal plus its exact effect reversal.  Corpus skips
+    always consume their safety slot; hidden spot-check rows are effectless and immutable.  This
+    prevents an unpaired later row from silently shadowing work through the SQL view.
+    """
+    try:
+        schema_version = int(
+            connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+        )
+        if schema_version != REQUIRED_SCHEMA:
+            raise PilotContractError(
+                f"controlled review requires exact schema {REQUIRED_SCHEMA}, found {schema_version}"
+            )
+        state_rows = list(
+            connection.execute(
+                """SELECT effective_after_review_event_id, effective_after_ledger_id
+                     FROM review_effect_state WHERE singleton_key = 1"""
+            )
+        )
+        if len(state_rows) != 1:
+            raise PilotContractError("schema v60 review-effect cutoff singleton is missing or ambiguous")
+        effect_cutoff = int(state_rows[0][0])
+        ledger_cutoff = int(state_rows[0][1])
+        if effect_cutoff != policy.after_review_event_id:
+            raise PilotContractError(
+                "active pilot baseline does not equal the immutable schema-v60 review-effect cutoff"
+            )
+
+        raw_events = _dict_rows(
+            connection.execute(
+                """SELECT id, segment_id, reviewer, action, compensation_action, source,
+                          timestamp_ms, created_at, duration_ms, operation_id,
+                          operation_payload_hash, app_git_sha, playback_guard_version
+                     FROM review_events
+                    WHERE id > ? AND source IN ('couch', 'couch_spot_check')
+                    ORDER BY id""",
+                (effect_cutoff,),
+            )
+        )
+        event_by_id = {int(row["id"]): row for row in raw_events}
+        for event_id, event in event_by_id.items():
+            if not _is_lower_hex(event["app_git_sha"], 40):
+                raise PilotContractError(
+                    f"post-v60 paid event {event_id} lacks an exact 40-lowerhex app_git_sha"
+                )
+            if event["playback_guard_version"] != PLAYBACK_GUARD_VERSION:
+                raise PilotContractError(
+                    f"post-v60 paid event {event_id} playback guard is not {PLAYBACK_GUARD_VERSION!r}"
+                )
+            if not _is_canonical_uuid(event["operation_id"]):
+                raise PilotContractError(f"post-v60 paid event {event_id} lacks a canonical operation UUID")
+            if not _is_lower_hex(event["operation_payload_hash"], 64):
+                raise PilotContractError(f"post-v60 paid event {event_id} lacks a canonical payload hash")
+
+        ledger_rows = _dict_rows(
+            connection.execute(
+                """SELECT id, entry_id, entry_key, policy_version, review_event_id,
+                          canonical_work_id, canonical_identity_kind, reviewer, segment_id,
+                          source, compensation_action, effective_decision, decision_revision,
+                          duration_ms, rate_basis_points, entitlement_micro_iqd,
+                          delta_micro_iqd, corrected_entitlement_ms, delta_corrected_ms,
+                          created_at, reverses_entry_id
+                     FROM review_compensation_ledger
+                    WHERE id > ?
+                       OR review_event_id IN (
+                            SELECT id FROM review_events
+                             WHERE id > ? AND source IN ('couch', 'couch_spot_check')
+                       )
+                    ORDER BY id""",
+                (ledger_cutoff, effect_cutoff),
+            )
+        )
+        originals_by_event: dict[int, list[dict[str, object]]] = {}
+        original_by_entry: dict[str, dict[str, object]] = {}
+        reversals: list[dict[str, object]] = []
+        for row in ledger_rows:
+            event_id = row["review_event_id"]
+            reverses = row["reverses_entry_id"]
+            if event_id is not None and reverses is None:
+                originals_by_event.setdefault(int(event_id), []).append(row)
+                original_by_entry[str(row["entry_id"])] = row
+            elif event_id is None and reverses is not None:
+                reversals.append(row)
+            else:
+                raise PilotContractError(
+                    f"post-v60 ledger row {row['entry_id']} is neither one original nor one reversal"
+                )
+
+        originals: dict[int, dict[str, object]] = {}
+        for event_id, event in event_by_id.items():
+            rows = originals_by_event.get(event_id, [])
+            if len(rows) != 1:
+                raise PilotContractError(
+                    f"post-v60 paid event {event_id} has {len(rows)} original ledger rows; required exactly one"
+                )
+            row = rows[0]
+            originals[event_id] = row
+            if row["policy_version"] != COMPENSATION_POLICY_VERSION:
+                raise PilotContractError(
+                    f"post-v60 paid event {event_id} is bound to inactive policy {row['policy_version']!r}"
+                )
+            expected = (
+                row["entry_key"] == f"review-event:{event_id}"
+                and row["segment_id"] == event["segment_id"]
+                and isinstance(row["reviewer"], str)
+                and isinstance(event["reviewer"], str)
+                and str(row["reviewer"]).casefold() == str(event["reviewer"]).casefold()
+                and row["source"] == event["source"]
+                and row["compensation_action"] == event["compensation_action"]
+                and row["effective_decision"] == event["action"]
+                and row["duration_ms"] == event["duration_ms"]
+            )
+            if not expected:
+                raise PilotContractError(
+                    f"post-v60 paid event {event_id} and its original ledger identity disagree"
+                )
+            if type(row["decision_revision"]) is not int or int(row["decision_revision"]) < 0:
+                raise PilotContractError(
+                    f"post-v60 paid event {event_id} has an invalid ledger decision revision"
+                )
+        extra_originals = sorted(set(originals_by_event) - set(event_by_id))
+        if extra_originals:
+            raise PilotContractError(
+                f"post-v60 ledger original points outside paid pilot history: event {extra_originals[0]}"
+            )
+
+        reversal_by_target: dict[str, dict[str, object]] = {}
+        for reversal in reversals:
+            entry_id = str(reversal["entry_id"])
+            target_id = str(reversal["reverses_entry_id"])
+            target = original_by_entry.get(target_id)
+            if target is None:
+                raise PilotContractError(
+                    f"post-v60 reversal {entry_id} targets a missing/non-pilot original {target_id!r}"
+                )
+            target_event_id = int(target["review_event_id"])
+            if event_by_id[target_event_id]["source"] == "couch_spot_check":
+                raise PilotContractError(
+                    f"hidden spot-check event {target_event_id} is immutable and cannot be reversed"
+                )
+            if target_id in reversal_by_target:
+                raise PilotContractError(f"original ledger entry {target_id} has more than one reversal")
+            operation_id = str(reversal["entry_key"] or "")
+            operation_id = operation_id.removeprefix("undo:") if operation_id.startswith("undo:") else ""
+            exact_pair = (
+                _is_canonical_uuid(operation_id)
+                and reversal["policy_version"] == target["policy_version"] == COMPENSATION_POLICY_VERSION
+                and reversal["canonical_work_id"] == target["canonical_work_id"]
+                and reversal["canonical_identity_kind"] == target["canonical_identity_kind"]
+                and isinstance(reversal["reviewer"], str)
+                and isinstance(target["reviewer"], str)
+                and str(reversal["reviewer"]).casefold() == str(target["reviewer"]).casefold()
+                and reversal["segment_id"] == target["segment_id"]
+                and reversal["source"] == "couch_undo"
+                and reversal["compensation_action"] == "undo"
+                and reversal["effective_decision"] == "undo"
+                and reversal["decision_revision"] == target["decision_revision"]
+                and reversal["duration_ms"] == target["duration_ms"]
+                and reversal["rate_basis_points"] == 0
+                and reversal["entitlement_micro_iqd"] == 0
+                and reversal["delta_micro_iqd"] == -int(target["delta_micro_iqd"])
+                and reversal["delta_corrected_ms"] == -int(target["delta_corrected_ms"])
+            )
+            if not exact_pair:
+                raise PilotContractError(
+                    f"post-v60 reversal {entry_id} is not the exact inverse of original {target_id}"
+                )
+            reversal_by_target[target_id] = reversal
+
+        effect_rows = _dict_rows(
+            connection.execute(
+                """SELECT id, review_event_id, segment_id, reviewer, source, action,
+                          decision_revision, created_at
+                     FROM human_decision_effect_events
+                    WHERE review_event_id IS NOT NULL
+                      AND review_event_id > ?
+                    ORDER BY id""",
+                (effect_cutoff,),
+            )
+        )
+        effects_by_event: dict[int, list[dict[str, object]]] = {}
+        effect_by_id: dict[int, dict[str, object]] = {}
+        for effect in effect_rows:
+            effect_id = int(effect["id"])
+            effect_by_id[effect_id] = effect
+            effects_by_event.setdefault(int(effect["review_event_id"]), []).append(effect)
+        effect_reversals = _dict_rows(
+            connection.execute(
+                """SELECT r.effect_event_id, r.operation_id, r.created_at
+                     FROM human_decision_effect_reversals r
+                     JOIN human_decision_effect_events e ON e.id = r.effect_event_id
+                    WHERE e.review_event_id IS NOT NULL AND e.review_event_id > ?
+                    ORDER BY r.effect_event_id""",
+                (effect_cutoff,),
+            )
+        )
+        effect_reversal_by_id = {int(row["effect_event_id"]): row for row in effect_reversals}
+        for event_id, event in event_by_id.items():
+            effect_candidates = effects_by_event.get(event_id, [])
+            action = str(event["action"])
+            source = str(event["source"])
+            requires_decision_effect = source == "couch" and action != "skip"
+            if not requires_decision_effect:
+                if effect_candidates:
+                    kind = "hidden spot-check" if source == "couch_spot_check" else "skip"
+                    raise PilotContractError(
+                        f"{kind} event {event_id} unexpectedly has a human-decision effect"
+                    )
+                continue
+            if len(effect_candidates) != 1:
+                raise PilotContractError(
+                    f"post-v60 judgement event {event_id} has {len(effect_candidates)} effect rows; required one"
+                )
+            effect = effect_candidates[0]
+            effect_id = int(effect["id"])
+            original = originals[event_id]
+            if not (
+                effect["segment_id"] == event["segment_id"]
+                and isinstance(effect["reviewer"], str)
+                and str(effect["reviewer"]).casefold() == str(event["reviewer"]).casefold()
+                and effect["source"] == event["source"]
+                and effect["action"] == action
+                and effect["decision_revision"] == original["decision_revision"]
+            ):
+                raise PilotContractError(f"effect row {effect_id} disagrees with paid event {event_id}")
+            reversal = reversal_by_target.get(str(original["entry_id"]))
+            effect_reversal = effect_reversal_by_id.get(effect_id)
+            if reversal is None and effect_reversal is not None:
+                raise PilotContractError(f"active paid event {event_id} has a forged effect reversal")
+            if reversal is not None:
+                operation_id = str(reversal["entry_key"])[len("undo:") :]
+                if effect_reversal is None or effect_reversal["operation_id"] != operation_id:
+                    raise PilotContractError(
+                        f"reversed paid event {event_id} lacks its exact operation-bound effect reversal"
+                    )
+        extra_effect_events = sorted(set(effects_by_event) - set(event_by_id))
+        if extra_effect_events:
+            raise PilotContractError(
+                f"phone effect points outside post-v60 paid history: event {extra_effect_events[0]}"
+            )
+
+        effective_rows = _dict_rows(
+            connection.execute(
+                """SELECT review_event_id, segment_id, reviewer, action, source, timestamp_ms,
+                          review_event_created_at, review_event_duration_ms,
+                          review_event_compensation_action, operation_id, operation_payload_hash,
+                          app_git_sha, playback_guard_version, ledger_id, ledger_entry_id,
+                          canonical_work_id, canonical_identity_kind, decision_revision
+                     FROM effective_review_events_v60
+                    WHERE review_event_id > ? AND policy_version = ?
+                      AND source IN ('couch', 'couch_spot_check')
+                    ORDER BY review_event_id""",
+                (effect_cutoff, COMPENSATION_POLICY_VERSION),
+            )
+        )
+        effective_ids = {int(row["review_event_id"]) for row in effective_rows}
+        effective_non_skip_ids = {
+            int(row["review_event_id"]) for row in effective_rows if row["action"] != "skip"
+        }
+        expected_effective_non_skip_ids: set[int] = set()
+        reversed_non_skip_count = 0
+        for event_id, original in originals.items():
+            reversed_row = reversal_by_target.get(str(original["entry_id"]))
+            action = str(event_by_id[event_id]["action"])
+            if action != "skip" and reversed_row is None:
+                expected_effective_non_skip_ids.add(event_id)
+            elif action != "skip" and reversed_row is not None:
+                reversed_non_skip_count += 1
+            if reversed_row is not None and event_id in effective_ids:
+                raise PilotContractError(f"reversed paid event {event_id} remains in the effective view")
+        if effective_non_skip_ids != expected_effective_non_skip_ids:
+            missing = sorted(expected_effective_non_skip_ids - effective_non_skip_ids)
+            unexpected = sorted(effective_non_skip_ids - expected_effective_non_skip_ids)
+            raise PilotContractError(
+                "effective non-skip view disagrees with exact reversals: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        active_work_ids: set[str] = set()
+        for row in effective_rows:
+            work_id = str(row["canonical_work_id"])
+            if work_id in active_work_ids:
+                raise PilotContractError(f"effective paid history repeats canonical work {work_id!r}")
+            active_work_ids.add(work_id)
+        raw_skip_count = sum(1 for event in raw_events if event["action"] == "skip")
+        counted_event_count = raw_skip_count + len(effective_non_skip_ids)
+        if len(raw_events) != counted_event_count + reversed_non_skip_count:
+            raise PilotContractError(
+                "raw non-skip history exceeds effective history without one exact reversal pair per extra original"
+            )
+
+        counted_rows = [row for row in effective_rows if row["action"] != "skip"]
+        for event_id, event in event_by_id.items():
+            if event["action"] != "skip":
+                continue
+            original = originals[event_id]
+            counted_rows.append(
+                {
+                    "review_event_id": event_id,
+                    "segment_id": event["segment_id"],
+                    "reviewer": event["reviewer"],
+                    "action": event["action"],
+                    "source": event["source"],
+                    "timestamp_ms": event["timestamp_ms"],
+                    "review_event_created_at": event["created_at"],
+                    "review_event_duration_ms": event["duration_ms"],
+                    "review_event_compensation_action": event["compensation_action"],
+                    "operation_id": event["operation_id"],
+                    "operation_payload_hash": event["operation_payload_hash"],
+                    "app_git_sha": event["app_git_sha"],
+                    "playback_guard_version": event["playback_guard_version"],
+                    "ledger_id": original["id"],
+                    "ledger_entry_id": original["entry_id"],
+                    "canonical_work_id": original["canonical_work_id"],
+                    "canonical_identity_kind": original["canonical_identity_kind"],
+                    "decision_revision": original["decision_revision"],
+                }
+            )
+        counted_rows.sort(key=lambda row: int(row["review_event_id"]))
+        effective_events = tuple(
+            EffectiveReviewEvent(
+                event_id=int(row["review_event_id"]),
+                segment_id=str(row["segment_id"]),
+                reviewer=str(row["reviewer"]),
+                action=str(row["action"]),
+                source=str(row["source"]),
+                created_at=str(row["review_event_created_at"] or ""),
+                timestamp_ms=row["timestamp_ms"],
+                duration_ms=row["review_event_duration_ms"],
+                compensation_action=str(row["review_event_compensation_action"] or ""),
+                operation_id=str(row["operation_id"] or ""),
+                operation_payload_hash=str(row["operation_payload_hash"] or ""),
+                app_git_sha=str(row["app_git_sha"] or ""),
+                playback_guard_version=str(row["playback_guard_version"] or ""),
+                ledger_id=int(row["ledger_id"]),
+                ledger_entry_id=str(row["ledger_entry_id"]),
+                canonical_work_id=str(row["canonical_work_id"]),
+                canonical_identity_kind=str(row["canonical_identity_kind"]),
+                decision_revision=row["decision_revision"],
+            )
+            for row in counted_rows
+        )
+        return PilotReviewHistory(
+            effective_events=effective_events,
+            raw_original_count=len(raw_events),
+            reversal_count=len(reversals),
+            effect_event_count=len(effect_rows),
+            effect_reversal_count=len(effect_reversals),
+        )
+    except PilotContractError:
+        raise
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        raise PilotContractError(f"schema-v60 effective review history cannot be proved: {error}") from error
+
+
 def audit_active_hidden_state(
     connection: sqlite3.Connection,
     data_dir: Path,
@@ -344,6 +773,7 @@ def audit_active_hidden_state(
     if schema_errors:
         raise PilotContractError("; ".join(schema_errors))
     del schema_evidence
+    history = audit_pilot_review_history(connection, policy)
 
     digest = policy_sha256(policy)
     baseline = policy.after_review_event_id
@@ -437,22 +867,13 @@ def audit_active_hidden_state(
     completed_keys = {name: set() for name in policy.reviewer_caps}
     skipped_keys = {name: set() for name in policy.reviewer_caps}
     hidden_event_actions: dict[tuple[str, str], str] = {}
-    try:
-        events = list(
-            connection.execute(
-                """SELECT id, segment_id, reviewer, action, source FROM review_events
-                    WHERE id > ? AND source IN ('couch', 'couch_spot_check')
-                    ORDER BY id""",
-                (baseline,),
-            )
-        )
-    except sqlite3.Error as error:
-        raise PilotContractError(f"post-baseline review history cannot be read: {error}") from error
-    for event_id, segment_id, actual, action, source in events:
+    for event in history.effective_events:
+        event_id = event.event_id
+        segment_id = event.segment_id
+        actual = event.reviewer
+        action = event.action
+        source = event.source
         reviewer = _canonical_reviewer(policy, actual, "controlled-review history")
-        action = str(action)
-        source = str(source)
-        segment_id = str(segment_id)
         if source == "couch":
             if action not in {"accept", "edit", "reject", "skip"}:
                 raise PilotContractError(f"post-baseline Couch event {event_id} has invalid action {action!r}")
@@ -561,4 +982,7 @@ def audit_active_hidden_state(
         unresolved_keys=unresolved_keys,
         corpus_actions=corpus_actions,
         hidden_actions=hidden_actions,
+        effective_events=history.effective_events,
+        raw_original_count=history.raw_original_count,
+        reversal_count=history.reversal_count,
     )

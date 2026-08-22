@@ -34,7 +34,22 @@
   let editText = '';
   let editTextarea: HTMLTextAreaElement | null = null;
   let statusMsg = '';
-  let history: { id: string; decision: string; prev: SpeechSegment }[] = [];
+  type InboxHistoryEntry =
+    | {
+        kind: 'human';
+        id: string;
+        decision: 'accept' | 'edit' | 'reject';
+        effectEventId: number;
+        operationId: string;
+      }
+    | {
+        kind: 'flag';
+        id: string;
+        decision: 'flag';
+        effectEventId: number;
+        operationId: string;
+      };
+  let history: InboxHistoryEntry[] = [];
   // Round-23 #12: the autonomy dial reflects and WRITES the real backend `jury_autonomy_level` setting
   // (read by the T0 gate's apply_autonomy), not a dead local variable.
   let autonomyLevel: 'observe' | 'propose' | 'act_confirm' | 'act_auto' = 'propose';
@@ -217,9 +232,6 @@
     const idx = currentIndex;
     isSubmitting = true;
     try {
-      // Reassignment (not .push) — this component is legacy-mode, so only assignment invalidates
-      // `disabled={history.length === 0}`; mutation left the Undo button permanently disabled.
-      history = [...history, { id: cur.id, decision: 'accept', prev: { ...cur } }];
       // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
       // revision and fingerprint itself and refuses a decision without sufficient evidence.
       // Reported, never thrown — losing the receipt must not lose the human's work.
@@ -232,14 +244,21 @@
       } catch (e) {
         console.error('playback receipt failed', e);
       }
-      await api.recordHumanDecision(cur.id, 'accept', null);
-      queue[idx] = { ...cur, humanDecision: 'accept' };
+      const commit = await api.recordHumanDecision(cur.id, 'accept', null);
+      history = [
+        ...history,
+        {
+          kind: 'human',
+          id: cur.id,
+          decision: 'accept',
+          effectEventId: commit.effectEventId,
+          operationId: crypto.randomUUID(),
+        },
+      ];
+      queue[idx] = commit.segment;
       statusMsg = $t('inbox.status.accepted');
       advance();
     } catch (e) {
-      // The decision did not persist: drop the phantom undo entry pushed above and
-      // tell the reviewer, rather than silently swallowing it (unhandled rejection).
-      history = history.slice(0, -1);
       statusMsg = String(e).includes('E_NO_PLAYBACK_EVIDENCE')
         ? $t('review.mustListen')
         : $t('inbox.status.acceptFailed', { err: String(e) });
@@ -275,7 +294,6 @@
     const text = editText.trim();
     isSubmitting = true;
     try {
-      history = [...history, { id: cur.id, decision: 'edit', prev: { ...cur } }];
       // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
       // revision and fingerprint itself and refuses a decision without sufficient evidence.
       // Reported, never thrown — losing the receipt must not lose the human's work.
@@ -288,17 +306,22 @@
       } catch (e) {
         console.error('playback receipt failed', e);
       }
-      await api.recordHumanDecision(cur.id, 'edit', text);
-      queue[idx] = {
-        ...cur,
-        humanDecision: 'edit',
-        verdictTranscript: text,
-      };
+      const commit = await api.recordHumanDecision(cur.id, 'edit', text);
+      history = [
+        ...history,
+        {
+          kind: 'human',
+          id: cur.id,
+          decision: 'edit',
+          effectEventId: commit.effectEventId,
+          operationId: crypto.randomUUID(),
+        },
+      ];
+      queue[idx] = commit.segment;
       isEditing = false;
       statusMsg = $t('inbox.status.edited');
       advance();
     } catch (e) {
-      history = history.slice(0, -1);
       statusMsg = String(e).includes('E_NO_PLAYBACK_EVIDENCE')
         ? $t('review.mustListen')
         : $t('inbox.status.editFailed', { err: String(e) });
@@ -315,7 +338,6 @@
     const idx = currentIndex;
     isSubmitting = true;
     try {
-      history = [...history, { id: cur.id, decision: 'reject', prev: { ...cur } }];
       // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
       // revision and fingerprint itself and refuses a decision without sufficient evidence.
       // Reported, never thrown — losing the receipt must not lose the human's work.
@@ -328,12 +350,21 @@
       } catch (e) {
         console.error('playback receipt failed', e);
       }
-      await api.recordHumanDecision(cur.id, 'reject', null);
-      queue[idx] = { ...cur, humanDecision: 'reject' };
+      const commit = await api.recordHumanDecision(cur.id, 'reject', null);
+      history = [
+        ...history,
+        {
+          kind: 'human',
+          id: cur.id,
+          decision: 'reject',
+          effectEventId: commit.effectEventId,
+          operationId: crypto.randomUUID(),
+        },
+      ];
+      queue[idx] = commit.segment;
       statusMsg = $t('inbox.status.rejected');
       advance();
     } catch (e) {
-      history = history.slice(0, -1);
       statusMsg = String(e).includes('E_NO_PLAYBACK_EVIDENCE')
         ? $t('review.mustListen')
         : $t('inbox.status.rejectFailed', { err: String(e) });
@@ -365,25 +396,21 @@
     const idx = currentIndex;
     isSubmitting = true;
     try {
-      // Record an undo entry BEFORE the await (same as accept/reject) so an accidental `f` — a common
-      // fat-finger next to `e`/`x` — is recoverable via Backspace/Undo instead of permanently escalating
-      // the segment. The 'flag' tag routes undo() to clear the escalation rather than a human decision.
-      history = [...history, { id: cur.id, decision: 'flag', prev: { ...cur } }];
-      await api.writeSegmentVerdict(
-        cur.id,
-        'escalated',
-        null,
-        'Flagged for second-pass adjudication',
-        null,
-        null,
-        true,
-      );
-      queue[idx] = { ...cur, escalated: true };
+      const commit = await api.recordReviewFlag(cur.id, 'Flagged for second-pass adjudication');
+      history = [
+        ...history,
+        {
+          kind: 'flag',
+          id: cur.id,
+          decision: 'flag',
+          effectEventId: commit.effectEventId,
+          operationId: crypto.randomUUID(),
+        },
+      ];
+      queue[idx] = commit.segment;
       statusMsg = $t('inbox.status.flagged');
       advance();
     } catch (e) {
-      // Persist failed: drop the phantom undo entry pushed above and surface the failure.
-      history = history.slice(0, -1);
       statusMsg = $t('inbox.status.flagFailed', { err: String(e) });
     } finally {
       isSubmitting = false;
@@ -391,28 +418,39 @@
   }
 
   async function undo() {
-    // Guard against racing an in-flight decision. Every persisting action (accept/reject/commitEdit/flag)
-    // sets isSubmitting and pushes its history entry BEFORE its await; a Backspace during that await would
-    // pop that just-pushed entry and fire the inverse op (clearHumanDecision) against the SAME id while its
-    // record is still in flight — and if the in-flight action then rejects, its catch does another
-    // history.slice(0,-1), dropping a PREVIOUS segment's entry (permanent undo loss). The four mutators all
-    // guard isSubmitting; undo must too.
+    // Guard against racing any in-flight write. Decisions and flags publish history only after their
+    // atomic commit; Undo must never overlap a mutation of the same queue/history state.
     if (isSubmitting) return;
     const last = history[history.length - 1];
     if (!last) return;
+    isSubmitting = true;
     history = history.slice(0, -1); // reassignment: keeps the Undo button's disabled binding live
     try {
-      // A flag set `escalated` (not a human_decision), so it needs the inverse op. Everything else is a
-      // human decision, cleared to NULL (P3-3: not overwritten with a fake 'accept', which corrupted
-      // agent_examples).
-      if (last.decision === 'flag') {
-        await api.clearEscalation(last.id);
+      // Flag is not a human decision and keeps its dedicated inverse. A human decision is reversed by
+      // immutable effect id; no renderer snapshot or blanket "clear" is trusted.
+      let restored: SpeechSegment;
+      if (last.kind === 'flag') {
+        const outcome = await api.undoReviewFlag(last.effectEventId, last.operationId);
+        if (outcome.status === 'conflict') {
+          statusMsg = $t('inbox.status.undoFailed', {
+            err: 'The segment changed after this flag; Undo refused without changing it.',
+          });
+          return;
+        }
+        restored = outcome.segment;
       } else {
-        await api.clearHumanDecision(last.id);
+        const outcome = await api.undoHumanDecision(last.effectEventId, last.operationId);
+        if (outcome.status === 'conflict') {
+          statusMsg = $t('inbox.status.undoFailed', {
+            err: 'The segment changed after this decision; Undo refused without changing it.',
+          });
+          return;
+        }
+        restored = outcome.segment;
       }
       const idx = queue.findIndex((s) => s.id === last.id);
       if (idx >= 0) {
-        queue[idx] = { ...last.prev };
+        queue[idx] = restored;
         // Navigate directly to the undone segment, not blindly to currentIndex-1.
         // If the user accepted seg#5 then scrolled to seg#10, undo should show seg#5.
         currentIndex = idx;
@@ -424,6 +462,8 @@
       // dropped the entry, making the undo permanently unretryable).
       history = [...history, last];
       statusMsg = $t('inbox.status.undoFailed', { err: String(e) });
+    } finally {
+      isSubmitting = false;
     }
   }
 

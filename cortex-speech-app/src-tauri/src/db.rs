@@ -14,6 +14,7 @@ pub enum PendingWork {
     /// No signal-anomaly score yet.
     SignalAnomaly,
 }
+
 use base64::Engine as _;
 use rusqlite::{backup, params, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,18 @@ use unicode_normalization::UnicodeNormalization;
 
 /// One row of the `jobs` table as read: (id, kind, state, progress, completed, total, error_code).
 type JobRow = (String, String, String, f64, i64, Option<i64>, Option<String>);
+
+const REVIEW_AUTHORITY_DELETE_ABORT: &str = "segment with durable review authority cannot be deleted";
+
+fn map_segment_delete_error(error: rusqlite::Error) -> AppError {
+    if error.to_string().contains(REVIEW_AUTHORITY_DELETE_ABORT) {
+        AppError::Validation(format!(
+            "segment deletion refused: {REVIEW_AUTHORITY_DELETE_ABORT}; reviewed clips and their evidence are append-only"
+        ))
+    } else {
+        AppError::Database(error)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +112,117 @@ pub struct SpeechSegment {
     /// import path does not run it). Filled by `src/bin/speaker_change_probe.rs --persist`. Compare
     /// against [`crate::diarization::SPEAKER_CHANGE_THRESHOLD`], where the calibration is documented.
     pub speaker_change_score: Option<f64>,
+}
+
+/// One atomic, server-authored human adjudication and its exact inverse identity.
+///
+/// The renderer receives the authoritative post-commit row; it never supplies the snapshot used by
+/// Undo.  `effect_event_id` binds every learning/pay side effect produced by this decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanDecisionCommit {
+    pub effect_event_id: i64,
+    pub segment_id: String,
+    pub effective_action: String,
+    pub prior_revision: i64,
+    pub decided_revision: i64,
+    pub segment: SpeechSegment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum HumanDecisionUndoOutcome {
+    #[serde(rename = "applied")]
+    Applied {
+        #[serde(rename = "restoredRevision")]
+        restored_revision: i64,
+        segment: SpeechSegment,
+    },
+    #[serde(rename = "alreadyApplied")]
+    AlreadyApplied { segment: SpeechSegment },
+    #[serde(rename = "conflict")]
+    Conflict { segment: SpeechSegment },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HumanFlagCommit {
+    pub effect_event_id: i64,
+    pub segment_id: String,
+    pub prior_revision: i64,
+    pub flag_revision: i64,
+    pub segment: SpeechSegment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum HumanFlagUndoOutcome {
+    #[serde(rename = "applied")]
+    Applied {
+        #[serde(rename = "restoredRevision")]
+        restored_revision: i64,
+        segment: SpeechSegment,
+    },
+    #[serde(rename = "alreadyApplied")]
+    AlreadyApplied { segment: SpeechSegment },
+    #[serde(rename = "conflict")]
+    Conflict { segment: SpeechSegment },
+}
+
+#[derive(Debug)]
+struct DecisionEffectSnapshot {
+    review_event_id: Option<i64>,
+    segment_id: String,
+    reviewer: Option<String>,
+    source: String,
+    action: String,
+    decision_transcript: Option<String>,
+    decision_annotated_transcript: Option<String>,
+    decision_verified: bool,
+    decision_corrected_at: String,
+    decision_rationale: Option<String>,
+    prior_revision: i64,
+    decision_revision: i64,
+    prior_verified: bool,
+    prior_annotated_transcript: Option<String>,
+    prior_verdict: Option<String>,
+    prior_verdict_transcript: Option<String>,
+    prior_rationale: Option<String>,
+    prior_escalated: bool,
+    prior_human_decision: Option<String>,
+    prior_corrected_at: Option<String>,
+    prior_reviewed_by: Option<String>,
+}
+
+#[derive(Debug)]
+struct DesktopReplayEffect {
+    id: i64,
+    segment_id: String,
+    source: String,
+    reviewer: Option<String>,
+    operation_payload_hash: String,
+    action: String,
+    decision_transcript: Option<String>,
+    decision_annotated_transcript: Option<String>,
+    decision_verified: bool,
+    decision_corrected_at: String,
+    decision_rationale: Option<String>,
+    requested_action: String,
+    requested_transcript: Option<String>,
+    requested_timestamp_ms: i64,
+    prior_revision: i64,
+    decision_revision: i64,
+    prior_verdict_transcript: Option<String>,
+}
+
+#[derive(Debug)]
+struct FlagEffectSnapshot {
+    segment_id: String,
+    flag_revision: i64,
+    prior_verdict: Option<String>,
+    prior_rationale: Option<String>,
+    flag_rationale: String,
+    prior_escalated: bool,
 }
 
 /// One reviewer's measured throughput, from the append-only `review_events` trail (Migration v45).
@@ -246,9 +370,16 @@ fn review_decision_progress_on(conn: &Connection, limit: &ReviewDecisionLimit) -
     let mut by_reviewer: HashMap<String, i64> = limit.reviewer_caps.iter().map(|(name, _)| (name.clone(), 0)).collect();
     let mut statement = conn.prepare(
         "SELECT reviewer, COUNT(*)
-           FROM review_events
-          WHERE id > ?1 AND source = 'couch'
-            AND action IN ('accept','edit','reject','skip')
+           FROM (
+                SELECT reviewer
+                  FROM effective_review_events_v60
+                 WHERE review_event_id > ?1 AND source = 'couch'
+                   AND action IN ('accept','edit','reject')
+                UNION ALL
+                SELECT reviewer
+                  FROM review_events
+                 WHERE id > ?1 AND source = 'couch' AND action = 'skip'
+           ) counted_actions
           GROUP BY LOWER(TRIM(reviewer))",
     )?;
     let rows = statement
@@ -303,17 +434,79 @@ fn enforce_review_action_limit_on(conn: &Connection, reviewer: &str, limit: &Rev
 }
 
 fn validate_review_operation_identity(operation_id: &str, payload_hash: &str) -> AppResult<()> {
-    let parsed = uuid::Uuid::parse_str(operation_id)
-        .map_err(|_| AppError::Validation("review operation id must be a canonical UUID".into()))?;
-    if parsed.hyphenated().to_string() != operation_id {
-        return Err(AppError::Validation("review operation id must be a lowercase hyphenated UUID".into()));
-    }
+    validate_operation_uuid(operation_id)?;
     if payload_hash.len() != 64
         || !payload_hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(AppError::Validation("review operation payload hash must be canonical lowercase SHA-256".into()));
     }
     Ok(())
+}
+
+fn validate_operation_uuid(operation_id: &str) -> AppResult<()> {
+    let parsed = uuid::Uuid::parse_str(operation_id)
+        .map_err(|_| AppError::Validation("operation id must be a canonical UUID".into()))?;
+    if parsed.hyphenated().to_string() != operation_id {
+        return Err(AppError::Validation("operation id must be a lowercase hyphenated UUID".into()));
+    }
+    Ok(())
+}
+
+/// Server-derived idempotency digest for one desktop adjudication request.
+///
+/// Length framing makes the encoding unambiguous; NFC + trimming mirrors the persisted transcript
+/// boundary. The renderer supplies only the UUID, so it cannot make two different requests claim
+/// the same payload digest. This hash is request identity (SHA-256), not the decoded-PCM BLAKE3
+/// audio identity stored in `speech_segments.audio_content_hash`.
+pub(crate) fn desktop_decision_payload_hash(
+    segment_id: &str,
+    decision: &str,
+    corrected_transcript: Option<&str>,
+    timestamp_ms: Option<i64>,
+) -> String {
+    fn framed(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+
+    let corrected = corrected_transcript.map(|text| to_nfc(text.trim())).filter(|text| !text.is_empty());
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-desktop-human-decision-v1\0");
+    framed(&mut hash, segment_id.as_bytes());
+    framed(&mut hash, decision.as_bytes());
+    match corrected.as_deref() {
+        Some(text) => {
+            hash.update([1]);
+            framed(&mut hash, text.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    match timestamp_ms {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_be_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Canonical phone/Couch operation payload. This is shared with the HTTP boundary and persisted
+/// request snapshots so restore validation can rederive every post-v60 operation digest exactly.
+pub(crate) fn review_operation_payload_hash(
+    segment_id: &str,
+    action: &str,
+    transcript: &str,
+    reviewer: &str,
+) -> String {
+    let transcript = to_nfc(transcript.trim());
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-review-operation-v1");
+    for value in [segment_id, action, transcript.as_str(), reviewer] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn validate_review_pilot_policy_sha256(policy_sha256: &str) -> AppResult<()> {
@@ -662,8 +855,35 @@ fn expected_schema_contract() -> AppResult<&'static Vec<SchemaObjectContract>> {
 
 pub(crate) fn validate_current_schema_contract(conn: &Connection) -> AppResult<()> {
     let expected = expected_schema_contract()?;
+    validate_schema_contract_against(conn, expected)
+}
+
+/// Validate an exact historical schema prefix without asking that database to satisfy migrations
+/// it has not run yet.  The pre-migration safety pin necessarily inspects the old schema before the
+/// upgrade; comparing it with HEAD would make every legitimate upgrade fail closed.
+pub(crate) fn validate_schema_contract_at_version(conn: &Connection, version: i64) -> AppResult<()> {
+    let current = crate::migrations::max_supported_version();
+    if version == current {
+        return validate_current_schema_contract(conn);
+    }
+    if version < 1 || version > current {
+        return Err(AppError::Other(format!(
+            "cannot construct schema contract for unsupported migration v{version} (supported 1..={current})"
+        )));
+    }
+
+    let reference = Database::open(":memory:")?;
+    reference.initialize_inner(false)?;
+    let rollback_count = usize::try_from(current - version)
+        .map_err(|_| AppError::Other(format!("invalid schema rollback distance from v{current} to v{version}")))?;
+    crate::migrations::rollback(&reference, rollback_count)?;
+    let expected = read_schema_contract(reference.connection())?;
+    validate_schema_contract_against(conn, &expected)
+}
+
+fn validate_schema_contract_against(conn: &Connection, expected: &[SchemaObjectContract]) -> AppResult<()> {
     let actual = read_schema_contract(conn)?;
-    if actual == *expected {
+    if actual == expected {
         return Ok(());
     }
 
@@ -695,13 +915,6 @@ fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str> {
     }
 }
 
-/// The speech_segments columns loaded when recording a human decision, in SELECT order:
-/// `(is_gold, raw_transcript, normalized_transcript, annotated_transcript, verdict_transcript,
-/// prior_verdict, audio_path, model_version_id)`. Aliased to keep the `query_row` annotation
-/// readable (clippy::type_complexity).
-type HumanDecisionContext =
-    (i32, String, Option<String>, Option<String>, Option<String>, Option<String>, String, String);
-
 /// Canonicalize stored text to Unicode NFC. Sorani/Arabic combining marks (diacritics,
 /// madda, hamza) can arrive decomposed from ASR or import; storing inconsistent forms
 /// silently fragments FTS search, content-dedup, and WER references that all assume one
@@ -712,7 +925,17 @@ type HumanDecisionContext =
 /// equal to the value it just stored, and every retry would look like a brand-new decision.
 /// Bump when the sufficiency RULE changes. Stored on every receipt so a row always says which rule
 /// it satisfied, instead of being re-judged later under one it never met.
-pub const PLAYBACK_POLICY_VERSION: i64 = 1;
+pub const PLAYBACK_POLICY_VERSION: i64 = 3;
+
+/// Canonical decoded-PCM identity written by the v51 backfill/import path.
+///
+/// `audio_fingerprint` (v50) is only a 64-bit spectral candidate bucket and can collide. Playback
+/// authorization therefore uses the 64-character BLAKE3 `audio_content_hash` exclusively. The
+/// receipt table keeps its legacy column name for schema compatibility, but policy 2+ stores this
+/// content hash in that column. Policy 3 additionally binds the exact source span.
+pub(crate) fn is_canonical_audio_content_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// How much of the clip's media time must actually have been played.
 ///
@@ -734,18 +957,165 @@ pub const PLAYBACK_POLICY_VERSION: i64 = 1;
 /// has 20+ decisions across both reviewers; a length-aware rule (ratio OR a fixed unheard-tail
 /// allowance) is the likelier long-run answer than any single ratio.
 pub const MIN_PLAYBACK_COVERAGE: f64 = 0.85;
+pub const MAX_SOURCE_SPAN_DURATION_DELTA_MS: i64 = 1;
 
 /// A reviewer's record of having heard one clip at one revision.
 #[derive(Debug, Clone)]
 pub struct PlaybackReceipt {
     pub segment_id: String,
     pub segment_revision: i64,
-    pub audio_fingerprint: String,
+    pub audio_content_hash: String,
     pub reviewer: Option<String>,
     pub session_id: Option<String>,
     pub started_at_ms: i64,
     pub played_ms: i64,
     pub clip_duration_ms: i64,
+    /// Server-resolved source window. Request surfaces leave these `None`; the raw writer accepts
+    /// only a canonical pair and policy-3 storage persists both.
+    pub source_start_ms: Option<i64>,
+    pub source_end_ms: Option<i64>,
+}
+
+/// Server-owned playback identity that must still be valid at the instant a paid review write
+/// commits. The HTTP layer checks once for a useful error before entering the write path; this
+/// second copy is deliberately carried into the SQLite transaction so a concurrent audio/revision
+/// change cannot turn evidence for clip A into a verdict or payment for clip B.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaybackDecisionProof {
+    pub(crate) segment_revision: i64,
+    pub(crate) audio_content_hash: String,
+    pub(crate) source_start_ms: i64,
+    pub(crate) source_end_ms: i64,
+}
+
+pub(crate) fn canonical_source_span(alignment_json: Option<&str>) -> Option<(i64, i64)> {
+    let value = serde_json::from_str::<serde_json::Value>(alignment_json?).ok()?;
+    let start = value.get("source_start_ms")?.as_i64()?;
+    let end = value.get("source_end_ms")?.as_i64()?;
+    (start >= 0 && end > start).then_some((start, end))
+}
+
+/// Segment durations come from decoded PCM while alignment endpoints are integer milliseconds;
+/// endpoint rounding may differ by one millisecond, but anything larger is a different amount of
+/// work and must never authorize playback or compensation.
+pub(crate) fn source_span_matches_duration(source_start_ms: i64, source_end_ms: i64, duration_ms: i64) -> bool {
+    source_start_ms >= 0
+        && source_end_ms > source_start_ms
+        && duration_ms > 0
+        && (source_end_ms - source_start_ms).abs_diff(duration_ms) <= MAX_SOURCE_SPAN_DURATION_DELTA_MS as u64
+}
+
+fn validate_playback_receipt_nonnegative_fields(receipt: &PlaybackReceipt) -> AppResult<()> {
+    if receipt.segment_revision < 0 {
+        return Err(AppError::Validation("cannot record playback evidence with a negative segment revision".into()));
+    }
+    if receipt.started_at_ms < 0 {
+        return Err(AppError::Validation("cannot record playback evidence with a negative start timestamp".into()));
+    }
+    if receipt.played_ms < 0 {
+        return Err(AppError::Validation("cannot record playback evidence with negative played media time".into()));
+    }
+    Ok(())
+}
+
+pub(crate) const PLAYBACK_EVIDENCE_CHANGED: &str = "E_PLAYBACK_EVIDENCE_CHANGED";
+pub(crate) const HIDDEN_ANSWER_KEY_CHANGED: &str = "E_HIDDEN_ANSWER_KEY_CHANGED";
+
+fn has_sufficient_playback_evidence_on(
+    conn: &Connection,
+    segment_id: &str,
+    revision: i64,
+    content_hash: &str,
+    source_start_ms: i64,
+    source_end_ms: i64,
+    reviewer: Option<&str>,
+) -> AppResult<bool> {
+    // Reject the proof claim itself before consulting storage. The SQL below independently checks
+    // the server row, but an internal caller still cannot present a legacy spectral bucket or an
+    // invented identity as an authorization capability.
+    if !is_canonical_audio_content_hash(content_hash) || source_start_ms < 0 || source_end_ms <= source_start_ms {
+        return Ok(false);
+    }
+    let sufficient: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+             FROM playback_receipts p
+              JOIN speech_segments s ON s.id = p.segment_id
+             WHERE s.id = ?1
+               AND COALESCE(s.review_revision, 0) = ?2
+               AND typeof(s.audio_content_hash) = 'text'
+               AND length(s.audio_content_hash) = 64
+               AND s.audio_content_hash NOT GLOB '*[^0-9a-f]*'
+               AND s.audio_content_hash = ?3
+               AND typeof(p.segment_revision) = 'integer'
+               AND p.segment_revision = COALESCE(s.review_revision, 0)
+               AND p.audio_fingerprint = s.audio_content_hash
+               AND json_valid(s.alignment_json)
+               AND json_extract(s.alignment_json, '$.source_start_ms') = ?4
+               AND json_extract(s.alignment_json, '$.source_end_ms') = ?5
+               AND ABS(
+                    (json_extract(s.alignment_json, '$.source_end_ms')
+                     - json_extract(s.alignment_json, '$.source_start_ms'))
+                    - s.duration_ms
+               ) <= ?9
+               AND typeof(p.source_start_ms) = 'integer' AND p.source_start_ms = ?4
+               AND typeof(p.source_end_ms) = 'integer' AND p.source_end_ms = ?5
+               AND p.reviewer IS ?6
+               AND typeof(p.policy_version) = 'integer' AND p.policy_version = ?7
+               AND typeof(p.started_at_ms) = 'integer' AND p.started_at_ms >= 0
+               AND typeof(p.played_ms) = 'integer' AND p.played_ms >= 0
+               AND typeof(p.clip_duration_ms) = 'integer' AND p.clip_duration_ms > 0
+               AND typeof(s.duration_ms) = 'integer' AND s.duration_ms > 0
+               AND p.clip_duration_ms = s.duration_ms
+               AND MIN(1.0, CAST(p.played_ms AS REAL) / CAST(p.clip_duration_ms AS REAL)) >= ?8
+        )",
+        params![
+            segment_id,
+            revision,
+            content_hash,
+            source_start_ms,
+            source_end_ms,
+            reviewer,
+            PLAYBACK_POLICY_VERSION,
+            MIN_PLAYBACK_COVERAGE,
+            MAX_SOURCE_SPAN_DURATION_DELTA_MS,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(sufficient == 1)
+}
+
+/// Re-read the exact hidden-check answer from the transaction snapshot using the one canonical
+/// corpus policy implementation. Repeating that policy as SQL would eventually drift from
+/// `quality::human_verified_text` / `is_human_rejected` and grade a reviewer against a key that the
+/// exporter no longer considers human gold.
+fn current_hidden_answer_key_on(conn: &Connection, segment_id: &str) -> AppResult<Option<String>> {
+    let segment: Option<SpeechSegment> = conn
+        .query_row(
+            "SELECT raw_transcript, annotated_transcript, verdict_transcript, human_decision, verdict
+               FROM speech_segments
+              WHERE id = ?1",
+            [segment_id],
+            |row| {
+                Ok(SpeechSegment {
+                    id: segment_id.to_string(),
+                    raw_transcript: row.get(0)?,
+                    annotated_transcript: row.get(1)?,
+                    verdict_transcript: row.get(2)?,
+                    human_decision: row.get(3)?,
+                    verdict: row.get(4)?,
+                    ..Default::default()
+                })
+            },
+        )
+        .optional()?;
+    let Some(segment) = segment else {
+        return Ok(None);
+    };
+    if crate::quality::is_human_rejected(&segment) {
+        return Ok(None);
+    }
+    Ok(crate::quality::human_verified_text(&segment).map(str::to_string))
 }
 
 pub(crate) fn to_nfc(s: &str) -> String {
@@ -759,6 +1129,101 @@ fn nfc_transcripts(seg: &SpeechSegment) -> (String, Option<String>, Option<Strin
         seg.normalized_transcript.as_deref().map(to_nfc),
         seg.annotated_transcript.as_deref().map(to_nfc),
     )
+}
+
+/// Review-owned fields a pasted dataset is attempting to author.
+///
+/// Since schema v60, human truth is valid only when it is committed through the atomic decision /
+/// flag effect graph (or was frozen by the v60 legacy-authority migration). A renderer-supplied JSON
+/// row cannot prove either authority. Keep this list deliberately broader than just the final
+/// `human_decision`: verdict evidence and gold/verification flags affect queues, pay, export, or
+/// training just as directly and therefore cannot be smuggled in through the machine-data merge.
+fn imported_review_owned_fields(seg: &SpeechSegment) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if seg.annotated_transcript.is_some() {
+        fields.push("annotatedTranscript");
+    }
+    if seg.verified {
+        fields.push("verified");
+    }
+    if seg.verdict.is_some() {
+        fields.push("verdict");
+    }
+    if seg.verdict_transcript.is_some() {
+        fields.push("verdictTranscript");
+    }
+    if seg.rationale.is_some() {
+        fields.push("rationale");
+    }
+    if seg.evidence_json.is_some() {
+        fields.push("evidenceJson");
+    }
+    if seg.agreement_score.is_some() {
+        fields.push("agreementScore");
+    }
+    if seg.escalated {
+        fields.push("escalated");
+    }
+    if seg.human_decision.is_some() {
+        fields.push("humanDecision");
+    }
+    if seg.corrected_at.is_some() {
+        fields.push("correctedAt");
+    }
+    if seg.is_gold {
+        fields.push("isGold");
+    }
+    if seg.reviewed_by.is_some() {
+        fields.push("reviewedBy");
+    }
+    fields
+}
+
+pub(crate) fn review_owned_projection_matches(left: &SpeechSegment, right: &SpeechSegment) -> bool {
+    left.annotated_transcript == right.annotated_transcript
+        && left.verified == right.verified
+        && left.verdict == right.verdict
+        && left.verdict_transcript == right.verdict_transcript
+        && left.rationale == right.rationale
+        && left.evidence_json == right.evidence_json
+        && left.agreement_score == right.agreement_score
+        && left.escalated == right.escalated
+        && left.human_decision == right.human_decision
+        && left.corrected_at == right.corrected_at
+        && left.is_gold == right.is_gold
+        && left.reviewed_by == right.reviewed_by
+}
+
+fn history_source_identity_matches(left: &SpeechSegment, right: &SpeechSegment) -> bool {
+    left.id == right.id
+        && left.audio_path == right.audio_path
+        && left.alignment_json == right.alignment_json
+        && left.duration_ms == right.duration_ms
+}
+
+fn history_machine_projection_matches(left: &SpeechSegment, right: &SpeechSegment) -> bool {
+    left.raw_transcript == right.raw_transcript
+        && left.normalized_transcript == right.normalized_transcript
+        && left.speaker_id == right.speaker_id
+        && left.confidence == right.confidence
+        && left.ctc_score == right.ctc_score
+        && left.clipping_ratio == right.clipping_ratio
+        && left.rms_db == right.rms_db
+        && left.snr_db == right.snr_db
+        && left.split == right.split
+        && left.signal_anomaly_score == right.signal_anomaly_score
+        && left.alignment_quality == right.alignment_quality
+        && left.model_version_id.as_deref().unwrap_or("unknown@pre-registry")
+            == right.model_version_id.as_deref().unwrap_or("unknown@pre-registry")
+        && left.confidence_source.as_deref().unwrap_or("unknown")
+            == right.confidence_source.as_deref().unwrap_or("unknown")
+        && left.cloud_call == right.cloud_call
+        && left.decoder_config_hash == right.decoder_config_hash
+        && left.normalizer_version == right.normalizer_version
+        && left.denoised == right.denoised
+        && left.diarized == right.diarized
+        && left.vad_backend == right.vad_backend
+        && left.speaker_change_score == right.speaker_change_score
 }
 
 /// Fold Sorani codepoint variants (Kaf ك/ک, Yeh ي/ی, Heh, Hamza, ZWNJ, tatweel) in a
@@ -953,7 +1418,7 @@ static SUSPECT_FIRST_ORDER: std::sync::LazyLock<String> = std::sync::LazyLock::n
     )
 });
 
-fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String> {
+pub(crate) fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String> {
     let corrected_key = learning_text_key(corrected);
     candidates.iter().filter_map(|candidate| candidate.as_deref()).find_map(|candidate| {
         let trimmed = candidate.trim();
@@ -966,6 +1431,24 @@ fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String
 }
 
 impl Database {
+    fn with_full_sync<T>(&self, operation: impl FnOnce() -> AppResult<T>) -> AppResult<T> {
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        let result = operation();
+        let reset = self.conn.execute_batch("PRAGMA synchronous=NORMAL;");
+        match result {
+            Ok(value) => {
+                reset?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(reset_error) = reset {
+                    tracing::warn!("failed to restore SQLite synchronous=NORMAL after error: {reset_error}");
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Open a frozen SQLite artifact without creating `-wal`/`-shm` sidecars beside it. Plain
     /// `SQLITE_OPEN_READ_ONLY` can still open WAL shared memory; that mutates a manifest-bound
     /// snapshot and makes its final exact-inventory verification fail. SQLite's `immutable=1` URI
@@ -1168,19 +1651,25 @@ impl Database {
         Ok(())
     }
 
-    /// ASR-side insert/upsert. On id conflict it rewrites the ASR-owned columns (transcripts, audio,
-    /// acoustic metrics, provenance) and DELIBERATELY omits every jury / human-decision / gold column
-    /// (verdict*, human_decision, corrected_at, is_gold, ...) and `created_at` — those survive an upsert
-    /// (pinned by the history-restore tests; full-row restore is [`Self::resurrect_segment_snapshot`]).
+    /// Generic ASR/source insert-upsert.
     ///
-    /// CALLER CONTRACT (anti-clobber): `annotated_transcript`, `verified` and `speaker_id` ARE in the
-    /// update list, so never call this with a row snapshot held across long/await-able work — a
-    /// concurrent human edit to those columns would be silently reverted (the rediarize bug). Re-read
-    /// the row at persist time, or use a targeted update (`update_speaker_id`,
-    /// `update_asr_transcript_if_unreviewed`, ...). Audited call sites: batch normalize + couch submit
-    /// re-read fresh; history/couch undo restore a snapshot BY DESIGN; imports build fresh rows.
+    /// At schema 60 this boundary accepts only a neutral review projection and its SQL never names a
+    /// review-owned column.  Human truth must be created by an atomic effect writer.  The historical
+    /// pre-v60 shape remains solely for migration compatibility.
     pub fn insert_segment(&self, seg: &SpeechSegment) -> AppResult<()> {
         validate_segment(seg)?;
+        if crate::migrations::get_current_version(self)? >= 60 {
+            let review_fields = imported_review_owned_fields(seg);
+            if !review_fields.is_empty() {
+                return Err(AppError::Validation(format!(
+                    "generic segment insert/upsert cannot author review-owned field(s) {} at schema v60",
+                    review_fields.join(", ")
+                )));
+            }
+            self.upsert_machine_segment_row(seg)?;
+            self.track_write()?;
+            return Ok(());
+        }
         let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
         self.conn.execute(
             "INSERT INTO speech_segments
@@ -1235,20 +1724,351 @@ impl Database {
         Ok(())
     }
 
-    /// Resurrect a HARD-DELETED segment from a full in-memory snapshot, persisting EVERY column the
-    /// snapshot carries — including the jury / human-review / gold-provenance fields (verdict,
-    /// verdict_transcript, rationale, evidence_json, agreement_score, escalated, human_decision,
-    /// corrected_at, is_gold) and `created_at` that [`insert_segment`] deliberately omits.
-    ///
-    /// [`insert_segment`]'s 17-column subset is correct for the normal edit path, where the row still
-    /// exists and its `ON CONFLICT DO UPDATE` branch leaves the untouched columns intact. But undoing a
-    /// deletion runs as a *fresh* INSERT (the row was physically removed by `delete_segment` /
-    /// `delete_segments_batch`), so anything `insert_segment` skips would silently revert to its schema
-    /// default: verdict/human_decision/is_gold/corrected_at → NULL/0 and `created_at` → datetime('now'),
-    /// reordering the row in every `ORDER BY created_at` query and export. This method writes the whole
-    /// row so a restore is lossless. `created_at` falls back to `datetime('now')` only when the snapshot
-    /// genuinely lacks one (the column is NOT NULL).
+    /// Schema-v60 machine/source upsert. Review-owned columns are absent from both INSERT and UPDATE.
+    fn upsert_machine_segment_row(&self, segment: &SpeechSegment) -> AppResult<()> {
+        let raw_nfc = to_nfc(&segment.raw_transcript);
+        let normalized_nfc = segment.normalized_transcript.as_deref().map(to_nfc);
+        self.conn.execute(
+            "INSERT INTO speech_segments
+                (id, created_at, audio_path, raw_transcript, normalized_transcript,
+                 alignment_json, duration_ms, speaker_id, confidence, ctc_score,
+                 clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                 alignment_quality, model_version_id, confidence_source, cloud_call,
+                 decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                 speaker_change_score, updated_at)
+             VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8,
+                 ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'),
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET
+                 audio_path=excluded.audio_path,
+                 raw_transcript=excluded.raw_transcript,
+                 normalized_transcript=excluded.normalized_transcript,
+                 alignment_json=excluded.alignment_json,
+                 duration_ms=excluded.duration_ms,
+                 speaker_id=excluded.speaker_id,
+                 confidence=excluded.confidence,
+                 ctc_score=excluded.ctc_score,
+                 clipping_ratio=excluded.clipping_ratio,
+                 rms_db=excluded.rms_db,
+                 snr_db=excluded.snr_db,
+                 split=excluded.split,
+                 signal_anomaly_score=excluded.signal_anomaly_score,
+                 alignment_quality=excluded.alignment_quality,
+                 model_version_id=excluded.model_version_id,
+                 confidence_source=excluded.confidence_source,
+                 cloud_call=excluded.cloud_call,
+                 decoder_config_hash=excluded.decoder_config_hash,
+                 normalizer_version=excluded.normalizer_version,
+                 denoised=excluded.denoised,
+                 diarized=excluded.diarized,
+                 vad_backend=excluded.vad_backend,
+                 speaker_change_score=excluded.speaker_change_score,
+                 updated_at=datetime('now')",
+            params![
+                segment.id,
+                segment.created_at,
+                segment.audio_path,
+                raw_nfc,
+                normalized_nfc,
+                segment.alignment_json,
+                segment.duration_ms,
+                segment.speaker_id,
+                segment.confidence,
+                segment.ctc_score,
+                segment.clipping_ratio,
+                segment.rms_db,
+                segment.snr_db,
+                segment.split,
+                segment.signal_anomaly_score,
+                segment.alignment_quality,
+                segment.model_version_id,
+                segment.confidence_source,
+                segment.cloud_call as i32,
+                segment.decoder_config_hash,
+                segment.normalizer_version,
+                segment.denoised.map(|value| value as i32),
+                segment.diarized.map(|value| value as i32),
+                segment.vad_backend,
+                segment.speaker_change_score,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Schema-v60 generic/editor insert boundary. New rows may carry machine/source metadata only;
+    /// human truth must originate in the atomic review-effect writers.
+    pub(crate) fn insert_machine_segment_snapshot(&self, segment: &SpeechSegment) -> AppResult<()> {
+        validate_segment(segment)?;
+        let review_fields = imported_review_owned_fields(segment);
+        if !review_fields.is_empty() {
+            return Err(AppError::Validation(format!(
+                "generic segment insert cannot author review-owned field(s) {} at schema v60",
+                review_fields.join(", ")
+            )));
+        }
+        let raw_nfc = to_nfc(&segment.raw_transcript);
+        let normalized_nfc = segment.normalized_transcript.as_deref().map(to_nfc);
+        self.conn.execute(
+            "INSERT INTO speech_segments
+                (id, created_at, audio_path, raw_transcript, normalized_transcript,
+                 alignment_json, duration_ms, speaker_id, confidence, ctc_score,
+                 clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                 alignment_quality, model_version_id, confidence_source, cloud_call,
+                 decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                 speaker_change_score, updated_at)
+             VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8,
+                 ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'),
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, datetime('now'))",
+            params![
+                segment.id,
+                segment.created_at,
+                segment.audio_path,
+                raw_nfc,
+                normalized_nfc,
+                segment.alignment_json,
+                segment.duration_ms,
+                segment.speaker_id,
+                segment.confidence,
+                segment.ctc_score,
+                segment.clipping_ratio,
+                segment.rms_db,
+                segment.snr_db,
+                segment.split,
+                segment.signal_anomaly_score,
+                segment.alignment_quality,
+                segment.model_version_id,
+                segment.confidence_source,
+                segment.cloud_call as i32,
+                segment.decoder_config_hash,
+                segment.normalizer_version,
+                segment.denoised.map(|value| value as i32),
+                segment.diarized.map(|value| value as i32),
+                segment.vad_backend,
+                segment.speaker_change_score,
+            ],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Persist a generic v60 whole-row editor request through an explicit machine/source allowlist.
+    /// Review-owned columns are compared but never named in the UPDATE.
+    pub(crate) fn persist_machine_segment_snapshot(
+        &self,
+        expected: &SpeechSegment,
+        desired: &SpeechSegment,
+    ) -> AppResult<()> {
+        validate_segment(desired)?;
+        if expected.id != desired.id {
+            return Err(AppError::Validation("generic segment update endpoints must identify the same segment".into()));
+        }
+        if !review_owned_projection_matches(expected, desired) {
+            return Err(AppError::Validation(format!(
+                "generic segment update for {} attempted to mutate review-owned truth",
+                expected.id
+            )));
+        }
+        let current = self.get_segment_by_id(&expected.id)?.ok_or_else(|| {
+            AppError::Validation(format!("Cannot update segment {}: it no longer exists", expected.id))
+        })?;
+        if !review_owned_projection_matches(&current, expected)
+            || !history_source_identity_matches(&current, expected)
+            || !history_machine_projection_matches(&current, expected)
+        {
+            return Err(AppError::Validation(format!(
+                "Cannot apply stale generic update for segment {}: its stored state changed",
+                expected.id
+            )));
+        }
+
+        let raw_nfc = to_nfc(&desired.raw_transcript);
+        let normalized_nfc = desired.normalized_transcript.as_deref().map(to_nfc);
+        self.conn.execute(
+            "UPDATE speech_segments SET
+                audio_path=?2, raw_transcript=?3, normalized_transcript=?4,
+                alignment_json=?5, duration_ms=?6, speaker_id=?7,
+                confidence=?8, ctc_score=?9, clipping_ratio=?10, rms_db=?11, snr_db=?12,
+                split=?13, signal_anomaly_score=?14, alignment_quality=?15,
+                model_version_id=COALESCE(?16, 'unknown@pre-registry'),
+                confidence_source=COALESCE(?17, 'unknown'), cloud_call=?18,
+                decoder_config_hash=?19, normalizer_version=?20, denoised=?21,
+                diarized=?22, vad_backend=?23, speaker_change_score=?24,
+                updated_at=datetime('now')
+             WHERE id=?1",
+            params![
+                desired.id,
+                desired.audio_path,
+                raw_nfc,
+                normalized_nfc,
+                desired.alignment_json,
+                desired.duration_ms,
+                desired.speaker_id,
+                desired.confidence,
+                desired.ctc_score,
+                desired.clipping_ratio,
+                desired.rms_db,
+                desired.snr_db,
+                desired.split,
+                desired.signal_anomaly_score,
+                desired.alignment_quality,
+                desired.model_version_id,
+                desired.confidence_source,
+                desired.cloud_call as i32,
+                desired.decoder_config_hash,
+                desired.normalizer_version,
+                desired.denoised.map(|value| value as i32),
+                desired.diarized.map(|value| value as i32),
+                desired.vad_backend,
+                desired.speaker_change_score,
+            ],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Apply one generic history endpoint without ever writing review-owned or source-identity
+    /// columns. The two immutable command endpoints must agree on those protected projections, and
+    /// the current machine/source projection must still equal the endpoint being reversed. A later
+    /// human decision is deliberately allowed: its current review projection is left byte-for-byte
+    /// untouched while the older machine edit is undone/redone.
+    pub(crate) fn apply_history_machine_snapshot(
+        &self,
+        expected: &SpeechSegment,
+        desired: &SpeechSegment,
+    ) -> AppResult<()> {
+        if crate::migrations::get_current_version(self)? < 60 {
+            return self.insert_segment(desired);
+        }
+        if expected.id != desired.id {
+            return Err(AppError::Validation("history update endpoints must identify the same segment".into()));
+        }
+        if !review_owned_projection_matches(expected, desired) {
+            return Err(AppError::Validation(format!(
+                "history update for segment {} attempted to mutate review-owned truth",
+                expected.id
+            )));
+        }
+        if !history_source_identity_matches(expected, desired) {
+            return Err(AppError::Validation(format!(
+                "history update for segment {} attempted to mutate protected source identity",
+                expected.id
+            )));
+        }
+        let current = self.get_segment_by_id(&expected.id)?.ok_or_else(|| {
+            AppError::Validation(format!("Cannot apply history for segment {}: it no longer exists", expected.id))
+        })?;
+        if !history_source_identity_matches(&current, expected)
+            || !history_machine_projection_matches(&current, expected)
+        {
+            return Err(AppError::Validation(format!(
+                "Cannot apply stale history for segment {}: its machine/source state changed after the recorded edit",
+                expected.id
+            )));
+        }
+
+        let raw_nfc = to_nfc(&desired.raw_transcript);
+        let normalized_nfc = desired.normalized_transcript.as_deref().map(to_nfc);
+        self.conn.execute(
+            "UPDATE speech_segments SET
+                raw_transcript=?2, normalized_transcript=?3, speaker_id=?4,
+                confidence=?5, ctc_score=?6, clipping_ratio=?7, rms_db=?8, snr_db=?9,
+                split=?10, signal_anomaly_score=?11, alignment_quality=?12,
+                model_version_id=COALESCE(?13, 'unknown@pre-registry'),
+                confidence_source=COALESCE(?14, 'unknown'), cloud_call=?15,
+                decoder_config_hash=?16, normalizer_version=?17, denoised=?18,
+                diarized=?19, vad_backend=?20, speaker_change_score=?21,
+                updated_at=datetime('now')
+             WHERE id=?1",
+            params![
+                desired.id,
+                raw_nfc,
+                normalized_nfc,
+                desired.speaker_id,
+                desired.confidence,
+                desired.ctc_score,
+                desired.clipping_ratio,
+                desired.rms_db,
+                desired.snr_db,
+                desired.split,
+                desired.signal_anomaly_score,
+                desired.alignment_quality,
+                desired.model_version_id,
+                desired.confidence_source,
+                desired.cloud_call as i32,
+                desired.decoder_config_hash,
+                desired.normalizer_version,
+                desired.denoised.map(|value| value as i32),
+                desired.diarized.map(|value| value as i32),
+                desired.vad_backend,
+                desired.speaker_change_score,
+            ],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Undo the fields owned by batch transcription. The command intentionally carries only the
+    /// pre-batch row, so deterministic redo is unsupported; its inverse is correspondingly limited
+    /// to the exact ASR columns the batch writer owns. Review/source fields are never named.
+    pub(crate) fn restore_batch_transcription_snapshot(&self, previous: &SpeechSegment) -> AppResult<()> {
+        if crate::migrations::get_current_version(self)? < 60 {
+            return self.insert_segment(previous);
+        }
+        let Some(current) = self.get_segment_by_id(&previous.id)? else {
+            return Ok(());
+        };
+        if !history_source_identity_matches(&current, previous) {
+            return Err(AppError::Validation(format!(
+                "Cannot undo batch transcription for segment {}: its protected source identity changed",
+                previous.id
+            )));
+        }
+        let raw_nfc = to_nfc(&previous.raw_transcript);
+        let normalized_nfc = previous.normalized_transcript.as_deref().map(to_nfc);
+        self.conn.execute(
+            "UPDATE speech_segments SET
+                raw_transcript=?2, normalized_transcript=?3, confidence=?4,
+                confidence_source=COALESCE(?5, 'unknown'),
+                model_version_id=COALESCE(?6, 'unknown@pre-registry'), cloud_call=?7,
+                updated_at=datetime('now')
+             WHERE id=?1",
+            params![
+                previous.id,
+                raw_nfc,
+                normalized_nfc,
+                previous.confidence,
+                previous.confidence_source,
+                previous.model_version_id,
+                previous.cloud_call as i32,
+            ],
+        )?;
+        self.track_write()?;
+        Ok(())
+    }
+
+    /// Legacy lossless full-row insertion. Schema 60 turns this generic boundary into a machine/source
+    /// upsert: it rejects any review-owned projection and never names review columns. Reviewed deletion
+    /// is itself forbidden, so an effect-backed row can never need whole-row resurrection.
     pub fn insert_segment_full(&self, seg: &SpeechSegment) -> AppResult<()> {
+        if crate::migrations::get_current_version(self)? >= 60 {
+            validate_segment(seg)?;
+            let review_fields = imported_review_owned_fields(seg);
+            if !review_fields.is_empty() {
+                return Err(AppError::Validation(format!(
+                    "generic full segment insert/upsert cannot author review-owned field(s) {} at schema v60",
+                    review_fields.join(", ")
+                )));
+            }
+            self.upsert_machine_segment_row(seg)?;
+            self.track_write()?;
+            return Ok(());
+        }
+        self.insert_segment_full_unchecked(seg)
+    }
+
+    fn insert_segment_full_unchecked(&self, seg: &SpeechSegment) -> AppResult<()> {
         validate_segment(seg)?;
         let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
         // NFC-normalize the jury verdict transcript too, so a restored row stays byte-consistent with
@@ -1351,9 +2171,19 @@ impl Database {
         Ok(())
     }
 
-    /// Targeted single-column update: sets `verified` without touching any other field.
-    /// Returns true if the row was found and updated.
-    pub fn update_verified(&self, id: &str, verified: bool) -> AppResult<bool> {
+    /// Legacy batch verification cannot create schema-v60 human truth: every production review must
+    /// have an immutable decision effect (or belong to the frozen pre-v60 authority snapshot).
+    pub fn update_verified(&self, _id: &str, _verified: bool) -> AppResult<bool> {
+        Err(AppError::Validation(
+            "legacy batch verify/unverify is disabled; use the review decision flow so human truth has an immutable effect"
+                .into(),
+        ))
+    }
+
+    /// Test-only fixture writer for legacy/evaluation scenarios that intentionally model an unbound
+    /// verified bit. Production code must never call this schema-v60 bypass.
+    #[cfg(test)]
+    pub fn update_verified_for_test(&self, id: &str, verified: bool) -> AppResult<bool> {
         let rows = self.conn.execute(
             "UPDATE speech_segments SET verified = ?2, updated_at = datetime('now') WHERE id = ?1",
             params![id, verified as i32],
@@ -1386,11 +2216,28 @@ impl Database {
     }
 
     pub fn insert_segments_batch(&self, segments: &[SpeechSegment]) -> AppResult<()> {
+        let schema_v60 = crate::migrations::get_current_version(self)? >= 60;
+        if schema_v60 {
+            // Validate the complete batch before the savepoint or first INSERT. One forged row must
+            // reject the payload without partially importing the preceding neutral rows.
+            for segment in segments {
+                validate_segment(segment)?;
+                let review_fields = imported_review_owned_fields(segment);
+                if !review_fields.is_empty() {
+                    return Err(AppError::Validation(format!(
+                        "generic segment batch cannot author review-owned field(s) {} at schema v60",
+                        review_fields.join(", ")
+                    )));
+                }
+            }
+        }
         // Use a SAVEPOINT on the shared connection — avoids opening a second
         // file handle that could race with other writers under WAL mode.
         self.conn.execute("SAVEPOINT batch_insert", [])?;
         let result: AppResult<()> = (|| {
-            let mut stmt = self.conn.prepare(
+            let mut legacy_stmt = (!schema_v60)
+                .then(|| {
+                    self.conn.prepare(
                 "INSERT INTO speech_segments
                     (id, audio_path, raw_transcript, normalized_transcript,
                      annotated_transcript, alignment_json, duration_ms, speaker_id, verified, confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
@@ -1420,96 +2267,85 @@ impl Database {
                     denoised=excluded.denoised,
                     diarized=excluded.diarized,
                     vad_backend=excluded.vad_backend,
-                    updated_at=datetime('now')"
-            )?;
+                     updated_at=datetime('now')",
+                    )
+                })
+                .transpose()?;
+            let mut machine_stmt = schema_v60
+                .then(|| {
+                    self.conn.prepare(
+                        "INSERT INTO speech_segments
+                            (id, created_at, audio_path, raw_transcript, normalized_transcript,
+                             alignment_json, duration_ms, speaker_id, confidence, ctc_score,
+                             clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                             alignment_quality, model_version_id, confidence_source, cloud_call,
+                             decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                             speaker_change_score, updated_at)
+                         VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8,
+                             ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                             COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'),
+                             ?19, ?20, ?21, ?22, ?23, ?24, ?25, datetime('now'))
+                         ON CONFLICT(id) DO UPDATE SET
+                             audio_path=excluded.audio_path,
+                             raw_transcript=excluded.raw_transcript,
+                             normalized_transcript=excluded.normalized_transcript,
+                             alignment_json=excluded.alignment_json,
+                             duration_ms=excluded.duration_ms,
+                             speaker_id=excluded.speaker_id,
+                             confidence=excluded.confidence,
+                             ctc_score=excluded.ctc_score,
+                             clipping_ratio=excluded.clipping_ratio,
+                             rms_db=excluded.rms_db,
+                             snr_db=excluded.snr_db,
+                             split=excluded.split,
+                             signal_anomaly_score=excluded.signal_anomaly_score,
+                             alignment_quality=excluded.alignment_quality,
+                             model_version_id=excluded.model_version_id,
+                             confidence_source=excluded.confidence_source,
+                             cloud_call=excluded.cloud_call,
+                             decoder_config_hash=excluded.decoder_config_hash,
+                             normalizer_version=excluded.normalizer_version,
+                             denoised=excluded.denoised,
+                             diarized=excluded.diarized,
+                             vad_backend=excluded.vad_backend,
+                             speaker_change_score=excluded.speaker_change_score,
+                             updated_at=datetime('now')",
+                    )
+                })
+                .transpose()?;
             for seg in segments {
                 validate_segment(seg)?;
                 let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
-                stmt.execute(params![
-                    seg.id,
-                    seg.audio_path,
-                    raw_nfc,
-                    normalized_nfc,
-                    annotated_nfc,
-                    seg.alignment_json,
-                    seg.duration_ms,
-                    seg.speaker_id,
-                    seg.verified as i32,
-                    seg.confidence,
-                    seg.ctc_score,
-                    seg.clipping_ratio,
-                    seg.rms_db,
-                    seg.snr_db,
-                    seg.split,
-                    seg.signal_anomaly_score,
-                    seg.model_version_id,
-                    seg.confidence_source,
-                    seg.cloud_call as i32,
-                    seg.decoder_config_hash,
-                    seg.normalizer_version,
-                    seg.denoised.map(|b| b as i32),
-                    seg.diarized.map(|b| b as i32),
-                    seg.vad_backend,
-                ])?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.release_savepoint("batch_insert")?;
-                self.track_write()?;
-                Ok(())
-            }
-            Err(e) => {
-                self.cleanup_savepoint_after_error("batch_insert");
-                Err(e)
-            }
-        }
-    }
-
-    pub fn merge_dataset_json(&self, json_content: &str) -> AppResult<(usize, usize)> {
-        let external_segments: Vec<SpeechSegment> = serde_json::from_str(json_content)?;
-        let mut updated = 0;
-        let mut created = 0;
-
-        self.conn.execute("SAVEPOINT merge_json", [])?;
-        let result: AppResult<()> = (|| {
-            let mut check_stmt = self.conn.prepare("SELECT id FROM speech_segments WHERE id = ?1")?;
-            // Guard: never overwrite a human's reviewed row; only update unreviewed ones. verified = 0 is
-            // load-bearing alongside the human_decision/verdict checks: "Verify"/"Verify selected"
-            // (batch_verify -> update_verified) sets ONLY verified=1 and leaves human_decision/verdict NULL,
-            // so without this clause a pasted-dataset merge would overwrite a human-VERIFIED row's transcript
-            // (and its verified flag) with imported machine text — silently destroying reviewed work and, if
-            // the imported row carries verified=true, shipping unapproved text as human-verified GOLD. Mirrors
-            // the sibling update_asr_transcript_if_unreviewed / update_batch_transcription_if_unreviewed
-            // guards (the merge path was simply never given the clause). Importing a NEW verified row (an id
-            // not present locally) still works — this only refuses to OVERWRITE an existing reviewed row.
-            let mut update_stmt = self.conn.prepare(
-                "UPDATE speech_segments SET
-                    audio_path=?2, raw_transcript=?3, normalized_transcript=?4,
-                    annotated_transcript=?5, alignment_json=?6, duration_ms=?7,
-                    speaker_id=?8, verified=?9, confidence=?10, ctc_score=?11,
-                    clipping_ratio=?12, rms_db=?13, snr_db=?14, split=?15, signal_anomaly_score=?16,
-                    model_version_id=COALESCE(?17, 'unknown@pre-registry'),
-                    confidence_source=COALESCE(?18, 'unknown'),
-                    cloud_call=?19,
-                    decoder_config_hash=?20,
-                    normalizer_version=?21,
-                    updated_at=datetime('now')
-                 WHERE id=?1
-                   AND verified = 0
-                   AND (human_decision IS NULL OR human_decision = '')
-                   AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
-            )?;
-
-            for seg in &external_segments {
-                validate_segment(seg)?;
-                let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
-                let exists = check_stmt.exists(params![seg.id])?;
-                if exists {
-                    // Count only rows the guard actually changed — a human-reviewed row matches 0
-                    // rows here (the UPDATE skips it), so it must not be reported as "updated".
-                    let changed = update_stmt.execute(params![
+                if let Some(stmt) = machine_stmt.as_mut() {
+                    stmt.execute(params![
+                        seg.id,
+                        seg.created_at,
+                        seg.audio_path,
+                        raw_nfc,
+                        normalized_nfc,
+                        seg.alignment_json,
+                        seg.duration_ms,
+                        seg.speaker_id,
+                        seg.confidence,
+                        seg.ctc_score,
+                        seg.clipping_ratio,
+                        seg.rms_db,
+                        seg.snr_db,
+                        seg.split,
+                        seg.signal_anomaly_score,
+                        seg.alignment_quality,
+                        seg.model_version_id,
+                        seg.confidence_source,
+                        seg.cloud_call as i32,
+                        seg.decoder_config_hash,
+                        seg.normalizer_version,
+                        seg.denoised.map(|b| b as i32),
+                        seg.diarized.map(|b| b as i32),
+                        seg.vad_backend,
+                        seg.speaker_change_score,
+                    ])?;
+                } else if let Some(stmt) = legacy_stmt.as_mut() {
+                    stmt.execute(params![
                         seg.id,
                         seg.audio_path,
                         raw_nfc,
@@ -1531,20 +2367,213 @@ impl Database {
                         seg.cloud_call as i32,
                         seg.decoder_config_hash,
                         seg.normalizer_version,
+                        seg.denoised.map(|b| b as i32),
+                        seg.diarized.map(|b| b as i32),
+                        seg.vad_backend,
                     ])?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("batch_insert")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(e) => {
+                self.cleanup_savepoint_after_error("batch_insert");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn merge_dataset_json(&self, json_content: &str) -> AppResult<(usize, usize)> {
+        let external_segments: Vec<SpeechSegment> = serde_json::from_str(json_content)?;
+        let schema_v60 = crate::migrations::get_current_version(self)? >= 60;
+
+        // Validate the entire renderer-owned payload before opening the savepoint or touching even one
+        // row. At v60+, pasted JSON may carry machine/source metadata only; review truth must be born
+        // through the server-owned effect finalizers. Pre-v60 keeps its historical lossless-import
+        // behavior solely for migration compatibility.
+        if schema_v60 {
+            for segment in &external_segments {
+                let fields = imported_review_owned_fields(segment);
+                if !fields.is_empty() {
+                    return Err(AppError::Validation(format!(
+                        "Dataset merge refused atomically: segment '{}' supplies review-owned field(s) {}; use the review decision/flag flow so human truth has immutable authority",
+                        segment.id,
+                        fields.join(", ")
+                    )));
+                }
+            }
+        }
+        let mut updated = 0;
+        let mut created = 0;
+
+        self.conn.execute("SAVEPOINT merge_json", [])?;
+        let result: AppResult<()> = (|| {
+            let mut check_stmt = self.conn.prepare("SELECT id FROM speech_segments WHERE id = ?1")?;
+            let update_sql = if schema_v60 {
+                // Do not even name review-owned columns in the SET list. The complete guard also keeps
+                // machine transcript/metadata replacement away from every current or frozen reviewed
+                // row; pasted data must never mutate the baseline of an existing review chain.
+                "UPDATE speech_segments SET
+                    audio_path=?2, raw_transcript=?3, normalized_transcript=?4,
+                    alignment_json=?5, duration_ms=?6, speaker_id=?7,
+                    confidence=?8, ctc_score=?9, clipping_ratio=?10, rms_db=?11,
+                    snr_db=?12, split=?13, signal_anomaly_score=?14,
+                    model_version_id=COALESCE(?15, 'unknown@pre-registry'),
+                    confidence_source=COALESCE(?16, 'unknown'), cloud_call=?17,
+                    decoder_config_hash=?18, normalizer_version=?19,
+                    updated_at=datetime('now')
+                 WHERE id=?1
+                   AND verified = 0 AND escalated = 0 AND is_gold = 0
+                   AND annotated_transcript IS NULL
+                   AND human_decision IS NULL AND verdict IS NULL
+                   AND verdict_transcript IS NULL AND rationale IS NULL
+                   AND evidence_json IS NULL AND agreement_score IS NULL
+                   AND corrected_at IS NULL AND reviewed_by IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM legacy_reviewed_segments_v60 legacy
+                       WHERE legacy.id = speech_segments.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM human_decision_effect_events effect
+                       WHERE effect.segment_id = speech_segments.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM review_flag_effect_events flag
+                       WHERE flag.segment_id = speech_segments.id
+                   )"
+            } else {
+                "UPDATE speech_segments SET
+                    audio_path=?2, raw_transcript=?3, normalized_transcript=?4,
+                    annotated_transcript=?5, alignment_json=?6, duration_ms=?7,
+                    speaker_id=?8, verified=?9, confidence=?10, ctc_score=?11,
+                    clipping_ratio=?12, rms_db=?13, snr_db=?14, split=?15, signal_anomaly_score=?16,
+                    model_version_id=COALESCE(?17, 'unknown@pre-registry'),
+                    confidence_source=COALESCE(?18, 'unknown'), cloud_call=?19,
+                    decoder_config_hash=?20, normalizer_version=?21,
+                    updated_at=datetime('now')
+                 WHERE id=?1
+                   AND verified = 0
+                   AND (human_decision IS NULL OR human_decision = '')
+                   AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))"
+            };
+            let mut update_stmt = self.conn.prepare(update_sql)?;
+
+            let mut insert_machine_stmt = if schema_v60 {
+                Some(self.conn.prepare(
+                    "INSERT INTO speech_segments
+                        (id, created_at, audio_path, raw_transcript, normalized_transcript,
+                         alignment_json, duration_ms, speaker_id, confidence, ctc_score,
+                         clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
+                         alignment_quality, model_version_id, confidence_source, cloud_call,
+                         decoder_config_hash, normalizer_version, denoised, diarized, vad_backend,
+                         speaker_change_score, updated_at)
+                     VALUES (?1, COALESCE(?2, datetime('now')), ?3, ?4, ?5, ?6, ?7, ?8,
+                         ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                         COALESCE(?17, 'unknown@pre-registry'), COALESCE(?18, 'unknown'),
+                         ?19, ?20, ?21, ?22, ?23, ?24, ?25, datetime('now'))",
+                )?)
+            } else {
+                None
+            };
+
+            for seg in &external_segments {
+                validate_segment(seg)?;
+                let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(seg);
+                let exists = check_stmt.exists(params![seg.id])?;
+                if exists {
+                    // Count only rows the guard actually changed — a human-reviewed row matches 0
+                    // rows here (the UPDATE skips it), so it must not be reported as "updated".
+                    let changed = if schema_v60 {
+                        update_stmt.execute(params![
+                            seg.id,
+                            seg.audio_path,
+                            raw_nfc,
+                            normalized_nfc,
+                            seg.alignment_json,
+                            seg.duration_ms,
+                            seg.speaker_id,
+                            seg.confidence,
+                            seg.ctc_score,
+                            seg.clipping_ratio,
+                            seg.rms_db,
+                            seg.snr_db,
+                            seg.split,
+                            seg.signal_anomaly_score,
+                            seg.model_version_id,
+                            seg.confidence_source,
+                            seg.cloud_call as i32,
+                            seg.decoder_config_hash,
+                            seg.normalizer_version,
+                        ])?
+                    } else {
+                        update_stmt.execute(params![
+                            seg.id,
+                            seg.audio_path,
+                            raw_nfc,
+                            normalized_nfc,
+                            annotated_nfc,
+                            seg.alignment_json,
+                            seg.duration_ms,
+                            seg.speaker_id,
+                            seg.verified as i32,
+                            seg.confidence,
+                            seg.ctc_score,
+                            seg.clipping_ratio,
+                            seg.rms_db,
+                            seg.snr_db,
+                            seg.split,
+                            seg.signal_anomaly_score,
+                            seg.model_version_id,
+                            seg.confidence_source,
+                            seg.cloud_call as i32,
+                            seg.decoder_config_hash,
+                            seg.normalizer_version,
+                        ])?
+                    };
                     if changed > 0 {
                         updated += 1;
                     }
                 } else {
-                    // Lossless full-column insert for NEW ids. SpeechSegment deserializes every jury /
-                    // human-review / gold column, and a merged dataset can carry reviewed rows — the old
-                    // ASR-column-only INSERT silently dropped verdict/human_decision/is_gold/
-                    // corrected_at/alignment_quality/created_at, stripping the human work product so the
-                    // merged rows graded as unreviewed machine drafts. A new id has no local state to
-                    // protect, so persisting the whole snapshot is unconditionally correct (the guarded
-                    // UPDATE above keeps its unreviewed-only, ASR-columns-only semantics for EXISTING
-                    // rows — external jury state must not overwrite local jury state).
-                    self.insert_segment_full(seg)?;
+                    if let Some(stmt) = insert_machine_stmt.as_mut() {
+                        // Schema-v60 imports create machine/source rows only. Review fields take their
+                        // schema defaults and cannot be supplied by renderer JSON.
+                        stmt.execute(params![
+                            seg.id,
+                            seg.created_at,
+                            seg.audio_path,
+                            raw_nfc,
+                            normalized_nfc,
+                            seg.alignment_json,
+                            seg.duration_ms,
+                            seg.speaker_id,
+                            seg.confidence,
+                            seg.ctc_score,
+                            seg.clipping_ratio,
+                            seg.rms_db,
+                            seg.snr_db,
+                            seg.split,
+                            seg.signal_anomaly_score,
+                            seg.alignment_quality,
+                            seg.model_version_id,
+                            seg.confidence_source,
+                            seg.cloud_call as i32,
+                            seg.decoder_config_hash,
+                            seg.normalizer_version,
+                            seg.denoised.map(|value| value as i32),
+                            seg.diarized.map(|value| value as i32),
+                            seg.vad_backend,
+                            seg.speaker_change_score,
+                        ])?;
+                    } else {
+                        // Historical pre-v60 compatibility: before atomic effect authority existed,
+                        // dataset merge was the supported lossless reviewed-row import.
+                        self.insert_segment_full(seg)?;
+                    }
                     created += 1;
                 }
             }
@@ -1852,7 +2881,9 @@ impl Database {
         let result: AppResult<()> = (|| {
             self.archive_loop0_evidence_for(id)?;
             self.archive_c4_evidence_for(id)?;
-            self.conn.execute("DELETE FROM speech_segments WHERE id = ?1", params![id])?;
+            self.conn
+                .execute("DELETE FROM speech_segments WHERE id = ?1", params![id])
+                .map_err(map_segment_delete_error)?;
             Ok(())
         })();
         match result {
@@ -1878,7 +2909,7 @@ impl Database {
             }
             let mut stmt = self.conn.prepare("DELETE FROM speech_segments WHERE id = ?1")?;
             for id in ids {
-                stmt.execute(params![id])?;
+                stmt.execute(params![id]).map_err(map_segment_delete_error)?;
             }
             Ok(())
         })();
@@ -1922,6 +2953,77 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    fn decision_snapshot_on(conn: &Connection, id: &str) -> AppResult<Option<(SpeechSegment, i64, Option<String>)>> {
+        let query = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS}, review_revision, audio_content_hash
+               FROM speech_segments WHERE id = ?1"
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((Self::map_row(row)?, row.get(37)?, row.get(38)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// A review flag owns only verdict/rationale/escalation.  Before it snapshots those fields, the
+    /// human-owned fields it leaves untouched must already have a durable origin: either the exact
+    /// immutable pre-v60 reviewed-row snapshot, or the canonical empty/non-human baseline.  Without
+    /// this check a trigger-disabled/imported row could set `verified` or an annotation first and
+    /// then use a perfectly valid flag effect to make that unbound text look review-authorized.
+    fn flag_human_baseline_is_authorized_on(conn: &Connection, segment: &SpeechSegment) -> AppResult<bool> {
+        let exact_legacy_human_baseline: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM legacy_reviewed_segments_v60 legacy
+                   JOIN speech_segments current
+                     ON current.rowid = legacy.original_rowid
+                    AND current.id = legacy.id
+                  WHERE current.id = ?1
+                    AND current.review_revision >= legacy.review_revision
+                    AND current.human_decision IS legacy.human_decision
+                    AND current.verdict_transcript IS legacy.verdict_transcript
+                    AND current.annotated_transcript IS legacy.annotated_transcript
+                    AND current.verified IS legacy.verified
+                    AND current.reviewed_by IS legacy.reviewed_by
+                    AND current.corrected_at IS legacy.corrected_at
+                    AND current.is_gold IS legacy.is_gold
+             )",
+            [&segment.id],
+            |row| row.get(0),
+        )?;
+        if exact_legacy_human_baseline {
+            return Ok(true);
+        }
+
+        Ok(!segment.verified
+            && segment.annotated_transcript.is_none()
+            && segment.human_decision.as_deref().map_or(true, |value| value.trim().is_empty())
+            && segment.reviewed_by.as_deref().map_or(true, |value| value.trim().is_empty())
+            && segment.corrected_at.as_deref().map_or(true, |value| value.trim().is_empty())
+            && !segment.is_gold)
+    }
+
+    fn load_correction_memories_on(conn: &Connection) -> AppResult<Vec<crate::corrections::MemoryEntry>> {
+        let mut stmt = conn.prepare(
+            "SELECT wrong_token, human_token, slot_key, phonetic_key, confidence, hit_count
+               FROM effective_correction_memory_v60
+              ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::corrections::MemoryEntry {
+                wrong_token: row.get(0)?,
+                human_token: row.get(1)?,
+                slot_key: row.get(2)?,
+                phonetic_key: row.get(3)?,
+                confidence: row.get(4)?,
+                hit_count: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Look up a segment by its `audio_path` column using the `idx_segments_audio_path` index.
@@ -2081,25 +3183,28 @@ impl Database {
                 "review compensation refused: segment {segment_id} has non-positive duration {duration_ms}"
             )));
         }
-        if let (Some(hash), Some(alignment)) = (content_hash.filter(|value| !value.trim().is_empty()), alignment_json) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&alignment) {
-                let start = value.get("source_start_ms").and_then(serde_json::Value::as_i64);
-                let end = value.get("source_end_ms").and_then(serde_json::Value::as_i64);
-                if let (Some(start), Some(end)) = (start, end) {
-                    if start >= 0 && end > start {
-                        return Ok((
-                            format!("audio-segment-v1:{}:{start}:{end}", hash.trim()),
-                            "audio_content_hash+source_span",
-                            duration_ms,
-                        ));
-                    }
+        if let Some(hash) = content_hash {
+            if !is_canonical_audio_content_hash(&hash) {
+                return Err(AppError::Validation(format!(
+                    "review compensation refused: segment {segment_id} has no canonical PCM content hash"
+                )));
+            }
+            if let Some((start, end)) = canonical_source_span(alignment_json.as_deref()) {
+                if !source_span_matches_duration(start, end, duration_ms) {
+                    return Err(AppError::Validation(format!(
+                        "review compensation refused: segment {segment_id} source span disagrees with decoded duration"
+                    )));
                 }
+                return Ok((
+                    format!("audio-segment-v1:{hash}:{start}:{end}"),
+                    "audio_content_hash+source_span",
+                    duration_ms,
+                ));
             }
         }
-        // Legacy/test rows can predate canonical PCM identity. Keep the ledger honest about the
-        // weaker key; the production readiness gate requires this count to be zero inside the live
-        // paid focus, so a fallback can never be silently described as duplicate-safe.
-        Ok((format!("segment-id-v1:{segment_id}"), "segment_id_fallback", duration_ms))
+        Err(AppError::Validation(format!(
+            "review compensation refused: segment {segment_id} lacks a canonical PCM content hash and valid source span"
+        )))
     }
 
     fn verify_review_pay_policy_tx(tx: &rusqlite::Transaction<'_>) -> AppResult<i64> {
@@ -2157,6 +3262,187 @@ impl Database {
                 },
             )
             .optional()?)
+    }
+
+    pub(crate) fn human_decision_effect_for_operation(&self, operation_id: &str) -> AppResult<Option<(i64, String)>> {
+        validate_operation_uuid(operation_id)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT e.id, e.segment_id
+                   FROM human_decision_effect_events e
+                   JOIN review_events r ON r.id = e.review_event_id
+                  WHERE r.operation_id = ?1",
+                params![operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Durable bodyless-phone Undo target. Select the latest Couch decision for this reviewer even
+    /// when it is already reversed: a lost Undo response or process restart must replay that same
+    /// idempotent inverse, never fall through and retract an older decision.
+    pub(crate) fn latest_phone_human_decision_effect(
+        &self,
+        reviewer: &str,
+    ) -> AppResult<Option<(i64, String, String)>> {
+        let reviewer = reviewer.trim();
+        if reviewer.is_empty() {
+            return Err(AppError::Validation("phone undo reviewer must not be blank".into()));
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT effect.id, event.operation_id, effect.segment_id
+                   FROM human_decision_effect_events effect
+                   JOIN review_events event ON event.id = effect.review_event_id
+                  WHERE effect.source = 'couch'
+                    AND effect.reviewer = ?1 COLLATE NOCASE
+                    AND event.source = 'couch'
+                  ORDER BY effect.id DESC
+                  LIMIT 1",
+                params![reviewer],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    fn desktop_human_decision_replay_on(
+        conn: &Connection,
+        operation_id: &str,
+        operation_payload_hash: &str,
+        segment_id: &str,
+    ) -> AppResult<Option<HumanDecisionCommit>> {
+        let existing: Option<DesktopReplayEffect> = conn
+            .query_row(
+                "SELECT id, segment_id, source, reviewer, operation_payload_hash, action,
+                        decision_transcript, decision_annotated_transcript, decision_verified,
+                        decision_corrected_at, decision_rationale, requested_action, requested_transcript,
+                        requested_timestamp_ms, prior_revision, decision_revision,
+                        prior_verdict_transcript
+                   FROM human_decision_effect_events
+                  WHERE operation_id = ?1",
+                params![operation_id],
+                |row| {
+                    Ok(DesktopReplayEffect {
+                        id: row.get(0)?,
+                        segment_id: row.get(1)?,
+                        source: row.get(2)?,
+                        reviewer: row.get(3)?,
+                        operation_payload_hash: row.get(4)?,
+                        action: row.get(5)?,
+                        decision_transcript: row.get(6)?,
+                        decision_annotated_transcript: row.get(7)?,
+                        decision_verified: row.get::<_, i32>(8)? != 0,
+                        decision_corrected_at: row.get(9)?,
+                        decision_rationale: row.get(10)?,
+                        requested_action: row.get(11)?,
+                        requested_transcript: row.get(12)?,
+                        requested_timestamp_ms: row.get(13)?,
+                        prior_revision: row.get(14)?,
+                        decision_revision: row.get(15)?,
+                        prior_verdict_transcript: row.get(16)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(effect) = existing else {
+            return Ok(None);
+        };
+        let rederived_payload_hash = desktop_decision_payload_hash(
+            &effect.segment_id,
+            &effect.requested_action,
+            effect.requested_transcript.as_deref(),
+            Some(effect.requested_timestamp_ms),
+        );
+        if effect.segment_id != segment_id
+            || effect.operation_payload_hash != operation_payload_hash
+            || rederived_payload_hash != effect.operation_payload_hash
+        {
+            return Err(AppError::Validation(
+                "desktop decision operation UUID was already used for a different canonical payload".into(),
+            ));
+        }
+        if effect.source != "desktop" || effect.reviewer.is_some() {
+            return Err(AppError::Other("desktop decision operation is bound to a non-desktop effect".into()));
+        }
+        let Some((segment, current_revision, _)) = Self::decision_snapshot_on(conn, segment_id)? else {
+            return Err(AppError::Validation(
+                "desktop decision operation committed, but its segment no longer exists".into(),
+            ));
+        };
+        let expected_verdict = human_verdict_for_decision(&effect.action)?;
+        let expected_verdict_transcript = if effect.action == "reject" {
+            effect.prior_verdict_transcript.as_deref()
+        } else {
+            effect.decision_transcript.as_deref()
+        };
+        let later_review_mutation: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM human_decision_effect_reversals reversal
+                  WHERE reversal.effect_event_id = ?1
+                 UNION ALL
+                 SELECT 1
+                   FROM human_decision_effect_events newer
+                  WHERE newer.segment_id = ?2
+                    AND newer.decision_revision > ?3
+                 UNION ALL
+                 SELECT 1
+                   FROM review_flag_effect_events flag
+                  WHERE flag.segment_id = ?2
+                    AND flag.flag_revision > ?3
+             )",
+            params![effect.id, segment_id, effect.decision_revision],
+            |row| row.get(0),
+        )?;
+        if current_revision < effect.decision_revision
+            || later_review_mutation
+            || segment.human_decision.as_deref() != Some(effect.action.as_str())
+            || segment.verdict.as_deref() != Some(expected_verdict)
+            || segment.escalated
+            || segment.reviewed_by.is_some()
+            || segment.verified != effect.decision_verified
+            || segment.annotated_transcript.as_deref() != effect.decision_annotated_transcript.as_deref()
+            || segment.verdict_transcript.as_deref() != expected_verdict_transcript
+            || segment.corrected_at.as_deref() != Some(effect.decision_corrected_at.as_str())
+            || segment.rationale != effect.decision_rationale
+        {
+            return Err(AppError::Validation(
+                "desktop decision operation committed, but its exact post-state is no longer current".into(),
+            ));
+        }
+        Ok(Some(HumanDecisionCommit {
+            effect_event_id: effect.id,
+            segment_id: effect.segment_id,
+            effective_action: effect.action,
+            prior_revision: effect.prior_revision,
+            decided_revision: effect.decision_revision,
+            segment,
+        }))
+    }
+
+    /// Lost-response preflight for the desktop IPC. It deliberately runs before playback/revision
+    /// lookup: a committed decision advanced the row, so fresh evidence for the old revision no
+    /// longer exists. The same check is repeated under BEGIN IMMEDIATE in the writer for races.
+    pub(crate) fn replay_desktop_human_decision(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
+        operation_id: &str,
+    ) -> AppResult<Option<HumanDecisionCommit>> {
+        validate_operation_uuid(operation_id)?;
+        human_verdict_for_decision(decision)?;
+        if !timestamp_ms.is_some_and(|timestamp| timestamp > 0) {
+            return Err(AppError::Validation(
+                "replayable desktop decisions require a positive request timestamp".into(),
+            ));
+        }
+        let operation_payload_hash =
+            desktop_decision_payload_hash(segment_id, decision, corrected_transcript, timestamp_ms);
+        Self::desktop_human_decision_replay_on(&self.conn, operation_id, &operation_payload_hash, segment_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2252,63 +3538,85 @@ impl Database {
         Ok(())
     }
 
-    fn append_review_compensation_reversal_tx(
+    /// Append the exact signed inverse of the ledger row bound to one phone decision effect.
+    /// Nothing is re-derived from the current segment: the immutable original entry is the authority.
+    fn append_review_compensation_reversal_for_effect_tx(
         tx: &rusqlite::Transaction<'_>,
-        segment_id: &str,
-        reviewer: &str,
+        effect_event_id: i64,
         operation_id: &str,
-        decision_revision: i64,
     ) -> AppResult<()> {
-        use rusqlite::OptionalExtension;
-
         Self::verify_review_pay_policy_tx(tx)?;
-        let (audio_work_id, identity_kind, duration_ms) = Self::compensation_audio_identity_tx(tx, segment_id)?;
-        let reviewer_key = reviewer.trim().to_lowercase();
-        let canonical_work_id = format!("reviewer-work-v1:{}:{reviewer_key}:{audio_work_id}", reviewer_key.len());
-        // Undo reverses THIS decision's exact signed adjustment, not the work's whole current
-        // entitlement. That distinction matters after a genuine re-decision: undoing edit→reject
-        // must restore the prior 100% edit entitlement by reversing the -90% adjustment, not erase
-        // all pay. A zero-delta re-decision must likewise reverse zero rather than reaching past it
-        // to an older nonzero entry.
-        let target: Option<(String, i64, i64)> = tx
+        let original: (String, String, String, String, String, String, i64, i64, i64, i64) = tx.query_row(
+            "SELECT l.entry_id, l.policy_version, l.canonical_work_id,
+                    l.canonical_identity_kind, l.reviewer, l.segment_id,
+                    l.decision_revision, l.duration_ms, l.delta_micro_iqd,
+                    l.delta_corrected_ms
+               FROM human_decision_effect_events e
+               JOIN review_compensation_ledger l ON l.review_event_id = e.review_event_id
+              WHERE e.id = ?1 AND e.review_event_id IS NOT NULL
+                AND l.reverses_entry_id IS NULL",
+            params![effect_event_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )?;
+        if original.1 != REVIEW_PAY_POLICY_VERSION || original.3 != "audio_content_hash+source_span" || original.7 <= 0
+        {
+            return Err(AppError::Validation(
+                "phone undo refused: original compensation identity is not canonical policy evidence".into(),
+            ));
+        }
+        let latest_unreversed_entry: Option<String> = tx
             .query_row(
-                "SELECT entry_id, delta_micro_iqd, delta_corrected_ms
-                   FROM review_compensation_ledger
-                  WHERE policy_version = ?1 AND canonical_work_id = ?2
-                    AND segment_id = ?3 AND reviewer = ?4 COLLATE NOCASE
-                    AND decision_revision = ?5 AND compensation_action <> 'undo'
-                  ORDER BY id DESC LIMIT 1",
-                params![REVIEW_PAY_POLICY_VERSION, canonical_work_id, segment_id, reviewer, decision_revision],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                "SELECT candidate.entry_id
+                   FROM review_compensation_ledger candidate
+                  WHERE candidate.policy_version = ?1
+                    AND candidate.canonical_work_id = ?2
+                    AND candidate.review_event_id IS NOT NULL
+                    AND candidate.reverses_entry_id IS NULL
+                    AND NOT EXISTS (
+                         SELECT 1 FROM review_compensation_ledger reversal
+                          WHERE reversal.reverses_entry_id = candidate.entry_id
+                    )
+                  ORDER BY candidate.id DESC
+                  LIMIT 1",
+                params![original.1, original.2],
+                |row| row.get(0),
             )
             .optional()?;
-        let reversal_delta = target
-            .as_ref()
-            .map(|(_, delta, _)| delta.checked_neg().ok_or_else(|| AppError::Other("review reversal overflow".into())))
-            .transpose()?
-            .unwrap_or(0);
+        if latest_unreversed_entry.as_deref() != Some(original.0.as_str()) {
+            return Err(AppError::Validation(
+                "phone undo refused: a newer active entitlement mutation owns this canonical audio work".into(),
+            ));
+        }
         let current_corrected_ms: i64 = tx.query_row(
             "SELECT COALESCE(SUM(delta_corrected_ms), 0)
                FROM review_compensation_ledger
               WHERE policy_version = ?1 AND canonical_work_id = ?2",
-            params![REVIEW_PAY_POLICY_VERSION, canonical_work_id],
+            params![original.1, original.2],
             |row| row.get(0),
         )?;
-        let reversal_corrected_delta = target
-            .as_ref()
-            .map(|(_, _, delta)| {
-                delta.checked_neg().ok_or_else(|| AppError::Other("corrected-audio reversal overflow".into()))
-            })
-            .transpose()?
-            .unwrap_or(0);
+        let reversal_delta =
+            original.8.checked_neg().ok_or_else(|| AppError::Other("review reversal overflow".into()))?;
+        let reversal_corrected_delta =
+            original.9.checked_neg().ok_or_else(|| AppError::Other("corrected-audio reversal overflow".into()))?;
         let corrected_entitlement_ms = current_corrected_ms
             .checked_add(reversal_corrected_delta)
             .ok_or_else(|| AppError::Other("corrected-audio reversal balance overflow".into()))?;
         if corrected_entitlement_ms < 0 {
             return Err(AppError::Other("corrected-audio reversal would produce a negative entitlement".into()));
         }
-        let reverses = target.map(|(entry_id, _, _)| entry_id);
-        let entry_id = uuid::Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO review_compensation_ledger
                 (entry_id, entry_key, policy_version, canonical_work_id, canonical_identity_kind,
@@ -2319,19 +3627,19 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'couch_undo', 'undo', 'undo',
                      ?8, ?9, 0, 0, ?10, ?11, ?12, ?13)",
             params![
-                entry_id,
+                uuid::Uuid::new_v4().to_string(),
                 format!("undo:{operation_id}"),
-                REVIEW_PAY_POLICY_VERSION,
-                canonical_work_id,
-                identity_kind,
-                reviewer,
-                segment_id,
-                decision_revision,
-                duration_ms,
+                original.1,
+                original.2,
+                original.3,
+                original.4,
+                original.5,
+                original.6,
+                original.7,
                 reversal_delta,
                 corrected_entitlement_ms,
                 reversal_corrected_delta,
-                reverses,
+                original.0,
             ],
         )?;
         Ok(())
@@ -2533,8 +3841,8 @@ impl Database {
                                AND result.reviewer = key.reviewer COLLATE NOCASE
                         )
                         OR EXISTS (
-                            SELECT 1 FROM review_events event
-                             WHERE event.id > key.after_review_event_id
+                            SELECT 1 FROM effective_review_events_v60 event
+                             WHERE event.review_event_id > key.after_review_event_id
                                AND event.segment_id = key.segment_id
                                AND event.reviewer = key.reviewer COLLATE NOCASE
                                AND event.source = 'couch'
@@ -2562,17 +3870,21 @@ impl Database {
         submitted: &str,
         expected: &str,
     ) -> AppResult<()> {
-        self.record_spot_check_inner(segment_id, reviewer, action, submitted, expected, None, None)
+        self.record_spot_check_inner(
+            segment_id, reviewer, action, submitted, expected, action, submitted, None, None, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn record_spot_check_with_operation(
+    #[cfg(test)]
+    pub(crate) fn record_spot_check_with_operation(
         &self,
         segment_id: &str,
         reviewer: &str,
         action: &str,
         submitted: &str,
         expected: &str,
+        playback: Option<&PlaybackDecisionProof>,
         operation_id: &str,
         operation_payload_hash: &str,
     ) -> AppResult<()> {
@@ -2583,8 +3895,40 @@ impl Database {
             action,
             submitted,
             expected,
+            action,
+            submitted,
             Some((operation_id, operation_payload_hash)),
             None,
+            playback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_spot_check_with_operation_request(
+        &self,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        submitted: &str,
+        expected: &str,
+        requested_action: &str,
+        requested_transcript: &str,
+        playback: Option<&PlaybackDecisionProof>,
+        operation_id: &str,
+        operation_payload_hash: &str,
+    ) -> AppResult<()> {
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        self.record_spot_check_inner(
+            segment_id,
+            reviewer,
+            action,
+            submitted,
+            expected,
+            requested_action,
+            requested_transcript,
+            Some((operation_id, operation_payload_hash)),
+            None,
+            playback,
         )
     }
 
@@ -2592,7 +3936,8 @@ impl Database {
     /// transaction and before the first insert, so a stale/repaired session cannot manufacture paid
     /// hidden-check results outside its policy namespace.
     #[allow(clippy::too_many_arguments)]
-    pub fn record_pilot_spot_check_with_operation(
+    #[cfg(test)]
+    pub(crate) fn record_pilot_spot_check_with_operation(
         &self,
         policy_sha256: &str,
         after_review_event_id: i64,
@@ -2601,6 +3946,7 @@ impl Database {
         action: &str,
         submitted: &str,
         expected: &str,
+        playback: Option<&PlaybackDecisionProof>,
         operation_id: &str,
         operation_payload_hash: &str,
     ) -> AppResult<()> {
@@ -2613,8 +3959,44 @@ impl Database {
             action,
             submitted,
             expected,
+            action,
+            submitted,
             Some((operation_id, operation_payload_hash)),
             Some((policy_sha256, after_review_event_id)),
+            playback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_pilot_spot_check_with_operation_request(
+        &self,
+        policy_sha256: &str,
+        after_review_event_id: i64,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        submitted: &str,
+        expected: &str,
+        requested_action: &str,
+        requested_transcript: &str,
+        playback: Option<&PlaybackDecisionProof>,
+        operation_id: &str,
+        operation_payload_hash: &str,
+    ) -> AppResult<()> {
+        let reviewer = validate_review_pilot_hidden_namespace(policy_sha256, after_review_event_id, reviewer)?;
+        validate_review_pilot_hidden_segment_id(segment_id)?;
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        self.record_spot_check_inner(
+            segment_id,
+            &reviewer,
+            action,
+            submitted,
+            expected,
+            requested_action,
+            requested_transcript,
+            Some((operation_id, operation_payload_hash)),
+            Some((policy_sha256, after_review_event_id)),
+            playback,
         )
     }
 
@@ -2626,11 +4008,40 @@ impl Database {
         action: &str,
         submitted: &str,
         expected: &str,
+        requested_action: &str,
+        requested_transcript: &str,
         operation: Option<(&str, &str)>,
         pilot_namespace: Option<(&str, i64)>,
+        playback: Option<&PlaybackDecisionProof>,
     ) -> AppResult<()> {
         let submitted_nfc = to_nfc(submitted.trim());
         let expected_nfc = to_nfc(expected.trim());
+        let requested_action = requested_action.trim();
+        let requested_transcript_nfc = to_nfc(requested_transcript.trim());
+        if !matches!(requested_action, "accept" | "edit" | "reject" | "bad" | "skip") {
+            return Err(AppError::Validation("hidden-check request action is outside the client vocabulary".into()));
+        }
+        let enforce_production_proof = operation.is_some();
+        let generated_operation = operation.is_none().then(|| {
+            (
+                uuid::Uuid::new_v4().to_string(),
+                review_operation_payload_hash(segment_id, requested_action, &requested_transcript_nfc, reviewer),
+            )
+        });
+        let operation = operation.or_else(|| {
+            generated_operation
+                .as_ref()
+                .map(|(operation_id, payload_hash)| (operation_id.as_str(), payload_hash.as_str()))
+        });
+        if let Some((_, payload_hash)) = operation {
+            let expected_payload_hash =
+                review_operation_payload_hash(segment_id, requested_action, &requested_transcript_nfc, reviewer);
+            if payload_hash != expected_payload_hash {
+                return Err(AppError::Validation(
+                    "hidden-check operation payload hash does not match its exact submitted request".into(),
+                ));
+            }
+        }
         // A hidden check has a known-valid human answer. "Noticed" therefore means the reviewer
         // actually recovered that answer (under the same normalized text key used by the learning
         // paths), not merely that they changed *something*. A blanket reject or arbitrary garbage
@@ -2639,7 +4050,14 @@ impl Database {
         let cer = crate::wer::compute_cer(&expected_nfc, &submitted_nfc);
         self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
         let write = (|| -> AppResult<bool> {
-            let tx = self.conn.unchecked_transaction()?;
+            // Paid hidden-check writes use BEGIN IMMEDIATE: once the in-transaction evidence check
+            // passes, no second connection can swap the audio, advance the revision, or remove its
+            // receipt before score + event + compensation commit.
+            let tx = if enforce_production_proof {
+                rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?
+            } else {
+                self.conn.unchecked_transaction()?
+            };
             // Resolve the stored reviewer spelling while proving the exact policy+baseline grant.
             // This also prevents a case-only re-pair from bypassing spot_checks' binary reviewer PK.
             let effective_reviewer = if let Some((policy_sha256, after_review_event_id)) = pilot_namespace {
@@ -2659,6 +4077,56 @@ impl Database {
             } else {
                 reviewer.to_string()
             };
+            // A committed first answer is immutable. A replay writes and earns nothing, so it needs
+            // no fresh playback/key proof; acknowledging it before those checks keeps outbox retries
+            // idempotent even if the owner has since changed the answer row.
+            let already_recorded: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM spot_checks WHERE segment_id = ?1 AND reviewer = ?2
+                 )",
+                params![segment_id, effective_reviewer],
+                |row| row.get(0),
+            )?;
+            if already_recorded {
+                tx.commit()?;
+                return Ok(false);
+            }
+            if enforce_production_proof && action != "skip" && playback.is_none() {
+                tx.rollback()?;
+                return Err(AppError::Validation(
+                    "E_NO_PLAYBACK_EVIDENCE: a hidden judgement must be bound to the clip that reviewer heard".into(),
+                ));
+            }
+            if let Some(proof) = playback {
+                if !has_sufficient_playback_evidence_on(
+                    &tx,
+                    segment_id,
+                    proof.segment_revision,
+                    &proof.audio_content_hash,
+                    proof.source_start_ms,
+                    proof.source_end_ms,
+                    Some(reviewer),
+                )? {
+                    tx.rollback()?;
+                    return Err(AppError::Validation(format!(
+                        "{PLAYBACK_EVIDENCE_CHANGED}: clip identity or playback proof changed while the hidden check was being saved"
+                    )));
+                }
+            }
+            // The answer key was obtained before this write transaction. An owner correction or
+            // reject racing the submit must not grade/pay the reviewer against that stale text.
+            // BEGIN IMMEDIATE above freezes this canonical key until the result commits.
+            if enforce_production_proof {
+                let current_expected = current_hidden_answer_key_on(&tx, segment_id)?;
+                let expected_matches =
+                    current_expected.as_deref().is_some_and(|value| to_nfc(value.trim()) == expected_nfc);
+                if !expected_matches {
+                    tx.rollback()?;
+                    return Err(AppError::Validation(format!(
+                        "{HIDDEN_ANSWER_KEY_CHANGED}: hidden-check answer changed while the result was being saved"
+                    )));
+                }
+            }
             let changed = tx.execute(
                 "INSERT INTO spot_checks
                      (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
@@ -2667,6 +4135,23 @@ impl Database {
                 params![segment_id, effective_reviewer, action, submitted_nfc, expected_nfc, noticed as i32, cer],
             )?;
             if changed > 0 {
+                let (served_raw, served_revision): (String, i64) = tx.query_row(
+                    "SELECT raw_transcript, review_revision
+                       FROM speech_segments WHERE id = ?1",
+                    params![segment_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let served_transcript = to_nfc(served_raw.trim());
+                if served_transcript.is_empty() {
+                    return Err(AppError::Validation(
+                        "hidden-check write refused: the server-owned served transcript is blank".into(),
+                    ));
+                }
+                if playback.is_some_and(|proof| proof.segment_revision != served_revision) {
+                    return Err(AppError::Validation(format!(
+                        "{PLAYBACK_EVIDENCE_CHANGED}: hidden-check served revision changed before commit"
+                    )));
+                }
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_millis() as i64)
@@ -2674,26 +4159,28 @@ impl Database {
                 tx.execute(
                     "INSERT INTO review_events
                         (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
-                         duration_ms, operation_id, operation_payload_hash)
+                         duration_ms, operation_id, operation_payload_hash, requested_action,
+                         requested_transcript, served_transcript, served_revision, app_git_sha,
+                         playback_guard_version)
                      VALUES (?1, ?2, ?3, ?3, 'couch_spot_check', ?4,
-                             (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?5, ?6)",
+                             (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?5, ?6, ?7, ?8,
+                             ?9, ?10, ?11,
+                             'content-hash-raw-counter-v3')",
                     params![
                         segment_id,
                         effective_reviewer,
                         action,
                         timestamp_ms,
                         operation.map(|value| value.0),
-                        operation.map(|value| value.1)
+                        operation.map(|value| value.1),
+                        requested_action,
+                        requested_transcript_nfc,
+                        served_transcript,
+                        served_revision,
+                        crate::GIT_SHA,
                     ],
                 )?;
                 let event_id = tx.last_insert_rowid();
-                let revision: Option<i64> = tx
-                    .query_row(
-                        "SELECT review_revision FROM speech_segments WHERE id = ?1",
-                        params![segment_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
                 Self::append_review_compensation_tx(
                     &tx,
                     event_id,
@@ -2702,7 +4189,7 @@ impl Database {
                     "couch_spot_check",
                     action,
                     action,
-                    revision,
+                    Some(served_revision),
                 )?;
             }
             tx.commit()?;
@@ -2746,7 +4233,7 @@ impl Database {
         source: &str,
         timestamp_ms: i64,
     ) -> AppResult<()> {
-        self.record_review_event_inner(segment_id, reviewer, action, source, timestamp_ms, None, None)
+        self.record_review_event_inner(segment_id, reviewer, action, source, timestamp_ms, None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2768,6 +4255,8 @@ impl Database {
             timestamp_ms,
             operation_id,
             operation_payload_hash,
+            action,
+            "",
             None,
         )
     }
@@ -2782,9 +4271,23 @@ impl Database {
         timestamp_ms: i64,
         operation_id: &str,
         operation_payload_hash: &str,
+        requested_action: &str,
+        requested_transcript: &str,
         action_limit: Option<&ReviewDecisionLimit>,
     ) -> AppResult<()> {
         validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        let requested_action = requested_action.trim();
+        let requested_transcript = to_nfc(requested_transcript.trim());
+        if requested_action != "skip" {
+            return Err(AppError::Validation("skip audit request snapshot must remain skip".into()));
+        }
+        let expected_payload_hash =
+            review_operation_payload_hash(segment_id, requested_action, &requested_transcript, reviewer);
+        if operation_payload_hash != expected_payload_hash {
+            return Err(AppError::Validation(
+                "skip operation payload hash does not match its exact submitted request".into(),
+            ));
+        }
         self.record_review_event_inner(
             segment_id,
             reviewer,
@@ -2792,6 +4295,7 @@ impl Database {
             source,
             timestamp_ms,
             Some((operation_id, operation_payload_hash)),
+            Some((requested_action, requested_transcript.as_str())),
             action_limit,
         )
     }
@@ -2805,6 +4309,7 @@ impl Database {
         source: &str,
         timestamp_ms: i64,
         operation: Option<(&str, &str)>,
+        request: Option<(&str, &str)>,
         action_limit: Option<&ReviewDecisionLimit>,
     ) -> AppResult<()> {
         if action != "skip" {
@@ -2815,40 +4320,74 @@ impl Database {
         if action_limit.is_some() && source != "couch" {
             return Err(AppError::Validation("controlled-review limits are valid only for Couch actions".into()));
         }
-        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
-        let tx = if action_limit.is_some() {
-            rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?
-        } else {
-            self.conn.unchecked_transaction()?
-        };
-        if let Some(limit) = action_limit {
-            enforce_review_action_limit_on(&tx, reviewer, limit)?;
+        if timestamp_ms <= 0 {
+            return Err(AppError::Validation("review event timestamp must be positive".into()));
         }
-        tx.execute(
-            "INSERT INTO review_events
-                (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
-                 duration_ms, operation_id, operation_payload_hash)
-             VALUES (?1, ?2, ?3, ?3, ?4, ?5,
-                     (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?6, ?7)",
-            params![
+        let generated_operation = operation.is_none().then(|| {
+            (uuid::Uuid::new_v4().to_string(), review_operation_payload_hash(segment_id, action, "", reviewer))
+        });
+        let operation = operation.or_else(|| {
+            generated_operation
+                .as_ref()
+                .map(|(operation_id, payload_hash)| (operation_id.as_str(), payload_hash.as_str()))
+        });
+        let (requested_action, requested_transcript) = request.unwrap_or((action, ""));
+        self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(limit) = action_limit {
+                enforce_review_action_limit_on(&tx, reviewer, limit)?;
+            }
+            let (served_draft, served_revision): (String, i64) = tx.query_row(
+                "SELECT COALESCE(NULLIF(TRIM(annotated_transcript), ''), raw_transcript),
+                        review_revision
+                   FROM speech_segments WHERE id = ?1",
+                params![segment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let served_transcript = to_nfc(served_draft.trim());
+            if served_transcript.is_empty() {
+                return Err(AppError::Validation(
+                    "skip audit refused: the server-owned served transcript is blank".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
+                     duration_ms, operation_id, operation_payload_hash, requested_action,
+                     requested_transcript, served_transcript, served_revision, app_git_sha,
+                     playback_guard_version)
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?5,
+                         (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?6, ?7, ?8,
+                         ?9, ?10, ?11, ?12, 'content-hash-raw-counter-v3')",
+                params![
+                    segment_id,
+                    reviewer,
+                    action,
+                    source,
+                    timestamp_ms,
+                    operation.map(|value| value.0),
+                    operation.map(|value| value.1),
+                    requested_action,
+                    requested_transcript,
+                    served_transcript,
+                    served_revision,
+                    crate::GIT_SHA,
+                ],
+            )?;
+            let event_id = tx.last_insert_rowid();
+            Self::append_review_compensation_tx(
+                &tx,
+                event_id,
                 segment_id,
                 reviewer,
-                action,
                 source,
-                timestamp_ms,
-                operation.map(|value| value.0),
-                operation.map(|value| value.1)
-            ],
-        )?;
-        let event_id = tx.last_insert_rowid();
-        let revision: Option<i64> = tx
-            .query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![segment_id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        Self::append_review_compensation_tx(&tx, event_id, segment_id, reviewer, source, action, action, revision)?;
-        tx.commit()?;
-        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+                action,
+                action,
+                Some(served_revision),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })?;
         self.track_write()?;
         Ok(())
     }
@@ -5378,7 +6917,12 @@ impl Database {
     /// speech_segments.verdict, so a C4 query can still recover auto_accept-vs-jury_accept-vs-jury_edit.
     /// Call ONLY after the verdict UPDATE affected the row (segment was not already human-decided), so a
     /// stale/late machine verdict never plants a phantom T0/T1 over a human's decision.
-    pub fn record_decision_verdict(&self, segment_id: &str, verdict: &str, escalated: bool) -> AppResult<()> {
+    fn record_decision_verdict_on(
+        conn: &Connection,
+        segment_id: &str,
+        verdict: &str,
+        escalated: bool,
+    ) -> AppResult<()> {
         let auto_accept_verdict = if escalated || verdict == "escalated" {
             "T1_ESCALATE"
         } else if matches!(verdict, "auto_accept" | "jury_accept" | "jury_edit") {
@@ -5386,26 +6930,31 @@ impl Database {
         } else {
             return Ok(());
         };
-        self.conn.execute(
-            "INSERT OR REPLACE INTO decision_verdicts (segment_id, auto_accept_verdict, verdict_computed_at)
-             VALUES (?1, ?2, datetime('now'))",
+        conn.execute(
+            "INSERT INTO decision_verdicts (segment_id, auto_accept_verdict, verdict_computed_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(segment_id) DO UPDATE SET
+                 auto_accept_verdict=excluded.auto_accept_verdict,
+                 verdict_computed_at=excluded.verdict_computed_at",
             params![segment_id, auto_accept_verdict],
         )?;
         Ok(())
     }
 
-    /// Write a MACHINE jury verdict to a segment (T0/T1/T2 and the agentic/escalation paths).
+    /// Direct decision-log fixture authority for pre-v60 migration tests. Production schema-v60
+    /// jury writes are disabled before either segment state or classification metrics can mutate.
+    #[cfg(test)]
+    pub(crate) fn record_decision_verdict(&self, segment_id: &str, verdict: &str, escalated: bool) -> AppResult<()> {
+        Self::record_decision_verdict_on(&self.conn, segment_id, verdict, escalated)
+    }
+
+    /// Persist a legacy machine-jury verdict only before schema v60.
     ///
-    /// The human-review path is `record_human_decision`, NOT this function. A machine verdict must never
-    /// overwrite a human decision: the jury runs on a SEPARATE WAL connection from the human path, reads
-    /// its segment snapshot once at the start of a run, then may block for seconds on a T2 cloud call —
-    /// so a curator can accept/edit the same segment mid-run. Without this guard the late machine write
-    /// would silently revert the human's `verdict` (the COALESCE-preferred gold transcript source) and
-    /// flip `escalated` back, mis-routing the segment. The predicate mirrors the consensus/ASR write
-    /// paths (the `human_decision`/`verdict NOT IN (human_*)` guards elsewhere in this file): a verdict
-    /// for an already-human-decided segment matches 0 rows and is a no-op, leaving the human authoritative.
+    /// The first paid-review release deliberately freezes all automated jury writers at v60. This
+    /// database boundary is shared by T0, T1, T2, and the direct jury command paths so none can
+    /// create review-looking truth without the evidence-backed human decision protocol.
     #[allow(clippy::too_many_arguments)]
-    pub fn write_segment_verdict(
+    pub(crate) fn write_segment_verdict(
         &self,
         segment_id: &str,
         verdict: &str,
@@ -5414,19 +6963,83 @@ impl Database {
         evidence_json: Option<&str>,
         agreement_score: Option<f64>,
         escalated: bool,
-    ) -> AppResult<()> {
-        // agreement_score uses COALESCE(?6, existing): a machine verdict that carries NO confidence
-        // signal must never destroy a previously persisted one. The T1/T2 escalation paths (cloud-off,
-        // audio-prep failure, no-majority) all write None moments after run_t0_gate persisted the real
-        // IRT confidence for the same segment — the unconditional overwrite NULLed it, and both
-        // suspect-first orderings (COALESCE(agreement_score, 0.5)) collapsed back to recency: the one
-        // live review-speed feature was silently nominal (true-10 audit 2026-07-09). No caller has a
-        // legitimate "clear the confidence" case; callers that HAVE a signal pass Some and still win.
-        // SAVEPOINT (write-path audit, Week 2): the verdict UPDATE and its decision-log INSERT are one
-        // invariant — a crash or SQLITE_BUSY between them used to leave a written verdict with no C4
-        // denominator record. Same idiom as delete_segment/del_seg.
+    ) -> AppResult<bool> {
+        if crate::migrations::get_current_version(self)? >= 60 {
+            return Err(AppError::Validation(
+                "machine jury writes are disabled at schema v60; paid review truth must use the evidence-backed human decision flow"
+                    .into(),
+            ));
+        }
+        self.write_segment_verdict_legacy(
+            segment_id,
+            verdict,
+            transcript,
+            rationale,
+            evidence_json,
+            agreement_score,
+            escalated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_segment_verdict_legacy(
+        &self,
+        segment_id: &str,
+        verdict: &str,
+        transcript: Option<&str>,
+        rationale: Option<&str>,
+        evidence_json: Option<&str>,
+        agreement_score: Option<f64>,
+        escalated: bool,
+    ) -> AppResult<bool> {
+        if segment_id.trim().is_empty() || segment_id != segment_id.trim() {
+            return Err(AppError::Validation("machine jury segment id must be canonical and nonblank".into()));
+        }
+        if !matches!(verdict, "auto_accept" | "jury_accept" | "jury_edit" | "escalated") {
+            return Err(AppError::Validation(format!(
+                "machine jury verdict '{verdict}' is not allowed; human truth requires the atomic review decision flow"
+            )));
+        }
+        if escalated != (verdict == "escalated") {
+            return Err(AppError::Validation(
+                "machine jury escalation flag must exactly match verdict='escalated'".into(),
+            ));
+        }
+        if let Some(transcript) = transcript {
+            let canonical = to_nfc(transcript.trim());
+            if canonical.is_empty() || canonical != transcript {
+                return Err(AppError::Validation("machine jury transcript must be nonblank, trimmed NFC text".into()));
+            }
+        }
+        if verdict == "escalated" && transcript.is_some() {
+            return Err(AppError::Validation(
+                "machine escalation cannot author a review transcript; use the atomic human decision flow".into(),
+            ));
+        }
+        if verdict != "escalated" && transcript.is_none() {
+            return Err(AppError::Validation(
+                "machine accept/edit verdict requires an exact machine transcript".into(),
+            ));
+        }
+        if let Some(rationale) = rationale {
+            let canonical = to_nfc(rationale.trim());
+            if canonical.is_empty() || canonical != rationale {
+                return Err(AppError::Validation(
+                    "machine jury rationale must be nonblank, trimmed NFC text when present".into(),
+                ));
+            }
+        }
+        if let Some(evidence) = evidence_json {
+            serde_json::from_str::<serde_json::Value>(evidence)
+                .map_err(|error| AppError::Validation(format!("machine jury evidence must be valid JSON: {error}")))?;
+        }
+        if agreement_score.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err(AppError::Validation(
+                "machine jury agreement score must be finite and between zero and one".into(),
+            ));
+        }
         self.conn.execute("SAVEPOINT verdict_write", [])?;
-        let result: AppResult<()> = (|| {
+        let result: AppResult<bool> = (|| {
             let affected = self.conn.execute(
                 "UPDATE speech_segments
                  SET verdict              = ?2,
@@ -5456,21 +7069,48 @@ impl Database {
                 );
             } else {
                 // M2.2/P1.2: record the T0/T1 classification for the C4 denominator (no-op for human/unknown).
-                self.record_decision_verdict(segment_id, verdict, escalated)?;
+                Self::record_decision_verdict_on(&self.conn, segment_id, verdict, escalated)?;
             }
-            Ok(())
+            Ok(affected > 0)
         })();
         match result {
-            Ok(()) => {
+            Ok(wrote) => {
                 self.release_savepoint("verdict_write")?;
-                self.track_write()?;
-                Ok(())
+                if wrote {
+                    self.track_write()?;
+                }
+                Ok(wrote)
             }
             Err(e) => {
                 self.cleanup_savepoint_after_error("verdict_write");
                 Err(e)
             }
         }
+    }
+
+    /// Explicit pre-v60 machine-state fixture authority. This bypass is compiled only into unit
+    /// tests that exercise frozen legacy state; registered application routes cannot call it.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_legacy_machine_verdict_for_test(
+        &self,
+        segment_id: &str,
+        verdict: &str,
+        transcript: Option<&str>,
+        rationale: Option<&str>,
+        evidence_json: Option<&str>,
+        agreement_score: Option<f64>,
+        escalated: bool,
+    ) -> AppResult<bool> {
+        self.write_segment_verdict_legacy(
+            segment_id,
+            verdict,
+            transcript,
+            rationale,
+            evidence_json,
+            agreement_score,
+            escalated,
+        )
     }
 
     /// Fully RE-OPEN a segment whose human decision is being undone. record_human_decision OVERWRITES
@@ -5480,171 +7120,495 @@ impl Database {
     /// verdict = 'human_*' so the "undone" segment still looked decided on reload AND the machine
     /// verdict-write guard (write_segment_verdict / jury::write_verdict) would refuse to re-adjudicate it.
     pub fn clear_human_decision(&self, segment_id: &str) -> AppResult<()> {
-        // Undo also retracts the DPO/few-shot learning pair the edit produced (round-24 hunt #9): the
-        // agent_examples row is the ONLY provenance of a human edit, and build_dpo_dataset /
-        // get_few_shot_examples filter solely on verified_by_human=1 (never on the segment's current
-        // decision). Left behind, a retracted edit would permanently train the model to prefer a fix
-        // the human took back. Delete it in the SAME transaction as the re-open so the two can never
-        // diverge (a decision cleared with its learning pair still live, or vice versa).
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE speech_segments
-             SET human_decision     = NULL,
-                 corrected_at       = NULL,
-                 -- The attribution belongs to the decision being undone; leaving it would credit a
-                 -- reviewer for a verdict that no longer exists (v43).
-                 reviewed_by        = NULL,
-                 verdict            = NULL,
-                 verdict_transcript = NULL,
-                 rationale          = NULL,
-                 evidence_json      = NULL,
-                 agreement_score   = NULL,
-                 escalated          = 1,
-                 updated_at         = datetime('now')
-             WHERE id = ?1",
-            params![segment_id],
-        )?;
-        tx.execute("DELETE FROM agent_examples WHERE segment_id = ?1", params![segment_id])?;
-        tx.commit()?;
-        self.track_write()?;
-        Ok(())
+        let _ = segment_id;
+        Err(AppError::Validation(
+            "clear_human_decision is disabled: undo requires an immutable decision effect id and operation UUID".into(),
+        ))
     }
 
-    /// Losslessly undo one phone decision as a single compare-and-swap transaction.
-    ///
-    /// The previous implementation committed `clear_human_decision` and the snapshot restore as two
-    /// independent writes. If the second failed, the row was permanently half-undone and the retry
-    /// fence rejected it because the first write had already cleared `reviewed_by`. Here the full-row
-    /// restore and retraction of its trainable example either both commit or both roll back. A revision
-    /// mismatch returns `Ok(None)` without changing anything.
-    pub fn undo_phone_human_decision(
+    /// Reverse exactly one active human-decision effect. The immutable database snapshot is the
+    /// only restore authority; the caller supplies only the effect identity, actor, and idempotency
+    /// UUID. A stale row is a conflict with no mutation.
+    pub fn undo_human_decision(
         &self,
-        previous: &SpeechSegment,
-        reviewer: &str,
-        expected_revision: i64,
+        effect_event_id: i64,
+        actor: Option<&str>,
         operation_id: &str,
-    ) -> AppResult<Option<i64>> {
-        validate_segment(previous)?;
-        if operation_id.trim().is_empty() {
-            return Err(AppError::Validation("undo requires a durable operation id".into()));
+    ) -> AppResult<HumanDecisionUndoOutcome> {
+        if effect_event_id <= 0 {
+            return Err(AppError::Validation("human decision effect id must be positive".into()));
         }
-        let (raw_nfc, normalized_nfc, annotated_nfc) = nfc_transcripts(previous);
-        let verdict_transcript_nfc = previous.verdict_transcript.as_deref().map(to_nfc);
-        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
-        let tx = self.conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE speech_segments SET
-                 created_at = COALESCE(:created_at, created_at),
-                 audio_path = :audio_path,
-                 raw_transcript = :raw_transcript,
-                 normalized_transcript = :normalized_transcript,
-                 annotated_transcript = :annotated_transcript,
-                 alignment_json = :alignment_json,
-                 duration_ms = :duration_ms,
-                 speaker_id = :speaker_id,
-                 verified = :verified,
-                 confidence = :confidence,
-                 ctc_score = :ctc_score,
-                 clipping_ratio = :clipping_ratio,
-                 rms_db = :rms_db,
-                 snr_db = :snr_db,
-                 split = :split,
-                 signal_anomaly_score = :signal_anomaly_score,
-                 verdict = :verdict,
-                 verdict_transcript = :verdict_transcript,
-                 rationale = :rationale,
-                 evidence_json = :evidence_json,
-                 agreement_score = :agreement_score,
-                 escalated = :escalated,
-                 human_decision = :human_decision,
-                 corrected_at = :corrected_at,
-                 is_gold = :is_gold,
-                 alignment_quality = :alignment_quality,
-                 model_version_id = COALESCE(:model_version_id, 'unknown@pre-registry'),
-                 confidence_source = COALESCE(:confidence_source, 'unknown'),
-                 cloud_call = :cloud_call,
-                 decoder_config_hash = :decoder_config_hash,
-                 normalizer_version = :normalizer_version,
-                 denoised = :denoised,
-                 diarized = :diarized,
-                 vad_backend = :vad_backend,
-                 reviewed_by = :reviewed_by,
-                 speaker_change_score = :speaker_change_score,
-                 updated_at = datetime('now')
-             WHERE id = :id
-               AND review_revision = :expected_revision
-               AND reviewed_by = :reviewer",
-            rusqlite::named_params! {
-                ":id": previous.id,
-                ":expected_revision": expected_revision,
-                ":reviewer": reviewer,
-                ":created_at": previous.created_at,
-                ":audio_path": previous.audio_path,
-                ":raw_transcript": raw_nfc,
-                ":normalized_transcript": normalized_nfc,
-                ":annotated_transcript": annotated_nfc,
-                ":alignment_json": previous.alignment_json,
-                ":duration_ms": previous.duration_ms,
-                ":speaker_id": previous.speaker_id,
-                ":verified": previous.verified as i32,
-                ":confidence": previous.confidence,
-                ":ctc_score": previous.ctc_score,
-                ":clipping_ratio": previous.clipping_ratio,
-                ":rms_db": previous.rms_db,
-                ":snr_db": previous.snr_db,
-                ":split": previous.split,
-                ":signal_anomaly_score": previous.signal_anomaly_score,
-                ":verdict": previous.verdict,
-                ":verdict_transcript": verdict_transcript_nfc,
-                ":rationale": previous.rationale,
-                ":evidence_json": previous.evidence_json,
-                ":agreement_score": previous.agreement_score,
-                ":escalated": previous.escalated as i32,
-                ":human_decision": previous.human_decision,
-                ":corrected_at": previous.corrected_at,
-                ":is_gold": previous.is_gold as i32,
-                ":alignment_quality": previous.alignment_quality,
-                ":model_version_id": previous.model_version_id,
-                ":confidence_source": previous.confidence_source,
-                ":cloud_call": previous.cloud_call as i32,
-                ":decoder_config_hash": previous.decoder_config_hash,
-                ":normalizer_version": previous.normalizer_version,
-                ":denoised": previous.denoised.map(i32::from),
-                ":diarized": previous.diarized.map(i32::from),
-                ":vad_backend": previous.vad_backend,
-                ":reviewed_by": previous.reviewed_by,
-                ":speaker_change_score": previous.speaker_change_score,
-            },
-        )?;
-        if changed == 0 {
-            tx.rollback()?;
-            return Ok(None);
+        validate_operation_uuid(operation_id)?;
+        let outcome = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let effect = tx
+                .query_row(
+                    "SELECT review_event_id, segment_id, reviewer, source, action,
+                            decision_transcript, decision_annotated_transcript, decision_verified,
+                            decision_corrected_at, decision_rationale, prior_revision,
+                            decision_revision, prior_verified, prior_annotated_transcript, prior_verdict,
+                            prior_verdict_transcript, prior_rationale, prior_escalated, prior_human_decision,
+                            prior_corrected_at, prior_reviewed_by
+                       FROM human_decision_effect_events WHERE id = ?1",
+                    params![effect_event_id],
+                    |row| {
+                        Ok(DecisionEffectSnapshot {
+                            review_event_id: row.get(0)?,
+                            segment_id: row.get(1)?,
+                            reviewer: row.get(2)?,
+                            source: row.get(3)?,
+                            action: row.get(4)?,
+                            decision_transcript: row.get(5)?,
+                            decision_annotated_transcript: row.get(6)?,
+                            decision_verified: row.get::<_, i32>(7)? != 0,
+                            decision_corrected_at: row.get(8)?,
+                            decision_rationale: row.get(9)?,
+                            prior_revision: row.get(10)?,
+                            decision_revision: row.get(11)?,
+                            prior_verified: row.get::<_, i32>(12)? != 0,
+                            prior_annotated_transcript: row.get(13)?,
+                            prior_verdict: row.get(14)?,
+                            prior_verdict_transcript: row.get(15)?,
+                            prior_rationale: row.get(16)?,
+                            prior_escalated: row.get::<_, i32>(17)? != 0,
+                            prior_human_decision: row.get(18)?,
+                            prior_corrected_at: row.get(19)?,
+                            prior_reviewed_by: row.get(20)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("unknown human decision effect id".into()))?;
+            let actor_ok = match (effect.source.as_str(), effect.reviewer.as_deref(), actor.map(str::trim)) {
+                ("desktop", None, None) => true,
+                ("couch", Some(owner), Some(candidate)) => owner.eq_ignore_ascii_case(candidate),
+                _ => false,
+            };
+            if !actor_ok {
+                return Err(AppError::Validation("human decision undo actor does not own this effect".into()));
+            }
+            if effect.decision_rationale != effect.prior_rationale {
+                return Err(AppError::Other(
+                    "human decision effect does not preserve its server-owned rationale snapshot".into(),
+                ));
+            }
+            let current = Self::decision_snapshot_on(&tx, &effect.segment_id)?
+                .ok_or_else(|| AppError::Validation("cannot undo a decision whose segment no longer exists".into()))?;
+            let prior_reversal: Option<String> = tx
+                .query_row(
+                    "SELECT operation_id FROM human_decision_effect_reversals WHERE effect_event_id = ?1",
+                    params![effect_event_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(prior_operation) = prior_reversal {
+                tx.rollback()?;
+                return Ok(if prior_operation == operation_id {
+                    HumanDecisionUndoOutcome::AlreadyApplied { segment: current.0 }
+                } else {
+                    HumanDecisionUndoOutcome::Conflict { segment: current.0 }
+                });
+            }
+            let expected_verdict = human_verdict_for_decision(&effect.action)?;
+            let expected_verdict_transcript = if effect.action == "reject" {
+                effect.prior_verdict_transcript.as_deref()
+            } else {
+                effect.decision_transcript.as_deref()
+            };
+            let later_review_mutation: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                       FROM human_decision_effect_events newer
+                      WHERE newer.segment_id = ?1
+                        AND newer.decision_revision > ?2
+                     UNION ALL
+                     SELECT 1
+                       FROM review_flag_effect_events flag
+                      WHERE flag.segment_id = ?1
+                        AND flag.flag_revision > ?2
+                 )",
+                params![effect.segment_id, effect.decision_revision],
+                |row| row.get(0),
+            )?;
+            if current.1 < effect.decision_revision || later_review_mutation {
+                tx.rollback()?;
+                return Ok(HumanDecisionUndoOutcome::Conflict { segment: current.0 });
+            }
+            let changed = tx.execute(
+                "UPDATE speech_segments
+                    SET verified = ?2,
+                        annotated_transcript = ?3,
+                        verdict = ?4,
+                        verdict_transcript = ?5,
+                        escalated = ?6,
+                        human_decision = ?7,
+                        corrected_at = ?8,
+                        reviewed_by = ?9,
+                        updated_at = datetime('now')
+                  WHERE id = ?1
+                    AND review_revision = ?10
+                    AND human_decision = ?11
+                    AND verdict = ?12
+                    AND escalated = 0
+                    AND reviewed_by IS ?13
+                    AND verified = ?14
+                    AND annotated_transcript IS ?15
+                    AND verdict_transcript IS ?16
+                    AND corrected_at = ?17
+                    AND rationale IS ?18",
+                params![
+                    effect.segment_id,
+                    effect.prior_verified as i32,
+                    effect.prior_annotated_transcript,
+                    effect.prior_verdict,
+                    effect.prior_verdict_transcript,
+                    effect.prior_escalated as i32,
+                    effect.prior_human_decision,
+                    effect.prior_corrected_at,
+                    effect.prior_reviewed_by,
+                    current.1,
+                    effect.action,
+                    expected_verdict,
+                    effect.reviewer,
+                    effect.decision_verified as i32,
+                    effect.decision_annotated_transcript,
+                    expected_verdict_transcript,
+                    effect.decision_corrected_at,
+                    effect.decision_rationale,
+                ],
+            )?;
+            if changed == 0 {
+                tx.rollback()?;
+                return Ok(HumanDecisionUndoOutcome::Conflict { segment: current.0 });
+            }
+            let restored_revision: i64 = tx.query_row(
+                "SELECT review_revision FROM speech_segments WHERE id = ?1",
+                params![effect.segment_id],
+                |row| row.get(0),
+            )?;
+            if restored_revision != current.1 + 1 {
+                return Err(AppError::Other("human decision undo did not advance exactly one revision".into()));
+            }
+            if effect.review_event_id.is_some() {
+                Self::append_review_compensation_reversal_for_effect_tx(&tx, effect_event_id, operation_id)?;
+            }
+            tx.execute(
+                "INSERT INTO human_decision_effect_reversals (effect_event_id, operation_id)
+                 VALUES (?1, ?2)",
+                params![effect_event_id, operation_id],
+            )?;
+            tx.execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                     started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version,
+                     source_start_ms, source_end_ms)
+                 SELECT p.segment_id, ?4, p.audio_fingerprint, p.reviewer, p.session_id,
+                        p.started_at_ms, p.played_ms, p.clip_duration_ms,
+                        MIN(1.0, CAST(p.played_ms AS REAL) / CAST(p.clip_duration_ms AS REAL)),
+                        p.policy_version, p.source_start_ms, p.source_end_ms
+                   FROM playback_receipts p
+                   JOIN speech_segments s ON s.id = p.segment_id
+                  WHERE p.segment_id = ?1 AND p.reviewer IS ?2
+                    AND p.segment_revision = ?3 AND p.policy_version = ?5
+                    AND length(s.audio_content_hash) = 64
+                    AND s.audio_content_hash NOT GLOB '*[^0-9a-f]*'
+                    AND p.audio_fingerprint = s.audio_content_hash
+                    AND json_valid(s.alignment_json)
+                    AND typeof(json_extract(s.alignment_json, '$.source_start_ms')) = 'integer'
+                    AND typeof(json_extract(s.alignment_json, '$.source_end_ms')) = 'integer'
+                    AND json_extract(s.alignment_json, '$.source_start_ms') >= 0
+                    AND json_extract(s.alignment_json, '$.source_end_ms')
+                        > json_extract(s.alignment_json, '$.source_start_ms')
+                    AND typeof(p.source_start_ms) = 'integer'
+                    AND typeof(p.source_end_ms) = 'integer'
+                    AND p.source_start_ms = json_extract(s.alignment_json, '$.source_start_ms')
+                    AND p.source_end_ms = json_extract(s.alignment_json, '$.source_end_ms')
+                    AND ABS((p.source_end_ms - p.source_start_ms) - s.duration_ms) <= ?6
+                    AND p.clip_duration_ms = s.duration_ms
+                    AND p.clip_duration_ms > 0 AND p.played_ms >= 0 AND p.started_at_ms >= 0
+                    AND NOT EXISTS (
+                        SELECT 1 FROM playback_receipts newer
+                         WHERE newer.segment_id = ?1 AND newer.reviewer IS ?2
+                           AND newer.segment_revision = ?4 AND newer.policy_version = ?5
+                    )
+                  ORDER BY MIN(1.0, CAST(p.played_ms AS REAL) / CAST(p.clip_duration_ms AS REAL)) DESC,
+                           p.id DESC
+                  LIMIT 1",
+                params![
+                    effect.segment_id,
+                    effect.reviewer,
+                    effect.prior_revision,
+                    restored_revision,
+                    PLAYBACK_POLICY_VERSION,
+                    MAX_SOURCE_SPAN_DURATION_DELTA_MS,
+                ],
+            )?;
+            let segment = Self::decision_snapshot_on(&tx, &effect.segment_id)?
+                .ok_or_else(|| AppError::Other("segment disappeared inside human decision undo".into()))?
+                .0;
+            tx.commit()?;
+            Ok(HumanDecisionUndoOutcome::Applied { restored_revision, segment })
+        })?;
+        if matches!(&outcome, HumanDecisionUndoOutcome::Applied { .. }) {
+            self.track_write()?;
         }
-        tx.execute("DELETE FROM agent_examples WHERE segment_id = ?1", params![previous.id])?;
-        let restored_revision: i64 =
-            tx.query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![previous.id], |row| {
-                row.get(0)
-            })?;
-        // Carry THIS reviewer's best listening receipt forward to the restored revision. The decision
-        // bumped the revision past the receipt, so without this the immediate re-decision on a clip
-        // the reviewer just heard, decided and undid was refused 428 — Undo punished listening.
-        // Fingerprint equality is the invariant that makes the carry honest: the revision is a write
-        // counter, but the receipt names the exact audio bytes, and those are unchanged. One row,
-        // best coverage, only if no receipt already sits at the restored revision, only for the
-        // reviewer doing the undo — everyone else still owes their own listen.
-        tx.execute(
-            "INSERT INTO playback_receipts (segment_id, segment_revision, audio_fingerprint, reviewer,                                             session_id, started_at_ms, played_ms, clip_duration_ms,                                             coverage_ratio, policy_version)              SELECT segment_id, ?3, audio_fingerprint, reviewer, session_id, started_at_ms,                     played_ms, clip_duration_ms, coverage_ratio, policy_version              FROM playback_receipts              WHERE segment_id = ?1 AND reviewer IS ?2                AND audio_fingerprint = (SELECT COALESCE(NULLIF(TRIM(COALESCE(audio_fingerprint, '')), ''),                                                          'id:' || id)                                          FROM speech_segments WHERE id = ?1)                AND NOT EXISTS (SELECT 1 FROM playback_receipts p2                                 WHERE p2.segment_id = ?1 AND p2.reviewer IS ?2                                   AND p2.segment_revision = ?3)              ORDER BY coverage_ratio DESC LIMIT 1",
-            params![previous.id, reviewer, restored_revision],
-        )?;
-        // Corpus undo and money undo are one state transition. A failure to append the signed
-        // reversal rolls the row restore back too; no successful Undo can leave stale payable credit.
-        Self::append_review_compensation_reversal_tx(&tx, &previous.id, reviewer, operation_id, expected_revision)?;
-        tx.commit()?;
-        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-        self.track_write()?;
-        Ok(Some(restored_revision))
+        Ok(outcome)
     }
-
+    pub fn record_review_flag(
+        &self,
+        segment_id: &str,
+        rationale: &str,
+        operation_id: &str,
+    ) -> AppResult<HumanFlagCommit> {
+        let rationale = to_nfc(rationale.trim());
+        if rationale.is_empty() {
+            return Err(AppError::Validation("review flag rationale must not be blank".into()));
+        }
+        validate_operation_uuid(operation_id)?;
+        let commit = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let replay = tx
+                .query_row(
+                    "SELECT id, segment_id, prior_revision, flag_revision, flag_rationale
+                       FROM review_flag_effect_events
+                      WHERE operation_id = ?1",
+                    params![operation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((effect_event_id, replay_segment_id, prior_revision, flag_revision, replay_rationale)) = replay {
+                if replay_segment_id != segment_id || replay_rationale != rationale {
+                    return Err(AppError::Validation(
+                        "review flag operation UUID was already used for a different request".into(),
+                    ));
+                }
+                let current = Self::decision_snapshot_on(&tx, segment_id)?
+                    .ok_or_else(|| AppError::Validation("flag replay segment no longer exists".into()))?;
+                let reversed: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM review_flag_effect_reversals
+                          WHERE flag_effect_event_id = ?1
+                     )",
+                    params![effect_event_id],
+                    |row| row.get(0),
+                )?;
+                let later_review_mutation: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                           FROM review_flag_effect_events newer
+                          WHERE newer.segment_id = ?1
+                            AND newer.flag_revision > ?2
+                         UNION ALL
+                         SELECT 1
+                           FROM human_decision_effect_events decision
+                          WHERE decision.segment_id = ?1
+                            AND decision.decision_revision > ?2
+                     )",
+                    params![segment_id, flag_revision],
+                    |row| row.get(0),
+                )?;
+                if reversed
+                    || later_review_mutation
+                    || current.1 < flag_revision
+                    || current.0.verdict.as_deref() != Some("escalated")
+                    || current.0.rationale.as_deref() != Some(rationale.as_str())
+                    || !current.0.escalated
+                    || current
+                        .0
+                        .human_decision
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                {
+                    return Err(AppError::Validation(
+                        "review flag operation was committed, but its exact post-state is no longer current".into(),
+                    ));
+                }
+                tx.rollback()?;
+                return Ok(HumanFlagCommit {
+                    effect_event_id,
+                    segment_id: replay_segment_id,
+                    prior_revision,
+                    flag_revision,
+                    segment: current.0,
+                });
+            }
+            let (prior, prior_revision, _) = Self::decision_snapshot_on(&tx, segment_id)?
+                .ok_or_else(|| AppError::Validation("cannot flag an unknown segment".into()))?;
+            if prior.human_decision.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+                return Err(AppError::Validation("cannot flag a segment that already has a human decision".into()));
+            }
+            if !Self::flag_human_baseline_is_authorized_on(&tx, &prior)? {
+                return Err(AppError::Validation(
+                    "review flag refused: the segment carries human review fields with no immutable legacy or decision-effect authority"
+                        .into(),
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE speech_segments
+                    SET verdict = 'escalated', rationale = ?2, escalated = 1,
+                        updated_at = datetime('now')
+                  WHERE id = ?1 AND review_revision = ?3
+                    AND (human_decision IS NULL OR human_decision = '')",
+                params![segment_id, rationale, prior_revision],
+            )?;
+            if changed != 1 {
+                return Err(AppError::Validation("segment changed while its review flag was being saved".into()));
+            }
+            let flag_revision: i64 = tx.query_row(
+                "SELECT review_revision FROM speech_segments WHERE id = ?1",
+                params![segment_id],
+                |row| row.get(0),
+            )?;
+            if flag_revision != prior_revision + 1 {
+                return Err(AppError::Other("review flag did not advance exactly one revision".into()));
+            }
+            tx.execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id, segment_id, prior_revision, flag_revision, prior_verdict,
+                     prior_rationale, flag_rationale, prior_escalated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    operation_id,
+                    segment_id,
+                    prior_revision,
+                    flag_revision,
+                    prior.verdict,
+                    prior.rationale,
+                    rationale,
+                    prior.escalated as i32,
+                ],
+            )?;
+            let effect_event_id = tx.last_insert_rowid();
+            let segment = Self::decision_snapshot_on(&tx, segment_id)?
+                .ok_or_else(|| AppError::Other("segment disappeared inside review flag transaction".into()))?
+                .0;
+            tx.commit()?;
+            Ok(HumanFlagCommit {
+                effect_event_id,
+                segment_id: segment_id.to_string(),
+                prior_revision,
+                flag_revision,
+                segment,
+            })
+        })?;
+        self.track_write()?;
+        Ok(commit)
+    }
+    pub fn undo_review_flag(&self, effect_event_id: i64, operation_id: &str) -> AppResult<HumanFlagUndoOutcome> {
+        if effect_event_id <= 0 {
+            return Err(AppError::Validation("review flag effect id must be positive".into()));
+        }
+        validate_operation_uuid(operation_id)?;
+        let outcome = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let effect = tx
+                .query_row(
+                    "SELECT segment_id, flag_revision, prior_verdict,
+                            prior_rationale, flag_rationale, prior_escalated
+                       FROM review_flag_effect_events WHERE id = ?1",
+                    params![effect_event_id],
+                    |row| {
+                        Ok(FlagEffectSnapshot {
+                            segment_id: row.get(0)?,
+                            flag_revision: row.get(1)?,
+                            prior_verdict: row.get(2)?,
+                            prior_rationale: row.get(3)?,
+                            flag_rationale: row.get(4)?,
+                            prior_escalated: row.get::<_, i32>(5)? != 0,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| AppError::Validation("unknown review flag effect id".into()))?;
+            let current = Self::decision_snapshot_on(&tx, &effect.segment_id)?
+                .ok_or_else(|| AppError::Validation("cannot undo a flag whose segment no longer exists".into()))?;
+            let prior_reversal: Option<String> = tx
+                .query_row(
+                    "SELECT operation_id FROM review_flag_effect_reversals WHERE flag_effect_event_id = ?1",
+                    params![effect_event_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(prior_operation) = prior_reversal {
+                tx.rollback()?;
+                return Ok(if prior_operation == operation_id {
+                    HumanFlagUndoOutcome::AlreadyApplied { segment: current.0 }
+                } else {
+                    HumanFlagUndoOutcome::Conflict { segment: current.0 }
+                });
+            }
+            let later_review_mutation: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                       FROM review_flag_effect_events newer
+                      WHERE newer.segment_id = ?1
+                        AND newer.flag_revision > ?2
+                     UNION ALL
+                     SELECT 1
+                       FROM human_decision_effect_events decision
+                      WHERE decision.segment_id = ?1
+                        AND decision.decision_revision > ?2
+                 )",
+                params![effect.segment_id, effect.flag_revision],
+                |row| row.get(0),
+            )?;
+            if current.1 < effect.flag_revision || later_review_mutation {
+                tx.rollback()?;
+                return Ok(HumanFlagUndoOutcome::Conflict { segment: current.0 });
+            }
+            let changed = tx.execute(
+                "UPDATE speech_segments
+                    SET verdict = ?2, rationale = ?3, escalated = ?4,
+                        updated_at = datetime('now')
+                  WHERE id = ?1 AND review_revision = ?5
+                    AND verdict = 'escalated' AND escalated = 1
+                    AND rationale = ?6
+                    AND (human_decision IS NULL OR human_decision = '')",
+                params![
+                    effect.segment_id,
+                    effect.prior_verdict,
+                    effect.prior_rationale,
+                    effect.prior_escalated as i32,
+                    current.1,
+                    effect.flag_rationale,
+                ],
+            )?;
+            if changed == 0 {
+                tx.rollback()?;
+                return Ok(HumanFlagUndoOutcome::Conflict { segment: current.0 });
+            }
+            let restored_revision: i64 = tx.query_row(
+                "SELECT review_revision FROM speech_segments WHERE id = ?1",
+                params![effect.segment_id],
+                |row| row.get(0),
+            )?;
+            if current.1 + 1 != restored_revision {
+                return Err(AppError::Other("review flag undo did not advance exactly one revision".into()));
+            }
+            tx.execute(
+                "INSERT INTO review_flag_effect_reversals (flag_effect_event_id, operation_id)
+                 VALUES (?1, ?2)",
+                params![effect_event_id, operation_id],
+            )?;
+            let segment = Self::decision_snapshot_on(&tx, &effect.segment_id)?
+                .ok_or_else(|| AppError::Other("segment disappeared inside review flag undo".into()))?
+                .0;
+            tx.commit()?;
+            Ok(HumanFlagUndoOutcome::Applied { restored_revision, segment })
+        })?;
+        if matches!(&outcome, HumanFlagUndoOutcome::Applied { .. }) {
+            self.track_write()?;
+        }
+        Ok(outcome)
+    }
     /// Reverse a UI `flag()` escalation (the review-inbox Undo path): clear the `escalated` flag and the
     /// machine `'escalated'` verdict + rationale that flag wrote, WITHOUT touching a human_decision (flag
     /// never sets one). This is the exact inverse of flag — unlike `clear_human_decision`, which
@@ -5653,17 +7617,10 @@ impl Database {
     /// SET expression references the row's PRE-UPDATE values (SQLite semantics), so both CASEs see the
     /// original verdict.
     pub fn clear_escalation(&self, segment_id: &str) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE speech_segments
-             SET escalated  = 0,
-                 verdict    = CASE WHEN verdict = 'escalated' THEN NULL ELSE verdict END,
-                 rationale  = CASE WHEN verdict = 'escalated' THEN NULL ELSE rationale END,
-                 updated_at = datetime('now')
-             WHERE id = ?1 AND (human_decision IS NULL OR human_decision = '')",
-            params![segment_id],
-        )?;
-        self.track_write()?;
-        Ok(())
+        let _ = segment_id;
+        Err(AppError::Validation(
+            "clear_escalation is disabled: undo requires an immutable review-flag effect id and operation UUID".into(),
+        ))
     }
 
     /// Capture a MODEL correction (the jury auto-correcting OmniASR) as a provenance-tagged PSEUDO
@@ -5717,6 +7674,7 @@ impl Database {
     /// Record a human decision (accept/edit/reject) and optionally store a
     /// corrected transcript.  Gold segments are updated but never written to
     /// agent_examples. M2.1: Also logs decision timing to decision_log table.
+    #[cfg(test)]
     pub fn record_human_decision(
         &self,
         segment_id: &str,
@@ -5727,15 +7685,11 @@ impl Database {
         self.record_human_decision_by(segment_id, decision, corrected_transcript, timestamp_ms, None)
     }
 
-    /// [`record_human_decision`] with reviewer attribution (Migration v43).
-    ///
-    /// `annotator` names the human who made THIS decision — a named Couch Review reviewer. `None` means
-    /// "not attributed" and is the correct value for the owner's own desktop, where there is exactly one
-    /// human and no token naming them; it is stored as SQL NULL rather than a fabricated "owner", because
-    /// a provenance column that invents its own values is worse than an empty one.
-    ///
-    /// The attribution is written INSIDE the same transaction as the verdict, so a crash can never leave a
-    /// decision whose author is unknown (or an author for a decision that never committed).
+    /// Legacy desktop decision entry point. Desktop effects are deliberately anonymous; named reviewers
+    /// must use the phone writer, which binds their identity to the review event, compensation row, and
+    /// immutable effect. Supplying `annotator` therefore fails closed instead of creating an effect whose
+    /// post-state cannot be authenticated during exact Undo.
+    #[cfg(test)]
     pub fn record_human_decision_by(
         &self,
         segment_id: &str,
@@ -5755,6 +7709,8 @@ impl Database {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         Ok(())
     }
@@ -5762,6 +7718,7 @@ impl Database {
     /// Phone review is a complete adjudication, so the transcript/verdict, attribution, learning
     /// side-effects, annotation, and `verified` flag must share one commit. Keeping finalization in
     /// this transaction prevents an interrupted second write from leaving a decided-but-pending row.
+    #[cfg(test)]
     pub fn record_phone_human_decision_by(
         &self,
         segment_id: &str,
@@ -5789,6 +7746,7 @@ impl Database {
     /// Atomically record a phone decision only if the row is still the exact revision that was
     /// served/read. `Ok(None)` is a normal compare-and-swap miss: no row or learning side effect was
     /// written. `Ok(Some(revision))` returns the post-decision revision for a safe undo token.
+    #[cfg(test)]
     pub fn record_phone_human_decision_by_at_revision(
         &self,
         segment_id: &str,
@@ -5809,11 +7767,15 @@ impl Database {
             Some("couch"),
             None,
             None,
+            None,
+            None,
         )
+        .map(|commit| commit.map(|value| value.decided_revision))
     }
 
     /// Production phone write with a client-authored idempotency identity committed in the same
     /// transaction as verdict, event, and compensation. HTTP retries must use this variant.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_phone_human_decision_by_at_revision_with_operation(
         &self,
@@ -5824,32 +7786,6 @@ impl Database {
         expected_revision: i64,
         operation_id: &str,
         operation_payload_hash: &str,
-    ) -> AppResult<Option<i64>> {
-        self.record_phone_human_decision_by_at_revision_with_operation_limit(
-            segment_id,
-            decision,
-            corrected_transcript,
-            annotator,
-            expected_revision,
-            operation_id,
-            operation_payload_hash,
-            None,
-        )
-    }
-
-    /// The controlled-pilot production variant. The limit is checked under an IMMEDIATE SQLite
-    /// transaction before the segment, audit event, or compensation ledger can change.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_phone_human_decision_by_at_revision_with_operation_limit(
-        &self,
-        segment_id: &str,
-        decision: &str,
-        corrected_transcript: Option<&str>,
-        annotator: &str,
-        expected_revision: i64,
-        operation_id: &str,
-        operation_payload_hash: &str,
-        decision_limit: Option<&ReviewDecisionLimit>,
     ) -> AppResult<Option<i64>> {
         validate_review_operation_identity(operation_id, operation_payload_hash)?;
         self.record_human_decision_by_with_finalize(
@@ -5862,12 +7798,56 @@ impl Database {
             true,
             Some("couch"),
             Some((operation_id, operation_payload_hash)),
+            Some((decision, corrected_transcript.unwrap_or_default())),
+            None,
+            None,
+        )
+        .map(|commit| commit.map(|value| value.decided_revision))
+    }
+
+    /// The controlled-pilot production variant. The limit is checked under an IMMEDIATE SQLite
+    /// transaction before the segment, audit event, or compensation ledger can change.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_phone_human_decision_by_at_revision_with_operation_limit(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        annotator: &str,
+        expected_revision: i64,
+        playback: &PlaybackDecisionProof,
+        operation_id: &str,
+        operation_payload_hash: &str,
+        requested_action: &str,
+        requested_transcript: &str,
+        decision_limit: Option<&ReviewDecisionLimit>,
+    ) -> AppResult<Option<HumanDecisionCommit>> {
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        if playback.segment_revision != expected_revision {
+            return Err(AppError::Validation(
+                "playback proof revision does not match the served decision revision".into(),
+            ));
+        }
+        self.record_human_decision_by_with_finalize(
+            segment_id,
+            decision,
+            corrected_transcript,
+            None,
+            Some(annotator),
+            Some(expected_revision),
+            true,
+            Some("couch"),
+            Some((operation_id, operation_payload_hash)),
+            Some((requested_action, requested_transcript)),
             decision_limit,
+            Some(playback),
         )
     }
 
-    /// Record a DESKTOP adjudication complete: decision, transcript, attribution and `verified` in
+    /// Record a DESKTOP adjudication complete: decision, transcript and `verified` in
     /// one commit, so an interrupted second write can never leave a decided-but-pending row.
+    /// The desktop boundary is anonymous: `annotator = Some(_)` is rejected; named work must use
+    /// the attributed Couch writer so its effect and compensation identities remain exact.
     ///
     /// The phone has had this since the finalization transaction was written; the desktop reached
     /// `verified` through a separate `update_segment_fields` call that ReviewInbox never made.
@@ -5890,8 +7870,46 @@ impl Database {
             None,
             None,
             None,
+            None,
+            None,
         )
         .map(|_| ())
+    }
+
+    /// Finalize a desktop adjudication only while the exact anonymous playback proof remains valid.
+    /// The useful preflight error is produced by the command layer; this is the authority check,
+    /// repeated under the same IMMEDIATE transaction and revision CAS as the decision itself.
+    pub(crate) fn finalize_human_review_with_playback(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
+        playback: &PlaybackDecisionProof,
+        operation_id: &str,
+    ) -> AppResult<HumanDecisionCommit> {
+        validate_operation_uuid(operation_id)?;
+        let operation_payload_hash =
+            desktop_decision_payload_hash(segment_id, decision, corrected_transcript, timestamp_ms);
+        match self.record_human_decision_by_with_finalize(
+            segment_id,
+            decision,
+            corrected_transcript,
+            timestamp_ms,
+            None,
+            Some(playback.segment_revision),
+            true,
+            None,
+            Some((operation_id, &operation_payload_hash)),
+            None,
+            None,
+            Some(playback),
+        )? {
+            Some(commit) => Ok(commit),
+            None => Err(AppError::Validation(format!(
+                "{PLAYBACK_EVIDENCE_CHANGED}: clip identity, revision, or playback proof changed while the desktop decision was being saved"
+            ))),
+        }
     }
 
     /// Finish a row written by an older release that committed the decision but not phone
@@ -5914,6 +7932,12 @@ impl Database {
         corrected_transcript: Option<&str>,
         expected_revision: i64,
     ) -> AppResult<Option<i64>> {
+        if crate::migrations::get_current_version(self)? >= 60 {
+            return Err(AppError::Validation(
+                "legacy interrupted phone decision requires the offline repair lane; schema-v60 runtime cannot mutate human truth without an immutable effect"
+                    .into(),
+            ));
+        }
         let corrected = corrected_transcript.map(|text| to_nfc(text.trim())).filter(|text| !text.is_empty());
         let changed = self.conn.execute(
             "UPDATE speech_segments
@@ -5953,8 +7977,8 @@ impl Database {
     /// affirming human-authored text. The text is never invented, only carried forward.
     ///
     /// Returns the effective decision and, when it had to resolve the approved text itself, that text.
-    fn authoritative_decision(
-        &self,
+    fn authoritative_decision_on(
+        conn: &Connection,
         segment_id: &str,
         requested: &str,
         approved: Option<&str>,
@@ -5968,8 +7992,7 @@ impl Database {
         let (approved_text, resolved): (String, Option<String>) = match approved {
             Some(text) if !text.trim().is_empty() => (text.to_string(), None),
             _ => {
-                let shipped: Option<String> = self
-                    .conn
+                let shipped: Option<String> = conn
                     .query_row(
                         "SELECT COALESCE(NULLIF(TRIM(verdict_transcript), ''),                                  NULLIF(TRIM(annotated_transcript), ''),                                  raw_transcript)                          FROM speech_segments WHERE id = ?1",
                         [segment_id],
@@ -5986,7 +8009,7 @@ impl Database {
         };
 
         let wanted = Self::provenance_norm(&approved_text);
-        let mut stmt = self.conn.prepare("SELECT transcript FROM segment_hypotheses WHERE segment_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT transcript FROM segment_hypotheses WHERE segment_id = ?1")?;
         let mut rows = stmt.query([segment_id])?;
         let mut saw_any_hypothesis = false;
         while let Some(row) = rows.next()? {
@@ -6016,15 +8039,15 @@ impl Database {
     /// or whitespace-only rewrite; both are a no-op under the same key that suppresses degenerate
     /// learning pairs. Classifying again in the database boundary keeps every direct/replayed phone
     /// call on the 10% accept rate unless the retained words materially changed.
-    fn phone_compensation_action(
-        &self,
+    fn phone_compensation_action_on(
+        conn: &Connection,
         segment_id: &str,
         requested: &str,
         submitted: Option<&str>,
     ) -> AppResult<String> {
         match requested {
             "accept" | "edit" => {
-                let served: String = self.conn.query_row(
+                let served: String = conn.query_row(
                     "SELECT COALESCE(NULLIF(TRIM(annotated_transcript), ''), raw_transcript)
                        FROM speech_segments WHERE id = ?1",
                     [segment_id],
@@ -6080,17 +8103,36 @@ impl Database {
             .flatten())
     }
 
-    pub fn segment_audio_fingerprint(&self, segment_id: &str) -> AppResult<Option<String>> {
+    pub fn segment_audio_content_hash(&self, segment_id: &str) -> AppResult<Option<String>> {
         use rusqlite::OptionalExtension;
-        Ok(self
+        let value = self
             .conn
             .query_row(
-                "SELECT NULLIF(TRIM(COALESCE(audio_fingerprint, '')), '') FROM speech_segments WHERE id = ?1",
+                "SELECT NULLIF(TRIM(COALESCE(audio_content_hash, '')), '') FROM speech_segments WHERE id = ?1",
                 [segment_id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
-            .flatten())
+            .flatten();
+        match value {
+            Some(content_hash) if is_canonical_audio_content_hash(&content_hash) => Ok(Some(content_hash)),
+            Some(_) => {
+                Err(AppError::Validation(format!("segment {segment_id} has a non-canonical audio content hash")))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn segment_source_span(&self, segment_id: &str) -> AppResult<Option<(i64, i64)>> {
+        use rusqlite::OptionalExtension;
+        let alignment = self
+            .conn
+            .query_row("SELECT alignment_json FROM speech_segments WHERE id = ?1", [segment_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten();
+        Ok(canonical_source_span(alignment.as_deref()))
     }
 
     /// Refuse a gold-minting verdict that has no proof the reviewer heard THIS clip.
@@ -6107,10 +8149,10 @@ impl Database {
         &self,
         segment_id: &str,
         revision: i64,
-        fingerprint: &str,
+        content_hash: &str,
         reviewer: Option<&str>,
     ) -> AppResult<()> {
-        if self.has_sufficient_playback_evidence(segment_id, revision, fingerprint, reviewer)? {
+        if self.has_sufficient_playback_evidence(segment_id, revision, content_hash, reviewer)? {
             return Ok(());
         }
         Err(AppError::Validation(format!(
@@ -6124,7 +8166,7 @@ impl Database {
     /// `played_ms` is cumulative MEDIA time advanced, never wall-clock and never a `play()` call —
     /// download, metadata load and an autoplay attempt all prove nothing about listening.
     ///
-    /// EVERY identity field is resolved HERE, from the row — revision, fingerprint, and the
+    /// EVERY identity field is resolved HERE, from the row — revision, decoded-PCM content hash, and the
     /// coverage denominator alike. The struct's values for those three are treated as claims and
     /// overwritten. Found by the 2026-08-19 hunt: the phone path resolved all three at its call
     /// site, the desktop resolved two and passed the renderer's clipDurationMs through — and both
@@ -6134,29 +8176,60 @@ impl Database {
     /// door, so no caller can.
     pub fn record_playback_receipt(&self, receipt: &PlaybackReceipt) -> AppResult<()> {
         use rusqlite::OptionalExtension;
-        let row: Option<(i64, Option<String>, i64)> = self
+        validate_playback_receipt_nonnegative_fields(receipt)?;
+        let row: Option<(i64, Option<String>, i64, Option<String>)> = self
             .conn
             .query_row(
                 "SELECT COALESCE(review_revision, 0),
-                        NULLIF(TRIM(COALESCE(audio_fingerprint, '')), ''),
-                        COALESCE(duration_ms, 0)
+                        NULLIF(TRIM(COALESCE(audio_content_hash, '')), ''),
+                        COALESCE(duration_ms, 0), alignment_json
                  FROM speech_segments WHERE id = ?1",
                 [&receipt.segment_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((revision, fingerprint, duration_ms)) = row else {
+        let Some((revision, content_hash, duration_ms, alignment_json)) = row else {
             return Err(AppError::Validation(format!(
                 "cannot mint a listening receipt for unknown segment {}",
                 receipt.segment_id
             )));
         };
+        let content_hash = content_hash.ok_or_else(|| {
+            AppError::Validation(format!(
+                "cannot mint a listening receipt for segment {} without a server-derived audio content hash",
+                receipt.segment_id
+            ))
+        })?;
+        if !is_canonical_audio_content_hash(&content_hash) {
+            return Err(AppError::Validation(format!(
+                "cannot mint a listening receipt for segment {} with a non-canonical audio content hash",
+                receipt.segment_id
+            )));
+        }
+        if duration_ms <= 0 {
+            return Err(AppError::Validation(format!(
+                "cannot mint a listening receipt for segment {} without a positive server clip duration",
+                receipt.segment_id
+            )));
+        }
+        let (source_start_ms, source_end_ms) = canonical_source_span(alignment_json.as_deref()).ok_or_else(|| {
+            AppError::Validation(format!(
+                "cannot mint policy-3 listening evidence for segment {} without a canonical server source span",
+                receipt.segment_id
+            ))
+        })?;
+        if !source_span_matches_duration(source_start_ms, source_end_ms, duration_ms) {
+            return Err(AppError::Validation(format!(
+                "cannot mint policy-3 listening evidence for segment {} whose source span disagrees with decoded duration",
+                receipt.segment_id
+            )));
+        }
         let resolved = PlaybackReceipt {
             segment_revision: revision,
-            audio_fingerprint: fingerprint.unwrap_or_else(|| format!("id:{}", receipt.segment_id)),
-            // The row's own clip length wins; the claim survives only for a row with no duration,
-            // which on the live library is zero rows of 15,905.
-            clip_duration_ms: if duration_ms > 0 { duration_ms } else { receipt.clip_duration_ms },
+            audio_content_hash: content_hash,
+            clip_duration_ms: duration_ms,
+            source_start_ms: Some(source_start_ms),
+            source_end_ms: Some(source_end_ms),
             ..receipt.clone()
         };
         self.record_playback_receipt_raw(&resolved)
@@ -6167,7 +8240,7 @@ impl Database {
     /// The 2026-08-20 hunt found the front door's own resolution re-opening the hole the serve/decide
     /// fence had just closed: the fence verifies the serve against the current revision, then
     /// [`Self::record_playback_receipt`] re-queries the row, so a write landing in between rebinds
-    /// the receipt to a revision (and fingerprint) the reviewer never heard. Check-and-insert as one
+    /// the receipt to a revision (and content hash) the reviewer never heard. Check-and-insert as one
     /// `INSERT … SELECT … WHERE review_revision = ?` closes that: SQLite executes it atomically, so
     /// either the receipt is minted against exactly the verified revision or nothing is written.
     ///
@@ -6178,30 +8251,48 @@ impl Database {
         receipt: &PlaybackReceipt,
         expected_revision: i64,
     ) -> AppResult<bool> {
+        validate_playback_receipt_nonnegative_fields(receipt)?;
+        if expected_revision < 0 {
+            return Err(AppError::Validation(
+                "cannot record playback evidence at a negative expected segment revision".into(),
+            ));
+        }
         let changed = self.conn.execute(
             "INSERT INTO playback_receipts (segment_id, segment_revision, audio_fingerprint, reviewer,
                                             session_id, started_at_ms, played_ms, clip_duration_ms,
-                                            coverage_ratio, policy_version)
-             SELECT s.id, ?2,
-                    COALESCE(NULLIF(TRIM(COALESCE(s.audio_fingerprint, '')), ''), 'id:' || s.id),
-                    ?3, ?4, ?5, ?6,
-                    CASE WHEN COALESCE(s.duration_ms, 0) > 0 THEN s.duration_ms ELSE ?7 END,
-                    CASE WHEN CASE WHEN COALESCE(s.duration_ms, 0) > 0 THEN s.duration_ms ELSE ?7 END > 0
-                         THEN MIN(1.0, CAST(?6 AS REAL)
-                                       / (CASE WHEN COALESCE(s.duration_ms, 0) > 0 THEN s.duration_ms ELSE ?7 END))
-                         ELSE 0.0 END,
-                    ?8
+                                            coverage_ratio, policy_version, source_start_ms, source_end_ms)
+             SELECT s.id, ?2, s.audio_content_hash,
+                     ?3, ?4, ?5, ?6, s.duration_ms,
+                     MIN(1.0, CAST(?6 AS REAL) / CAST(s.duration_ms AS REAL)),
+                     ?7,
+                     json_extract(s.alignment_json, '$.source_start_ms'),
+                     json_extract(s.alignment_json, '$.source_end_ms')
              FROM speech_segments s
-             WHERE s.id = ?1 AND COALESCE(s.review_revision, 0) = ?2",
+             WHERE s.id = ?1 AND COALESCE(s.review_revision, 0) = ?2
+               AND typeof(s.duration_ms) = 'integer' AND s.duration_ms > 0
+               AND typeof(s.audio_content_hash) = 'text'
+               AND length(s.audio_content_hash) = 64
+               AND s.audio_content_hash NOT GLOB '*[^0-9a-f]*'
+               AND json_valid(s.alignment_json)
+               AND typeof(json_extract(s.alignment_json, '$.source_start_ms')) = 'integer'
+               AND typeof(json_extract(s.alignment_json, '$.source_end_ms')) = 'integer'
+               AND json_extract(s.alignment_json, '$.source_start_ms') >= 0
+               AND json_extract(s.alignment_json, '$.source_end_ms')
+                   > json_extract(s.alignment_json, '$.source_start_ms')
+               AND ABS(
+                    (json_extract(s.alignment_json, '$.source_end_ms')
+                     - json_extract(s.alignment_json, '$.source_start_ms'))
+                    - s.duration_ms
+               ) <= ?8",
             params![
                 receipt.segment_id,
                 expected_revision,
                 receipt.reviewer,
                 receipt.session_id,
                 receipt.started_at_ms,
-                receipt.played_ms.max(0),
-                receipt.clip_duration_ms.max(0),
+                receipt.played_ms,
                 PLAYBACK_POLICY_VERSION,
+                MAX_SOURCE_SPAN_DURATION_DELTA_MS,
             ],
         )?;
         Ok(changed == 1)
@@ -6214,17 +8305,43 @@ impl Database {
     /// forward. Production surfaces go through [`Self::record_playback_receipt`]; minting a receipt
     /// from unresolved client claims through this is the exact bug the front door closed.
     pub(crate) fn record_playback_receipt_raw(&self, receipt: &PlaybackReceipt) -> AppResult<()> {
-        let coverage = if receipt.clip_duration_ms > 0 {
-            (receipt.played_ms as f64 / receipt.clip_duration_ms as f64).min(1.0)
-        } else {
-            0.0
+        if !is_canonical_audio_content_hash(&receipt.audio_content_hash) {
+            return Err(AppError::Validation(
+                "cannot record policy-3 playback evidence without a canonical server-derived decoded-PCM BLAKE3 hash"
+                    .into(),
+            ));
+        }
+        validate_playback_receipt_nonnegative_fields(receipt)?;
+        if receipt.clip_duration_ms <= 0 {
+            return Err(AppError::Validation(
+                "cannot record policy-3 playback evidence without a positive clip duration".into(),
+            ));
+        }
+        let (source_start_ms, source_end_ms) = match (receipt.source_start_ms, receipt.source_end_ms) {
+            (Some(start), Some(end)) if start >= 0 && end > start => (start, end),
+            _ => {
+                return Err(AppError::Validation(
+                    "cannot record policy-3 playback evidence without a canonical source span".into(),
+                ));
+            }
         };
+        if !source_span_matches_duration(source_start_ms, source_end_ms, receipt.clip_duration_ms) {
+            return Err(AppError::Validation(
+                "cannot record policy-3 playback evidence whose source span disagrees with decoded clip duration"
+                    .into(),
+            ));
+        }
+        let coverage = (receipt.played_ms as f64 / receipt.clip_duration_ms as f64).min(1.0);
         self.conn.execute(
-            "INSERT INTO playback_receipts (segment_id, segment_revision, audio_fingerprint, reviewer,                                             session_id, started_at_ms, played_ms, clip_duration_ms,                                             coverage_ratio, policy_version)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO playback_receipts
+                (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                 started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version,
+                 source_start_ms, source_end_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 receipt.segment_id,
                 receipt.segment_revision,
-                receipt.audio_fingerprint,
+                receipt.audio_content_hash,
                 receipt.reviewer,
                 receipt.session_id,
                 receipt.started_at_ms,
@@ -6232,6 +8349,8 @@ impl Database {
                 receipt.clip_duration_ms,
                 coverage,
                 PLAYBACK_POLICY_VERSION,
+                source_start_ms,
+                source_end_ms,
             ],
         )?;
         Ok(())
@@ -6242,14 +8361,14 @@ impl Database {
     /// Deliberately strict about identity, not just quantity:
     ///   * the receipt must name this segment AND the revision being decided — a correction changes
     ///     the text under judgement, so the previous listen does not carry over;
-    ///   * it must name the audio FINGERPRINT now on file, so a receipt cannot be replayed against a
+    ///   * it must name the decoded-PCM CONTENT HASH now on file, so a receipt cannot be replayed against a
     ///     different clip or survive the audio being swapped underneath it;
     ///   * coverage is cumulative media time, so a paused, seeked or replayed listen still counts
     ///     honestly and a download does not count at all.
     ///
     /// `reviewer` is part of the evidence's identity: listening is PERSONAL.
     ///
-    /// Found by the hunt: matching on segment+revision+fingerprint alone let reviewer A's full
+    /// Found by the hunt: matching on segment+revision+content-hash alone let reviewer A's full
     /// listen evidence reviewer B's blind verdict (a clip A heard and skipped goes to B's queue
     /// with A's receipt still valid for it). `None` matches only anonymous (desktop-minted)
     /// receipts, never a named phone receipt, and vice versa: SQL `IS` treats NULL as its own
@@ -6258,23 +8377,24 @@ impl Database {
         &self,
         segment_id: &str,
         revision: i64,
-        fingerprint: &str,
+        content_hash: &str,
         reviewer: Option<&str>,
     ) -> AppResult<bool> {
-        use rusqlite::OptionalExtension;
-        let best: Option<f64> = self
-            .conn
-            .query_row(
-                "SELECT MAX(coverage_ratio) FROM playback_receipts                  WHERE segment_id = ?1 AND segment_revision = ?2 AND audio_fingerprint = ?3                    AND reviewer IS ?4",
-                params![segment_id, revision, fingerprint, reviewer],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(best.unwrap_or(0.0) >= MIN_PLAYBACK_COVERAGE)
+        let Some((source_start_ms, source_end_ms)) = self.segment_source_span(segment_id)? else {
+            return Ok(false);
+        };
+        has_sufficient_playback_evidence_on(
+            &self.conn,
+            segment_id,
+            revision,
+            content_hash,
+            source_start_ms,
+            source_end_ms,
+            reviewer,
+        )
     }
 
-    // Ten parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
+    // Eleven parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
     // what verdict, whose text, when, who, at which revision, whether this call finalizes, and which
     // surface audits it). Bundling them into a struct would move the width rather than remove it,
     // and this is a private helper with three call sites — all in this file.
@@ -6296,201 +8416,247 @@ impl Database {
         finalize: bool,
         audit_source: Option<&str>,
         audit_operation: Option<(&str, &str)>,
+        audit_request: Option<(&str, &str)>,
         decision_limit: Option<&ReviewDecisionLimit>,
-    ) -> AppResult<Option<i64>> {
+        required_playback: Option<&PlaybackDecisionProof>,
+    ) -> AppResult<Option<HumanDecisionCommit>> {
+        if audit_source.is_none() && annotator.is_some() {
+            return Err(AppError::Validation(
+                "named reviewers cannot use the anonymous desktop decision boundary; use the attributed Couch writer"
+                    .into(),
+            ));
+        }
         if decision_limit.is_some() && (audit_source != Some("couch") || annotator.is_none()) {
             return Err(AppError::Validation(
                 "controlled-review limits are valid only for attributed Couch decisions".into(),
             ));
         }
-        // `finalize` and `expected_revision` are INDEPENDENT, and conflating them cost real work.
-        // Until 2026-08-20 finalize was derived as `expected_revision.is_some()` — a CAS token only
-        // the phone supplies — so no desktop decision ever set `verified`. ReviewMode hid it behind a
-        // second write; ReviewInbox had none, so its decisions never reached the corpus at all (the
-        // export counts `verified = 1`). Nine such rows were found on the live library.
-        //
-        // The SQL already treats them separately (`verified = CASE WHEN ?6`, and the CAS clause is
-        // `?7 IS NULL OR ...`), so a caller may finalize without a revision token.
-        // NFC-canonicalize the human correction like EVERY other transcript write path (insert/restore/
-        // update_*). Without it a decomposed (NFD) paste / IME input becomes the lone non-NFC label in an
-        // otherwise-NFC corpus (verdict_transcript is the COALESCE-preferred gold source) and defeats the
-        // no-op-edit dedup guard — which compares via learning_text_key WITHOUT NFC — so an edit that is
-        // byte-different-but-NFC-identical to the wrong text emits a degenerate DPO pair.
+        let playback_identity_is_valid = matches!((audit_source, annotator), (Some("couch"), Some(_)) | (None, None));
+        if required_playback.is_some() && !playback_identity_is_valid {
+            return Err(AppError::Validation(
+                "playback-bound review writes require an attributed Couch reviewer or anonymous desktop identity"
+                    .into(),
+            ));
+        }
+        if expected_revision.is_some_and(|revision| revision < 0) {
+            return Err(AppError::Validation("human decision revision must be non-negative".into()));
+        }
+        if timestamp_ms.is_some_and(|timestamp| timestamp <= 0) {
+            return Err(AppError::Validation("human decision timestamp must be positive".into()));
+        }
+        if audit_source.is_none() && audit_operation.is_some() && timestamp_ms.is_none() {
+            return Err(AppError::Validation(
+                "replayable desktop decisions require a positive request timestamp".into(),
+            ));
+        }
+        human_verdict_for_decision(decision)?;
         let corrected_owned: Option<String> =
             corrected_transcript.map(|t| to_nfc(t.trim())).filter(|value| !value.is_empty());
-        let corrected_transcript = corrected_owned.as_deref();
-        // AUTHORITATIVE CLASSIFICATION — the backend decides what this decision IS, never the
-        // renderer's word for it. A reviewer pressing "Accept" is approving the text in front of
-        // them; on a RE-review that text is a previous human's correction, and recording it as
-        // `accept` would state that an ASR engine produced it. Measured 2026-08-18 on segment
-        // 82681df2: five humans edited it (Rubar, Lamo, Sewa, Rubar, Roza), the sixth pressed
-        // Accept, and the row then claimed the champion had written a name and punctuation that
-        // appear in none of its four hypotheses.
-        // Pay follows the semantic action against the text actually served. Keep it BEFORE
-        // `authoritative_decision`: that function may reclassify an unchanged accept of earlier
-        // human-authored text to `edit` solely to preserve corpus provenance, which must not turn a
-        // 10% accept into a 100% correction.
-        let compensation_action = if audit_source == Some("couch") {
-            self.phone_compensation_action(segment_id, decision, corrected_transcript)?
-        } else {
-            decision.to_string()
-        };
-        let (decision_owned, resolved_text) =
-            self.authoritative_decision(segment_id, decision, corrected_transcript)?;
-        let decision = decision_owned.as_str();
-        let corrected_owned = resolved_text.or(corrected_owned);
-        let corrected_transcript = corrected_owned.as_deref();
-        let human_verdict = human_verdict_for_decision(decision)?;
-        if decision == "edit" && corrected_transcript.is_none() {
-            return Err(AppError::Validation("Human edit decisions require a corrected transcript".into()));
+        let (requested_action, requested_transcript) = audit_request
+            .map(|(action, transcript)| (action.trim().to_string(), to_nfc(transcript.trim())))
+            .unwrap_or_else(|| (decision.to_string(), corrected_owned.clone().unwrap_or_default()));
+        if requested_action.is_empty() || requested_action.chars().any(char::is_control) {
+            return Err(AppError::Validation("review request action must be a non-blank canonical token".into()));
         }
-
-        let (
-            is_gold,
-            raw_transcript,
-            normalized_transcript,
-            annotated_transcript,
-            verdict_transcript,
-            prior_verdict,
-            audio_path,
-            model_version_id,
-        ): HumanDecisionContext = self.conn.query_row(
-            "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,
-                        verdict_transcript, verdict, audio_path, model_version_id
-                 FROM speech_segments
-                 WHERE id = ?1",
-            params![segment_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
-            },
-        )?;
-
-        // Accept-what-you-SEE, enforced at the shared root (text-provenance audit defect #22): an
-        // accept arriving with no text used to keep the PRIOR verdict_transcript via COALESCE — a
-        // machine jury proposal the reviewer may never have seen then graded as "human_verified"
-        // gold. Snapshot what the serving law actually showed them (annotated ▸ verbatim raw).
-        // Empty snapshot stays None (blank-transcript law: never persist a blank over anything).
-        let accept_snapshot: Option<String> = if decision == "accept" && corrected_transcript.is_none() {
-            let seen = crate::corrections::loop0_draft_text(annotated_transcript.as_deref(), &raw_transcript);
-            Some(to_nfc(seen.trim())).filter(|t| !t.is_empty())
+        if audit_source == Some("couch")
+            && !matches!(requested_action.as_str(), "accept" | "edit" | "reject" | "bad" | "skip")
+        {
+            return Err(AppError::Validation("Couch request action is outside the accepted client vocabulary".into()));
+        }
+        let desktop_requested_transcript = corrected_owned.clone();
+        let desktop_requested_timestamp_ms = if audit_source.is_none() {
+            Some(timestamp_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or(1)
+                    .max(1)
+            }))
         } else {
             None
         };
-        let corrected_transcript = corrected_transcript.or(accept_snapshot.as_deref());
-
-        let rejected_learning_transcript = if decision == "edit" {
-            corrected_transcript.and_then(|fix| {
-                rejected_transcript_for_learning(
-                    fix,
-                    &[
-                        verdict_transcript.clone(),
-                        annotated_transcript.clone(),
-                        normalized_transcript.clone(),
-                        Some(raw_transcript.clone()),
-                    ],
+        let supplied_desktop_operation = audit_source.is_none() && audit_operation.is_some();
+        let generated_operation = audit_operation.is_none().then(|| {
+            let payload_hash = if let (Some("couch"), Some(reviewer)) = (audit_source, annotator) {
+                review_operation_payload_hash(segment_id, &requested_action, &requested_transcript, reviewer)
+            } else {
+                desktop_decision_payload_hash(
+                    segment_id,
+                    decision,
+                    desktop_requested_transcript.as_deref(),
+                    desktop_requested_timestamp_ms,
                 )
-            })
-        } else {
-            None
-        };
+            };
+            (uuid::Uuid::new_v4().to_string(), payload_hash)
+        });
+        let operation_identity = audit_operation.or_else(|| {
+            generated_operation
+                .as_ref()
+                .map(|(operation_id, payload_hash)| (operation_id.as_str(), payload_hash.as_str()))
+        });
+        let (operation_id, operation_payload_hash) = operation_identity
+            .ok_or_else(|| AppError::Other("human decision operation identity could not be generated".into()))?;
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        if let (Some("couch"), Some(reviewer)) = (audit_source, annotator) {
+            let expected_payload_hash =
+                review_operation_payload_hash(segment_id, &requested_action, &requested_transcript, reviewer);
+            if operation_payload_hash != expected_payload_hash {
+                return Err(AppError::Validation(
+                    "Couch operation payload hash does not match its exact submitted request".into(),
+                ));
+            }
+        }
+        // All classifications, the pre-state snapshot, the revision CAS, pay and learning artifacts
+        // live under one write reservation.  No renderer snapshot and no pre-transaction read is
+        // authoritative for an irreversible human decision.
+        let (commit, wrote) = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            if supplied_desktop_operation {
+                if let Some(commit) =
+                    Self::desktop_human_decision_replay_on(&tx, operation_id, operation_payload_hash, segment_id)?
+                {
+                    tx.rollback()?;
+                    return Ok((Some(commit), false));
+                }
+            }
+            let Some((prior, prior_revision, stored_content_hash)) = Self::decision_snapshot_on(&tx, segment_id)?
+            else {
+                tx.rollback()?;
+                return Ok((None, false));
+            };
+            if expected_revision.is_some_and(|expected| expected != prior_revision) {
+                tx.rollback()?;
+                return Ok((None, false));
+            }
+            if let Some(limit) = decision_limit {
+                let Some(reviewer) = annotator else {
+                    return Err(AppError::Validation("controlled-review decision has no reviewer".into()));
+                };
+                enforce_review_action_limit_on(&tx, reviewer, limit)?;
+            }
+            if let Some(proof) = required_playback {
+                if proof.segment_revision != prior_revision
+                    || !is_canonical_audio_content_hash(&proof.audio_content_hash)
+                    || proof.source_start_ms < 0
+                    || proof.source_end_ms <= proof.source_start_ms
+                    || stored_content_hash.as_deref() != Some(proof.audio_content_hash.as_str())
+                {
+                    tx.rollback()?;
+                    return Ok((None, false));
+                }
+                if !has_sufficient_playback_evidence_on(
+                    &tx,
+                    segment_id,
+                    proof.segment_revision,
+                    &proof.audio_content_hash,
+                    proof.source_start_ms,
+                    proof.source_end_ms,
+                    annotator,
+                )? {
+                    tx.rollback()?;
+                    return Ok((None, false));
+                }
+            }
 
-        // For an edit, capture the durable audio identity for the corrections ledger. Best-effort:
-        // computed BEFORE the transaction (no file I/O while a write is open) and, if the audio is
-        // unavailable, the verdict still records — we skip the audit row rather than fail the
-        // human's correction over a missing file.
-        let ledger_hash = if decision == "edit" {
-            crate::pipeline::source_audio_identity(Path::new(&audio_path)).ok().map(|identity| identity.content_hash)
-        } else {
-            None
-        };
+            // Freeze the exact server-owned transcript that this decision classified.  The Couch
+            // and desktop surfaces both serve the annotated draft when present, otherwise the raw
+            // draft.  Keeping this immutable pre-state beside the effect lets restore re-derive
+            // accept-vs-edit compensation instead of trusting the asserted payable action.
+            let served_transcript = to_nfc(
+                crate::corrections::loop0_draft_text(prior.annotated_transcript.as_deref(), &prior.raw_transcript)
+                    .trim(),
+            );
+            if served_transcript.is_empty() {
+                return Err(AppError::Validation(
+                    "human decision refused: the server-owned served transcript is blank".into(),
+                ));
+            }
 
-        // The model's wrong transcript for this edit (the agent proposal when available, else the
-        // raw ASR) — the shared "wrong" side of both the audit-ledger row and the LOOP-0 memory.
-        let wrong_side: Option<String> = if decision == "edit" {
-            Some(rejected_learning_transcript.clone().unwrap_or_else(|| raw_transcript.clone()))
-        } else {
-            None
-        };
-
-        // LOOP-0 evidence-based confidence (true-10 audit): for every PRE-EXISTING correction memory
-        // that would have fired on this segment, record whether the human's decision confirmed or
-        // contradicted it. The finalized transcript the human reviewed (annotated ▸ normalized ▸ raw)
-        // mirrors `pipeline::shadow_log_loop0`, so the evidence matches the shadow signal.
-        //
-        //   * edit   -> reference is the human's fix; a memory whose firing moves the text TOWARD it is
-        //               a confirm, AWAY is an override (over-trigger).
-        //   * accept -> reference IS the finalized text; any memory that fires there over-triggered on a
-        //               draft the human just confirmed was already correct -> override.
-        //   * reject -> inconclusive (the human discarded the whole clip, not a verdict on any word) -> skip.
-        //
-        // Snapshot the memories BEFORE the capture/upsert below so the memory born from THIS edit cannot
-        // confirm itself. Gold is excluded to match the capture path: gold human-decisions are the firing
-        // eval set (see `firing_error_delta`), and tuning the store on them would leak.
-        let finalized_text =
-            crate::corrections::loop0_draft_text(annotated_transcript.as_deref(), &raw_transcript).to_string();
-        let confidence_reference: Option<String> = match decision {
-            "edit" => corrected_transcript.map(str::to_string),
-            "accept" => Some(finalized_text.clone()),
-            _ => None,
-        };
-        type MemoryOutcomeUpdate = (String, String, String, crate::corrections::MemoryOutcome);
-        let confidence_updates: Vec<MemoryOutcomeUpdate> = match (is_gold, confidence_reference.as_deref()) {
-            (0, Some(reference)) => {
-                let cfg = crate::corrections::FiringConfig::default();
-                let mems = self.load_correction_memories()?;
-                // Winner-take-all per slot (matches runtime firing): only the memory that would actually
-                // fire at each slot is credited, so a losing sibling in the same slot earns no spurious
-                // confirm/override.
-                crate::corrections::classify_memory_outcomes(&finalized_text, reference, &mems, &cfg)
+            // Pay follows what changed relative to the exact text served; corpus provenance may further
+            // reclassify an accept of earlier human-authored text as an edit. Both are derived inside the
+            // same transaction as the update.
+            let compensation_action = if audit_source == Some("couch") {
+                Self::phone_compensation_action_on(&tx, segment_id, decision, corrected_owned.as_deref())?
+            } else {
+                decision.to_string()
+            };
+            let (decision_owned, resolved_text) =
+                Self::authoritative_decision_on(&tx, segment_id, decision, corrected_owned.as_deref())?;
+            let decision = decision_owned.as_str();
+            let corrected_owned = resolved_text.or(corrected_owned);
+            let accept_snapshot = if decision == "accept" && corrected_owned.is_none() {
+                Some(to_nfc(
+                    crate::corrections::loop0_draft_text(prior.annotated_transcript.as_deref(), &prior.raw_transcript)
+                        .trim(),
+                ))
+                .filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            let corrected_owned = corrected_owned.or(accept_snapshot);
+            let corrected_transcript = corrected_owned.as_deref();
+            if matches!(decision, "accept" | "edit") && corrected_transcript.is_none() {
+                return Err(AppError::Validation(format!(
+                    "Human {decision} decisions require non-blank accepted text"
+                )));
+            }
+            let content_hash = stored_content_hash.filter(|hash| is_canonical_audio_content_hash(hash));
+            if decision == "edit" && content_hash.is_none() {
+                return Err(AppError::Validation(format!(
+                    "human edit refused: segment {segment_id} has no canonical server-owned PCM content hash"
+                )));
+            }
+            let human_verdict = human_verdict_for_decision(decision)?;
+            let rejected_learning_transcript = if decision == "edit" {
+                corrected_transcript.and_then(|fix| {
+                    rejected_transcript_for_learning(
+                        fix,
+                        &[
+                            prior.verdict_transcript.clone(),
+                            prior.annotated_transcript.clone(),
+                            prior.normalized_transcript.clone(),
+                            Some(prior.raw_transcript.clone()),
+                        ],
+                    )
+                })
+            } else {
+                None
+            };
+            let wrong_side = (decision == "edit")
+                .then(|| rejected_learning_transcript.clone().unwrap_or_else(|| prior.raw_transcript.clone()));
+            let finalized_text =
+                crate::corrections::loop0_draft_text(prior.annotated_transcript.as_deref(), &prior.raw_transcript)
+                    .to_string();
+            let confidence_reference = match decision {
+                "edit" => corrected_transcript.map(str::to_string),
+                "accept" => corrected_transcript.map(str::to_string),
+                _ => None,
+            };
+            type MemoryOutcomeUpdate = (String, String, String, crate::corrections::MemoryOutcome);
+            let confidence_updates: Vec<MemoryOutcomeUpdate> = if !prior.is_gold {
+                if let Some(reference) = confidence_reference.as_deref() {
+                    let memories = Self::load_correction_memories_on(&tx)?;
+                    crate::corrections::classify_memory_outcomes(
+                        &finalized_text,
+                        reference,
+                        &memories,
+                        &crate::corrections::FiringConfig::default(),
+                    )
                     .into_iter()
-                    .map(|(idx, outcome)| {
-                        let m = &mems[idx];
-                        (m.slot_key.clone(), m.wrong_token.clone(), m.human_token.clone(), outcome)
+                    .map(|(index, outcome)| {
+                        let memory = &memories[index];
+                        (memory.slot_key.clone(), memory.wrong_token.clone(), memory.human_token.clone(), outcome)
                     })
                     .collect()
-            }
-            _ => Vec::new(),
-        };
-
-        // DURABILITY, exactly where the data is irreplaceable. The connection runs
-        // `synchronous=NORMAL`, which under WAL means a commit survives a process crash but not
-        // necessarily power loss — recent commits can still sit in the OS page cache. Every other
-        // write here is reproducible: audio can be re-transcribed, alignments recomputed, packs
-        // re-exported. A human decision cannot. It is a person listening to a clip once, and losing
-        // it means asking a paid reviewer to redo work with no way to know which clips were lost.
-        //
-        // SQLite refuses `PRAGMA synchronous` inside a transaction ("Safety level may not be changed
-        // inside a transaction"), so the escalation happens HERE, before the write opens, and is
-        // dropped after the commit. The cost lands on the decision write alone.
-        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
-
-        // The human's verdict, the learning pair, and the audit-ledger row commit together as one
-        // atomic correction — a crash can never leave a verdict without its provenance, or vice versa.
-        // A pilot slot is a cross-connection invariant. BEGIN IMMEDIATE takes SQLite's write
-        // reservation before the counter read, so two reviewers racing decision 20 cannot both see
-        // 19 and commit 20+21. Ordinary writes retain their existing deferred transaction.
-        let tx = if decision_limit.is_some() {
-            rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?
-        } else {
-            self.conn.unchecked_transaction()?
-        };
-        if let Some(limit) = decision_limit {
-            let Some(reviewer) = annotator else {
-                return Err(AppError::Validation("controlled-review decision has no reviewer".into()));
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
             };
-            enforce_review_action_limit_on(&tx, reviewer, limit)?;
-        }
-        let changed = tx.execute(
-            "UPDATE speech_segments
+
+            let changed = tx.execute(
+                "UPDATE speech_segments
              SET human_decision     = ?2,
                  verdict            = ?3,
                  verdict_transcript = COALESCE(?4, verdict_transcript),
@@ -6502,231 +8668,290 @@ impl Database {
                  corrected_at       = datetime('now'),
                  updated_at         = datetime('now')
              WHERE id = ?1
-               AND (?7 IS NULL OR review_revision = ?7)",
-            // reviewed_by is set UNCONDITIONALLY (not COALESCEd): it names the author of the row's
-            // CURRENT decision, so a desktop re-review of a clip a phone reviewer had decided must clear
-            // the stale name rather than leave the previous reviewer credited for someone else's verdict.
-            params![segment_id, decision, human_verdict, corrected_transcript, annotator, finalize, expected_revision],
-        )?;
-        if changed == 0 {
-            tx.rollback()?;
-            return Ok(None);
-        }
-        // Migration v53's trigger increments this in the SAME statement. Capture it before commit so
-        // the caller can bind an undo entry to the exact post-decision row without a second-read race.
-        let decided_revision: i64 =
-            tx.query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![segment_id], |row| {
-                row.get(0)
-            })?;
-
-        // Rejecting a clip retracts any prior EDIT's learning pair (round-24 hunt #9): a human who
-        // edited a segment and then rejects it as garbage audio must not keep training the model to
-        // prefer that edit. build_dpo_dataset / get_few_shot_examples key only on verified_by_human=1,
-        // never on the current decision, so the stale pair would survive; delete it here, in the same
-        // transaction as the reject verdict. (Undo is handled the same way in clear_human_decision.)
-        if decision == "reject" {
-            tx.execute("DELETE FROM agent_examples WHERE segment_id = ?1", params![segment_id])?;
-        }
-
-        // Insert into agent_examples when it is an edit on a non-gold segment.
-        // The rejected side must be the actual agent proposal when available,
-        // not blindly the original raw ASR transcript.
-        if is_gold == 0 {
-            if let (Some(wrong), Some(fix)) = (rejected_learning_transcript.clone(), corrected_transcript) {
-                let example_id = uuid::Uuid::new_v4().to_string();
-                tx.execute(
-                    "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![example_id, segment_id, wrong, fix],
-                )?;
-            }
-        }
-
-        // Append to the corrections provenance ledger for any edit with a concrete fix and a
-        // resolvable audio identity. Holdout exclusion is applied downstream by content hash, so
-        // the ledger records gold and non-gold alike — it is the full audit trail, keyed on the
-        // durable audio_content_hash, that makes the training set reconstructable and every label
-        // attributable to the model_version that produced it.
-        if let (Some(content_hash), Some(fix), Some(wrong)) = (ledger_hash, corrected_transcript, wrong_side.as_deref())
-        {
-            // Only record a GENUINE correction. `wrong_side` falls back to raw_transcript when no
-            // candidate differed from the fix (the model was already right), which would otherwise
-            // append a row whose raw_hypothesis == human_fix (up to whitespace/case) and pollute the
-            // reconstructable training ledger with non-corrections. Gate on the same learning-key
-            // difference the agent_examples / LOOP-0 paths already use.
-            if learning_text_key(wrong) != learning_text_key(fix) {
-                let correction_id = uuid::Uuid::new_v4().to_string();
-                tx.execute(
-                    "INSERT INTO corrections
-                        (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict, model_version_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![correction_id, segment_id, content_hash, wrong, fix, prior_verdict, model_version_id],
-                )?;
-            }
-        }
-
-        // LOOP 0: distil the edit into per-slot error memories so the SAME confusion is corrected on
-        // the next decode with no retraining. Gold is excluded — a memory firing on a held-out clip
-        // would leak into eval. Upsert on the natural key (slot + wrong + human): a repeated,
-        // independently confirmed correction bumps hit_count instead of inserting a duplicate.
-        if is_gold == 0 {
-            if let (Some(wrong), Some(fix)) = (wrong_side.as_deref(), corrected_transcript) {
-                // Dedup within THIS one correction by natural key. hit_count tracks INDEPENDENT
-                // (cross-segment) confirmations — the anti-one-off guard (min_hits). A single edit that
-                // repeats the SAME confusion in one sentence (e.g. a doubled phrase) yields duplicate
-                // memories; without deduping, the first occurrence INSERTs the row and the second UPDATEs
-                // the row just inserted, so ONE edit on ONE segment fakes a second confirmation
-                // (hit_count 1). Count each distinct confusion in a correction exactly once.
-                let mut seen_keys: std::collections::HashSet<(String, String, String)> =
-                    std::collections::HashSet::new();
-                for mem in crate::corrections::extract_substitution_memories(wrong, fix) {
-                    if !seen_keys.insert((mem.slot_key.clone(), mem.wrong_token.clone(), mem.human_token.clone())) {
-                        continue;
-                    }
-                    let bumped = tx.execute(
-                        "UPDATE correction_memory SET hit_count = hit_count + 1
-                         WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3",
-                        params![mem.slot_key, mem.wrong_token, mem.human_token],
-                    )?;
-                    if bumped == 0 {
-                        let mem_id = uuid::Uuid::new_v4().to_string();
-                        tx.execute(
-                            "INSERT INTO correction_memory
-                                (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
-                                 model_version_id, confidence)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                            params![
-                                mem_id,
-                                mem.wrong_token,
-                                mem.human_token,
-                                mem.slot_key,
-                                mem.phonetic_key,
-                                segment_id,
-                                model_version_id,
-                                // Start at the Beta(1,1) prior (0.5), not the frozen 1.0: a fresh memory
-                                // has zero firing-outcome evidence and must earn its way past tau_conf.
-                                crate::corrections::beta_confidence(0, 0)
-                            ],
-                        )?;
-                    }
-                }
-            }
-        }
-
-        // Apply the pre-computed LOOP-0 confidence evidence. Each pre-existing memory that would have
-        // fired on this segment gets a confirm or an override; `confidence` becomes the Beta(1,1)
-        // posterior of the updated counts (the SET expressions evaluate against the OLD row values, so
-        // `+1`/`+2`/`+3` reconstruct `beta_confidence(new_confirm, new_override)` exactly). `last_fired_at`
-        // records this shadow-fire against a human-reviewed segment — the column was never written before.
-        for (slot_key, wrong_token, human_token, outcome) in &confidence_updates {
-            let sql = match outcome {
-                crate::corrections::MemoryOutcome::Confirm => {
-                    "UPDATE correction_memory
-                        SET confirm_count = confirm_count + 1,
-                            confidence    = (confirm_count + 2.0) / (confirm_count + override_count + 3.0),
-                            last_fired_at = datetime('now')
-                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3"
-                }
-                crate::corrections::MemoryOutcome::Override => {
-                    "UPDATE correction_memory
-                        SET override_count = override_count + 1,
-                            confidence     = (confirm_count + 1.0) / (confirm_count + override_count + 3.0),
-                            last_fired_at  = datetime('now')
-                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3"
-                }
-                crate::corrections::MemoryOutcome::Neutral => continue,
-            };
-            tx.execute(sql, params![slot_key, wrong_token, human_token])?;
-        }
-
-        // M2.1: Log decision timing to decision_log for instrumentation before M3 marathon.
-        if let Some(ts_ms) = timestamp_ms {
-            tx.execute(
-                "INSERT INTO decision_log (segment_id, decision_type, timestamp_ms, human_decision, created_at)
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-                params![segment_id, decision, ts_ms, decision],
+               AND review_revision = ?7",
+                params![segment_id, decision, human_verdict, corrected_transcript, annotator, finalize, prior_revision],
             )?;
-        }
+            if changed == 0 {
+                tx.rollback()?;
+                return Ok((None, false));
+            }
+            let decided_revision: i64 = tx.query_row(
+                "SELECT review_revision FROM speech_segments WHERE id = ?1",
+                params![segment_id],
+                |row| row.get(0),
+            )?;
 
-        // The audit row rides the SAME commit as the decision it records (see the fn doc): a
-        // verified row without its pay-bearing event, or an event for a verdict that never
-        // committed, are both now unrepresentable states rather than kill-window outcomes.
-        if let (Some(source), Some(who)) = (audit_source, annotator) {
-            let event_ts = timestamp_ms.unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0)
-            });
-            tx.execute(
-                "INSERT INTO review_events
+            if decided_revision != prior_revision + 1 {
+                return Err(AppError::Other("human decision did not advance exactly one review revision".into()));
+            }
+            let Some((post_decision, post_revision, _)) = Self::decision_snapshot_on(&tx, segment_id)? else {
+                return Err(AppError::Other("segment disappeared after its human decision update".into()));
+            };
+            if post_revision != decided_revision {
+                return Err(AppError::Other("human decision post-state revision drifted before effect capture".into()));
+            }
+            let decision_transcript = if decision == "reject" {
+                None
+            } else {
+                Some(
+                    post_decision
+                        .verdict_transcript
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .ok_or_else(|| AppError::Other("accept/edit decision has no exact retained transcript".into()))?
+                        .to_string(),
+                )
+            };
+            let decision_corrected_at = post_decision
+                .corrected_at
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| AppError::Other("human decision has no exact corrected_at post-state".into()))?;
+            let mut review_event_id = None;
+            if let (Some(source), Some(who)) = (audit_source, annotator) {
+                let event_ts = timestamp_ms.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                });
+                tx.execute(
+                    "INSERT INTO review_events
                     (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
-                     duration_ms, operation_id, operation_payload_hash)
+                     duration_ms, operation_id, operation_payload_hash, requested_action,
+                     requested_transcript, served_transcript, served_revision, app_git_sha,
+                     playback_guard_version)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6,
-                         (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?7, ?8)",
-                params![
+                         (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?7, ?8, ?9, ?10,
+                         ?11, ?12, ?13,
+                         'content-hash-raw-counter-v3')",
+                    params![
+                        segment_id,
+                        who,
+                        decision,
+                        compensation_action,
+                        source,
+                        event_ts,
+                        operation_id,
+                        operation_payload_hash,
+                        requested_action,
+                        requested_transcript,
+                        &served_transcript,
+                        prior_revision,
+                        crate::GIT_SHA,
+                    ],
+                )?;
+                let event_id = tx.last_insert_rowid();
+                Self::append_review_compensation_tx(
+                    &tx,
+                    event_id,
                     segment_id,
                     who,
-                    decision,
-                    compensation_action,
                     source,
-                    event_ts,
-                    audit_operation.map(|value| value.0),
-                    audit_operation.map(|value| value.1)
+                    &compensation_action,
+                    decision,
+                    Some(decided_revision),
+                )?;
+                review_event_id = Some(event_id);
+            }
+
+            let effect_source = audit_source.unwrap_or("desktop");
+            let effect_reviewer = if audit_source == Some("couch") { annotator } else { None };
+            let effect_operation_id = (effect_source == "desktop").then_some(operation_id);
+            let effect_operation_payload_hash = (effect_source == "desktop").then_some(operation_payload_hash);
+            let effect_requested_action = (effect_source == "desktop").then_some(requested_action.as_str());
+            let effect_requested_transcript =
+                (effect_source == "desktop").then_some(desktop_requested_transcript.as_deref()).flatten();
+            tx.execute(
+                "INSERT INTO human_decision_effect_events
+                 (review_event_id, segment_id, reviewer, source, operation_id,
+                  operation_payload_hash, action, served_transcript, decision_transcript,
+                  decision_annotated_transcript, decision_verified, decision_corrected_at,
+                  decision_rationale, requested_action, requested_transcript, requested_timestamp_ms, prior_revision,
+                  decision_revision, prior_verified, prior_annotated_transcript, prior_verdict,
+                  prior_verdict_transcript, prior_rationale, prior_escalated, prior_human_decision,
+                  prior_corrected_at, prior_reviewed_by)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                params![
+                    review_event_id,
+                    segment_id,
+                    effect_reviewer,
+                    effect_source,
+                    effect_operation_id,
+                    effect_operation_payload_hash,
+                    decision,
+                    &served_transcript,
+                    decision_transcript,
+                    post_decision.annotated_transcript,
+                    post_decision.verified as i32,
+                    decision_corrected_at,
+                    post_decision.rationale,
+                    effect_requested_action,
+                    effect_requested_transcript,
+                    desktop_requested_timestamp_ms,
+                    prior_revision,
+                    decided_revision,
+                    prior.verified as i32,
+                    prior.annotated_transcript,
+                    prior.verdict,
+                    prior.verdict_transcript,
+                    prior.rationale,
+                    prior.escalated as i32,
+                    prior.human_decision,
+                    prior.corrected_at,
+                    prior.reviewed_by,
                 ],
             )?;
-            let event_id = tx.last_insert_rowid();
-            Self::append_review_compensation_tx(
-                &tx,
-                event_id,
-                segment_id,
-                who,
-                source,
-                &compensation_action,
-                decision,
-                Some(decided_revision),
-            )?;
-        }
+            let effect_event_id = tx.last_insert_rowid();
 
-        // DURABILITY, exactly where the data is irreplaceable. The connection runs
-        // `synchronous=NORMAL`, which under WAL means a commit is durable against a process crash
-        // but NOT necessarily against power loss: recent commits can still be sitting in the OS page
-        // cache when the machine drops. Every other write here is reproducible — audio can be
-        // re-transcribed, alignments recomputed, packs re-exported. A human decision cannot: it is a
-        // person listening to a clip once, and losing it means asking a paid reviewer to do the work
-        // again with no way to know which clips were lost.
-        //
-        // So this ONE commit escalates to FULL (an fsync at commit) and drops back afterwards. The
-        // cost lands on the decision write alone, not on transcription or import.
-        //
-        // On the error path the connection is deliberately LEFT at FULL: too-durable is the safe
-        // direction, and a slower connection is a better outcome than a silently less durable one.
-        tx.commit()?;
-        // Back to NORMAL now the durable commit is done. On the error paths above the connection is
-        // deliberately left at FULL: too-durable is the safe direction to fail in.
-        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-        self.track_write()?;
-        Ok(Some(decided_revision))
+            let genuine_edit = wrong_side
+                .as_deref()
+                .zip(corrected_transcript)
+                .filter(|(wrong, fix)| learning_text_key(wrong) != learning_text_key(fix));
+            if !prior.is_gold && genuine_edit.is_some() {
+                if let (Some(wrong), Some(fix)) = (rejected_learning_transcript.as_deref(), corrected_transcript) {
+                    tx.execute(
+                        "INSERT INTO agent_examples
+                        (id, segment_id, wrong_transcript, human_fix, source, verified_by_human,
+                         effect_event_id)
+                     VALUES (?1, ?2, ?3, ?4, 'human', 1, ?5)",
+                        params![uuid::Uuid::new_v4().to_string(), segment_id, wrong, fix, effect_event_id],
+                    )?;
+                }
+            }
+            if let Some((wrong, fix)) = genuine_edit {
+                tx.execute(
+                    "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix, jury_verdict,
+                     model_version_id, reviewer_id, effect_event_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        segment_id,
+                        content_hash,
+                        wrong,
+                        fix,
+                        prior.verdict,
+                        prior.model_version_id,
+                        effect_reviewer,
+                        effect_event_id,
+                    ],
+                )?;
+            }
+
+            // One immutable contribution row per (decision effect, memory). New memory baselines never
+            // mutate; Undo makes their contribution disappear through the effective-effect view.
+            let mut contributions: HashMap<String, (i64, i64, i64, bool)> = HashMap::new();
+            if !prior.is_gold {
+                if let Some((wrong, fix)) = genuine_edit {
+                    let mut seen = std::collections::HashSet::new();
+                    for memory in crate::corrections::extract_substitution_memories(wrong, fix) {
+                        if !seen.insert((
+                            memory.slot_key.clone(),
+                            memory.wrong_token.clone(),
+                            memory.human_token.clone(),
+                        )) {
+                            continue;
+                        }
+                        tx.execute(
+                            "INSERT INTO correction_memory
+                        (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
+                         model_version_id, confidence, hit_count, confirm_count, override_count,
+                         last_fired_at, legacy_seed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, NULL, 0)
+                     ON CONFLICT(slot_key, wrong_token, human_token) DO NOTHING",
+                            params![
+                                uuid::Uuid::new_v4().to_string(),
+                                memory.wrong_token,
+                                memory.human_token,
+                                memory.slot_key,
+                                memory.phonetic_key,
+                                segment_id,
+                                prior.model_version_id,
+                                crate::corrections::beta_confidence(0, 0),
+                            ],
+                        )?;
+                        let memory_id: String = tx.query_row(
+                            "SELECT id FROM correction_memory
+                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3",
+                            params![memory.slot_key, memory.wrong_token, memory.human_token],
+                            |row| row.get(0),
+                        )?;
+                        contributions.entry(memory_id).or_insert((0, 0, 0, false)).0 = 1;
+                    }
+                }
+            }
+            for (slot_key, wrong_token, human_token, outcome) in confidence_updates {
+                let Some(memory_id) = tx
+                    .query_row(
+                        "SELECT id FROM correction_memory
+                      WHERE slot_key = ?1 AND wrong_token = ?2 AND human_token = ?3",
+                        params![slot_key, wrong_token, human_token],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                else {
+                    return Err(AppError::Other(
+                        "effective correction memory disappeared inside decision transaction".into(),
+                    ));
+                };
+                let entry = contributions.entry(memory_id).or_insert((0, 0, 0, false));
+                match outcome {
+                    crate::corrections::MemoryOutcome::Confirm => entry.1 = 1,
+                    crate::corrections::MemoryOutcome::Override => entry.2 = 1,
+                    crate::corrections::MemoryOutcome::Neutral => continue,
+                }
+                entry.3 = true;
+            }
+            for (memory_id, (capture, confirm, override_delta, fired)) in contributions {
+                tx.execute(
+                    "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta, fired_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN ?6 = 1 THEN datetime('now') END)",
+                    params![effect_event_id, memory_id, capture, confirm, override_delta, fired as i32],
+                )?;
+            }
+
+            if let Some(ts_ms) = timestamp_ms {
+                tx.execute(
+                    "INSERT INTO decision_log (segment_id, decision_type, timestamp_ms, human_decision, created_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                    params![segment_id, decision, ts_ms, decision],
+                )?;
+            }
+
+            let Some((segment, authoritative_revision, _)) = Self::decision_snapshot_on(&tx, segment_id)? else {
+                return Err(AppError::Other("segment disappeared inside human decision transaction".into()));
+            };
+            if authoritative_revision != decided_revision {
+                return Err(AppError::Other("human decision authoritative row revision drifted before commit".into()));
+            }
+
+            tx.commit()?;
+            Ok((
+                Some(HumanDecisionCommit {
+                    effect_event_id,
+                    segment_id: segment_id.to_string(),
+                    effective_action: decision.to_string(),
+                    prior_revision,
+                    decided_revision,
+                    segment,
+                }),
+                true,
+            ))
+        })?;
+        if wrote {
+            self.track_write()?;
+        }
+        Ok(commit)
     }
 
     /// Load all LOOP-0 correction memories for the firing rule. `apply_memories` applies the
     /// confidence / hit-count / phonetic gates itself, so every stored row is returned here.
     pub fn load_correction_memories(&self) -> AppResult<Vec<crate::corrections::MemoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT wrong_token, human_token, slot_key, phonetic_key, confidence, hit_count
-             FROM correction_memory",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(crate::corrections::MemoryEntry {
-                wrong_token: row.get(0)?,
-                human_token: row.get(1)?,
-                slot_key: row.get(2)?,
-                phonetic_key: row.get(3)?,
-                confidence: row.get(4)?,
-                hit_count: row.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Self::load_correction_memories_on(&self.conn)
     }
 
     /// Return escalated segments ordered riskiest-first (lowest agreement_score).

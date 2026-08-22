@@ -117,7 +117,7 @@ fn validate_active_pilot_snapshot_authority(
         // the external drill reject policy-bearing pre-v59 artifacts.
         return Ok(());
     }
-    crate::db::validate_current_schema_contract(connection)
+    crate::db::validate_schema_contract_at_version(connection, schema_version)
         .map_err(|error| format!("snapshot hidden-key schema contract is not exact: {error}"))?;
 
     let names = policy.reviewer_names();
@@ -1532,16 +1532,34 @@ mod tests {
         assert!(schema_error.contains("schema contract") && schema_error.contains("missing"), "{schema_error}");
 
         let db = seeded_db();
+        let operation_id = uuid::Uuid::new_v4().to_string();
         db.connection()
             .execute(
                 "INSERT INTO review_events
-                    (segment_id, reviewer, action, source, timestamp_ms)
-                 VALUES ('hidden-complete', 'Hawzhin', 'accept', 'couch_spot_check', 1)",
-                [],
+                    (segment_id, reviewer, action, source, timestamp_ms, operation_id,
+                     operation_payload_hash, requested_action, requested_transcript,
+                     served_transcript, served_revision, app_git_sha, playback_guard_version)
+                 VALUES ('hidden-complete', 'Hawzhin', 'accept', 'couch_spot_check', 1, ?1,
+                         ?2, 'accept', '', 'ڕەفەرێنس', 0, ?3,
+                         'content-hash-raw-counter-v3')",
+                rusqlite::params![operation_id, "a".repeat(64), crate::GIT_SHA],
             )
             .unwrap();
         let event_error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
         assert!(event_error.contains("no durable active-policy grant"), "{event_error}");
+    }
+
+    #[test]
+    fn active_pilot_pre_migration_snapshot_accepts_exact_v59_and_rejects_drift() {
+        let db = seeded_db();
+        crate::migrations::rollback(&db, 1).unwrap();
+        let policy = pilot_policy();
+
+        validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap();
+
+        db.connection().execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert", []).unwrap();
+        let error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(error.contains("schema contract") && error.contains("missing"), "{error}");
     }
 
     #[test]
@@ -2019,7 +2037,7 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![60, 59, 58]);
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pre-upgrade-row".to_string(),
             audio_path: "/must-survive.wav".to_string(),
@@ -2028,18 +2046,18 @@ mod tests {
         })
         .unwrap();
 
-        // Make the snapshot root impossible to create. The shared guard must return before v58/v59 run.
+        // Make the snapshot root impossible to create. The shared guard must return before v58-v60 run.
         let blocked_root = profile.path().join("not-a-directory");
         std::fs::write(&blocked_root, b"block child creation").unwrap();
         let error = initialize_with_required_pre_migration_pin(&db, &blocked_root).unwrap_err().to_string();
         assert!(!error.is_empty());
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 57, "a failed pin must leave v58/v59 pending");
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 57, "a failed pin must leave v58-v60 pending");
 
-        // With a usable profile directory, the helper first promotes the v57 pages and only then runs v58/v59.
+        // With a usable profile directory, the helper first promotes the v57 pages and only then runs v58-v60.
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("an established v57 profile requires a pin");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 59);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 60);
         assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the migration pin must be self-verifying");
         let pinned = Database::open(pin.join(DB_FILE).to_string_lossy().as_ref()).unwrap();
         assert_eq!(crate::migrations::get_current_version(&pinned).unwrap(), 57);
@@ -2057,12 +2075,12 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![60, 59, 58]);
 
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("a v57 profile requires a complete safety pin even when config uses defaults");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 59);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 60);
         for state in OPTIONAL_SNAPSHOT_STATE {
             assert_eq!(std::fs::read(pin.join(state.absent_file)).unwrap(), state.absent_bytes);
         }

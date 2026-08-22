@@ -1,6 +1,6 @@
 //! Batch review-action IPC commands — slice 3 of the Week-4 `commands.rs` decomposition.
 //!
-//! Behaviour and command NAMES are unchanged: `commands.rs` re-exports this module
+//! Command names remain stable while unsafe legacy batch verification fails closed: `commands.rs` re-exports this module
 //! (`pub use batch::*;`), so `lib.rs`'s invoke_handler still names `commands::batch_verify` and the
 //! frontend's `invoke('batch_verify')` is untouched. Same functions, only relocated.
 //!
@@ -44,92 +44,18 @@ fn normalize_cached(cache_key: String, compute: impl FnOnce() -> String) -> Stri
 #[tauri::command]
 pub fn batch_verify(
     ids: Vec<String>,
-    verified: bool,
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
+    _verified: bool,
+    _state: State<'_, AppState>,
+    _app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("batch_verify")?;
     for id in &ids {
         validate::validate_identifier(id)?;
     }
-
-    let total = ids.len();
-    state.try_start_batch()?;
-
-    let cancel = state.ensure_cancel_token()?;
-    let app_clone = app.clone();
-
-    std::thread::spawn(move || {
-        struct BatchGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for BatchGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_batch();
-                }
-            }
-        }
-        let _guard = BatchGuard { app: app_clone.clone() };
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({ "type": "started", "total": total, "operation": "verify" }),
-        );
-
-        // One targeted UPDATE per segment — no read-modify-write cycle.
-        let mut succeeded = 0u32;
-        let mut failed = 0u32;
-        let mut cancelled = false;
-
-        for (i, id) in ids.iter().enumerate() {
-            if cancel.is_cancelled() {
-                cancelled = true;
-                break;
-            }
-            let update_ok = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                match app_state.lock_db().update_verified(id, verified) {
-                    Ok(updated) => updated,
-                    Err(error) => {
-                        tracing::error!("Batch verify DB update failed for {id}: {error}");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            if update_ok {
-                succeeded += 1;
-            } else {
-                failed += 1;
-            }
-
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": i + 1, "total": total,
-                    "file": id,
-                    "status": if verified { "verifying" } else { "unverifying" },
-                    "operation": "verify"
-                }),
-            );
-        }
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({
-                "type": "completed", "total": total,
-                "succeeded": succeeded, "failed": failed,
-                "cancelled": cancelled, "operation": "verify"
-            }),
-        );
-    });
-
-    Ok(serde_json::json!({ "status": "started" }))
+    Err(
+        "legacy batch verify/unverify is disabled; use the review decision flow so every human verdict has immutable evidence"
+            .into(),
+    )
 }
 
 #[tauri::command]

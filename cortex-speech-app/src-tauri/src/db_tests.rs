@@ -4,6 +4,9 @@
 
 use super::*;
 
+const TEST_AUDIO_CONTENT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OTHER_AUDIO_CONTENT_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 fn make_db() -> Database {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
@@ -18,6 +21,119 @@ fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
         duration_ms: 1000,
         ..SpeechSegment::default()
     }
+}
+
+#[test]
+fn legacy_verified_bit_writer_is_disabled_at_schema_v60() {
+    let db = make_db();
+    db.insert_segment(&make_segment("verify-disabled", "/verify-disabled.wav")).unwrap();
+    let error = db.update_verified("verify-disabled", true).unwrap_err();
+    assert!(matches!(error, AppError::Validation(_)), "{error}");
+    assert!(error.to_string().contains("legacy batch verify/unverify is disabled"), "{error}");
+    let row = db.get_segment_by_id("verify-disabled").unwrap().unwrap();
+    assert!(!row.verified && row.human_decision.is_none());
+    let effects: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id = 'verify-disabled'",
+            [],
+            |result| result.get(0),
+        )
+        .unwrap();
+    assert_eq!(effects, 0, "a refused legacy writer must publish no pseudo-review authority");
+}
+
+fn make_hidden_check_segment(id: &str, audio_path: &str, expected: &str) -> SpeechSegment {
+    SpeechSegment {
+        id: id.to_string(),
+        audio_path: audio_path.to_string(),
+        raw_transcript: expected.to_string(),
+        verdict_transcript: Some(expected.to_string()),
+        verdict: Some("human_accept".into()),
+        human_decision: Some("accept".into()),
+        verified: true,
+        duration_ms: 1_000,
+        ..SpeechSegment::default()
+    }
+}
+
+fn test_source_span(segment_id: &str, duration_ms: i64) -> (i64, i64) {
+    let digest = blake3::hash(segment_id.as_bytes());
+    let mut offset_bytes = [0_u8; 8];
+    offset_bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    let source_start_ms = (u64::from_le_bytes(offset_bytes) % 1_000_000_000) as i64;
+    (source_start_ms, source_start_ms + duration_ms)
+}
+
+fn ensure_test_audio_content_hash(db: &Database, segment_id: &str) -> String {
+    let duration_ms: i64 = db
+        .connection()
+        .query_row("SELECT duration_ms FROM speech_segments WHERE id = ?1", [segment_id], |row| row.get(0))
+        .unwrap();
+    let (source_start_ms, _) = test_source_span(segment_id, duration_ms);
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET audio_content_hash = ?2,
+                    alignment_json = COALESCE(
+                        alignment_json,
+                        json_object('source_start_ms', ?3, 'source_end_ms', ?3 + duration_ms)
+                    )
+              WHERE id = ?1
+                AND NULLIF(TRIM(COALESCE(audio_content_hash, '')), '') IS NULL",
+            params![segment_id, TEST_AUDIO_CONTENT_HASH, source_start_ms],
+        )
+        .unwrap();
+    db.segment_audio_content_hash(segment_id)
+        .unwrap()
+        .expect("playback fixture must have a server-row audio content hash")
+}
+
+fn full_playback_proof(db: &Database, segment_id: &str, reviewer: &str) -> PlaybackDecisionProof {
+    let audio_content_hash = ensure_test_audio_content_hash(db, segment_id);
+    let segment_revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+    let (source_start_ms, source_end_ms) = db.segment_source_span(segment_id).unwrap().unwrap();
+    let receipt = PlaybackReceipt {
+        segment_id: segment_id.to_string(),
+        segment_revision,
+        audio_content_hash: audio_content_hash.clone(),
+        reviewer: Some(reviewer.to_string()),
+        session_id: Some("hidden-test".into()),
+        started_at_ms: 1_700_000_000_000,
+        played_ms: 1_000,
+        clip_duration_ms: 1_000,
+        source_start_ms: None,
+        source_end_ms: None,
+    };
+    assert!(db.record_playback_receipt_if_at_revision(&receipt, segment_revision).unwrap());
+    PlaybackDecisionProof { segment_revision, audio_content_hash, source_start_ms, source_end_ms }
+}
+
+fn latest_human_effect_id(db: &Database, segment_id: &str) -> i64 {
+    db.connection()
+        .query_row(
+            "SELECT id FROM human_decision_effect_events WHERE segment_id = ?1 ORDER BY id DESC LIMIT 1",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .expect("human decision must publish its immutable effect")
+}
+
+fn record_test_phone_decision(
+    db: &Database,
+    segment_id: &str,
+    decision: &str,
+    corrected_transcript: Option<&str>,
+    reviewer: &str,
+) {
+    ensure_test_audio_content_hash(db, segment_id);
+    let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+    assert!(
+        db.record_phone_human_decision_by_at_revision(segment_id, decision, corrected_transcript, reviewer, revision,)
+            .unwrap()
+            .is_some(),
+        "the attributed phone decision must win its revision CAS"
+    );
 }
 
 /// Migration v49 / audit #6. The DEFAULT must fail closed: an existing library has no recorded
@@ -296,7 +412,7 @@ fn dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk
     // a transaction (SQLite's 12-step recreate); see docs/STRICT_SPEECH_SEGMENTS_PLAN.md.
     let db = make_db(); // foreign_keys=ON
     db.insert_segment(&make_segment("seg-1", "/a.wav")).unwrap();
-    db.write_segment_verdict("seg-1", "auto_accept", Some("t"), None, None, Some(0.9), false).unwrap();
+    db.write_legacy_machine_verdict_for_test("seg-1", "auto_accept", Some("t"), None, None, Some(0.9), false).unwrap();
     let child_before: i64 = db
         .connection()
         .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id='seg-1'", [], |r| r.get(0))
@@ -317,6 +433,143 @@ fn dropping_speech_segments_cascade_deletes_children_so_strict_recreate_needs_fk
         "DROP TABLE speech_segments with foreign_keys=ON cascade-deleted the child verdict rows: \
              the naive STRICT recreate is DATA-DESTROYING and must run with foreign_keys OFF, outside a txn"
     );
+}
+
+#[test]
+fn schema60_refuses_every_machine_jury_writer_before_mutation() {
+    let registrations = include_str!("lib.rs");
+    for command in ["commands::run_t0_gate", "commands::run_jury_pipeline", "commands::run_t2_for_segment"] {
+        assert!(
+            registrations.contains(command),
+            "registered jury command disappeared from the policy inventory: {command}"
+        );
+    }
+    let command_pipeline = include_str!("commands.rs");
+    let direct_commands = include_str!("commands/jury.rs");
+    let jury_router = include_str!("jury/mod.rs");
+    for source in [command_pipeline, direct_commands, jury_router] {
+        assert!(!source.contains("write_machine_jury_verdict"), "no registered jury route may bypass the v60 guard");
+    }
+    assert!(
+        command_pipeline.matches(".write_segment_verdict(").count() >= 8,
+        "every T1/T2 pipeline branch must terminate at the shared v60 refusal"
+    );
+    assert_eq!(
+        direct_commands.matches(".write_segment_verdict(").count(),
+        1,
+        "the direct T2 endpoint must terminate at the shared v60 refusal"
+    );
+    assert_eq!(
+        jury_router.matches("db.write_segment_verdict(").count(),
+        1,
+        "the T0 jury router must terminate at the shared v60 refusal"
+    );
+
+    let db = make_db();
+    db.insert_segment(&make_segment("machine-verdict-disabled", "/a.wav")).unwrap();
+
+    let snapshot = || {
+        db.connection()
+            .query_row(
+                "SELECT review_revision, verdict, verdict_transcript, jury_transcript,
+                        rationale, evidence_json, agreement_score, escalated,
+                        (SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = speech_segments.id)
+                   FROM speech_segments
+                  WHERE id = 'machine-verdict-disabled'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<f64>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let before = snapshot();
+
+    // T1/T2 and the pipeline's direct jury branches all terminate at this database guard.
+    let direct_error = db
+        .write_segment_verdict(
+            "machine-verdict-disabled",
+            "jury_accept",
+            Some("machine candidate"),
+            Some("machine consensus"),
+            Some(r#"{"source":"jury"}"#),
+            Some(0.9),
+            false,
+        )
+        .unwrap_err();
+    assert!(direct_error.to_string().contains("disabled at schema v60"), "{direct_error}");
+    assert_eq!(snapshot(), before, "the shared T1/T2 database boundary must not mutate state or metrics");
+
+    // T0 uses the public jury helper, which must reach the same refusal before pseudo-learning.
+    let t0_error = crate::jury::write_verdict(
+        &db,
+        "machine-verdict-disabled",
+        crate::jury::Verdict::AutoAccept,
+        Some("machine candidate"),
+        Some("machine consensus"),
+        Some(r#"{"source":"t0"}"#),
+        Some(0.9),
+    )
+    .unwrap_err();
+    assert!(t0_error.to_string().contains("disabled at schema v60"), "{t0_error}");
+    assert_eq!(snapshot(), before, "T0 refusal must leave the segment and decision metrics byte-for-byte unchanged");
+}
+
+#[test]
+fn schema60_generic_insert_boundaries_reject_review_truth_atomically_and_preserve_existing_authority() {
+    let db = make_db();
+
+    let mut forged_single = make_segment("forged-single", "/forged-single.wav");
+    forged_single.annotated_transcript = Some("renderer answer".into());
+    forged_single.verified = true;
+    let error = db.insert_segment(&forged_single).unwrap_err();
+    assert!(error.to_string().contains("review-owned field"), "{error}");
+    assert!(db.get_segment_by_id(&forged_single.id).unwrap().is_none());
+
+    let neutral_batch = make_segment("neutral-batch", "/neutral-batch.wav");
+    let mut forged_batch = make_segment("forged-batch", "/forged-batch.wav");
+    forged_batch.human_decision = Some("edit".into());
+    forged_batch.reviewed_by = Some("renderer".into());
+    let error = db.insert_segments_batch(&[neutral_batch.clone(), forged_batch]).unwrap_err();
+    assert!(error.to_string().contains("review-owned field"), "{error}");
+    assert!(
+        db.get_segment_by_id(&neutral_batch.id).unwrap().is_none(),
+        "prevalidation must reject the complete batch before its first insert"
+    );
+
+    let mut forged_full = make_segment("forged-full", "/forged-full.wav");
+    forged_full.verdict = Some("human_accept".into());
+    forged_full.verdict_transcript = Some("renderer answer".into());
+    let error = db.insert_segment_full(&forged_full).unwrap_err();
+    assert!(error.to_string().contains("review-owned field"), "{error}");
+    assert!(db.get_segment_by_id(&forged_full.id).unwrap().is_none());
+
+    let mut existing = make_segment("machine-upsert", "/machine-upsert.wav");
+    existing.confidence = Some(0.4);
+    db.insert_segment(&existing).unwrap();
+    db.finalize_human_review("machine-upsert", "accept", Some("test"), Some(123), None).unwrap();
+    let reviewed = db.get_segment_by_id("machine-upsert").unwrap().unwrap();
+
+    let mut machine_refresh = make_segment("machine-upsert", "/machine-upsert.wav");
+    machine_refresh.raw_transcript = "new machine draft".into();
+    machine_refresh.speaker_id = Some("speaker-2".into());
+    machine_refresh.confidence = Some(0.95);
+    db.insert_segment_full(&machine_refresh).unwrap();
+    let after = db.get_segment_by_id("machine-upsert").unwrap().unwrap();
+    assert!(review_owned_projection_matches(&reviewed, &after));
+    assert_eq!(after.raw_transcript, "new machine draft");
+    assert_eq!(after.speaker_id.as_deref(), Some("speaker-2"));
+    assert_eq!(after.confidence, Some(0.95));
 }
 
 #[test]
@@ -364,84 +617,26 @@ fn disk_full_rolls_back_a_batch_insert_atomically() {
 }
 
 #[test]
-fn redecision_undo_and_retranscribe_sequence_preserves_or_resets_exactly_as_designed() {
-    // Reproduction of the 2026-07-14 live-test data-loss sequence, mechanically, at the DB layer —
-    // written BEFORE any fix, per process. The UI flow on an ALREADY-VERIFIED clip was:
-    //   (1) save a new decision (recordHumanDecision + whole-row upsert),
-    //   (2) Undo review (clearHumanDecision + upsert of the pre-save snapshot),
-    //   (3) re-transcribe (upsert with a fresh machine draft + verified=false).
-    // This pins what each stage does to the owner's gold so the responsibilities are provable:
-    // the undo RESTORES everything (incl. the prior decision, via human_decision=excluded);
-    // the RE-TRANSCRIBE is the destructive step (fresh draft wipes annotated + verified by design).
-    let db = Database::open(":memory:").unwrap();
-    db.initialize().unwrap();
-
-    // Owner's reviewed row: verified gold with an 'edit' decision.
+fn redecision_undo_restores_the_database_owned_prior_decision_exactly() {
+    let db = make_db();
     let mut owner = make_segment("s1", "/a.wav");
     owner.annotated_transcript = Some("owner gold کە کە".into());
     owner.verified = true;
     db.insert_segment(&owner).unwrap();
+    ensure_test_audio_content_hash(&db, "s1");
     db.record_human_decision("s1", "edit", Some("owner gold کە کە"), None).unwrap();
-    // The frontend STORE row mirrors the full DB row (all columns selected) — snapshot it like
-    // ReviewMode's `{...seg}` undo entry does.
-    let prev_snapshot = db.get_segment_by_id("s1").unwrap().unwrap();
-    assert_eq!(prev_snapshot.human_decision.as_deref(), Some("edit"), "precondition: decision in snapshot");
-
-    // (1) A NEW decision is saved over it (the live test's 'Use this text' + Save).
+    let prior = db.get_segment_by_id("s1").unwrap().unwrap();
     db.record_human_decision("s1", "edit", Some("gemini text خۆ"), None).unwrap();
-    let mut resaved = db.get_segment_by_id("s1").unwrap().unwrap();
-    resaved.annotated_transcript = Some("gemini text خۆ".into());
-    resaved.verified = true;
-    db.insert_segment(&resaved).unwrap();
-
-    // (2a) THE BUG, documented: the pre-fix undo pair (clearHumanDecision + plain updateSegment
-    // upsert) loses the PRIOR decision, because insert_segment deliberately omits the decision
-    // columns (anti-clobber for ordinary edits). This is exactly the 2026-07-14 live data loss.
-    db.clear_human_decision("s1").unwrap();
-    db.insert_segment(&prev_snapshot).unwrap();
-    let after_old_pair = db.get_segment_by_id("s1").unwrap().unwrap();
-    assert_eq!(
-        after_old_pair.annotated_transcript.as_deref(),
-        Some("owner gold کە کە"),
-        "the old pair does restore the transcript (which is why the loss was so easy to miss)"
-    );
-    assert!(after_old_pair.verified, "the old pair does restore verified");
-    assert_eq!(
-        after_old_pair.human_decision, None,
-        "DOCUMENTED BUG: the old clear+upsert pair silently loses the prior decision — the reason \
-             undoLast now uses restore_segment_snapshot instead"
-    );
-
-    // (2b) THE FIX: the lossless snapshot restore (what undoLast calls now) brings back the FULL
-    // pre-save state — prior decision included.
-    db.insert_segment_full(&prev_snapshot).unwrap();
-    let after_undo = db.get_segment_by_id("s1").unwrap().unwrap();
-    assert_eq!(after_undo.annotated_transcript.as_deref(), Some("owner gold کە کە"));
-    assert!(after_undo.verified);
-    assert_eq!(
-        after_undo.human_decision.as_deref(),
-        Some("edit"),
-        "insert_segment_full must restore the PRIOR decision losslessly"
-    );
-
-    // (3) Re-transcribe on the (restored, verified) clip: fresh draft + verified=false, exactly
-    // what ReviewMode.retranscribe upserts. THIS is the destructive-by-design step.
-    let mut retranscribed = db.get_segment_by_id("s1").unwrap().unwrap();
-    retranscribed.raw_transcript = "fresh machine draft".into();
-    retranscribed.annotated_transcript = Some("fresh machine draft".into());
-    retranscribed.verified = false;
-    db.insert_segment(&retranscribed).unwrap();
-    let after_rt = db.get_segment_by_id("s1").unwrap().unwrap();
-    assert!(!after_rt.verified, "re-transcribe reopens the clip");
-    assert_eq!(after_rt.annotated_transcript.as_deref(), Some("fresh machine draft"));
-    // The decision column itself survives a re-transcribe upsert (it rides the row) — so the final
-    // NULL observed live can only have come from the UNDO's clear if stage (2) failed, or from the
-    // row having no decision at snapshot time. This assertion documents the mechanical truth.
-    assert_eq!(
-        after_rt.human_decision.as_deref(),
-        Some("edit"),
-        "a re-transcribe upsert does not itself clear human_decision"
-    );
+    let second_effect = latest_human_effect_id(&db, "s1");
+    let outcome = db.undo_human_decision(second_effect, None, "00000000-0000-4000-8000-000000000201").unwrap();
+    assert!(matches!(outcome, HumanDecisionUndoOutcome::Applied { .. }));
+    let restored = db.get_segment_by_id("s1").unwrap().unwrap();
+    assert_eq!(restored.human_decision, prior.human_decision);
+    assert_eq!(restored.verdict, prior.verdict);
+    assert_eq!(restored.verdict_transcript, prior.verdict_transcript);
+    assert_eq!(restored.annotated_transcript, prior.annotated_transcript);
+    assert_eq!(restored.verified, prior.verified);
+    assert!(db.clear_human_decision("s1").is_err(), "snapshot-free legacy clear remains disabled");
 }
 
 #[test]
@@ -482,11 +677,12 @@ fn intelligence_report_joins_shadow_and_verdicts_against_human_decisions() {
 
 #[test]
 fn write_segment_verdict_is_atomic_with_its_decision_log() {
-    // Write-path audit (Week 2): the verdict UPDATE and the decision_verdicts INSERT are one
+    // Pre-v60 compatibility audit: the legacy verdict UPDATE and decision_verdicts INSERT are one
     // invariant. Fault-inject the second statement by dropping its table: the whole write must
     // FAIL and the verdict UPDATE must ROLL BACK — never a verdict without its C4 denominator row.
     let db = make_db();
     db.insert_segment(&make_segment("atom", "/audio/s.wav")).unwrap();
+    db.conn.execute("DELETE FROM schema_migrations WHERE version = 60", []).unwrap();
     db.conn.execute_batch("DROP TABLE decision_verdicts").unwrap();
 
     let result = db.write_segment_verdict("atom", "escalated", None, None, None, Some(0.4), true);
@@ -610,6 +806,7 @@ fn spot_check_candidates_respect_their_limit_and_need_a_wrong_draft() {
             s.verdict_transcript = Some(a.to_string());
         }
         db.insert_segment_full(&s).unwrap();
+        ensure_test_audio_content_hash(&db, id);
     };
     plant("sc-wrong-1", "دەقی هەڵە", Some("دەقی ڕاست"));
     plant("sc-wrong-2", "هەڵەی دوو", Some("ڕاستی دوو"));
@@ -733,6 +930,7 @@ fn the_agreement_sample_pairs_two_raters_and_never_hides_a_third() {
     let db = make_db();
     for id in ["a1", "a2", "a3", "solo"] {
         db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+        ensure_test_audio_content_hash(&db, id);
     }
     assert!(db.agreement_sample().unwrap().is_none(), "no double-review yet means NO sample, not an empty one");
 
@@ -767,7 +965,7 @@ fn the_agreement_sample_pairs_two_raters_and_never_hides_a_third() {
 }
 
 #[test]
-fn a_human_decision_records_which_reviewer_made_it() {
+fn a_named_reviewer_is_recorded_only_at_the_attributed_phone_boundary() {
     // Migration v43. Multi-reviewer Couch Review means several named people decide clips at once, so a
     // decision that does not say WHO made it is unattributable — an audit gap, and the missing substrate
     // for any later inter-annotator agreement study. Four properties, each of which broke a real design:
@@ -784,24 +982,41 @@ fn a_human_decision_records_which_reviewer_made_it() {
     }
     let reviewed_by = |id: &str| db.get_segment_by_id(id).unwrap().unwrap().reviewed_by;
 
-    db.record_human_decision_by("att-phone", "accept", None, None, Some("Sara")).unwrap();
+    let unsupported = db.record_human_decision_by("att-phone", "accept", None, None, Some("Sara")).unwrap_err();
+    assert!(
+        unsupported.to_string().contains("anonymous desktop decision boundary"),
+        "a named desktop write must fail with an actionable boundary error: {unsupported}"
+    );
+    assert_eq!(db.get_segment_by_id("att-phone").unwrap().unwrap().human_decision, None);
+    assert_eq!(
+        db.connection()
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='att-phone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0,
+        "the rejected named-desktop call must publish no partial effect"
+    );
+    record_test_phone_decision(&db, "att-phone", "accept", None, "Sara");
     assert_eq!(reviewed_by("att-phone").as_deref(), Some("Sara"), "an attributed decision names its reviewer");
 
     db.record_human_decision("att-desktop", "accept", None, None).unwrap();
     assert_eq!(reviewed_by("att-desktop"), None, "an unattributed decision stores NULL, never a made-up name");
 
-    db.record_human_decision_by("att-redecide", "accept", None, None, Some("Sara")).unwrap();
-    db.record_human_decision_by("att-redecide", "edit", Some("ڕاستکراوە"), None, Some("Hemn")).unwrap();
+    record_test_phone_decision(&db, "att-redecide", "accept", None, "Sara");
+    record_test_phone_decision(&db, "att-redecide", "edit", Some("ڕاستکراوە"), "Hemn");
     assert_eq!(reviewed_by("att-redecide").as_deref(), Some("Hemn"), "the CURRENT decision's author wins");
     db.record_human_decision("att-redecide", "accept", None, None).unwrap();
     assert_eq!(reviewed_by("att-redecide"), None, "a desktop re-review clears the previous reviewer's name");
 
-    db.clear_human_decision("att-phone").unwrap();
-    assert_eq!(reviewed_by("att-phone"), None, "undo retracts the attribution along with the decision");
+    assert!(db.clear_human_decision("att-phone").is_err(), "legacy snapshot-free clear must stay disabled");
+    assert_eq!(reviewed_by("att-phone").as_deref(), Some("Sara"), "a refused unsafe clear must not erase attribution");
 }
 
 #[test]
-fn reviewer_attribution_survives_a_whole_row_upsert() {
+fn reviewed_rows_refuse_whole_row_and_asr_upserts_and_preserve_attribution() {
     // WHOLE-ROW CLOBBER — the recurring defect family in this file. `insert_segment_full` rewrites EVERY
     // column from a snapshot, and the couch's own undo path uses it. A `reviewed_by` missing from that
     // statement's column list would silently revert to NULL on any restore, stripping the attribution off
@@ -809,44 +1024,49 @@ fn reviewer_attribution_survives_a_whole_row_upsert() {
     // same way it omits human_decision, so an ASR-only re-write must LEAVE it intact, not clear it.
     let db = make_db();
     db.insert_segment(&make_segment("rt-1", "/rt-1.wav")).unwrap();
-    db.record_human_decision_by("rt-1", "accept", None, Some(4200), Some("Sara")).unwrap();
+    record_test_phone_decision(&db, "rt-1", "accept", None, "Sara");
 
-    // Round-trip the FULL row, exactly as the couch undo does.
+    // Policy-3 reviewed rows are no longer restored by renderer-owned whole-row snapshots. Even an
+    // apparently identical UPSERT names immutable audio fields in its UPDATE clause, so it must be
+    // refused rather than reopening a clobber path around exact effect-based Undo.
     let snapshot = db.get_segment_by_id("rt-1").unwrap().unwrap();
     assert_eq!(snapshot.reviewed_by.as_deref(), Some("Sara"));
-    db.insert_segment_full(&snapshot).unwrap();
+    let error = db.insert_segment_full(&snapshot).unwrap_err();
+    assert!(error.to_string().contains("paid policy-3 source identity is immutable"), "{error}");
     assert_eq!(
         db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
         Some("Sara"),
         "insert_segment_full must persist reviewed_by — dropping it is the whole-row-clobber bug"
     );
 
-    // The ASR-column subset must not touch it (it never carries a human decision).
+    // The ASR upsert also names paid identity fields. A corrected/redecoded clip is a new segment
+    // version; it cannot overwrite the immutable reviewed source in place.
     let mut asr_only = make_segment("rt-1", "/rt-1.wav");
     asr_only.raw_transcript = "re-decoded".to_string();
-    db.insert_segment(&asr_only).unwrap();
+    let asr_error = db.insert_segment(&asr_only).unwrap_err();
+    assert!(asr_error.to_string().contains("paid policy-3 source identity is immutable"), "{asr_error}");
     assert_eq!(
         db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
         Some("Sara"),
-        "an ASR-only upsert must leave the human attribution intact"
+        "a refused ASR upsert must leave the human attribution intact"
     );
+    assert_ne!(db.get_segment_by_id("rt-1").unwrap().unwrap().raw_transcript, "re-decoded");
 }
 
 #[test]
-fn write_segment_verdict_records_all_machine_verdict_classes() {
-    // P1.2: decision_verdicts must classify every machine verdict for the C4 denominator. Before the
-    // fix only jury_accept recorded a row; auto_accept and jury_edit (also auto-resolutions) dropped.
+fn historical_decision_verdict_fixture_records_all_machine_classes() {
+    // Frozen pre-v60 C4 history must remain readable with the same classification vocabulary even
+    // though schema-v60 production jury writers are disabled.
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
     for id in ["aa", "je", "es", "hv"] {
         db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
     }
-    db.record_human_decision("hv", "accept", None, None).unwrap();
 
-    db.write_segment_verdict("aa", "auto_accept", Some("m"), None, None, Some(0.9), false).unwrap();
-    db.write_segment_verdict("je", "jury_edit", Some("m"), None, None, Some(0.8), false).unwrap();
-    db.write_segment_verdict("es", "escalated", None, None, None, None, true).unwrap();
-    db.write_segment_verdict("hv", "auto_accept", Some("m"), None, None, Some(0.9), false).unwrap();
+    db.record_decision_verdict("aa", "auto_accept", false).unwrap();
+    db.record_decision_verdict("je", "jury_edit", false).unwrap();
+    db.record_decision_verdict("es", "escalated", true).unwrap();
+    db.record_decision_verdict("hv", "human_accept", false).unwrap();
 
     let verdict_of = |id: &str| -> Option<String> {
         db.connection()
@@ -1004,7 +1224,7 @@ fn wsl_refinement_must_not_overwrite_a_verified_transcript() {
     db.insert_segment(&seg).expect("insert");
 
     // Human verifies via the same single-column path batch_verify uses (verified only; decision/verdict NULL).
-    assert!(db.update_verified("ver-1", true).unwrap());
+    assert!(db.update_verified_for_test("ver-1", true).unwrap());
     let locked = db.get_segment_by_id("ver-1").unwrap().unwrap();
     assert!(locked.verified);
     assert!(locked.human_decision.is_none(), "verify leaves human_decision NULL — the race precondition");
@@ -1491,52 +1711,177 @@ fn machine_verdict_never_overwrites_a_human_decision() {
 }
 
 #[test]
-fn clear_human_decision_reopens_the_segment_for_re_adjudication() {
-    // Undo of a human decision must FULLY re-open the segment: clear the human decision AND the
-    // verdict it set (the pre-decision machine verdict is gone), returning it to the review queue.
-    // Otherwise the stale verdict='human_*' both shows as decided on reload and blocks re-jury.
+fn exact_human_effect_undo_restores_the_prior_machine_state() {
     let db = make_db();
     db.insert_segment(&make_segment("cl1", "/cl1.wav")).unwrap();
+    ensure_test_audio_content_hash(&db, "cl1");
+    db.write_segment_verdict("cl1", "jury_accept", Some("machine"), Some("machine rationale"), None, Some(0.8), true)
+        .unwrap();
+    let prior = db.get_segment_by_id("cl1").unwrap().unwrap();
     db.record_human_decision("cl1", "edit", Some("human gold"), None).unwrap();
     assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("human_edit"));
 
-    db.clear_human_decision("cl1").unwrap();
-    let cleared = db.get_segment_by_id("cl1").unwrap().unwrap();
-    assert_eq!(cleared.human_decision, None, "human_decision must be cleared");
-    assert_eq!(cleared.verdict, None, "the stale human verdict must be cleared, not left as 'human_edit'");
-    assert_eq!(cleared.verdict_transcript, None, "the human gold transcript is part of the undone decision");
-    assert!(cleared.escalated, "a re-opened segment returns to the review queue");
-
-    // A fresh machine verdict now applies (the human-decision guard no longer blocks it).
-    db.write_segment_verdict("cl1", "jury_accept", Some("machine"), None, None, Some(0.8), false).unwrap();
-    assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("jury_accept"));
+    let effect_id = latest_human_effect_id(&db, "cl1");
+    assert!(matches!(
+        db.undo_human_decision(effect_id, None, "00000000-0000-4000-8000-000000000202").unwrap(),
+        HumanDecisionUndoOutcome::Applied { .. }
+    ));
+    let restored = db.get_segment_by_id("cl1").unwrap().unwrap();
+    assert_eq!(restored.human_decision, prior.human_decision);
+    assert_eq!(restored.verdict, prior.verdict);
+    assert_eq!(restored.verdict_transcript, prior.verdict_transcript);
+    assert_eq!(restored.escalated, prior.escalated);
 }
 
 #[test]
-fn clear_escalation_is_the_exact_inverse_of_a_flag() {
-    // A UI flag() sets verdict='escalated' + escalated=1. Undo must clear BOTH (unlike
-    // clear_human_decision, which sets escalated=1). And it must NOT touch a segment that a human
-    // decided after the flag.
+fn human_decision_undo_refuses_rationale_drift() {
+    let db = make_db();
+    db.insert_segment(&make_segment("undo-rationale-cas", "/undo-rationale-cas.wav")).unwrap();
+    db.write_segment_verdict(
+        "undo-rationale-cas",
+        "jury_accept",
+        Some("machine"),
+        Some("server rationale"),
+        None,
+        Some(0.8),
+        false,
+    )
+    .unwrap();
+    db.record_human_decision("undo-rationale-cas", "accept", None, Some(1)).unwrap();
+    let effect_id = latest_human_effect_id(&db, "undo-rationale-cas");
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET rationale = 'out-of-band rationale'
+              WHERE id = 'undo-rationale-cas'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        db.undo_human_decision(effect_id, None, "00000000-0000-4000-8000-000000000205").unwrap(),
+        HumanDecisionUndoOutcome::Conflict { .. }
+    ));
+    let kept = db.get_segment_by_id("undo-rationale-cas").unwrap().unwrap();
+    assert_eq!(kept.human_decision.as_deref(), Some("accept"));
+    assert_eq!(kept.rationale.as_deref(), Some("out-of-band rationale"));
+}
+
+#[test]
+fn exact_review_flag_effect_undo_is_idempotent_and_conflict_safe() {
     let db = make_db();
     db.insert_segment(&make_segment("fl1", "/fl1.wav")).unwrap();
-    db.write_segment_verdict("fl1", "escalated", None, Some("Flagged for second-pass adjudication"), None, None, true)
+    let commit = db
+        .record_review_flag("fl1", "Flagged for second-pass adjudication", "00000000-0000-4000-8000-000000000901")
         .unwrap();
-    let flagged = db.get_segment_by_id("fl1").unwrap().unwrap();
+    let flagged = commit.segment;
     assert!(flagged.escalated && flagged.verdict.as_deref() == Some("escalated"));
 
-    db.clear_escalation("fl1").unwrap();
+    assert!(matches!(
+        db.undo_review_flag(commit.effect_event_id, "00000000-0000-4000-8000-000000000203").unwrap(),
+        HumanFlagUndoOutcome::Applied { .. }
+    ));
     let un = db.get_segment_by_id("fl1").unwrap().unwrap();
     assert!(!un.escalated, "escalated flag must be cleared (inverse of flag)");
     assert_eq!(un.verdict, None, "the 'escalated' verdict must be cleared");
     assert_eq!(un.rationale, None, "the flag rationale must be cleared");
+    assert!(matches!(
+        db.undo_review_flag(commit.effect_event_id, "00000000-0000-4000-8000-000000000203").unwrap(),
+        HumanFlagUndoOutcome::AlreadyApplied { .. }
+    ));
 
-    // Guard: once a human has decided, clear_escalation must be a no-op (never stomp a decision).
+    // A later human decision wins; the stale flag undo is a no-mutation conflict.
     db.insert_segment(&make_segment("fl2", "/fl2.wav")).unwrap();
-    db.write_segment_verdict("fl2", "escalated", None, Some("flag"), None, None, true).unwrap();
+    let stale = db.record_review_flag("fl2", "flag", "00000000-0000-4000-8000-000000000902").unwrap();
     db.record_human_decision("fl2", "accept", None, None).unwrap();
-    db.clear_escalation("fl2").unwrap();
+    assert!(matches!(
+        db.undo_review_flag(stale.effect_event_id, "00000000-0000-4000-8000-000000000204").unwrap(),
+        HumanFlagUndoOutcome::Conflict { .. }
+    ));
     let kept = db.get_segment_by_id("fl2").unwrap().unwrap();
     assert_eq!(kept.human_decision.as_deref(), Some("accept"), "a human-decided row must be untouched");
+}
+
+#[test]
+fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
+    let forged = make_db();
+    forged.insert_segment(&make_segment("flag-unbound", "/flag-unbound.wav")).unwrap();
+    forged
+        .connection()
+        .execute(
+            "UPDATE speech_segments
+                SET verified = 1, annotated_transcript = 'forged unbound truth'
+              WHERE id = 'flag-unbound'",
+            [],
+        )
+        .unwrap();
+    let error = forged
+        .record_review_flag("flag-unbound", "must not launder this row", "00000000-0000-4000-8000-000000000903")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no immutable legacy or decision-effect authority"),
+        "an effect must not snapshot unbound human truth as its baseline: {error}"
+    );
+    let unchanged = forged.get_segment_by_id("flag-unbound").unwrap().unwrap();
+    assert_eq!(unchanged.verdict, None);
+    assert!(!unchanged.escalated);
+    let effect_count: i64 = forged
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_flag_effect_events WHERE segment_id = 'flag-unbound'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(effect_count, 0, "a refused flag must not leave partial effect evidence");
+
+    // Each optional human-authority marker is independently sufficient to reject a first flag.
+    // These cases pin the Rust-1.81-compatible Option checks; none may be treated as a clean
+    // baseline merely because the other two markers are absent.
+    for (suffix, column) in [("decision", "human_decision"), ("reviewer", "reviewed_by"), ("corrected", "corrected_at")]
+    {
+        let db = make_db();
+        let segment_id = format!("flag-unbound-{suffix}");
+        db.insert_segment(&make_segment(&segment_id, "/flag-unbound-marker.wav")).unwrap();
+        db.connection()
+            .execute(&format!("UPDATE speech_segments SET {column} = 'unbound authority' WHERE id = ?1"), [&segment_id])
+            .unwrap();
+        let prior = db.get_segment_by_id(&segment_id).unwrap().unwrap();
+        assert!(
+            !Database::flag_human_baseline_is_authorized_on(db.connection(), &prior).unwrap(),
+            "{column} must independently make the baseline unauthorized"
+        );
+        let error = db
+            .record_review_flag(
+                &segment_id,
+                "must reject every unbound marker",
+                match suffix {
+                    "decision" => "00000000-0000-4000-8000-000000000911",
+                    "reviewer" => "00000000-0000-4000-8000-000000000912",
+                    _ => "00000000-0000-4000-8000-000000000913",
+                },
+            )
+            .expect_err("an unsnapshotted human-authority marker must reject the first flag");
+        let message = error.to_string();
+        if suffix == "decision" {
+            assert!(message.contains("already has a human decision"), "unexpected refusal: {error}");
+        } else {
+            assert!(
+                message.contains("no immutable legacy or decision-effect authority"),
+                "{column} unexpectedly authorized a first flag: {error}"
+            );
+        }
+    }
+
+    let legacy = make_db();
+    assert_eq!(crate::migrations::rollback(&legacy, 1).unwrap(), vec![60]);
+    let mut legacy_reviewed = make_segment("flag-legacy", "/flag-legacy.wav");
+    legacy_reviewed.verified = true;
+    legacy_reviewed.annotated_transcript = Some("immutable legacy truth".into());
+    legacy.insert_segment_full(&legacy_reviewed).unwrap();
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60]);
+    let commit = legacy
+        .record_review_flag("flag-legacy", "legacy row needs adjudication", "00000000-0000-4000-8000-000000000904")
+        .expect("an exact immutable pre-v60 reviewed baseline remains flaggable");
+    assert!(commit.segment.escalated);
+    assert_eq!(commit.segment.annotated_transcript.as_deref(), Some("immutable legacy truth"));
+    assert!(commit.segment.verified);
 }
 
 #[test]
@@ -2028,7 +2373,7 @@ fn consensus_batch_never_touches_a_flag_verified_row() {
     let mut s = make_segment("cv-1", "/cv.wav");
     s.raw_transcript = "دەقی داخراو".to_string();
     db.insert_segment(&s).unwrap();
-    db.update_verified("cv-1", true).unwrap();
+    db.update_verified_for_test("cv-1", true).unwrap();
 
     let changed = db
         .update_segment_consensus_batch(&[("cv-1".to_string(), "دەقی مەکینە".to_string(), "norm".to_string(), 0.9)])
@@ -2053,6 +2398,7 @@ fn human_edit_does_not_write_no_op_correction_ledger_row() {
     let mut seg = make_segment("noop-1", &audio_path);
     seg.raw_transcript = "hello world".to_string();
     db.insert_segment(&seg).expect("insert");
+    ensure_test_audio_content_hash(&db, "noop-1");
 
     // A no-op edit: the corrected text equals the raw ASR (up to the learning key).
     db.record_human_decision("noop-1", "edit", Some("hello world"), None).expect("record no-op edit");
@@ -2065,6 +2411,7 @@ fn human_edit_does_not_write_no_op_correction_ledger_row() {
     let mut seg2 = make_segment("real-1", &audio_path);
     seg2.raw_transcript = "helo wrld".to_string();
     db.insert_segment(&seg2).expect("insert real");
+    ensure_test_audio_content_hash(&db, "real-1");
     db.record_human_decision("real-1", "edit", Some("hello world"), None).expect("record real edit");
     let real_rows: i64 =
         db.conn.query_row("SELECT COUNT(*) FROM corrections WHERE segment_id='real-1'", [], |r| r.get(0)).unwrap();
@@ -2113,7 +2460,7 @@ fn merge_dataset_json_does_not_overwrite_a_verified_only_row() {
     let mut seg = make_segment("merge-ver", "/v.wav");
     seg.raw_transcript = "human verified original".to_string();
     db.insert_segment(&seg).expect("insert");
-    assert!(db.update_verified("merge-ver", true).unwrap());
+    assert!(db.update_verified_for_test("merge-ver", true).unwrap());
     let locked = db.get_segment_by_id("merge-ver").unwrap().unwrap();
     assert!(locked.verified && locked.human_decision.is_none(), "verify leaves decision NULL (the precondition)");
 
@@ -2131,7 +2478,8 @@ fn merge_dataset_json_does_not_overwrite_a_verified_only_row() {
     assert_eq!(after.raw_transcript, "human verified original", "verified transcript must be intact");
     assert!(after.verified, "verified flag must stay set");
 
-    // A NEW verified row (id not present locally) is still importable — the guard only refuses OVERWRITES.
+    // Schema v60 cannot accept renderer-authored verification even for a new id. A verified row needs
+    // immutable legacy/effect authority; JSON import can prove neither.
     let fresh = vec![SpeechSegment {
         id: "merge-new".to_string(),
         audio_path: "/n.wav".to_string(),
@@ -2140,8 +2488,102 @@ fn merge_dataset_json_does_not_overwrite_a_verified_only_row() {
         duration_ms: 1000,
         ..SpeechSegment::default()
     }];
-    let (created2, _u2) = db.merge_dataset_json(&serde_json::to_string(&fresh).unwrap()).expect("merge new");
-    assert_eq!(created2, 1, "a new verified row (not a local overwrite) still imports");
+    let err = db.merge_dataset_json(&serde_json::to_string(&fresh).unwrap()).unwrap_err();
+    assert!(err.to_string().contains("review-owned field(s) verified"), "unexpected error: {err}");
+    assert!(db.get_segment_by_id("merge-new").unwrap().is_none(), "refusal must create no unbound human row");
+}
+
+#[test]
+fn merge_dataset_json_v60_accepts_machine_only_insert_and_update() {
+    let db = make_db();
+    let incoming = vec![SpeechSegment {
+        id: "merge-machine".to_string(),
+        created_at: Some("2026-08-22 01:02:03".to_string()),
+        audio_path: "/machine.wav".to_string(),
+        raw_transcript: "machine draft one".to_string(),
+        normalized_transcript: Some("machine normalized one".to_string()),
+        duration_ms: 1_000,
+        confidence: Some(0.7),
+        confidence_source: Some("real_posterior".to_string()),
+        model_version_id: Some("omniasr-7b-champion".to_string()),
+        ..SpeechSegment::default()
+    }];
+    assert_eq!(
+        db.merge_dataset_json(&serde_json::to_string(&incoming).unwrap()).unwrap(),
+        (1, 0),
+        "machine-only new rows remain importable"
+    );
+    let created = db.get_segment_by_id("merge-machine").unwrap().unwrap();
+    assert_eq!(created.raw_transcript, "machine draft one");
+    assert_eq!(created.created_at.as_deref(), Some("2026-08-22 01:02:03"));
+    assert!(!created.verified);
+    assert!(created.annotated_transcript.is_none());
+    assert!(created.human_decision.is_none());
+
+    let replacement = vec![SpeechSegment {
+        id: "merge-machine".to_string(),
+        audio_path: "/machine-v2.wav".to_string(),
+        raw_transcript: "machine draft two".to_string(),
+        normalized_transcript: Some("machine normalized two".to_string()),
+        duration_ms: 1_001,
+        confidence: Some(0.8),
+        confidence_source: Some("real_posterior".to_string()),
+        model_version_id: Some("omniasr-7b-champion".to_string()),
+        ..SpeechSegment::default()
+    }];
+    assert_eq!(
+        db.merge_dataset_json(&serde_json::to_string(&replacement).unwrap()).unwrap(),
+        (0, 1),
+        "machine-only existing rows remain updateable"
+    );
+    let updated = db.get_segment_by_id("merge-machine").unwrap().unwrap();
+    assert_eq!(updated.raw_transcript, "machine draft two");
+    assert_eq!(updated.audio_path, "/machine-v2.wav");
+    assert_eq!(updated.created_at.as_deref(), Some("2026-08-22 01:02:03"), "merge updates preserve row identity");
+    assert!(updated.annotated_transcript.is_none());
+    assert!(!updated.verified);
+}
+
+#[test]
+fn merge_dataset_json_v60_rejects_mixed_review_payload_before_any_insert_or_update() {
+    let db = make_db();
+    let mut existing = make_segment("merge-existing", "/existing.wav");
+    existing.raw_transcript = "original machine draft".to_string();
+    db.insert_segment(&existing).unwrap();
+
+    let payload = vec![
+        SpeechSegment {
+            id: "merge-existing".to_string(),
+            audio_path: "/replacement.wav".to_string(),
+            raw_transcript: "replacement machine draft".to_string(),
+            duration_ms: 1_000,
+            ..SpeechSegment::default()
+        },
+        SpeechSegment {
+            id: "merge-forged-review".to_string(),
+            audio_path: "/forged.wav".to_string(),
+            raw_transcript: "machine draft".to_string(),
+            annotated_transcript: Some("renderer-authored human answer".to_string()),
+            verified: true,
+            human_decision: Some("edit".to_string()),
+            reviewed_by: Some("forged-reviewer".to_string()),
+            duration_ms: 1_000,
+            ..SpeechSegment::default()
+        },
+    ];
+    let err = db.merge_dataset_json(&serde_json::to_string(&payload).unwrap()).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("Dataset merge refused atomically"), "unexpected error: {message}");
+    assert!(message.contains("annotatedTranscript") && message.contains("verified") && message.contains("reviewedBy"));
+    assert_eq!(
+        db.get_segment_by_id("merge-existing").unwrap().unwrap().raw_transcript,
+        "original machine draft",
+        "the valid-looking update must not run before a later forged row is rejected"
+    );
+    assert!(
+        db.get_segment_by_id("merge-forged-review").unwrap().is_none(),
+        "the forged insert must leave no partial row"
+    );
 }
 
 #[test]
@@ -2192,6 +2634,7 @@ fn human_edit_learning_uses_agent_proposal_before_raw_asr() {
     seg.verdict_transcript = Some("agent proposed transcript".to_string());
     seg.escalated = true;
     db.insert_segment(&seg).expect("insert segment");
+    ensure_test_audio_content_hash(&db, "learn-agent");
     db.write_segment_verdict(
         "learn-agent",
         "jury_accept",
@@ -2231,6 +2674,7 @@ fn human_edit_skips_learning_pair_when_proposal_matches_fix() {
     seg.raw_transcript = "same text".to_string();
     seg.verdict_transcript = Some("same   text".to_string());
     db.insert_segment(&seg).expect("insert segment");
+    ensure_test_audio_content_hash(&db, "learn-same");
     db.write_segment_verdict("learn-same", "jury_accept", Some("same   text"), None, None, Some(0.9), true)
         .expect("write agent verdict");
 
@@ -2244,18 +2688,19 @@ fn human_edit_skips_learning_pair_when_proposal_matches_fix() {
 }
 
 #[test]
-fn record_human_decision_appends_to_corrections_ledger() {
+fn record_human_decision_uses_stored_pcm_hash_for_corrections_ledger() {
     let db = make_db();
-    // A real on-disk audio file so the durable content hash (the ledger's identity) can be
-    // computed, even though the database itself is in memory.
+    // The correction identity is the server-owned canonical decoded-PCM hash already stored on
+    // the row. It must never be recomputed from mutable file bytes at decision time.
     let tmp = tempfile::tempdir().expect("tempdir");
     let audio = tmp.path().join("clip.wav");
     std::fs::write(&audio, b"RIFF....fake-audio-bytes").expect("write audio");
-    let expected_hash = crate::pipeline::source_audio_identity(&audio).expect("identity").content_hash;
 
     let mut seg = make_segment("led-1", audio.to_str().expect("audio path"));
     seg.raw_transcript = "wrong text".to_string();
     db.insert_segment(&seg).expect("insert segment");
+    let expected_hash = ensure_test_audio_content_hash(&db, "led-1");
+    std::fs::write(&audio, b"different bytes after import").expect("mutate source after canonical import");
     // The agent verdict the human is about to override (captured into jury_verdict).
     db.write_segment_verdict("led-1", "jury_accept", Some("agent guess"), None, None, Some(0.7), true)
         .expect("write agent verdict");
@@ -2279,7 +2724,7 @@ fn record_human_decision_appends_to_corrections_ledger() {
         )
         .expect("a corrections ledger row must exist after an edit");
     assert_eq!(segment_id.as_deref(), Some("led-1"));
-    assert_eq!(hash, expected_hash, "the ledger must key on the durable audio content hash");
+    assert_eq!(hash, expected_hash, "the ledger must use the stored canonical PCM content hash exactly");
     assert!(!raw_hyp.is_empty(), "raw_hypothesis must record what the model produced");
     assert_eq!(fix, "right text");
     assert_eq!(jury.as_deref(), Some("jury_accept"), "jury_verdict captures the pre-override agent verdict");
@@ -2306,22 +2751,26 @@ fn non_edit_decision_writes_no_corrections_ledger_row() {
 }
 
 #[test]
-fn edit_with_missing_audio_still_records_verdict_without_ledger_row() {
-    // Best-effort ledger: a missing audio file must never block the human's correction.
+fn edit_without_stored_pcm_identity_is_refused_atomically() {
+    // An edit is durable training data. Missing server-owned PCM identity must fail closed rather
+    // than record an unbindable verdict or silently omit its correction provenance.
     let db = make_db();
     let mut seg = make_segment("led-missing", "/nonexistent/gone.wav");
     seg.raw_transcript = "wrong".to_string();
     db.insert_segment(&seg).expect("insert segment");
 
-    db.record_human_decision("led-missing", "edit", Some("right"), None).expect("edit must still succeed");
+    let err = db
+        .record_human_decision("led-missing", "edit", Some("right"), None)
+        .expect_err("edit without canonical server identity must be refused");
+    assert!(err.to_string().contains("canonical server-owned PCM content hash"));
 
     let fresh = db.get_segment_by_id("led-missing").expect("load").expect("exists");
-    assert_eq!(fresh.human_decision.as_deref(), Some("edit"), "the verdict is recorded despite missing audio");
+    assert!(fresh.human_decision.is_none(), "a refused edit must leave the row untouched");
     let count: i64 = db
         .connection()
         .query_row("SELECT COUNT(*) FROM corrections WHERE segment_id = ?1", params!["led-missing"], |r| r.get(0))
         .expect("count");
-    assert_eq!(count, 0, "no ledger row when the audio identity cannot be computed");
+    assert_eq!(count, 0, "a refused edit must mint no correction row");
 }
 
 #[test]
@@ -2330,12 +2779,14 @@ fn edit_populates_correction_memory_with_substitution() {
     let mut seg = make_segment("mem-1", "/data/audio/mem-1.wav");
     seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
     db.insert_segment(&seg).expect("insert");
+    ensure_test_audio_content_hash(&db, "mem-1");
     db.record_human_decision("mem-1", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
 
     let (wrong, human, hits): (String, String, i64) = db
         .connection()
         .query_row(
-            "SELECT wrong_token, human_token, hit_count FROM correction_memory WHERE source_segment = ?1",
+            "SELECT wrong_token, human_token, hit_count
+               FROM effective_correction_memory_v60 WHERE source_segment = ?1",
             params!["mem-1"],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -2352,12 +2803,13 @@ fn repeated_correction_bumps_hit_count_not_duplicates() {
         let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
+        ensure_test_audio_content_hash(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
     }
     let (rows, max_hits): (i64, i64) = db
         .connection()
         .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(hit_count), 0) FROM correction_memory
+            "SELECT COUNT(*), COALESCE(MAX(hit_count), 0) FROM effective_correction_memory_v60
                  WHERE wrong_token = 'باش' AND human_token = 'خراپ'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -2378,12 +2830,13 @@ fn a_single_edit_repeating_one_confusion_counts_as_one_capture_not_a_confirmatio
     let mut seg = make_segment("mem-rep", "/data/audio/mem-rep.wav");
     seg.raw_transcript = "ئەو باش بوو ئەو باش بوو".to_string();
     db.insert_segment(&seg).expect("insert");
+    ensure_test_audio_content_hash(&db, "mem-rep");
     db.record_human_decision("mem-rep", "edit", Some("ئەو خراپ بوو ئەو خراپ بوو"), None).expect("edit");
 
     let (rows, max_hits): (i64, i64) = db
         .connection()
         .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(hit_count), 0) FROM correction_memory
+            "SELECT COUNT(*), COALESCE(MAX(hit_count), 0) FROM effective_correction_memory_v60
                  WHERE wrong_token = 'باش' AND human_token = 'خراپ'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -2399,6 +2852,7 @@ fn gold_edit_does_not_populate_correction_memory() {
     let mut seg = make_segment("mem-gold", "/data/audio/mem-gold.wav");
     seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
     db.insert_segment(&seg).expect("insert");
+    ensure_test_audio_content_hash(&db, "mem-gold");
     db.connection().execute("UPDATE speech_segments SET is_gold = 1 WHERE id = 'mem-gold'", []).expect("mark gold");
     db.record_human_decision("mem-gold", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
 
@@ -2415,6 +2869,7 @@ fn load_correction_memories_returns_captured_entries() {
     let mut seg = make_segment("lm-1", "/data/audio/lm-1.wav");
     seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
     db.insert_segment(&seg).expect("insert");
+    ensure_test_audio_content_hash(&db, "lm-1");
     db.record_human_decision("lm-1", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
 
     let mems = db.load_correction_memories().expect("load");
@@ -2438,6 +2893,7 @@ fn loop0_round_trips_capture_to_fire_through_the_database() {
         let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
+        ensure_test_audio_content_hash(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
     }
 
@@ -2461,6 +2917,7 @@ fn confirmed_memory_confidence_rises_above_tau_conf() {
     let mut seg0 = make_segment("cf-0", "/data/audio/cf-0.wav");
     seg0.raw_transcript = "ئەو ساڵە باش بوو".to_string();
     db.insert_segment(&seg0).expect("insert");
+    ensure_test_audio_content_hash(&db, "cf-0");
     db.record_human_decision("cf-0", "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
     let fresh = db.load_correction_memories().expect("load")[0].confidence;
     assert!(fresh < tau, "a freshly captured memory sits at the 0.5 prior, below tau_conf: {fresh}");
@@ -2470,6 +2927,7 @@ fn confirmed_memory_confidence_rises_above_tau_conf() {
         let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
+        ensure_test_audio_content_hash(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
     }
     let confirmed = db.load_correction_memories().expect("load")[0].confidence;
@@ -2488,6 +2946,7 @@ fn overridden_memory_confidence_decays_below_tau_conf() {
         let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
+        ensure_test_audio_content_hash(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
     }
     let confident = db.load_correction_memories().expect("load")[0].confidence;
@@ -2514,12 +2973,14 @@ fn confidence_evidence_stamps_last_fired_at_and_skips_gold() {
         let mut seg = make_segment(id, &format!("/data/audio/{id}.wav"));
         seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
         db.insert_segment(&seg).expect("insert");
+        ensure_test_audio_content_hash(&db, id);
         db.record_human_decision(id, "edit", Some("ئەو ساڵە خراپ بوو"), None).expect("edit");
     }
     let (fired_set, confirms): (i64, i64) = db
         .connection()
         .query_row(
-            "SELECT last_fired_at IS NOT NULL, confirm_count FROM correction_memory WHERE wrong_token = 'باش'",
+            "SELECT last_fired_at IS NOT NULL, confirm_count
+               FROM effective_correction_memory_v60 WHERE wrong_token = 'باش'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -2535,7 +2996,9 @@ fn confidence_evidence_stamps_last_fired_at_and_skips_gold() {
     db.record_human_decision("lf-gold", "accept", None, None).expect("accept");
     let overrides: i64 = db
         .connection()
-        .query_row("SELECT override_count FROM correction_memory WHERE wrong_token = 'باش'", [], |r| r.get(0))
+        .query_row("SELECT override_count FROM effective_correction_memory_v60 WHERE wrong_token = 'باش'", [], |r| {
+            r.get(0)
+        })
         .expect("query");
     assert_eq!(overrides, 0, "a gold-segment decision must not update firing-outcome evidence (eval-leak guard)");
 }
@@ -2560,9 +3023,10 @@ fn loop0_shadow_log_records_would_fire_flag() {
 }
 
 #[test]
-fn deleting_a_segment_preserves_its_loop0_over_trigger_evidence() {
-    // C5 survivor-bias guard: the owner's normal cleanup (review a bad clip, then delete it) must not
-    // erase the over-trigger evidence that gate reads — else the gate looks safer than reality.
+fn a_segment_with_loop0_over_trigger_evidence_cannot_be_deleted() {
+    // C5 survivor-bias guard: cleanup must not erase the over-trigger evidence that the gate reads —
+    // otherwise the gate would look safer than reality. Schema v60 therefore refuses the delete and
+    // preserves both the reviewed segment and its durable observation.
     let db = make_db();
     let mut seg = make_segment("ov-1", "/data/audio/ov-1.wav");
     seg.raw_transcript = "ئەو ساڵە باش بوو".to_string();
@@ -2575,11 +3039,13 @@ fn deleting_a_segment_preserves_its_loop0_over_trigger_evidence() {
         db.intelligence_report().expect("report")["loop0Shadow"]["firedButHumanAcceptedOriginal"].as_i64().unwrap();
     assert_eq!(ot_before, 1, "the over-trigger is counted while the segment exists");
 
-    db.delete_segment("ov-1").expect("delete");
+    let err = db.delete_segment("ov-1").expect_err("review evidence must make the segment append-only");
+    assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
+    assert!(db.get_segment_by_id("ov-1").unwrap().is_some(), "the reviewed segment remains authoritative");
 
     let ot_after =
         db.intelligence_report().expect("report")["loop0Shadow"]["firedButHumanAcceptedOriginal"].as_i64().unwrap();
-    assert_eq!(ot_after, 1, "the over-trigger evidence SURVIVES deletion via the durable archive");
+    assert_eq!(ot_after, 1, "the refused delete cannot erase the over-trigger evidence");
 }
 
 #[test]
@@ -2711,7 +3177,7 @@ fn restore_stages_pending_migrations_and_foreign_keys_before_overwriting_live_da
     {
         let candidate = Database::open(migration_fail_path.to_str().unwrap()).unwrap();
         candidate.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&candidate, 2).unwrap(), vec![59, 58]);
+        assert_eq!(crate::migrations::rollback(&candidate, 3).unwrap(), vec![60, 59, 58]);
         candidate
             .connection()
             .execute_batch(
@@ -3138,11 +3604,9 @@ fn escalation_write_with_no_confidence_preserves_the_persisted_irt_confidence() 
 }
 
 #[test]
-fn c4_precision_survives_deleting_a_contradicted_auto_accept() {
-    // True-10 audit 2026-07-09 (v34, same class as the v33 C5 fix): deleting a reviewed bad
-    // clip CASCADE-deleted its decision_verdicts row, shrinking t0HumanContradicted — the C4
-    // precision that authorizes raising the autonomy dial could only drift optimistic. The
-    // archive must preserve the contradiction across the delete.
+fn c4_precision_refuses_deleting_a_contradicted_auto_accept() {
+    // A reviewed clip and the machine decision it contradicted are durable authority. Refusing both
+    // single and batch deletion keeps the C4 numerator and denominator from drifting optimistically.
     let db = make_db();
     db.insert_segment(&make_segment("good", "/audio/g.wav")).unwrap();
     db.insert_segment(&make_segment("bad", "/audio/b.wav")).unwrap();
@@ -3156,20 +3620,24 @@ fn c4_precision_survives_deleting_a_contradicted_auto_accept() {
     assert_eq!(before["autoAcceptPrecision"]["t0HumanContradicted"], 1);
     assert_eq!(before["autoAcceptPrecision"]["t0HumanConfirmed"], 1);
 
-    // The owner's documented cleanup: review the bad clip, then delete it.
-    db.delete_segment("bad").unwrap();
+    let err = db.delete_segment("bad").expect_err("contradicted reviewed clip must be append-only");
+    assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
 
     let after = db.intelligence_report().unwrap();
     assert_eq!(
         after["autoAcceptPrecision"]["t0HumanContradicted"], 1,
-        "deleting the contradicted clip must not erase the contradiction (survivor bias)"
+        "the refused delete must not erase the contradiction (survivor bias)"
     );
     assert_eq!(after["autoAcceptPrecision"]["t0Accepts"], 2, "the T0 denominator survives too");
-    // And batch delete folds the archive the same way.
-    db.delete_segments_batch(&["good".to_string()]).unwrap();
+    let err = db
+        .delete_segments_batch(&["good".to_string()])
+        .expect_err("batch deletion must enforce the same durable-authority boundary");
+    assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
     let final_report = db.intelligence_report().unwrap();
     assert_eq!(final_report["autoAcceptPrecision"]["t0HumanConfirmed"], 1);
     assert_eq!(final_report["autoAcceptPrecision"]["t0Accepts"], 2);
+    assert!(db.get_segment_by_id("good").unwrap().is_some());
+    assert!(db.get_segment_by_id("bad").unwrap().is_some());
 }
 
 #[test]
@@ -3186,8 +3654,9 @@ fn shadow_metrics_count_distinct_segments_not_observations() {
     assert_eq!(report["loop0Shadow"]["totalObservations"], 1, "one segment, not three rows");
     assert_eq!(report["loop0Shadow"]["wouldFire"], 1);
     assert_eq!(report["loop0Shadow"]["firedButHumanAcceptedOriginal"], 1, "one physical over-trigger event, not two");
-    // The per-segment semantics survive deletion through the archive.
-    db.delete_segment("re").unwrap();
+    // The per-segment semantics survive attempted cleanup because the reviewed row is append-only.
+    let err = db.delete_segment("re").expect_err("reviewed shadow evidence must refuse deletion");
+    assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
     let after = db.intelligence_report().unwrap();
     assert_eq!(after["loop0Shadow"]["firedButHumanAcceptedOriginal"], 1);
     assert_eq!(after["loop0Shadow"]["totalObservations"], 1);
@@ -3370,14 +3839,10 @@ fn list_recent_jobs_returns_newest_first_and_respects_limit() {
 }
 
 #[test]
-fn merge_dataset_json_preserves_review_provenance_on_newly_created_rows() {
-    // DATA-LOSS regression: SpeechSegment deserializes every jury / human-review / gold column, but the
-    // merge's INSERT path used its own 21-column statement that silently DROPPED verdict,
-    // verdict_transcript, rationale, evidence_json, agreement_score, escalated, human_decision,
-    // corrected_at, is_gold, alignment_quality and created_at for NEW ids. Merging a reviewed dataset
-    // into another library therefore stripped the human work product — the merged rows then graded as
-    // unreviewed machine drafts. The INSERT path must be the lossless full-column insert
-    // (insert_segment_full), exactly like the delete-undo restore.
+fn merge_dataset_json_v60_refuses_unbound_review_provenance_on_new_rows() {
+    // A lossless renderer-owned reviewed-row import was legitimate before v60. It is now a provenance
+    // bypass: no playback-bound decision/flag effect can authorize these fields. Refuse rather than
+    // silently dropping the claimed human work or trusting it without immutable authority.
     let db = make_db();
 
     let incoming = vec![SpeechSegment {
@@ -3398,20 +3863,22 @@ fn merge_dataset_json_preserves_review_provenance_on_newly_created_rows() {
         ..SpeechSegment::default()
     }];
     let json = serde_json::to_string(&incoming).expect("serialize");
-    let (created, updated) = db.merge_dataset_json(&json).expect("merge");
-    assert_eq!((created, updated), (1, 0), "a new id must take the INSERT path");
-
-    let row = db.get_segment_by_id("merge-new-gold").unwrap().expect("row created");
-    assert_eq!(row.human_decision.as_deref(), Some("edit"), "human_decision must survive the merge");
-    assert!(row.is_gold, "is_gold must survive the merge");
-    assert_eq!(row.verdict.as_deref(), Some("human_edit"), "verdict must survive the merge");
-    assert_eq!(row.corrected_at.as_deref(), Some("2026-01-02 03:05:00"), "corrected_at must survive");
-    assert_eq!(row.alignment_quality.as_deref(), Some("word_aligner"), "alignment_quality must survive");
-    assert_eq!(
-        row.created_at.as_deref(),
-        Some("2026-01-02 03:04:05"),
-        "created_at must survive, or the merged row reorders every ORDER BY created_at view/export"
-    );
+    let err = db.merge_dataset_json(&json).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("Dataset merge refused atomically"), "unexpected error: {message}");
+    for field in [
+        "annotatedTranscript",
+        "verified",
+        "verdict",
+        "verdictTranscript",
+        "rationale",
+        "humanDecision",
+        "correctedAt",
+        "isGold",
+    ] {
+        assert!(message.contains(field), "error must identify rejected field {field}: {message}");
+    }
+    assert!(db.get_segment_by_id("merge-new-gold").unwrap().is_none(), "refused merge must create no row");
 }
 
 #[test]
@@ -3493,6 +3960,7 @@ fn every_segment_write_rejects_structurally_invalid_alignment_metadata() {
 fn phone_decision_rolls_back_every_side_effect_when_finalization_fails() {
     let db = make_db();
     db.insert_segment(&make_segment("phone-atomic", "/a.wav")).unwrap();
+    ensure_test_audio_content_hash(&db, "phone-atomic");
     db.connection()
         .execute_batch(
             "CREATE TRIGGER fail_phone_finalize BEFORE UPDATE ON speech_segments
@@ -3512,6 +3980,41 @@ fn phone_decision_rolls_back_every_side_effect_when_finalization_fails() {
         .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 'phone-atomic'", [], |row| row.get(0))
         .unwrap();
     assert_eq!(examples, 0, "learning side effects must roll back with finalization");
+}
+
+#[test]
+fn schema_v60_legacy_phone_finalizer_refuses_half_written_human_truth_without_mutation() {
+    let db = make_db();
+    db.insert_segment(&make_segment("legacy-half-written", "/legacy.wav")).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET human_decision='edit', verdict='human_edit',
+                    verdict_transcript='human correction', reviewed_by='Sara'
+              WHERE id='legacy-half-written'",
+            [],
+        )
+        .unwrap();
+    let before = db.get_segment_by_id_with_revision("legacy-half-written").unwrap().unwrap();
+    assert!(!before.0.verified && before.0.annotated_transcript.is_none());
+
+    let error = db
+        .finalize_phone_human_decision_at_revision("legacy-half-written", Some("human correction"), before.1)
+        .unwrap_err();
+    assert!(error.to_string().contains("offline repair lane"), "unexpected refusal: {error}");
+
+    let after = db.get_segment_by_id_with_revision("legacy-half-written").unwrap().unwrap();
+    assert_eq!(after.1, before.1, "refusal must not advance revision");
+    assert!(!after.0.verified && after.0.annotated_transcript.is_none());
+    let effects: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='legacy-half-written'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(effects, 0, "legacy refusal must neither invent nor partially write an effect");
 }
 
 #[test]
@@ -4107,6 +4610,7 @@ fn a_spot_check_is_never_served_in_a_dialect_the_reviewer_cannot_judge() {
         seg.raw_transcript = "دەقی هەڵە".into();
         seg.verified = true;
         db.insert_segment(&seg).unwrap();
+        ensure_test_audio_content_hash(&db, id);
         // Through the real decision path, so the answer key lands where a human edit leaves it.
         db.record_human_decision(id, "edit", Some("دەقی ڕاست"), None).unwrap();
         ids.push(id);
@@ -4174,6 +4678,7 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
         let mut seg = make_segment(id, &format!("/audio/{id}.wav"));
         seg.duration_ms = ms;
         db.insert_segment(&seg).unwrap();
+        ensure_test_audio_content_hash(&db, id);
     }
     let revision = db.segment_review_revision("a").unwrap().unwrap();
     let revision =
@@ -4199,9 +4704,12 @@ fn reviewed_audio_ms_counts_each_clip_once_per_reviewer() {
     // PAY SURVIVES DELETION (2026-08-20 hunt): the owner pruning a reviewed clip must not shrink
     // the total for work that was genuinely done — the event snapshots the duration it was paid
     // against (v56), so the number the owner pays on is append-only in practice.
-    db.delete_segment("a").unwrap();
-    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "clip 'a' is gone; Rubar's reviewed-audio total is not");
-    assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000, "hers neither");
+    assert!(
+        db.delete_segment("a").is_err(),
+        "effect-bound review evidence is append-only, so deleting its source segment must fail closed"
+    );
+    assert_eq!(db.reviewed_audio_ms("Rubar").unwrap(), 30_000, "failed deletion cannot shrink review progress");
+    assert_eq!(db.reviewed_audio_ms("Sewa").unwrap(), 9_000, "nor another reviewer's progress");
 }
 
 fn record_payable_edit(db: &Database, segment_id: &str, reviewer: &str, duration_ms: i64) -> i64 {
@@ -4209,6 +4717,7 @@ fn record_payable_edit(db: &Database, segment_id: &str, reviewer: &str, duration
     segment.raw_transcript = "هەڵە".into();
     segment.duration_ms = duration_ms;
     db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(db, segment_id);
     let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
     db.record_phone_human_decision_by_at_revision(segment_id, "edit", Some("ڕاست"), reviewer, revision)
         .unwrap()
@@ -4258,6 +4767,7 @@ fn review_compensation_records_the_owner_authorized_action_schedule() {
     let mut edit = make_segment("pay-edit", "/edit.wav");
     edit.raw_transcript = "هەڵە".into();
     db.insert_segment(&edit).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-edit");
     let revision = db.segment_review_revision("pay-edit").unwrap().unwrap();
     db.record_phone_human_decision_by_at_revision("pay-edit", "edit", Some("ڕاست"), "Sara", revision).unwrap().unwrap();
 
@@ -4268,10 +4778,12 @@ fn review_compensation_records_the_owner_authorized_action_schedule() {
         .unwrap();
 
     db.insert_segment(&make_segment("pay-reject", "/reject.wav")).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-reject");
     let revision = db.segment_review_revision("pay-reject").unwrap().unwrap();
     db.record_phone_human_decision_by_at_revision("pay-reject", "reject", None, "Sara", revision).unwrap().unwrap();
 
     db.insert_segment(&make_segment("pay-skip", "/skip.wav")).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-skip");
     db.record_review_event("pay-skip", "Sara", "skip", "test", 1_700_000_000_000).unwrap();
 
     let rows: Vec<(String, i64, i64, i64)> = db
@@ -4348,6 +4860,7 @@ fn redecisions_adjust_to_one_current_entitlement_and_skip_never_retracts_it() {
     segment.duration_ms = 2_000;
     segment.raw_transcript = "دەقی مۆدێل".into();
     db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-redecision");
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: "pay-redecision".into(),
         model_id: "omniasr-wsl-7b".into(),
@@ -4408,6 +4921,7 @@ fn a_spot_check_retry_cannot_mint_a_second_event_or_change_the_first_action() {
     let mut segment = make_segment("pay-spot-retry", "/pay-spot-retry.wav");
     segment.duration_ms = 2_000;
     db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-spot-retry");
 
     db.record_spot_check("pay-spot-retry", "Sara", "edit", "ڕاست", "ڕاست").unwrap();
     db.record_spot_check("pay-spot-retry", "Sara", "reject", "جیاواز", "ڕاست").unwrap();
@@ -4440,6 +4954,7 @@ fn compensation_failure_rolls_back_its_review_event() {
     let mut segment = make_segment("pay-atomic", "/pay-atomic.wav");
     segment.raw_transcript = "هەڵە".into();
     db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-atomic");
     let served_revision = db.segment_review_revision("pay-atomic").unwrap().unwrap();
     db.connection()
         .execute_batch(
@@ -4470,14 +4985,52 @@ fn compensation_failure_rolls_back_its_review_event() {
 }
 
 #[test]
+fn a_short_source_span_can_never_mint_compensation_for_a_ten_times_longer_duration() {
+    let db = make_db();
+    let mut segment = make_segment("pay-duration-drift", "/pay-duration-drift.wav");
+    segment.duration_ms = 10_000;
+    db.insert_segment(&segment).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET audio_content_hash = ?2,
+                    alignment_json = json_object('source_start_ms', 0, 'source_end_ms', 1000)
+              WHERE id = ?1",
+            params!["pay-duration-drift", TEST_AUDIO_CONTENT_HASH],
+        )
+        .unwrap();
+    let revision = db.segment_review_revision("pay-duration-drift").unwrap().unwrap();
+    let error = db
+        .record_phone_human_decision_by_at_revision_with_operation(
+            "pay-duration-drift",
+            "edit",
+            Some("human truth"),
+            "Sara",
+            revision,
+            "77777777-7777-4777-8777-777777777777",
+            &review_operation_payload_hash("pay-duration-drift", "edit", "human truth", "Sara"),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("source span disagrees with decoded duration"), "{error}");
+    let row = db.get_segment_by_id("pay-duration-drift").unwrap().unwrap();
+    assert!(row.human_decision.is_none() && !row.verified, "failed pay identity must roll back the decision");
+    for table in ["review_events", "review_compensation_ledger", "human_decision_effect_events"] {
+        let count: i64 =
+            db.connection().query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "failed duration identity must not leave {table} evidence");
+    }
+}
+
+#[test]
 fn review_operation_receipt_exactly_identifies_the_committed_phone_work() {
     let db = make_db();
     let mut segment = make_segment("pay-operation", "/pay-operation.wav");
     segment.raw_transcript = "هەڵە".into();
     db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-operation");
     let revision = db.segment_review_revision("pay-operation").unwrap().unwrap();
     let operation_id = "123e4567-e89b-42d3-a456-426614174000";
-    let payload_hash = "a".repeat(64);
+    let payload_hash = review_operation_payload_hash("pay-operation", "edit", "ڕاست", "Sara");
     db.record_phone_human_decision_by_at_revision_with_operation(
         "pay-operation",
         "edit",
@@ -4519,9 +5072,10 @@ fn duplicate_review_operation_uuid_is_rejected_and_rolls_back_the_other_payload(
         let mut segment = make_segment(id, &format!("/{id}.wav"));
         segment.raw_transcript = "هەڵە".into();
         db.insert_segment(&segment).unwrap();
+        ensure_test_audio_content_hash(&db, id);
     }
     let operation_id = "223e4567-e89b-42d3-a456-426614174000";
-    let first_hash = "a".repeat(64);
+    let first_hash = review_operation_payload_hash("pay-operation-first", "edit", "ڕاستی یەکەم", "Sara");
     let revision = db.segment_review_revision("pay-operation-first").unwrap().unwrap();
     db.record_phone_human_decision_by_at_revision_with_operation(
         "pay-operation-first",
@@ -4536,7 +5090,7 @@ fn duplicate_review_operation_uuid_is_rejected_and_rolls_back_the_other_payload(
     .unwrap();
 
     let second_revision = db.segment_review_revision("pay-operation-second").unwrap().unwrap();
-    let second_hash = "b".repeat(64);
+    let second_hash = review_operation_payload_hash("pay-operation-second", "edit", "ڕاستی دووەم", "Sara");
     assert!(
         db.record_phone_human_decision_by_at_revision_with_operation(
             "pay-operation-second",
@@ -4606,23 +5160,29 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
     let db = make_db();
     for id in ["pilot-sara-1", "pilot-sara-2", "pilot-hemn-skip", "pilot-hemn-2"] {
         db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+        ensure_test_audio_content_hash(&db, id);
     }
     let limit = ReviewDecisionLimit::new(0, 2, vec![("Sara".into(), 1), ("Hemn".into(), 1)]).unwrap();
-    let sara_revision = db.segment_review_revision("pilot-sara-1").unwrap().unwrap();
+    let sara_proof = full_playback_proof(&db, "pilot-sara-1", "Sara");
+    let sara_revision = sara_proof.segment_revision;
     db.record_phone_human_decision_by_at_revision_with_operation_limit(
         "pilot-sara-1",
         "accept",
         Some("test"),
         "Sara",
         sara_revision,
+        &sara_proof,
         "423e4567-e89b-42d3-a456-426614174001",
-        &"a".repeat(64),
+        &review_operation_payload_hash("pilot-sara-1", "accept", "test", "Sara"),
+        "accept",
+        "test",
         Some(&limit),
     )
     .unwrap()
     .unwrap();
 
-    let refused_revision = db.segment_review_revision("pilot-sara-2").unwrap().unwrap();
+    let refused_proof = full_playback_proof(&db, "pilot-sara-2", "Sara");
+    let refused_revision = refused_proof.segment_revision;
     let refused = db
         .record_phone_human_decision_by_at_revision_with_operation_limit(
             "pilot-sara-2",
@@ -4630,8 +5190,11 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
             Some("different"),
             "Sara",
             refused_revision,
+            &refused_proof,
             "423e4567-e89b-42d3-a456-426614174002",
-            &"b".repeat(64),
+            &review_operation_payload_hash("pilot-sara-2", "edit", "different", "Sara"),
+            "edit",
+            "different",
             Some(&limit),
         )
         .unwrap_err();
@@ -4647,11 +5210,14 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
         "couch",
         1,
         "423e4567-e89b-42d3-a456-426614174003",
-        &"c".repeat(64),
+        &review_operation_payload_hash("pilot-hemn-skip", "skip", "", "Hemn"),
+        "skip",
+        "",
         Some(&limit),
     )
     .unwrap();
-    let hemn_revision = db.segment_review_revision("pilot-hemn-2").unwrap().unwrap();
+    let hemn_proof = full_playback_proof(&db, "pilot-hemn-2", "Hemn");
+    let hemn_revision = hemn_proof.segment_revision;
     let refused = db
         .record_phone_human_decision_by_at_revision_with_operation_limit(
             "pilot-hemn-2",
@@ -4659,8 +5225,11 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
             Some("test"),
             "Hemn",
             hemn_revision,
+            &hemn_proof,
             "423e4567-e89b-42d3-a456-426614174004",
-            &"d".repeat(64),
+            &review_operation_payload_hash("pilot-hemn-2", "accept", "test", "Hemn"),
+            "accept",
+            "test",
             Some(&limit),
         )
         .unwrap_err();
@@ -4682,6 +5251,65 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
 }
 
 #[test]
+fn paid_corpus_write_rechecks_a_trigger_disabled_missing_playback_receipt_inside_its_transaction() {
+    let db = make_db();
+    db.insert_segment(&make_segment("corpus-proof", "/corpus-proof.wav")).unwrap();
+    let stale = full_playback_proof(&db, "corpus-proof", "Sara");
+    let revision = stale.segment_revision;
+    db.connection().execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_delete", []).unwrap();
+    db.connection().execute("DELETE FROM playback_receipts WHERE segment_id='corpus-proof'", []).unwrap();
+
+    let refused = db
+        .record_phone_human_decision_by_at_revision_with_operation_limit(
+            "corpus-proof",
+            "accept",
+            Some("test"),
+            "Sara",
+            revision,
+            &stale,
+            "923e4567-e89b-42d3-a456-426614174001",
+            &review_operation_payload_hash("corpus-proof", "accept", "test", "Sara"),
+            "accept",
+            "test",
+            None,
+        )
+        .unwrap();
+    assert!(refused.is_none(), "vanished playback evidence must behave as an atomic state conflict");
+    let empty: (i64, i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT verified,
+                    (SELECT COUNT(*) FROM review_events WHERE segment_id='corpus-proof'),
+                    (SELECT COUNT(*) FROM review_compensation_ledger WHERE segment_id='corpus-proof'),
+                    (SELECT COUNT(*) FROM review_events
+                      WHERE segment_id='corpus-proof' AND operation_id IS NOT NULL)
+               FROM speech_segments WHERE id='corpus-proof'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(empty, (0, 0, 0, 0), "verdict, event, ledger, and operation receipt must all stay absent");
+
+    let current = full_playback_proof(&db, "corpus-proof", "Sara");
+    let committed = db
+        .record_phone_human_decision_by_at_revision_with_operation_limit(
+            "corpus-proof",
+            "accept",
+            Some("test"),
+            "Sara",
+            revision,
+            &current,
+            "923e4567-e89b-42d3-a456-426614174002",
+            &review_operation_payload_hash("corpus-proof", "accept", "test", "Sara"),
+            "accept",
+            "test",
+            None,
+        )
+        .unwrap();
+    assert!(committed.is_some(), "current raw playback evidence authorizes the exact paid write");
+}
+
+#[test]
 fn controlled_review_cap_serializes_the_last_slot_across_database_connections() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pilot-race.db");
@@ -4690,6 +5318,7 @@ fn controlled_review_cap_serializes_the_last_slot_across_database_connections() 
     setup.initialize().unwrap();
     for id in ["pilot-race-a", "pilot-race-b"] {
         setup.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+        full_playback_proof(&setup, id, "Sara");
     }
     drop(setup);
 
@@ -4701,6 +5330,15 @@ fn controlled_review_cap_serializes_the_last_slot_across_database_connections() 
         workers.push(std::thread::spawn(move || {
             let db = Database::open(&path_text).unwrap();
             let revision = db.segment_review_revision(id).unwrap().unwrap();
+            let proof = PlaybackDecisionProof {
+                segment_revision: revision,
+                audio_content_hash: db
+                    .segment_audio_content_hash(id)
+                    .unwrap()
+                    .expect("fixture has exact audio content hash"),
+                source_start_ms: db.segment_source_span(id).unwrap().unwrap().0,
+                source_end_ms: db.segment_source_span(id).unwrap().unwrap().1,
+            };
             let limit = ReviewDecisionLimit::new(0, 1, vec![("Sara".into(), 1)]).unwrap();
             barrier.wait();
             db.record_phone_human_decision_by_at_revision_with_operation_limit(
@@ -4709,8 +5347,11 @@ fn controlled_review_cap_serializes_the_last_slot_across_database_connections() 
                 Some("test"),
                 "Sara",
                 revision,
+                &proof,
                 &format!("523e4567-e89b-42d3-a456-42661417400{index}"),
-                &format!("{:064x}", index + 1),
+                &review_operation_payload_hash(id, "accept", "test", "Sara"),
+                "accept",
+                "test",
                 Some(&limit),
             )
         }));
@@ -4812,18 +5453,21 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
     let db = make_db();
     let policy = "c".repeat(64);
     for id in ["pilot-result", "pilot-skip", "pilot-unreserved"] {
-        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+        db.insert_segment_full(&make_hidden_check_segment(id, &format!("/{id}.wav"), "ڕاست")).unwrap();
+        ensure_test_audio_content_hash(&db, id);
     }
     db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &["pilot-result".into(), "pilot-skip".into()], 2).unwrap();
     assert!(!db.review_pilot_hidden_key_resolved(&policy, 0, "Sara", "pilot-result").unwrap());
 
     let operation_id = "623e4567-e89b-42d3-a456-426614174001";
-    let payload_hash = "d".repeat(64);
+    let sara_proofs =
+        [full_playback_proof(&db, "pilot-result", "Sara"), full_playback_proof(&db, "pilot-unreserved", "Sara")];
     for (candidate_policy, baseline, segment_id) in [
         ("e".repeat(64), 0, "pilot-result"),
         (policy.clone(), 1, "pilot-result"),
         (policy.clone(), 0, "pilot-unreserved"),
     ] {
+        let proof = if segment_id == "pilot-result" { &sara_proofs[0] } else { &sara_proofs[1] };
         let error = db
             .record_pilot_spot_check_with_operation(
                 &candidate_policy,
@@ -4833,8 +5477,9 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
                 "edit",
                 "ڕاست",
                 "ڕاست",
+                Some(proof),
                 operation_id,
-                &payload_hash,
+                &review_operation_payload_hash(segment_id, "edit", "ڕاست", "Sara"),
             )
             .unwrap_err()
             .to_string();
@@ -4852,6 +5497,7 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
         .unwrap();
     assert_eq!(empty_counts, (0, 0, 0), "authorization refusal must roll back every consequence");
 
+    let lowercase_proof = full_playback_proof(&db, "pilot-result", "sARA");
     db.record_pilot_spot_check_with_operation(
         &policy,
         0,
@@ -4860,20 +5506,22 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
         "edit",
         "ڕاست",
         "ڕاست",
+        Some(&lowercase_proof),
         operation_id,
-        &payload_hash,
+        &review_operation_payload_hash("pilot-result", "edit", "ڕاست", "sARA"),
     )
     .unwrap();
     db.record_pilot_spot_check_with_operation(
         &policy,
         0,
         "pilot-result",
-        "SARA",
+        "sARA",
         "edit",
         "ڕاست",
         "ڕاست",
+        None,
         operation_id,
-        &payload_hash,
+        &review_operation_payload_hash("pilot-result", "edit", "ڕاست", "sARA"),
     )
     .unwrap();
     let committed_counts: (i64, i64, i64) = db
@@ -4896,7 +5544,7 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
         "couch",
         2,
         "623e4567-e89b-42d3-a456-426614174002",
-        &"e".repeat(64),
+        &review_operation_payload_hash("pilot-skip", "skip", "", "SARA"),
     )
     .unwrap();
     assert!(db.review_pilot_hidden_key_resolved(&policy, 0, "Sara", "pilot-skip").unwrap());
@@ -4904,19 +5552,150 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
 }
 
 #[test]
+fn hidden_judgement_requires_current_playback_inside_its_atomic_write() {
+    let db = make_db();
+    db.insert_segment_full(&make_hidden_check_segment("hidden-proof", "/hidden-proof.wav", "ڕاست")).unwrap();
+
+    let missing = db
+        .record_spot_check_with_operation(
+            "hidden-proof",
+            "Sara",
+            "edit",
+            "ڕاست",
+            "ڕاست",
+            None,
+            "823e4567-e89b-42d3-a456-426614174001",
+            &review_operation_payload_hash("hidden-proof", "edit", "ڕاست", "Sara"),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("E_NO_PLAYBACK_EVIDENCE"), "unexpected missing-proof error: {missing}");
+
+    let stale = full_playback_proof(&db, "hidden-proof", "Sara");
+    db.connection().execute("DROP TRIGGER speech_segments_v60_paid_identity_immutable_update", []).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash = ?1 WHERE id = 'hidden-proof'",
+            [OTHER_AUDIO_CONTENT_HASH],
+        )
+        .unwrap();
+    let moved = db
+        .record_spot_check_with_operation(
+            "hidden-proof",
+            "Sara",
+            "edit",
+            "ڕاست",
+            "ڕاست",
+            Some(&stale),
+            "823e4567-e89b-42d3-a456-426614174002",
+            &review_operation_payload_hash("hidden-proof", "edit", "ڕاست", "Sara"),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(moved.contains(PLAYBACK_EVIDENCE_CHANGED), "unexpected stale-proof error: {moved}");
+    let empty: (i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM spot_checks WHERE segment_id='hidden-proof'),
+                    (SELECT COUNT(*) FROM review_events WHERE segment_id='hidden-proof'),
+                    (SELECT COUNT(*) FROM review_compensation_ledger WHERE segment_id='hidden-proof')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(empty, (0, 0, 0), "every stale-proof consequence must roll back");
+
+    let current = full_playback_proof(&db, "hidden-proof", "Sara");
+    db.record_spot_check_with_operation(
+        "hidden-proof",
+        "Sara",
+        "edit",
+        "ڕاست",
+        "ڕاست",
+        Some(&current),
+        "823e4567-e89b-42d3-a456-426614174003",
+        &review_operation_payload_hash("hidden-proof", "edit", "ڕاست", "Sara"),
+    )
+    .unwrap();
+    let committed: (i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM spot_checks WHERE segment_id='hidden-proof'),
+                    (SELECT COUNT(*) FROM review_events WHERE segment_id='hidden-proof'),
+                    (SELECT COUNT(*) FROM review_compensation_ledger WHERE segment_id='hidden-proof')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(committed, (1, 1, 1), "score, audit event, and credit must share one commit");
+}
+
+#[test]
+fn hidden_result_rechecks_the_canonical_answer_key_and_skip_remains_zero_credit() {
+    let db = make_db();
+    db.insert_segment_full(&make_hidden_check_segment("hidden-key", "/hidden-key.wav", "کۆن")).unwrap();
+    db.connection()
+        .execute("UPDATE speech_segments SET verdict_transcript = 'نوێ' WHERE id = 'hidden-key'", [])
+        .unwrap();
+    let proof = full_playback_proof(&db, "hidden-key", "Sara");
+    let stale_key = db
+        .record_spot_check_with_operation(
+            "hidden-key",
+            "Sara",
+            "edit",
+            "کۆن",
+            "کۆن",
+            Some(&proof),
+            "823e4567-e89b-42d3-a456-426614174004",
+            &review_operation_payload_hash("hidden-key", "edit", "کۆن", "Sara"),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(stale_key.contains(HIDDEN_ANSWER_KEY_CHANGED), "unexpected stale-key error: {stale_key}");
+
+    db.record_spot_check_with_operation(
+        "hidden-key",
+        "Sara",
+        "skip",
+        "",
+        "نوێ",
+        None,
+        "823e4567-e89b-42d3-a456-426614174005",
+        &review_operation_payload_hash("hidden-key", "skip", "", "Sara"),
+    )
+    .unwrap();
+    let (event_count, ledger_count, basis_points, earned): (i64, i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM review_events WHERE segment_id='hidden-key'),
+                    COUNT(*), MAX(rate_basis_points), COALESCE(SUM(delta_micro_iqd), 0)
+               FROM review_compensation_ledger
+              WHERE segment_id='hidden-key'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!((event_count, ledger_count), (1, 1));
+    assert_eq!((basis_points, earned), (0, 0), "skip is quality telemetry, never paid judgement");
+}
+
+#[test]
 fn pilot_reservation_backfills_completed_v58_checks_before_minting_fresh_keys() {
     let db = make_db();
     let policy = "f".repeat(64);
     for (index, id) in ["completed-hidden-a", "completed-hidden-b"].into_iter().enumerate() {
-        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+        db.insert_segment_full(&make_hidden_check_segment(id, &format!("/{id}.wav"), "ڕاست")).unwrap();
+        let reviewer = if index == 0 { "Sara" } else { "sARA" };
+        let proof = full_playback_proof(&db, id, reviewer);
         db.record_spot_check_with_operation(
             id,
-            if index == 0 { "Sara" } else { "sARA" },
+            reviewer,
             "edit",
             "ڕاست",
             "ڕاست",
+            Some(&proof),
             &format!("723e4567-e89b-42d3-a456-42661417400{index}"),
-            &format!("{:064x}", index + 1),
+            &review_operation_payload_hash(id, "edit", "ڕاست", reviewer),
         )
         .unwrap();
     }
@@ -4962,9 +5741,9 @@ fn pilot_hidden_key_reservation_serializes_the_final_two_slots_across_connection
 }
 
 #[test]
-fn schema_v58_upgrades_to_v59_without_reinterpreting_live_baseline_863() {
+fn schema_v58_upgrades_through_v60_without_reinterpreting_live_baseline_863() {
     let db = make_db();
-    assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![59]);
+    assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![60, 59]);
     db.connection()
         .execute(
             "INSERT INTO review_events
@@ -4973,7 +5752,7 @@ fn schema_v58_upgrades_to_v59_without_reinterpreting_live_baseline_863() {
             [],
         )
         .unwrap();
-    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59]);
+    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60]);
     let policy = "8".repeat(64);
     assert_eq!(
         db.reserve_review_pilot_hidden_keys(&policy, 863, "Sara", &["baseline-863-hidden".into()], 2).unwrap(),
@@ -4987,11 +5766,14 @@ fn undo_and_its_signed_reversal_are_atomic_and_idempotent() {
     let mut previous = make_segment("pay-undo", "/pay-undo.wav");
     previous.raw_transcript = "هەڵە".into();
     db.insert_segment(&previous).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-undo");
     let served_revision = db.segment_review_revision("pay-undo").unwrap().unwrap();
     let decided_revision = db
         .record_phone_human_decision_by_at_revision("pay-undo", "edit", Some("ڕاست"), "Sara", served_revision)
         .unwrap()
         .unwrap();
+    let effect_id = latest_human_effect_id(&db, "pay-undo");
+    assert_eq!(db.segment_review_revision("pay-undo").unwrap(), Some(decided_revision));
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
 
     db.connection()
@@ -5002,15 +5784,17 @@ fn undo_and_its_signed_reversal_are_atomic_and_idempotent() {
              BEGIN SELECT RAISE(ABORT, 'injected reversal failure'); END;",
         )
         .unwrap();
-    assert!(db.undo_phone_human_decision(&previous, "Sara", decided_revision, "pay-undo-operation").is_err());
+    let undo_operation = "00000000-0000-4000-8000-000000000101";
+    assert!(db.undo_human_decision(effect_id, Some("Sara"), undo_operation).is_err());
     let still_decided = db.get_segment_by_id("pay-undo").unwrap().unwrap();
     assert_eq!(still_decided.human_decision.as_deref(), Some("edit"));
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
 
     db.connection().execute_batch("DROP TRIGGER fail_compensation_undo;").unwrap();
-    db.undo_phone_human_decision(&previous, "Sara", decided_revision, "pay-undo-operation")
-        .unwrap()
-        .expect("the rolled-back operation remains retryable");
+    assert!(matches!(
+        db.undo_human_decision(effect_id, Some("Sara"), undo_operation).unwrap(),
+        HumanDecisionUndoOutcome::Applied { .. }
+    ));
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 0);
 
     let entries: Vec<(String, i64, i64, Option<String>, String)> = db
@@ -5034,8 +5818,11 @@ fn undo_and_its_signed_reversal_are_atomic_and_idempotent() {
     assert_eq!(entries[1].3.as_deref(), Some(entries[0].4.as_str()));
 
     assert!(
-        db.undo_phone_human_decision(&previous, "Sara", decided_revision, "pay-undo-operation").unwrap().is_none(),
-        "a replayed undo loses the revision CAS and cannot append another reversal"
+        matches!(
+            db.undo_human_decision(effect_id, Some("Sara"), undo_operation).unwrap(),
+            HumanDecisionUndoOutcome::AlreadyApplied { .. }
+        ),
+        "the same operation UUID is an idempotent success and cannot append another reversal"
     );
     let count: i64 = db
         .connection()
@@ -5044,6 +5831,87 @@ fn undo_and_its_signed_reversal_are_atomic_and_idempotent() {
         })
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[test]
+fn phone_undo_refuses_a_shadowed_canonical_alias_entitlement_then_unwinds_latest_first() {
+    let db = make_db();
+    for segment_id in ["alias-a", "alias-b"] {
+        db.insert_segment(&make_segment(segment_id, &format!("/{segment_id}.wav"))).unwrap();
+        ensure_test_audio_content_hash(&db, segment_id);
+    }
+    let shared_alignment: String = db
+        .connection()
+        .query_row("SELECT alignment_json FROM speech_segments WHERE id = 'alias-a'", [], |row| row.get(0))
+        .unwrap();
+    db.connection()
+        .execute("UPDATE speech_segments SET alignment_json = ?1 WHERE id = 'alias-b'", [shared_alignment])
+        .unwrap();
+
+    let proof_a = full_playback_proof(&db, "alias-a", "Sara");
+    let op_a = "00000000-0000-4000-8000-000000000401";
+    let commit_a = db
+        .record_phone_human_decision_by_at_revision_with_operation_limit(
+            "alias-a",
+            "accept",
+            Some("test"),
+            "Sara",
+            proof_a.segment_revision,
+            &proof_a,
+            op_a,
+            &review_operation_payload_hash("alias-a", "accept", "test", "Sara"),
+            "accept",
+            "test",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+    let proof_b = full_playback_proof(&db, "alias-b", "Sara");
+    let op_b = "00000000-0000-4000-8000-000000000402";
+    let commit_b = db
+        .record_phone_human_decision_by_at_revision_with_operation_limit(
+            "alias-b",
+            "edit",
+            Some("corrected"),
+            "Sara",
+            proof_b.segment_revision,
+            &proof_b,
+            op_b,
+            &review_operation_payload_hash("alias-b", "edit", "corrected", "Sara"),
+            "edit",
+            "corrected",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
+
+    let shadowed = db.undo_human_decision(commit_a.effect_event_id, Some("Sara"), op_a).unwrap_err();
+    assert!(shadowed.to_string().contains("newer active entitlement mutation"), "{shadowed}");
+    assert_eq!(
+        db.get_segment_by_id("alias-a").unwrap().unwrap().human_decision.as_deref(),
+        Some("accept"),
+        "a refused alias undo must roll the segment update back"
+    );
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
+
+    assert!(matches!(
+        db.undo_human_decision(commit_b.effect_event_id, Some("Sara"), op_b).unwrap(),
+        HumanDecisionUndoOutcome::Applied { .. }
+    ));
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
+    assert!(matches!(
+        db.undo_human_decision(commit_a.effect_event_id, Some("Sara"), op_a).unwrap(),
+        HumanDecisionUndoOutcome::Applied { .. }
+    ));
+    assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 0);
 }
 
 #[test]
@@ -5063,8 +5931,7 @@ fn undo_of_a_redecision_reverses_only_that_decisions_delta() {
         .unwrap();
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
 
-    let before_edit = db.get_segment_by_id("pay-undo-redecision").unwrap().unwrap();
-    let edit_revision = db
+    let _edit_revision = db
         .record_phone_human_decision_by_at_revision(
             "pay-undo-redecision",
             "edit",
@@ -5074,9 +5941,13 @@ fn undo_of_a_redecision_reverses_only_that_decisions_delta() {
         )
         .unwrap()
         .unwrap();
+    let edit_effect_id = latest_human_effect_id(&db, "pay-undo-redecision");
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
     let restored_accept_revision =
-        db.undo_phone_human_decision(&before_edit, "Sara", edit_revision, "undo-accept-to-edit").unwrap().unwrap();
+        match db.undo_human_decision(edit_effect_id, Some("Sara"), "00000000-0000-4000-8000-000000000102").unwrap() {
+            HumanDecisionUndoOutcome::Applied { restored_revision, .. } => restored_revision,
+            other => panic!("expected applied edit undo, got {other:?}"),
+        };
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
 
     // Exercise the opposite signed adjustment too: undoing edit -> reject must add back the 90%
@@ -5091,13 +5962,16 @@ fn undo_of_a_redecision_reverses_only_that_decisions_delta() {
         )
         .unwrap()
         .unwrap();
-    let before_reject = db.get_segment_by_id("pay-undo-redecision").unwrap().unwrap();
-    let reject_revision = db
+    let _reject_revision = db
         .record_phone_human_decision_by_at_revision("pay-undo-redecision", "reject", None, "Sara", edit_revision)
         .unwrap()
         .unwrap();
+    let reject_effect_id = latest_human_effect_id(&db, "pay-undo-redecision");
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 500_000);
-    db.undo_phone_human_decision(&before_reject, "Sara", reject_revision, "undo-edit-to-reject").unwrap().unwrap();
+    assert!(matches!(
+        db.undo_human_decision(reject_effect_id, Some("Sara"), "00000000-0000-4000-8000-000000000103",).unwrap(),
+        HumanDecisionUndoOutcome::Applied { .. }
+    ));
     assert_eq!(db.review_compensation_summary("Sara").unwrap().earned_micro_iqd, 5_000_000);
 
     let entries: Vec<(String, i64, i64, Option<String>, String)> = db
@@ -5131,12 +6005,13 @@ fn undo_of_a_redecision_reverses_only_that_decisions_delta() {
 }
 
 #[test]
-fn compensation_survives_live_duration_changes_and_segment_deletion() {
+fn paid_audio_identity_is_immutable_and_effect_bound_segment_deletion_is_refused() {
     let db = make_db();
     let mut segment = make_segment("pay-delete", "/pay-delete.wav");
     segment.duration_ms = 1_234;
     segment.raw_transcript = "هەڵە".into();
     db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&db, "pay-delete");
     let revision = db.segment_review_revision("pay-delete").unwrap().unwrap();
     db.record_phone_human_decision_by_at_revision("pay-delete", "edit", Some("ڕاست"), "Sara", revision)
         .unwrap()
@@ -5146,13 +6021,22 @@ fn compensation_survives_live_duration_changes_and_segment_deletion() {
     assert_eq!(summary.earned_micro_iqd, earned);
     assert_eq!(summary.corrected_audio_ms, 1_234);
 
-    db.connection().execute("UPDATE speech_segments SET duration_ms = 999999 WHERE id = 'pay-delete'", []).unwrap();
+    let mutation = db
+        .connection()
+        .execute("UPDATE speech_segments SET duration_ms = 999999 WHERE id = 'pay-delete'", [])
+        .unwrap_err();
+    assert!(mutation.to_string().contains("paid policy-3 source identity is immutable"), "{mutation}");
+    assert_eq!(db.get_segment_by_id("pay-delete").unwrap().unwrap().duration_ms, 1_234);
     assert_eq!(
         db.review_compensation_summary("Sara").unwrap().earned_micro_iqd,
         earned,
-        "later metadata repair must not rewrite a paid duration snapshot"
+        "a refused identity mutation must leave the paid duration snapshot authoritative"
     );
-    db.delete_segment("pay-delete").unwrap();
+    assert!(
+        db.delete_segment("pay-delete").is_err(),
+        "deleting an effect-bound correction would destroy immutable provenance and must be refused"
+    );
+    assert!(db.get_segment_by_id("pay-delete").unwrap().is_some());
     let summary = db.review_compensation_summary("Sara").unwrap();
     assert_eq!(summary.earned_micro_iqd, earned);
     assert_eq!(summary.corrected_audio_ms, 1_234);
@@ -5166,6 +6050,86 @@ fn compensation_survives_live_duration_changes_and_segment_deletion() {
         )
         .unwrap();
     assert_eq!(snapshots, (1_234, 1_234));
+}
+
+#[test]
+fn deletion_is_allowed_only_for_authority_free_segments() {
+    let assert_refused = |db: &Database, id: &str| {
+        let error = db.delete_segment(id).expect_err("durable review authority must block deletion");
+        assert!(matches!(error, AppError::Validation(_)), "{id}: {error}");
+        assert!(
+            error.to_string().contains("durable review authority"),
+            "{id}: deletion refusal must be explicit: {error}"
+        );
+        assert!(db.get_segment_by_id(id).unwrap().is_some(), "{id}: refused deletion must preserve the row");
+    };
+
+    let db = make_db();
+    db.insert_segment(&make_segment("delete-clean", "/delete-clean.wav")).unwrap();
+    db.delete_segment("delete-clean").expect("an authority-free segment remains deletable");
+    assert!(db.get_segment_by_id("delete-clean").unwrap().is_none());
+
+    db.insert_segment(&make_segment("delete-flag", "/delete-flag.wav")).unwrap();
+    db.record_review_flag("delete-flag", "human escalation evidence", "00000000-0000-4000-8000-000000000401").unwrap();
+    assert_refused(&db, "delete-flag");
+
+    insert_playback_segment(&db, "delete-playback", 1_000);
+    let playback_revision = db.segment_review_revision("delete-playback").unwrap().unwrap();
+    db.record_playback_receipt_raw(&receipt(
+        "delete-playback",
+        playback_revision,
+        TEST_AUDIO_CONTENT_HASH,
+        1_000,
+        1_000,
+    ))
+    .unwrap();
+    assert_refused(&db, "delete-playback");
+
+    db.insert_segment(&make_segment("delete-pay", "/delete-pay.wav")).unwrap();
+    ensure_test_audio_content_hash(&db, "delete-pay");
+    db.record_review_event_with_operation(
+        "delete-pay",
+        "Sara",
+        "skip",
+        "couch",
+        1,
+        "00000000-0000-4000-8000-000000000402",
+        &review_operation_payload_hash("delete-pay", "skip", "", "Sara"),
+    )
+    .unwrap();
+    assert_refused(&db, "delete-pay");
+
+    db.insert_segment(&make_segment("delete-spot", "/delete-spot.wav")).unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO spot_checks
+                (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+             VALUES ('delete-spot', 'Sara', 'edit', 'right', 'right', 1, 0.0)",
+            [],
+        )
+        .unwrap();
+    assert_refused(&db, "delete-spot");
+
+    let legacy = make_db();
+    assert_eq!(crate::migrations::rollback(&legacy, 1).unwrap(), vec![60]);
+    let mut reviewed = make_segment("delete-legacy", "/delete-legacy.wav");
+    reviewed.verified = true;
+    reviewed.human_decision = Some("accept".into());
+    reviewed.verdict = Some("human_accept".into());
+    reviewed.verdict_transcript = Some("legacy truth".into());
+    reviewed.annotated_transcript = Some("legacy truth".into());
+    legacy.insert_segment_full(&reviewed).unwrap();
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60]);
+    assert_refused(&legacy, "delete-legacy");
+
+    db.insert_segment(&make_segment("delete-batch-clean", "/delete-batch-clean.wav")).unwrap();
+    db.insert_segment(&make_segment("delete-batch-reviewed", "/delete-batch-reviewed.wav")).unwrap();
+    db.connection().execute("UPDATE speech_segments SET verified = 1 WHERE id = 'delete-batch-reviewed'", []).unwrap();
+    let batch_error =
+        db.delete_segments_batch(&["delete-batch-clean".into(), "delete-batch-reviewed".into()]).unwrap_err();
+    assert!(matches!(batch_error, AppError::Validation(_)), "{batch_error}");
+    assert!(db.get_segment_by_id("delete-batch-clean").unwrap().is_some(), "batch refusal is atomic");
+    assert!(db.get_segment_by_id("delete-batch-reviewed").unwrap().is_some());
 }
 
 #[test]
@@ -5517,6 +6481,7 @@ fn phone_decision_revision_cas_has_no_side_effects_on_a_stale_row() {
     let mut segment = make_segment("decision-cas", "/decision-cas.wav");
     segment.raw_transcript = "هەڵە".into();
     db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&db, "decision-cas");
     let served_revision = db.segment_review_revision("decision-cas").unwrap().unwrap();
 
     db.update_speaker_id("decision-cas", Some("SPEAKER_01")).unwrap();
@@ -5543,54 +6508,60 @@ fn phone_decision_revision_cas_has_no_side_effects_on_a_stale_row() {
 }
 
 #[test]
-fn phone_undo_rolls_back_the_row_if_learning_retraction_fails_then_retries_cleanly() {
+fn phone_undo_rolls_back_every_effect_when_reversal_insert_fails_then_retries_cleanly() {
     let db = make_db();
-    let mut previous = make_segment("undo-atomic", "/undo-atomic.wav");
-    previous.raw_transcript = "هەڵە".into();
-    db.insert_segment(&previous).unwrap();
+    let mut segment = make_segment("undo-atomic", "/undo-atomic.wav");
+    segment.raw_transcript = "هەڵە".into();
+    db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(&db, "undo-atomic");
     let served_revision = db.segment_review_revision("undo-atomic").unwrap().unwrap();
     let decided_revision = db
         .record_phone_human_decision_by_at_revision("undo-atomic", "edit", Some("ڕاست"), "Sara", served_revision)
         .unwrap()
         .unwrap();
+    let effect_id = latest_human_effect_id(&db, "undo-atomic");
+    let operation_id = "00000000-0000-4000-8000-000000000104";
 
     db.connection()
         .execute_batch(
-            "CREATE TRIGGER fail_undo_learning_delete
-             BEFORE DELETE ON agent_examples
-             WHEN old.segment_id = 'undo-atomic'
-             BEGIN SELECT RAISE(ABORT, 'injected undo failure'); END;",
+            "CREATE TRIGGER fail_effect_reversal
+             BEFORE INSERT ON human_decision_effect_reversals
+             BEGIN SELECT RAISE(ABORT, 'injected effect reversal failure'); END;",
         )
         .unwrap();
-    assert!(db.undo_phone_human_decision(&previous, "Sara", decided_revision, "undo-stale").is_err());
+    assert!(db.undo_human_decision(effect_id, Some("Sara"), operation_id).is_err());
 
     let still_decided = db.get_segment_by_id("undo-atomic").unwrap().unwrap();
-    assert!(still_decided.verified, "the row update must roll back with the failed delete");
+    assert!(still_decided.verified, "row restore must roll back with the failed effect reversal");
     assert_eq!(still_decided.reviewed_by.as_deref(), Some("Sara"));
     assert_eq!(db.segment_review_revision("undo-atomic").unwrap(), Some(decided_revision));
-    let examples_after_failure: i64 = db
-        .connection()
-        .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 'undo-atomic'", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(examples_after_failure, 1);
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT COUNT(*) FROM effective_human_decision_effects_v60 WHERE id = ?1", [effect_id], |row| {
+                row.get::<_, i64>(0)
+            },)
+            .unwrap(),
+        1
+    );
 
-    db.connection().execute_batch("DROP TRIGGER fail_undo_learning_delete;").unwrap();
-    let restored_revision = db
-        .undo_phone_human_decision(&previous, "Sara", decided_revision, "undo-success")
-        .unwrap()
-        .expect("the same undo token remains repairable after rollback");
-    assert!(restored_revision > decided_revision);
+    db.connection().execute_batch("DROP TRIGGER fail_effect_reversal;").unwrap();
+    assert!(matches!(
+        db.undo_human_decision(effect_id, Some("Sara"), operation_id).unwrap(),
+        HumanDecisionUndoOutcome::Applied { .. }
+    ));
     let restored = db.get_segment_by_id("undo-atomic").unwrap().unwrap();
     assert!(!restored.verified);
     assert!(restored.human_decision.is_none());
     assert!(restored.reviewed_by.is_none());
-    let examples_after_success: i64 = db
-        .connection()
-        .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 'undo-atomic'", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(examples_after_success, 0);
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT COUNT(*) FROM effective_human_decision_effects_v60 WHERE id = ?1", [effect_id], |row| {
+                row.get::<_, i64>(0)
+            },)
+            .unwrap(),
+        0
+    );
 }
-
 #[test]
 fn alignment_cas_never_overwrites_concurrent_boundary_metadata() {
     let db = make_db();
@@ -5630,6 +6601,7 @@ fn seed_for_provenance(db: &Database, id: &str, champion_text: &str) {
     let mut seg = make_segment(id, "/a/clip.wav");
     seg.raw_transcript = champion_text.to_string();
     db.insert_segment(&seg).unwrap();
+    ensure_test_audio_content_hash(db, id);
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: id.to_string(),
         model_id: "omniasr-wsl-7b".into(),
@@ -5643,7 +6615,7 @@ fn seed_for_provenance(db: &Database, id: &str, champion_text: &str) {
 fn accepting_the_champions_own_text_stays_an_accept() {
     let db = make_db();
     seed_for_provenance(&db, "acc-1", "کاک لە ئەمە شتێکی تر");
-    db.record_human_decision_by("acc-1", "accept", Some("کاک لە ئەمە شتێکی تر"), None, Some("Sara")).unwrap();
+    db.record_human_decision("acc-1", "accept", Some("کاک لە ئەمە شتێکی تر"), None).unwrap();
     let seg = db.get_segment_by_id("acc-1").unwrap().unwrap();
     assert_eq!(seg.human_decision.as_deref(), Some("accept"), "a genuine ASR accept must stay an accept");
 }
@@ -5653,7 +6625,7 @@ fn whitespace_alone_never_demotes_a_real_accept() {
     // The gate compares on words, not spacing; the backend must agree or it reclassifies honest accepts.
     let db = make_db();
     seed_for_provenance(&db, "acc-2", "کاک لە ئەمە شتێکی تر");
-    db.record_human_decision_by("acc-2", "accept", Some("  کاک   لە ئەمە\tشتێکی تر  "), None, Some("Sara")).unwrap();
+    db.record_human_decision("acc-2", "accept", Some("  کاک   لە ئەمە\tشتێکی تر  "), None).unwrap();
     assert_eq!(db.get_segment_by_id("acc-2").unwrap().unwrap().human_decision.as_deref(), Some("accept"));
 }
 
@@ -5664,11 +6636,10 @@ fn confirming_a_previous_humans_correction_is_recorded_as_human_authored() {
     // appear in none of its hypotheses.
     let db = make_db();
     seed_for_provenance(&db, "reg-82681df2", "کاک لە ئەمە شتێکی تر یەعنی");
-    db.record_human_decision_by("reg-82681df2", "edit", Some("کاک لامۆ، شتێکی تر، یەعنی"), None, Some("Rubar")).unwrap();
+    db.record_human_decision("reg-82681df2", "edit", Some("کاک لامۆ، شتێکی تر، یەعنی"), None).unwrap();
 
     // A later reviewer approves what they see — which is Rubar's text, not the engine's.
-    db.record_human_decision_by("reg-82681df2", "accept", Some("کاک لامۆ، شتێکی تر، یەعنی"), None, Some("Hawzhin"))
-        .unwrap();
+    db.record_human_decision("reg-82681df2", "accept", Some("کاک لامۆ، شتێکی تر، یەعنی"), None).unwrap();
 
     let seg = db.get_segment_by_id("reg-82681df2").unwrap().unwrap();
     assert_eq!(
@@ -5694,7 +6665,7 @@ fn confirming_a_previous_humans_correction_is_recorded_as_human_authored() {
 fn an_accept_of_text_no_engine_produced_is_never_an_accept() {
     let db = make_db();
     seed_for_provenance(&db, "acc-3", "کاک لە ئەمە شتێکی تر");
-    db.record_human_decision_by("acc-3", "accept", Some("تەواو جیاواز و دەستکاریکراو"), None, Some("Sara")).unwrap();
+    db.record_human_decision("acc-3", "accept", Some("تەواو جیاواز و دەستکاریکراو"), None).unwrap();
     let seg = db.get_segment_by_id("acc-3").unwrap().unwrap();
     assert_eq!(
         seg.human_decision.as_deref(),
@@ -5716,7 +6687,7 @@ fn an_auxiliary_engines_output_still_counts_as_an_accept() {
         confidence: None,
     })
     .unwrap();
-    db.record_human_decision_by("acc-4", "accept", Some("دەقی مۆدێلی تر"), None, Some("Sara")).unwrap();
+    db.record_human_decision("acc-4", "accept", Some("دەقی مۆدێلی تر"), None).unwrap();
     assert_eq!(db.get_segment_by_id("acc-4").unwrap().unwrap().human_decision.as_deref(), Some("accept"));
 }
 
@@ -5724,7 +6695,7 @@ fn an_auxiliary_engines_output_still_counts_as_an_accept() {
 fn a_reject_is_never_reclassified() {
     let db = make_db();
     seed_for_provenance(&db, "rej-1", "دەقی چامپیۆن");
-    db.record_human_decision_by("rej-1", "reject", None, None, Some("Sara")).unwrap();
+    db.record_human_decision("rej-1", "reject", None, None).unwrap();
     assert_eq!(db.get_segment_by_id("rej-1").unwrap().unwrap().human_decision.as_deref(), Some("reject"));
 }
 
@@ -5741,7 +6712,7 @@ fn a_human_decision_commit_is_fsynced_and_the_connection_returns_to_normal() {
     let before: i64 = db.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
     assert_eq!(before, 1, "precondition: the connection runs NORMAL (1)");
 
-    db.record_human_decision_by("dur-1", "accept", Some("دەقی چامپیۆن"), None, Some("Sara")).unwrap();
+    db.record_human_decision("dur-1", "accept", Some("دەقی چامپیۆن"), None).unwrap();
 
     let after: i64 = db.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
     assert_eq!(after, 1, "the escalation must not leak: other writes stay on NORMAL");
@@ -5754,6 +6725,7 @@ fn a_human_decision_commit_is_fsynced_and_the_connection_returns_to_normal() {
 
 /// Measure, do not assume: reviewer throughput has to survive the fsync.
 #[test]
+#[ignore = "mandatory verify-10 gate runs this wall-clock benchmark in isolation from parallel fsync tests"]
 fn the_durability_cost_per_decision_is_measured_not_assumed() {
     use std::time::Instant;
     let db = make_db();
@@ -5763,7 +6735,7 @@ fn the_durability_cost_per_decision_is_measured_not_assumed() {
     }
     let start = Instant::now();
     for i in 0..N {
-        db.record_human_decision_by(&format!("perf-{i}"), "accept", Some("دەقی چامپیۆن"), None, Some("Sara")).unwrap();
+        db.record_human_decision(&format!("perf-{i}"), "accept", Some("دەقی چامپیۆن"), None).unwrap();
     }
     let per_decision = start.elapsed().as_secs_f64() / N as f64;
     println!("MEASURED: {:.1} ms per durable human decision (n={N})", per_decision * 1000.0);
@@ -5781,17 +6753,27 @@ fn the_durability_cost_per_decision_is_measured_not_assumed() {
 // which is not the presence of listening. These pin what counts as having heard a clip.
 // ---------------------------------------------------------------------------------------------
 
-fn receipt(segment: &str, revision: i64, fingerprint: &str, played: i64, total: i64) -> PlaybackReceipt {
+fn receipt(segment: &str, revision: i64, content_hash: &str, played: i64, total: i64) -> PlaybackReceipt {
+    let (source_start_ms, source_end_ms) = test_source_span(segment, total);
     PlaybackReceipt {
         segment_id: segment.to_string(),
         segment_revision: revision,
-        audio_fingerprint: fingerprint.to_string(),
+        audio_content_hash: content_hash.to_string(),
         reviewer: Some("Sara".into()),
         session_id: Some("sess-1".into()),
         started_at_ms: 1_700_000_000_000,
         played_ms: played,
         clip_duration_ms: total,
+        source_start_ms: Some(source_start_ms),
+        source_end_ms: Some(source_end_ms),
     }
+}
+
+fn insert_playback_segment(db: &Database, id: &str, duration_ms: i64) {
+    let mut segment = make_segment(id, "/a/clip.wav");
+    segment.duration_ms = duration_ms;
+    db.insert_segment(&segment).unwrap();
+    ensure_test_audio_content_hash(db, id);
 }
 
 /// The receipt's identity fields are the SERVER's to state, whichever surface minted it.
@@ -5808,9 +6790,10 @@ fn a_receipt_is_measured_against_the_rows_own_clip_length() {
     let mut seg = make_segment("pb-den", "/a/clip.wav");
     seg.duration_ms = 10_000;
     db.insert_segment(&seg).unwrap();
+    ensure_test_audio_content_hash(&db, "pb-den");
 
     // The client claims the clip is 100ms and that it played all 100ms.
-    db.record_playback_receipt(&receipt("pb-den", 0, "fp-lie", 100, 100)).unwrap();
+    db.record_playback_receipt(&receipt("pb-den", 0, OTHER_AUDIO_CONTENT_HASH, 100, 100)).unwrap();
     let (total, coverage): (i64, f64) = db
         .connection()
         .query_row(
@@ -5823,47 +6806,72 @@ fn a_receipt_is_measured_against_the_rows_own_clip_length() {
     assert!(coverage < 0.02, "100ms of a 10s clip is not a listen, got {coverage}");
 }
 
-/// Mint and check must derive the SAME identity from the same row, or honest work deadlocks.
-///
-/// Found by the hunt: the desktop mint fell back to `path:{audio_path}` where the check fell back to
-/// `id:{segment_id}` — receipts for an unfingerprinted row could never satisfy the guard that reads
-/// them. Both now resolve inside the mint itself.
+/// A segment identifier, path, or spectral bucket is not exact audio identity. Missing decoded-PCM
+/// content hashes fail closed at mint.
 #[test]
-fn mint_and_check_agree_on_identity_for_an_unfingerprinted_row() {
+fn a_row_without_an_audio_content_hash_cannot_mint_playback_evidence() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-fp", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-fp", 7, "fp-client-claim", 1_000, 1_000)).unwrap();
-
-    let revision = db.segment_review_revision("pb-fp").unwrap().unwrap_or(0);
-    let fingerprint = db.segment_audio_fingerprint("pb-fp").unwrap().unwrap_or_else(|| format!("id:{}", "pb-fp"));
+    let error = db
+        .record_playback_receipt(&receipt("pb-fp", 7, OTHER_AUDIO_CONTENT_HASH, 1_000, 1_000))
+        .expect_err("client claims cannot replace missing server audio identity");
+    assert!(error.to_string().contains("server-derived audio content hash"));
+    let raw_error = db
+        .record_playback_receipt_raw(&receipt("pb-fp", 0, "   ", 1_000, 1_000))
+        .expect_err("even the internal writer must reject identity-free evidence");
+    assert!(raw_error.to_string().contains("canonical server-derived decoded-PCM BLAKE3 hash"));
     assert!(
-        db.has_sufficient_playback_evidence("pb-fp", revision, &fingerprint, Some("Sara")).unwrap(),
-        "the receipt must be findable under the exact identity the guard derives"
+        !db.record_playback_receipt_if_at_revision(&receipt("pb-fp", 0, OTHER_AUDIO_CONTENT_HASH, 1_000, 1_000), 0,)
+            .unwrap(),
+        "the atomic phone mint must write nothing when the server row has no content hash"
     );
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'pb-fp'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 /// Listening is PERSONAL: someone else's ears are not your evidence.
 ///
-/// Found by the hunt, verified certain: the guard matched receipts by segment+revision+fingerprint
+/// Found by the hunt, verified certain: the guard matched receipts by segment+revision+content hash
 /// only, so reviewer A's full listen let reviewer B's blind verdict through — on the phone, a clip
 /// A skipped after hearing goes to B's queue with A's receipt still valid for it.
 #[test]
 fn someone_elses_listening_is_not_your_evidence() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-who", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-who", 0, "fp-a", 1_000, 1_000)).unwrap(); // by Sara
+    let content_hash = ensure_test_audio_content_hash(&db, "pb-who");
+    db.record_playback_receipt(&receipt("pb-who", 0, OTHER_AUDIO_CONTENT_HASH, 1_000, 1_000)).unwrap(); // by Sara
 
     let revision = db.segment_review_revision("pb-who").unwrap().unwrap_or(0);
-    let fp = db.segment_audio_fingerprint("pb-who").unwrap().unwrap_or_else(|| "id:pb-who".into());
-    assert!(db.has_sufficient_playback_evidence("pb-who", revision, &fp, Some("Sara")).unwrap());
+    assert!(db.has_sufficient_playback_evidence("pb-who", revision, &content_hash, Some("Sara")).unwrap());
     assert!(
-        !db.has_sufficient_playback_evidence("pb-who", revision, &fp, Some("Hemn")).unwrap(),
+        !db.has_sufficient_playback_evidence("pb-who", revision, &content_hash, Some("Hemn")).unwrap(),
         "Sara's listen must not evidence Hemn's verdict"
     );
     assert!(
-        !db.has_sufficient_playback_evidence("pb-who", revision, &fp, None).unwrap(),
+        !db.has_sufficient_playback_evidence("pb-who", revision, &content_hash, None).unwrap(),
         "an anonymous desktop check must not ride a named phone receipt"
     );
+}
+
+#[test]
+fn a_noncanonical_decision_proof_is_never_an_authorization_capability() {
+    let db = make_db();
+    insert_playback_segment(&db, "pb-proof-shape", 1_000);
+    let revision = db.segment_review_revision("pb-proof-shape").unwrap().unwrap();
+    db.record_playback_receipt(&receipt("pb-proof-shape", revision, TEST_AUDIO_CONTENT_HASH, 900, 1_000)).unwrap();
+
+    assert!(!db.has_sufficient_playback_evidence("pb-proof-shape", revision, "424242", Some("Sara")).unwrap());
+    assert!(!db
+        .has_sufficient_playback_evidence(
+            "pb-proof-shape",
+            revision,
+            &TEST_AUDIO_CONTENT_HASH.to_uppercase(),
+            Some("Sara"),
+        )
+        .unwrap());
 }
 
 /// Voice focus narrows the queue to the named clips and NOTHING else — and no focus is the full queue.
@@ -5917,10 +6925,11 @@ fn a_desktop_decision_is_finalized_in_the_same_commit() {
 
     // An edit carries its text in the same commit too.
     db.insert_segment(&make_segment("fin-2", "/a/clip.wav")).unwrap();
-    db.finalize_human_review("fin-2", "edit", Some("دەقی ڕاست"), None, Some("Sara")).unwrap();
+    ensure_test_audio_content_hash(&db, "fin-2");
+    db.finalize_human_review("fin-2", "edit", Some("دەقی ڕاست"), None, None).unwrap();
     let row = db.get_segment_by_id("fin-2").unwrap().unwrap();
     assert!(row.verified);
-    assert_eq!(row.reviewed_by.as_deref(), Some("Sara"));
+    assert_eq!(row.reviewed_by, None, "desktop effects remain anonymous by contract");
 
     // And the un-finalizing recorder still exists for batch tools that must NOT verify.
     db.insert_segment(&make_segment("fin-3", "/a/clip.wav")).unwrap();
@@ -5932,25 +6941,206 @@ fn a_desktop_decision_is_finalized_in_the_same_commit() {
 }
 
 #[test]
+fn desktop_decision_retry_returns_the_original_commit_and_uuid_reuse_or_late_retry_fails_closed() {
+    let db = make_db();
+    db.insert_segment(&make_segment("desktop-replay", "/desktop-replay.wav")).unwrap();
+    let audio_content_hash = ensure_test_audio_content_hash(&db, "desktop-replay");
+    let revision = db.segment_review_revision("desktop-replay").unwrap().unwrap();
+    let (source_start_ms, source_end_ms) = db.segment_source_span("desktop-replay").unwrap().unwrap();
+    assert!(db
+        .record_playback_receipt_if_at_revision(
+            &PlaybackReceipt {
+                segment_id: "desktop-replay".into(),
+                segment_revision: revision,
+                audio_content_hash: audio_content_hash.clone(),
+                reviewer: None,
+                session_id: Some("desktop".into()),
+                started_at_ms: 1_700_000_000_000,
+                played_ms: 1_000,
+                clip_duration_ms: 1_000,
+                source_start_ms: None,
+                source_end_ms: None,
+            },
+            revision,
+        )
+        .unwrap());
+    let proof =
+        PlaybackDecisionProof { segment_revision: revision, audio_content_hash, source_start_ms, source_end_ms };
+    let operation_id = "11111111-2222-4333-8444-555555555555";
+    let first = db
+        .finalize_human_review_with_playback(
+            "desktop-replay",
+            "accept",
+            Some("test"),
+            Some(1_700_000_000_001),
+            &proof,
+            operation_id,
+        )
+        .unwrap();
+    let replay = db
+        .finalize_human_review_with_playback(
+            "desktop-replay",
+            "accept",
+            Some("test"),
+            Some(1_700_000_000_001),
+            &proof,
+            operation_id,
+        )
+        .expect("a lost-response retry with the exact frozen request returns its original commit");
+    assert_eq!(replay.effect_event_id, first.effect_event_id);
+    assert_eq!(replay.decided_revision, first.decided_revision);
+    let effect_count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id = ?1", [operation_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(effect_count, 1, "retry must not duplicate the immutable effect");
+
+    db.set_speaker_change_score("desktop-replay", 0.42).unwrap();
+    let metadata_revision = db.segment_review_revision("desktop-replay").unwrap().unwrap();
+    assert!(metadata_revision > first.decided_revision);
+    let after_metadata = db
+        .finalize_human_review_with_playback(
+            "desktop-replay",
+            "accept",
+            Some("test"),
+            Some(1_700_000_000_001),
+            &proof,
+            operation_id,
+        )
+        .expect("unrelated metadata may advance revision without invalidating an exact lost-response replay");
+    assert_eq!(after_metadata.effect_event_id, first.effect_event_id);
+    assert_eq!(after_metadata.decided_revision, first.decided_revision);
+
+    let reused = db
+        .finalize_human_review_with_playback(
+            "desktop-replay",
+            "accept",
+            Some("different text"),
+            Some(1_700_000_000_001),
+            &proof,
+            operation_id,
+        )
+        .unwrap_err();
+    assert!(reused.to_string().contains("different canonical payload"), "{reused}");
+
+    assert!(matches!(
+        db.undo_human_decision(first.effect_event_id, None, "00000000-0000-4000-8000-000000000309",).unwrap(),
+        HumanDecisionUndoOutcome::Applied { .. }
+    ));
+    let stale_replay = db
+        .finalize_human_review_with_playback(
+            "desktop-replay",
+            "accept",
+            Some("test"),
+            Some(1_700_000_000_001),
+            &proof,
+            operation_id,
+        )
+        .unwrap_err();
+    assert!(stale_replay.to_string().contains("exact post-state is no longer current"), "{stale_replay}");
+}
+
+#[test]
 fn a_full_listen_is_sufficient_evidence() {
     let db = make_db();
-    db.insert_segment(&make_segment("pb-1", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-1", 0, "fp-a", 9_000, 9_000)).unwrap();
-    assert!(db.has_sufficient_playback_evidence("pb-1", 0, "fp-a", Some("Sara")).unwrap());
+    insert_playback_segment(&db, "pb-1", 9_000);
+    db.record_playback_receipt_raw(&receipt("pb-1", 1, TEST_AUDIO_CONTENT_HASH, 9_000, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-1", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap());
+}
+
+#[test]
+fn a_receipt_for_a_different_source_span_never_authorizes_the_same_hash_revision_and_duration() {
+    let db = make_db();
+    insert_playback_segment(&db, "pb-span", 1_000);
+    let revision = db.segment_review_revision("pb-span").unwrap().unwrap();
+    let content_hash = db.segment_audio_content_hash("pb-span").unwrap().unwrap();
+    db.record_playback_receipt_raw(&receipt("pb-span", revision, &content_hash, 1_000, 1_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-span", revision, &content_hash, Some("Sara")).unwrap());
+
+    // Model a trigger-disabled staged database: keep the same segment id, decoded-PCM hash,
+    // duration, and revision while swapping only the window into the shared source recording.
+    db.connection().execute("DROP TRIGGER speech_segments_review_revision", []).unwrap();
+    db.connection().execute("DROP TRIGGER speech_segments_v60_paid_identity_immutable_update", []).unwrap();
+    let (old_start, old_end) = test_source_span("pb-span", 1_000);
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET alignment_json = json_object(
+                    'source_start_ms', ?2, 'source_end_ms', ?3,
+                    'chunk_index', 0, 'chunk_count', 1
+                )
+              WHERE id = ?1",
+            params!["pb-span", old_start + 2_000, old_end + 2_000],
+        )
+        .unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-span", revision, &content_hash, Some("Sara")).unwrap(),
+        "policy-3 evidence must bind the exact source window, not only the whole-source hash"
+    );
+}
+
+#[test]
+fn one_millisecond_alignment_rounding_is_valid_but_larger_duration_drift_is_not() {
+    let db = make_db();
+    db.insert_segment(&make_segment("pb-rounding", "/pb-rounding.wav")).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET audio_content_hash = ?2,
+                    alignment_json = json_object('source_start_ms', 50, 'source_end_ms', 1051)
+              WHERE id = ?1",
+            params!["pb-rounding", TEST_AUDIO_CONTENT_HASH],
+        )
+        .unwrap();
+    let revision = db.segment_review_revision("pb-rounding").unwrap().unwrap();
+    db.record_playback_receipt(&PlaybackReceipt {
+        segment_id: "pb-rounding".into(),
+        segment_revision: revision,
+        audio_content_hash: TEST_AUDIO_CONTENT_HASH.into(),
+        reviewer: Some("Sara".into()),
+        session_id: None,
+        started_at_ms: 1,
+        played_ms: 900,
+        clip_duration_ms: 1_000,
+        source_start_ms: None,
+        source_end_ms: None,
+    })
+    .unwrap();
+    assert!(db
+        .has_sufficient_playback_evidence("pb-rounding", revision, TEST_AUDIO_CONTENT_HASH, Some("Sara"))
+        .unwrap());
+
+    db.connection().execute("DROP TRIGGER speech_segments_review_revision", []).unwrap();
+    db.connection().execute("DROP TRIGGER speech_segments_v60_paid_identity_immutable_update", []).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET alignment_json = json_object('source_start_ms', 50, 'source_end_ms', 1052)
+              WHERE id = 'pb-rounding'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-rounding", revision, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
+        "two milliseconds is outside the measured endpoint-rounding tolerance"
+    );
 }
 
 /// The atomic mint (2026-08-20 hunt): check-and-insert in ONE statement, so a write landing between
 /// a caller's version fence and the mint can never rebind the receipt to a revision (and
-/// fingerprint) the reviewer never heard. `false` writes NOTHING.
+/// content hash) the reviewer never heard. `false` writes NOTHING.
 #[test]
 fn a_receipt_is_minted_only_at_the_expected_revision() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-rev", "/a/clip.wav")).unwrap();
+    ensure_test_audio_content_hash(&db, "pb-rev");
     let current = db.segment_review_revision("pb-rev").unwrap().unwrap_or(0);
 
     // At the verified revision: minted, with identity resolved from the row.
     assert!(db
-        .record_playback_receipt_if_at_revision(&receipt("pb-rev", 0, "claimed-fp", 9_000, 9_000), current)
+        .record_playback_receipt_if_at_revision(&receipt("pb-rev", 0, OTHER_AUDIO_CONTENT_HASH, 9_000, 9_000), current)
         .unwrap());
     let n: i64 = db
         .connection()
@@ -5960,7 +7150,10 @@ fn a_receipt_is_minted_only_at_the_expected_revision() {
 
     // At a revision the row is no longer on: declined, and NOTHING is written.
     assert!(!db
-        .record_playback_receipt_if_at_revision(&receipt("pb-rev", 0, "claimed-fp", 9_000, 9_000), current + 7)
+        .record_playback_receipt_if_at_revision(
+            &receipt("pb-rev", 0, OTHER_AUDIO_CONTENT_HASH, 9_000, 9_000),
+            current + 7,
+        )
         .unwrap());
     let n: i64 = db
         .connection()
@@ -5977,7 +7170,7 @@ fn no_receipt_at_all_is_not_evidence() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-2", "/a/clip.wav")).unwrap();
     assert!(
-        !db.has_sufficient_playback_evidence("pb-2", 0, "fp-a", Some("Sara")).unwrap(),
+        !db.has_sufficient_playback_evidence("pb-2", 0, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
         "a clip nobody played must never satisfy the listening requirement"
     );
 }
@@ -5986,9 +7179,53 @@ fn no_receipt_at_all_is_not_evidence() {
 fn opening_a_clip_without_hearing_it_is_not_evidence() {
     // The exact failure the old `audioError` gate allowed: the audio loaded fine and was never heard.
     let db = make_db();
-    db.insert_segment(&make_segment("pb-3", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-3", 0, "fp-a", 0, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-3", 0, "fp-a", Some("Sara")).unwrap());
+    insert_playback_segment(&db, "pb-3", 9_000);
+    db.record_playback_receipt_raw(&receipt("pb-3", 1, TEST_AUDIO_CONTENT_HASH, 0, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-3", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap());
+}
+
+/// Runtime authorization recomputes the server-bound raw counters.  ``coverage_ratio`` is a useful
+/// derived audit field, but changing that REAL must never turn zero listening into permission.
+#[test]
+fn a_forged_coverage_ratio_wrong_policy_or_denominator_cannot_unlock_a_verdict() {
+    let db = make_db();
+    insert_playback_segment(&db, "pb-raw-authority", 1_000);
+    db.record_playback_receipt_raw(&receipt("pb-raw-authority", 1, TEST_AUDIO_CONTENT_HASH, 0, 1_000)).unwrap();
+    db.connection().execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_update", []).unwrap();
+
+    db.connection()
+        .execute("UPDATE playback_receipts SET coverage_ratio = 1.0 WHERE segment_id = 'pb-raw-authority'", [])
+        .unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-raw-authority", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
+        "a forged derived ratio cannot override played_ms=0"
+    );
+
+    db.connection()
+        .execute(
+            "UPDATE playback_receipts
+                SET played_ms = 1000, clip_duration_ms = 1000, policy_version = ?1
+              WHERE segment_id = 'pb-raw-authority'",
+            [PLAYBACK_POLICY_VERSION + 1],
+        )
+        .unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-raw-authority", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
+        "raw counters minted under another policy cannot authorize this policy"
+    );
+
+    db.connection()
+        .execute(
+            "UPDATE playback_receipts
+                SET played_ms = 100, clip_duration_ms = 100, policy_version = ?1
+              WHERE segment_id = 'pb-raw-authority'",
+            [PLAYBACK_POLICY_VERSION],
+        )
+        .unwrap();
+    assert!(
+        !db.has_sufficient_playback_evidence("pb-raw-authority", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
+        "a client-sized denominator cannot replace the server's 1000ms duration"
+    );
 }
 
 /// The bar is a TUNED number, so pin it by behaviour and not only by its own name.
@@ -6007,17 +7244,17 @@ fn the_listening_bar_sits_exactly_where_the_constant_says() {
     let just_under = ((MIN_PLAYBACK_COVERAGE * total as f64) - 1.0).floor() as i64;
     let just_over = (MIN_PLAYBACK_COVERAGE * total as f64).ceil() as i64;
 
-    db.insert_segment(&make_segment("pb-bar-lo", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-bar-lo", 0, "fp-a", just_under, total)).unwrap();
+    insert_playback_segment(&db, "pb-bar-lo", total);
+    db.record_playback_receipt_raw(&receipt("pb-bar-lo", 1, TEST_AUDIO_CONTENT_HASH, just_under, total)).unwrap();
     assert!(
-        !db.has_sufficient_playback_evidence("pb-bar-lo", 0, "fp-a", Some("Sara")).unwrap(),
+        !db.has_sufficient_playback_evidence("pb-bar-lo", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
         "{just_under}ms of {total}ms is below the bar and must not satisfy it"
     );
 
-    db.insert_segment(&make_segment("pb-bar-hi", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-bar-hi", 0, "fp-a", just_over, total)).unwrap();
+    insert_playback_segment(&db, "pb-bar-hi", total);
+    db.record_playback_receipt_raw(&receipt("pb-bar-hi", 1, TEST_AUDIO_CONTENT_HASH, just_over, total)).unwrap();
     assert!(
-        db.has_sufficient_playback_evidence("pb-bar-hi", 0, "fp-a", Some("Sara")).unwrap(),
+        db.has_sufficient_playback_evidence("pb-bar-hi", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
         "{just_over}ms of {total}ms is at or above the bar and must satisfy it"
     );
 }
@@ -6025,42 +7262,51 @@ fn the_listening_bar_sits_exactly_where_the_constant_says() {
 #[test]
 fn half_a_sentence_is_not_enough_to_judge_it() {
     let db = make_db();
-    db.insert_segment(&make_segment("pb-4", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-4", 0, "fp-a", 4_500, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-4", 0, "fp-a", Some("Sara")).unwrap());
+    insert_playback_segment(&db, "pb-4", 9_000);
+    db.record_playback_receipt_raw(&receipt("pb-4", 1, TEST_AUDIO_CONTENT_HASH, 4_500, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-4", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap());
 }
 
 #[test]
 fn a_previous_clips_listen_can_never_unlock_this_one() {
     // The generation/source-change race, at the level that actually enforces it.
     let db = make_db();
-    db.insert_segment(&make_segment("pb-5", "/a/clip.wav")).unwrap();
-    db.insert_segment(&make_segment("pb-6", "/a/other.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-5", 0, "fp-a", 9_000, 9_000)).unwrap();
+    insert_playback_segment(&db, "pb-5", 9_000);
+    insert_playback_segment(&db, "pb-6", 9_000);
+    db.record_playback_receipt_raw(&receipt("pb-5", 1, TEST_AUDIO_CONTENT_HASH, 9_000, 9_000)).unwrap();
     assert!(
-        !db.has_sufficient_playback_evidence("pb-6", 0, "fp-b", Some("Sara")).unwrap(),
+        !db.has_sufficient_playback_evidence("pb-6", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
         "evidence for one clip must not unlock a different clip"
     );
 }
 
 #[test]
 fn a_listen_of_different_audio_bytes_does_not_count() {
-    // A receipt must not survive the audio being swapped underneath it.
+    // A policy-3 receipt with bytes other than the retained segment's decoded-PCM BLAKE3 identity
+    // is rejected at insertion, before it can become playback authority.
     let db = make_db();
-    db.insert_segment(&make_segment("pb-7", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-7", 0, "fp-old", 9_000, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-7", 0, "fp-new", Some("Sara")).unwrap());
+    insert_playback_segment(&db, "pb-7", 9_000);
+    let err = db
+        .record_playback_receipt_raw(&receipt("pb-7", 1, OTHER_AUDIO_CONTENT_HASH, 9_000, 9_000))
+        .expect_err("mismatched decoded-PCM identity must fail closed");
+    assert!(err.to_string().contains("policy-3 playback evidence"), "unexpected refusal: {err}");
+    assert!(!db.has_sufficient_playback_evidence("pb-7", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap());
+    let receipt_count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'pb-7'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(receipt_count, 0, "a rejected identity must leave no receipt behind");
 }
 
 #[test]
 fn a_correction_requires_its_own_listen() {
     // Re-review after an edit changes the text under judgement, so the earlier listen does not carry.
     let db = make_db();
-    db.insert_segment(&make_segment("pb-8", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-8", 0, "fp-a", 9_000, 9_000)).unwrap();
-    assert!(db.has_sufficient_playback_evidence("pb-8", 0, "fp-a", Some("Sara")).unwrap());
+    insert_playback_segment(&db, "pb-8", 9_000);
+    db.record_playback_receipt_raw(&receipt("pb-8", 1, TEST_AUDIO_CONTENT_HASH, 9_000, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-8", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap());
     assert!(
-        !db.has_sufficient_playback_evidence("pb-8", 1, "fp-a", Some("Sara")).unwrap(),
+        !db.has_sufficient_playback_evidence("pb-8", 2, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap(),
         "revision 1 is a different judgement and needs its own evidence"
     );
 }
@@ -6070,27 +7316,70 @@ fn seeking_and_replaying_accumulate_honestly() {
     // Cumulative media time: two partial listens that together cover the clip DO count, because the
     // reviewer did hear all of it — while wall-clock or a play() count would have accepted neither.
     let db = make_db();
-    db.insert_segment(&make_segment("pb-9", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-9", 0, "fp-a", 5_000, 9_000)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-9", 0, "fp-a", Some("Sara")).unwrap());
-    db.record_playback_receipt_raw(&receipt("pb-9", 0, "fp-a", 8_700, 9_000)).unwrap();
-    assert!(db.has_sufficient_playback_evidence("pb-9", 0, "fp-a", Some("Sara")).unwrap());
+    insert_playback_segment(&db, "pb-9", 9_000);
+    db.record_playback_receipt_raw(&receipt("pb-9", 1, TEST_AUDIO_CONTENT_HASH, 5_000, 9_000)).unwrap();
+    assert!(!db.has_sufficient_playback_evidence("pb-9", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap());
+    db.record_playback_receipt_raw(&receipt("pb-9", 1, TEST_AUDIO_CONTENT_HASH, 8_700, 9_000)).unwrap();
+    assert!(db.has_sufficient_playback_evidence("pb-9", 1, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap());
 }
 
 #[test]
 fn a_zero_duration_clip_can_never_be_certified_heard() {
-    // Corrupt/empty audio must fail closed rather than divide its way to 100% coverage.
+    // Corrupt/empty audio must fail closed at mint, not persist a receipt that later happens to be
+    // ignored or substitute a client-provided denominator for missing server truth.
     let db = make_db();
-    db.insert_segment(&make_segment("pb-10", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-10", 0, "fp-a", 0, 0)).unwrap();
-    assert!(!db.has_sufficient_playback_evidence("pb-10", 0, "fp-a", Some("Sara")).unwrap());
+    insert_playback_segment(&db, "pb-10", 0);
+    let revision = db.segment_review_revision("pb-10").unwrap().unwrap();
+    let claim = receipt("pb-10", revision, TEST_AUDIO_CONTENT_HASH, 1_000, 1_000);
+    assert!(db.record_playback_receipt(&claim).unwrap_err().to_string().contains("positive server clip duration"));
+    assert!(!db.record_playback_receipt_if_at_revision(&claim, revision).unwrap());
+
+    let mut raw = claim;
+    raw.clip_duration_ms = 0;
+    assert!(db.record_playback_receipt_raw(&raw).unwrap_err().to_string().contains("positive clip duration"));
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id='pb-10'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn playback_writers_reject_negative_fields_instead_of_clamping_them() {
+    let db = make_db();
+    insert_playback_segment(&db, "pb-negative", 1_000);
+    let revision = db.segment_review_revision("pb-negative").unwrap().unwrap();
+    let base = receipt("pb-negative", revision, TEST_AUDIO_CONTENT_HASH, 900, 1_000);
+
+    let mut bad_receipts = Vec::new();
+    let mut negative_revision = base.clone();
+    negative_revision.segment_revision = -1;
+    bad_receipts.push(negative_revision);
+    let mut negative_start = base.clone();
+    negative_start.started_at_ms = -1;
+    bad_receipts.push(negative_start);
+    let mut negative_played = base;
+    negative_played.played_ms = -1;
+    bad_receipts.push(negative_played);
+
+    for bad in bad_receipts {
+        assert!(db.record_playback_receipt_raw(&bad).is_err());
+        assert!(db.record_playback_receipt(&bad).is_err());
+        assert!(db.record_playback_receipt_if_at_revision(&bad, revision).is_err());
+    }
+    let count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id='pb-negative'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[test]
 fn a_receipt_records_which_policy_it_satisfied() {
     let db = make_db();
-    db.insert_segment(&make_segment("pb-11", "/a/clip.wav")).unwrap();
-    db.record_playback_receipt_raw(&receipt("pb-11", 0, "fp-a", 9_000, 9_000)).unwrap();
+    insert_playback_segment(&db, "pb-11", 9_000);
+    let revision = db.segment_review_revision("pb-11").unwrap().unwrap();
+    db.record_playback_receipt_raw(&receipt("pb-11", revision, TEST_AUDIO_CONTENT_HASH, 9_000, 9_000)).unwrap();
     let version: i64 = db
         .connection()
         .query_row("SELECT policy_version FROM playback_receipts WHERE segment_id='pb-11'", [], |r| r.get(0))
@@ -6104,7 +7393,8 @@ fn a_verdict_without_a_listen_is_refused_by_the_backend() {
     // offline, so a disabled button is usability, not a guarantee.
     let db = make_db();
     db.insert_segment(&make_segment("pb-guard-1", "/a/clip.wav")).unwrap();
-    let error = db.require_playback_evidence("pb-guard-1", 0, "fp-a", Some("Sara")).unwrap_err().to_string();
+    let error =
+        db.require_playback_evidence("pb-guard-1", 0, TEST_AUDIO_CONTENT_HASH, Some("Sara")).unwrap_err().to_string();
     assert!(error.contains("E_NO_PLAYBACK_EVIDENCE"), "refusal must be machine-readable, got: {error}");
 }
 
@@ -6112,12 +7402,15 @@ fn a_verdict_without_a_listen_is_refused_by_the_backend() {
 fn a_verdict_with_a_real_listen_is_allowed() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-guard-2", "/a/clip.wav")).unwrap();
+    ensure_test_audio_content_hash(&db, "pb-guard-2");
     // Through the REAL front door: the mint resolves identity from the row, so the check derives it
-    // the same way every production caller does, instead of hardcoding a fingerprint.
-    db.record_playback_receipt(&receipt("pb-guard-2", 0, "ignored-claim", 9_000, 9_000)).unwrap();
+    // the same way every production caller does, instead of hardcoding a content hash.
+    db.record_playback_receipt(&receipt("pb-guard-2", 0, OTHER_AUDIO_CONTENT_HASH, 9_000, 9_000)).unwrap();
     let revision = db.segment_review_revision("pb-guard-2").unwrap().unwrap_or(0);
-    let fp = db.segment_audio_fingerprint("pb-guard-2").unwrap().unwrap_or_else(|| "id:pb-guard-2".into());
-    db.require_playback_evidence("pb-guard-2", revision, &fp, Some("Sara")).expect("a heard clip must be decidable");
+    let content_hash =
+        db.segment_audio_content_hash("pb-guard-2").unwrap().expect("fixture has exact audio content hash");
+    db.require_playback_evidence("pb-guard-2", revision, &content_hash, Some("Sara"))
+        .expect("a heard clip must be decidable");
 }
 
 #[test]
@@ -6125,8 +7418,11 @@ fn evidence_for_the_wrong_clip_does_not_satisfy_the_guard() {
     let db = make_db();
     db.insert_segment(&make_segment("pb-guard-3", "/a/clip.wav")).unwrap();
     db.insert_segment(&make_segment("pb-guard-4", "/a/other.wav")).unwrap();
-    db.record_playback_receipt(&receipt("pb-guard-3", 0, "fp-a", 9_000, 9_000)).unwrap();
-    assert!(db.require_playback_evidence("pb-guard-4", 0, "fp-b", Some("Sara")).is_err());
+    ensure_test_audio_content_hash(&db, "pb-guard-3");
+    ensure_test_audio_content_hash(&db, "pb-guard-4");
+    db.record_playback_receipt(&receipt("pb-guard-3", 0, OTHER_AUDIO_CONTENT_HASH, 9_000, 9_000)).unwrap();
+    let other_revision = db.segment_review_revision("pb-guard-4").unwrap().unwrap();
+    assert!(db.require_playback_evidence("pb-guard-4", other_revision, TEST_AUDIO_CONTENT_HASH, Some("Sara")).is_err());
 }
 
 /// 2026-08-20 external review, blocker #1: "rows exist" must never mean "file completed". A

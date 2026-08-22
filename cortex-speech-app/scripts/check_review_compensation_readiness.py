@@ -2,9 +2,9 @@
 """Fail-closed production gate for Cortex reviewer compensation.
 
 This gate reads the migrated live database and active voice focus without modifying either.  It
-proves the authorized policy constants, one ledger consequence per post-cutoff review event,
-append-only triggers, durable schema-v59 hidden-key grants, the 24-action pilot ceiling, signed
-re-decision/reversal arithmetic, and canonical audio identity for every focused clip.  A pre-v59
+proves the authorized policy constants, one ledger consequence per effective post-cutoff event,
+append-only triggers, durable schema-v60 hidden-key grants, the 24-action pilot ceiling, signed
+re-decision/reversal arithmetic, and canonical audio identity for every focused clip.  A pre-v60
 database cannot be called ready merely because the source tree contains the new release code.
 """
 
@@ -19,7 +19,16 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from pilot_focus_contract import (
+    CANONICAL_IDENTITY_KIND,
+    canonical_audio_work_id,
+    canonical_reviewer_work_id,
+    canonical_source_span,
+    source_span_duration_issue,
+)
+
 from review_pilot_hidden_contract import (
+    COMPENSATION_POLICY_VERSION,
     POLICY_FILE as REVIEW_PILOT_FILE,
     REQUIRED_SCHEMA as REVIEW_PILOT_REQUIRED_SCHEMA,
     PilotContractError,
@@ -29,7 +38,7 @@ from review_pilot_hidden_contract import (
 )
 
 
-POLICY_VERSION = "review-iqd-v1-2026-08-21"
+POLICY_VERSION = COMPENSATION_POLICY_VERSION
 BASE_RATE_MICRO_IQD_PER_HOUR = 18_000_000_000
 BASIS_POINTS = {"edit": 10_000, "accept": 1_000, "reject": 1_000, "skip": 0}
 REQUIRED_TRIGGERS = {
@@ -42,6 +51,19 @@ REQUIRED_TRIGGERS = {
     "review_compensation_settlement_validate_insert",
     "review_compensation_settlement_immutable_update",
     "review_compensation_settlement_immutable_delete",
+    "review_events_v60_provenance_validate_insert",
+    "review_events_v60_provenance_immutable_update",
+    "review_events_v60_post_cutoff_immutable_update",
+    "review_events_v60_post_cutoff_immutable_delete",
+    "review_effect_state_immutable_insert",
+    "review_effect_state_immutable_update",
+    "review_effect_state_immutable_delete",
+    "human_decision_effect_events_validate_review_event_insert",
+    "human_decision_effect_events_immutable_update",
+    "human_decision_effect_events_immutable_delete",
+    "human_decision_effect_reversals_validate_phone_insert",
+    "human_decision_effect_reversals_immutable_update",
+    "human_decision_effect_reversals_immutable_delete",
 }
 
 
@@ -73,23 +95,20 @@ def _exact_entitlement(duration_ms: int, basis_points: int) -> int:
 
 
 def _canonical_focus_status(row: sqlite3.Row) -> tuple[bool, str, str | None]:
-    if int(row["duration_ms"]) <= 0:
+    if type(row["duration_ms"]) is not int or row["duration_ms"] <= 0:
         return False, "non-positive duration", None
-    content_hash = str(row["audio_content_hash"] or "").strip()
-    if not content_hash:
-        return False, "missing audio_content_hash", None
-    try:
-        alignment = json.loads(row["alignment_json"] or "null")
-    except json.JSONDecodeError:
-        return False, "invalid alignment_json", None
-    if not isinstance(alignment, dict):
-        return False, "alignment_json is not an object", None
-    start = alignment.get("source_start_ms")
-    end = alignment.get("source_end_ms")
-    # bool is an int subclass in Python; JSON true/false are not millisecond coordinates.
-    if type(start) is not int or type(end) is not int or start < 0 or end <= start:
-        return False, "missing canonical source span", None
-    return True, "", f"audio-segment-v1:{content_hash}:{start}:{end}"
+    work_id, reason = canonical_audio_work_id(row["audio_content_hash"], row["alignment_json"])
+    if work_id is None:
+        return False, reason, None
+    source_span, span_reason = canonical_source_span(row["alignment_json"])
+    if source_span is None:
+        return False, span_reason or "source span is invalid", None
+    duration_issue = source_span_duration_issue(
+        row["duration_ms"], source_span, subject="payable duration"
+    )
+    if duration_issue:
+        return False, duration_issue, None
+    return True, reason, work_id
 
 
 def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
@@ -114,6 +133,7 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return {**evidence, "ok": False, "errors": [f"invalid focus file: {error}"]}
     evidence["focusIds"] = len(focus_ids)
+    focus_id_set = set(focus_ids)
 
     try:
         pilot_policy = read_policy(db_path.parent / REVIEW_PILOT_FILE)
@@ -133,9 +153,9 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
         except sqlite3.Error:
             schema_version = 0
         evidence["schemaVersion"] = schema_version
-        if schema_version < REVIEW_PILOT_REQUIRED_SCHEMA:
+        if schema_version != REVIEW_PILOT_REQUIRED_SCHEMA:
             errors.append(
-                f"schema {schema_version} is older than durable pilot migration {REVIEW_PILOT_REQUIRED_SCHEMA}"
+                f"schema {schema_version} is not exact required pilot schema {REVIEW_PILOT_REQUIRED_SCHEMA}"
             )
             return {**evidence, "ok": False, "errors": errors}
 
@@ -192,7 +212,11 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
             for row in connection.execute(
                 """SELECT name, sql FROM sqlite_master
                     WHERE type = 'trigger'
-                      AND (name LIKE 'review_compensation_%' OR name LIKE 'review_event_operation_%')"""
+                      AND (name LIKE 'review_compensation_%'
+                           OR name LIKE 'review_event_operation_%'
+                           OR name LIKE 'review_events_v60_%'
+                           OR name LIKE 'review_effect_state_%'
+                           OR name LIKE 'human_decision_effect_%')"""
             )
         }
         missing_triggers = sorted(REQUIRED_TRIGGERS - triggers.keys())
@@ -214,35 +238,142 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
             errors.append("missing unique partial review-operation id index")
         evidence["operationIdIndex"] = bool(operation_index_sql)
 
+        ledger_event_index = next(
+            (
+                row
+                for row in connection.execute("PRAGMA index_list('review_compensation_ledger')")
+                if row["name"] == "idx_review_compensation_one_entry_per_event"
+            ),
+            None,
+        )
+        ledger_event_index_sql = ""
+        ledger_event_index_columns: list[str] = []
+        if ledger_event_index is not None:
+            index_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (ledger_event_index["name"],),
+            ).fetchone()
+            ledger_event_index_sql = " ".join(str(index_row["sql"] or "").upper().split()) if index_row else ""
+            ledger_event_index_columns = [
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA index_info('{ledger_event_index['name']}')"
+                )
+            ]
+        valid_ledger_event_index = (
+            ledger_event_index is not None
+            and int(ledger_event_index["unique"]) == 1
+            and int(ledger_event_index["partial"]) == 1
+            and ledger_event_index_columns == ["review_event_id"]
+            and "".join(ledger_event_index_sql.split())
+            == (
+                "CREATEUNIQUEINDEXIDX_REVIEW_COMPENSATION_ONE_ENTRY_PER_EVENT"
+                "ONREVIEW_COMPENSATION_LEDGER(REVIEW_EVENT_ID)WHEREREVIEW_EVENT_IDISNOTNULL"
+            )
+        )
+        if not valid_ledger_event_index:
+            errors.append(
+                "missing/malformed unique partial idx_review_compensation_one_entry_per_event"
+            )
+        evidence["eventLedgerUniqueIndex"] = valid_ledger_event_index
+
+        reversal_index = next(
+            (
+                row
+                for row in connection.execute("PRAGMA index_list('review_compensation_ledger')")
+                if row["name"] == "idx_review_compensation_one_reversal_per_entry"
+            ),
+            None,
+        )
+        reversal_index_sql = ""
+        reversal_index_columns: list[str] = []
+        if reversal_index is not None:
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (reversal_index["name"],),
+            ).fetchone()
+            reversal_index_sql = " ".join(str(row["sql"] or "").upper().split()) if row else ""
+            reversal_index_columns = [
+                str(item["name"])
+                for item in connection.execute(
+                    f"PRAGMA index_info('{reversal_index['name']}')"
+                )
+            ]
+        valid_reversal_index = (
+            reversal_index is not None
+            and int(reversal_index["unique"]) == 1
+            and int(reversal_index["partial"]) == 1
+            and reversal_index_columns == ["reverses_entry_id"]
+            and "".join(reversal_index_sql.split())
+            == (
+                "CREATEUNIQUEINDEXIDX_REVIEW_COMPENSATION_ONE_REVERSAL_PER_ENTRY"
+                "ONREVIEW_COMPENSATION_LEDGER(REVERSES_ENTRY_ID)"
+                "WHEREREVERSES_ENTRY_IDISNOTNULL"
+            )
+        )
+        if not valid_reversal_index:
+            errors.append(
+                "missing/malformed unique partial idx_review_compensation_one_reversal_per_entry"
+            )
+        evidence["ledgerReversalUniqueIndex"] = valid_reversal_index
+
         events = {
             int(row["id"]): row
             for row in connection.execute(
                 """SELECT id, segment_id, reviewer, action, compensation_action, source, duration_ms,
-                          operation_id, operation_payload_hash
-                     FROM review_events WHERE id > ? ORDER BY id""",
+                          operation_id, operation_payload_hash, app_git_sha, playback_guard_version
+                     FROM review_events
+                    WHERE id > ? AND source IN ('couch', 'couch_spot_check')
+                    ORDER BY id""",
                 (cutoff,),
             )
         }
-        ledger_rows = list(
+        all_ledger_rows = list(
             connection.execute(
                 """SELECT id, entry_id, policy_version, review_event_id, canonical_work_id,
                           canonical_identity_kind, reviewer, segment_id, compensation_action,
                           effective_decision, duration_ms, rate_basis_points,
                           entitlement_micro_iqd, delta_micro_iqd,
                           corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id
-                     FROM review_compensation_ledger
-                    WHERE policy_version = ? ORDER BY id""",
-                (POLICY_VERSION,),
+                     FROM review_compensation_ledger ORDER BY id"""
             )
         )
-        evidence["postCutoffEvents"] = len(events)
-        evidence["ledgerEntries"] = len(ledger_rows)
+        ledger_rows = [row for row in all_ledger_rows if row["policy_version"] == POLICY_VERSION]
+        effective_event_ids = {event.event_id for event in hidden_state.effective_events}
+        effective_ledger_ids = {event.ledger_id for event in hidden_state.effective_events}
+        accounting_effective_events = int(
+            connection.execute(
+                """SELECT COUNT(*) FROM effective_review_events_v60
+                    WHERE review_event_id > ? AND policy_version = ?
+                      AND source IN ('couch', 'couch_spot_check')""",
+                (cutoff, POLICY_VERSION),
+            ).fetchone()[0]
+        )
+        evidence["postCutoffEvents"] = len(effective_event_ids)
+        evidence["accountingEffectiveEvents"] = accounting_effective_events
+        evidence["rawPostCutoffEvents"] = len(events)
+        evidence["ledgerEntries"] = len(effective_ledger_ids)
+        evidence["rawLedgerEntries"] = len(ledger_rows)
+        evidence["reversalEntries"] = hidden_state.reversal_count
+        evidence["allPolicyLedgerEntries"] = len(all_ledger_rows)
 
         event_entry_counts: dict[int, int] = {}
+        all_policy_event_entry_counts: dict[int, int] = {}
         entry_by_id: dict[str, sqlite3.Row] = {}
         balances: dict[str, int] = {}
         corrected_balances: dict[str, int] = {}
         fallback_entries = 0
+        for row in all_ledger_rows:
+            review_event_id = row["review_event_id"]
+            if review_event_id is not None:
+                event_id = int(review_event_id)
+                all_policy_event_entry_counts[event_id] = all_policy_event_entry_counts.get(event_id, 0) + 1
+                if event_id in events and row["policy_version"] != POLICY_VERSION:
+                    errors.append(
+                        f"post-cutoff event {event_id} has a foreign-policy ledger consequence "
+                        f"{row['policy_version']!r}"
+                    )
+
         for row in ledger_rows:
             entry_id = str(row["entry_id"])
             entry_by_id[entry_id] = row
@@ -270,6 +401,34 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
                         errors.append(f"ledger identity {entry_id} disagrees with review event {review_event_id}")
                     if int(row["duration_ms"]) != int(event["duration_ms"]):
                         errors.append(f"ledger duration {entry_id} disagrees with review event {review_event_id}")
+                    segment = connection.execute(
+                        """SELECT id, audio_content_hash, alignment_json, duration_ms
+                             FROM speech_segments WHERE id = ?""",
+                        (event["segment_id"],),
+                    ).fetchone()
+                    identity_reason = "segment is missing"
+                    canonical = False
+                    if segment is not None:
+                        canonical, identity_reason, _audio_work_id = _canonical_focus_status(segment)
+                    expected_work_id: str | None = None
+                    if segment is not None and canonical:
+                        expected_work_id, reviewer_reason = canonical_reviewer_work_id(
+                            event["reviewer"],
+                            segment["audio_content_hash"],
+                            segment["alignment_json"],
+                        )
+                        if expected_work_id is None:
+                            identity_reason = reviewer_reason
+                    if (
+                        expected_work_id is None
+                        or row["canonical_identity_kind"] != CANONICAL_IDENTITY_KIND
+                        or row["canonical_work_id"] != expected_work_id
+                    ):
+                        errors.append(
+                            f"ledger canonical identity {entry_id} disagrees with event segment: "
+                            f"expected kind={CANONICAL_IDENTITY_KIND!r}, work={expected_work_id!r}; "
+                            f"reason={identity_reason or 'none'}"
+                        )
                 expected_bps = BASIS_POINTS.get(action)
                 if expected_bps is None:
                     errors.append(f"ledger entry {entry_id} has unsupported action {action!r}")
@@ -338,10 +497,17 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
 
         for event_id, event in events.items():
             action = str(event["compensation_action"] or "")
+            if str(event["segment_id"]) not in focus_id_set:
+                errors.append(f"post-cutoff event {event_id} is outside the exact active review focus")
             if action not in BASIS_POINTS:
                 errors.append(f"post-cutoff event {event_id} lacks a valid compensation_action")
             if event_entry_counts.get(event_id, 0) != 1:
                 errors.append(f"post-cutoff event {event_id} has {event_entry_counts.get(event_id, 0)} ledger entries")
+            if all_policy_event_entry_counts.get(event_id, 0) != 1:
+                errors.append(
+                    f"post-cutoff event {event_id} has {all_policy_event_entry_counts.get(event_id, 0)} "
+                    "total ledger entries across all policies"
+                )
             if str(event["source"] or "").startswith("couch"):
                 operation_id = str(event["operation_id"] or "")
                 operation_hash = str(event["operation_payload_hash"] or "")
@@ -354,6 +520,11 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
                 if len(operation_hash) != 64 or any(char not in "0123456789abcdef" for char in operation_hash):
                     errors.append(f"post-cutoff couch event {event_id} lacks a canonical payload hash")
         evidence["durableOperationReceipts"] = sum(
+            1
+            for event_id, event in events.items()
+            if event_id in effective_event_ids and str(event["operation_id"] or "")
+        )
+        evidence["rawDurableOperationReceipts"] = sum(
             1 for event in events.values() if str(event["operation_id"] or "")
         )
         evidence["fallbackLedgerEntries"] = fallback_entries

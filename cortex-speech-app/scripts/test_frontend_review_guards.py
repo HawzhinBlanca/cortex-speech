@@ -49,6 +49,21 @@ def _matching_brace(src: str, opening: int) -> int:
     return -1
 
 
+def _matching_paren(src: str, opening: int) -> int:
+    """Return the closing parenthesis paired with ``opening`` for a source-policy call."""
+    if opening == -1 or src[opening] != "(":
+        return -1
+    depth = 0
+    for index in range(opening, len(src)):
+        if src[index] == "(":
+            depth += 1
+        elif src[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
 def test_retranscribe_uses_authoritative_champion_row_and_guards_editor_writes() -> None:
     """ReviewMode.doRetranscribe() must use the champion's atomic backend commit, reload that exact row,
     and only then update the local store. It may never recreate the removed alternative-engine whole-row
@@ -83,8 +98,8 @@ def test_retranscribe_uses_authoritative_champion_row_and_guards_editor_writes()
 
 
 def test_submit_guards_editor_writes_against_navigation() -> None:
-    """ReviewMode.submit() (accept/edit): after the recordHumanDecision + updateSegment awaits, the store
-    write targets seg by id (correct even if the reviewer navigated away — an 'edit' hashes the whole file,
+    """ReviewMode.submit() (accept/edit): after the atomic recordHumanDecision await, the authoritative
+    returned row is applied to seg by id (correct even if the reviewer navigated away,
     hundreds of ms), but editText/lastLoadedOriginal/editedChips belong to the CURRENT clip. Without a
     current-vs-seg recheck, navigating mid-await puts seg's text into another clip's editor (and submit never
     resets lastLoadedId, so that clip's load effect no-ops and never reloads its own text); a subsequent Save
@@ -95,51 +110,55 @@ def test_submit_guards_editor_writes_against_navigation() -> None:
     and then restores a genuinely navigated row. Pin that equivalent (and component-tested) state machine
     instead of requiring the old literal early-return guard."""
     body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function submit(")
-    # P2.3b: the persist is now the TARGETED field update (was a whole-row updateSegment). The
-    # wrong-segment-guard invariant is unchanged — the guard must still sit between the store write and
-    # the editor write; only the store-write marker moved.
-    store_write = body.find("await api.updateSegmentFields(seg.id,")
+    # v60 removes the second renderer-owned write completely: decision, verification and transcript
+    # commit together, and the UI consumes only the server-returned authoritative row.  The navigation
+    # invariant remains: that id-targeted store update must precede the guarded editor write.
+    decision_commit = body.find("const commit = await api.recordHumanDecision(")
+    store_write = body.find("segments.update((list) => list.map((s) => (s.id === seg.id ? commit.segment : s)))")
     visible_capture = body.find("const visibleId = current?.id ?? null;")
     editor_guard = body.find("if (visibleId === seg.id)", visible_capture)
     guard_open = body.find("{", editor_guard)
     guard_close = _matching_brace(body, guard_open)
     editor_write = body.find("editText = text;", editor_guard)
-    if store_write == -1 or editor_write == -1:
-        raise AssertionError("submit structure changed (store/editor write markers missing) — gate vacuous")
+    if decision_commit == -1 or store_write == -1 or editor_write == -1:
+        raise AssertionError("submit atomic-commit/store/editor markers are missing — gate vacuous")
     if (
         visible_capture == -1
         or editor_guard == -1
         or guard_open == -1
         or guard_close == -1
-        or not (store_write < visible_capture < editor_guard < guard_open < editor_write < guard_close)
+        or not (decision_commit < store_write < visible_capture < editor_guard < guard_open < editor_write < guard_close)
     ):
         raise AssertionError(
             "submit() writes editText without capturing the post-await visible id and guarding the editor "
             "write with `if (visibleId === seg.id)`: navigating during the decision await would put seg's "
             "text into another clip's editor and Save it as that clip's human gold."
         )
+    if "api.updateSegmentFields(seg.id" in body or "api.updateSegment(" in body:
+        raise AssertionError(
+            "submit() performs a second renderer-owned segment write after the atomic human decision; "
+            "that can split verification from its immutable effect or clobber a fresher row"
+        )
 
 
-def test_go_draft_persist_uses_targeted_field_update() -> None:
-    """ReviewMode.go(): navigating with a dirty edit persists it as a draft. P2.3b: it must use the
-    TARGETED api.updateSegmentFields (annotatedTranscript only) — NEVER a whole-row api.updateSegment of
-    the store row. A whole-row upsert reverts a concurrent background batch's writes to this segment (the
-    store is stale vs the DB during a batch) AND a mid-align aligner's CTC timings (the whole-row-clobber
-    class). A field update touches only annotatedTranscript, so it is clobber-safe vs BOTH — which is why
-    the old `!aligning` skip + freshRow spread are no longer needed here. Stronger invariant than before:
-    the persist is structurally incapable of the clobber, not merely guarded against it."""
-    body = _function_body(_read("src/lib/ReviewMode.svelte"), "async function go(")
-    if "updateSegmentFields(seg.id, { annotatedTranscript:" not in body:
+def test_review_mode_drafts_are_session_local_until_atomic_decision() -> None:
+    """A typed ReviewMode draft is not authoritative human truth until submit() atomically records the
+    decision and all effects. Navigation may retain it in the in-session editCache, but navigation and
+    teardown must never persist annotatedTranscript by themselves."""
+    src = _read("src/lib/ReviewMode.svelte")
+    body = _function_body(src, "async function go(")
+    for forbidden in ("api.updateSegmentFields(", "api.updateSegment("):
+        if forbidden in src:
+            raise AssertionError(
+                f"ReviewMode still contains {forbidden!r}; drafts must stay session-local until the atomic "
+                "recordHumanDecision commit"
+            )
+    if "session-local editCache" not in body or "const editCache = new Map<string, string>()" not in src:
         raise AssertionError(
-            "go()'s draft-persist does not use the targeted updateSegmentFields — a whole-row upsert of the "
-            "batch-stale store row reverts a concurrent batch's writes. Persist annotatedTranscript via "
-            "api.updateSegmentFields(seg.id, { annotatedTranscript: text })."
+            "ReviewMode navigation no longer proves that dirty drafts remain in its per-segment session cache"
         )
-    if "api.updateSegment(" in body:
-        raise AssertionError(
-            "go() still whole-row upserts via api.updateSegment(...) — that reverts a concurrent batch's "
-            "writes to the segment (whole-row-clobber class); use the targeted api.updateSegmentFields."
-        )
+    if "await api.recordHumanDecision(" not in src:
+        raise AssertionError("ReviewMode lost its only durable human-review commit path")
 
 
 def test_inbox_undo_bails_while_a_decision_is_in_flight() -> None:
@@ -157,20 +176,23 @@ def test_inbox_undo_bails_while_a_decision_is_in_flight() -> None:
         )
 
 
-def test_app_normalize_uses_freshrow_not_a_stale_spread() -> None:
-    """App.svelte handleNormalize persists a whole-row updateSegment AFTER `await api.normalizeText`. It
-    must build the row from the FRESH store row by id, never spread the pre-await `{ ...seg }` snapshot —
-    which reverts any verify/edit/align stamp that landed during the normalize await (the
-    update-segment-whole-row-upsert clobber class)."""
-    body = _function_body(_read("src/App.svelte"), "async function handleNormalize(")
-    if "$segments.find((s) => s.id === seg.id)" not in body:
-        raise AssertionError(
-            "handleNormalize spreads a pre-await snapshot into updateSegment instead of the fresh store row "
-            "— a concurrent write during the normalize await is silently reverted (whole-row clobber class). "
-            "Use `...($segments.find((s) => s.id === seg.id) ?? seg)`."
-        )
-    if "{ ...seg, normalizedTranscript }" in body:
-        raise AssertionError("handleNormalize still spreads the stale `{ ...seg }` whole row; use freshRow-by-id")
+def test_frontend_has_no_generic_whole_row_segment_writer() -> None:
+    """A whole SpeechSegment necessarily carries annotatedTranscript and verified, so a generic frontend
+    update_segment wrapper can bypass the schema-v60 review-effect authority even when its caller meant to
+    change an unrelated field. Keep that IPC unreachable from every frontend source file."""
+    commands = _read("src/lib/commands.ts")
+    if "export async function updateSegment(" in commands:
+        raise AssertionError("commands.ts re-exposes the generic whole-row update_segment writer")
+    direct_invoke = re.compile(r"invoke(?:<[^>]*>)?\(\s*['\"]update_segment['\"]")
+    for path in sorted((REPO_ROOT / "src").rglob("*")):
+        if path.suffix not in {".ts", ".svelte"}:
+            continue
+        src = path.read_text(encoding="utf-8")
+        if "api.updateSegment(" in src or direct_invoke.search(src):
+            raise AssertionError(
+                f"{path.relative_to(REPO_ROOT)} can invoke the generic whole-row segment writer; "
+                "review-bearing fields must be structurally unreachable"
+            )
 
 
 def test_app_export_audio_excludes_human_rejected() -> None:
@@ -207,30 +229,86 @@ def test_waveform_stretches_peaks_across_the_canvas() -> None:
         raise AssertionError("Waveform still uses the 1-sample:1-bar samplesPerBar clamp; peaks won't fill the width")
 
 
-def test_app_save_handlers_use_field_level_updates() -> None:
-    """App.svelte's single-field mutations — handleSaveAnnotation (annotatedTranscript), handleSaveSpeaker
-    (speakerId), and handleToggleVerify (verified) — must each persist via api.updateSegmentFields (reads the
-    fresh row under the DB lock, writes only the named field, records undo history), NEVER a whole-row
-    api.updateSegment(...): a whole-row upsert of the STALE store row reverts any column a concurrent writer
-    changed. The Verify button in particular is reachable while the WSL-7B refinement loop is writing
-    raw_transcript in the background (it runs on wsl-log events, so it holds NO $isProcessing lock and never
-    disables Verify), so a whole-row upsert would silently revert the 7B's fresh transcript. freshRow can't
-    help — the store itself is the stale source (hunt-6 / iter 162)."""
-    src = _read("src/App.svelte")
-    for fn, field in (
-        ("handleSaveAnnotation", "annotatedTranscript"),
-        ("handleSaveSpeaker", "speakerId"),
-        ("handleToggleVerify", "verified"),
-    ):
-        body = _function_body(src, f"async function {fn}(")
-        if "api.updateSegment(" in body:  # any whole-row upsert; updateSegmentFields( does NOT match this
-            raise AssertionError(
-                f"{fn} whole-row-upserts a stale segment via api.updateSegment(...) — it can revert a "
-                f"concurrent writer (a batch op, or the WSL-7B refinement which holds no $isProcessing lock). "
-                f"Use api.updateSegmentFields(seg.id, {{ {field} }})."
-            )
-        if "api.updateSegmentFields(seg.id" not in body:
-            raise AssertionError(f"{fn} must persist via api.updateSegmentFields(seg.id, ...) (field-level, lock-safe)")
+def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> None:
+    """The main library may play and inspect transcript/diff data, but only ReviewMode can correct and
+    approve it. Its remaining partial writer is statically and dynamically limited to speaker/alignment
+    metadata, and no frontend call may send annotatedTranscript or verified through it."""
+    app = _read("src/App.svelte")
+    commands = _read("src/lib/commands.ts")
+    review_mode = _read("src/lib/ReviewMode.svelte")
+
+    forbidden_ui = (
+        "handleSaveAnnotation",
+        "handleToggleVerify",
+        "handleNormalize",
+        'data-testid="verify-btn"',
+        "finishEditingWord",
+        "scheduleAutoSave({ annotatedTranscript",
+        "Save annotation",
+        "Toggle verified",
+        "Toggle verification",
+        'aria-keyshortcuts="Enter Space F2"',
+        "ondblclick={() => playWordClip",
+    )
+    present = [marker for marker in forbidden_ui if marker in app]
+    if present:
+        raise AssertionError(
+            "App.svelte still exposes a library review mutation path: "
+            + ", ".join(repr(marker) for marker in present)
+        )
+
+    transcript = "value={$selectedSegment.annotatedTranscript ?? ''}"
+    transcript_start = app.find(transcript)
+    transcript_end = app.find("</textarea>", transcript_start)
+    if transcript_start == -1 or transcript_end == -1 or "readonly" not in app[transcript_start:transcript_end]:
+        raise AssertionError("the library's annotated transcript surface is not explicitly read-only")
+    for retained in ("<DiffView", "function playWordClip(", "async function handleAlign(", "handleSaveSpeaker"):
+        if retained not in app:
+            raise AssertionError(f"the read-only/metadata library capability {retained!r} was removed")
+
+    allowed_type = "Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>"
+    if allowed_type not in commands:
+        raise AssertionError(
+            "updateSegmentFields is not statically limited to speakerId/alignmentJson metadata"
+        )
+    wrapper_start = commands.find("export async function updateSegmentFields(")
+    wrapper_end = commands.find("\n}\n", wrapper_start)
+    if wrapper_start == -1 or wrapper_end == -1:
+        raise AssertionError("updateSegmentFields wrapper not found — this gate would pass vacuously")
+    wrapper = commands[wrapper_start:wrapper_end]
+    for forbidden in ("annotatedTranscript", "verified"):
+        if forbidden in wrapper:
+            raise AssertionError(f"updateSegmentFields can represent forbidden review field {forbidden}")
+
+    if "const unexpected = Object.keys(fields).filter(" not in app:
+        raise AssertionError("App autosave has no runtime fail-closed metadata key allowlist")
+    if "key !== 'speakerId' && key !== 'alignmentJson'" not in app:
+        raise AssertionError("App autosave metadata allowlist drifted from the typed wrapper")
+
+    for path in sorted((REPO_ROOT / "src").rglob("*")):
+        if path.suffix not in {".ts", ".svelte"}:
+            continue
+        src = path.read_text(encoding="utf-8")
+        cursor = 0
+        while True:
+            marker = src.find("api.updateSegmentFields", cursor)
+            if marker == -1:
+                break
+            opening = src.find("(", marker)
+            closing = _matching_paren(src, opening)
+            if closing == -1:
+                raise AssertionError(f"could not parse updateSegmentFields call in {path.relative_to(REPO_ROOT)}")
+            call = src[marker : closing + 1]
+            for forbidden in ("annotatedTranscript", "verified"):
+                if forbidden in call:
+                    raise AssertionError(
+                        f"{path.relative_to(REPO_ROOT)} sends forbidden review field {forbidden} "
+                        "through updateSegmentFields"
+                    )
+            cursor = closing + 1
+
+    if "await api.recordHumanDecision(" not in review_mode:
+        raise AssertionError("ReviewMode no longer owns the atomic human-decision path")
 
 
 def test_settings_close_persist_routes_through_savequietly() -> None:
@@ -435,19 +513,41 @@ def test_segment_stats_verified_excludes_placeholder_only_rows() -> None:
         )
 
 
-def test_verify_all_pending_excludes_placeholder_and_empty_rows() -> None:
-    """The ROOT of the class test_segment_stats_verified_excludes_placeholder_only_rows only band-aided at the
-    COUNT: handleBatchVerify('pending') builds its id list as $segments.filter(s => !s.verified) with no
-    content filter, so "Verify All Pending" marks placeholder ('[Pending WSL 7B ASR]') / empty rows verified.
-    They never ship (export drops placeholders) but they STRAND — the WSL-7B refinement loop skips verified
-    rows (update_asr_transcript_if_unreviewed's `AND verified=0`), so the placeholder can never be filled — and
-    they dishonestly read as verified. Since the frontend is now windowed, the whole-view id query must request
-    only `real` transcripts instead of filtering the incomplete render window."""
-    body = _function_body(_read("src/App.svelte"), "async function handleBatchVerify(")
-    if "resolveViewIds('real', false, null)" not in body:
+def test_batch_verify_controls_are_not_reachable_and_review_mode_owns_approval() -> None:
+    """Schema-v60 human truth requires one playback-bound, immutable decision effect per approval.
+
+    The legacy Verify All/Selected path wrote only ``verified=1`` and therefore produced reviewed rows
+    with no effect authority; a healthy snapshot containing such a row could not pass the fail-closed
+    restore gate. Keep the compatibility IPC wrapper out of the reachable UI, and leave ReviewMode's
+    atomic human-decision command as the approval path.
+    """
+    app = _read("src/App.svelte")
+    commands = _read("src/lib/commands.ts")
+    forbidden = (
+        "handleBatchVerify(",
+        "api.batchVerify(",
+        "$t('batchVerify.allPending')",
+        "$t('batchVerify.selected')",
+    )
+    present = [marker for marker in forbidden if marker in app]
+    if present:
         raise AssertionError(
-            "handleBatchVerify('pending') must request unverified IDs with transcriptState='real'; otherwise "
-            "Verify All Pending can mark placeholders/empty rows verified or cover only the loaded page."
+            "App.svelte must not expose legacy batch verification under schema v60; found "
+            + ", ".join(repr(marker) for marker in present)
+        )
+
+    command_markers = ("function batchVerify(", "invoke('batch_verify'", 'invoke("batch_verify"')
+    present_commands = [marker for marker in command_markers if marker in commands]
+    if present_commands:
+        raise AssertionError(
+            "Frontend commands must not retain an invocable batch verification wrapper under schema v60; found "
+            + ", ".join(repr(marker) for marker in present_commands)
+        )
+
+    review_mode = _read("src/lib/ReviewMode.svelte")
+    if "await api.recordHumanDecision(" not in review_mode:
+        raise AssertionError(
+            "ReviewMode must retain the atomic recordHumanDecision approval path after removing legacy batch verify"
         )
 
 

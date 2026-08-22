@@ -40,7 +40,10 @@
 //! Reviewer links carry a pairing secret in the URL fragment, exchange it for a distinct Secure,
 //! HttpOnly session cookie, and never send the pairing secret in a URL or data request.
 
-use crate::db::{Database, ReviewDecisionLimit, SpeechSegment, REVIEW_PILOT_LIMIT_REACHED};
+use crate::db::{
+    Database, HumanDecisionUndoOutcome, PlaybackDecisionProof, ReviewDecisionLimit, SpeechSegment,
+    HIDDEN_ANSWER_KEY_CHANGED, PLAYBACK_EVIDENCE_CHANGED, REVIEW_PILOT_LIMIT_REACHED,
+};
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -147,20 +150,12 @@ const MAX_SESSIONS_PER_REVIEWER: usize = 8;
 static COUCH_RATE_LIMITER: crate::throttle::GlobalRateLimiter =
     crate::throttle::GlobalRateLimiter::new_with_burst(120, 60);
 
-/// One undoable phone decision: the pre-decision snapshot to restore, plus the row's
-/// post-decision monotonic revision — the staleness fence `api_undo` compares atomically while
-/// restoring (text-provenance audit #2/#3: the old fence keyed only on `reviewed_by`, which no
-/// non-decision writer touches, so a batch normalize / desktop edit / champion re-draft between
-/// decision and undo was silently reverted to the snapshot).
+/// One undoable phone decision. The database owns the inverse snapshot and CAS revision; this token
+/// carries only immutable identities and can never act as renderer authority over a corpus row.
 struct UndoEntry {
-    /// Identifies THIS in-flight submit. Two requests from the same reviewer can overlap; removing
-    /// `stack.pop()` on one failure could otherwise discard the other request's successful undo entry.
     operation_id: String,
     seg_id: String,
-    prev: SpeechSegment,
-    /// `None` until the decision's final row write lands: an entry with no revision is a decision
-    /// whose write never completed, and restoring over an unverifiable state is not a safe inverse.
-    decided_revision: Option<i64>,
+    effect_event_id: i64,
 }
 
 /// Per-session state shared by the accept threads. One mutex: the critical sections are map lookups,
@@ -2267,6 +2262,37 @@ fn lock_state(state: &Mutex<CouchState>) -> std::sync::MutexGuard<'_, CouchState
     state.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+fn remember_phone_undo(
+    state: &Mutex<CouchState>,
+    reviewer: &str,
+    operation_id: &str,
+    segment_id: &str,
+    effect_event_id: i64,
+) {
+    let mut guard = lock_state(state);
+    let stack = guard.undo.entry(reviewer.to_string()).or_default();
+    if !stack.iter().any(|entry| entry.effect_event_id == effect_event_id) {
+        stack.push(UndoEntry {
+            operation_id: operation_id.to_string(),
+            seg_id: segment_id.to_string(),
+            effect_event_id,
+        });
+    }
+    let overflow = stack.len().saturating_sub(UNDO_DEPTH);
+    if overflow > 0 {
+        stack.drain(0..overflow);
+    }
+}
+
+fn retain_phone_undo_token(state: &Mutex<CouchState>, reviewer: &str, insertion_index: usize, entry: UndoEntry) {
+    let mut guard = lock_state(state);
+    let stack = guard.undo.entry(reviewer.to_string()).or_default();
+    if stack.iter().any(|existing| existing.effect_event_id == entry.effect_event_id) {
+        return;
+    }
+    stack.insert(insertion_index.min(stack.len()), entry);
+}
+
 /// Execute one protected route only while the cookie still resolves to the same reviewer. The caller
 /// reads the bounded POST body first, so a slow client cannot hold revocation hostage merely by never
 /// finishing its upload. The read guard stays through the whole closure; `revoke_in` takes the write
@@ -3512,7 +3538,7 @@ struct DecisionBody {
     ///
     /// Not wall-clock, not a `play()` call, not a download — a clip can arrive, decode and sit at
     /// 0:00 while nobody hears a word. The page only reports how much it played; the SERVER resolves
-    /// the segment's revision and audio fingerprint itself, so a client cannot mint evidence naming a
+    /// the segment's revision and decoded-PCM content hash itself, so a client cannot mint evidence naming a
     /// clip or revision it never loaded.
     #[serde(default, rename = "heardMs")]
     heard_ms: Option<i64>,
@@ -3532,14 +3558,7 @@ enum ReviewOperationState {
 /// changing `edit` to `accept` while reusing the UUID is still a different client operation and must
 /// be rejected. Length framing makes the tuple unambiguous for arbitrary Unicode transcript text.
 fn decision_operation_payload_hash(segment_id: &str, action: &str, text: &str, reviewer: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"cortex-review-operation-v1");
-    for value in [segment_id, action, text, reviewer] {
-        let bytes = value.as_bytes();
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
-    }
-    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::db::review_operation_payload_hash(segment_id, action, text, reviewer)
 }
 
 fn review_operation_state(
@@ -3626,9 +3645,21 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         let payload_hash = decision_operation_payload_hash(&parsed.id, &parsed.action, &parsed.text, reviewer);
         match review_operation_state(db, operation_id, &payload_hash, &parsed.id, reviewer) {
             Ok(ReviewOperationState::ExactReplay) => {
+                let effect = match db.human_decision_effect_for_operation(operation_id) {
+                    Ok(effect) => effect,
+                    Err(error) => return err_reply(500, &format!("decision effect lookup failed: {error}")),
+                };
+                let effect_event_id = effect.as_ref().map(|value| value.0);
+                if let Some((effect_event_id, segment_id)) = effect.as_ref() {
+                    remember_phone_undo(state, reviewer, operation_id, segment_id, *effect_event_id);
+                }
                 return json_reply_with_accounting(
                     200,
-                    serde_json::json!({ "ok": true, "duplicate": true }),
+                    serde_json::json!({
+                        "ok": true,
+                        "duplicate": true,
+                        "effectEventId": effect_event_id,
+                    }),
                     db,
                     reviewer,
                 );
@@ -3703,6 +3734,12 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             other => return err_reply(400, &format!("unknown action '{other}'")),
         }
     };
+    if parsed.heard_ms.is_some_and(|value| value < 0) {
+        return err_reply(400, "heardMs must be a non-negative media-time counter");
+    }
+    if parsed.clip_duration_ms.is_some_and(|value| value < 0) {
+        return err_reply(400, "clipDurationMs must not be negative");
+    }
 
     // A dropped RESPONSE (not a dropped request) means the write landed and the page never heard so.
     // Answer the retry with the success it already earned, before taking a lease, minting a second
@@ -3725,6 +3762,18 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         // exactly when a reviewer is least sure their work registered.
         forget_work_audio_assignment(state, &parsed.id, reviewer);
         return json_reply_with_accounting(200, serde_json::json!({ "ok": true, "duplicate": true }), db, reviewer);
+    }
+    if already_recorded {
+        match crate::migrations::get_current_version(db) {
+            Ok(version) if version >= 60 => {
+                return err_reply(
+                    409,
+                    "this legacy interrupted decision requires offline repair before review can continue; no corpus state was changed",
+                )
+            }
+            Ok(_) => {}
+            Err(error) => return err_reply(500, &format!("schema authority lookup failed: {error}")),
+        }
     }
 
     // A completed hidden check never changes the corpus row, so the corpus duplicate predicate above
@@ -3750,9 +3799,9 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // check, writing an audit event, or touching the corpus. The completed identical retry above is
     // deliberately earlier: acknowledging bytes that are already durably stored writes nothing and
     // lets an outbox created by the immediately previous phone build drain safely after deployment.
-    // Spot checks still require a parseable stamp, though their stamp is not compared for freshness
-    // because grading never mutates the answer-key row. A skip remains the only mutating-flow
-    // exemption because it writes no verdict.
+    // Hidden checks require the same parseable, fresh stamp as corpus decisions: grading does not
+    // mutate the answer-key row, but its playback evidence still belongs to the exact bytes served.
+    // A skip remains the only new-action exemption because it writes no verdict or paid judgement.
     let served_revision = if parsed.action == "skip" {
         None
     } else {
@@ -3873,25 +3922,25 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // misclassify accept-vs-edit against the NEW row and mint a DPO pair anti-training the fresher
     // draft. Refuse; the page reloads and serves the current text.
     //
-    // Placed BEFORE the receipt mint (audit fix 2026-08-20). The receipt's revision, fingerprint
+    // Placed BEFORE the receipt mint (audit fix 2026-08-20). The receipt's revision, content hash,
     // and duration are all resolved from the row, so minting one for a submit whose serve predates
     // a re-chunk would bind this reviewer's real listening to audio they never heard — evidence
     // manufactured by ordering. A stale serve must be refused while it is still only a claim.
     //
-    // Three exemptions, each because the fence would refuse an act that cannot conflict:
+    // Two exemptions, each because the fence would refuse an act that cannot conflict:
     //   * a replay finishing an already-recorded decision — its write one landed, so the stamp has
     //     legitimately moved;
     //   * a SKIP — it writes no verdict, and fencing it boomeranged the clip back to the same
     //     reviewer forever (the lease is kept on a 409) while the offline replay of the skip was
-    //     dropped into the "work lost" banner, all for an act with nothing to be stale about;
-    //   * a SPOT CHECK — see above.
+    //     dropped into the "work lost" banner, all for an act with nothing to be stale about.
+    // A hidden check is NOT exempt: the browser's heard milliseconds belong to the exact audio it
+    // was served. Rebinding them to whatever revision happens to exist at submit time would create
+    // playback evidence for bytes the reviewer may never have heard, even though grading leaves the
+    // corpus row unchanged. Availability after a benign metadata stamp is secondary to evidence
+    // identity; the reviewer reloads and hears the current row.
     // Neither exemption can manufacture evidence: the mint below re-verifies the revision
     // atomically and simply declines the receipt when the row has moved.
-    if !already_recorded
-        && parsed.action != "skip"
-        && expected_key.is_none()
-        && served_revision != Some(request_revision)
-    {
+    if !already_recorded && parsed.action != "skip" && served_revision != Some(request_revision) {
         return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
     }
 
@@ -3943,7 +3992,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     //
     // Order matters and is not obvious: the page reports its heard-time WITH the decision, so the
     // receipt for this very submit has to be recorded before the guard can possibly pass. Checking
-    // first would refuse every decision forever. The revision and the fingerprint are still resolved
+    // first would refuse every decision forever. The revision and content hash are still resolved
     // server-side, and the coverage denominator is the server's own clip length, so neither half of
     // the ratio is the client's to assert.
     //
@@ -3958,18 +4007,37 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // clip nobody heard is a guess either way.
     let now_ms =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    let fingerprint =
-        db.segment_audio_fingerprint(&parsed.id).ok().flatten().unwrap_or_else(|| format!("id:{}", parsed.id));
-    // The revision this receipt binds to. For a decision it is the one the fence just verified
-    // against the serve. For a SPOT CHECK it is the row as it stands NOW: bulk stamps bump gold
-    // rows' revisions without touching the audio, the fence exempts checks for exactly that
-    // reason, and the receipt + evidence check must agree on one value or an honest listener
-    // would be refused.
-    let revision = if expected_key.is_some() {
-        db.segment_review_revision(&parsed.id).ok().flatten().unwrap_or(request_revision)
-    } else {
-        request_revision
+    let content_hash = match db.segment_audio_content_hash(&parsed.id) {
+        Ok(Some(value)) => Some(value),
+        Ok(None) if parsed.action == "skip" => {
+            tracing::info!(
+                "skip on {} has no server-derived audio content hash; no playback receipt will be minted",
+                parsed.id
+            );
+            None
+        }
+        Ok(None) => {
+            return err_reply(
+                503,
+                "playback identity is unavailable — this clip has no canonical server-derived audio content hash",
+            )
+        }
+        Err(error) => return err_reply(500, &format!("playback identity lookup failed: {error}")),
     };
+    let source_span = match db.segment_source_span(&parsed.id) {
+        Ok(Some(value)) => Some(value),
+        Ok(None) if parsed.action == "skip" => None,
+        Ok(None) => {
+            return err_reply(
+                503,
+                "playback identity is unavailable — this clip has no canonical server-derived source span",
+            )
+        }
+        Err(error) => return err_reply(500, &format!("playback source-span lookup failed: {error}")),
+    };
+    // The revision this receipt binds to is always the exact row fetched above. Every non-skip
+    // submit—including a hidden check—has just proven that it equals the served rowVersion.
+    let revision = request_revision;
     // A skip whose SERVE is already stale mints nothing at all: the skip itself still lands (it
     // writes no verdict), but the mint below resolves identity from the CURRENT row, and listening
     // that happened on a serve the fence can no longer verify must not become evidence bound to a
@@ -3982,21 +4050,23 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             .is_some_and(|served| served != request_revision);
     if stale_skip {
         tracing::info!("skip on {} kept, receipt declined: the serve predates the current row", parsed.id);
-    } else if let Some(heard_ms) = parsed.heard_ms {
+    } else if let (Some(heard_ms), Some(content_hash)) = (parsed.heard_ms, content_hash.as_ref()) {
         let receipt = crate::db::PlaybackReceipt {
             segment_id: parsed.id.clone(),
             segment_revision: revision,
-            audio_fingerprint: fingerprint.clone(),
+            audio_content_hash: content_hash.clone(),
             reviewer: Some(reviewer.to_string()),
             session_id: None,
             started_at_ms: now_ms,
-            played_ms: heard_ms.max(0),
-            clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0).max(0),
+            played_ms: heard_ms,
+            clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0),
+            source_start_ms: None,
+            source_end_ms: None,
         };
         // Atomic check-and-mint (2026-08-20 hunt): the front door's own resolution re-queried the
         // row AFTER the fence, so a write landing in between rebound the receipt to a revision the
         // reviewer never heard. The mint now verifies the revision in the same statement that
-        // inserts — fingerprint and duration are resolved from exactly the verified row.
+        // inserts — content hash and duration are resolved from exactly the verified row.
         match db.record_playback_receipt_if_at_revision(&receipt, revision) {
             Ok(true) => {}
             Ok(false) if parsed.action == "skip" => {
@@ -4032,16 +4102,25 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         }
     }
     if parsed.action != "skip" {
-        match db.has_sufficient_playback_evidence(&parsed.id, revision, &fingerprint, Some(reviewer)) {
+        let Some(content_hash) = content_hash.as_deref() else {
+            return err_reply(
+                503,
+                "playback identity is unavailable — this clip has no canonical server-derived audio content hash",
+            );
+        };
+        match db.has_sufficient_playback_evidence(&parsed.id, revision, content_hash, Some(reviewer)) {
             Ok(true) => {}
             Ok(false) => {
-                tracing::warn!("PLAYBACK_EVIDENCE_REFUSED: {} by {reviewer} at revision {revision}", parsed.id);
+                tracing::warn!(
+                    "PLAYBACK_EVIDENCE_V3_CONTENT_HASH_RAW_COUNTER_REFUSED: {} by {reviewer} at revision {revision}",
+                    parsed.id
+                );
                 // 428 Precondition Required: the reviewer must do something first, and it is neither a
                 // conflict (409) nor a malformed request (400). The page holds the clip and says so; the
                 // outbox treats it as a settled answer rather than retrying what can never land.
                 return err_reply(
                     428,
-                    &db.require_playback_evidence(&parsed.id, revision, &fingerprint, Some(reviewer))
+                    &db.require_playback_evidence(&parsed.id, revision, content_hash, Some(reviewer))
                         .err()
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
@@ -4054,7 +4133,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             Err(e) => return err_reply(500, &format!("playback evidence check failed: {e}")),
         }
     }
-
     // SKIP — the explicit NO-VERDICT (R4.4), handled before any of the write machinery because it
     // shares none of it.
     //
@@ -4084,6 +4162,8 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             now_ms,
             operation_id,
             operation_payload_hash,
+            &parsed.action,
+            &parsed.text,
             pilot_decision_limit.as_ref(),
         ) {
             tracing::warn!("Couch Review skip event not recorded for {}: {error}", parsed.id);
@@ -4151,8 +4231,16 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             Err(error) => return err_reply(503, &error),
         }
         let submitted = text.as_deref().unwrap_or_default();
+        let playback_proof = content_hash.as_ref().zip(source_span).filter(|_| decision != "skip").map(
+            |(value, (source_start_ms, source_end_ms))| PlaybackDecisionProof {
+                segment_revision: revision,
+                audio_content_hash: value.clone(),
+                source_start_ms,
+                source_end_ms,
+            },
+        );
         let recorded = if let Some((policy_sha256, after_review_event_id)) = pilot_namespace.as_ref() {
-            db.record_pilot_spot_check_with_operation(
+            db.record_pilot_spot_check_with_operation_request(
                 policy_sha256,
                 *after_review_event_id,
                 &parsed.id,
@@ -4160,22 +4248,32 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 decision,
                 submitted,
                 &expected,
+                &parsed.action,
+                &parsed.text,
+                playback_proof.as_ref(),
                 operation_id,
                 operation_payload_hash,
             )
         } else {
-            db.record_spot_check_with_operation(
+            db.record_spot_check_with_operation_request(
                 &parsed.id,
                 reviewer,
                 decision,
                 submitted,
                 &expected,
+                &parsed.action,
+                &parsed.text,
+                playback_proof.as_ref(),
                 operation_id,
                 operation_payload_hash,
             )
         };
         if let Err(e) = recorded {
             tracing::warn!("Couch Review spot-check not recorded for {}: {e}", parsed.id);
+            let message = e.to_string();
+            if message.contains(PLAYBACK_EVIDENCE_CHANGED) || message.contains(HIDDEN_ANSWER_KEY_CHANGED) {
+                return err_reply(409, "this clip changed while the decision was being saved — reload it");
+            }
             // A 200 removes this decision from the phone's durable outbox forever. If the score did
             // not commit, success would silently discard the first answer and let a later attempt
             // replace the measurement. Return the same retryable 5xx class used by ordinary decision
@@ -4224,7 +4322,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     //
     // It sits after validation so a REJECTED request (bad action, placeholder text, missing row) cannot
     // leave a 15-minute lease on a clip it never decided, locking other reviewers out of it.
-    let undo_operation_id = (!already_recorded).then(|| operation_id.to_string());
     {
         let now = Instant::now();
         let mut guard = lock_state(state);
@@ -4235,55 +4332,54 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             return err_reply(503, "this operation is still being saved — retrying is safe");
         }
         guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
-        // No undo entry when finishing a half-written decision: `prev` is the HALF-DECIDED row, not the
-        // pre-decision one, so storing it would make the undo button restore a corrupt snapshot. The
-        // entry pushed by the original attempt is the true one and is deliberately left in place.
-        if let Some(undo_operation_id) = undo_operation_id.as_ref() {
-            let stack = guard.undo.entry(reviewer.to_string()).or_default();
-            // Two tabs may replay the same durable operation concurrently. They share one inverse;
-            // never create two undo entries for the one human act.
-            if !stack.iter().any(|entry| entry.operation_id == *undo_operation_id) {
-                stack.push(UndoEntry {
-                    operation_id: undo_operation_id.clone(),
-                    seg_id: prev.id.clone(),
-                    prev: prev.clone(),
-                    decided_revision: None,
-                });
-            }
-            // Bounded HERE, at the only site that grows it: the pushes in api_undo are restorations of
-            // an entry just popped, so they cannot exceed what the stack already held.
-            let overflow = stack.len().saturating_sub(UNDO_DEPTH);
-            if overflow > 0 {
-                stack.drain(0..overflow);
-            }
-        }
     }
     // New decisions finalize in the SAME transaction that mints the DPO pair/correction memories.
     // A legacy half-written row is finalized without replaying those side effects.
-    let write_result = if already_recorded {
-        db.finalize_phone_human_decision_at_revision(&parsed.id, text.as_deref(), request_revision)
-    } else {
-        db.record_phone_human_decision_by_at_revision_with_operation_limit(
-            &parsed.id,
-            decision,
-            text.as_deref(),
-            reviewer,
-            request_revision,
-            operation_id,
-            operation_payload_hash,
-            pilot_decision_limit.as_ref(),
-        )
+    let Some(content_hash) = content_hash else {
+        return err_reply(
+            503,
+            "playback identity is unavailable — this clip has no canonical server-derived audio content hash",
+        );
     };
-    let decided_revision = match write_result {
-        Ok(Some(revision)) => revision,
-        Ok(None) => {
-            if let Some(undo_operation_id) = undo_operation_id.as_deref() {
-                let mut guard = lock_state(state);
-                if let Some(stack) = guard.undo.get_mut(reviewer) {
-                    stack.retain(|entry| entry.operation_id != undo_operation_id);
-                }
+    let Some((source_start_ms, source_end_ms)) = source_span else {
+        return err_reply(503, "playback identity is unavailable — this clip has no canonical server source span");
+    };
+    let corpus_playback_proof = PlaybackDecisionProof {
+        segment_revision: revision,
+        audio_content_hash: content_hash,
+        source_start_ms,
+        source_end_ms,
+    };
+    if already_recorded {
+        return match db.finalize_phone_human_decision_at_revision(&parsed.id, text.as_deref(), request_revision) {
+            Ok(Some(_)) => {
+                forget_work_audio_assignment(state, &parsed.id, reviewer);
+                json_reply_with_accounting(200, serde_json::json!({ "ok": true, "duplicate": true }), db, reviewer)
             }
-            let reply = operation_result_after_write_failure(
+            Ok(None) => {
+                err_reply(409, "this interrupted legacy decision changed before finalization — reload the fresh row")
+            }
+            Err(error) => err_reply(500, &error.to_string()),
+        };
+    }
+
+    let commit = match db.record_phone_human_decision_by_at_revision_with_operation_limit(
+        &parsed.id,
+        decision,
+        text.as_deref(),
+        reviewer,
+        request_revision,
+        &corpus_playback_proof,
+        operation_id,
+        operation_payload_hash,
+        &parsed.action,
+        &parsed.text,
+        pilot_decision_limit.as_ref(),
+    ) {
+        Ok(Some(commit)) => commit,
+        Ok(None) => {
+            lock_state(state).in_flight_operations.remove(operation_id);
+            return operation_result_after_write_failure(
                 db,
                 reviewer,
                 &parsed.id,
@@ -4292,170 +4388,118 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 409,
                 "this clip changed while the decision was being saved — reload for the fresh draft",
             );
-            lock_state(state).in_flight_operations.remove(operation_id);
-            return reply;
         }
-        Err(e) => {
-            // A concurrent identical request may have won the UNIQUE race. Classify that durable
-            // receipt before deleting the shared undo inverse or returning a retryable failure.
+        Err(error) => {
+            // A concurrent identical request may have won the UNIQUE race. Resolve the immutable
+            // effect before publishing an undo token; no row snapshot is ever reconstructed here.
             if matches!(
                 review_operation_state(db, operation_id, operation_payload_hash, &parsed.id, reviewer),
                 Ok(ReviewOperationState::ExactReplay)
             ) {
-                let current_revision =
-                    db.get_segment_by_id_with_revision(&parsed.id).ok().flatten().map(|(_, revision)| revision);
-                if let Some(revision) = current_revision {
-                    if let Some(stack) = lock_state(state).undo.get_mut(reviewer) {
-                        if let Some(entry) = stack.iter_mut().find(|entry| entry.operation_id == operation_id) {
-                            entry.decided_revision = Some(revision);
-                        }
+                let effect = match db.human_decision_effect_for_operation(operation_id) {
+                    Ok(Some(effect)) => effect,
+                    Ok(None) => {
+                        lock_state(state).in_flight_operations.remove(operation_id);
+                        return err_reply(500, "committed decision is missing its immutable effect");
                     }
-                }
+                    Err(lookup_error) => {
+                        lock_state(state).in_flight_operations.remove(operation_id);
+                        return err_reply(500, &format!("decision effect lookup failed: {lookup_error}"));
+                    }
+                };
+                remember_phone_undo(state, reviewer, operation_id, &effect.1, effect.0);
                 forget_work_audio_assignment(state, &parsed.id, reviewer);
                 lock_state(state).in_flight_operations.remove(operation_id);
                 return json_reply_with_accounting(
                     200,
-                    serde_json::json!({ "ok": true, "duplicate": true }),
+                    serde_json::json!({
+                        "ok": true,
+                        "duplicate": true,
+                        "effectEventId": effect.0,
+                    }),
                     db,
                     reviewer,
                 );
             }
-            if e.to_string().contains(REVIEW_PILOT_LIMIT_REACHED) {
+            if error.to_string().contains(REVIEW_PILOT_LIMIT_REACHED) {
                 let mut guard = lock_state(state);
-                if let Some(undo_operation_id) = undo_operation_id.as_deref() {
-                    if let Some(stack) = guard.undo.get_mut(reviewer) {
-                        stack.retain(|entry| entry.operation_id != undo_operation_id);
-                    }
-                }
                 if guard.leases.get(&parsed.id).is_some_and(|(who, _)| who == reviewer) {
                     guard.leases.remove(&parsed.id);
                 }
                 guard.in_flight_operations.remove(operation_id);
                 return err_reply(409, "controlled review pilot complete — no more review actions are authorized");
             }
-            if let Some(undo_operation_id) = undo_operation_id.as_deref() {
-                let mut guard = lock_state(state);
-                if let Some(stack) = guard.undo.get_mut(reviewer) {
-                    stack.retain(|entry| {
-                        entry.operation_id != undo_operation_id
-                            || entry.seg_id != parsed.id
-                            || entry.decided_revision.is_some()
-                    });
-                }
-            }
-            // The lease is deliberately KEPT. The reviewer still has the clip open and their outbox can
-            // retry; freeing it immediately would hand the same work to another reviewer.
-            let reply = operation_result_after_write_failure(
+            lock_state(state).in_flight_operations.remove(operation_id);
+            return operation_result_after_write_failure(
                 db,
                 reviewer,
                 &parsed.id,
                 operation_id,
                 operation_payload_hash,
                 500,
-                &e.to_string(),
+                &error.to_string(),
             );
-            lock_state(state).in_flight_operations.remove(operation_id);
-            return reply;
         }
     };
     lock_state(state).in_flight_operations.remove(operation_id);
-    // Stamp the undo entry with the row's POST-decision revision returned by the SAME transaction —
-    // api_undo refuses to restore unless the row still carries exactly this value, which
-    // is what makes undo safe against every intervening writer, not only re-reviews. On a resumed
-    // half-written decision the original attempt's entry (revision still None) is the one completed.
-    {
-        let mut guard = lock_state(state);
-        if let Some(stack) = guard.undo.get_mut(reviewer) {
-            let entry = if let Some(undo_operation_id) = undo_operation_id.as_deref() {
-                stack.iter_mut().find(|entry| entry.operation_id == undo_operation_id)
-            } else {
-                stack.iter_mut().rev().find(|entry| entry.seg_id == parsed.id && entry.decided_revision.is_none())
-            };
-            if let Some(entry) = entry {
-                entry.decided_revision = Some(decided_revision);
-            }
-        }
-    }
-    // Decided, so the lease has served its purpose — release it rather than waiting out the TTL. (The
-    // clip also leaves the pending queue, so this is housekeeping, not correctness.)
+    remember_phone_undo(state, reviewer, operation_id, &commit.segment_id, commit.effect_event_id);
     forget_work_audio_assignment(state, &parsed.id, reviewer);
-    // No audit() here: the review event and compensation delta committed WITH the decision, inside
-    // its transaction. Refresh both the full activity total and the distinct weighted-pay total.
-    json_reply_with_accounting(200, serde_json::json!({ "ok": true }), db, reviewer)
+    json_reply_with_accounting(
+        200,
+        serde_json::json!({ "ok": true, "effectEventId": commit.effect_event_id }),
+        db,
+        reviewer,
+    )
 }
-
-/// Undo the LAST phone decision: retract the learning pair the decision produced, then restore the
-/// pre-decision row LOSSLESSLY. Returns the undone segment id.
-///
-/// `clear_human_decision` is kept ONLY for its side effect of deleting the DPO/few-shot agent_examples
-/// row the edit produced (a retracted edit left in the trainable pool permanently teaches the model a
-/// fix the human took back). The row-restore itself MUST go through `insert_segment_full`, not
-/// `insert_segment`: `prev` is the exact pre-decision snapshot, and a clip served to the couch queue can
-/// carry jury state (a jury-ESCALATED clip is unverified, so it is in `get_segments(false)`) — verdict,
-/// verdict_transcript, rationale, evidence_json, agreement_score, escalated, is_gold. `insert_segment`
-/// writes a 17-column subset that OMITS every one of those, so it would leave them at whatever
-/// `clear_human_decision` set (jury verdict/evidence NULLed, is_gold from the undone accept still set) —
-/// silently dropping the pre-decision jury verdict on undo. `insert_segment_full` rewrites the whole row
-/// (including created_at) back to `prev`, so undo is a true inverse.
-/// Undo pops from THIS reviewer's stack only. A single shared stack meant one reviewer's ↩ retracted
-/// whichever decision happened to be last — usually someone else's, with no indication to either of them.
+/// Undo this reviewer's last decision through its immutable database effect. The phone supplies no
+/// row snapshot and cannot restore fields the decision did not own.
 fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
-    let popped = lock_state(state).undo.get_mut(reviewer).and_then(|stack| stack.pop());
-    let Some(entry) = popped else {
-        return err_reply(409, "nothing to undo");
+    let popped = lock_state(state).undo.get_mut(reviewer).and_then(|stack| {
+        let insertion_index = stack.len().checked_sub(1)?;
+        stack.pop().map(|entry| (entry, insertion_index))
+    });
+    let (entry, insertion_index) = match popped {
+        Some(value) => value,
+        None => match db.latest_phone_human_decision_effect(reviewer) {
+            Ok(Some((effect_event_id, operation_id, seg_id))) => {
+                (UndoEntry { operation_id, seg_id, effect_event_id }, 0)
+            }
+            Ok(None) => return err_reply(409, "nothing to undo"),
+            Err(error) => return err_reply(500, &format!("undo target lookup failed: {error}")),
+        },
     };
     let id = entry.seg_id.clone();
-    // STALENESS + ATOMICITY FENCE. The full-row restore and learning-example retraction happen in ONE
-    // database transaction whose UPDATE includes both reviewer and monotonic revision predicates.
-    // There is no check-then-write window, and a failed restore cannot leave a half-undone row.
-    let Some(expected_revision) = entry.decided_revision else {
-        lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-        return err_reply(409, "the prior decision did not finish cleanly — retry the decision before undoing it");
+    let outcome = match db.undo_human_decision(entry.effect_event_id, Some(reviewer), &entry.operation_id) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            retain_phone_undo_token(state, reviewer, insertion_index, entry);
+            return err_reply(500, &error.to_string());
+        }
     };
-    let restored_revision =
-        match db.undo_phone_human_decision(&entry.prev, reviewer, expected_revision, &entry.operation_id) {
-            Ok(Some(revision)) => revision,
-            Ok(None) => {
-                let owner = db.get_segment_by_id(&id).ok().flatten().and_then(|row| row.reviewed_by);
-                lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-                return match owner {
-                    Some(other) if other != reviewer => {
-                        err_reply(409, &format!("{other} has reviewed this clip since — undo would erase their work"))
-                    }
-                    None => {
-                        err_reply(409, "this clip has been changed at the desktop since — undo would erase that change")
-                    }
-                    _ => err_reply(409, "this clip has been changed since the decision — undo would erase that change"),
-                };
-            }
-            Err(e) => {
-                lock_state(state).undo.entry(reviewer.to_string()).or_default().push(entry);
-                return err_reply(500, &e.to_string());
-            }
-        };
-    // The clip is pending again and this reviewer is about to see it — hold it for them so a second
-    // reviewer's queue cannot grab the clip out from under the person mid-correction.
-    //
-    // But only if it is actually free. This used to `insert` unconditionally, unlike api_renew and
-    // api_decision's collision guard, which both refuse when `holder() != reviewer` (external review
-    // 2026-08-06 #3). The theft is reachable from the write-two failure state that
-    // `an_interrupted_decision_is_finished_on_replay_and_never_recorded_twice` already pins: Sara's
-    // submit 500s leaving the row unverified with reviewed_by='Sara' and an undo entry; her lease
-    // lapses; Hemn's queue legitimately leases the clip and he starts typing; Sara taps undo. The old
-    // line handed her Hemn's lease, and his save was then refused 409 — "another reviewer is working
-    // on this clip" — over a conflict the undo itself had just manufactured.
-    //
-    // `holder` is the right predicate and already expires stale entries, so this grants exactly when
-    // the lease is absent, expired, or already hers, and never takes one that is someone else's.
+    let (segment, restored_revision) = match outcome {
+        HumanDecisionUndoOutcome::Applied { restored_revision, segment } => (segment, Some(restored_revision)),
+        HumanDecisionUndoOutcome::AlreadyApplied { segment } => (segment, None),
+        HumanDecisionUndoOutcome::Conflict { segment } => {
+            retain_phone_undo_token(state, reviewer, insertion_index, entry);
+            let owner = segment.reviewed_by.clone();
+            return match owner {
+                Some(other) if !other.eq_ignore_ascii_case(reviewer) => {
+                    err_reply(409, &format!("{other} has reviewed this clip since — undo would erase their work"))
+                }
+                None => err_reply(409, "this clip changed at the desktop since — undo refused without mutation"),
+                _ => err_reply(409, "this clip changed since the decision — undo refused without mutation"),
+            };
+        }
+    };
+    // Keep the same stable token after success. If the response is lost, the bodyless retry must
+    // replay this exact idempotent undo instead of falling through to an older decision.
+    retain_phone_undo_token(state, reviewer, insertion_index, entry);
     {
         let mut guard = lock_state(state);
         let now = Instant::now();
         let current = guard.holder(&id, now).map(str::to_string);
         match current {
             Some(other) if other != reviewer => {
-                // The undo itself stands — it is her own past decision being reversed. Only the lease
-                // claim is refused, so if she does try to save she gets an HONEST 409 against a lease
-                // Hemn really holds, rather than him getting a fabricated one.
                 tracing::info!(
                     "Couch Review: undo by {reviewer} left {id} leased to {other} — not stealing an active lease"
                 );
@@ -4465,13 +4509,17 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
             }
         }
     }
-    // The restore rewrote the row, so the page's served rowVersion is stale by construction. Hand
-    // back the fresh fingerprint so the immediate re-decision (the whole point of undo) is not
-    // refused by the serve/decide fence it would otherwise trip.
-    let row_version = restored_revision.to_string();
-    json_reply_with_accounting(200, serde_json::json!({ "id": id, "rowVersion": row_version }), db, reviewer)
+    let row_version = restored_revision
+        .or_else(|| db.get_segment_by_id_with_revision(&id).ok().flatten().map(|(_, revision)| revision))
+        .unwrap_or_default()
+        .to_string();
+    json_reply_with_accounting(
+        200,
+        serde_json::json!({ "id": id, "rowVersion": row_version, "segment": segment }),
+        db,
+        reviewer,
+    )
 }
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4489,6 +4537,30 @@ mod tests {
         let path = dir.join("couch-test.db").to_string_lossy().to_string();
         let db = Database::open(&path).unwrap();
         db.initialize().unwrap();
+        // Tiny RIFF-only fixtures bypass the import/backfill pipeline. A TEMP trigger gives every
+        // subsequently inserted fixture the same canonical decoded-PCM content hash before any
+        // queue/server connection can observe it, without weakening the production schema.
+        db.connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fixture_audio_content_hash
+                 AFTER INSERT ON speech_segments
+                 WHEN NEW.audio_content_hash IS NULL
+                 BEGIN
+                     UPDATE speech_segments
+                        SET audio_content_hash = printf('%064x', NEW.rowid),
+                            alignment_json = COALESCE(
+                                alignment_json,
+                                json_object(
+                                    'source_start_ms', 0,
+                                    'source_end_ms', NEW.duration_ms,
+                                    'chunk_index', 0,
+                                    'chunk_count', 1
+                                )
+                            )
+                      WHERE id = NEW.id;
+                 END;",
+            )
+            .unwrap();
         (db, path)
     }
 
@@ -4506,6 +4578,9 @@ mod tests {
             audio_path: path.to_string_lossy().into_owned(),
             raw_transcript: raw.into(),
             duration_ms: 1500,
+            alignment_json: Some(
+                r#"{"source_start_ms":0,"source_end_ms":1500,"chunk_index":0,"chunk_count":1}"#.into(),
+            ),
             ..SpeechSegment::default()
         }
     }
@@ -4828,8 +4903,7 @@ mod tests {
                 vec![UndoEntry {
                     operation_id: "undo-operation".to_string(),
                     seg_id: "undo-segment".to_string(),
-                    prev: seg("undo-segment", "undo text"),
-                    decided_revision: Some(17),
+                    effect_event_id: 17,
                 }],
             )]),
             in_flight_operations: HashSet::from(["in-flight-operation".to_string()]),
@@ -5061,7 +5135,7 @@ mod tests {
     /// Whole-state fingerprint for read-only endpoint tests. Every mutable CouchState field is
     /// represented, including the state that is intentionally not durable (leases, undo, skips, and
     /// in-flight operations). Keep this list beside CouchState's field list when that state grows.
-    type UndoTestSnapshot = (String, String, String, Option<i64>);
+    type UndoTestSnapshot = (String, String, i64);
 
     #[derive(Debug, PartialEq)]
     struct CouchStateTestSnapshot {
@@ -5092,14 +5166,7 @@ mod tests {
                         reviewer.clone(),
                         entries
                             .iter()
-                            .map(|entry| {
-                                (
-                                    entry.operation_id.clone(),
-                                    entry.seg_id.clone(),
-                                    serde_json::to_string(&entry.prev).expect("serialize undo snapshot"),
-                                    entry.decided_revision,
-                                )
-                            })
+                            .map(|entry| (entry.operation_id.clone(), entry.seg_id.clone(), entry.effect_event_id))
                             .collect(),
                     )
                 })
@@ -5384,11 +5451,11 @@ mod tests {
         assert_eq!(receipts, 0, "but its evidence is declined — nobody can bind it to the served audio");
     }
 
-    /// A SPOT CHECK is exempt from the version fence too: grading writes nothing to the row, and
-    /// bulk metadata runs (a rights stamp) bump every GOLD row's revision at once — one such run
-    /// must not 409 every check in flight and thin the honesty measurement.
+    /// A hidden check is revision-bound even though grading does not update the corpus row. The
+    /// browser's heard milliseconds belong to the row it was served; rebinding them after any bulk
+    /// stamp would manufacture evidence for a revision it never heard.
     #[test]
-    fn a_spot_check_is_graded_even_when_a_bulk_stamp_bumped_the_row() {
+    fn a_spot_check_is_refused_when_a_bulk_stamp_bumped_the_served_row() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, db_path) = test_db(tmp.path());
         gold_seg(&db, "sc1", "دەقی هەڵە", "دەقی ڕاست");
@@ -5408,10 +5475,14 @@ mod tests {
             "heardMs": 600_000, "rowVersion": served.to_string(),
         });
         let (code, _, msg, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
-        assert_eq!(code, 200, "the check is graded, not bounced: {}", String::from_utf8_lossy(&msg));
+        assert_eq!(code, 409, "stale hidden playback must be refused: {}", String::from_utf8_lossy(&msg));
         let report = db.spot_check_report().unwrap();
-        assert_eq!(report.len(), 1, "and SCORED");
-        assert_eq!(report[0].noticed, 1, "she corrected the planted error");
+        assert!(report.is_empty(), "a stale check must not be scored or paid");
+        let receipts: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'sc1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(receipts, 0, "the stale submit must be refused before receipt minting");
     }
 
     /// The pay-bearing audit row commits WITH the decision, inside its transaction — a verified row
@@ -5441,7 +5512,7 @@ mod tests {
     }
 
     /// The version fence must fire BEFORE the receipt mint (audit fix 2026-08-20). A receipt's
-    /// revision, fingerprint and duration are all resolved from the CURRENT row, so minting one for
+    /// revision, content hash and duration are all resolved from the CURRENT row, so minting one for
     /// a submit whose serve predates a re-chunk would bind this reviewer's real listening to a row
     /// they were never shown — evidence manufactured purely by ordering. Without the fix this test
     /// fails on the second assertion: the 409 still comes back, but the receipt is already on disk.
@@ -5470,7 +5541,7 @@ mod tests {
     }
 
     /// The SERVER half of the phone's playback evidence: what the page reports is only how much
-    /// media time it played; the revision and the audio fingerprint are resolved here.
+    /// media time it played; the revision and decoded-PCM content hash are resolved here.
     ///
     /// A client that could name those could mint a receipt for a clip or revision it never loaded,
     /// and the guard would then be comparing the client's claim with the client's claim.
@@ -5484,12 +5555,12 @@ mod tests {
         let body = serde_json::json!({
             "id": "pr1", "action": "accept", "text": "دەقی سەرەتایی",
             "heardMs": 8_800, "clipDurationMs": 9_000,
-            // Deliberately NOT sent: revision and fingerprint are not the client's to assert.
+            // Deliberately NOT sent: revision and content hash are not the client's to assert.
         });
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 200);
 
-        let (segment_id, revision, fingerprint, played, coverage): (String, i64, String, i64, f64) = db
+        let (segment_id, revision, content_hash, played, coverage): (String, i64, String, i64, f64) = db
             .connection()
             .query_row(
                 "SELECT segment_id, segment_revision, audio_fingerprint, played_ms, coverage_ratio                  FROM playback_receipts WHERE segment_id = 'pr1'",
@@ -5501,17 +5572,23 @@ mod tests {
         assert_eq!(segment_id, "pr1");
         assert_eq!(played, 8_800, "the page's reported media time is recorded verbatim");
         assert!(coverage > 0.97, "8.8s of a 9s clip is a full listen, got {coverage}");
-        assert!(!fingerprint.is_empty(), "the receipt must name the audio it was minted against");
+        assert_eq!(content_hash.len(), 64, "the receipt must name canonical decoded PCM");
         assert!(revision >= 0, "the revision is resolved server-side, not supplied");
 
-        // And the evidence actually satisfies the guard for THIS clip at THIS revision.
-        db.require_playback_evidence("pr1", revision, &fingerprint, Some("Sara"))
-            .expect("a clip heard end to end must be decidable");
+        // HTTP 200 proves the receipt satisfied the guard INSIDE the decision transaction.  The
+        // successful decision then bumps the row revision, so replaying that old receipt afterwards
+        // must fail the current-row fence rather than becoming reusable authority.
+        let current_revision = db.segment_review_revision("pr1").unwrap().unwrap_or(0);
+        assert!(current_revision > revision, "the accepted decision advances the row version");
+        assert!(
+            !db.has_sufficient_playback_evidence("pr1", revision, &content_hash, Some("Sara")).unwrap(),
+            "a receipt from the decided revision is historical evidence, not future authorization"
+        );
     }
 
     /// The coverage DENOMINATOR is the server's clip length, never the client's claim about it.
     ///
-    /// Resolving the revision and the fingerprint server-side stops a client naming a clip it never
+    /// Resolving the revision and content hash server-side stops a client naming a clip it never
     /// loaded, but left the length it is measured against in the client's hands: a page reporting
     /// "I played 100ms of a 100ms clip" scores a perfect 1.0 and clears the bar having played a
     /// tenth of a second of a 1.5s sentence. Both halves of the ratio have to come from the server
@@ -5544,11 +5621,36 @@ mod tests {
         assert!(coverage < 0.10, "100ms of a 1.5s clip is not a listen, got {coverage}");
 
         let revision = db.segment_review_revision("pr3").unwrap().unwrap_or(0);
-        let fingerprint = db.segment_audio_fingerprint("pr3").unwrap().unwrap_or_default();
+        let content_hash = db.segment_audio_content_hash("pr3").unwrap().unwrap_or_default();
         assert!(
-            !db.has_sufficient_playback_evidence("pr3", revision, &fingerprint, Some("Sara")).unwrap(),
+            !db.has_sufficient_playback_evidence("pr3", revision, &content_hash, Some("Sara")).unwrap(),
             "a tenth of a second must not satisfy the listening bar"
         );
+    }
+
+    #[test]
+    fn negative_phone_playback_is_rejected_instead_of_clamped_into_a_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("negative-playback", "دەق")).unwrap();
+        let state = state();
+        let body = serde_json::json!({
+            "id": "negative-playback",
+            "action": "accept",
+            "text": "دەق",
+            "heardMs": -1,
+            "clipDurationMs": 1_500,
+        });
+
+        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 400, "negative media time is invalid evidence, not zero media time");
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'negative-playback'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     /// ENFORCEMENT, end to end: an under-played clip is REFUSED and the row is left untouched.
@@ -5613,6 +5715,66 @@ mod tests {
 
         let row = db.get_segment_by_id("enf2").unwrap().unwrap();
         assert!(!row.verified, "a skip still writes no verdict");
+    }
+
+    #[test]
+    fn a_missing_audio_content_hash_blocks_every_durable_review_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("no-fingerprint", "دەقی دوو")).unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash = NULL WHERE id = 'no-fingerprint'", [])
+            .unwrap();
+        let state = state();
+
+        let revision = db.segment_review_revision("no-fingerprint").unwrap().unwrap_or(0);
+        let verdict = serde_json::json!({
+            "id": "no-fingerprint",
+            "action": "accept",
+            "text": "دەقی دوو",
+            "heardMs": 1_500,
+            "clipDurationMs": 1_500,
+            "rowVersion": revision.to_string(),
+            "operationId": uuid::Uuid::new_v4().to_string(),
+        });
+        let (code, ..) = super::api_decision(&db, verdict.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(code, 503, "a segment id must never stand in for exact audio identity");
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'no-fingerprint'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0,
+            "a failed verdict must not mint pseudo-identity evidence"
+        );
+
+        let skip = serde_json::json!({
+            "id": "no-fingerprint",
+            "action": "skip",
+            "heardMs": 0,
+            "clipDurationMs": 1_500,
+            "rowVersion": revision.to_string(),
+            "operationId": uuid::Uuid::new_v4().to_string(),
+        });
+        let (code, ..) = super::api_decision(&db, skip.to_string().as_bytes(), "Sara", &state);
+        assert_eq!(
+            code, 500,
+            "skip needs no listening proof, but its durable audit/pay identity must still fail closed"
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'no-fingerprint'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0,
+            "a refused identity-free skip cannot mint evidence"
+        );
     }
 
     /// Undo must not orphan the reviewer's own listening: the immediate re-decision has to land.
@@ -5698,8 +5860,12 @@ mod tests {
         // Queue now empty (both reviewed).
         assert!(queue_ids(&db, "Sara", &state).is_empty(), "both clips reviewed -> empty queue");
 
+        // Model a watchdog/app restart: the in-memory Undo stack is gone, but reviewer-scoped DB
+        // truth still resolves the latest Couch effect and its original stable operation UUID.
+        let restarted_state = Mutex::new(CouchState::default());
+
         // UNDO restores the LAST decision (s2): unverified again, decision cleared.
-        let (code, _, body, ..) = api_undo(&db, "Sara", &state);
+        let (code, _, body, ..) = api_undo(&db, "Sara", &restarted_state);
         assert_eq!(code, 200);
         let undone: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(undone["id"], "s2");
@@ -5707,52 +5873,66 @@ mod tests {
         assert!(!row.verified, "undo must reopen the clip");
         assert_eq!(row.reviewed_by, None, "undo retracts the attribution with the decision");
 
-        // Second undo pops s1; third has nothing left.
-        let (code, ..) = api_undo(&db, "Sara", &state);
-        assert_eq!(code, 200);
-        let (code, ..) = api_undo(&db, "Sara", &state);
-        assert_eq!(code, 409, "empty undo stack is a 409, not a phantom undo");
+        // A bodyless retry after a lost HTTP response replays the SAME durable operation. It must
+        // never fall through to s1 and accidentally undo older work.
+        let restarted_again = Mutex::new(CouchState::default());
+        let (code, _, retry_body, ..) = api_undo(&db, "Sara", &restarted_again);
+        assert_eq!(code, 200, "the stable undo token makes a lost-response retry idempotent");
+        let retried: serde_json::Value = serde_json::from_slice(&retry_body).unwrap();
+        assert_eq!(retried["id"], "s2", "a retry must remain bound to the same effect");
+        assert!(db.get_segment_by_id("s1").unwrap().unwrap().verified, "older work must not be touched");
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM human_decision_effect_reversals", [], |row| row.get(0))
+                .unwrap(),
+            1,
+            "idempotent retries append no second reversal"
+        );
     }
 
     #[test]
-    fn a_legacy_interrupted_decision_is_finished_on_replay_and_never_recorded_twice() {
-        // Releases before atomic phone finalization could commit verdict/learning effects while leaving
-        // verified=0. Construct that durable legacy state directly, then prove an outbox replay repairs
-        // it without repeating any learning side effect.
+    fn a_named_reviewer_cannot_enter_the_legacy_nonfinalized_desktop_path() {
+        // The legacy attributed-desktop writer could leave reviewed_by=Sara while publishing a desktop
+        // effect whose reviewer is necessarily NULL. Exact Undo could not authenticate that post-state.
+        // Current code must reject the mixed boundary before any decision or learning effect, while the
+        // real phone path remains available and atomic.
         let tmp = tempfile::tempdir().unwrap();
-        let (db, path) = test_db(tmp.path());
+        let (db, _) = test_db(tmp.path());
         db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
         let state = state();
         let fix = "دەق یەک ڕاستکراوە";
         let body = serde_json::json!({"heardMs": 600_000, "id": "s1", "action": "edit", "text": fix});
 
-        let side = rusqlite::Connection::open(&path).unwrap();
-        let pairs = |c: &rusqlite::Connection| -> i64 {
-            c.query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's1'", [], |r| r.get(0)).unwrap()
-        };
-        let memory_hits = |c: &rusqlite::Connection| -> i64 {
-            c.query_row("SELECT COALESCE(SUM(hit_count), 0) FROM correction_memory", [], |r| r.get(0)).unwrap()
-        };
+        let error = db.record_human_decision_by("s1", "edit", Some(fix), None, Some("Sara")).unwrap_err();
+        assert!(error.to_string().contains("anonymous desktop decision boundary"));
+        let untouched = db.get_segment_by_id("s1").unwrap().unwrap();
+        assert_eq!(untouched.human_decision, None);
+        for table in ["human_decision_effect_events", "agent_examples", "corrections"] {
+            let count: i64 = db
+                .connection()
+                .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE segment_id='s1'"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "the rejected mixed-boundary call must leave {table} untouched");
+        }
 
-        db.record_human_decision_by("s1", "edit", Some(fix), None, Some("Sara")).unwrap();
-
-        let half = db.get_segment_by_id("s1").unwrap().unwrap();
-        assert!(!half.verified, "legacy desktop-style decision is not phone-finalized");
-        assert_eq!(half.reviewed_by.as_deref(), Some("Sara"));
-        let pairs_after_failure = pairs(&side);
-        let hits_after_failure = memory_hits(&side);
-        assert!(pairs_after_failure >= 1, "the legacy decision must have a learning pair to deduplicate");
-
-        // The outbox replays against the current atomic endpoint.
+        // The attributed phone endpoint then records the whole decision graph in one commit.
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
-        assert_eq!(code, 200, "the replay must succeed, not 409 or 500");
+        assert_eq!(code, 200, "the supported attributed path must remain available");
 
         let done = db.get_segment_by_id("s1").unwrap().unwrap();
-        assert!(done.verified, "the replay FINISHES the interrupted write");
+        assert!(done.verified);
+        assert_eq!(done.reviewed_by.as_deref(), Some("Sara"));
         assert_eq!(done.annotated_transcript.as_deref(), Some(fix));
-
-        assert_eq!(pairs(&side), pairs_after_failure, "a replay must not mint a second learning pair");
-        assert_eq!(memory_hits(&side), hits_after_failure, "a replay must not bump correction_memory hit_count");
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='s1' AND source='couch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -5772,15 +5952,17 @@ mod tests {
         assert_eq!(code, 200);
 
         // The owner corrects the same clip at the desktop afterwards.
-        crate::jury::record_human_decision_by(&db, "s1", "edit", Some("ڕاستکراوەی خاوەن"), None, Some("Owner"))
-            .unwrap();
+        crate::jury::record_human_decision(&db, "s1", "edit", Some("ڕاستکراوەی خاوەن"), None).unwrap();
 
         // Sara now taps undo. Her snapshot predates the owner's edit entirely.
         let (code, _, msg, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 409, "undo must not silently revert someone else's later work");
-        assert!(String::from_utf8_lossy(&msg).contains("Owner"), "the refusal must name who would lose work: {msg:?}");
+        assert!(
+            String::from_utf8_lossy(&msg).contains("desktop"),
+            "the refusal must identify the anonymous desktop boundary: {msg:?}"
+        );
         let row = db.get_segment_by_id("s1").unwrap().unwrap();
-        assert_eq!(row.reviewed_by.as_deref(), Some("Owner"), "the owner's edit must survive the refused undo");
+        assert_eq!(row.reviewed_by, None, "the anonymous desktop edit must survive the refused undo");
         assert_eq!(row.verdict_transcript.as_deref(), Some("ڕاستکراوەی خاوەن"));
 
         // And the entry is KEPT, not consumed by the refusal — a refused undo must not silently
@@ -5790,11 +5972,9 @@ mod tests {
     }
 
     #[test]
-    fn undo_refuses_when_any_writer_touched_the_row_since_not_only_a_re_review() {
-        // Audit #2/#3: the old fence keyed ONLY on reviewed_by, which no non-decision writer touches
-        // — batch normalize, the refine loop, a desktop text edit and a champion re-draft all rewrite
-        // transcript columns while leaving reviewed_by intact, so undo silently reverted every one of
-        // them. The fence is now the row's updated_at fingerprint captured post-decision.
+    fn undo_allows_unrelated_metadata_writes_and_preserves_them_exactly() {
+        // Exact effect Undo owns only review fields. A background metadata write may advance the row
+        // revision, but it must neither block Undo nor be reverted by renderer snapshot authority.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
         db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
@@ -5815,18 +5995,15 @@ mod tests {
             .unwrap();
 
         let (code, _, msg, ..) = api_undo(&db, "Sara", &state);
-        assert_eq!(code, 409, "undo must refuse: a background writer touched the row since the decision");
-        assert!(
-            String::from_utf8_lossy(&msg).contains("changed since the decision"),
-            "the refusal names the reason: {msg:?}"
-        );
+        assert_eq!(code, 200, "metadata-only revision drift must not block exact effect Undo: {msg:?}");
         let row = db.get_segment_by_id("s1").unwrap().unwrap();
-        assert_eq!(row.normalized_transcript.as_deref(), Some("نوێ"), "the later write must survive");
-        assert_eq!(row.reviewed_by.as_deref(), Some("Sara"), "the decision itself is untouched by the refusal");
+        assert_eq!(row.normalized_transcript.as_deref(), Some("نوێ"), "the later metadata write must survive Undo");
+        assert_eq!(row.reviewed_by, None, "the exact review-owned attribution is restored");
 
-        // Kept, not consumed: a refused undo must not become \"nothing to undo\".
-        let (code, ..) = api_undo(&db, "Sara", &state);
-        assert_eq!(code, 409);
+        // A lost HTTP response is safe: the DB-derived retry reaches the same reversal idempotently.
+        let (code, _, retry, ..) = api_undo(&db, "Sara", &state);
+        assert_eq!(code, 200, "bodyless retry must resolve the same durable reversal: {retry:?}");
+        assert_eq!(db.get_segment_by_id("s1").unwrap().unwrap().normalized_transcript.as_deref(), Some("نوێ"));
     }
 
     #[test]
@@ -5885,9 +6062,7 @@ mod tests {
         db.record_spot_check("g1", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
 
         // The owner then un-verifies it, so it is pending work again and no longer an answer key.
-        let mut reopened = db.get_segment_by_id("g1").unwrap().unwrap();
-        reopened.verified = false;
-        db.insert_segment(&reopened).unwrap();
+        db.connection().execute("UPDATE speech_segments SET verified = 0 WHERE id = 'g1'", []).unwrap();
 
         let body = serde_json::json!({"heardMs": 600_000, "id": "g1", "action": "edit", "text": "ڕاستکراوەی سارا"});
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
@@ -6211,8 +6386,9 @@ mod tests {
         assert_eq!(sara_row.reviewed_by.as_deref(), Some("Sara"));
         assert!(!db.get_segment_by_id("b1").unwrap().unwrap().verified, "Hemn's own clip reopened");
 
-        // A reviewer with nothing of their own gets 409, not a phantom undo of someone else's work.
-        assert_eq!(api_undo(&db, "Hemn", &state).0, 409, "Hemn's stack is empty — his one decision is undone");
+        // Hemn's bodyless retry is bound to the same durable effect and remains an idempotent 200;
+        // it can never fall through to Sara's older decision.
+        assert_eq!(api_undo(&db, "Hemn", &state).0, 200, "Hemn's lost-response retry is idempotent");
         assert_eq!(api_undo(&db, "Nobody", &state).0, 409, "a reviewer who has decided nothing can undo nothing");
         assert!(db.get_segment_by_id("a1").unwrap().unwrap().verified, "and Sara's row is STILL untouched");
     }
@@ -6560,7 +6736,10 @@ mod tests {
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["duplicate"], true);
         assert_eq!(counts(), (1, 1, 1), "a restart replay must be side-effect free");
-        assert!(lock_state(&restarted_state).undo.is_empty(), "a replay is not a second undoable act");
+        let guard = lock_state(&restarted_state);
+        let undo = guard.undo.get("Sara").expect("exact replay restores the original durable undo token");
+        assert_eq!(undo.len(), 1, "a replay is not a second undoable act");
+        assert_eq!(undo[0].effect_event_id, db.human_decision_effect_for_operation(operation_id).unwrap().unwrap().0);
     }
 
     #[test]
@@ -6753,6 +6932,11 @@ mod tests {
     /// A GOLD clip with a known human answer whose RAW draft is wrong — the shape a spot check needs.
     /// `is_gold` matters: without it a peer's fresh correction would qualify as an answer key.
     fn gold_seg(db: &Database, id: &str, wrong_draft: &str, human_answer: &str) {
+        assert_eq!(
+            crate::migrations::rollback(db, 1).unwrap(),
+            vec![60],
+            "gold test authority must be created before the v60 legacy snapshot"
+        );
         let mut s = seg(id, wrong_draft);
         s.verified = true;
         s.is_gold = true;
@@ -6760,6 +6944,7 @@ mod tests {
         s.verdict = Some("human_edit".into());
         s.verdict_transcript = Some(human_answer.into());
         db.insert_segment_full(&s).unwrap();
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60]);
     }
 
     #[test]
@@ -7416,7 +7601,10 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(request.join().unwrap().0, 200, "the operation ordered before revoke may finish");
         revoked_rx
-            .recv_timeout(Duration::from_secs(5))
+            // The 1,441-test suite saturates the Windows scheduler with restore/database drills.
+            // Ordering is already proved by the strict 250ms pre-release non-completion assertion;
+            // allow a loaded CI worker time to schedule the revoker after the guard is released.
+            .recv_timeout(Duration::from_secs(15))
             .expect("revoke completes after the protected operation")
             .expect("revoke succeeds");
         revoker.join().unwrap();
@@ -7595,6 +7783,8 @@ mod tests {
         for (id, ms) in [("r1", 9000), ("r2", 21000)] {
             let mut s = seg(id, "دەق");
             s.duration_ms = ms;
+            s.alignment_json =
+                Some(format!("{{\"source_start_ms\":0,\"source_end_ms\":{ms},\"chunk_index\":0,\"chunk_count\":1}}"));
             db.insert_segment(&s).unwrap();
         }
         let state = state();
@@ -7715,6 +7905,8 @@ mod tests {
         for (id, raw) in [("pay-nfc", "é"), ("pay-space", "hello world"), ("pay-real", "hello world")] {
             let mut segment = seg(id, raw);
             segment.duration_ms = 1_000;
+            segment.alignment_json =
+                Some(r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#.into());
             db.insert_segment(&segment).unwrap();
         }
         let state = state();
@@ -9744,6 +9936,9 @@ mod tests {
             segment.audio_path = wav.to_string_lossy().into_owned();
             db.insert_segment(&segment).unwrap();
         }
+        db.connection()
+            .execute("UPDATE speech_segments SET alignment_json = NULL WHERE id LIKE 'audio-%'", [])
+            .unwrap();
         let state = state();
         let expired = Instant::now().checked_sub(LEASE_TTL).unwrap();
         {
@@ -9848,7 +10043,7 @@ mod tests {
             guard.leases.insert("audio-policy".into(), ("Sara".into(), Instant::now()));
             guard.served_work.insert(("audio-policy".into(), "Sara".into()));
         }
-        assert!(db.update_verified("audio-policy", true).unwrap());
+        assert!(db.update_verified_for_test("audio-policy", true).unwrap());
         let denied = api_audio(&db, "audio-policy", "Sara", &state, None, Some(&etag));
         assert_eq!(denied.0, 403, "completion revokes object access before a matching ETag can produce 304");
         let denied_header = |name: &str| denied.3.iter().find(|(key, _)| *key == name).map(|(_, value)| value.as_str());
@@ -9925,6 +10120,15 @@ mod tests {
             pilot_spot_checks: HashSet::from([("audio-pilot-key".into(), "Hawzhin".into())]),
             ..CouchState::default()
         });
+        let key_alignment = db
+            .get_segment_by_id("audio-pilot-key")
+            .unwrap()
+            .unwrap()
+            .alignment_json
+            .expect("fixture has a compensation source span");
+        db.connection()
+            .execute("UPDATE speech_segments SET alignment_json = NULL WHERE id = 'audio-pilot-key'", [])
+            .unwrap();
 
         assert_eq!(
             api_audio(&db, "audio-pilot-work", "Hawzhin", &state, None, None).0,
@@ -9941,6 +10145,9 @@ mod tests {
             200,
             "the outstanding hidden-only catch-up check remains playable at the corpus cap"
         );
+        db.connection()
+            .execute("UPDATE speech_segments SET alignment_json = ?1 WHERE id = 'audio-pilot-key'", [key_alignment])
+            .unwrap();
         db.record_spot_check("audio-pilot-key", "Hawzhin", "edit", "ڕاستی پایلۆت", "ڕاستی پایلۆت").unwrap();
         assert_eq!(
             api_audio(&db, "audio-pilot-key", "Hawzhin", &state, None, None).0,
@@ -9963,6 +10170,7 @@ mod tests {
         let mut s = seg("s1", "دەق");
         s.audio_path = wav.to_string_lossy().to_string();
         db.insert_segment(&s).unwrap();
+        db.connection().execute("UPDATE speech_segments SET alignment_json = NULL WHERE id = 's1'", []).unwrap();
         drop(db);
 
         let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());

@@ -49,6 +49,7 @@ from review_pilot_hidden_contract import (
     PilotContractError,
     ReviewPilotPolicy,
     audit_active_hidden_state,
+    audit_pilot_review_history,
     read_policy,
 )
 
@@ -100,27 +101,29 @@ def load_pilot_served_checks(
 def pilot_progress(
     conn: sqlite3.Connection, policy: ReviewPilotPolicy
 ) -> tuple[int, dict[str, int]]:
-    """Count exactly the real Couch events the transactional server cap counts."""
-    current_max = conn.execute("SELECT COALESCE(MAX(id), 0) FROM review_events").fetchone()[0]
-    if policy.after_review_event_id > current_max:
-        raise PolicyBroken("controlled-review baseline is ahead of durable review history")
+    """Count only exact, non-reversed schema-v60 Couch decisions."""
     counts = {name: 0 for name in policy.reviewer_caps}
     total = 0
-    for actual, count in conn.execute(
-        """
-        SELECT reviewer, COUNT(*) FROM review_events
-        WHERE id > ? AND source = 'couch' AND action IN ('accept','edit','reject','skip')
-        GROUP BY LOWER(TRIM(reviewer))
-        """,
-        (policy.after_review_event_id,),
-    ):
-        canonical = next((name for name in counts if name.lower() == actual.strip().lower()), None)
+    try:
+        history = audit_pilot_review_history(conn, policy)
+    except PilotContractError as error:
+        raise PolicyBroken(str(error)) from error
+    for event in history.effective_events:
+        if event.source != "couch":
+            continue
+        if event.action not in {"accept", "edit", "reject", "skip"}:
+            raise PolicyBroken(f"effective event {event.event_id} has invalid action {event.action!r}")
+        canonical = next(
+            (name for name in counts if name.lower() == event.reviewer.strip().lower()), None
+        )
         if canonical is None:
-            raise PolicyBroken(f"controlled-review history contains unauthorized reviewer {actual!r}")
-        if count < 0 or count > policy.reviewer_caps[canonical]:
+            raise PolicyBroken(
+                f"controlled-review history contains unauthorized reviewer {event.reviewer!r}"
+            )
+        counts[canonical] += 1
+        if counts[canonical] > policy.reviewer_caps[canonical]:
             raise PolicyBroken(f"controlled-review history exceeds the limit for {canonical}")
-        counts[canonical] = count
-        total += count
+        total += 1
     if total > policy.max_total_corpus_actions:
         raise PolicyBroken("controlled-review history exceeds the total limit")
     return total, counts
@@ -547,7 +550,22 @@ def main() -> int:
         print("      At the action cap, Couch serves hidden-only catch-up; no third key or corpus action is allowed.")
         return 1
 
-    print("SPOT-CHECK POOL: healthy — fresh hidden checks cover every live reviewer's accessible campaign")
+    if pilot_policy is not None and pilot_total is not None and pilot_hidden_state is not None:
+        if (
+            pilot_total == pilot_policy.max_total_corpus_actions
+            and pilot_hidden_state.total_hidden_actions == MAX_UI_ACTIONS - pilot_policy.max_total_corpus_actions
+        ):
+            print(
+                "CONTROLLED PILOT QC: COMPLETE — run check_review_pilot_certification.py for the "
+                "playback + compensation certificate"
+            )
+        else:
+            print(
+                "CONTROLLED PILOT CERTIFICATION: PENDING — capacity is ready, but progress is "
+                f"{pilot_total}/{pilot_policy.max_total_corpus_actions} corpus and "
+                f"{pilot_hidden_state.total_hidden_actions}/{MAX_UI_ACTIONS - pilot_policy.max_total_corpus_actions} hidden"
+            )
+    print("SPOT-CHECK CAPACITY: READY — fresh hidden checks cover every live reviewer's accessible campaign")
     return 0
 
 

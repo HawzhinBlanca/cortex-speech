@@ -34,7 +34,7 @@ from review_pilot_hidden_contract import (
     HIDDEN_TABLE as HIDDEN_KEY_TABLE,
     HIDDEN_TABLE_SQL,
     HIDDEN_TRIGGER_SQL,
-    REQUIRED_SCHEMA as HIDDEN_KEY_SCHEMA_VERSION,
+    HIDDEN_KEY_SCHEMA_VERSION,
     TOTAL_HIDDEN_KEYS,
     ReviewPilotPolicy as HiddenReviewPilotPolicy,
     normalized_sql,

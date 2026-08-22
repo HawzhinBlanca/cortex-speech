@@ -54,6 +54,8 @@ struct LearningRow {
     speaker_id: Option<String>,
     confidence: Option<f64>,
     agreement_score: Option<f64>,
+    effect_event_id: Option<i64>,
+    retained_human_text: Option<String>,
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -99,10 +101,26 @@ fn build_dpo_dataset_filtered(
                 ss.duration_ms,
                 ss.speaker_id,
                 ss.confidence,
-                ss.agreement_score
+                ss.agreement_score,
+                ae.effect_event_id,
+                COALESCE(NULLIF(TRIM(ss.verdict_transcript), ''),
+                         NULLIF(TRIM(ss.annotated_transcript), '')) AS retained_human_text
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
          WHERE ss.is_gold = 0 AND ae.verified_by_human = 1
+           AND (
+                (ae.effect_event_id IS NOT NULL AND EXISTS (
+                     SELECT 1
+                       FROM effective_human_decision_effects_v60 effect
+                      WHERE effect.id = ae.effect_event_id
+                        AND effect.segment_id = ae.segment_id
+                        AND effect.action = 'edit'
+                ))
+                OR
+                (ae.effect_event_id IS NULL
+                 AND ss.verified = 1
+                 AND ss.human_decision = 'edit')
+           )
          ORDER BY ae.created_at DESC, ae.id ASC",
     )?;
 
@@ -121,6 +139,8 @@ fn build_dpo_dataset_filtered(
             speaker_id: row.get(10)?,
             confidence: row.get(11)?,
             agreement_score: row.get(12)?,
+            effect_event_id: row.get(13)?,
+            retained_human_text: row.get(14)?,
         })
     })?;
 
@@ -132,6 +152,10 @@ fn build_dpo_dataset_filtered(
         }
         let wrong = row.wrong_transcript.trim();
         let fix = row.human_fix.trim();
+        if row.effect_event_id.is_none() && !super::legacy_human_fix_is_current(row.retained_human_text.as_deref(), fix)
+        {
+            continue;
+        }
         if wrong.is_empty() || fix.is_empty() || learning_text_key(wrong) == learning_text_key(fix) {
             continue;
         }
@@ -661,13 +685,14 @@ mod tests {
         })
         .unwrap();
         // A HUMAN correction — verified_by_human defaults to 1 (trainable).
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES ('h1', 'seg-1', 'wrong asr text', 'human verified fix')",
-                [],
-            )
-            .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "h1",
+            "seg-1",
+            "wrong asr text",
+            "human verified fix",
+            None,
+        );
         // A MODEL correction — captured as pseudo (verified_by_human=0, NOT trainable).
         db.record_model_correction("seg-1", "wrong asr text", "model proposed fix", "jury").unwrap();
 
@@ -677,6 +702,115 @@ mod tests {
         assert!(
             !result.jsonl.contains("model proposed fix"),
             "a model pseudo-label must never enter the DPO training set"
+        );
+    }
+
+    #[test]
+    fn dpo_legacy_example_requires_current_matching_verified_edit() {
+        let db = open_mem_db();
+        assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![60]);
+        db.insert_segment(&SpeechSegment {
+            id: "legacy-dpo".into(),
+            audio_path: "/legacy-dpo.wav".into(),
+            raw_transcript: "wrong draft".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified = 1, human_decision = 'edit', annotated_transcript = 'Human   Fix'
+                  WHERE id = 'legacy-dpo'",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('legacy-dpo-row', 'legacy-dpo', 'wrong draft', 'human fix')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60]);
+
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET annotated_transcript = 'different correction'
+                  WHERE id = 'legacy-dpo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET annotated_transcript = ' HUMAN fix ', verified = 0
+                  WHERE id = 'legacy-dpo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "unverified legacy evidence must remain inactive");
+    }
+
+    #[test]
+    fn accept_memory_evidence_uses_the_authoritative_accepted_hypothesis() {
+        // Accepting an alternative stored ASR hypothesis is still an `accept`, but the accepted text can
+        // differ from annotated/raw. Memory evidence must be judged against what the human actually
+        // accepted; comparing the prior draft to itself would invert this Confirm into an Override.
+        let db = open_mem_db();
+        assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![60]);
+        let original = "ئەو ساڵە باش بوو";
+        let accepted = "ئەو ساڵە خراپ بوو";
+        let memory = crate::corrections::extract_substitution_memories(original, accepted)
+            .into_iter()
+            .next()
+            .expect("one substitution memory");
+        db.connection()
+            .execute(
+                "INSERT INTO correction_memory
+                    (id, wrong_token, human_token, slot_key, phonetic_key,
+                     confidence, hit_count, confirm_count, override_count)
+                 VALUES ('accepted-hypothesis-memory', ?1, ?2, ?3, ?4, 0.5, 0, 0, 0)",
+                params![memory.wrong_token, memory.human_token, memory.slot_key, memory.phonetic_key],
+            )
+            .unwrap();
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60]);
+
+        db.insert_segment(&SpeechSegment {
+            id: "accepted-hypothesis-segment".into(),
+            audio_path: "/accepted-hypothesis.wav".into(),
+            raw_transcript: original.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: "accepted-hypothesis-segment".into(),
+            model_id: "alternative-asr-hypothesis".into(),
+            transcript: accepted.into(),
+            confidence: Some(0.9),
+        })
+        .unwrap();
+
+        db.record_human_decision("accepted-hypothesis-segment", "accept", Some(accepted), None)
+            .expect("accept alternative stored hypothesis");
+        let (effective_action, confirm, override_delta): (String, i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT effect.action, contribution.confirm_delta, contribution.override_delta
+                   FROM human_decision_effect_events effect
+                   JOIN correction_memory_contributions contribution
+                     ON contribution.effect_event_id = effect.id
+                  WHERE effect.segment_id = 'accepted-hypothesis-segment'
+                    AND contribution.memory_id = 'accepted-hypothesis-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(effective_action, "accept", "a stored ASR hypothesis must retain machine provenance");
+        assert_eq!(
+            (confirm, override_delta),
+            (1, 0),
+            "the memory moves the prior draft exactly toward the authoritative accepted text"
         );
     }
 
@@ -768,13 +902,14 @@ mod tests {
         })
         .expect("insert hypothesis");
         insert_current_source_reference(&db, &audio_path_str, "gemini-2.5-pro", "source reference text");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-learning", "seg-learning", "agent wrong text", "human corrected text"],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-learning",
+            "seg-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1);
@@ -801,18 +936,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    "ex-private-path-learning",
-                    "seg-private-path-learning",
-                    "agent wrong text",
-                    "human corrected text"
-                ],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-private-path-learning",
+            "seg-private-path-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1);
@@ -876,18 +1007,14 @@ mod tests {
             created_at: None,
         })
         .expect("insert stale source reference");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    "ex-stale-reference-learning",
-                    "seg-stale-reference-learning",
-                    "agent wrong text",
-                    "human corrected text"
-                ],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-stale-reference-learning",
+            "seg-stale-reference-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1);
@@ -959,13 +1086,14 @@ mod tests {
         .expect("write verdict");
         insert_current_source_reference(&db, &audio_path_str, "gemini-2.5-pro", "source reference pro text");
         insert_current_source_reference(&db, &audio_path_str, "gemini-2.5-flash", "source reference flash text");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-reference-learning", "seg-reference-learning", "agent wrong text", "human corrected text"],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-reference-learning",
+            "seg-reference-learning",
+            "agent wrong text",
+            "human corrected text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         let pair: DpoPair = serde_json::from_str(result.jsonl.lines().next().expect("jsonl row")).expect("dpo pair");
@@ -990,13 +1118,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-duplicate", "seg-duplicate", "same   text", "same text"],
-            )
-            .expect("insert learning example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-duplicate",
+            "seg-duplicate",
+            "same   text",
+            "same text",
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 0);
@@ -1020,13 +1149,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-holdout", "seg-holdout", "wrong text", "corrected text"],
-            )
-            .expect("insert example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-holdout",
+            "seg-holdout",
+            "wrong text",
+            "corrected text",
+            None,
+        );
 
         // 2. Insert into gold_segments with is_holdout = 1
         db.connection()
@@ -1070,13 +1200,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&segment).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-holdout", "seg-holdout", "wrong text", "corrected text"],
-            )
-            .expect("insert example");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "ex-holdout",
+            "seg-holdout",
+            "wrong text",
+            "corrected text",
+            None,
+        );
         db.connection()
             .execute(
                 "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
@@ -1114,12 +1245,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).expect("insert segment");
-        db.connection()
-            .execute(
-                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix) VALUES (?1, ?2, ?3, ?4)",
-                params!["ex-x", "seg-x", "wrong text", "corrected text"],
-            )
-            .expect("insert example");
+        super::super::insert_active_human_example_fixture(&db, "ex-x", "seg-x", "wrong text", "corrected text", None);
         assert_eq!(build_dpo_dataset(&db).expect("build").pair_count, 1, "readable clip is a valid pair");
 
         // Repoint the segment at a present-but-unhashable path (a directory): exists() is true but
@@ -1233,11 +1359,10 @@ mod tests {
     }
 
     #[test]
-    fn undo_and_reject_retract_the_dpo_learning_pair() {
-        // Round-24 hunt #9: build_dpo_dataset / few-shot key only on verified_by_human=1, never on the
-        // segment's CURRENT decision, so a human edit later UNDONE or whose clip is later REJECTED used
-        // to keep training the model to prefer a retracted fix. clear_human_decision and the reject
-        // path now delete the agent_examples pair in the same transaction as the decision change.
+    fn reversed_or_shadowed_edit_effect_retracts_the_dpo_pair_without_deleting_history() {
+        // Schema v60 makes human learning artifacts append-only. Their visibility follows the owning
+        // effect: reversing the edit or shadowing it with a later reject retracts learning without a
+        // broad DELETE from agent_examples.
         let db = open_mem_db();
         let seg = SpeechSegment {
             id: "s-retract".to_string(),
@@ -1247,19 +1372,41 @@ mod tests {
         };
         db.insert_segment(&seg).expect("insert");
 
-        // A human edit creates the learning pair -> one DPO pair.
-        db.record_human_decision("s-retract", "edit", Some("ئەو ڕاستە"), None).expect("edit");
+        let first_effect = super::super::insert_active_human_example_fixture(
+            &db,
+            "s-retract-example-1",
+            "s-retract",
+            "ئەو غەڵەتە",
+            "ئەو ڕاستە",
+            None,
+        );
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "an edit produces a DPO pair");
 
-        // Undo retracts it.
-        db.clear_human_decision("s-retract").expect("undo");
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'dpo-first-edit-undo')",
+                [first_effect],
+            )
+            .unwrap();
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "undo must retract the learning pair");
 
-        // Re-edit, then REJECT the clip -> retracted again.
-        db.record_human_decision("s-retract", "edit", Some("ئەو ڕاستە"), None).expect("re-edit");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "s-retract-example-2",
+            "s-retract",
+            "ئەو غەڵەتە",
+            "ئەو ڕاستە",
+            None,
+        );
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "re-edit re-creates the pair");
-        db.record_human_decision("s-retract", "reject", None, None).expect("reject");
+        super::super::insert_human_effect_fixture(&db, "s-retract", "reject", None);
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "reject must retract the learning pair");
+        let physical_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_examples WHERE segment_id = 's-retract'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(physical_rows, 2, "effect projection must retract learning without deleting evidence history");
     }
 
     #[test]
@@ -1281,7 +1428,14 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).expect("insert");
-        db.record_human_decision("seg-no-leak", "edit", Some(fix), None).expect("edit");
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "seg-no-leak-example",
+            "seg-no-leak",
+            "raw asr text",
+            fix,
+            None,
+        );
 
         let result = build_dpo_dataset(&db).expect("build dpo");
         assert_eq!(result.pair_count, 1, "an edit produces one DPO pair");

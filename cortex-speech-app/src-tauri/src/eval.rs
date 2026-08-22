@@ -1454,6 +1454,13 @@ mod tests {
         })
         .unwrap();
 
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash = ?1 WHERE id = 's1'",
+                [blake3::hash(b"eval-human-edit-s1").to_hex().to_string()],
+            )
+            .unwrap();
+
         db.write_segment_verdict("s1", "jury_edit", Some("دەقی جوری"), None, None, None, false).unwrap();
         db.record_human_decision("s1", "edit", Some("دەقی مرۆڤ"), None).unwrap();
 
@@ -1732,7 +1739,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-            db.update_verified(&id, true).unwrap();
+            db.update_verified_for_test(&id, true).unwrap();
             db.record_human_decision(&id, "accept", None, None).unwrap();
         }
 
@@ -1801,7 +1808,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.update_verified("keep", true).unwrap();
+        db.update_verified_for_test("keep", true).unwrap();
         // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
         db.record_human_decision("keep", "accept", None, None).unwrap();
         // LEAK: a holdout gold entry + a verified segment on the SAME audio path.
@@ -1817,7 +1824,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.update_verified("leak", true).unwrap();
+        db.update_verified_for_test("leak", true).unwrap();
         // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
         db.record_human_decision("leak", "accept", None, None).unwrap();
 
@@ -1895,7 +1902,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-                db.update_verified(id, true).unwrap();
+                db.update_verified_for_test(id, true).unwrap();
                 db.record_human_decision(id, "accept", None, None).unwrap();
                 expected_rows += 1;
             }
@@ -2032,7 +2039,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-                db.update_verified(&id, true).unwrap();
+                db.update_verified_for_test(&id, true).unwrap();
                 db.record_human_decision(&id, "accept", None, None).unwrap();
                 ids.push(id);
             }
@@ -2104,7 +2111,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.update_verified("intact", true).unwrap();
+        db.update_verified_for_test("intact", true).unwrap();
         // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
         db.record_human_decision("intact", "accept", None, None).unwrap();
         // Sibling chunk whose offsets were clobbered to a bare word array: must be SKIPPED,
@@ -2117,7 +2124,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.update_verified("clobbered", true).unwrap();
+        db.update_verified_for_test("clobbered", true).unwrap();
         // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
         db.record_human_decision("clobbered", "accept", None, None).unwrap();
 
@@ -2166,7 +2173,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.update_verified("good", true).unwrap();
+        db.update_verified_for_test("good", true).unwrap();
         // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
         db.record_human_decision("good", "accept", None, None).unwrap();
 
@@ -2179,7 +2186,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.update_verified("markbad", true).unwrap();
+        db.update_verified_for_test("markbad", true).unwrap();
         // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
         db.record_human_decision("markbad", "reject", None, None).unwrap();
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='markbad'", []).unwrap();
@@ -2194,7 +2201,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        db.update_verified("clipped", true).unwrap();
+        db.update_verified_for_test("clipped", true).unwrap();
         // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
         db.record_human_decision("clipped", "accept", None, None).unwrap();
 
@@ -2244,7 +2251,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-            db.update_verified(id, true).unwrap();
+            db.update_verified_for_test(id, true).unwrap();
             // Gold-provenance law (2026-08-12): the flag alone no longer grades human gold.
             db.record_human_decision(id, "accept", None, None).unwrap();
         }

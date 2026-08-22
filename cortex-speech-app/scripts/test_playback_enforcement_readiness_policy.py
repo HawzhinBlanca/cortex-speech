@@ -27,10 +27,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE = REPO_ROOT / "scripts" / "check_playback_enforcement_readiness.py"
 DB_RS = REPO_ROOT / "src-tauri" / "src" / "db.rs"
 COUCH_RS = REPO_ROOT / "src-tauri" / "src" / "couch.rs"
+COMMANDS_RS = REPO_ROOT / "src-tauri" / "src" / "commands.rs"
+SEGMENTS_WRITE_RS = REPO_ROOT / "src-tauri" / "src" / "commands" / "segments_write.rs"
+CERTIFICATION_GATE = REPO_ROOT / "scripts" / "check_review_pilot_certification.py"
 VERIFY_10 = REPO_ROOT.parent / "scripts" / "verify_10.py"
+REQUEUE_TOOL = REPO_ROOT / "scripts" / "requeue_unheard_decisions.py"
+LEGACY_REPAIR_TOOL = REPO_ROOT / "scripts" / "repair_unfinalized_reviews.py"
 
 sys.path.insert(0, str(GATE.parent))
 import check_playback_enforcement_readiness as gate  # noqa: E402
+import repair_unfinalized_reviews as repair  # noqa: E402
+import requeue_unheard_decisions as requeue  # noqa: E402
+
+EVENT_TIMESTAMP_MS = 1_700_000_001_000
+CONTENT_HASH = "a" * 64
+OTHER_CONTENT_HASH = "b" * 64
 
 
 def _rust_const(name: str, source: Path) -> str:
@@ -47,6 +58,46 @@ def test_the_policy_version_matches_the_rust_constant() -> None:
     assert int(_rust_const("PLAYBACK_POLICY_VERSION", DB_RS)) == gate.PLAYBACK_POLICY_VERSION
 
 
+def test_source_span_duration_tolerance_matches_the_rust_constant() -> None:
+    from pilot_focus_contract import MAX_SOURCE_SPAN_DURATION_DELTA_MS
+
+    assert (
+        int(_rust_const("MAX_SOURCE_SPAN_DURATION_DELTA_MS", DB_RS))
+        == MAX_SOURCE_SPAN_DURATION_DELTA_MS
+        == 1
+    )
+
+
+def test_runtime_and_repair_tools_never_authorize_from_the_stored_ratio() -> None:
+    rust = DB_RS.read_text(encoding="utf-8")
+    start = rust.index("fn has_sufficient_playback_evidence_on(")
+    end = rust.index("\n/// Re-read the exact hidden-check answer", start)
+    authorization = rust[start:end]
+    assert "coverage_ratio" not in authorization
+    assert "played_ms" in authorization and "clip_duration_ms" in authorization
+    assert "PLAYBACK_POLICY_VERSION" in authorization
+    assert "s.audio_content_hash" in authorization
+    assert "s.audio_fingerprint" not in authorization
+    assert "source_start_ms" in authorization and "source_end_ms" in authorization
+    assert "s.alignment_json" in authorization
+    for path in (REQUEUE_TOOL, LEGACY_REPAIR_TOOL):
+        source = path.read_text(encoding="utf-8")
+        assert "MAX(coverage_ratio)" not in source
+        assert "uncovered" in source
+    requeue_source = REQUEUE_TOOL.read_text(encoding="utf-8")
+    assert "UPDATE speech_segments" not in requeue_source
+    assert "DELETE FROM agent_examples" not in requeue_source
+    assert "offline --apply cannot atomically reverse every decision side effect" in requeue_source
+
+
+def test_playback_identity_has_no_segment_id_or_path_fallback() -> None:
+    for path in (DB_RS, COUCH_RS, COMMANDS_RS, SEGMENTS_WRITE_RS, GATE, CERTIFICATION_GATE):
+        source = path.read_text(encoding="utf-8")
+        assert "'id:' ||" not in source, f"{path.name} still invents SQL identity from a segment id"
+        assert 'format!("id:' not in source, f"{path.name} still invents identity from a segment id"
+        assert 'format!("path:' not in source, f"{path.name} still substitutes a path for audio identity"
+
+
 def test_the_refusal_marker_is_the_string_the_server_actually_logs() -> None:
     assert gate.ENFORCE_MARKER.decode() in COUCH_RS.read_text(encoding="utf-8"), (
         "the gate greps the binary for a marker the server no longer emits, so it would pass on silence"
@@ -58,16 +109,143 @@ def _seed(db_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     conn.executescript(
         """
-        CREATE TABLE speech_segments (id TEXT PRIMARY KEY, review_revision INTEGER, audio_fingerprint TEXT);
-        CREATE TABLE review_events (segment_id TEXT, reviewer TEXT, action TEXT, source TEXT, created_at TEXT);
-        CREATE TABLE playback_receipts (segment_id TEXT, segment_revision INTEGER, audio_fingerprint TEXT,
-                                        coverage_ratio REAL, created_at TEXT, reviewer TEXT);
-        INSERT INTO speech_segments VALUES ('s1', 0, 'fp1');
-        INSERT INTO review_events VALUES ('s1', 'Sara', 'accept', 'couch', '2026-08-18 21:19:20');
+        CREATE TABLE speech_segments (id TEXT PRIMARY KEY, review_revision INTEGER,
+                                      audio_fingerprint TEXT, audio_content_hash TEXT,
+                                      duration_ms INTEGER, alignment_json TEXT);
+        CREATE TABLE review_events (id INTEGER PRIMARY KEY AUTOINCREMENT, segment_id TEXT,
+                                    reviewer TEXT, action TEXT, source TEXT, created_at TEXT,
+                                    timestamp_ms INTEGER);
+        CREATE TABLE review_compensation_ledger (review_event_id INTEGER, policy_version TEXT,
+                                                 decision_revision INTEGER, segment_id TEXT,
+                                                 reviewer TEXT, source TEXT);
+        CREATE TABLE playback_receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, segment_id TEXT,
+                                        segment_revision INTEGER, audio_fingerprint TEXT,
+                                        coverage_ratio REAL, created_at TEXT, reviewer TEXT,
+                                        played_ms INTEGER, clip_duration_ms INTEGER, policy_version INTEGER,
+                                        started_at_ms INTEGER, source_start_ms INTEGER,
+                                        source_end_ms INTEGER);
+        INSERT INTO speech_segments VALUES ('s1', 1, '424242',
+                                             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                                             1000, '{"source_start_ms":0,"source_end_ms":1000}');
+        INSERT INTO review_events
+            (segment_id, reviewer, action, source, created_at, timestamp_ms)
+            VALUES ('s1', 'Sara', 'accept', 'couch', '2026-08-18 21:19:20', 1700000001000);
+        INSERT INTO review_compensation_ledger VALUES
+            (1, 'review-iqd-v1-2026-08-21', 1, 's1', 'Sara', 'couch');
         """
     )
     conn.commit()
     conn.close()
+
+
+def _insert_receipt(
+    conn: sqlite3.Connection,
+    segment_id: str,
+    revision: int,
+    fingerprint: str,
+    coverage: float,
+    created_at: str,
+    reviewer: str | None,
+    *,
+    played_ms: int | None = None,
+    duration_ms: int = 1000,
+    policy_version: int = gate.PLAYBACK_POLICY_VERSION,
+    started_at_ms: int = EVENT_TIMESTAMP_MS - 1,
+    source_start_ms: int = 0,
+    source_end_ms: int | None = None,
+    omit_source_span: bool = False,
+) -> None:
+    played = round(coverage * duration_ms) if played_ms is None else played_ms
+    receipt_start = None if omit_source_span else source_start_ms
+    receipt_end = None if omit_source_span else (
+        source_start_ms + duration_ms if source_end_ms is None else source_end_ms
+    )
+    conn.execute(
+        """INSERT INTO playback_receipts
+               (segment_id, segment_revision, audio_fingerprint, coverage_ratio, created_at,
+                reviewer, played_ms, clip_duration_ms, policy_version, started_at_ms,
+                source_start_ms, source_end_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            segment_id,
+            revision,
+            fingerprint,
+            coverage,
+            created_at,
+            reviewer,
+            played,
+            duration_ms,
+            policy_version,
+            started_at_ms,
+            receipt_start,
+            receipt_end,
+        ),
+    )
+
+
+def _insert_event(
+    conn: sqlite3.Connection,
+    segment_id: str,
+    reviewer: str,
+    action: str,
+    created_at: str,
+    *,
+    decision_revision: int,
+    timestamp_ms: int = EVENT_TIMESTAMP_MS,
+) -> int:
+    cursor = conn.execute(
+        """INSERT INTO review_events
+               (segment_id, reviewer, action, source, created_at, timestamp_ms)
+             VALUES (?, ?, ?, 'couch', ?, ?)""",
+        (segment_id, reviewer, action, created_at, timestamp_ms),
+    )
+    event_id = cursor.lastrowid
+    assert event_id is not None
+    conn.execute(
+        """INSERT INTO review_compensation_ledger
+               (review_event_id, policy_version, decision_revision, segment_id, reviewer, source)
+             VALUES (?, 'review-iqd-v1-2026-08-21', ?, ?, ?, 'couch')""",
+        (event_id, decision_revision, segment_id, reviewer),
+    )
+    return event_id
+
+
+def _operational_connection(*, cutoff: int) -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        f"""
+        CREATE TABLE speech_segments (
+            id TEXT PRIMARY KEY, review_revision INTEGER, audio_fingerprint TEXT,
+            audio_content_hash TEXT, duration_ms INTEGER,
+            verified INTEGER, human_decision TEXT, verdict TEXT, corrected_at TEXT, reviewed_by TEXT,
+            annotated_transcript TEXT, verdict_transcript TEXT, rationale TEXT, evidence_json TEXT,
+            agreement_score REAL, escalated INTEGER, updated_at TEXT,
+            alignment_json TEXT DEFAULT '{{"source_start_ms":0,"source_end_ms":1000}}'
+        );
+        CREATE TABLE review_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, segment_id TEXT, reviewer TEXT, action TEXT,
+            source TEXT, created_at TEXT, timestamp_ms INTEGER
+        );
+        CREATE TABLE review_compensation_ledger (
+            review_event_id INTEGER, policy_version TEXT, decision_revision INTEGER,
+            segment_id TEXT, reviewer TEXT, source TEXT
+        );
+        CREATE TABLE playback_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, segment_id TEXT, segment_revision INTEGER,
+            audio_fingerprint TEXT, coverage_ratio REAL, created_at TEXT, reviewer TEXT,
+            played_ms INTEGER, clip_duration_ms INTEGER, policy_version INTEGER, started_at_ms INTEGER,
+            source_start_ms INTEGER, source_end_ms INTEGER
+        );
+        CREATE TABLE decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, segment_id TEXT, decision_type TEXT,
+            timestamp_ms INTEGER, human_decision TEXT, created_at TEXT
+        );
+        CREATE TABLE review_compensation_policies (policy_version TEXT, effective_after_event_id INTEGER);
+        CREATE TABLE agent_examples (segment_id TEXT);
+        INSERT INTO review_compensation_policies VALUES ('review-iqd-v1-2026-08-21', {cutoff});
+        """
+    )
+    return conn
 
 
 def _run(db_path: Path, exe: Path, since: str) -> subprocess.CompletedProcess:
@@ -165,10 +343,14 @@ def test_a_covered_decision_passes_so_the_gate_is_not_merely_a_refuser() -> None
         conn = sqlite3.connect(db_path)
         # TWO reviewers, because the gate's device bar is part of what "ready" means. A positive
         # control that dodges one of the checks is not a control for the gate as configured.
-        conn.execute("INSERT INTO speech_segments VALUES ('s2', 0, 'fp2')")
-        conn.execute("INSERT INTO review_events VALUES ('s2', 'Hemn', 'edit', 'couch', '2026-08-20 10:00:00')")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.97, '2026-08-18 21:19:20', 'Sara')")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s2', 0, 'fp2', 0.93, '2026-08-20 10:00:00', 'Hemn')")
+        conn.execute(
+            """INSERT INTO speech_segments VALUES
+                   (?, 1, '525252', ?, 1000, '{"source_start_ms":0,"source_end_ms":1000}')""",
+            ("s2", OTHER_CONTENT_HASH),
+        )
+        _insert_event(conn, "s2", "Hemn", "edit", "2026-08-20 10:00:00", decision_revision=1)
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 0.97, "2026-08-18 21:19:20", "Sara")
+        _insert_receipt(conn, "s2", 0, OTHER_CONTENT_HASH, 0.93, "2026-08-20 10:00:00", "Hemn")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -188,7 +370,7 @@ def test_a_receipt_below_the_bar_is_reported_as_a_refusal() -> None:
         db_path = tmp / "t.db"
         _seed(db_path)
         conn = sqlite3.connect(db_path)
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.42, '2026-08-18 21:19:20', 'Sara')")
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 0.42, "2026-08-18 21:19:20", "Sara")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -209,7 +391,7 @@ def test_one_device_is_not_enough_to_enforce_on_eight() -> None:
         db_path = tmp / "t.db"
         _seed(db_path)
         conn = sqlite3.connect(db_path)
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.99, '2026-08-18 21:19:20', 'Sara')")
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 0.99, "2026-08-18 21:19:20", "Sara")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -263,10 +445,15 @@ def test_a_decision_that_bumped_the_revision_still_counts_as_evidenced() -> None
         conn = sqlite3.connect(db_path)
         # The decision landed at revision 3 and pushed the row to 4 -- exactly what the server does.
         conn.execute("UPDATE speech_segments SET review_revision = 4 WHERE id = 's1'")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 3, 'fp1', 0.96, '2026-08-18 21:19:20', 'Sara')")
-        conn.execute("INSERT INTO speech_segments VALUES ('s2', 4, 'fp2')")
-        conn.execute("INSERT INTO review_events VALUES ('s2', 'Hemn', 'edit', 'couch', '2026-08-18 21:19:20')")
-        conn.execute("INSERT INTO playback_receipts VALUES ('s2', 3, 'fp2', 0.93, '2026-08-18 21:19:20', 'Hemn')")
+        conn.execute("UPDATE review_compensation_ledger SET decision_revision = 4 WHERE review_event_id = 1")
+        _insert_receipt(conn, "s1", 3, CONTENT_HASH, 0.96, "2026-08-18 21:19:20", "Sara")
+        conn.execute(
+            """INSERT INTO speech_segments VALUES
+                   (?, 4, '525252', ?, 1000, '{"source_start_ms":0,"source_end_ms":1000}')""",
+            ("s2", OTHER_CONTENT_HASH),
+        )
+        _insert_event(conn, "s2", "Hemn", "edit", "2026-08-18 21:19:20", decision_revision=4)
+        _insert_receipt(conn, "s2", 3, OTHER_CONTENT_HASH, 0.93, "2026-08-18 21:19:20", "Hemn")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -296,7 +483,7 @@ def test_anothers_receipt_does_not_evidence_my_decision() -> None:
         _seed(db_path)
         conn = sqlite3.connect(db_path)
         # The receipt at the decision's own second — but minted by SOMEBODY ELSE.
-        conn.execute("INSERT INTO playback_receipts VALUES ('s1', 0, 'fp1', 0.99, '2026-08-18 21:19:20', 'Hemn')")
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 0.99, "2026-08-18 21:19:20", "Hemn")
         conn.commit()
         conn.close()
         exe = tmp / "cortex-speech-app.exe"
@@ -308,6 +495,484 @@ def test_anothers_receipt_does_not_evidence_my_decision() -> None:
         )
         assert result.returncode == 1, "someone else's listen must not read as this reviewer's evidence: " + result.stdout
         assert "enforcement REFUSED 1 of 1" in result.stdout, result.stdout
+
+
+def test_another_audio_content_hash_cannot_evidence_the_current_bytes() -> None:
+    """Revision/reviewer equality is not audio identity.
+
+    A high-coverage receipt for stale bytes must not hide a below-bar receipt for the segment's
+    current server-owned content hash. Rust binds all four fields; the retrospective gate must too.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 0.42, "2026-08-18 21:19:20", "Sara")
+        _insert_receipt(conn, "s1", 0, OTHER_CONTENT_HASH, 1.0, "2026-08-18 21:19:20", "Sara")
+        conn.commit()
+        conn.close()
+        exe = tmp / "cortex-speech-app.exe"
+        exe.write_bytes(gate.ENFORCE_MARKER)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(GATE),
+                "--db",
+                str(db_path),
+                "--exe",
+                str(exe),
+                "--since",
+                "2020-01-01 00:00:00",
+                "--min-decisions",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1, result.stdout
+        assert "best canonical coverage 0.42" in result.stdout, result.stdout
+
+
+def test_stored_ratio_cannot_override_zero_raw_listening_or_wrong_policy() -> None:
+    """The durable authority is raw media time under the current policy, not a mutable REAL."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        _insert_receipt(
+            conn,
+            "s1",
+            0,
+            CONTENT_HASH,
+            1.0,
+            "2026-08-18 21:19:20",
+            "Sara",
+            played_ms=0,
+            policy_version=999,
+        )
+        conn.commit()
+        reason = gate.uncovered(conn, "s1", "2026-08-18 21:19:20", "Sara", 0, EVENT_TIMESTAMP_MS)
+        audited, semantic_errors = gate.playback_receipt_semantic_issues(conn)
+        conn.close()
+        assert audited == 1
+        assert reason is not None and "best canonical coverage 0.00" in reason
+        assert any("policy_version=999" in error for error in semantic_errors)
+
+
+def test_legacy_policy_one_receipt_is_historical_but_never_authorizes() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        db_path = Path(raw) / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        _insert_receipt(
+            conn,
+            "s1",
+            0,
+            "424242",
+            1.0,
+            "2026-08-18 21:19:20",
+            "Sara",
+            policy_version=gate.LEGACY_PLAYBACK_POLICY_VERSION,
+            omit_source_span=True,
+        )
+        conn.commit()
+
+        audited, semantic_errors = gate.playback_receipt_semantic_issues(conn)
+        reason = gate.uncovered(
+            conn,
+            "s1",
+            "2026-08-18 21:19:20",
+            "Sara",
+            0,
+            EVENT_TIMESTAMP_MS,
+        )
+        conn.close()
+
+        assert audited == 1 and semantic_errors == []
+        assert reason is not None and "best canonical coverage 0.00" in reason
+
+
+def test_policy_two_content_hash_receipt_is_historical_but_never_authorizes_v3() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        db_path = Path(raw) / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        _insert_receipt(
+            conn,
+            "s1",
+            0,
+            CONTENT_HASH,
+            1.0,
+            "2026-08-18 21:19:20",
+            "Sara",
+            policy_version=gate.CONTENT_HASH_ONLY_PLAYBACK_POLICY_VERSION,
+            omit_source_span=True,
+        )
+        conn.commit()
+
+        audited, semantic_errors = gate.playback_receipt_semantic_issues(conn)
+        reason = gate.uncovered(
+            conn,
+            "s1",
+            "2026-08-18 21:19:20",
+            "Sara",
+            0,
+            EVENT_TIMESTAMP_MS,
+        )
+        conn.close()
+
+        assert audited == 1 and semantic_errors == []
+        assert reason is not None and "best canonical coverage 0.00" in reason
+
+
+def test_policy_three_receipt_span_must_exactly_match_even_when_duration_matches() -> None:
+    cases = [
+        (None, None, True, "coordinates are not exact integers"),
+        ("zero", 1000, False, "coordinates are not exact integers"),
+        (0, 0, False, "not a non-empty forward range"),
+        (1000, 2000, False, "disagrees with server-owned (0, 1000)"),
+    ]
+    for start, end, omit, expected in cases:
+        with tempfile.TemporaryDirectory() as raw:
+            db_path = Path(raw) / "t.db"
+            _seed(db_path)
+            conn = sqlite3.connect(db_path)
+            _insert_receipt(
+                conn,
+                "s1",
+                0,
+                CONTENT_HASH,
+                1.0,
+                "2026-08-18 21:19:20",
+                "Sara",
+                source_start_ms=start,  # type: ignore[arg-type]
+                source_end_ms=end,
+                omit_source_span=omit,
+            )
+            conn.commit()
+            audited, semantic_errors = gate.playback_receipt_semantic_issues(conn)
+            reason = gate.uncovered(
+                conn,
+                "s1",
+                "2026-08-18 21:19:20",
+                "Sara",
+                0,
+                EVENT_TIMESTAMP_MS,
+            )
+            conn.close()
+            assert audited == 1 and any(expected in error for error in semantic_errors), semantic_errors
+            assert reason is not None and expected in reason, reason
+
+
+def test_policy_three_allows_one_ms_endpoint_rounding_but_refuses_tenfold_duration() -> None:
+    for duration_ms, should_pass in ((1001, True), (10_000, False)):
+        with tempfile.TemporaryDirectory() as raw:
+            db_path = Path(raw) / "t.db"
+            _seed(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.execute("UPDATE speech_segments SET duration_ms=? WHERE id='s1'", (duration_ms,))
+            _insert_receipt(
+                conn,
+                "s1",
+                0,
+                CONTENT_HASH,
+                1.0,
+                "2026-08-18 21:19:20",
+                "Sara",
+                duration_ms=duration_ms,
+                source_start_ms=0,
+                source_end_ms=1000,
+            )
+            conn.commit()
+            audited, semantic_errors = gate.playback_receipt_semantic_issues(conn)
+            reason = gate.uncovered(
+                conn,
+                "s1",
+                "2026-08-18 21:19:20",
+                "Sara",
+                0,
+                EVENT_TIMESTAMP_MS,
+            )
+            conn.close()
+
+            assert audited == 1
+            if should_pass:
+                assert semantic_errors == []
+                assert reason is None
+            else:
+                assert any("differs from exact source span length" in item for item in semantic_errors)
+                assert reason is not None and "differs from exact source span length" in reason
+
+
+def test_policy_three_refuses_null_or_malformed_server_owned_alignment_span() -> None:
+    cases = [
+        (None, "alignment_json is not text"),
+        ("{", "alignment_json is malformed"),
+        ('{"source_start_ms":true,"source_end_ms":1000}', "not exact integers"),
+        ('{"source_start_ms":1000,"source_end_ms":1000}', "not a non-empty forward range"),
+    ]
+    for alignment_json, expected in cases:
+        with tempfile.TemporaryDirectory() as raw:
+            db_path = Path(raw) / "t.db"
+            _seed(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.execute("UPDATE speech_segments SET alignment_json=? WHERE id='s1'", (alignment_json,))
+            _insert_receipt(conn, "s1", 0, CONTENT_HASH, 1.0, "2026-08-18 21:19:20", "Sara")
+            conn.commit()
+            audited, semantic_errors = gate.playback_receipt_semantic_issues(conn)
+            reason = gate.uncovered(
+                conn,
+                "s1",
+                "2026-08-18 21:19:20",
+                "Sara",
+                0,
+                EVENT_TIMESTAMP_MS,
+            )
+            conn.close()
+            assert audited == 1 and any(expected in error for error in semantic_errors), semantic_errors
+            assert reason is not None and expected in reason, reason
+
+
+def test_blank_server_content_hash_cannot_be_replaced_by_a_client_claim() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        db_path = Path(raw) / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE speech_segments SET audio_content_hash = NULL WHERE id = 's1'")
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 1.0, "2026-08-18 21:19:20", "Sara")
+        conn.commit()
+
+        reason = gate.uncovered(conn, "s1", "2026-08-18 21:19:20", "Sara", 0, EVENT_TIMESTAMP_MS)
+        audited, semantic_errors = gate.playback_receipt_semantic_issues(conn)
+        conn.close()
+
+        assert reason is not None and "no canonical server-derived audio content hash" in reason
+        assert audited == 1
+        assert any("no canonical server-derived audio content hash" in error for error in semantic_errors)
+
+
+def test_receipt_minted_after_the_decision_cannot_retroactively_authorize_it() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 1.0, "2026-08-18 21:19:25", "Sara")
+        conn.commit()
+        reason = gate.uncovered(conn, "s1", "2026-08-18 21:19:20", "Sara", 0, EVENT_TIMESTAMP_MS)
+        conn.close()
+        assert reason is not None and "best canonical coverage 0.00" in reason
+
+
+def test_old_revision_cannot_authorize_a_later_decision_with_the_same_audio() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        db_path = Path(raw) / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE speech_segments SET review_revision = 5 WHERE id = 's1'")
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 1.0, "2026-08-18 21:19:19", "Sara")
+        conn.commit()
+        reason = gate.uncovered(conn, "s1", "2026-08-18 21:19:20", "Sara", 4, EVENT_TIMESTAMP_MS)
+        conn.close()
+        assert reason is not None and "revision 4 best canonical coverage 0.00" in reason
+
+
+def test_ledger_identity_mismatch_cannot_name_a_receipt_revision() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        db_path = Path(raw) / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE review_compensation_ledger SET reviewer = 'Hemn'")
+        _insert_receipt(conn, "s1", 0, CONTENT_HASH, 1.0, "2026-08-18 21:19:20", "Sara")
+        conn.commit()
+        revision, reason = gate.corpus_receipt_revision_for_event(conn, 1, "s1", "Sara", "couch")
+        conn.close()
+        assert revision is None and reason is not None and "identity disagree" in reason
+
+
+def test_multiple_ledger_rows_cannot_name_a_receipt_revision() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        db_path = Path(raw) / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """INSERT INTO review_compensation_ledger VALUES
+                 (1, 'other-policy', 1, 's1', 'Sara', 'couch')"""
+        )
+        revision, reason = gate.corpus_receipt_revision_for_event(conn, 1, "s1", "Sara", "couch")
+        conn.close()
+        assert revision is None and reason is not None and "2 immutable compensation rows" in reason
+
+
+def test_same_second_receipt_started_after_event_is_not_evidence() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        db_path = Path(raw) / "t.db"
+        _seed(db_path)
+        conn = sqlite3.connect(db_path)
+        _insert_receipt(
+            conn,
+            "s1",
+            0,
+            CONTENT_HASH,
+            1.0,
+            "2026-08-18 21:19:20",
+            "Sara",
+            started_at_ms=EVENT_TIMESTAMP_MS + 1,
+        )
+        conn.commit()
+        reason = gate.uncovered(conn, "s1", "2026-08-18 21:19:20", "Sara", 0, EVENT_TIMESTAMP_MS)
+        conn.close()
+        assert reason is not None and "after decision" in reason
+
+
+def test_legacy_repair_requires_exact_current_revision_and_decision_identity() -> None:
+    conn = _operational_connection(cutoff=10)
+    conn.execute(
+        """INSERT INTO speech_segments
+               (id, review_revision, audio_fingerprint, audio_content_hash, duration_ms,
+                verified, human_decision,
+                verdict, corrected_at, reviewed_by, annotated_transcript, escalated)
+             VALUES ('legacy', 2, '424242',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     1000, 0, 'edit', 'human_edit',
+                     '2026-08-18 21:19:20', NULL, 'correct text', 0)"""
+    )
+    conn.execute(
+        """INSERT INTO decision_log
+               (segment_id, decision_type, timestamp_ms, human_decision, created_at)
+             VALUES ('legacy', 'edit', ?, 'edit', '2026-08-18 21:19:20')""",
+        (EVENT_TIMESTAMP_MS,),
+    )
+    _insert_receipt(conn, "legacy", 1, CONTENT_HASH, 1.0, "2026-08-18 21:19:20", None)
+    finalizable, ambiguous = repair.legacy_finalizable_reviews(conn)
+    assert [row["segment_id"] for row in finalizable] == ["legacy"] and not ambiguous
+
+    # A later text/alignment revision must not be rebound to the old receipt.
+    conn.execute("UPDATE speech_segments SET review_revision = 5 WHERE id = 'legacy'")
+    finalizable, ambiguous = repair.legacy_finalizable_reviews(conn)
+    conn.close()
+    assert not finalizable
+    assert len(ambiguous) == 1 and "revision 4 best canonical coverage 0.00" in ambiguous[0]["failure"]
+
+
+def test_requeue_refuses_a_later_desktop_decision_even_if_old_couch_event_is_latest() -> None:
+    conn = _operational_connection(cutoff=1)
+    conn.execute(
+        """INSERT INTO speech_segments
+               (id, review_revision, audio_fingerprint, audio_content_hash, duration_ms,
+                verified, human_decision,
+                verdict, corrected_at, reviewed_by, annotated_transcript, escalated)
+             VALUES ('changed', 2, '424242',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     1000, 1, 'edit', 'human_edit',
+                     '2026-08-18 21:20:00', NULL, 'desktop correction', 0)"""
+    )
+    conn.execute(
+        """INSERT INTO review_events
+               (segment_id, reviewer, action, source, created_at, timestamp_ms)
+             VALUES ('changed', 'Sara', 'accept', 'couch', '2026-08-18 21:19:20', ?)""",
+        (EVENT_TIMESTAMP_MS,),
+    )
+    conn.execute(
+        """INSERT INTO decision_log
+               (segment_id, decision_type, timestamp_ms, human_decision, created_at)
+             VALUES ('changed', 'accept', ?, 'accept', '2026-08-18 21:19:20'),
+                    ('changed', 'edit', ?, 'edit', '2026-08-18 21:20:00')""",
+        (EVENT_TIMESTAMP_MS, EVENT_TIMESTAMP_MS + 40_000),
+    )
+    targets, blocked = requeue.audit_requeue_candidates(conn, "2020-01-01 00:00:00")
+    conn.close()
+    assert not targets and len(blocked) == 1
+    assert "current decision/action disagree" in blocked[0]["evidence_failure"]
+
+
+def test_requeue_reports_malformed_event_identity_without_crashing() -> None:
+    conn = _operational_connection(cutoff=1)
+    conn.execute(
+        """INSERT INTO speech_segments
+               (id, review_revision, audio_fingerprint, audio_content_hash, duration_ms,
+                verified, human_decision,
+                verdict, corrected_at, reviewed_by, annotated_transcript, escalated)
+             VALUES ('malformed', 1, '424242',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     1000, 1, 'accept', 'human_accept',
+                     '2026-08-18 21:19:20', 'Sara', 'text', 0)"""
+    )
+    conn.execute(
+        """INSERT INTO review_events
+               (segment_id, reviewer, action, source, created_at, timestamp_ms)
+             VALUES ('malformed', ?, 'accept', 'couch', '2026-08-18 21:19:20', ?)""",
+        (sqlite3.Binary(b"Sara"), EVENT_TIMESTAMP_MS),
+    )
+    targets, blocked = requeue.audit_requeue_candidates(conn, "2020-01-01 00:00:00")
+    conn.close()
+    assert not targets and len(blocked) == 1
+    assert "reviewer identity" in blocked[0]["evidence_failure"]
+
+
+def test_requeue_never_clears_post_policy_paid_state_without_compensation_reversal() -> None:
+    conn = _operational_connection(cutoff=0)
+    conn.execute(
+        """INSERT INTO speech_segments
+               (id, review_revision, audio_fingerprint, audio_content_hash, duration_ms,
+                verified, human_decision,
+                verdict, corrected_at, reviewed_by, annotated_transcript, escalated)
+             VALUES ('paid', 1, '424242',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     1000, 1, 'accept', 'human_accept',
+                     '2026-08-18 21:19:20', 'Sara', 'text', 0)"""
+    )
+    conn.execute(
+        """INSERT INTO review_events
+               (segment_id, reviewer, action, source, created_at, timestamp_ms)
+             VALUES ('paid', 'Sara', 'accept', 'couch', '2026-08-18 21:19:20', ?)""",
+        (EVENT_TIMESTAMP_MS,),
+    )
+    conn.execute(
+        """INSERT INTO decision_log
+               (segment_id, decision_type, timestamp_ms, human_decision, created_at)
+             VALUES ('paid', 'accept', ?, 'accept', '2026-08-18 21:19:20')""",
+        (EVENT_TIMESTAMP_MS,),
+    )
+    conn.execute(
+        """INSERT INTO review_compensation_ledger VALUES
+             (1, 'review-iqd-v1-2026-08-21', 1, 'paid', 'Sara', 'couch')"""
+    )
+    targets, blocked = requeue.audit_requeue_candidates(conn, "2020-01-01 00:00:00")
+    conn.close()
+    assert not targets and len(blocked) == 1
+    assert "compensation reversal" in blocked[0]["evidence_failure"]
+
+
+def test_requeue_can_select_only_an_exact_unpaid_legacy_current_decision() -> None:
+    conn = _operational_connection(cutoff=1)
+    conn.execute(
+        """INSERT INTO speech_segments
+               (id, review_revision, audio_fingerprint, audio_content_hash, duration_ms,
+                verified, human_decision,
+                verdict, corrected_at, reviewed_by, annotated_transcript, escalated)
+             VALUES ('legacy', 1, '424242',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     1000, 1, 'reject', 'human_reject',
+                     '2026-08-18 21:19:20', 'Sara', 'kept text', 0)"""
+    )
+    conn.execute(
+        """INSERT INTO review_events
+               (segment_id, reviewer, action, source, created_at, timestamp_ms)
+             VALUES ('legacy', 'Sara', 'reject', 'couch', '2026-08-18 21:19:20', ?)""",
+        (EVENT_TIMESTAMP_MS,),
+    )
+    conn.execute(
+        """INSERT INTO decision_log
+               (segment_id, decision_type, timestamp_ms, human_decision, created_at)
+             VALUES ('legacy', 'reject', ?, 'reject', '2026-08-18 21:19:20')""",
+        (EVENT_TIMESTAMP_MS,),
+    )
+    targets, blocked = requeue.audit_requeue_candidates(conn, "2020-01-01 00:00:00")
+    conn.close()
+    assert not blocked and [row["segment_id"] for row in targets] == ["legacy"]
 
 
 def main() -> int:

@@ -896,9 +896,14 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
         "Ok(rows.collect::<Result<Vec<_>, _>>()?)",
         "fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str>",
         "fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String>",
-        "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,\n                        verdict_transcript",
-        "verdict_transcript.clone(),",
-        "Some(raw_transcript.clone()),",
+        # v60 widened the authority from a hand-mapped decision tuple to the complete SpeechSegment,
+        # revision and canonical PCM hash in one statement.  `map_row` and both `row.get` calls must
+        # retain `?`, or a malformed database row could be silently treated as absent/defaulted.
+        "fn decision_snapshot_on(conn: &Connection, id: &str) -> AppResult<Option<(SpeechSegment, i64, Option<String>)>>",
+        "Ok(Some((Self::map_row(row)?, row.get(37)?, row.get(38)?)))",
+        "let Some((prior, prior_revision, stored_content_hash)) = Self::decision_snapshot_on(&tx, segment_id)?",
+        "prior.verdict_transcript.clone(),",
+        "Some(prior.raw_transcript.clone()),",
     ]
     missing = [pattern for pattern in required if pattern not in db]
     if missing:
@@ -906,7 +911,7 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
         raise AssertionError(f"db.rs is missing explicit DB read error propagation:\n{formatted}")
     if db.count("Ok(rows.collect::<Result<Vec<_>, _>>()?)") < 2:
         raise AssertionError("db.rs must propagate row-mapping errors from batch segment and escalation reads")
-    if "): HumanDecisionContext =" not in db:
+    if "Self::decision_snapshot_on(&tx, segment_id)?" not in db:
         raise AssertionError("Database::record_human_decision must read a full segment snapshot before updating it")
     if "human_edit_learning_uses_agent_proposal_before_raw_asr" not in db:
         raise AssertionError("Database::record_human_decision needs a regression for agent proposal learning examples")

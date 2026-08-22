@@ -7,6 +7,8 @@ import {
   is7bUnavailableError,
   listAgentImportReports,
   listAgentStageEvents,
+  recordHumanDecision,
+  recordReviewFlag,
 } from '../../src/lib/commands';
 
 const invokeMock = vi.mocked(invoke);
@@ -52,6 +54,81 @@ describe('commands audio export contract', () => {
     expect(invokeMock).toHaveBeenCalledWith('list_agent_stage_events', {
       runId: 'run-1',
       limit: 9,
+    });
+  });
+});
+
+describe('desktop review decision idempotency', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('replays one uncertain invoke with the exact same operation identity and payload', async () => {
+    const commit = {
+      effectEventId: 41,
+      segmentId: 'segment-1',
+      effectiveAction: 'edit',
+      priorRevision: 3,
+      decidedRevision: 4,
+      segment: { id: 'segment-1' },
+    };
+    invokeMock
+      .mockRejectedValueOnce(new Error('transport response lost'))
+      .mockResolvedValueOnce(commit);
+
+    await expect(recordHumanDecision('segment-1', 'edit', 'دەقی ڕاست', 1_777_000)).resolves.toBe(
+      commit,
+    );
+
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    const first = invokeMock.mock.calls[0];
+    const second = invokeMock.mock.calls[1];
+    expect(first[0]).toBe('record_human_decision');
+    expect(second[0]).toBe('record_human_decision');
+    expect(second[1]).toEqual(first[1]);
+    expect(first[1]).toMatchObject({
+      segmentId: 'segment-1',
+      decision: 'edit',
+      correctedTranscript: 'دەقی ڕاست',
+      timestampMs: 1_777_000,
+      operationId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    });
+  });
+});
+
+describe('desktop review flag idempotency', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('replays one uncertain invoke with the exact same flag operation identity and payload', async () => {
+    const commit = {
+      effectEventId: 52,
+      segmentId: 'segment-2',
+      priorRevision: 7,
+      flagRevision: 8,
+      segment: { id: 'segment-2' },
+    };
+    invokeMock
+      .mockRejectedValueOnce(new Error('transport response lost'))
+      .mockResolvedValueOnce(commit);
+
+    await expect(recordReviewFlag('segment-2', 'needs a second listen')).resolves.toBe(commit);
+
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    const first = invokeMock.mock.calls[0];
+    const second = invokeMock.mock.calls[1];
+    expect(first[0]).toBe('record_review_flag');
+    expect(second[0]).toBe('record_review_flag');
+    expect(second[1]).toEqual(first[1]);
+    expect(first[1]).toMatchObject({
+      segmentId: 'segment-2',
+      rationale: 'needs a second listen',
+      operationId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
     });
   });
 });
