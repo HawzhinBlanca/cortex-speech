@@ -295,6 +295,9 @@ fn test_pipeline_import_empty_directory() {
 
     let check_db = Database::open(&db_path).unwrap();
     assert_eq!(check_db.segment_count().unwrap(), 0, "Empty dir should produce no segments");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0)).unwrap();
+    assert_eq!(jobs, 0, "an empty folder must not create a fake recovery-journal generation");
 }
 
 // ── 7. CancellationToken ──────────────────────────────────────────────

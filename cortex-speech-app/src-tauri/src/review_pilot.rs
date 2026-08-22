@@ -27,6 +27,8 @@ pub const REVIEW_PILOT_TOTAL_CORPUS_ACTIONS: i64 = 20;
 pub const REVIEW_PILOT_HIDDEN_QC_PER_REVIEWER: i64 = 2;
 pub const REVIEW_PILOT_TOTAL_HIDDEN_QC: i64 = 4;
 pub const REVIEW_PILOT_MAX_COMPENSATED_UI_ACTIONS: i64 = 24;
+/// First database schema that makes hidden-key grants part of the snapshotted SQLite authority.
+pub const REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION: i64 = 59;
 pub const CONTROLLED_PILOT_FOCUS_CONTRACT_FILE: &str = "controlled_pilot_focus.json";
 const CONTROLLED_PILOT_FOCUS_CONTRACT: &str = include_str!("../../controlled_pilot_focus.json");
 const FOCUS_CANONICALIZATION: &str = "utf8_sorted_unique_ids_lf_join_final_lf_v1";
@@ -251,6 +253,30 @@ impl ReviewPilotPolicy {
                 .iter()
                 .all(|entry| names.iter().any(|name| name.trim().eq_ignore_ascii_case(entry.name.trim())))
     }
+
+    /// Stable identity of the validated policy's semantic fields.
+    ///
+    /// This deliberately does not hash the source JSON bytes: harmless whitespace, reviewer order,
+    /// and ASCII case are not different policies under the authorization rules.  Length-framed
+    /// fields and a domain separator make the digest unambiguous and safe to persist as the durable
+    /// namespace for hidden-check reservations.
+    pub fn policy_sha256(&self) -> Result<String, String> {
+        let policy = self.clone().validate_and_canonicalize()?;
+        let mut digest = Sha256::new();
+        digest.update(b"cortex-review-pilot-policy-v1\0");
+        digest.update(policy.schema_version.to_be_bytes());
+        digest.update(policy.after_review_event_id.to_be_bytes());
+        digest.update(policy.max_total_corpus_actions.to_be_bytes());
+        digest.update((policy.reviewers.len() as u64).to_be_bytes());
+        for reviewer in policy.reviewers {
+            let canonical_name = reviewer.name.to_ascii_lowercase();
+            let name_bytes = canonical_name.as_bytes();
+            digest.update((name_bytes.len() as u64).to_be_bytes());
+            digest.update(name_bytes);
+            digest.update(reviewer.max_corpus_actions.to_be_bytes());
+        }
+        Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    }
 }
 
 pub fn parse(raw: &str) -> Result<ReviewPilotPolicy, String> {
@@ -316,22 +342,45 @@ mod tests {
     }
 
     #[test]
+    fn policy_digest_is_stable_for_equivalent_semantics_and_changes_with_the_baseline() {
+        let policy = parse(&policy_json(863)).unwrap();
+        let digest = policy.policy_sha256().unwrap();
+        assert_eq!(digest, "cd8c93e7336e4d7f2731cd190a8cc45101498433dfee971079cb29d64d74d333");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        let mut equivalent = policy.clone();
+        equivalent.reviewers.reverse();
+        equivalent.reviewers[0].name = format!("  {}  ", equivalent.reviewers[0].name.to_ascii_uppercase());
+        equivalent.reviewers[1].name = equivalent.reviewers[1].name.to_ascii_uppercase();
+        assert_eq!(equivalent.policy_sha256().unwrap(), digest);
+
+        let mut later = policy;
+        later.after_review_event_id += 1;
+        assert_ne!(later.policy_sha256().unwrap(), digest);
+    }
+
+    #[test]
     fn absence_is_normal_but_every_broken_or_weakened_policy_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load(dir.path()), Ok(None));
         install_test_focus(dir.path(), ["segment-a"]);
-        for bad in [
-            "{not json}".to_string(),
-            policy_json(-1),
-            policy_json(0).replace("\"max_total_corpus_actions\": 20", "\"max_total_corpus_actions\": 21"),
-            policy_json(0).replace("\"max_corpus_actions\": 10", "\"max_corpus_actions\": 20"),
-            policy_json(0).replace("\"Hawzhin\"", "\"Pavel\""),
-            policy_json(0).replace(
-                "{\"name\": \"Hawzhin\", \"max_corpus_actions\": 10}",
-                "{\"name\": \"Hawzhin\", \"max_corpus_actions\": 10}, {\"name\": \"Rubar\", \"max_corpus_actions\": 10}",
-            ),
-            policy_json(0).replace("\n            }", ", \"typo\": true\n            }"),
-        ] {
+        let valid: serde_json::Value = serde_json::from_str(&policy_json(0)).unwrap();
+        let mut wrong_total = valid.clone();
+        wrong_total["max_total_corpus_actions"] = serde_json::json!(21);
+        let mut wrong_reviewer_cap = valid.clone();
+        wrong_reviewer_cap["reviewers"][0]["max_corpus_actions"] = serde_json::json!(20);
+        let mut duplicate_reviewer = valid.clone();
+        duplicate_reviewer["reviewers"][1]["name"] = duplicate_reviewer["reviewers"][0]["name"].clone();
+        let mut third_reviewer = valid.clone();
+        let mut added = third_reviewer["reviewers"][0].clone();
+        added["name"] = serde_json::json!("Rubar");
+        third_reviewer["reviewers"].as_array_mut().unwrap().push(added);
+        let mut unknown_field = valid;
+        unknown_field.as_object_mut().unwrap().insert("typo".into(), serde_json::json!(true));
+        let bad_policies = [wrong_total, wrong_reviewer_cap, duplicate_reviewer, third_reviewer, unknown_field]
+            .map(|value| serde_json::to_string(&value).unwrap());
+        for bad in ["{not json}".to_string(), policy_json(-1)].into_iter().chain(bad_policies) {
             std::fs::write(dir.path().join(REVIEW_PILOT_FILE), bad).unwrap();
             assert!(load(dir.path()).is_err(), "broken policy was accepted");
         }

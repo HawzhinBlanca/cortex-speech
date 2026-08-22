@@ -12,6 +12,7 @@ from typing import Any
 from unittest import mock
 
 from pilot_focus_contract import contract_for_ids, verify_controlled_pilot_focus
+from review_pilot_hidden_contract import HIDDEN_SCHEMA_SQL, HIDDEN_TRIGGER_SQL
 
 SCRIPT = Path(__file__).with_name("create_recovery_snapshot.py")
 SPEC = importlib.util.spec_from_file_location("create_recovery_snapshot", SCRIPT)
@@ -22,7 +23,23 @@ TEST_FOCUS_CONTRACT = contract_for_ids(["s1"])
 snapshot.verify_controlled_pilot_focus = lambda root: verify_controlled_pilot_focus(root, TEST_FOCUS_CONTRACT)
 
 
-def seed_profile(root: Path) -> None:
+def create_hidden_key_authority(con: sqlite3.Connection) -> None:
+    con.executescript(HIDDEN_SCHEMA_SQL)
+
+
+def insert_hidden_rows_bypassing_trigger(
+    con: sqlite3.Connection,
+    trigger_name: str,
+    rows: list[tuple[str, int, str, str]],
+) -> None:
+    """Build a corrupt-but-exact-schema fixture that the validator must reject."""
+
+    con.execute(f'DROP TRIGGER "{trigger_name}"')
+    con.executemany("INSERT INTO review_pilot_hidden_keys VALUES(?, ?, ?, ?)", rows)
+    con.execute(HIDDEN_TRIGGER_SQL[trigger_name])
+
+
+def seed_profile(root: Path, *, schema_version: int = 59, policy: bool = True) -> None:
     con = sqlite3.connect(root / "cortex-speech.db")
     con.executescript(
         """
@@ -30,16 +47,25 @@ def seed_profile(root: Path) -> None:
         CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT NOT NULL);
         CREATE TABLE speech_segments(id TEXT PRIMARY KEY);
         INSERT INTO speech_segments VALUES('s1');
-        CREATE TABLE review_events(id INTEGER PRIMARY KEY);
-        CREATE TABLE spot_checks(id INTEGER PRIMARY KEY);
+        CREATE TABLE review_events(
+            id INTEGER PRIMARY KEY, segment_id TEXT NOT NULL, reviewer TEXT NOT NULL,
+            action TEXT NOT NULL, source TEXT NOT NULL
+        );
+        CREATE TABLE spot_checks(segment_id TEXT, reviewer TEXT, action TEXT);
         CREATE TABLE model_versions(id TEXT PRIMARY KEY);
         CREATE TABLE import_jobs(id TEXT PRIMARY KEY);
         CREATE TABLE import_job_files(id INTEGER PRIMARY KEY);
         """
     )
+    if schema_version >= snapshot.HIDDEN_KEY_SCHEMA_VERSION:
+        create_hidden_key_authority(con)
     con.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
-        snapshot.source_migrations(snapshot.DEFAULT_MIGRATIONS),
+        [
+            entry
+            for entry in snapshot.source_migrations(snapshot.DEFAULT_MIGRATIONS)
+            if entry[0] <= schema_version
+        ],
     )
     con.commit()
     con.close()
@@ -47,12 +73,13 @@ def seed_profile(root: Path) -> None:
     (root / "champion.json").write_text("{}", encoding="utf-8")
     (root / "reviewer_dialects.json").write_text("{}", encoding="utf-8")
     (root / "voice_focus.json").write_text('{"name":"x","segment_ids":["s1"]}', encoding="utf-8")
-    (root / "review_pilot_policy.json").write_text(
-        '{"schema_version":1,"after_review_event_id":0,"max_total_corpus_actions":20,'
-        '"reviewers":[{"name":"Hawzhin","max_corpus_actions":10},'
-        '{"name":"Pavel","max_corpus_actions":10}]}',
-        encoding="utf-8",
-    )
+    if policy:
+        (root / "review_pilot_policy.json").write_text(
+            '{"schema_version":1,"after_review_event_id":0,"max_total_corpus_actions":20,'
+            '"reviewers":[{"name":"Hawzhin","max_corpus_actions":10},'
+            '{"name":"Pavel","max_corpus_actions":10}]}',
+            encoding="utf-8",
+        )
 
 
 def promoted_fixture(base: Path) -> tuple[Path, dict[str, object]]:
@@ -334,15 +361,12 @@ def test_snapshot_requires_exact_description_bound_migration_prefix() -> None:
         base = Path(raw)
         data = base / "data"
         data.mkdir()
-        seed_profile(data)
-        connection = sqlite3.connect(data / snapshot.DB_FILE)
-        connection.execute("DELETE FROM schema_migrations WHERE version > 57")
-        connection.commit()
-        connection.close()
+        seed_profile(data, schema_version=58, policy=False)
         local, evidence = snapshot.promote_snapshot(
             data, label="older_prefix", expected_foreign_keys=0, repo_root=base
         )
-        assert evidence["schemaVersion"] == 57
+        assert evidence["schemaVersion"] == 58
+        assert snapshot.HIDDEN_KEY_TABLE not in evidence["rowCounts"]
         snapshot.verify_tree(local, expected_evidence=evidence, expected_foreign_keys=0)
 
     mutations = (
@@ -494,6 +518,7 @@ def test_verify_tree_binds_schema2_evidence_and_policy_baseline() -> None:
         local, evidence = promoted_fixture(Path(raw))
         payload = load_manifest(local)
         payload["databaseEvidence"]["schemaVersion"] = 55
+        del payload["databaseEvidence"]["rowCounts"][snapshot.HIDDEN_KEY_TABLE]
         write_manifest(local, payload)
         assert_verify_refuses(local, evidence, "databaseEvidence differs")
 
@@ -511,6 +536,239 @@ def test_verify_tree_binds_schema2_evidence_and_policy_baseline() -> None:
             assert "ahead of its database review-event maximum" in str(error)
         else:
             raise AssertionError("a pilot baseline ahead of the restored DB must be refused")
+
+
+def test_schema59_hidden_keys_require_exact_policy_binding_and_schema58_stays_valid() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data)
+        policy = snapshot.validate_review_pilot_policy(
+            (data / snapshot.REVIEW_PILOT_FILE).read_bytes()
+        )
+        policy_sha = snapshot.review_pilot_policy_sha256(policy)
+        connection = sqlite3.connect(data / snapshot.DB_FILE)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 0, 'Hawzhin', 'hidden-1')",
+            (policy_sha,),
+        )
+        connection.commit()
+        connection.close()
+        local, evidence = snapshot.promote_snapshot(
+            data, label="bound_v59", expected_foreign_keys=0, repo_root=base
+        )
+        assert evidence["schemaVersion"] == 59
+        assert evidence["rowCounts"][snapshot.HIDDEN_KEY_TABLE] == 1
+        snapshot.verify_tree(local, expected_evidence=evidence, expected_foreign_keys=0)
+
+    mismatches = (
+        ("0" * 64, 0, "Hawzhin", "disagrees with the active policy SHA/baseline"),
+        (None, 1, "Hawzhin", "disagrees with the active policy SHA/baseline"),
+        (None, 0, "Rubar", "unauthorized reviewer"),
+    )
+    for wrong_sha, baseline, reviewer, expected in mismatches:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            data = base / "data"
+            data.mkdir()
+            seed_profile(data)
+            policy = snapshot.validate_review_pilot_policy(
+                (data / snapshot.REVIEW_PILOT_FILE).read_bytes()
+            )
+            policy_sha = wrong_sha or snapshot.review_pilot_policy_sha256(policy)
+            connection = sqlite3.connect(data / snapshot.DB_FILE)
+            row = (policy_sha, baseline, reviewer, "hidden-mismatch")
+            if wrong_sha is not None and baseline == int(policy["after_review_event_id"]):
+                insert_hidden_rows_bypassing_trigger(
+                    connection, "review_pilot_hidden_keys_policy_insert", [row]
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO review_pilot_hidden_keys VALUES(?, ?, ?, ?)", row
+                )
+            connection.commit()
+            connection.close()
+            try:
+                snapshot.promote_snapshot(
+                    data, label="mismatch_v59", expected_foreign_keys=0, repo_root=base
+                )
+            except RuntimeError as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError("schema-v59 hidden key escaped its exact pilot binding")
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data)
+        connection = sqlite3.connect(data / snapshot.DB_FILE)
+        connection.executescript(
+            "DROP TRIGGER review_pilot_hidden_keys_immutable_delete;"
+            "DROP TRIGGER review_pilot_hidden_keys_immutable_update;"
+            "DROP TRIGGER review_pilot_hidden_keys_quota_insert;"
+            "DROP TABLE review_pilot_hidden_keys;"
+        )
+        connection.commit()
+        connection.close()
+        try:
+            snapshot.promote_snapshot(
+                data, label="missing_v59", expected_foreign_keys=0, repo_root=base
+            )
+        except RuntimeError as error:
+            assert "missing required table" in str(error), error
+        else:
+            raise AssertionError("schema v59 without its hidden-key authority was accepted")
+
+
+def test_active_snapshot_requires_completed_and_live_session_hidden_keys_to_be_durable() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data)
+        policy = snapshot.validate_review_pilot_policy(
+            (data / snapshot.REVIEW_PILOT_FILE).read_bytes()
+        )
+        session = {
+            "db_path": str(data / snapshot.DB_FILE),
+            "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+            "pilot_policy": policy,
+            "pilot_spot_checks": [["remembered-hidden", "Hawzhin"]],
+        }
+        (data / "couch_session.json").write_text(json.dumps(session), encoding="utf-8")
+        try:
+            snapshot.promote_snapshot(
+                data, label="missing_session_grant", expected_foreign_keys=0, repo_root=base
+            )
+        except RuntimeError as error:
+            assert "has no durable grant" in str(error), error
+        else:
+            raise AssertionError("a session-only hidden assignment entered a recovery snapshot")
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data)
+        connection = sqlite3.connect(data / snapshot.DB_FILE)
+        connection.execute(
+            "INSERT INTO review_events VALUES(1, 'completed-hidden', 'Pavel', 'accept', 'couch_spot_check')"
+        )
+        connection.commit()
+        connection.close()
+        try:
+            snapshot.promote_snapshot(
+                data, label="missing_event_grant", expected_foreign_keys=0, repo_root=base
+            )
+        except RuntimeError as error:
+            assert "has no durable active-policy grant" in str(error), error
+        else:
+            raise AssertionError("an ungranted completed hidden event entered a recovery snapshot")
+
+
+def test_policy_bearing_schema58_headless_snapshot_is_refused_as_nonrestorable() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data, schema_version=58, policy=True)
+        try:
+            snapshot.promote_snapshot(
+                data, label="active_v58", expected_foreign_keys=0, repo_root=base
+            )
+        except RuntimeError as error:
+            assert "archival migration pin" in str(error), error
+        else:
+            raise AssertionError("a nonrestorable active-policy v58 headless snapshot was promoted")
+
+
+def test_schema59_hidden_history_survives_policy_lifecycle_and_caps_each_namespace() -> None:
+    # An active policy owns only its exact (SHA, baseline) namespace. A fully distinct historical
+    # namespace is inert audit history and remains recoverable even with a different old roster.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data)
+        policy = snapshot.validate_review_pilot_policy(
+            (data / snapshot.REVIEW_PILOT_FILE).read_bytes()
+        )
+        active_sha = snapshot.review_pilot_policy_sha256(policy)
+        historical_sha = "1" * 64
+        assert historical_sha != active_sha
+        connection = sqlite3.connect(data / snapshot.DB_FILE)
+        connection.executemany(
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, ?, ?, ?)",
+            [
+                (active_sha, 0, "Hawzhin", "active-hidden"),
+                (historical_sha, 17, "OldReviewer", "historical-hidden"),
+            ],
+        )
+        connection.commit()
+        connection.close()
+        local, evidence = snapshot.promote_snapshot(
+            data, label="historical_active", expected_foreign_keys=0, repo_root=base
+        )
+        assert evidence["rowCounts"][snapshot.HIDDEN_KEY_TABLE] == 2
+        snapshot.verify_tree(local, expected_evidence=evidence, expected_foreign_keys=0)
+
+    # Removing the policy ends activation, not the append-only audit history.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data, policy=False)
+        connection = sqlite3.connect(data / snapshot.DB_FILE)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 17, 'OldReviewer', 'historical-hidden')",
+            ("1" * 64,),
+        )
+        connection.commit()
+        connection.close()
+        local, evidence = snapshot.promote_snapshot(
+            data, label="historical_inactive", expected_foreign_keys=0, repo_root=base
+        )
+        assert evidence["rowCounts"][snapshot.HIDDEN_KEY_TABLE] == 1
+        snapshot.verify_tree(local, expected_evidence=evidence, expected_foreign_keys=0)
+
+    overages = (
+        (
+            "review_pilot_hidden_keys_quota_insert",
+            [("2" * 64, 18, "OldReviewer", f"reviewer-{index}") for index in range(3)],
+            "reviewer namespace cap",
+        ),
+        (
+            "review_pilot_hidden_keys_quota_insert",
+            [
+                ("3" * 64, 19, "OldA", "global-1"),
+                ("3" * 64, 19, "OldA", "global-2"),
+                ("3" * 64, 19, "OldB", "global-3"),
+                ("3" * 64, 19, "OldB", "global-4"),
+                ("3" * 64, 19, "OldC", "global-5"),
+            ],
+            "policy namespace cap",
+        ),
+    )
+    for trigger_name, rows, expected in overages:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            data = base / "data"
+            data.mkdir()
+            seed_profile(data, policy=False)
+            connection = sqlite3.connect(data / snapshot.DB_FILE)
+            insert_hidden_rows_bypassing_trigger(connection, trigger_name, rows)
+            connection.commit()
+            connection.close()
+            try:
+                snapshot.promote_snapshot(
+                    data, label="historical_overage", expected_foreign_keys=0, repo_root=base
+                )
+            except RuntimeError as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError(f"historical hidden-key {expected} was accepted")
 
 
 def test_offsite_staging_cleanup_never_deletes_a_preexisting_path() -> None:

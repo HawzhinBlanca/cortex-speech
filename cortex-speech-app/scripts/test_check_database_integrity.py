@@ -2,6 +2,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -13,6 +14,10 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("check_database_integrity.py")
 VERIFY_10 = SCRIPT.parents[2] / "scripts" / "verify_10.py"
 MIGRATIONS = SCRIPT.parents[1] / "src-tauri" / "src" / "migrations" / "mod.rs"
+sys.path.insert(0, str(SCRIPT.parent))
+
+from review_pilot_hidden_contract import HIDDEN_SCHEMA_SQL  # noqa: E402
+from review_pilot_hidden_contract import audit_hidden_schema  # noqa: E402
 
 
 def load_gate():
@@ -32,6 +37,22 @@ def source_migrations() -> list[tuple[int, str]]:
 
 
 class DatabaseIntegrityGateTests(unittest.TestCase):
+    def test_shared_v59_contract_matches_the_actual_rust_migration(self):
+        source = MIGRATIONS.read_text(encoding="utf-8")
+        match = re.search(
+            r'version:\s*59,.*?up_sql:\s*"(?P<sql>.*?)",\s*// Once an assignment exists',
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match, "could not extract migration 59 SQL")
+        connection = sqlite3.connect(":memory:")
+        connection.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT)")
+        connection.execute("INSERT INTO schema_migrations VALUES(59, 'fixture')")
+        connection.executescript(match.group("sql"))
+        _evidence, errors = audit_hidden_schema(connection)
+        connection.close()
+        self.assertEqual(errors, [], errors)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -89,6 +110,7 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
             INSERT INTO child VALUES(1, 'p1');
             """
         )
+        connection.executescript(HIDDEN_SCHEMA_SQL)
         connection.executemany("INSERT INTO schema_migrations VALUES(?, ?)", source_migrations())
         connection.commit()
         connection.close()
@@ -113,11 +135,71 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         self.assertEqual(report["quickCheck"], ["ok"])
         self.assertEqual(report["integrityCheck"], ["ok"])
         self.assertEqual(report["foreignKeyViolations"], 0)
-        self.assertEqual(report["schemaVersion"], 58)
-        self.assertEqual(report["migrationHistoryEntries"], 58)
+        self.assertEqual(report["schemaVersion"], 59)
+        self.assertEqual(report["migrationHistoryEntries"], 59)
         self.assertEqual(report["v58HypothesisArchiveRows"], 0)
         self.assertEqual(report["v58Loop0ArchiveRows"], 0)
         self.assertEqual(report["v58ImmutableTriggers"], 6)
+        self.assertEqual(report["pilotHiddenRows"], 0)
+        self.assertEqual(len(report["pilotHiddenTriggers"]), 4)
+
+    def test_v59_hidden_table_and_triggers_must_match_exactly(self):
+        connection = sqlite3.connect(self.db)
+        connection.execute("DROP TRIGGER review_pilot_hidden_keys_immutable_update")
+        connection.execute(
+            "CREATE TRIGGER review_pilot_hidden_keys_immutable_update "
+            "BEFORE UPDATE ON review_pilot_hidden_keys "
+            "BEGIN SELECT RAISE(ABORT, 'different message'); END"
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("does not exactly match" in error for error in report["errors"]), report)
+
+    def test_v59_historical_quota_overage_is_red_even_if_trigger_is_restored(self):
+        connection = sqlite3.connect(self.db)
+        connection.execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert")
+        connection.executemany(
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, ?, ?)",
+            [
+                ("a" * 64, "Hawzhin", "hidden-h1"),
+                ("a" * 64, "Hawzhin", "hidden-h2"),
+                ("a" * 64, "Hawzhin", "hidden-h3"),
+                ("a" * 64, "Pavel", "hidden-p1"),
+                ("a" * 64, "Rubar", "hidden-r1"),
+            ],
+        )
+        connection.execute(
+            """CREATE TRIGGER review_pilot_hidden_keys_quota_insert
+               BEFORE INSERT ON review_pilot_hidden_keys
+               WHEN NOT EXISTS (
+                   SELECT 1 FROM review_pilot_hidden_keys
+                    WHERE policy_sha256 = NEW.policy_sha256
+                      AND after_review_event_id = NEW.after_review_event_id
+                      AND reviewer = NEW.reviewer
+                      AND segment_id = NEW.segment_id
+               )
+               AND (
+                   (SELECT COUNT(*) FROM review_pilot_hidden_keys
+                     WHERE policy_sha256 = NEW.policy_sha256
+                       AND after_review_event_id = NEW.after_review_event_id
+                       AND reviewer = NEW.reviewer) >= 2
+                   OR
+                   (SELECT COUNT(*) FROM review_pilot_hidden_keys
+                     WHERE policy_sha256 = NEW.policy_sha256
+                       AND after_review_event_id = NEW.after_review_event_id) >= 4
+               )
+               BEGIN SELECT RAISE(ABORT, 'controlled review pilot hidden-key quota exceeded'); END"""
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertEqual(report["pilotHiddenReviewerOverages"], 1)
+        self.assertEqual(report["pilotHiddenNamespaceOverages"], 1)
+        self.assertTrue(any("exceeds max 2" in error for error in report["errors"]), report)
+        self.assertTrue(any("exceeds max 4" in error for error in report["errors"]), report)
 
     def test_v58_missing_trigger_or_asymmetric_archive_is_red(self):
         connection = sqlite3.connect(self.db)
@@ -240,14 +322,14 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
 
     def test_clean_but_stale_schema_is_red(self):
         connection = sqlite3.connect(self.db)
-        connection.execute("DELETE FROM schema_migrations WHERE version = 58")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 59")
         connection.commit()
         connection.close()
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
-        self.assertEqual(report["schemaVersion"], 57)
-        self.assertEqual(report["requiredSchemaVersion"], 58)
-        self.assertTrue(any("missing=[58]" in error for error in report["errors"]), report)
+        self.assertEqual(report["schemaVersion"], 58)
+        self.assertEqual(report["requiredSchemaVersion"], 59)
+        self.assertTrue(any("missing=[59]" in error for error in report["errors"]), report)
 
     def test_missing_middle_history_or_wrong_description_is_red(self):
         connection = sqlite3.connect(self.db)
@@ -257,7 +339,7 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         connection.close()
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
-        self.assertEqual(report["schemaVersion"], 58, "MAX alone would falsely green this fixture")
+        self.assertEqual(report["schemaVersion"], 59, "MAX alone would falsely green this fixture")
         self.assertTrue(any("missing=[23]" in error for error in report["errors"]), report)
         self.assertTrue(any("descriptionMismatch=[31]" in error for error in report["errors"]), report)
 

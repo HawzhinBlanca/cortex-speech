@@ -316,6 +316,39 @@ fn validate_review_operation_identity(operation_id: &str, payload_hash: &str) ->
     Ok(())
 }
 
+fn validate_review_pilot_policy_sha256(policy_sha256: &str) -> AppResult<()> {
+    if policy_sha256.len() != 64
+        || !policy_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::Validation("controlled-review policy digest must be canonical lowercase SHA-256".into()));
+    }
+    Ok(())
+}
+
+fn canonical_review_pilot_reviewer(reviewer: &str) -> AppResult<String> {
+    let reviewer = reviewer.trim();
+    if reviewer.is_empty() || reviewer.chars().count() > 40 || reviewer.chars().any(char::is_control) {
+        return Err(AppError::Validation("invalid controlled-review pilot reviewer".into()));
+    }
+    Ok(reviewer.to_string())
+}
+
+fn validate_review_pilot_hidden_namespace(
+    policy_sha256: &str,
+    after_review_event_id: i64,
+    reviewer: &str,
+) -> AppResult<String> {
+    validate_review_pilot_policy_sha256(policy_sha256)?;
+    if after_review_event_id < 0 {
+        return Err(AppError::Validation("controlled-review pilot baseline must be non-negative".into()));
+    }
+    canonical_review_pilot_reviewer(reviewer)
+}
+
+fn validate_review_pilot_hidden_segment_id(segment_id: &str) -> AppResult<()> {
+    crate::validation::input::validate_identifier(segment_id).map_err(AppError::Validation)
+}
+
 fn review_pay_basis_points(action: &str) -> AppResult<i64> {
     match action {
         "edit" => Ok(REVIEW_PAY_EDIT_BPS),
@@ -627,7 +660,7 @@ fn expected_schema_contract() -> AppResult<&'static Vec<SchemaObjectContract>> {
         .map_err(|error| AppError::Other(format!("cannot construct current schema contract: {error}")))
 }
 
-fn validate_current_schema_contract(conn: &Connection) -> AppResult<()> {
+pub(crate) fn validate_current_schema_contract(conn: &Connection) -> AppResult<()> {
     let expected = expected_schema_contract()?;
     let actual = read_schema_contract(conn)?;
     if actual == *expected {
@@ -2304,6 +2337,216 @@ impl Database {
         Ok(())
     }
 
+    /// Return this reviewer's complete durable hidden-key set for one exact controlled-pilot policy.
+    pub fn review_pilot_hidden_keys(
+        &self,
+        policy_sha256: &str,
+        after_review_event_id: i64,
+        reviewer: &str,
+    ) -> AppResult<Vec<String>> {
+        let reviewer = validate_review_pilot_hidden_namespace(policy_sha256, after_review_event_id, reviewer)?;
+        let mut statement = self.conn.prepare(
+            "SELECT segment_id
+               FROM review_pilot_hidden_keys
+              WHERE policy_sha256 = ?1 AND after_review_event_id = ?2
+                AND reviewer = ?3 COLLATE NOCASE
+              ORDER BY segment_id",
+        )?;
+        let keys = statement
+            .query_map(params![policy_sha256, after_review_event_id, reviewer], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    /// Atomically bind candidate hidden keys to one reviewer for the lifetime of an exact pilot.
+    ///
+    /// `BEGIN IMMEDIATE` takes the cross-connection write reservation before either quota read.
+    /// Therefore two process-local database handles cannot both consume the final per-reviewer or
+    /// global slot.  The migration trigger independently enforces both ceilings for every SQL writer.
+    pub fn reserve_review_pilot_hidden_keys(
+        &self,
+        policy_sha256: &str,
+        after_review_event_id: i64,
+        reviewer: &str,
+        segment_ids: &[String],
+        quota: usize,
+    ) -> AppResult<Vec<String>> {
+        let reviewer = validate_review_pilot_hidden_namespace(policy_sha256, after_review_event_id, reviewer)?;
+        let required_quota = usize::try_from(crate::review_pilot::REVIEW_PILOT_HIDDEN_QC_PER_REVIEWER)
+            .map_err(|_| AppError::Other("controlled-review hidden-key quota is not representable".into()))?;
+        if quota != required_quota {
+            return Err(AppError::Validation(format!(
+                "controlled-review hidden-key quota must be exactly {required_quota}"
+            )));
+        }
+        let global_quota = usize::try_from(crate::review_pilot::REVIEW_PILOT_TOTAL_HIDDEN_QC)
+            .map_err(|_| AppError::Other("controlled-review global hidden-key quota is not representable".into()))?;
+        let mut candidates = std::collections::BTreeSet::new();
+        for segment_id in segment_ids {
+            validate_review_pilot_hidden_segment_id(segment_id)?;
+            candidates.insert(segment_id.clone());
+            if candidates.len() > required_quota {
+                return Err(AppError::Validation(format!(
+                    "controlled-review hidden-key reservation exceeds reviewer quota {required_quota}"
+                )));
+            }
+        }
+
+        // Assignment is irreplaceable paid-review state. FULL makes the committed reservation as
+        // power-loss durable as the human verdict paths; every exit restores the connection default.
+        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
+        let reservation = (|| -> AppResult<(Vec<String>, bool)> {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let current_max: i64 =
+                tx.query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))?;
+            if after_review_event_id > current_max {
+                return Err(AppError::Validation(
+                    "controlled-review baseline is ahead of durable review history".into(),
+                ));
+            }
+            let conflicting_policy: Option<String> = tx
+                .query_row(
+                    "SELECT policy_sha256 FROM review_pilot_hidden_keys
+                      WHERE after_review_event_id = ?1 AND policy_sha256 <> ?2
+                      LIMIT 1",
+                    params![after_review_event_id, policy_sha256],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if conflicting_policy.is_some() {
+                return Err(AppError::Validation(
+                    "controlled-review baseline is already bound to another policy identity".into(),
+                ));
+            }
+
+            let mut statement = tx.prepare(
+                "SELECT segment_id
+                   FROM review_pilot_hidden_keys
+                  WHERE policy_sha256 = ?1 AND after_review_event_id = ?2
+                    AND reviewer = ?3 COLLATE NOCASE
+                  ORDER BY segment_id",
+            )?;
+            let existing = statement
+                .query_map(params![policy_sha256, after_review_event_id, reviewer], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            if existing.len() > required_quota {
+                return Err(AppError::Other("controlled-review hidden-key history exceeds the reviewer quota".into()));
+            }
+
+            // Schema-58/session-file deployments may already have completed checks when v59 first
+            // opens.  Their post-baseline couch_spot_check events are durable, unambiguous evidence
+            // that those keys consumed this pilot's lifetime budget.  Backfill them in this same
+            // reservation transaction before considering any fresh session candidates; otherwise a
+            // lost session could mint two replacements after the reviewer had already been paid.
+            let mut statement = tx.prepare(
+                "SELECT DISTINCT segment_id
+                   FROM review_events
+                  WHERE id > ?1 AND reviewer = ?2 COLLATE NOCASE
+                    AND source = 'couch_spot_check'
+                  ORDER BY segment_id",
+            )?;
+            let completed = statement
+                .query_map(params![after_review_event_id, reviewer], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            for segment_id in &completed {
+                validate_review_pilot_hidden_segment_id(segment_id)?;
+            }
+            let mut complete: std::collections::BTreeSet<String> = existing.iter().cloned().collect();
+            complete.extend(candidates.iter().cloned());
+            complete.extend(completed);
+            if complete.len() > required_quota {
+                return Err(AppError::Validation(format!(
+                    "controlled-review hidden-key reservation exceeds reviewer quota {required_quota}"
+                )));
+            }
+
+            let global_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM review_pilot_hidden_keys
+                  WHERE policy_sha256 = ?1 AND after_review_event_id = ?2",
+                params![policy_sha256, after_review_event_id],
+                |row| row.get(0),
+            )?;
+            let global_count = usize::try_from(global_count)
+                .map_err(|_| AppError::Other("controlled-review global hidden-key count is invalid".into()))?;
+            let additional = complete.len().saturating_sub(existing.len());
+            if global_count.saturating_add(additional) > global_quota {
+                return Err(AppError::Validation(format!(
+                    "controlled-review hidden-key reservation exceeds global quota {global_quota}"
+                )));
+            }
+
+            let mut changed = false;
+            for segment_id in complete.iter().filter(|segment_id| !existing.contains(segment_id)) {
+                tx.execute(
+                    "INSERT INTO review_pilot_hidden_keys
+                        (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![policy_sha256, after_review_event_id, reviewer, segment_id],
+                )?;
+                changed = true;
+            }
+            let complete = complete.into_iter().collect();
+            tx.commit()?;
+            Ok((complete, changed))
+        })();
+        let reset = self.conn.execute_batch("PRAGMA synchronous=NORMAL;");
+        let (complete, changed) = match reservation {
+            Ok(value) => {
+                reset?;
+                value
+            }
+            Err(error) => {
+                let _ = reset;
+                return Err(error);
+            }
+        };
+        if changed {
+            self.track_write()?;
+        }
+        Ok(complete)
+    }
+
+    /// Whether an exact durable pilot key has either an immutable answer or a later Couch skip.
+    pub fn review_pilot_hidden_key_resolved(
+        &self,
+        policy_sha256: &str,
+        after_review_event_id: i64,
+        reviewer: &str,
+        segment_id: &str,
+    ) -> AppResult<bool> {
+        let reviewer = validate_review_pilot_hidden_namespace(policy_sha256, after_review_event_id, reviewer)?;
+        validate_review_pilot_hidden_segment_id(segment_id)?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM review_pilot_hidden_keys key
+                  WHERE key.policy_sha256 = ?1
+                    AND key.after_review_event_id = ?2
+                    AND key.reviewer = ?3 COLLATE NOCASE
+                    AND key.segment_id = ?4
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM spot_checks result
+                             WHERE result.segment_id = key.segment_id
+                               AND result.reviewer = key.reviewer COLLATE NOCASE
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM review_events event
+                             WHERE event.id > key.after_review_event_id
+                               AND event.segment_id = key.segment_id
+                               AND event.reviewer = key.reviewer COLLATE NOCASE
+                               AND event.source = 'couch'
+                               AND event.action = 'skip'
+                        )
+                    )
+             )",
+            params![policy_sha256, after_review_event_id, reviewer, segment_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Record how a reviewer answered one spot check. The FIRST answer is immutable: a network retry
     /// cannot inflate the score, and a reviewer cannot improve a failed hidden check by submitting a
     /// different answer later. `ON CONFLICT DO NOTHING` still makes a lost-response replay idempotent.
@@ -2319,7 +2562,7 @@ impl Database {
         submitted: &str,
         expected: &str,
     ) -> AppResult<()> {
-        self.record_spot_check_inner(segment_id, reviewer, action, submitted, expected, None)
+        self.record_spot_check_inner(segment_id, reviewer, action, submitted, expected, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2341,6 +2584,37 @@ impl Database {
             submitted,
             expected,
             Some((operation_id, operation_payload_hash)),
+            None,
+        )
+    }
+
+    /// Pilot-scoped spot-check write.  The exact durable reservation is authorized inside the same
+    /// transaction and before the first insert, so a stale/repaired session cannot manufacture paid
+    /// hidden-check results outside its policy namespace.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_pilot_spot_check_with_operation(
+        &self,
+        policy_sha256: &str,
+        after_review_event_id: i64,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        submitted: &str,
+        expected: &str,
+        operation_id: &str,
+        operation_payload_hash: &str,
+    ) -> AppResult<()> {
+        let reviewer = validate_review_pilot_hidden_namespace(policy_sha256, after_review_event_id, reviewer)?;
+        validate_review_pilot_hidden_segment_id(segment_id)?;
+        validate_review_operation_identity(operation_id, operation_payload_hash)?;
+        self.record_spot_check_inner(
+            segment_id,
+            &reviewer,
+            action,
+            submitted,
+            expected,
+            Some((operation_id, operation_payload_hash)),
+            Some((policy_sha256, after_review_event_id)),
         )
     }
 
@@ -2353,6 +2627,7 @@ impl Database {
         submitted: &str,
         expected: &str,
         operation: Option<(&str, &str)>,
+        pilot_namespace: Option<(&str, i64)>,
     ) -> AppResult<()> {
         let submitted_nfc = to_nfc(submitted.trim());
         let expected_nfc = to_nfc(expected.trim());
@@ -2363,54 +2638,90 @@ impl Database {
         let noticed = action != "reject" && learning_text_key(&submitted_nfc) == learning_text_key(&expected_nfc);
         let cer = crate::wer::compute_cer(&expected_nfc, &submitted_nfc);
         self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
-        let tx = self.conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "INSERT INTO spot_checks
-                 (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(segment_id, reviewer) DO NOTHING",
-            params![segment_id, reviewer, action, submitted_nfc, expected_nfc, noticed as i32, cer],
-        )?;
-        if changed > 0 {
-            let timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as i64)
-                .unwrap_or(0);
-            tx.execute(
-                "INSERT INTO review_events
-                    (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
-                     duration_ms, operation_id, operation_payload_hash)
-                 VALUES (?1, ?2, ?3, ?3, 'couch_spot_check', ?4,
-                         (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?5, ?6)",
-                params![
+        let write = (|| -> AppResult<bool> {
+            let tx = self.conn.unchecked_transaction()?;
+            // Resolve the stored reviewer spelling while proving the exact policy+baseline grant.
+            // This also prevents a case-only re-pair from bypassing spot_checks' binary reviewer PK.
+            let effective_reviewer = if let Some((policy_sha256, after_review_event_id)) = pilot_namespace {
+                tx.query_row(
+                    "SELECT reviewer FROM review_pilot_hidden_keys
+                      WHERE policy_sha256 = ?1 AND after_review_event_id = ?2
+                        AND reviewer = ?3 COLLATE NOCASE AND segment_id = ?4",
+                    params![policy_sha256, after_review_event_id, reviewer, segment_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "controlled-review pilot hidden-check result has no durable reservation".into(),
+                    )
+                })?
+            } else {
+                reviewer.to_string()
+            };
+            let changed = tx.execute(
+                "INSERT INTO spot_checks
+                     (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(segment_id, reviewer) DO NOTHING",
+                params![segment_id, effective_reviewer, action, submitted_nfc, expected_nfc, noticed as i32, cer],
+            )?;
+            if changed > 0 {
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or(0);
+                tx.execute(
+                    "INSERT INTO review_events
+                        (segment_id, reviewer, action, compensation_action, source, timestamp_ms,
+                         duration_ms, operation_id, operation_payload_hash)
+                     VALUES (?1, ?2, ?3, ?3, 'couch_spot_check', ?4,
+                             (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?5, ?6)",
+                    params![
+                        segment_id,
+                        effective_reviewer,
+                        action,
+                        timestamp_ms,
+                        operation.map(|value| value.0),
+                        operation.map(|value| value.1)
+                    ],
+                )?;
+                let event_id = tx.last_insert_rowid();
+                let revision: Option<i64> = tx
+                    .query_row(
+                        "SELECT review_revision FROM speech_segments WHERE id = ?1",
+                        params![segment_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Self::append_review_compensation_tx(
+                    &tx,
+                    event_id,
                     segment_id,
-                    reviewer,
+                    &effective_reviewer,
+                    "couch_spot_check",
                     action,
-                    timestamp_ms,
-                    operation.map(|value| value.0),
-                    operation.map(|value| value.1)
-                ],
-            )?;
-            let event_id = tx.last_insert_rowid();
-            let revision: Option<i64> = tx
-                .query_row("SELECT review_revision FROM speech_segments WHERE id = ?1", params![segment_id], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            Self::append_review_compensation_tx(
-                &tx,
-                event_id,
-                segment_id,
-                reviewer,
-                "couch_spot_check",
-                action,
-                action,
-                revision,
-            )?;
+                    action,
+                    revision,
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed > 0)
+        })();
+        let reset = self.conn.execute_batch("PRAGMA synchronous=NORMAL;");
+        let changed = match write {
+            Ok(changed) => {
+                reset?;
+                changed
+            }
+            Err(error) => {
+                let _ = reset;
+                return Err(error);
+            }
+        };
+        if changed {
+            self.track_write()?;
         }
-        tx.commit()?;
-        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-        self.track_write()?;
         Ok(())
     }
 

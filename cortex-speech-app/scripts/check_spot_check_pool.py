@@ -25,10 +25,8 @@ Run:  python scripts/check_spot_check_pool.py [db_path]   (env CORTEX_DB overrid
 """
 
 import os
-import json
 import sqlite3
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 from pilot_focus_contract import verify_controlled_pilot_focus
@@ -43,16 +41,22 @@ from check_reviewer_queues_live import (
     servable_clips,
     source_dialects,
 )
+from review_pilot_hidden_contract import (
+    MAX_UI_ACTIONS,
+    POLICY_FILE,
+    PILOT_REVIEWERS,
+    HiddenPilotState,
+    PilotContractError,
+    ReviewPilotPolicy,
+    audit_active_hidden_state,
+    read_policy,
+)
 
 # Absolute floor for a live reviewer, even when another gate already says their queue is empty.
 # Production capacity is stricter and is derived below from the reviewer's whole accessible queue.
 MIN_KEYS_PER_REVIEWER = 3
-REVIEW_PILOT_FILE = "review_pilot_policy.json"
-COUCH_SESSION_FILE = "couch_session.json"
-REVIEW_PILOT_SCHEMA_VERSION = 1
-REVIEW_PILOT_REVIEWERS = 2
-REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER = 10
-REVIEW_PILOT_TOTAL_CORPUS_ACTIONS = 20
+REVIEW_PILOT_FILE = POLICY_FILE
+REVIEW_PILOT_REVIEWERS = len(PILOT_REVIEWERS)
 
 HUMAN_DECIDED = """(
     CASE WHEN TRIM(COALESCE(human_decision,'')) <> ''
@@ -62,120 +66,35 @@ HUMAN_DECIDED = """(
 )"""
 
 
-@dataclass(frozen=True)
-class ReviewPilotPolicy:
-    after_review_event_id: int
-    max_total_corpus_actions: int
-    reviewer_caps: dict[str, int]
-
-
-def _strict_json_loads(raw: str) -> object:
-    """Match serde_json: reject duplicate object fields and non-JSON numeric constants."""
-    def object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        value: dict[str, object] = {}
-        for key, item in pairs:
-            if key in value:
-                raise ValueError(f"duplicate JSON field {key!r}")
-            value[key] = item
-        return value
-
-    def invalid_constant(value: str) -> object:
-        raise ValueError(f"invalid JSON constant {value}")
-
-    return json.loads(raw, object_pairs_hook=object_without_duplicates, parse_constant=invalid_constant)
-
-
 def load_review_pilot_policy(data_dir: Path) -> ReviewPilotPolicy | None:
-    """Mirror Rust's strict two-reviewer/20-action operating-policy contract."""
+    """Load the exact two-reviewer policy and its owner-authorized focus."""
     path = data_dir / REVIEW_PILOT_FILE
     try:
-        raw = path.read_text(encoding="utf-8")
+        path.stat()
     except FileNotFoundError:
         return None
     except OSError as error:
-        raise PolicyBroken(f"{REVIEW_PILOT_FILE} is unreadable: {error}") from error
+        raise PolicyBroken(f"{REVIEW_PILOT_FILE} cannot be inspected: {error}") from error
     try:
-        value = _strict_json_loads(raw)
-    except (json.JSONDecodeError, ValueError) as error:
-        raise PolicyBroken(f"{REVIEW_PILOT_FILE} is invalid JSON: {error}") from error
-    if not isinstance(value, dict) or set(value) != {
-        "schema_version",
-        "after_review_event_id",
-        "max_total_corpus_actions",
-        "reviewers",
-    }:
-        raise PolicyBroken(f"{REVIEW_PILOT_FILE} has missing or unknown fields")
-    if type(value["schema_version"]) is not int or value["schema_version"] != REVIEW_PILOT_SCHEMA_VERSION:
-        raise PolicyBroken(f"{REVIEW_PILOT_FILE} schema_version must be {REVIEW_PILOT_SCHEMA_VERSION}")
-    after = value["after_review_event_id"]
-    total = value["max_total_corpus_actions"]
-    if isinstance(after, bool) or not isinstance(after, int) or after < 0:
-        raise PolicyBroken(f"{REVIEW_PILOT_FILE} after_review_event_id must be non-negative")
-    if isinstance(total, bool) or total != REVIEW_PILOT_TOTAL_CORPUS_ACTIONS:
-        raise PolicyBroken(
-            f"{REVIEW_PILOT_FILE} must cap exactly {REVIEW_PILOT_TOTAL_CORPUS_ACTIONS} corpus actions"
-        )
-    entries = value["reviewers"]
-    if not isinstance(entries, list) or len(entries) != REVIEW_PILOT_REVIEWERS:
-        raise PolicyBroken(f"{REVIEW_PILOT_FILE} must name exactly {REVIEW_PILOT_REVIEWERS} reviewers")
-    caps: dict[str, int] = {}
-    normalized: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"name", "max_corpus_actions"}:
-            raise PolicyBroken(f"{REVIEW_PILOT_FILE} has an invalid reviewer entry")
-        name = entry["name"]
-        cap = entry["max_corpus_actions"]
-        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 40 or any(
-            ord(char) < 32 or ord(char) == 127 for char in name
-        ):
-            raise PolicyBroken(f"{REVIEW_PILOT_FILE} has an invalid reviewer name")
-        name = name.strip()
-        key = name.lower()
-        if key in normalized:
-            raise PolicyBroken(f"{REVIEW_PILOT_FILE} reviewer names must be distinct")
-        if isinstance(cap, bool) or cap != REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER:
-            raise PolicyBroken(
-                f"{REVIEW_PILOT_FILE} must cap each reviewer at {REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER} corpus actions"
-            )
-        normalized.add(key)
-        caps[name] = cap
-    policy = ReviewPilotPolicy(after, total, dict(sorted(caps.items(), key=lambda item: item[0].lower())))
-    try:
+        policy = read_policy(path)
         verify_controlled_pilot_focus(data_dir)
-    except RuntimeError as error:
+    except (PilotContractError, RuntimeError) as error:
         raise PolicyBroken(str(error)) from error
     return policy
 
 
 def load_pilot_served_checks(
-    data_dir: Path, policy: ReviewPilotPolicy
-) -> dict[str, set[str]]:
-    """Read the durable distinct-key budget bound into the remembered Couch session."""
-    session_path = data_dir / COUCH_SESSION_FILE
+    data_dir: Path,
+    policy: ReviewPilotPolicy,
+    conn: sqlite3.Connection,
+    db_path: Path,
+) -> tuple[dict[str, set[str]], HiddenPilotState]:
+    """Return DB-authoritative grants after proving the session is only a consistent cache."""
     try:
-        session = json.loads(session_path.read_text(encoding="utf-8"))
-        policy_json = json.loads((data_dir / REVIEW_PILOT_FILE).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise PolicyBroken(f"controlled-pilot session state is unreadable: {error}") from error
-    if not isinstance(session, dict) or session.get("pilot_policy") != policy_json:
-        raise PolicyBroken("remembered session is not bound to the active controlled-pilot policy")
-    entries = session.get("pilot_spot_checks")
-    if not isinstance(entries, list):
-        raise PolicyBroken("remembered session has no valid pilot hidden-check budget")
-    out = {name: set() for name in policy.reviewer_caps}
-    for entry in entries:
-        if (
-            not isinstance(entry, list)
-            or len(entry) != 2
-            or not all(isinstance(value, str) and value.strip() for value in entry)
-        ):
-            raise PolicyBroken("remembered session has an invalid pilot hidden-check entry")
-        segment_id, actual = entry
-        canonical = next((name for name in out if name.lower() == actual.strip().lower()), None)
-        if canonical is None:
-            raise PolicyBroken(f"pilot hidden-check budget contains unauthorized reviewer {actual!r}")
-        out[canonical].add(segment_id)
-    return out
+        state = audit_active_hidden_state(conn, data_dir, db_path, policy)
+    except PilotContractError as error:
+        raise PolicyBroken(str(error)) from error
+    return state.grants, state
 
 
 def pilot_progress(
@@ -301,6 +220,20 @@ def pilot_certification_issues(
             issues.append(
                 f"{reviewer} used {skip_count} skip action(s); the 10-corpus-decision canary is incomplete"
             )
+        hidden_skip_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM review_events
+                 WHERE id > ? AND source = 'couch_spot_check' AND action = 'skip'
+                   AND LOWER(TRIM(reviewer)) = ?
+                """,
+                (policy.after_review_event_id, reviewer.lower()),
+            ).fetchone()[0]
+        )
+        if hidden_skip_count:
+            issues.append(
+                f"{reviewer} skipped {hidden_skip_count} hidden check(s); certification requires 2/2 completed"
+            )
         if progress[reviewer] < cap:
             continue
         quota = (cap + spot_check_every - 1) // spot_check_every
@@ -385,6 +318,7 @@ def main() -> int:
         return 1
     data_dir = Path(db_path).parent
     pilot_served: dict[str, set[str]] | None = None
+    pilot_hidden_state: HiddenPilotState | None = None
     try:
         roster = load_roster(data_dir)
         focus = load_focus(data_dir)
@@ -398,7 +332,6 @@ def main() -> int:
                     f"{REVIEW_PILOT_FILE} requires exactly these live reviewers: "
                     + ", ".join(pilot_policy.reviewer_caps)
                 )
-            pilot_served = load_pilot_served_checks(data_dir, pilot_policy)
         dialect_rs = (Path(__file__).resolve().parent.parent / "src-tauri" / "src" / "dialect.rs").read_text(
             encoding="utf-8"
         )
@@ -412,12 +345,26 @@ def main() -> int:
         return 1
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    if pilot_policy is not None:
+        try:
+            pilot_served, pilot_hidden_state = load_pilot_served_checks(
+                data_dir, pilot_policy, conn, Path(db_path)
+            )
+        except PolicyBroken as error:
+            conn.rollback()
+            conn.close()
+            print(f"FAIL: reviewer pilot hidden-key state cannot be evaluated: {error}")
+            return 1
 
     decisions = conn.execute(
         f"SELECT COUNT(*) FROM speech_segments WHERE verified = 1 AND {HUMAN_DECIDED}"
     ).fetchone()[0]
 
     if decisions == 0:
+        conn.rollback()
+        conn.close()
         if reviewers:
             print("FAIL: live reviewer links exist but there are no human answer keys for hidden listening checks")
             return 1
@@ -425,6 +372,8 @@ def main() -> int:
         return 0
 
     if not reviewers:
+        conn.rollback()
+        conn.close()
         print("SKIP: no live reviewer session — spot-check capacity is a launch-time gate")
         return 0
 
@@ -467,8 +416,18 @@ def main() -> int:
         try:
             pilot_total, pilot_counts = pilot_progress(conn, pilot_policy)
         except PolicyBroken as error:
+            conn.rollback()
             conn.close()
             print(f"FAIL: reviewer pilot policy cannot be evaluated: {error}")
+            return 1
+        assert pilot_hidden_state is not None
+        if (
+            pilot_total != pilot_hidden_state.total_corpus_actions
+            or pilot_counts != pilot_hidden_state.corpus_actions
+        ):
+            conn.rollback()
+            conn.close()
+            print("FAIL: controlled-review action counters disagree inside one database snapshot")
             return 1
         work_counts = pilot_bounded_work_counts(work_counts, pilot_policy, pilot_counts)
         assert pilot_served is not None
@@ -485,6 +444,7 @@ def main() -> int:
         for canonical, ids in pilot_served.items():
             quota = (pilot_policy.reviewer_caps[canonical] + spot_check_every - 1) // spot_check_every
             if len(ids) > quota:
+                conn.rollback()
                 conn.close()
                 print(f"FAIL: {canonical} has {len(ids)} pilot keys served beyond the {quota}-key ceiling")
                 return 1
@@ -504,6 +464,7 @@ def main() -> int:
                     dialect_table=dialect_table,
                 )[canonical]
                 if valid != len(unresolved):
+                    conn.rollback()
                     conn.close()
                     print(f"FAIL: {canonical} has a previously served pilot key that is no longer valid")
                     return 1
@@ -525,6 +486,7 @@ def main() -> int:
         certification_issues = pilot_certification_issues(
             conn, pilot_policy, pilot_counts, pilot_served, spot_check_every
         )
+    conn.rollback()
     conn.close()
     required: dict[str, int] = {}
     for reviewer in reviewers:
@@ -553,7 +515,7 @@ def main() -> int:
     if pilot_policy is not None and pilot_total is not None and pilot_counts is not None:
         print(
             f"controlled pilot       : {pilot_total}/{pilot_policy.max_total_corpus_actions} corpus actions "
-            f"(+ exactly 2 hidden QC per reviewer, max 24 compensated UI acts); "
+            f"(+ exactly 2 hidden QC per reviewer, max {MAX_UI_ACTIONS} compensated UI acts); "
             + ", ".join(
                 f"{name}={pilot_counts[name]}/{pilot_policy.reviewer_caps[name]}"
                 for name in pilot_policy.reviewer_caps

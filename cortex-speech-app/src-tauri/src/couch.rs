@@ -1100,6 +1100,7 @@ where
     // cannot fix. Checking here turns it into an honest error on Start, and never binds a port this
     // server cannot serve.
     let preflight_db = Database::open(&db_path).map_err(|e| format!("Couch Review cannot open the library: {e}"))?;
+    let mut durable_pilot_served_checks = HashSet::new();
     if let Some(policy) = configured_pilot.as_ref() {
         if policy.after_review_event_id > preflight_db.max_review_event_id().map_err(|error| error.to_string())? {
             return Err("controlled review pilot baseline is ahead of durable review history".to_string());
@@ -1108,6 +1109,25 @@ where
         preflight_db
             .review_decision_progress(&limit)
             .map_err(|error| format!("controlled review pilot history is invalid: {error}"))?;
+        let policy_sha256 = policy.policy_sha256()?;
+        for name in &names {
+            let quota = pilot_spot_check_quota(policy, name)?;
+            let remembered_ids: Vec<String> = pilot_served_checks
+                .iter()
+                .filter(|(_, reviewer)| reviewer.eq_ignore_ascii_case(name))
+                .map(|(segment_id, _)| segment_id.clone())
+                .collect();
+            let durable = preflight_db
+                .reserve_review_pilot_hidden_keys(
+                    &policy_sha256,
+                    policy.after_review_event_id,
+                    name,
+                    &remembered_ids,
+                    quota,
+                )
+                .map_err(|error| format!("controlled review pilot hidden-key history is invalid: {error}"))?;
+            durable_pilot_served_checks.extend(durable.into_iter().map(|segment_id| (segment_id, name.clone())));
+        }
     }
     drop(preflight_db);
 
@@ -1126,10 +1146,13 @@ where
     let shutdown = Arc::new(AtomicBool::new(false));
     // Rehydrate the served spot-check set for names still on the roster, so a check outstanding
     // across the restart is recognized and scored when its answer arrives instead of 409ing.
-    let spot_checks: HashSet<(String, String)> =
+    let mut spot_checks: HashSet<(String, String)> =
         served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
     let pilot_spot_checks: HashSet<(String, String)> =
-        pilot_served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
+        durable_pilot_served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
+    // The remembered file is now only a cache. A lost/repaired file is rebuilt from SQLite, and a
+    // stale remembered key had to be transactionally imported above before it can authorize audio.
+    spot_checks.extend(pilot_spot_checks.iter().cloned());
     let session_store = data_dir.as_ref().map(|dir| (dir.clone(), db_path.clone()));
     // Cookie sessions come back with the server, for names still on the roster. Without this the
     // browser holds a valid cookie the server has never heard of, answers 401, and the page reports
@@ -2445,9 +2468,10 @@ fn pilot_spot_check_plan(
 /// the proven two-key capacity, while pretending it remains a check would corrupt reviewer scoring.
 fn pilot_outstanding_spot_checks(
     db: &Database,
+    policy_sha256: &str,
+    after_review_event_id: i64,
     reviewer: &str,
     ids: &[String],
-    skipped: &HashSet<String>,
     allowed_dialects: Option<&[String]>,
     focus: Option<&HashSet<String>>,
 ) -> Result<Vec<SpeechSegment>, String> {
@@ -2456,7 +2480,10 @@ fn pilot_outstanding_spot_checks(
         rows.iter().map(|(segment, _)| (segment.id.as_str(), segment)).collect();
     let mut out = Vec::new();
     for id in ids {
-        if db.has_spot_check_result(id, reviewer).map_err(|error| error.to_string())? || skipped.contains(id) {
+        if db
+            .review_pilot_hidden_key_resolved(policy_sha256, after_review_event_id, reviewer, id)
+            .map_err(|error| error.to_string())?
+        {
             continue;
         }
         let Some(segment) = by_id.remove(id.as_str()) else {
@@ -2561,6 +2588,45 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
             return err_reply(503, "Review is temporarily paused: reviewer accounting is unavailable");
         }
     };
+    // SQLite is the lifetime authority for pilot hidden assignments. Import any remembered/in-memory
+    // mirror first (legacy upgrade), then use only the transactionally bounded set for planning. An
+    // empty mirror after a crash, Stop/Start, or snapshot recovery therefore cannot mint key three.
+    let durable_pilot_check_ids = if let Some(policy) = pilot_policy.as_ref() {
+        let policy_sha256 = match policy.policy_sha256() {
+            Ok(digest) => digest,
+            Err(error) => return err_reply(503, &format!("controlled review pilot is unavailable: {error}")),
+        };
+        let quota = match pilot_spot_check_quota(policy, reviewer) {
+            Ok(quota) => quota,
+            Err(error) => return err_reply(503, &format!("controlled review pilot is unavailable: {error}")),
+        };
+        let remembered_ids: Vec<String> = {
+            let guard = lock_state(state);
+            guard
+                .pilot_spot_checks
+                .iter()
+                .filter(|(_, name)| name.eq_ignore_ascii_case(reviewer))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        match db.reserve_review_pilot_hidden_keys(
+            &policy_sha256,
+            policy.after_review_event_id,
+            reviewer,
+            &remembered_ids,
+            quota,
+        ) {
+            Ok(ids) => Some(ids),
+            Err(error) => {
+                return err_reply(
+                    503,
+                    &format!("Review is temporarily paused: controlled hidden-check history is invalid ({error})"),
+                )
+            }
+        }
+    } else {
+        None
+    };
     let pending_ids = match db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_deref()) {
         Ok(ids) => ids,
         Err(e) => return err_reply(500, &e.to_string()),
@@ -2611,12 +2677,21 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     let skipped_by_me = guard.skipped.get(reviewer).cloned().unwrap_or_default();
     // A pilot key budget is DISTINCT-KEY based, not request based. Snapshot it under the same lock
     // that protects insertion so two concurrent reloads cannot both observe room for the final key.
-    let mut pilot_check_ids: Vec<String> = guard
-        .pilot_spot_checks
-        .iter()
-        .filter(|(_, name)| name.eq_ignore_ascii_case(reviewer))
-        .map(|(id, _)| id.clone())
-        .collect();
+    if let Some(ids) = durable_pilot_check_ids.as_ref() {
+        for id in ids {
+            let key = (id.clone(), reviewer.to_string());
+            guard.pilot_spot_checks.insert(key.clone());
+            guard.spot_checks.insert(key);
+        }
+    }
+    let mut pilot_check_ids: Vec<String> = durable_pilot_check_ids.unwrap_or_else(|| {
+        guard
+            .pilot_spot_checks
+            .iter()
+            .filter(|(_, name)| name.eq_ignore_ascii_case(reviewer))
+            .map(|(id, _)| id.clone())
+            .collect()
+    });
     pilot_check_ids.sort();
     pilot_check_ids.dedup();
     // A persisted session is the production paid-review path. Ephemeral test/dev callers preserve
@@ -2674,11 +2749,13 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         let selected: SpotCheckSelection = if let Some(policy) = pilot_policy.as_ref() {
             (|| {
                 let quota = pilot_spot_check_quota(policy, reviewer)?;
+                let policy_sha256 = policy.policy_sha256()?;
                 let outstanding = pilot_outstanding_spot_checks(
                     db,
+                    &policy_sha256,
+                    policy.after_review_event_id,
                     reviewer,
                     &pilot_check_ids,
-                    &skipped_by_me,
                     allowed_dialects.as_deref(),
                     focus.as_deref(),
                 )?;
@@ -2743,43 +2820,64 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
             }
             Ok(Some((candidates, pilot_quota))) => {
                 let wanted = candidates.len();
-                // Pilot key registration and its session-file save are one ordered operation. Taking
-                // the same cross-request persistence lock BEFORE mutating memory prevents a concurrent
-                // save/revoke from snapshotting a half-registered key budget.
-                let _pilot_persist = pilot_quota.map(|_| lock_session_persist());
-                let mut guard = lock_state(state);
                 if let Some(quota) = pilot_quota {
-                    // A second reload may have selected concurrently from the same snapshot. Recheck
-                    // the distinct-key total while holding the insertion lock; never trust the earlier
-                    // planning read as the authority for the two-key ceiling.
-                    let current: HashSet<String> = guard
-                        .pilot_spot_checks
-                        .iter()
-                        .filter(|(_, name)| name.eq_ignore_ascii_case(reviewer))
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    let additional = candidates.iter().filter(|segment| !current.contains(&segment.id)).count();
-                    if current.len().saturating_add(additional) > quota {
+                    let Some(policy) = pilot_policy.as_ref() else {
+                        return err_reply(503, "Review is temporarily paused: pilot key has no active policy");
+                    };
+                    let policy_sha256 = match policy.policy_sha256() {
+                        Ok(digest) => digest,
+                        Err(error) => {
+                            return err_reply(
+                                503,
+                                &format!("Review is temporarily paused: pilot policy identity failed ({error})"),
+                            )
+                        }
+                    };
+                    let candidate_ids: Vec<String> = candidates.iter().map(|segment| segment.id.clone()).collect();
+                    let authorized = match db.reserve_review_pilot_hidden_keys(
+                        &policy_sha256,
+                        policy.after_review_event_id,
+                        reviewer,
+                        &candidate_ids,
+                        quota,
+                    ) {
+                        Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
+                        Err(error) => {
+                            let mut guard = lock_state(state);
+                            for id in &serving {
+                                if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
+                                    guard.leases.remove(id);
+                                }
+                            }
+                            return err_reply(
+                                503,
+                                &format!("Review is temporarily paused: hidden-check reservation failed ({error})"),
+                            );
+                        }
+                    };
+                    if candidate_ids.iter().any(|id| !authorized.contains(id)) {
+                        let mut guard = lock_state(state);
                         for id in &serving {
                             if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
                                 guard.leases.remove(id);
                             }
                         }
-                        return err_reply(503, "Review is temporarily paused: controlled hidden-check quota changed");
+                        return err_reply(503, "Review is temporarily paused: hidden-check reservation is incomplete");
                     }
                 }
+                // Serialize remembered-file mirror writes so an older cache snapshot cannot replace
+                // a newer one. SQLite has already committed the pilot authority above; this file is
+                // now restart convenience only and may be rebuilt from the database.
+                let _pilot_persist = pilot_quota.map(|_| lock_session_persist());
+                let mut guard = lock_state(state);
                 let mut grew = false;
-                let mut inserted_spot_checks = Vec::new();
-                let mut inserted_pilot_checks = Vec::new();
                 for (idx, seg) in candidates.into_iter().enumerate() {
                     let key = (seg.id.clone(), reviewer.to_string());
                     if guard.spot_checks.insert(key.clone()) {
                         grew = true;
-                        inserted_spot_checks.push(key.clone());
                     }
                     if pilot_quota.is_some() && guard.pilot_spot_checks.insert(key.clone()) {
                         grew = true;
-                        inserted_pilot_checks.push(key);
                     }
                     // SPREAD EVENLY, and this is a fix, not a preference. The position used to be
                     // `((idx + 1) * SPOT_CHECK_EVERY).min(queue.len())`, and the comment above it
@@ -2818,10 +2916,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 let pilot_snapshot = (pilot_quota.is_some() && grew).then(|| snapshot_session_save(&guard)).flatten();
                 #[cfg(test)]
                 let inject_pilot_save_failure = pilot_quota.is_some() && grew && guard.fail_session_persist;
-                // Persist the grown served-set into the remembered session (phase 4): a check served
-                // now may be answered AFTER an app restart, and it must still be scored then rather
-                // than 409ing the reviewer. The persistence helper snapshots after taking the global
-                // ordering lock, so an older queue save cannot overwrite a later credential revoke.
+                // Persist the cache when possible. A failure no longer rolls back or rejects a queue:
+                // the exact assignments are already FULL-synchronous in SQLite and the next request
+                // or process start deterministically rehydrates this mirror from that authority.
                 drop(guard);
                 if grew {
                     let saved = if pilot_quota.is_some() {
@@ -2846,26 +2943,8 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                     };
                     if let Err(error) = saved {
                         if pilot_quota.is_some() {
-                            let mut guard = lock_state(state);
-                            // The response was never authorized, so restore the last durable served
-                            // set. This also ensures a same-process retry cannot see `grew == false`
-                            // and return keys that only ever existed in memory.
-                            for key in inserted_spot_checks {
-                                guard.spot_checks.remove(&key);
-                            }
-                            for key in inserted_pilot_checks {
-                                guard.pilot_spot_checks.remove(&key);
-                            }
-                            for id in &serving {
-                                if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
-                                    guard.leases.remove(id);
-                                }
-                            }
-                            return err_reply(
-                                503,
-                                &format!(
-                                    "Review is temporarily paused: controlled hidden-check state was not saved ({error})"
-                                ),
+                            tracing::warn!(
+                                "controlled hidden-check session mirror was not saved; SQLite remains authoritative: {error}"
                             );
                         }
                     }
@@ -3027,31 +3106,63 @@ fn forget_work_audio_assignment(state: &Mutex<CouchState>, id: &str, reviewer: &
 /// Resolve the in-memory proof that this exact reviewer was handed this exact object. A live lease
 /// by itself is intentionally insufficient: renew is allowed to reclaim an expired assignment, so
 /// treating any lease as delivery would turn that reliability endpoint into an object-id oracle.
-fn audio_assignment(id: &str, reviewer: &str, state: &Mutex<CouchState>) -> Result<AudioAssignment, Reply> {
+fn audio_assignment(
+    db: &Database,
+    id: &str,
+    reviewer: &str,
+    state: &Mutex<CouchState>,
+    pilot_policy: Option<&crate::review_pilot::ReviewPilotPolicy>,
+) -> Result<AudioAssignment, Reply> {
     let key = (id.to_string(), reviewer.to_string());
-    let mut guard = lock_state(state);
-    let holder = guard.holder(id, Instant::now()).map(str::to_string);
-    let skipped = guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(id));
-    if skipped {
-        if holder.as_deref() == Some(reviewer) {
-            guard.leases.remove(id);
+    let (skipped, served_work, remembered_hidden, remembered_pilot_count) = {
+        let mut guard = lock_state(state);
+        let holder = guard.holder(id, Instant::now()).map(str::to_string);
+        let skipped = guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(id));
+        if skipped {
+            if holder.as_deref() == Some(reviewer) {
+                guard.leases.remove(id);
+            }
+            guard.served_work.remove(&key);
         }
-        guard.served_work.remove(&key);
-        return Err(err_reply(403, "audio is no longer assigned to this reviewer — reload your queue"));
-    }
-    if holder.as_deref() == Some(reviewer) && guard.served_work.contains(&key) {
-        return Ok(AudioAssignment::Work);
-    }
-    if guard.spot_checks.contains(&key) {
-        let served_in_pilot = guard.pilot_spot_checks.contains(&key);
-        let distinct_pilot_keys = guard
+        let served_work = holder.as_deref() == Some(reviewer) && guard.served_work.contains(&key);
+        let remembered_hidden = guard.spot_checks.contains(&key);
+        let remembered_pilot_count = guard
             .pilot_spot_checks
             .iter()
             .filter(|(_, who)| who.eq_ignore_ascii_case(reviewer))
             .map(|(segment_id, _)| segment_id)
             .collect::<HashSet<_>>()
             .len();
-        return Ok(AudioAssignment::HiddenCheck { served_in_pilot, distinct_pilot_keys });
+        (skipped, served_work, remembered_hidden, remembered_pilot_count)
+    };
+    if skipped {
+        return Err(err_reply(403, "audio is no longer assigned to this reviewer — reload your queue"));
+    }
+    if let Some(policy) = pilot_policy {
+        let policy_sha256 = policy
+            .policy_sha256()
+            .map_err(|error| err_reply(503, &format!("controlled review pilot is unavailable: {error}")))?;
+        let ids = db
+            .review_pilot_hidden_keys(&policy_sha256, policy.after_review_event_id, reviewer)
+            .map_err(|error| err_reply(503, &format!("hidden-check authorization is unavailable: {error}")))?;
+        if ids.iter().any(|segment_id| segment_id == id) {
+            let resolved = db
+                .review_pilot_hidden_key_resolved(&policy_sha256, policy.after_review_event_id, reviewer, id)
+                .map_err(|error| err_reply(503, &format!("hidden-check authorization is unavailable: {error}")))?;
+            if resolved {
+                return Err(err_reply(403, "audio is no longer assigned to this reviewer — reload your queue"));
+            }
+            return Ok(AudioAssignment::HiddenCheck { served_in_pilot: true, distinct_pilot_keys: ids.len() });
+        }
+    }
+    if served_work {
+        return Ok(AudioAssignment::Work);
+    }
+    if pilot_policy.is_none() && remembered_hidden {
+        return Ok(AudioAssignment::HiddenCheck {
+            served_in_pilot: false,
+            distinct_pilot_keys: remembered_pilot_count,
+        });
     }
     Err(err_reply(403, "audio is not assigned to this reviewer — reload your queue"))
 }
@@ -3060,9 +3171,9 @@ fn audio_assignment(id: &str, reviewer: &str, state: &Mutex<CouchState>) -> Resu
 /// answers who the caller is; this is the separate object-level authorization boundary that answers
 /// whether that reviewer may fetch this segment NOW.
 fn authorize_audio(db: &Database, id: &str, reviewer: &str, state: &Mutex<CouchState>) -> Result<SpeechSegment, Reply> {
-    let assignment = audio_assignment(id, reviewer, state)?;
     let (allowed_dialects, focus) = reviewer_policy(reviewer, state).map_err(|error| err_reply(503, &error))?;
     let pilot_policy = active_pilot_policy(reviewer, state).map_err(|error| err_reply(503, &error))?;
+    let assignment = audio_assignment(db, id, reviewer, state, pilot_policy.as_ref())?;
 
     match (assignment, pilot_policy.as_ref()) {
         (AudioAssignment::Work, Some(policy)) => {
@@ -3150,7 +3261,21 @@ fn authorize_audio(db: &Database, id: &str, reviewer: &str, state: &Mutex<CouchS
     // Close state races between the first receipt lookup and the database/policy reads above. A
     // completed decision removes the lease; a skip records its exclusion. Neither may be followed by
     // a conditional 304 that silently re-authorizes cached biometric bytes.
-    let still_assigned = {
+    let still_assigned = if matches!(assignment, AudioAssignment::HiddenCheck { .. }) && pilot_policy.is_some() {
+        let Some(policy) = pilot_policy.as_ref() else {
+            return Err(err_reply(503, "controlled hidden-check policy disappeared during authorization"));
+        };
+        let policy_sha256 = policy
+            .policy_sha256()
+            .map_err(|error| err_reply(503, &format!("controlled review pilot is unavailable: {error}")))?;
+        let durable = db
+            .review_pilot_hidden_keys(&policy_sha256, policy.after_review_event_id, reviewer)
+            .map_err(|error| err_reply(503, &format!("hidden-check authorization is unavailable: {error}")))?;
+        durable.iter().any(|segment_id| segment_id == id)
+            && !db
+                .review_pilot_hidden_key_resolved(&policy_sha256, policy.after_review_event_id, reviewer, id)
+                .map_err(|error| err_reply(503, &format!("hidden-check authorization is unavailable: {error}")))?
+    } else {
         let key = (id.to_string(), reviewer.to_string());
         let mut guard = lock_state(state);
         let skipped = guard.skipped.get(reviewer).is_some_and(|ids| ids.contains(id));
@@ -3160,11 +3285,7 @@ fn authorize_audio(db: &Database, id: &str, reviewer: &str, state: &Mutex<CouchS
                     && guard.holder(id, Instant::now()).is_some_and(|who| who == reviewer)
                     && guard.served_work.contains(&key)
             }
-            AudioAssignment::HiddenCheck { .. } => {
-                !skipped
-                    && guard.spot_checks.contains(&key)
-                    && (pilot_policy.is_none() || guard.pilot_spot_checks.contains(&key))
-            }
+            AudioAssignment::HiddenCheck { .. } => !skipped && guard.spot_checks.contains(&key),
         }
     };
     if !still_assigned {
@@ -3527,12 +3648,28 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Ok(None) => return err_reply(404, "no such segment"),
         Err(e) => return err_reply(500, &e.to_string()),
     };
+    let pilot_policy = match active_pilot_policy(reviewer, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    let pilot_namespace = match pilot_policy.as_ref() {
+        Some(policy) => match policy.policy_sha256() {
+            Ok(policy_sha256) => Some((policy_sha256, policy.after_review_event_id)),
+            Err(error) => return err_reply(503, &format!("controlled review pilot is unavailable: {error}")),
+        },
+        None => None,
+    };
     // Hidden checks are deliberately served with their RAW, known-wrong draft even when the row also
     // carries its human answer in annotated_transcript. Pay/action classification must describe what
     // the reviewer did to the text they actually saw; QC correctness is scored separately against the
     // answer key below. Keeping those two baselines distinct prevents an attentive correction from
     // being paid as a 10% accept and a blind raw accept from being paid as a 100% edit.
-    let was_served_as_spot_check = {
+    let was_served_as_spot_check = if let Some((policy_sha256, after_review_event_id)) = pilot_namespace.as_ref() {
+        match db.review_pilot_hidden_keys(policy_sha256, *after_review_event_id, reviewer) {
+            Ok(ids) => ids.iter().any(|id| id == &parsed.id),
+            Err(error) => return err_reply(503, &format!("hidden-check authorization is unavailable: {error}")),
+        }
+    } else {
         let guard = lock_state(state);
         guard.spot_checks.contains(&(parsed.id.clone(), reviewer.to_string()))
     };
@@ -3638,10 +3775,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Ok(policy) => policy,
         Err(e) => return err_reply(503, &e),
     };
-    let pilot_policy = match active_pilot_policy(reviewer, state) {
+    let current_pilot_policy = match active_pilot_policy(reviewer, state) {
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
+    if current_pilot_policy != pilot_policy {
+        return err_reply(503, "controlled review policy changed while this decision was being checked");
+    }
     match pilot_policy.as_ref() {
         Some(policy) if parsed.pilot_after_review_event_id != Some(policy.after_review_event_id) => {
             return err_reply(409, "controlled review pilot changed — reload the queue before deciding")
@@ -3668,36 +3808,51 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // row's revision at once, which would otherwise 409 every check in flight and cost the honesty
     // measurement its scores. The full staleness rationale for the key itself is on the grading
     // block below.
-    let (expected_key, invalid_pilot_key, served_in_this_pilot): (Option<String>, bool, bool) = {
-        let mut guard = lock_state(state);
-        let key = (parsed.id.clone(), reviewer.to_string());
-        if !guard.spot_checks.contains(&key) {
-            (None, false, false)
-        } else {
-            let served_in_this_pilot = guard.pilot_spot_checks.contains(&key);
-            let answer = if crate::quality::is_human_rejected(&prev) {
-                None
-            } else {
-                crate::quality::human_verified_text(&prev)
-            };
-            if let Some(answer) = answer {
-                (Some(answer.to_string()), false, served_in_this_pilot)
-            } else if served_in_this_pilot {
-                // Replacing this bounded pilot key would consume a third distinct key; treating the
-                // submit as ordinary work would silently erase the measurement. Pause instead.
-                (None, true, true)
-            } else {
-                // The answer key is gone — the thing that made this a check. Drop the stale pair so it
-                // cannot swallow this clip again, and treat the submit as what it is: real work.
-                guard.spot_checks.remove(&key);
-                tracing::info!(
-                    "Couch Review: stale spot check for {} dropped — the human answer key is gone",
-                    parsed.id
-                );
+    let (expected_key, invalid_pilot_key, served_in_this_pilot): (Option<String>, bool, bool) =
+        if pilot_policy.is_some() {
+            if !was_served_as_spot_check {
                 (None, false, false)
+            } else {
+                let answer = if crate::quality::is_human_rejected(&prev) {
+                    None
+                } else {
+                    crate::quality::human_verified_text(&prev)
+                };
+                match answer {
+                    Some(answer) => (Some(answer.to_string()), false, true),
+                    None => (None, true, true),
+                }
             }
-        }
-    };
+        } else {
+            let mut guard = lock_state(state);
+            let key = (parsed.id.clone(), reviewer.to_string());
+            if !guard.spot_checks.contains(&key) {
+                (None, false, false)
+            } else {
+                let served_in_this_pilot = guard.pilot_spot_checks.contains(&key);
+                let answer = if crate::quality::is_human_rejected(&prev) {
+                    None
+                } else {
+                    crate::quality::human_verified_text(&prev)
+                };
+                if let Some(answer) = answer {
+                    (Some(answer.to_string()), false, served_in_this_pilot)
+                } else if served_in_this_pilot {
+                    // Replacing this bounded pilot key would consume a third distinct key; treating the
+                    // submit as ordinary work would silently erase the measurement. Pause instead.
+                    (None, true, true)
+                } else {
+                    // The answer key is gone — the thing that made this a check. Drop the stale pair so it
+                    // cannot swallow this clip again, and treat the submit as what it is: real work.
+                    guard.spot_checks.remove(&key);
+                    tracing::info!(
+                        "Couch Review: stale spot check for {} dropped — the human answer key is gone",
+                        parsed.id
+                    );
+                    (None, false, false)
+                }
+            }
+        };
     if invalid_pilot_key {
         return err_reply(503, "Review is temporarily paused: a controlled hidden-check key is no longer valid");
     }
@@ -3753,11 +3908,11 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // Serialize the last pre-receipt check with the database commit. The database repeats the cap
     // check under BEGIN IMMEDIATE (the cross-connection authority); this outer lock ensures a losing
     // in-process request leaves no playback-receipt side effect before that transaction refuses it.
-    // A skip is zero-pay and not a canary decision, but it DOES consume a pilot safety slot: otherwise
-    // repeated skips could refill queues and burn hidden keys beyond the ten-action capacity proof.
-    // Ordinary spot-check answers do not consume a slot because they are measurement, not new work.
+    // A regular-work skip is zero-pay and not a verdict, but it DOES consume a pilot corpus safety
+    // slot: otherwise repeated skips could refill queues forever. A hidden-check skip belongs to the
+    // separately bounded two-key QC budget and is recorded as a failed QC result below, not corpus work.
     let mut pilot_decision_limit: Option<ReviewDecisionLimit> = None;
-    let _pilot_commit_guard = if parsed.action == "skip" || expected_key.is_none() {
+    let _pilot_commit_guard = if expected_key.is_none() {
         let guard = lock_pilot_decision_commit();
         let current = match active_pilot_policy(reviewer, state) {
             Ok(policy) => policy,
@@ -3916,7 +4071,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     //     can judge it instead of being handed straight back on the next refill.
     //
     // Nothing to undo, because nothing was written; the clip is simply still pending for everyone else.
-    if parsed.action == "skip" {
+    if parsed.action == "skip" && expected_key.is_none() {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
@@ -3990,16 +4145,36 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // (or 0.00 for a reject) and averaged into spot_check_report with no filter — while the HTTP reply
     // was byte-identical to a real success. Test the key, not its artefact.
     if let Some(expected) = expected_key {
+        match active_pilot_policy(reviewer, state) {
+            Ok(current) if current == pilot_policy => {}
+            Ok(_) => return err_reply(503, "controlled review policy changed while this check was being saved"),
+            Err(error) => return err_reply(503, &error),
+        }
         let submitted = text.as_deref().unwrap_or_default();
-        if let Err(e) = db.record_spot_check_with_operation(
-            &parsed.id,
-            reviewer,
-            decision,
-            submitted,
-            &expected,
-            operation_id,
-            operation_payload_hash,
-        ) {
+        let recorded = if let Some((policy_sha256, after_review_event_id)) = pilot_namespace.as_ref() {
+            db.record_pilot_spot_check_with_operation(
+                policy_sha256,
+                *after_review_event_id,
+                &parsed.id,
+                reviewer,
+                decision,
+                submitted,
+                &expected,
+                operation_id,
+                operation_payload_hash,
+            )
+        } else {
+            db.record_spot_check_with_operation(
+                &parsed.id,
+                reviewer,
+                decision,
+                submitted,
+                &expected,
+                operation_id,
+                operation_payload_hash,
+            )
+        };
+        if let Err(e) = recorded {
             tracing::warn!("Couch Review spot-check not recorded for {}: {e}", parsed.id);
             // A 200 removes this decision from the phone's durable outbox forever. If the score did
             // not commit, success would silently discard the first answer and let a later attempt
@@ -8424,10 +8599,11 @@ mod tests {
         for item in reload["items"].as_array().unwrap() {
             let id = item["id"].as_str().unwrap();
             let corrected = if id == "pilot-key-1" { "ڕاستی یەک" } else { "ڕاستی دوو" };
+            let skipped_hidden_check = id == "pilot-key-2";
             let body = serde_json::json!({
                 "id": id,
-                "action": "edit",
-                "text": corrected,
+                "action": if skipped_hidden_check { "skip" } else { "edit" },
+                "text": if skipped_hidden_check { "" } else { corrected },
                 "rowVersion": item["rowVersion"],
                 "pilotAfterReviewEventId": item["pilotAfterReviewEventId"],
                 "heardMs": 1_500,
@@ -8435,12 +8611,26 @@ mod tests {
             });
             assert_eq!(api_decision(&db, body.to_string().as_bytes(), "Hawzhin", &state).0, 200);
         }
-        assert!(fetch()["items"].as_array().unwrap().is_empty(), "2/2 durable results end catch-up");
+        assert!(fetch()["items"].as_array().unwrap().is_empty(), "both durable QC outcomes end catch-up");
         assert_eq!(lock_state(&state).pilot_spot_checks.len(), 2, "a third key is never authorized");
+        assert_eq!(
+            db.review_decision_progress(&build_pilot_decision_limit(&policy).unwrap()).unwrap().total_review_actions,
+            10,
+            "a hidden-check skip consumes its bounded QC key, not an eleventh corpus slot"
+        );
+        let hidden_skip_source: String = db
+            .connection()
+            .query_row(
+                "SELECT source FROM review_events WHERE segment_id='pilot-key-2' AND reviewer='Hawzhin' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hidden_skip_source, "couch_spot_check", "a hidden skip must remain auditable as failed QC");
     }
 
     #[test]
-    fn pilot_never_returns_a_batch_until_its_distinct_key_budget_is_durable() {
+    fn pilot_uses_sqlite_authority_when_the_session_mirror_is_lost() {
         let dir = tempfile::tempdir().unwrap();
         crate::review_pilot::install_test_focus(dir.path(), ["persist-work", "persist-key-1", "persist-key-2"]);
         let (db, db_path) = test_db(dir.path());
@@ -8477,30 +8667,43 @@ mod tests {
             })
         };
 
-        // The in-memory planner may select two, but a failed durable save returns no batch and rolls
-        // its provisional registration back. A test hook is used because Windows can rename a target
-        // directory aside and make the old filesystem-based "failure" unexpectedly succeed.
+        // SQLite commits the two-key authorization before the response. The remembered-file mirror
+        // is deliberately failed: reviewers still receive a safe batch because restart recovery no
+        // longer depends on that cache.
         let failed_state = make_state(true);
-        let (code, ..) = api_queue(&db, "Hawzhin", &failed_state);
-        assert_eq!(code, 503);
-        assert!(lock_state(&failed_state).leases.is_empty(), "failed durability releases all work leases");
-        assert!(
-            lock_state(&failed_state).pilot_spot_checks.is_empty(),
-            "a same-process retry must not inherit keys that were never durably authorized"
+        let (code, _, first_body, ..) = api_queue(&db, "Hawzhin", &failed_state);
+        assert_eq!(code, 200);
+        let first_payload: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let mut first_ids: Vec<String> = first_payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect();
+        first_ids.sort();
+        let policy_sha256 = policy.policy_sha256().unwrap();
+        assert_eq!(
+            db.review_pilot_hidden_keys(&policy_sha256, policy.after_review_event_id, "Hawzhin").unwrap(),
+            first_ids,
+            "every returned hidden key must already be durable in SQLite"
         );
+        assert_eq!(lock_state(&failed_state).pilot_spot_checks.len(), 2);
         assert!(!session_path(dir.path()).exists());
-        assert!(db.spot_check_report().unwrap().is_empty(), "an unreturned batch cannot create paid QC results");
+        assert!(db.spot_check_report().unwrap().is_empty(), "serving a check does not fabricate a result");
 
-        // Simulate a process restart. Since the failed batch was never returned, starting from the
-        // last durable (empty) key budget is safe; the next successful save may now return exactly two.
+        // Simulate deleting couch_session.json and restarting from empty memory. The exact same two
+        // database reservations are re-served; there is no capacity for a third key.
         drop(failed_state);
         let restarted = make_state(false);
         let (code, _, body, ..) = api_queue(&db, "Hawzhin", &restarted);
         assert_eq!(code, 200);
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["items"].as_array().unwrap().len(), 2);
+        let mut restarted_ids: Vec<String> =
+            payload["items"].as_array().unwrap().iter().map(|item| item["id"].as_str().unwrap().to_string()).collect();
+        restarted_ids.sort();
+        assert_eq!(restarted_ids, first_ids);
         assert_eq!(lock_state(&restarted).pilot_spot_checks.len(), 2);
-        assert!(session_path(dir.path()).is_file(), "the returned two-key budget is durable before response");
+        assert!(!session_path(dir.path()).exists(), "the proof must not depend on recreating the failed mirror");
     }
 
     #[test]
@@ -9697,6 +9900,15 @@ mod tests {
         )
         .unwrap();
         let policy = crate::review_pilot::load(tmp.path()).unwrap().unwrap();
+        let policy_sha256 = policy.policy_sha256().unwrap();
+        db.reserve_review_pilot_hidden_keys(
+            &policy_sha256,
+            policy.after_review_event_id,
+            "Hawzhin",
+            &["audio-pilot-key".into()],
+            2,
+        )
+        .unwrap();
         let state = Mutex::new(CouchState {
             session_store: Some((tmp.path().to_path_buf(), db_path)),
             pairing_codes: HashMap::from([

@@ -162,6 +162,9 @@ fn test_import_directory_empty() {
     let db = Database::open(&db_path).unwrap();
     let segments = db.get_segments(None).unwrap();
     assert_eq!(segments.len(), 0, "No files should produce no segments");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0)).unwrap();
+    assert_eq!(jobs, 0, "an empty folder must not create a fake recovery-journal generation");
 }
 
 #[test]

@@ -38,6 +38,17 @@ from pathlib import Path, PureWindowsPath
 from activate_review_pilot import acquire_cortex_lock
 from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
 from pilot_focus_contract import verify_controlled_pilot_focus
+from review_pilot_hidden_contract import (
+    HIDDEN_KEYS_PER_REVIEWER,
+    HIDDEN_TABLE as HIDDEN_KEY_TABLE,
+    HIDDEN_TABLE_SQL,
+    HIDDEN_TRIGGER_SQL,
+    REQUIRED_SCHEMA as HIDDEN_KEY_SCHEMA_VERSION,
+    TOTAL_HIDDEN_KEYS,
+    ReviewPilotPolicy as HiddenReviewPilotPolicy,
+    normalized_sql,
+    policy_sha256 as hidden_policy_sha256,
+)
 
 DB_FILE = "cortex-speech.db"
 # Each state has a mandatory representation: the real JSON file or its exact absence marker.
@@ -53,7 +64,7 @@ REVIEW_PILOT_ABSENT_FILE = "review_pilot_policy.absent"
 REVIEW_PILOT_ABSENT_BYTES = b"review-pilot-policy-absent-v1\n"
 MANIFEST_FILE = "SNAPSHOT_MANIFEST.json"
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-COUNT_TABLES = (
+BASE_COUNT_TABLES = (
     "speech_segments",
     "review_events",
     "spot_checks",
@@ -85,6 +96,16 @@ WINDOWS_RESERVED_NAMES = {
     *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),
 }
+
+
+def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
+    """Keep schema-2 row-count evidence backward-compatible with pre-v59 snapshots."""
+
+    return (
+        BASE_COUNT_TABLES + (HIDDEN_KEY_TABLE,)
+        if schema_version >= HIDDEN_KEY_SCHEMA_VERSION
+        else BASE_COUNT_TABLES
+    )
 
 
 def state_absence_marker(name: str) -> str:
@@ -171,13 +192,9 @@ def db_evidence(path: Path, *, immutable: bool = False) -> dict[str, object]:
         quick = [row[0] for row in con.execute("PRAGMA quick_check")]
         integrity = [row[0] for row in con.execute("PRAGMA integrity_check")]
         foreign_keys = con.execute("PRAGMA foreign_key_check").fetchall()
-        counts: dict[str, int] = {}
         existing = {
             row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
-        for table in COUNT_TABLES:
-            if table in existing:
-                counts[table] = int(con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
         try:
             migration_history = tuple(
                 (int(version), str(description))
@@ -188,6 +205,20 @@ def db_evidence(path: Path, *, immutable: bool = False) -> dict[str, object]:
         except sqlite3.Error as error:
             raise RuntimeError(f"schema migration history cannot be read: {error}") from error
         schema_version = validate_migration_history(migration_history)
+        expected_tables = evidence_tables_for_schema(schema_version)
+        missing_tables = sorted(set(expected_tables) - existing)
+        if missing_tables:
+            raise RuntimeError(
+                f"schema v{schema_version} recovery evidence is missing required table(s): {missing_tables}"
+            )
+        if schema_version < HIDDEN_KEY_SCHEMA_VERSION and HIDDEN_KEY_TABLE in existing:
+            raise RuntimeError(
+                f"{HIDDEN_KEY_TABLE} exists before its schema v{HIDDEN_KEY_SCHEMA_VERSION} migration"
+            )
+        counts = {
+            table: int(con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            for table in expected_tables
+        }
         return {
             "quickCheck": quick,
             "integrityCheck": integrity,
@@ -274,7 +305,215 @@ def validate_review_pilot_policy(raw: bytes) -> dict[str, object]:
         normalized_names.append("".join(char.lower() if "A" <= char <= "Z" else char for char in name))
     if normalized_names[0] == normalized_names[1]:
         raise RuntimeError(f"{REVIEW_PILOT_FILE} reviewer names must be distinct")
+    if set(normalized_names) != {"hawzhin", "pavel"}:
+        raise RuntimeError(f"{REVIEW_PILOT_FILE} must name exactly Hawzhin and Pavel")
     return value
+
+
+def _ascii_lower(value: str) -> str:
+    return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in value)
+
+
+def review_pilot_policy_sha256(policy: dict[str, object]) -> str:
+    """Mirror Rust ``ReviewPilotPolicy::policy_sha256`` exactly."""
+
+    reviewers = {
+        str(entry["name"]).strip(): int(entry["max_corpus_actions"])
+        for entry in policy["reviewers"]  # type: ignore[union-attr]
+    }
+    return hidden_policy_sha256(
+        HiddenReviewPilotPolicy(
+            after_review_event_id=int(policy["after_review_event_id"]),
+            max_total_corpus_actions=int(policy["max_total_corpus_actions"]),
+            reviewer_caps=reviewers,
+        )
+    )
+
+
+def validate_hidden_key_policy_binding(
+    con: sqlite3.Connection,
+    schema_version: int,
+    policy: dict[str, object] | None,
+) -> None:
+    """Validate append-only v59 history and bind only the active pilot namespace."""
+
+    existing = {
+        str(row[0])
+        for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if schema_version < HIDDEN_KEY_SCHEMA_VERSION:
+        if HIDDEN_KEY_TABLE in existing:
+            raise RuntimeError(
+                f"{HIDDEN_KEY_TABLE} exists before its schema v{HIDDEN_KEY_SCHEMA_VERSION} migration"
+            )
+        if policy is not None:
+            raise RuntimeError(
+                f"policy-bearing schema v{schema_version} snapshot predates durable hidden-key "
+                f"authority v{HIDDEN_KEY_SCHEMA_VERSION}; create only an explicit archival migration pin"
+            )
+        return
+    if HIDDEN_KEY_TABLE not in existing:
+        raise RuntimeError(
+            f"schema v{schema_version} is missing required {HIDDEN_KEY_TABLE} authority"
+        )
+
+    table = con.execute(
+        "SELECT type, tbl_name, sql FROM sqlite_master WHERE name=?",
+        (HIDDEN_KEY_TABLE,),
+    ).fetchone()
+    if (
+        table is None
+        or str(table[0]) != "table"
+        or str(table[1]) != HIDDEN_KEY_TABLE
+        or normalized_sql(str(table[2] or "")) != normalized_sql(HIDDEN_TABLE_SQL)
+    ):
+        raise RuntimeError(
+            f"{HIDDEN_KEY_TABLE} does not exactly match the schema v59 authority contract"
+        )
+    actual_triggers = {
+        str(row[0]): str(row[1] or "")
+        for row in con.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+            (HIDDEN_KEY_TABLE,),
+        )
+    }
+    missing_triggers = sorted(set(HIDDEN_TRIGGER_SQL) - set(actual_triggers))
+    unexpected_triggers = sorted(set(actual_triggers) - set(HIDDEN_TRIGGER_SQL))
+    mismatched_triggers = sorted(
+        name
+        for name in set(HIDDEN_TRIGGER_SQL) & set(actual_triggers)
+        if normalized_sql(actual_triggers[name]) != normalized_sql(HIDDEN_TRIGGER_SQL[name])
+    )
+    if missing_triggers or unexpected_triggers or mismatched_triggers:
+        raise RuntimeError(
+            f"{HIDDEN_KEY_TABLE} trigger contract is invalid "
+            f"(missing={missing_triggers}, unexpected={unexpected_triggers}, "
+            f"mismatched={mismatched_triggers})"
+        )
+
+    rows = list(
+        con.execute(
+            f'SELECT policy_sha256, after_review_event_id, reviewer, segment_id '
+            f'FROM "{HIDDEN_KEY_TABLE}" ORDER BY policy_sha256, after_review_event_id, reviewer, segment_id'
+        )
+    )
+    expected_sha = review_pilot_policy_sha256(policy) if policy is not None else None
+    expected_baseline = int(policy["after_review_event_id"]) if policy is not None else None
+    authorized = (
+        {
+            _ascii_lower(str(entry["name"]).strip())
+            for entry in policy["reviewers"]  # type: ignore[union-attr]
+        }
+        if policy is not None
+        else set()
+    )
+    namespace_counts: dict[tuple[str, int], int] = {}
+    reviewer_counts: dict[tuple[str, int, str], int] = {}
+    active_grants: set[tuple[str, str]] = set()
+    for policy_sha, baseline, reviewer, segment_id in rows:
+        if (
+            not isinstance(policy_sha, str)
+            or len(policy_sha) != 64
+            or any(char not in "0123456789abcdef" for char in policy_sha)
+        ):
+            raise RuntimeError(f"{HIDDEN_KEY_TABLE} contains a non-canonical policy SHA-256")
+        if type(baseline) is not int or baseline < 0:
+            raise RuntimeError(f"{HIDDEN_KEY_TABLE} contains an invalid policy baseline")
+        if (
+            not isinstance(reviewer, str)
+            or reviewer != reviewer.strip()
+            or not 1 <= len(reviewer) <= 40
+        ):
+            raise RuntimeError(f"{HIDDEN_KEY_TABLE} contains an invalid reviewer")
+        canonical_reviewer = _ascii_lower(reviewer)
+        if (
+            not isinstance(segment_id, str)
+            or segment_id != segment_id.strip()
+            or not 1 <= len(segment_id.encode("utf-8")) <= 256
+            or not all(char.isalnum() or char in "_-." for char in segment_id)
+        ):
+            raise RuntimeError(f"{HIDDEN_KEY_TABLE} contains an invalid segment id")
+
+        namespace = (policy_sha, baseline)
+        reviewer_namespace = (policy_sha, baseline, canonical_reviewer)
+        namespace_counts[namespace] = namespace_counts.get(namespace, 0) + 1
+        reviewer_counts[reviewer_namespace] = reviewer_counts.get(reviewer_namespace, 0) + 1
+
+        if policy is not None:
+            same_sha = policy_sha == expected_sha
+            same_baseline = baseline == expected_baseline
+            if same_sha != same_baseline:
+                raise RuntimeError(
+                    f"{HIDDEN_KEY_TABLE} grant disagrees with the active policy SHA/baseline namespace"
+                )
+            if same_sha and canonical_reviewer not in authorized:
+                raise RuntimeError(
+                    f"{HIDDEN_KEY_TABLE} contains unauthorized reviewer {reviewer!r} in the active namespace"
+                )
+            if same_sha:
+                active_grants.add((canonical_reviewer, segment_id))
+
+    reviewer_overages = sorted(
+        key for key, count in reviewer_counts.items() if count > HIDDEN_KEYS_PER_REVIEWER
+    )
+    if reviewer_overages:
+        raise RuntimeError(
+            f"{HIDDEN_KEY_TABLE} exceeds the {HIDDEN_KEYS_PER_REVIEWER}-grant reviewer namespace cap: "
+            f"{reviewer_overages}"
+        )
+    namespace_overages = sorted(
+        key for key, count in namespace_counts.items() if count > TOTAL_HIDDEN_KEYS
+    )
+    if namespace_overages:
+        raise RuntimeError(
+            f"{HIDDEN_KEY_TABLE} exceeds the {TOTAL_HIDDEN_KEYS}-grant policy namespace cap: "
+            f"{namespace_overages}"
+        )
+
+    if policy is not None:
+        completed: set[tuple[str, str]] = set()
+        for event_id, segment_id, reviewer, action in con.execute(
+            """SELECT id, segment_id, reviewer, action FROM review_events
+                 WHERE id > ? AND source = 'couch_spot_check' ORDER BY id""",
+            (expected_baseline,),
+        ):
+            canonical_reviewer = _ascii_lower(str(reviewer).strip())
+            if canonical_reviewer not in authorized:
+                raise RuntimeError(
+                    f"post-baseline hidden event {event_id} has unauthorized reviewer {reviewer!r}"
+                )
+            if (
+                not isinstance(segment_id, str)
+                or segment_id != segment_id.strip()
+                or not 1 <= len(segment_id.encode("utf-8")) <= 256
+                or not all(char.isalnum() or char in "_-." for char in segment_id)
+            ):
+                raise RuntimeError(f"post-baseline hidden event {event_id} has an invalid segment id")
+            if action not in {"accept", "edit", "reject", "skip"}:
+                raise RuntimeError(f"post-baseline hidden event {event_id} has invalid action {action!r}")
+            key = (canonical_reviewer, segment_id)
+            if key not in active_grants:
+                raise RuntimeError(
+                    f"post-baseline hidden event {event_id} has no durable active-policy grant"
+                )
+            if key in completed:
+                raise RuntimeError(
+                    f"post-baseline hidden key {reviewer}/{segment_id} has multiple completion events"
+                )
+            completed.add(key)
+            observed = [
+                str(row[0])
+                for row in con.execute(
+                    """SELECT action FROM spot_checks
+                         WHERE segment_id = ? AND reviewer = ? COLLATE NOCASE""",
+                    (segment_id, reviewer),
+                )
+            ]
+            if observed != [action]:
+                raise RuntimeError(
+                    f"post-baseline hidden event {event_id} result mismatch: "
+                    f"event={action!r}, results={observed!r}"
+                )
 
 
 def capture_review_pilot_state(data_dir: Path, staging: Path) -> None:
@@ -289,6 +528,90 @@ def capture_review_pilot_state(data_dir: Path, staging: Path) -> None:
     validate_review_pilot_policy(raw)
     verify_controlled_pilot_focus(data_dir)
     (staging / REVIEW_PILOT_FILE).write_bytes(raw)
+
+
+def validate_live_session_hidden_cache(
+    data_dir: Path,
+    source_db: Path,
+    snapshot_db: Path,
+    policy: dict[str, object] | None,
+) -> None:
+    """Prove that any live session cache is only a subset of the snapshotted DB authority."""
+
+    session_path = data_dir / "couch_session.json"
+    if not session_path.exists() or policy is None:
+        return
+    session = _load_strict_json(session_path, "couch_session.json")
+    if not isinstance(session, dict):
+        raise RuntimeError("couch_session.json root must be an object")
+    recorded_db = session.get("db_path")
+    if (
+        not isinstance(recorded_db, str)
+        or os.path.normcase(os.path.abspath(recorded_db))
+        != os.path.normcase(os.path.abspath(source_db))
+    ):
+        raise RuntimeError("couch_session.json belongs to a different database")
+    remembered = session.get("pilot_policy")
+    if not isinstance(remembered, dict):
+        raise RuntimeError("couch_session.json is not bound to the active pilot policy")
+    remembered_policy = validate_review_pilot_policy(
+        (json.dumps(remembered, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    if (
+        review_pilot_policy_sha256(remembered_policy)
+        != review_pilot_policy_sha256(policy)
+    ):
+        raise RuntimeError("couch_session.json is bound to a different pilot policy")
+    pairing = session.get("reviewers")
+    if not isinstance(pairing, dict):
+        raise RuntimeError("couch_session.json has invalid reviewer pairing state")
+    paired = [
+        _ascii_lower(name.strip())
+        for name in pairing.values()
+        if isinstance(name, str) and _ascii_lower(name.strip()) in {"hawzhin", "pavel"}
+    ]
+    if sorted(paired) != ["hawzhin", "pavel"]:
+        raise RuntimeError("couch_session.json reviewer roster is not exactly Hawzhin and Pavel")
+    entries = session.get("pilot_spot_checks", [])
+    if not isinstance(entries, list):
+        raise RuntimeError("couch_session.json has invalid pilot_spot_checks state")
+
+    digest = review_pilot_policy_sha256(policy)
+    baseline = int(policy["after_review_event_id"])
+    con = open_readonly(snapshot_db, immutable=True)
+    try:
+        grants = {
+            (_ascii_lower(str(reviewer).strip()), str(segment_id))
+            for reviewer, segment_id in con.execute(
+                f"""SELECT reviewer, segment_id FROM {HIDDEN_KEY_TABLE}
+                     WHERE policy_sha256 = ? AND after_review_event_id = ?""",
+                (digest, baseline),
+            )
+        }
+    finally:
+        con.close()
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise RuntimeError("couch_session.json has an invalid pilot_spot_checks entry")
+        segment_id, reviewer = entry
+        canonical_reviewer = _ascii_lower(reviewer.strip()) if isinstance(reviewer, str) else ""
+        if (
+            not isinstance(segment_id, str)
+            or segment_id != segment_id.strip()
+            or not 1 <= len(segment_id.encode("utf-8")) <= 256
+            or not all(char.isalnum() or char in "_-." for char in segment_id)
+            or canonical_reviewer not in {"hawzhin", "pavel"}
+        ):
+            raise RuntimeError("couch_session.json has a non-canonical pilot hidden key")
+        key = (canonical_reviewer, segment_id)
+        if key in seen:
+            raise RuntimeError(f"couch_session.json duplicates pilot hidden key {key}")
+        if key not in grants:
+            raise RuntimeError(
+                f"couch_session.json pilot hidden key {reviewer}/{segment_id} has no durable grant"
+            )
+        seen.add(key)
 
 
 def capture_optional_state(data_dir: Path, staging: Path) -> None:
@@ -335,26 +658,41 @@ def verify_review_pilot_state(tree: Path) -> None:
         raise RuntimeError(
             f"snapshot must contain exactly one of {REVIEW_PILOT_FILE} or {REVIEW_PILOT_ABSENT_FILE}"
         )
+    parsed: dict[str, object] | None = None
     if policy_present:
         if policy.is_symlink() or not policy.is_file():
             raise RuntimeError(f"snapshot {REVIEW_PILOT_FILE} is not a regular file")
         parsed = validate_review_pilot_policy(policy.read_bytes())
         verify_controlled_pilot_focus(tree)
-        con = open_readonly(tree / DB_FILE, immutable=True)
-        try:
-            max_event_id = int(con.execute("SELECT COALESCE(MAX(id), 0) FROM review_events").fetchone()[0])
-        finally:
-            con.close()
-        if parsed["after_review_event_id"] > max_event_id:
-            raise RuntimeError(
-                "snapshot pilot baseline is ahead of its database review-event maximum: "
-                f"{parsed['after_review_event_id']} > {max_event_id}"
-            )
     else:
         if absent.is_symlink() or not absent.is_file():
             raise RuntimeError(f"snapshot {REVIEW_PILOT_ABSENT_FILE} is not a regular file")
         if absent.read_bytes() != REVIEW_PILOT_ABSENT_BYTES:
             raise RuntimeError(f"snapshot {REVIEW_PILOT_ABSENT_FILE} has invalid contents")
+
+    con = open_readonly(tree / DB_FILE, immutable=True)
+    try:
+        migration_history = tuple(
+            (int(version), str(description))
+            for version, description in con.execute(
+                "SELECT version, description FROM schema_migrations ORDER BY version"
+            )
+        )
+        schema_version = validate_migration_history(migration_history)
+        validate_hidden_key_policy_binding(con, schema_version, parsed)
+        if parsed is not None:
+            max_event_id = int(
+                con.execute("SELECT COALESCE(MAX(id), 0) FROM review_events").fetchone()[0]
+            )
+            if parsed["after_review_event_id"] > max_event_id:
+                raise RuntimeError(
+                    "snapshot pilot baseline is ahead of its database review-event maximum: "
+                    f"{parsed['after_review_event_id']} > {max_event_id}"
+                )
+    except sqlite3.Error as error:
+        raise RuntimeError(f"snapshot hidden-key authority cannot be verified: {error}") from error
+    finally:
+        con.close()
 
 
 def inventory(directory: Path) -> list[dict[str, object]]:
@@ -474,9 +812,13 @@ def validate_manifest_tree(tree: Path) -> dict[str, object]:
     _require_nonnegative_int(
         evidence["foreignKeyViolationCount"], "manifest databaseEvidence.foreignKeyViolationCount"
     )
-    _require_nonnegative_int(evidence["schemaVersion"], "manifest databaseEvidence.schemaVersion")
+    schema_version = _require_nonnegative_int(
+        evidence["schemaVersion"], "manifest databaseEvidence.schemaVersion"
+    )
     counts = _require_exact_object(
-        evidence["rowCounts"], set(COUNT_TABLES), "manifest databaseEvidence.rowCounts"
+        evidence["rowCounts"],
+        set(evidence_tables_for_schema(schema_version)),
+        "manifest databaseEvidence.rowCounts",
     )
     for table, count in counts.items():
         _require_nonnegative_int(count, f"manifest databaseEvidence.rowCounts.{table}")
@@ -637,6 +979,17 @@ def _promote_snapshot_locked(
     try:
         online_backup(source_db, staging / DB_FILE)
         copy_state(data_dir, staging)
+        captured_policy = (
+            validate_review_pilot_policy((staging / REVIEW_PILOT_FILE).read_bytes())
+            if (staging / REVIEW_PILOT_FILE).is_file()
+            else None
+        )
+        # The session is intentionally not copied (it holds live credentials), but any remembered
+        # assignment is irreplaceable authorization state.  Its keys must already exist in the
+        # snapshotted v59 authority before this recovery artifact can be promoted.
+        validate_live_session_hidden_cache(
+            data_dir, source_db, staging / DB_FILE, captured_policy
+        )
         write_manifest(
             staging,
             created_at=epoch,

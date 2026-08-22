@@ -3,9 +3,9 @@
 
 This gate reads the migrated live database and active voice focus without modifying either.  It
 proves the authorized policy constants, one ledger consequence per post-cutoff review event,
-append-only triggers, signed re-decision/reversal arithmetic, and canonical audio identity for every
-focused clip.  It deliberately fails on schema v56: the old executable must never be called ready for
-paid review merely because the source tree contains v57 code.
+append-only triggers, durable schema-v59 hidden-key grants, the 24-action pilot ceiling, signed
+re-decision/reversal arithmetic, and canonical audio identity for every focused clip.  A pre-v59
+database cannot be called ready merely because the source tree contains the new release code.
 """
 
 from __future__ import annotations
@@ -18,6 +18,15 @@ import sys
 import uuid
 from pathlib import Path
 from typing import Any
+
+from review_pilot_hidden_contract import (
+    POLICY_FILE as REVIEW_PILOT_FILE,
+    REQUIRED_SCHEMA as REVIEW_PILOT_REQUIRED_SCHEMA,
+    PilotContractError,
+    audit_active_hidden_state,
+    audit_hidden_schema,
+    read_policy,
+)
 
 
 POLICY_VERSION = "review-iqd-v1-2026-08-21"
@@ -107,6 +116,11 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
     evidence["focusIds"] = len(focus_ids)
 
     try:
+        pilot_policy = read_policy(db_path.parent / REVIEW_PILOT_FILE)
+    except PilotContractError as error:
+        return {**evidence, "ok": False, "errors": [f"controlled-review policy is invalid: {error}"]}
+
+    try:
         connection = _connect_read_only(db_path)
     except sqlite3.Error as error:
         return {**evidence, "ok": False, "errors": [f"cannot open database read-only: {error}"]}
@@ -119,9 +133,36 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
         except sqlite3.Error:
             schema_version = 0
         evidence["schemaVersion"] = schema_version
-        if schema_version < 57:
-            errors.append(f"schema {schema_version} is older than compensation migration 57")
+        if schema_version < REVIEW_PILOT_REQUIRED_SCHEMA:
+            errors.append(
+                f"schema {schema_version} is older than durable pilot migration {REVIEW_PILOT_REQUIRED_SCHEMA}"
+            )
             return {**evidence, "ok": False, "errors": errors}
+
+        hidden_schema_evidence, hidden_schema_errors = audit_hidden_schema(connection)
+        evidence.update(hidden_schema_evidence)
+        errors.extend(hidden_schema_errors)
+        if hidden_schema_errors:
+            return {**evidence, "ok": False, "errors": errors}
+        try:
+            hidden_state = audit_active_hidden_state(connection, db_path.parent, db_path, pilot_policy)
+        except PilotContractError as error:
+            errors.append(f"controlled-review hidden-key state is invalid: {error}")
+            return {**evidence, "ok": False, "errors": errors}
+        evidence.update(
+            {
+                "pilotPolicySha256": hidden_state.policy_sha256,
+                "pilotCorpusActions": hidden_state.total_corpus_actions,
+                "pilotHiddenActions": hidden_state.total_hidden_actions,
+                "pilotUiActions": hidden_state.total_ui_actions,
+                "pilotHiddenGrants": sum(len(ids) for ids in hidden_state.grants.values()),
+                "pilotHiddenResolved": sum(
+                    len(hidden_state.completed_keys[name] | hidden_state.skipped_keys[name])
+                    for name in hidden_state.grants
+                ),
+                "pilotHiddenUnresolved": sum(len(ids) for ids in hidden_state.unresolved_keys.values()),
+            }
+        )
 
         policy_rows = connection.execute(
             """SELECT effective_after_event_id, base_rate_micro_iqd_per_hour,

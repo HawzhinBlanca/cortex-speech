@@ -19,6 +19,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from review_pilot_hidden_contract import REQUIRED_SCHEMA as PILOT_HIDDEN_SCHEMA, audit_hidden_schema
+
 
 DEFAULT_MIGRATIONS = Path(__file__).resolve().parent.parent / "src-tauri" / "src" / "migrations" / "mod.rs"
 V58_PRODUCTION_ARCHIVE_ROWS = 2_104
@@ -316,6 +318,10 @@ def audit(
                     expected_v58_digest,
                     expected_v58_full_tuple_digest,
                 )
+            if schema_version >= PILOT_HIDDEN_SCHEMA:
+                hidden_evidence, hidden_errors = audit_hidden_schema(connection)
+                result.update(hidden_evidence)
+                errors.extend(hidden_errors)
         except (OSError, ValueError) as error:
             errors.append(f"latest source migration cannot be resolved: {error}")
         except sqlite3.Error as error:

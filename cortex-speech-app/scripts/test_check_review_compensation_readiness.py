@@ -10,6 +10,9 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("check_review_compensation_readiness.py")
 VERIFY_10 = SCRIPT.parents[2] / "scripts" / "verify_10.py"
+sys.path.insert(0, str(SCRIPT.parent))
+
+from review_pilot_hidden_contract import HIDDEN_SCHEMA_SQL, policy_sha256, read_policy  # noqa: E402
 
 
 def load_gate_module():
@@ -28,12 +31,35 @@ class CompensationReadinessGateTests(unittest.TestCase):
         self.db = self.root / "cortex-speech.db"
         self.focus = self.root / "voice_focus.json"
         self.focus.write_text(json.dumps({"segment_ids": ["s1"]}), encoding="utf-8")
+        self.pilot_policy = {
+            "schema_version": 1,
+            "after_review_event_id": 0,
+            "max_total_corpus_actions": 20,
+            "reviewers": [
+                {"name": "Hawzhin", "max_corpus_actions": 10},
+                {"name": "Pavel", "max_corpus_actions": 10},
+            ],
+        }
+        (self.root / "review_pilot_policy.json").write_text(
+            json.dumps(self.pilot_policy), encoding="utf-8"
+        )
+        (self.root / "couch_session.json").write_text(
+            json.dumps(
+                {
+                    "db_path": str(self.db),
+                    "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                    "pilot_policy": self.pilot_policy,
+                    "pilot_spot_checks": [],
+                }
+            ),
+            encoding="utf-8",
+        )
         connection = sqlite3.connect(self.db)
         connection.executescript(
             """
             PRAGMA foreign_keys = ON;
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT);
-            INSERT INTO schema_migrations VALUES (57, 'compensation fixture');
+            INSERT INTO schema_migrations VALUES (59, 'compensation + durable pilot fixture');
             CREATE TABLE speech_segments (
                 id TEXT PRIMARY KEY, audio_content_hash TEXT, alignment_json TEXT, duration_ms INTEGER
             );
@@ -42,6 +68,7 @@ class CompensationReadinessGateTests(unittest.TestCase):
                 compensation_action TEXT, source TEXT, duration_ms INTEGER,
                 operation_id TEXT, operation_payload_hash TEXT
             );
+            CREATE TABLE spot_checks (segment_id TEXT, reviewer TEXT, action TEXT);
             CREATE TABLE review_compensation_policies (
                 policy_version TEXT PRIMARY KEY, effective_after_event_id INTEGER,
                 base_rate_micro_iqd_per_hour INTEGER, edit_basis_points INTEGER,
@@ -90,15 +117,16 @@ class CompensationReadinessGateTests(unittest.TestCase):
             INSERT INTO review_compensation_policies VALUES
               ('review-iqd-v1-2026-08-21', 0, 18000000000, 10000, 1000, 1000, 0);
             INSERT INTO review_events VALUES
-              (1, 's1', 'Sara', 'edit', 'edit', 'couch', 1000,
+              (1, 's1', 'Hawzhin', 'edit', 'edit', 'couch', 1000,
                '11111111-1111-4111-8111-111111111111',
                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
             INSERT INTO review_compensation_ledger VALUES
               (1, 'entry-1', 'review-iqd-v1-2026-08-21', 1, 'work-1',
-               'audio_content_hash+source_span', 'Sara', 's1', 'edit', 'edit', 1000,
+               'audio_content_hash+source_span', 'Hawzhin', 's1', 'edit', 'edit', 1000,
                10000, 5000000, 5000000, 1000, 1000, NULL);
             """
         )
+        connection.executescript(HIDDEN_SCHEMA_SQL)
         connection.commit()
         connection.close()
 
@@ -121,6 +149,121 @@ class CompensationReadinessGateTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["totalEarnedMicroIqd"], 5_000_000)
         self.assertEqual(report["correctedAudioMs"], 1000)
+        self.assertEqual(report["schemaVersion"], 59)
+        self.assertEqual(report["pilotCorpusActions"], 1)
+        self.assertEqual(report["pilotHiddenActions"], 0)
+        self.assertEqual(report["pilotUiActions"], 1)
+        self.assertEqual(report["pilotHiddenGrants"], 0)
+
+    def test_session_hidden_key_must_be_a_subset_of_durable_grants(self):
+        session_path = self.root / "couch_session.json"
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["pilot_spot_checks"] = [["unreserved", "Hawzhin"]]
+        session_path.write_text(json.dumps(session), encoding="utf-8")
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("unreserved key" in error for error in report["errors"]), report)
+
+    def test_session_reviewer_roster_must_exactly_match_the_policy(self):
+        session_path = self.root / "couch_session.json"
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["reviewers"] = {"token-h": "Hawzhin", "token-r": "Rubar"}
+        session_path.write_text(json.dumps(session), encoding="utf-8")
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("unauthorized reviewer" in error for error in report["errors"]), report)
+
+    def test_post_baseline_hidden_result_requires_the_exact_durable_grant(self):
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            """INSERT INTO review_events VALUES
+               (2, 's1', 'Hawzhin', 'accept', 'accept', 'couch_spot_check', 1000,
+                '22222222-2222-4222-8222-222222222222', ?)""",
+            ("b" * 64,),
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("no active durable reservation" in error for error in report["errors"]), report)
+
+    def test_hidden_event_and_spot_result_must_exist_together_and_agree(self):
+        digest = policy_sha256(read_policy(self.root / "review_pilot_policy.json"))
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Hawzhin', 'hidden-a')",
+            (digest,),
+        )
+        connection.execute(
+            """INSERT INTO review_events VALUES
+               (2, 'hidden-a', 'Hawzhin', 'accept', 'accept', 'couch_spot_check', 1000,
+                '22222222-2222-4222-8222-222222222222', ?)""",
+            ("b" * 64,),
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("event/result mismatch" in error for error in report["errors"]), report)
+
+    def test_per_reviewer_cap_fails_before_total_ui_actions_can_exceed_24(self):
+        connection = sqlite3.connect(self.db)
+        connection.executemany(
+            """INSERT INTO review_events VALUES
+               (?, ?, 'Hawzhin', 'skip', 'skip', 'couch', 1000, ?, ?)""",
+            [
+                (
+                    event_id,
+                    f"work-{event_id}",
+                    f"{event_id:08x}-0000-4000-8000-{event_id:012x}",
+                    f"{event_id:064x}",
+                )
+                for event_id in range(2, 12)
+            ],
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("10-action cap" in error for error in report["errors"]), report)
+
+    def test_active_policy_sha_and_baseline_must_match_every_active_namespace_row(self):
+        digest = policy_sha256(read_policy(self.root / "review_pilot_policy.json"))
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 1, 'Hawzhin', 'hidden-a')",
+            (digest,),
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("SHA/baseline" in error for error in report["errors"]), report)
+
+    def test_active_baseline_cannot_use_a_noncanonical_policy_sha(self):
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Hawzhin', 'hidden-a')",
+            ("f" * 64,),
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("SHA/baseline" in error for error in report["errors"]), report)
+
+    def test_reserved_hidden_key_cannot_be_finalized_through_the_corpus_path(self):
+        digest = policy_sha256(read_policy(self.root / "review_pilot_policy.json"))
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES (?, 0, 'Hawzhin', 's1')",
+            (digest,),
+        )
+        connection.commit()
+        connection.close()
+        code, report = self.run_gate()
+        self.assertEqual(code, 1, report)
+        self.assertTrue(any("finalized through the corpus path" in error for error in report["errors"]), report)
 
     def test_read_connection_pins_one_explicit_snapshot(self):
         gate = load_gate_module()

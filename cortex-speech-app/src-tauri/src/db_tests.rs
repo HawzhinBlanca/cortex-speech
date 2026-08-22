@@ -2711,7 +2711,7 @@ fn restore_stages_pending_migrations_and_foreign_keys_before_overwriting_live_da
     {
         let candidate = Database::open(migration_fail_path.to_str().unwrap()).unwrap();
         candidate.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&candidate, 1).unwrap(), vec![58]);
+        assert_eq!(crate::migrations::rollback(&candidate, 2).unwrap(), vec![59, 58]);
         candidate
             .connection()
             .execute_batch(
@@ -2809,7 +2809,13 @@ fn restore_of_an_older_snapshot_migrates_it_forward_to_head() {
         // explicitly in the pre-v37 schema synthesis below, alongside the older rename migrations.
         let post_v56 = crate::migrations::MIGRATIONS.iter().filter(|migration| migration.version > 56).count();
         let reverted = crate::migrations::rollback(&old, post_v56).unwrap();
-        assert_eq!(reverted, vec![58, 57]);
+        let expected_reverted: Vec<i64> = crate::migrations::MIGRATIONS
+            .iter()
+            .rev()
+            .filter(|migration| migration.version > 56)
+            .map(|migration| migration.version)
+            .collect();
+        assert_eq!(reverted, expected_reverted);
         assert_eq!(crate::migrations::get_current_version(&old).unwrap(), 56);
         old.connection()
             .execute_batch(&format!(
@@ -4723,6 +4729,256 @@ fn controlled_review_cap_serializes_the_last_slot_across_database_connections() 
     let db = Database::open(&path_text).unwrap();
     let events: i64 = db.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
     assert_eq!(events, 1);
+}
+
+#[test]
+fn pilot_hidden_keys_are_policy_bound_idempotent_quota_limited_and_immutable() {
+    let db = make_db();
+    let policy = "a".repeat(64);
+    let other_policy = "b".repeat(64);
+    let first = vec!["pilot-hidden-b".to_string(), "pilot-hidden-a".to_string(), "pilot-hidden-a".to_string()];
+    assert_eq!(
+        db.reserve_review_pilot_hidden_keys(&policy, 0, "  Sara  ", &first, 2).unwrap(),
+        vec!["pilot-hidden-a", "pilot-hidden-b"]
+    );
+    assert_eq!(db.review_pilot_hidden_keys(&policy, 0, "sARA").unwrap(), vec!["pilot-hidden-a", "pilot-hidden-b"]);
+    assert_eq!(
+        db.reserve_review_pilot_hidden_keys(&policy, 0, "SARA", &first, 2).unwrap(),
+        vec!["pilot-hidden-a", "pilot-hidden-b"],
+        "a lost-response retry must return the complete durable set"
+    );
+    assert!(db
+        .reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &["pilot-hidden-c".into()], 2)
+        .unwrap_err()
+        .to_string()
+        .contains("reviewer quota"));
+    assert_eq!(db.review_pilot_hidden_keys(&policy, 0, "Sara").unwrap().len(), 2);
+
+    // Once any grant binds a baseline, a policy-file replacement cannot mint a fresh budget there.
+    let rebound = db
+        .reserve_review_pilot_hidden_keys(&other_policy, 0, "Sara", &["other-policy-key".into()], 2)
+        .unwrap_err()
+        .to_string();
+    assert!(rebound.contains("another policy identity"), "unexpected policy binding error: {rebound}");
+    assert!(db.review_pilot_hidden_keys(&other_policy, 0, "Sara").unwrap().is_empty());
+
+    for invalid in [
+        db.reserve_review_pilot_hidden_keys("BAD", 0, "Sara", &[], 2),
+        db.reserve_review_pilot_hidden_keys(&policy, -1, "Sara", &[], 2),
+        db.reserve_review_pilot_hidden_keys(&policy, 0, " ", &[], 2),
+        db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &[], 1),
+        db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &["../bad".into()], 2),
+    ] {
+        assert!(matches!(invalid, Err(AppError::Validation(_))));
+    }
+
+    // Duplicate SQL retries are no-ops, while any semantic mutation is physically refused.
+    assert_eq!(
+        db.connection()
+            .execute(
+                "INSERT OR IGNORE INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 0, 'sara', 'pilot-hidden-a')",
+                [&policy],
+            )
+            .unwrap(),
+        0
+    );
+    let update = db
+        .connection()
+        .execute(
+            "UPDATE review_pilot_hidden_keys SET segment_id='changed'
+              WHERE policy_sha256=?1 AND after_review_event_id=0 AND reviewer='Sara' AND segment_id='pilot-hidden-a'",
+            [&policy],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(update.contains("append-only"), "unexpected UPDATE guard: {update}");
+    let delete = db
+        .connection()
+        .execute("DELETE FROM review_pilot_hidden_keys WHERE policy_sha256=?1 AND after_review_event_id=0", [&policy])
+        .unwrap_err()
+        .to_string();
+    assert!(delete.contains("append-only"), "unexpected DELETE guard: {delete}");
+
+    db.reserve_review_pilot_hidden_keys(&policy, 0, "Hemn", &["hemn-a".into(), "hemn-b".into()], 2).unwrap();
+    let global =
+        db.reserve_review_pilot_hidden_keys(&policy, 0, "Ali", &["global-fifth".into()], 2).unwrap_err().to_string();
+    assert!(global.contains("global quota"), "unexpected global quota error: {global}");
+}
+
+#[test]
+fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
+    let db = make_db();
+    let policy = "c".repeat(64);
+    for id in ["pilot-result", "pilot-skip", "pilot-unreserved"] {
+        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+    }
+    db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &["pilot-result".into(), "pilot-skip".into()], 2).unwrap();
+    assert!(!db.review_pilot_hidden_key_resolved(&policy, 0, "Sara", "pilot-result").unwrap());
+
+    let operation_id = "623e4567-e89b-42d3-a456-426614174001";
+    let payload_hash = "d".repeat(64);
+    for (candidate_policy, baseline, segment_id) in [
+        ("e".repeat(64), 0, "pilot-result"),
+        (policy.clone(), 1, "pilot-result"),
+        (policy.clone(), 0, "pilot-unreserved"),
+    ] {
+        let error = db
+            .record_pilot_spot_check_with_operation(
+                &candidate_policy,
+                baseline,
+                segment_id,
+                "Sara",
+                "edit",
+                "ڕاست",
+                "ڕاست",
+                operation_id,
+                &payload_hash,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no durable reservation"), "unexpected authorization error: {error}");
+    }
+    let empty_counts: (i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM spot_checks),
+                    (SELECT COUNT(*) FROM review_events),
+                    (SELECT COUNT(*) FROM review_compensation_ledger)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(empty_counts, (0, 0, 0), "authorization refusal must roll back every consequence");
+
+    db.record_pilot_spot_check_with_operation(
+        &policy,
+        0,
+        "pilot-result",
+        "sARA",
+        "edit",
+        "ڕاست",
+        "ڕاست",
+        operation_id,
+        &payload_hash,
+    )
+    .unwrap();
+    db.record_pilot_spot_check_with_operation(
+        &policy,
+        0,
+        "pilot-result",
+        "SARA",
+        "edit",
+        "ڕاست",
+        "ڕاست",
+        operation_id,
+        &payload_hash,
+    )
+    .unwrap();
+    let committed_counts: (i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM spot_checks WHERE segment_id='pilot-result'),
+                    (SELECT COUNT(*) FROM review_events WHERE segment_id='pilot-result'),
+                    (SELECT COUNT(*) FROM review_compensation_ledger WHERE segment_id='pilot-result')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(committed_counts, (1, 1, 1), "retry and case-only re-pair must commit exactly once");
+    assert!(db.review_pilot_hidden_key_resolved(&policy, 0, "Sara", "pilot-result").unwrap());
+
+    db.record_review_event_with_operation(
+        "pilot-skip",
+        "SARA",
+        "skip",
+        "couch",
+        2,
+        "623e4567-e89b-42d3-a456-426614174002",
+        &"e".repeat(64),
+    )
+    .unwrap();
+    assert!(db.review_pilot_hidden_key_resolved(&policy, 0, "Sara", "pilot-skip").unwrap());
+    assert!(!db.review_pilot_hidden_key_resolved(&policy, 0, "Sara", "pilot-unreserved").unwrap());
+}
+
+#[test]
+fn pilot_reservation_backfills_completed_v58_checks_before_minting_fresh_keys() {
+    let db = make_db();
+    let policy = "f".repeat(64);
+    for (index, id) in ["completed-hidden-a", "completed-hidden-b"].into_iter().enumerate() {
+        db.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
+        db.record_spot_check_with_operation(
+            id,
+            if index == 0 { "Sara" } else { "sARA" },
+            "edit",
+            "ڕاست",
+            "ڕاست",
+            &format!("723e4567-e89b-42d3-a456-42661417400{index}"),
+            &format!("{:064x}", index + 1),
+        )
+        .unwrap();
+    }
+
+    let error =
+        db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &["would-be-third".into()], 2).unwrap_err().to_string();
+    assert!(error.contains("reviewer quota"), "completed keys must consume the lifetime budget: {error}");
+    assert!(db.review_pilot_hidden_keys(&policy, 0, "Sara").unwrap().is_empty(), "failed union is atomic");
+    assert_eq!(
+        db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &[], 2).unwrap(),
+        vec!["completed-hidden-a", "completed-hidden-b"],
+        "the next safe call must durably backfill both completed session-era keys"
+    );
+}
+
+#[test]
+fn pilot_hidden_key_reservation_serializes_the_final_two_slots_across_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pilot-hidden-race.db");
+    let path_text = path.to_string_lossy().to_string();
+    let setup = Database::open(&path_text).unwrap();
+    setup.initialize().unwrap();
+    drop(setup);
+    let policy = "9".repeat(64);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let mut workers = Vec::new();
+    for id in ["race-hidden-a", "race-hidden-b", "race-hidden-c"] {
+        let barrier = barrier.clone();
+        let path_text = path_text.clone();
+        let policy = policy.clone();
+        workers.push(std::thread::spawn(move || {
+            let db = Database::open(&path_text).unwrap();
+            barrier.wait();
+            db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &[id.to_string()], 2)
+        }));
+    }
+    barrier.wait();
+    let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 2);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let db = Database::open(&path_text).unwrap();
+    assert_eq!(db.review_pilot_hidden_keys(&policy, 0, "Sara").unwrap().len(), 2);
+}
+
+#[test]
+fn schema_v58_upgrades_to_v59_without_reinterpreting_live_baseline_863() {
+    let db = make_db();
+    assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![59]);
+    db.connection()
+        .execute(
+            "INSERT INTO review_events
+                (id, segment_id, reviewer, action, compensation_action, source, timestamp_ms, duration_ms)
+             VALUES (863, 'legacy-before-pilot', 'Owner', 'accept', 'accept', 'legacy', 0, 0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59]);
+    let policy = "8".repeat(64);
+    assert_eq!(
+        db.reserve_review_pilot_hidden_keys(&policy, 863, "Sara", &["baseline-863-hidden".into()], 2).unwrap(),
+        vec!["baseline-863-hidden"]
+    );
 }
 
 #[test]

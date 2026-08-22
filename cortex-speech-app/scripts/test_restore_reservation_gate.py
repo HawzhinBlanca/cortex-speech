@@ -101,8 +101,12 @@ def test_restore_admission_is_exclusive_and_all_appstate_handles_delegate() -> N
 def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
     commands = _read("commands.rs")
     production = commands.split("#[cfg(test)]\nmod tests", 1)[0]
-    helper = _fn_body(commands, "fn restore_with_mandatory_snapshot(", span=1100)
-    stage = helper.find("Database::stage_restore_source(source)")
+    # Restore validation now includes the complete durable-history and semantic gates before the
+    # pin. Keep the scan wide enough to include the final publish call as that safety work grows.
+    helper = _fn_body(commands, "fn restore_with_mandatory_snapshot(", span=1800)
+    # Match the production call exactly.  The restore helper uses the fully-qualified path so this
+    # gate cannot silently pass against an unrelated `Database` import or a similarly named helper.
+    stage = helper.find("crate::db::Database::stage_restore_source(source)")
     snapshot = helper.find("take_mandatory_pre_restore_snapshot(reservation, db, data_dir)?")
     restore = helper.find("db.commit_staged_restore(&staged)")
     if -1 in (stage, snapshot, restore) or not (stage < snapshot < restore):

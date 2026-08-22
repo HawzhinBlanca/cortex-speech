@@ -77,6 +77,199 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+#[derive(serde::Deserialize)]
+struct SnapshotPilotSession {
+    db_path: String,
+    reviewers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pilot_spot_checks: Vec<(String, String)>,
+    pilot_policy: Option<crate::review_pilot::ReviewPilotPolicy>,
+}
+
+fn exact_pilot_reviewer(
+    policy: &crate::review_pilot::ReviewPilotPolicy,
+    actual: &str,
+    source: &str,
+) -> Result<String, String> {
+    policy
+        .reviewers
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(actual.trim()))
+        .map(|entry| entry.name.clone())
+        .ok_or_else(|| format!("{source} contains unauthorized reviewer {actual:?}"))
+}
+
+/// A policy-bearing v59 snapshot is restorable only when SQLite already owns every hidden key that
+/// has escaped into a session or completion event. Zero is valid before traffic; missing history is
+/// not. The whole current-schema fingerprint is checked here so a dropped/changed authority trigger
+/// cannot be hidden by an otherwise healthy backup.
+fn validate_active_pilot_snapshot_authority(
+    connection: &rusqlite::Connection,
+    live_data_dir: Option<&Path>,
+    live_db_path: Option<&Path>,
+    policy: &crate::review_pilot::ReviewPilotPolicy,
+) -> Result<(), String> {
+    let schema_version: i64 = connection
+        .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))
+        .map_err(|error| format!("snapshot hidden-key schema version cannot be read: {error}"))?;
+    if schema_version < crate::review_pilot::REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION {
+        // The dedicated pre-migration pin is intentionally archival. Production named restore and
+        // the external drill reject policy-bearing pre-v59 artifacts.
+        return Ok(());
+    }
+    crate::db::validate_current_schema_contract(connection)
+        .map_err(|error| format!("snapshot hidden-key schema contract is not exact: {error}"))?;
+
+    let names = policy.reviewer_names();
+    if names.len() != 2
+        || !names.iter().any(|name| name.eq_ignore_ascii_case("Hawzhin"))
+        || !names.iter().any(|name| name.eq_ignore_ascii_case("Pavel"))
+    {
+        return Err("snapshot pilot roster must be exactly Hawzhin and Pavel".to_string());
+    }
+    let digest = policy.policy_sha256()?;
+    let baseline = policy.after_review_event_id;
+    let maximum: i64 = connection
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
+        .map_err(|error| format!("snapshot pilot review history cannot be read: {error}"))?;
+    if baseline > maximum {
+        return Err(format!("snapshot pilot baseline {baseline} is ahead of review-event maximum {maximum}"));
+    }
+    let conflicting: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM review_pilot_hidden_keys
+              WHERE (policy_sha256 = ?1 OR after_review_event_id = ?2)
+                AND NOT (policy_sha256 = ?1 AND after_review_event_id = ?2)",
+            rusqlite::params![digest, baseline],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("snapshot hidden-key namespace cannot be verified: {error}"))?;
+    if conflicting != 0 {
+        return Err(format!(
+            "snapshot has {conflicting} hidden-key grant(s) that disagree with the active policy SHA/baseline"
+        ));
+    }
+
+    let mut grants: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut reviewer_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT reviewer, segment_id FROM review_pilot_hidden_keys
+              WHERE policy_sha256 = ?1 AND after_review_event_id = ?2
+              ORDER BY reviewer COLLATE NOCASE, segment_id",
+        )
+        .map_err(|error| format!("snapshot hidden-key grants cannot be read: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![digest, baseline], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| format!("snapshot hidden-key grants cannot be read: {error}"))?;
+    for row in rows {
+        let (actual_reviewer, segment_id) =
+            row.map_err(|error| format!("snapshot hidden-key grant is unreadable: {error}"))?;
+        let reviewer = exact_pilot_reviewer(policy, &actual_reviewer, "durable hidden-key authority")?;
+        crate::validation::input::validate_identifier(&segment_id)
+            .map_err(|error| format!("durable hidden-key authority has invalid segment {segment_id:?}: {error}"))?;
+        let key = (reviewer.to_ascii_lowercase(), segment_id);
+        if !grants.insert(key.clone()) {
+            return Err(format!("snapshot hidden-key authority duplicates {}/{}", key.0, key.1));
+        }
+        *reviewer_counts.entry(key.0).or_default() += 1;
+    }
+    let per_reviewer = usize::try_from(crate::review_pilot::REVIEW_PILOT_HIDDEN_QC_PER_REVIEWER)
+        .map_err(|_| "snapshot hidden-key reviewer quota is invalid".to_string())?;
+    let total = usize::try_from(crate::review_pilot::REVIEW_PILOT_TOTAL_HIDDEN_QC)
+        .map_err(|_| "snapshot hidden-key global quota is invalid".to_string())?;
+    if reviewer_counts.values().any(|count| *count > per_reviewer) || grants.len() > total {
+        return Err("snapshot hidden-key authority exceeds the exact 2-per-reviewer/4-total quota".to_string());
+    }
+
+    let mut completed = std::collections::BTreeSet::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT id, segment_id, reviewer, action FROM review_events
+              WHERE id > ?1 AND source = 'couch_spot_check' ORDER BY id",
+        )
+        .map_err(|error| format!("snapshot hidden completion history cannot be read: {error}"))?;
+    let events = statement
+        .query_map([baseline], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        })
+        .map_err(|error| format!("snapshot hidden completion history cannot be read: {error}"))?;
+    for event in events {
+        let (event_id, segment_id, actual_reviewer, action) =
+            event.map_err(|error| format!("snapshot hidden completion event is unreadable: {error}"))?;
+        let reviewer = exact_pilot_reviewer(policy, &actual_reviewer, &format!("hidden event {event_id}"))?;
+        crate::validation::input::validate_identifier(&segment_id)
+            .map_err(|error| format!("hidden event {event_id} has invalid segment: {error}"))?;
+        if !matches!(action.as_str(), "accept" | "edit" | "reject" | "skip") {
+            return Err(format!("hidden event {event_id} has invalid action {action:?}"));
+        }
+        let key = (reviewer.to_ascii_lowercase(), segment_id.clone());
+        if !grants.contains(&key) {
+            return Err(format!("hidden event {event_id} has no durable active-policy grant"));
+        }
+        if !completed.insert(key.clone()) {
+            return Err(format!("hidden key {}/{} has multiple completion events", key.0, key.1));
+        }
+        let mut result_statement = connection
+            .prepare("SELECT action FROM spot_checks WHERE segment_id = ?1 AND reviewer = ?2 COLLATE NOCASE")
+            .map_err(|error| format!("hidden event {event_id} result cannot be read: {error}"))?;
+        let observed = result_statement
+            .query_map(rusqlite::params![segment_id, reviewer], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("hidden event {event_id} result cannot be read: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("hidden event {event_id} result cannot be read: {error}"))?;
+        if observed != [action.clone()] {
+            return Err(format!("hidden event {event_id} result mismatch: event={action:?}, results={observed:?}"));
+        }
+    }
+
+    if let (Some(data_dir), Some(db_path)) = (live_data_dir, live_db_path) {
+        let session_path = data_dir.join("couch_session.json");
+        match fs::read(&session_path) {
+            Ok(bytes) => {
+                let session: SnapshotPilotSession = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("snapshot refused because couch_session.json is invalid: {error}"))?;
+                let recorded = fs::canonicalize(&session.db_path)
+                    .map_err(|error| format!("snapshot session database path is unavailable: {error}"))?;
+                let expected = fs::canonicalize(db_path)
+                    .map_err(|error| format!("snapshot database path is unavailable: {error}"))?;
+                if recorded != expected {
+                    return Err("snapshot session belongs to a different database".to_string());
+                }
+                let session_policy = session
+                    .pilot_policy
+                    .ok_or_else(|| "snapshot session is not bound to the active pilot policy".to_string())?;
+                if session_policy.policy_sha256()? != digest {
+                    return Err("snapshot session is bound to a different pilot policy".to_string());
+                }
+                let paired = session.reviewers.values().cloned().collect::<Vec<_>>();
+                if !policy.matches_session(&paired) {
+                    return Err("snapshot session reviewer roster does not match the active pilot".to_string());
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for (segment_id, actual_reviewer) in session.pilot_spot_checks {
+                    crate::validation::input::validate_identifier(&segment_id)
+                        .map_err(|error| format!("snapshot session hidden key is invalid: {error}"))?;
+                    let reviewer = exact_pilot_reviewer(policy, &actual_reviewer, "snapshot session hidden cache")?;
+                    let key = (reviewer.to_ascii_lowercase(), segment_id);
+                    if !seen.insert(key.clone()) {
+                        return Err(format!("snapshot session duplicates hidden key {}/{}", key.0, key.1));
+                    }
+                    if !grants.contains(&key) {
+                        return Err(format!(
+                            "snapshot session hidden key {}/{} has no durable active-policy grant",
+                            key.0, key.1
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("snapshot session cannot be read: {error}")),
+        }
+    }
+    Ok(())
+}
+
 /// Capture paid-review policy with explicit absence semantics. A new snapshot contains exactly one
 /// of the validated policy or an absence marker. An unreadable/invalid active policy fails the whole
 /// snapshot instead of being misrepresented as intentionally absent.
@@ -109,6 +302,15 @@ fn capture_review_pilot_state(db: &Database, primary_data_dir: &Path, staging: &
                     policy.after_review_event_id
                 )));
             }
+            validate_active_pilot_snapshot_authority(
+                db.connection(),
+                Some(primary_data_dir),
+                Some(Path::new(db.path())),
+                &policy,
+            )
+            .map_err(|error| {
+                AppError::Other(format!("snapshot refused because hidden-key authority is incomplete: {error}"))
+            })?;
             fs::write(staging.join(crate::review_pilot::REVIEW_PILOT_FILE), bytes).map_err(AppError::Io)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -976,6 +1178,8 @@ pub(crate) fn verify_snapshot_manifest_for_restore(snapshot_dir: &Path) -> Resul
                 policy.after_review_event_id
             ));
         }
+        validate_active_pilot_snapshot_authority(&connection, None, None, &policy)
+            .map_err(|error| format!("snapshot pilot hidden-key authority is incomplete or incoherent: {error}"))?;
     } else if fs::read(&actual[crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE])
         .map_err(|error| format!("snapshot pilot absence marker is unreadable: {error}"))?
         != crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES
@@ -1300,6 +1504,79 @@ mod tests {
         })
         .unwrap();
         db
+    }
+
+    fn pilot_policy() -> crate::review_pilot::ReviewPilotPolicy {
+        crate::review_pilot::parse(
+            r#"{
+              "schema_version": 1,
+              "after_review_event_id": 0,
+              "max_total_corpus_actions": 20,
+              "reviewers": [
+                {"name": "Hawzhin", "max_corpus_actions": 10},
+                {"name": "Pavel", "max_corpus_actions": 10}
+              ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn active_pilot_snapshot_requires_exact_current_schema_and_completed_event_grants() {
+        let db = seeded_db();
+        let policy = pilot_policy();
+        validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap();
+
+        db.connection().execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert", []).unwrap();
+        let schema_error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(schema_error.contains("schema contract") && schema_error.contains("missing"), "{schema_error}");
+
+        let db = seeded_db();
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms)
+                 VALUES ('hidden-complete', 'Hawzhin', 'accept', 'couch_spot_check', 1)",
+                [],
+            )
+            .unwrap();
+        let event_error = validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap_err();
+        assert!(event_error.contains("no durable active-policy grant"), "{event_error}");
+    }
+
+    #[test]
+    fn active_pilot_snapshot_requires_live_session_keys_to_be_durable() {
+        let profile = tempfile::TempDir::new().unwrap();
+        let db_path = profile.path().join(DB_FILE);
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        let policy = pilot_policy();
+        std::fs::write(
+            profile.path().join("couch_session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "db_path": &db_path,
+                "reviewers": {"token-h": "Hawzhin", "token-p": "Pavel"},
+                "pilot_spot_checks": [["hidden-session", "Hawzhin"]],
+                "pilot_policy": &policy,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error =
+            validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+                .unwrap_err();
+        assert!(error.contains("no durable active-policy grant"), "{error}");
+
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 0, 'Hawzhin', 'hidden-session')",
+                [policy.policy_sha256().unwrap()],
+            )
+            .unwrap();
+        validate_active_pilot_snapshot_authority(db.connection(), Some(profile.path()), Some(&db_path), &policy)
+            .unwrap();
     }
 
     #[test]
@@ -1742,7 +2019,7 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![58]);
+        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![59, 58]);
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pre-upgrade-row".to_string(),
             audio_path: "/must-survive.wav".to_string(),
@@ -1751,18 +2028,18 @@ mod tests {
         })
         .unwrap();
 
-        // Make the snapshot root impossible to create. The shared guard must return before v58 runs.
+        // Make the snapshot root impossible to create. The shared guard must return before v58/v59 run.
         let blocked_root = profile.path().join("not-a-directory");
         std::fs::write(&blocked_root, b"block child creation").unwrap();
         let error = initialize_with_required_pre_migration_pin(&db, &blocked_root).unwrap_err().to_string();
         assert!(!error.is_empty());
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 57, "a failed pin must leave v58 pending");
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 57, "a failed pin must leave v58/v59 pending");
 
-        // With a usable profile directory, the helper first promotes the v57 pages and only then runs v58.
+        // With a usable profile directory, the helper first promotes the v57 pages and only then runs v58/v59.
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("an established v57 profile requires a pin");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 58);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 59);
         assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the migration pin must be self-verifying");
         let pinned = Database::open(pin.join(DB_FILE).to_string_lossy().as_ref()).unwrap();
         assert_eq!(crate::migrations::get_current_version(&pinned).unwrap(), 57);
@@ -1780,12 +2057,12 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![58]);
+        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![59, 58]);
 
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("a v57 profile requires a complete safety pin even when config uses defaults");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 58);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 59);
         for state in OPTIONAL_SNAPSHOT_STATE {
             assert_eq!(std::fs::read(pin.join(state.absent_file)).unwrap(), state.absent_bytes);
         }

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from pilot_focus_contract import contract_for_ids, verify_controlled_pilot_focus
+from review_pilot_hidden_contract import HIDDEN_SCHEMA_SQL, HIDDEN_TRIGGER_SQL
 
 SCRIPT = Path(__file__).with_name("restore_drill.py")
 SPEC = importlib.util.spec_from_file_location("restore_drill", SCRIPT)
@@ -25,8 +26,28 @@ drill_module.verify_controlled_pilot_focus = lambda root: verify_controlled_pilo
 DEPLOYMENT_SHA = "a" * 64
 
 
+def create_hidden_key_authority(connection: sqlite3.Connection) -> None:
+    connection.executescript(HIDDEN_SCHEMA_SQL)
+
+
+def insert_hidden_rows_bypassing_trigger(
+    connection: sqlite3.Connection,
+    trigger_name: str,
+    rows: list[tuple[str, int, str, str]],
+) -> None:
+    """Build a corrupt-but-exact-schema fixture that the drill must reject."""
+
+    connection.execute(f'DROP TRIGGER "{trigger_name}"')
+    connection.executemany("INSERT INTO review_pilot_hidden_keys VALUES(?, ?, ?, ?)", rows)
+    connection.execute(HIDDEN_TRIGGER_SQL[trigger_name])
+
+
 def seed_tree(
-    root: Path, *, policy: bool = True, absent_state: tuple[str, ...] = ()
+    root: Path,
+    *,
+    policy: bool = True,
+    absent_state: tuple[str, ...] = (),
+    db_schema: int = 59,
 ) -> None:
     connection = sqlite3.connect(root / drill_module.DB_FILE)
     connection.executescript(
@@ -35,10 +56,13 @@ def seed_tree(
         CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT NOT NULL);
         CREATE TABLE speech_segments(id TEXT PRIMARY KEY);
         INSERT INTO speech_segments VALUES('segment-1');
-        CREATE TABLE review_events(id INTEGER PRIMARY KEY);
-        INSERT INTO review_events VALUES(2);
-        INSERT INTO review_events VALUES(5);
-        CREATE TABLE spot_checks(id INTEGER PRIMARY KEY);
+        CREATE TABLE review_events(
+            id INTEGER PRIMARY KEY, segment_id TEXT NOT NULL, reviewer TEXT NOT NULL,
+            action TEXT NOT NULL, source TEXT NOT NULL
+        );
+        INSERT INTO review_events VALUES(2, 'legacy-2', 'legacy', 'accept', 'couch');
+        INSERT INTO review_events VALUES(5, 'legacy-5', 'legacy', 'accept', 'couch');
+        CREATE TABLE spot_checks(segment_id TEXT, reviewer TEXT, action TEXT);
         CREATE TABLE model_versions(
             id TEXT PRIMARY KEY,
             checkpoint_sha256 TEXT NOT NULL,
@@ -49,9 +73,15 @@ def seed_tree(
         CREATE TABLE import_job_files(id INTEGER PRIMARY KEY);
         """
     )
+    if db_schema >= drill_module.HIDDEN_KEY_SCHEMA_VERSION:
+        create_hidden_key_authority(connection)
     connection.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
-        drill_module.source_migrations(drill_module.DEFAULT_MIGRATIONS),
+        [
+            entry
+            for entry in drill_module.source_migrations(drill_module.DEFAULT_MIGRATIONS)
+            if entry[0] <= db_schema
+        ],
     )
     connection.commit()
     connection.close()
@@ -150,8 +180,9 @@ def fresh_tree(
     *,
     policy: bool = True,
     absent_state: tuple[str, ...] = (),
+    db_schema: int = 59,
 ) -> dict[str, Any]:
-    seed_tree(root, policy=policy, absent_state=absent_state)
+    seed_tree(root, policy=policy, absent_state=absent_state, db_schema=db_schema)
     return write_manifest(root, schema)
 
 
@@ -374,6 +405,7 @@ def test_schema2_evidence_shape_and_values_are_bound_to_restored_database() -> N
         root = Path(raw)
         payload = fresh_tree(root, 2)
         payload["databaseEvidence"]["schemaVersion"] = 56
+        del payload["databaseEvidence"]["rowCounts"][drill_module.HIDDEN_KEY_TABLE]
         write_payload(root, payload)
         assert_refused(root, "does not exactly match")
 
@@ -383,6 +415,194 @@ def test_schema2_evidence_shape_and_values_are_bound_to_restored_database() -> N
         del payload["databaseEvidence"]["rowCounts"]["import_jobs"]
         write_payload(root, payload)
         assert_refused(root, "rowCounts fields are invalid")
+
+
+def test_schema2_schema58_evidence_remains_backward_compatible() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        payload = fresh_tree(root, 2, db_schema=58, policy=False)
+        assert payload["databaseEvidence"]["schemaVersion"] == 58
+        assert drill_module.HIDDEN_KEY_TABLE not in payload["databaseEvidence"]["rowCounts"]
+        assert drill_module.drill(root) == []
+
+
+def test_policy_bearing_schema58_snapshot_is_explicitly_archival_not_restorable() -> None:
+    for manifest_schema in (1, 2):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fresh_tree(root, manifest_schema, db_schema=58, policy=True)
+            assert_refused(root, "archival only and not production-restorable")
+
+
+def test_schema59_hidden_key_authority_is_bound_to_the_exact_pilot() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root)
+        policy = drill_module.validate_review_pilot_policy(
+            (root / drill_module.REVIEW_PILOT_FILE).read_bytes()
+        )
+        policy_sha = drill_module.review_pilot_policy_sha256(policy)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.executemany(
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, ?, ?)",
+            [
+                (policy_sha, "Hawzhin", "hidden-h"),
+                (policy_sha, "Pavel", "hidden-p"),
+            ],
+        )
+        connection.commit()
+        connection.close()
+        payload = write_manifest(root, 2)
+        assert payload["databaseEvidence"]["rowCounts"][drill_module.HIDDEN_KEY_TABLE] == 2
+        assert drill_module.drill(root) == []
+
+    mismatches = (
+        ("0" * 64, 5, "Hawzhin", "disagrees with the active policy SHA/baseline"),
+        (None, 4, "Hawzhin", "disagrees with the active policy SHA/baseline"),
+        (None, 5, "Rubar", "unauthorized reviewer"),
+    )
+    for wrong_sha, baseline, reviewer, expected in mismatches:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            seed_tree(root)
+            policy = drill_module.validate_review_pilot_policy(
+                (root / drill_module.REVIEW_PILOT_FILE).read_bytes()
+            )
+            policy_sha = wrong_sha or drill_module.review_pilot_policy_sha256(policy)
+            connection = sqlite3.connect(root / drill_module.DB_FILE)
+            row = (policy_sha, baseline, reviewer, "hidden-mismatch")
+            if wrong_sha is not None and baseline == int(policy["after_review_event_id"]):
+                insert_hidden_rows_bypassing_trigger(
+                    connection, "review_pilot_hidden_keys_policy_insert", [row]
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO review_pilot_hidden_keys VALUES(?, ?, ?, ?)", row
+                )
+            connection.commit()
+            connection.close()
+            write_manifest(root, 2)
+            assert_refused(root, expected)
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root, policy=False)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, 'Hawzhin', 'orphan-grant')",
+            ("0" * 64,),
+        )
+        connection.commit()
+        connection.close()
+        write_manifest(root, 2)
+        assert drill_module.drill(root) == []
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 17, 'OldReviewer', 'historical-grant')",
+            ("1" * 64,),
+        )
+        connection.commit()
+        connection.close()
+        write_manifest(root, 2)
+        assert drill_module.drill(root) == []
+
+    overages = (
+        (
+            [("2" * 64, 18, "OldReviewer", f"reviewer-{index}") for index in range(3)],
+            "reviewer namespace cap",
+        ),
+        (
+            [
+                ("3" * 64, 19, "OldA", "global-1"),
+                ("3" * 64, 19, "OldA", "global-2"),
+                ("3" * 64, 19, "OldB", "global-3"),
+                ("3" * 64, 19, "OldB", "global-4"),
+                ("3" * 64, 19, "OldC", "global-5"),
+            ],
+            "policy namespace cap",
+        ),
+    )
+    for rows, expected in overages:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            seed_tree(root, policy=False)
+            connection = sqlite3.connect(root / drill_module.DB_FILE)
+            insert_hidden_rows_bypassing_trigger(
+                connection, "review_pilot_hidden_keys_quota_insert", rows
+            )
+            connection.commit()
+            connection.close()
+            write_manifest(root, 2)
+            assert_refused(root, expected)
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert")
+        connection.commit()
+        connection.close()
+        write_manifest(root, 1)
+        assert_refused(root, "trigger contract is invalid")
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.executescript(
+            "DROP TRIGGER review_pilot_hidden_keys_immutable_delete;"
+            "DROP TRIGGER review_pilot_hidden_keys_immutable_update;"
+            "DROP TRIGGER review_pilot_hidden_keys_quota_insert;"
+            "DROP TABLE review_pilot_hidden_keys;"
+        )
+        connection.commit()
+        connection.close()
+        write_manifest(root, 1)
+        assert_refused(root, "missing required review_pilot_hidden_keys authority")
+
+
+def test_schema59_policy_snapshot_requires_every_completed_hidden_event_to_have_a_grant() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.execute(
+            "INSERT INTO review_events VALUES(6, 'completed-hidden', 'Hawzhin', 'accept', 'couch_spot_check')"
+        )
+        connection.execute(
+            "INSERT INTO spot_checks VALUES('completed-hidden', 'Hawzhin', 'accept')"
+        )
+        connection.commit()
+        connection.close()
+        write_manifest(root, 2)
+        assert_refused(root, "has no durable active-policy grant")
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root)
+        policy = drill_module.validate_review_pilot_policy(
+            (root / drill_module.REVIEW_PILOT_FILE).read_bytes()
+        )
+        digest = drill_module.review_pilot_policy_sha256(policy)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.execute(
+            "INSERT INTO review_pilot_hidden_keys VALUES(?, 5, 'Hawzhin', 'completed-hidden')",
+            (digest,),
+        )
+        connection.execute(
+            "INSERT INTO review_events VALUES(6, 'completed-hidden', 'Hawzhin', 'accept', 'couch_spot_check')"
+        )
+        connection.execute(
+            "INSERT INTO spot_checks VALUES('completed-hidden', 'Hawzhin', 'accept')"
+        )
+        connection.commit()
+        connection.close()
+        write_manifest(root, 2)
+        assert drill_module.drill(root) == []
 
 
 def test_required_json_state_rejects_duplicate_keys_after_manifest_verifies() -> None:
@@ -397,11 +617,7 @@ def test_required_json_state_rejects_duplicate_keys_after_manifest_verifies() ->
 def test_migration_history_requires_an_exact_description_bound_canonical_prefix() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
-        seed_tree(root)
-        connection = sqlite3.connect(root / drill_module.DB_FILE)
-        connection.execute("DELETE FROM schema_migrations WHERE version > 57")
-        connection.commit()
-        connection.close()
+        seed_tree(root, db_schema=58, policy=False)
         write_manifest(root, 1)
         assert drill_module.drill(root) == [], "an exact older canonical prefix is restore-valid"
 

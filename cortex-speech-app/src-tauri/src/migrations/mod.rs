@@ -2259,7 +2259,79 @@ pub static MIGRATIONS: &[Migration] = &[
               ORDER BY id;
 
              DROP TABLE orphan_segment_hypotheses_archive_v58;
-             DROP TABLE orphan_loop0_shadow_log_archive_v58;",
+            DROP TABLE orphan_loop0_shadow_log_archive_v58;",
+        ),
+    },
+    Migration {
+        version: 59,
+        description: "Persist controlled-review pilot hidden-check reservations",
+        // Hidden-QC assignment is a paid-pilot lifetime invariant, not session state.  A durable,
+        // append-only natural key prevents a lost/repaired couch_session.json from minting another
+        // pair for the same reviewer and policy baseline.  There is deliberately no segment FK:
+        // the assignment evidence must outlive corpus-row deletion just like the review ledgers do.
+        up_sql: "CREATE TABLE review_pilot_hidden_keys (
+                     policy_sha256 TEXT NOT NULL
+                         CHECK(length(policy_sha256) = 64 AND policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     after_review_event_id INTEGER NOT NULL
+                         CHECK(after_review_event_id >= 0),
+                     reviewer TEXT NOT NULL COLLATE NOCASE
+                         CHECK(reviewer = trim(reviewer) AND length(reviewer) BETWEEN 1 AND 40),
+                     segment_id TEXT NOT NULL
+                         CHECK(segment_id = trim(segment_id) AND length(segment_id) BETWEEN 1 AND 256),
+                     PRIMARY KEY(policy_sha256, after_review_event_id, reviewer, segment_id)
+                 ) STRICT;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_policy_insert
+                 BEFORE INSERT ON review_pilot_hidden_keys
+                 WHEN EXISTS (
+                     SELECT 1 FROM review_pilot_hidden_keys
+                      WHERE after_review_event_id = NEW.after_review_event_id
+                        AND policy_sha256 <> NEW.policy_sha256
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot baseline is bound to another policy'); END;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_quota_insert
+                 BEFORE INSERT ON review_pilot_hidden_keys
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM review_pilot_hidden_keys
+                           WHERE policy_sha256 = NEW.policy_sha256
+                             AND after_review_event_id = NEW.after_review_event_id
+                             AND reviewer = NEW.reviewer
+                             AND segment_id = NEW.segment_id
+                      )
+                  AND (
+                       (SELECT COUNT(*) FROM review_pilot_hidden_keys
+                         WHERE policy_sha256 = NEW.policy_sha256
+                           AND after_review_event_id = NEW.after_review_event_id
+                           AND reviewer = NEW.reviewer) >= 2
+                       OR
+                       (SELECT COUNT(*) FROM review_pilot_hidden_keys
+                         WHERE policy_sha256 = NEW.policy_sha256
+                           AND after_review_event_id = NEW.after_review_event_id) >= 4
+                  )
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot hidden-key quota exceeded'); END;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_immutable_update
+                 BEFORE UPDATE ON review_pilot_hidden_keys
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot hidden keys are append-only'); END;
+
+                 CREATE TRIGGER review_pilot_hidden_keys_immutable_delete
+                 BEFORE DELETE ON review_pilot_hidden_keys
+                 BEGIN SELECT RAISE(ABORT, 'controlled review pilot hidden keys are append-only'); END;",
+        // Once an assignment exists, silently forgetting it would reopen paid hidden-check capacity.
+        // Empty development/test databases can still downgrade; production history cannot.
+        down_sql: Some(
+            "CREATE TEMP TABLE review_pilot_hidden_keys_v59_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero = 0)
+             );
+             INSERT INTO review_pilot_hidden_keys_v59_rollback_guard(must_be_zero)
+             SELECT 1 WHERE EXISTS (SELECT 1 FROM review_pilot_hidden_keys);
+             DROP TABLE review_pilot_hidden_keys_v59_rollback_guard;
+             DROP TRIGGER review_pilot_hidden_keys_immutable_delete;
+             DROP TRIGGER review_pilot_hidden_keys_immutable_update;
+             DROP TRIGGER review_pilot_hidden_keys_quota_insert;
+             DROP TRIGGER review_pilot_hidden_keys_policy_insert;
+             DROP TABLE review_pilot_hidden_keys;",
         ),
     },
 ];
@@ -2272,13 +2344,110 @@ mod tests {
     fn database_at_v57() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![58], "fixture must stop immediately before v58");
+        assert_eq!(rollback(&db, 2).unwrap(), vec![59, 58], "fixture must stop immediately before v58");
         assert_eq!(get_current_version(&db).unwrap(), 57);
         db
     }
 
     fn v58_fixture_id(index: i64) -> String {
         format!("00000000-0000-4000-8000-{index:012x}")
+    }
+
+    #[test]
+    fn v59_hidden_key_schema_enforces_policy_scoped_quotas_and_append_only_history() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(get_current_version(&db).unwrap(), 59);
+        let policy = "a".repeat(64);
+        for (reviewer, segment_id) in [("Sara", "s-a"), ("sARA", "s-b"), ("Hemn", "h-a"), ("HEMN", "h-b")] {
+            db.connection()
+                .execute(
+                    "INSERT INTO review_pilot_hidden_keys
+                        (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, 863, ?2, ?3)",
+                    rusqlite::params![policy, reviewer, segment_id],
+                )
+                .unwrap();
+        }
+        let reviewer_overflow = db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 863, 'Sara', 's-c')",
+                [&policy],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(reviewer_overflow.contains("quota exceeded"), "unexpected reviewer trigger: {reviewer_overflow}");
+        let global_overflow = db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 863, 'Ali', 'a-a')",
+                [&policy],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(global_overflow.contains("quota exceeded"), "unexpected global trigger: {global_overflow}");
+
+        assert_eq!(
+            db.connection()
+                .execute(
+                    "INSERT OR IGNORE INTO review_pilot_hidden_keys
+                        (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?1, 863, 'SARA', 's-a')",
+                    [&policy],
+                )
+                .unwrap(),
+            0,
+            "a duplicate retry is a no-op even when the reviewer spelling differs"
+        );
+        let other_policy = "b".repeat(64);
+        let rebound = db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 863, 'Ali', 'a-a')",
+                [&other_policy],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(rebound.contains("bound to another policy"), "unexpected policy trigger: {rebound}");
+        db.connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES (?1, 864, 'Ali', 'a-a')",
+                [&other_policy],
+            )
+            .unwrap();
+        assert!(db
+            .connection()
+            .execute(
+                "INSERT INTO review_pilot_hidden_keys
+                    (policy_sha256, after_review_event_id, reviewer, segment_id)
+                 VALUES ('BAD', 863, 'Ali', 'bad-hash')",
+                [],
+            )
+            .is_err());
+        for sql in
+            ["UPDATE review_pilot_hidden_keys SET segment_id = segment_id", "DELETE FROM review_pilot_hidden_keys"]
+        {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains("append-only"), "unexpected immutable-history trigger: {error}");
+        }
+        let rollback_error = rollback(&db, 1).expect_err("nonempty hidden-key history cannot be erased").to_string();
+        assert!(rollback_error.contains("CHECK constraint failed"), "unexpected rollback guard: {rollback_error}");
+        assert_eq!(get_current_version(&db).unwrap(), 59);
+
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert_eq!(rollback(&empty, 1).unwrap(), vec![59]);
+        assert_eq!(get_current_version(&empty).unwrap(), 58);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![59]);
     }
 
     /// Deterministic test twin of the measured production cohort. Its sorted-id digest is the
@@ -3325,7 +3494,7 @@ mod tests {
     fn v57_starts_prospectively_after_the_last_legacy_event() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 2).unwrap(), vec![58, 57], "fixture must return to the v56 schema");
+        assert_eq!(rollback(&db, 3).unwrap(), vec![59, 58, 57], "fixture must return to the v56 schema");
 
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pay-cutoff".into(),
@@ -3345,7 +3514,7 @@ mod tests {
             .unwrap();
         let legacy_event_id = db.connection().last_insert_rowid();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59]);
         let cutoff: i64 = db
             .connection()
             .query_row(
@@ -3515,7 +3684,7 @@ mod tests {
         for history_kind in ["ledger", "unledgered-event"] {
             let db = Database::open(":memory:").unwrap();
             db.initialize().unwrap();
-            assert_eq!(rollback(&db, 1).unwrap(), vec![58], "fixture must target v57 rollback semantics");
+            assert_eq!(rollback(&db, 2).unwrap(), vec![59, 58], "fixture must target v57 rollback semantics");
             db.insert_segment(&crate::db::SpeechSegment {
                 id: format!("pay-no-rollback-{history_kind}"),
                 audio_path: format!("/pay-no-rollback-{history_kind}.wav"),
@@ -3653,7 +3822,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archive_counts: (i64, i64) = db
             .connection()
@@ -3900,7 +4069,7 @@ mod tests {
         // Once an operator separately resolves the unknown class, the same pending migration can
         // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
         db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archived: i64 = db
             .connection()
@@ -3930,7 +4099,9 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59]);
+
+        assert_eq!(rollback(&db, 1).unwrap(), vec![59], "the empty v59 layer must be removed before probing v58");
 
         let rollback_error = rollback(&db, 1)
             .expect_err("rollback must not recreate children while their parents are still missing")
@@ -4000,7 +4171,7 @@ mod tests {
 
         // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
         // restored children in place. This pins the full up/down/up round trip.
-        assert_eq!(run_migrations(&db).unwrap(), vec![58]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59]);
         let reapply_counts: (i64, i64, i64, i64) = db
             .connection()
             .query_row(

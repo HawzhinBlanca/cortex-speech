@@ -1688,13 +1688,21 @@ impl ProcessingPipeline {
 
         let source_paths: Vec<String> = files.iter().map(|path| path.to_string_lossy().to_string()).collect();
         let total = files.len();
-        // P3.2: open a resume journal for this import (best-effort — a journal failure never fails the
-        // import). A crash leaves this job 'running'; the next launch can offer to resume it.
-        let job_id: Option<String> = db.begin_import_job(&dir_path.to_string_lossy(), total).ok();
         callback(PipelineEvent::Started { total });
         self.reset_finetuned_counters();
         callback(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, total, "");
+        // An empty selection is a successful no-op, not an import generation.  Recording a completed
+        // zero-file job pollutes the recovery journal and makes an accidental folder pick look like
+        // durable work.  Preserve the public event contract while leaving both journal tables clean.
+        if total == 0 {
+            callback(PipelineEvent::Completed { total: 0, succeeded: 0, failed: 0 });
+            self.finish_import_status();
+            return Ok(());
+        }
+        // P3.2: open a resume journal for this import (best-effort — a journal failure never fails the
+        // import). A crash leaves this job 'running'; the next launch can offer to resume it.
+        let job_id: Option<String> = db.begin_import_job(&dir_path.to_string_lossy(), total).ok();
         // RAII: clear import_status.running on EVERY exit path. The per-file `token.check()?` cancel
         // below early-returns before the manual finish_import_status() calls, which used to leave
         // get_import_status() reporting running:true forever after a cancelled directory import.

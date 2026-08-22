@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atomically arm the strict Hawzhin/Pavel paid-review certification pilot.
+"""Atomically arm the strict Hawzhin and Pavel paid-review certification pilot.
 
 This is the only supported writer for ``review_pilot_policy.json``. It requires Couch, the desktop
 app, importer, and watchdog to be offline; takes SQLite's write reservation; compares the caller's
@@ -9,8 +9,8 @@ their DPAPI tokens; writes the same policy snapshot into the session; rechecks t
 promotes both files. The revocation marker is removed last. Any crash after mutation begins therefore
 leaves Couch unable to resume, never unrestricted.
 
-For a pre-v58 library, establish durable revocation before the offline maintenance migration.  Once
-schema 58 and foreign keys are clean, inspect and activate with the printed event id::
+For a pre-v59 library, establish durable revocation before the offline maintenance migration. Once
+schema 59 and foreign keys are clean, inspect and activate with the printed event id::
 
     python scripts/activate_review_pilot.py --prepare-maintenance-revocation
     python scripts/activate_review_pilot.py --inspect
@@ -39,6 +39,14 @@ from pathlib import Path
 from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
 from check_reviewer_links_live import strict_json_loads, validate_saved_session_shape
 from pilot_focus_contract import verify_controlled_pilot_focus
+from review_pilot_hidden_contract import (
+    HIDDEN_KEYS_PER_REVIEWER,
+    HIDDEN_TABLE,
+    TOTAL_HIDDEN_KEYS,
+    audit_hidden_schema,
+    parse_policy as parse_hidden_policy,
+    policy_sha256 as hidden_policy_sha256,
+)
 
 POLICY_FILE = "review_pilot_policy.json"
 SESSION_FILE = "couch_session.json"
@@ -51,7 +59,7 @@ HIDDEN_QC_PER_REVIEWER = 2
 TOTAL_HIDDEN_QC = len(REVIEWERS) * HIDDEN_QC_PER_REVIEWER
 MAX_COMPENSATED_UI_ACTIONS = TOTAL_CAP + TOTAL_HIDDEN_QC
 COUCH_PORT = 8737
-REQUIRED_SCHEMA = 58
+REQUIRED_SCHEMA = 59
 
 
 def default_data_dir() -> Path:
@@ -290,13 +298,29 @@ def narrow_session(session: dict[str, object], db_path: Path, policy: dict[str, 
                 kept.append(entry)
         return kept
 
+    pilot_checks = filtered_checks("pilot_spot_checks")
+    remembered_policy_raw = session.get("pilot_policy")
+    if pilot_checks:
+        if remembered_policy_raw is None:
+            raise RuntimeError(
+                f"{SESSION_FILE} contains pilot hidden keys without the policy that authorized them"
+            )
+        remembered_policy = validate_pilot_policy(
+            remembered_policy_raw, f"{SESSION_FILE} remembered pilot policy"
+        )
+        if remembered_policy != policy:
+            raise RuntimeError(
+                f"{SESSION_FILE} pilot hidden keys belong to a different policy generation"
+            )
+
     narrowed = dict(session)  # preserve fields added by newer binaries; change only authorization state
     narrowed["reviewers"] = kept_pairing
     narrowed["sessions"] = kept_sessions
     narrowed["spot_checks"] = filtered_checks("spot_checks")
-    # Missing in pre-pilot sessions is valid.  On a CAS replacement, preserving the target
-    # reviewers' distinct served-key budget prevents a policy rewrite from minting extra checks.
-    narrowed["pilot_spot_checks"] = filtered_checks("pilot_spot_checks")
+    # Missing/empty in a pre-pilot session is valid. Nonempty keys are retained only when their
+    # remembered policy proves the exact generation that authorized them; v59 imports that mirror
+    # into the database before serving, where it becomes the lifetime authority.
+    narrowed["pilot_spot_checks"] = pilot_checks
     narrowed["pilot_policy"] = policy
     return narrowed
 
@@ -345,6 +369,141 @@ def database_preflight(conn: sqlite3.Connection) -> int:
     if not present:
         raise RuntimeError(f"database has no immutable compensation policy {POLICY_VERSION}")
     return int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM review_events").fetchone()[0])
+
+
+def _canonical_hidden_reviewer(actual: object, source: str) -> str:
+    if not isinstance(actual, str) or actual != actual.strip():
+        raise RuntimeError(f"{source} contains an invalid reviewer")
+    matches = [name for name in REVIEWERS if name.lower() == actual.lower()]
+    if len(matches) != 1:
+        raise RuntimeError(f"{source} contains unauthorized reviewer {actual!r}")
+    return matches[0]
+
+
+def _canonical_hidden_segment(actual: object, source: str) -> str:
+    if (
+        not isinstance(actual, str)
+        or actual != actual.strip()
+        or not actual
+        or len(actual.encode("utf-8")) > 256
+        or not all(char.isalnum() or char in "_-." for char in actual)
+    ):
+        raise RuntimeError(f"{source} contains an invalid segment id {actual!r}")
+    return actual
+
+
+def import_pilot_hidden_authority(
+    conn: sqlite3.Connection,
+    policy: dict[str, object],
+    session: dict[str, object],
+) -> dict[str, object]:
+    """Durably bridge every unambiguous v58 hidden key into the active v59 namespace.
+
+    The caller owns an IMMEDIATE transaction.  Existing grants, retained session assignments, and
+    completed post-baseline hidden events are one lifetime set: no source may mint replacements for
+    another, and no key is accepted unless its exact policy/reviewer/segment identity is provable.
+    """
+
+    parsed_policy = parse_hidden_policy(policy, "activation policy")
+    digest = hidden_policy_sha256(parsed_policy)
+    baseline = parsed_policy.after_review_event_id
+    _schema_evidence, schema_errors = audit_hidden_schema(conn)
+    if schema_errors:
+        raise RuntimeError("; ".join(schema_errors))
+
+    conflicting = int(
+        conn.execute(
+            f"""SELECT COUNT(*) FROM {HIDDEN_TABLE}
+                 WHERE (policy_sha256 = ? OR after_review_event_id = ?)
+                   AND NOT (policy_sha256 = ? AND after_review_event_id = ?)""",
+            (digest, baseline, digest, baseline),
+        ).fetchone()[0]
+    )
+    if conflicting:
+        raise RuntimeError(
+            f"{conflicting} hidden-key grant(s) disagree with the activation policy SHA/baseline"
+        )
+
+    durable = {name: set() for name in REVIEWERS}
+    for actual_reviewer, actual_segment in conn.execute(
+        f"""SELECT reviewer, segment_id FROM {HIDDEN_TABLE}
+             WHERE policy_sha256 = ? AND after_review_event_id = ?
+             ORDER BY reviewer COLLATE NOCASE, segment_id""",
+        (digest, baseline),
+    ):
+        reviewer = _canonical_hidden_reviewer(actual_reviewer, "durable hidden-key authority")
+        segment = _canonical_hidden_segment(actual_segment, "durable hidden-key authority")
+        if segment in durable[reviewer]:
+            raise RuntimeError(f"durable hidden-key authority duplicates {reviewer}/{segment}")
+        durable[reviewer].add(segment)
+
+    retained = {name: set() for name in REVIEWERS}
+    entries = session.get("pilot_spot_checks", [])
+    if not isinstance(entries, list):
+        raise RuntimeError(f"{SESSION_FILE} has invalid pilot_spot_checks state")
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise RuntimeError(f"{SESSION_FILE} has an invalid pilot_spot_checks entry")
+        segment = _canonical_hidden_segment(entry[0], f"{SESSION_FILE}.pilot_spot_checks")
+        reviewer = _canonical_hidden_reviewer(entry[1], f"{SESSION_FILE}.pilot_spot_checks")
+        if segment in retained[reviewer]:
+            raise RuntimeError(f"{SESSION_FILE} duplicates hidden key {reviewer}/{segment}")
+        retained[reviewer].add(segment)
+
+    completed = {name: set() for name in REVIEWERS}
+    for event_id, actual_segment, actual_reviewer, action in conn.execute(
+        """SELECT id, segment_id, reviewer, action FROM review_events
+             WHERE id > ? AND source = 'couch_spot_check'
+             ORDER BY id""",
+        (baseline,),
+    ):
+        reviewer = _canonical_hidden_reviewer(actual_reviewer, f"hidden event {event_id}")
+        segment = _canonical_hidden_segment(actual_segment, f"hidden event {event_id}")
+        if action not in {"accept", "edit", "reject", "skip"}:
+            raise RuntimeError(f"hidden event {event_id} has invalid action {action!r}")
+        if segment in completed[reviewer]:
+            raise RuntimeError(f"hidden key {reviewer}/{segment} has more than one completion event")
+        completed[reviewer].add(segment)
+
+    complete = {
+        name: durable[name] | retained[name] | completed[name]
+        for name in REVIEWERS
+    }
+    for reviewer, keys in complete.items():
+        if len(keys) > HIDDEN_KEYS_PER_REVIEWER:
+            raise RuntimeError(
+                f"hidden-key lifetime set exceeds the {HIDDEN_KEYS_PER_REVIEWER}-key quota for {reviewer}"
+            )
+    if sum(len(keys) for keys in complete.values()) > TOTAL_HIDDEN_KEYS:
+        raise RuntimeError(f"hidden-key lifetime set exceeds the {TOTAL_HIDDEN_KEYS}-key global quota")
+
+    inserted = 0
+    for reviewer in REVIEWERS:
+        for segment in sorted(complete[reviewer] - durable[reviewer]):
+            conn.execute(
+                f"""INSERT INTO {HIDDEN_TABLE}
+                       (policy_sha256, after_review_event_id, reviewer, segment_id)
+                     VALUES (?, ?, ?, ?)""",
+                (digest, baseline, reviewer, segment),
+            )
+            inserted += 1
+
+    verified = {name: set() for name in REVIEWERS}
+    for actual_reviewer, actual_segment in conn.execute(
+        f"""SELECT reviewer, segment_id FROM {HIDDEN_TABLE}
+             WHERE policy_sha256 = ? AND after_review_event_id = ?""",
+        (digest, baseline),
+    ):
+        reviewer = _canonical_hidden_reviewer(actual_reviewer, "verified hidden-key authority")
+        segment = _canonical_hidden_segment(actual_segment, "verified hidden-key authority")
+        verified[reviewer].add(segment)
+    if verified != complete:
+        raise RuntimeError("durable hidden-key authority does not exactly cover the retained lifetime set")
+    return {
+        "policySemanticSha256": digest,
+        "hiddenKeysImported": inserted,
+        "hiddenKeysDurable": sum(len(keys) for keys in verified.values()),
+    }
 
 
 def inspect(data_dir: Path, db_path: Path) -> dict[str, object]:
@@ -408,12 +567,19 @@ def _activate_locked(
     marker_path = data_dir / REVOCATION_FILE
     if not session_path.is_file():
         raise RuntimeError(f"remembered reviewer state is missing: {session_path}")
+    existing_policy: dict[str, object] | None = None
     if policy_path.is_file():
         if expected_policy_sha256 is None:
             raise RuntimeError("policy already exists; replacement requires --expected-policy-sha256")
         actual = sha256_file(policy_path)
         if actual != expected_policy_sha256.lower():
             raise RuntimeError(f"policy CAS mismatch: expected {expected_policy_sha256}, found {actual}")
+        try:
+            existing_policy = validate_pilot_policy(
+                strict_json_loads(policy_path.read_text(encoding="utf-8")), POLICY_FILE
+            )
+        except OSError as error:
+            raise RuntimeError(f"existing policy cannot be read: {error}") from error
     elif expected_policy_sha256 is not None:
         raise RuntimeError("policy CAS expected an existing file, but none exists")
 
@@ -429,9 +595,13 @@ def _activate_locked(
             raise RuntimeError(
                 f"review-event CAS mismatch: expected {expected_max_review_event_id}, found {maximum}"
             )
-        policy = pilot_policy(maximum)
+        # A schema-58 pilot may already have real post-baseline work.  Re-activation is a storage
+        # bridge, never a fresh budget: retain its exact semantic baseline.  Only the first activation
+        # starts at the current maximum.
+        policy = existing_policy if existing_policy is not None else pilot_policy(maximum)
         original_session = strict_json_loads(session_path.read_text(encoding="utf-8"))
         narrowed = narrow_session(original_session, db_path, policy)
+        hidden_authority = import_pilot_hidden_authority(conn, policy, narrowed)
 
         # Authority first. From this point until both replacements verify, every restart is denied.
         atomic_write(
@@ -500,13 +670,15 @@ def _activate_locked(
             "session": str(session_path),
             "sessionSha256": sha256_file(session_path),
             "backup": str(backup),
-            "afterReviewEventId": maximum,
+            "afterReviewEventId": policy["after_review_event_id"],
+            "activationMaxReviewEventId": maximum,
             "reviewers": list(REVIEWERS),
             "maxCorpusActions": TOTAL_CAP,
             "maxHiddenQcActions": TOTAL_HIDDEN_QC,
             "maxCompensatedUiActions": MAX_COMPENSATED_UI_ACTIONS,
             "controlledPilotFocusCount": initial_focus.segment_id_count,
             "controlledPilotFocusDigest": initial_focus.sorted_unique_segment_ids_sha256,
+            **hidden_authority,
         }
     except Exception:
         try:

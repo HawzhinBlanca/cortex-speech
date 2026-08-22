@@ -27,6 +27,7 @@ from pilot_focus_contract import (
     load_pilot_focus_contract,
     verify_controlled_pilot_focus,
 )
+from review_pilot_hidden_contract import HIDDEN_SCHEMA_SQL, policy_sha256, parse_policy
 
 TEST_FOCUS_IDS = ("focus-a", "focus-b", "focus-c")
 TEST_FOCUS_CONTRACT = contract_for_ids(TEST_FOCUS_IDS)
@@ -42,19 +43,24 @@ def activate(*args, **kwargs):
         return activator.activate(*args, **kwargs)
 
 
-def seed(root: Path, *, schema: int = 58) -> tuple[Path, dict[str, object]]:
+def seed(root: Path, *, schema: int = 59) -> tuple[Path, dict[str, object]]:
     db_path = root / "cortex-speech.db"
     conn = sqlite3.connect(db_path)
     conn.executescript(
         f"""
         PRAGMA foreign_keys=ON;
         CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT NOT NULL);
-        CREATE TABLE review_events(id INTEGER PRIMARY KEY, reviewer TEXT, action TEXT, source TEXT);
-        INSERT INTO review_events VALUES(863, 'legacy', 'accept', 'couch');
+        CREATE TABLE review_events(
+            id INTEGER PRIMARY KEY, segment_id TEXT NOT NULL, reviewer TEXT NOT NULL,
+            action TEXT NOT NULL, source TEXT NOT NULL
+        );
+        INSERT INTO review_events VALUES(863, 'legacy-segment', 'legacy', 'accept', 'couch');
         CREATE TABLE review_compensation_policies(policy_version TEXT PRIMARY KEY);
         INSERT INTO review_compensation_policies VALUES('review-iqd-v1-2026-08-21');
         """
     )
+    if schema >= 59:
+        conn.executescript(HIDDEN_SCHEMA_SQL)
     conn.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         [entry for entry in source_migrations(DEFAULT_MIGRATIONS) if entry[0] <= schema],
@@ -69,7 +75,7 @@ def seed(root: Path, *, schema: int = 58) -> tuple[Path, dict[str, object]]:
         },
         "db_path": str(db_path),
         "spot_checks": [["h1", "Hawzhin"], ["p1", "Pavel"], ["r1", "Rubar"]],
-        "pilot_spot_checks": [["ph1", "Hawzhin"], ["pp1", "Pavel"], ["pr1", "Rubar"]],
+        "pilot_spot_checks": [],
         "sessions": [
             {"token": "cookie-h", "reviewer": "Hawzhin", "issued_unix": 1},
             {"token": "cookie-p", "reviewer": "Pavel", "issued_unix": 2},
@@ -110,11 +116,29 @@ def test_activation_preserves_target_tokens_narrows_every_session_surface_and_ba
         }, "protected DPAPI token bytes must be preserved exactly"
         assert {entry["reviewer"] for entry in session["sessions"]} == {"Hawzhin", "Pavel"}
         assert {entry[1] for entry in session["spot_checks"]} == {"Hawzhin", "Pavel"}
-        assert {entry[1] for entry in session["pilot_spot_checks"]} == {"Hawzhin", "Pavel"}
+        assert session["pilot_spot_checks"] == []
         assert not (root / REVOCATION_FILE).exists()
         backup = Path(result["backup"])
         assert json.loads((backup / SESSION_FILE).read_text(encoding="utf-8")) == original
         assert (backup / f"{POLICY_FILE}.ABSENT").is_file()
+
+
+def test_first_activation_refuses_unnamespaced_legacy_pilot_hidden_keys() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, _ = seed(root)
+        session_path = root / SESSION_FILE
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["pilot_spot_checks"] = [["ambiguous-key", "Hawzhin"]]
+        session_path.write_text(json.dumps(session), encoding="utf-8")
+
+        try:
+            activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        except RuntimeError as error:
+            assert "without the policy" in str(error), error
+        else:
+            raise AssertionError("unnamespaced legacy hidden keys were reinterpreted as a new pilot")
+        assert not (root / POLICY_FILE).exists()
 
 
 def test_event_id_and_existing_policy_are_compare_and_swap_guards() -> None:
@@ -138,6 +162,128 @@ def test_event_id_and_existing_policy_are_compare_and_swap_guards() -> None:
         else:
             raise AssertionError("an existing policy was overwritten without a hash CAS")
         assert sha256_file(existing) == sha256_file(existing)
+
+
+def test_existing_pilot_cannot_reset_its_baseline_after_any_durable_activity() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, _ = seed(root)
+        activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        policy_path = root / POLICY_FILE
+        policy_hash = sha256_file(policy_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO review_events VALUES(864, 'corpus-work', 'Hawzhin', 'accept', 'couch')"
+        )
+        conn.commit()
+        conn.close()
+
+        result = activate(
+            root,
+            db_path,
+            expected_max_review_event_id=864,
+            expected_policy_sha256=policy_hash,
+            check_runtime=False,
+        )
+        assert result["afterReviewEventId"] == 863
+        assert result["activationMaxReviewEventId"] == 864
+        assert json.loads(policy_path.read_text(encoding="utf-8"))["after_review_event_id"] == 863
+
+
+def test_schema59_activation_imports_session_and_completed_hidden_keys_into_one_namespace() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, _ = seed(root)
+        activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+        policy_path = root / POLICY_FILE
+        policy_hash = sha256_file(policy_path)
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        session_path = root / SESSION_FILE
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["pilot_spot_checks"] = [
+            ["hidden-h-session", "Hawzhin"],
+            ["hidden-p-session", "Pavel"],
+        ]
+        session_path.write_text(json.dumps(session), encoding="utf-8")
+        conn = sqlite3.connect(db_path)
+        conn.executemany(
+            "INSERT INTO review_events VALUES(?, ?, ?, ?, 'couch_spot_check')",
+            [
+                (864, "hidden-h-completed", "Hawzhin", "accept"),
+                (865, "hidden-p-completed", "Pavel", "reject"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        result = activate(
+            root,
+            db_path,
+            expected_max_review_event_id=865,
+            expected_policy_sha256=policy_hash,
+            check_runtime=False,
+        )
+        expected_digest = policy_sha256(parse_policy(policy))
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            """SELECT policy_sha256, after_review_event_id, reviewer, segment_id
+                 FROM review_pilot_hidden_keys ORDER BY reviewer, segment_id"""
+        ).fetchall()
+        conn.close()
+        assert rows == [
+            (expected_digest, 863, "Hawzhin", "hidden-h-completed"),
+            (expected_digest, 863, "Hawzhin", "hidden-h-session"),
+            (expected_digest, 863, "Pavel", "hidden-p-completed"),
+            (expected_digest, 863, "Pavel", "hidden-p-session"),
+        ]
+        assert result["policySemanticSha256"] == expected_digest
+        assert result["hiddenKeysImported"] == 4
+        assert result["hiddenKeysDurable"] == 4
+        assert result["afterReviewEventId"] == 863
+
+
+def test_schema59_activation_rolls_back_when_hidden_history_exceeds_quota_or_schema_is_inexact() -> None:
+    for mutation, expected in (
+        ("over_quota", "lifetime set exceeds"),
+        ("missing_trigger", "trigger(s) missing"),
+    ):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path, _ = seed(root)
+            activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
+            policy_path = root / POLICY_FILE
+            policy_hash = sha256_file(policy_path)
+            session_path = root / SESSION_FILE
+            session_before = session_path.read_bytes()
+            conn = sqlite3.connect(db_path)
+            if mutation == "over_quota":
+                conn.executemany(
+                    "INSERT INTO review_events VALUES(?, ?, 'Hawzhin', 'accept', 'couch_spot_check')",
+                    [(864, "hidden-one"), (865, "hidden-two"), (866, "hidden-three")],
+                )
+                expected_max = 866
+            else:
+                conn.execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert")
+                expected_max = 863
+            conn.commit()
+            conn.close()
+            try:
+                activate(
+                    root,
+                    db_path,
+                    expected_max_review_event_id=expected_max,
+                    expected_policy_sha256=policy_hash,
+                    check_runtime=False,
+                )
+            except RuntimeError as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError(f"invalid hidden authority escaped: {mutation}")
+            conn = sqlite3.connect(db_path)
+            assert conn.execute("SELECT COUNT(*) FROM review_pilot_hidden_keys").fetchone()[0] == 0
+            conn.close()
+            assert policy_path.is_file()
+            assert session_path.read_bytes() == session_before
 
 
 def test_interrupted_activation_leaves_durable_revocation_instead_of_old_unrestricted_resume() -> None:
@@ -167,7 +313,7 @@ def test_schema_56_is_refused_before_any_activation_file_changes() -> None:
         try:
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         except RuntimeError as error:
-            assert "schema 56/58" in str(error)
+            assert "schema 56/59" in str(error)
         else:
             raise AssertionError("pre-compensation database was accepted")
         assert not (root / POLICY_FILE).exists()
@@ -238,7 +384,7 @@ def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation(
         assert not (root / REVOCATION_FILE).exists()
 
 
-def test_maintenance_revocation_precedes_schema_56_to_58_work_and_survives_refusal() -> None:
+def test_maintenance_revocation_precedes_schema_56_to_59_work_and_survives_refusal() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         db_path, original = seed(root, schema=56)
@@ -248,7 +394,7 @@ def test_maintenance_revocation_precedes_schema_56_to_58_work_and_survives_refus
         try:
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         except RuntimeError as error:
-            assert "schema 56/58" in str(error)
+            assert "schema 56/59" in str(error)
         else:
             raise AssertionError("schema 56 unexpectedly activated")
         assert (root / REVOCATION_FILE).read_bytes() == marker_before
