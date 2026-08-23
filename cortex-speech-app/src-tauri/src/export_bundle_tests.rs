@@ -71,7 +71,7 @@ fn insert_publishable_human_gold_segment(db: &Database, tmp: &TempDir, segment_i
     let audio = tmp.path().join(format!("{segment_id}.wav"));
     write_test_wav(&audio, 900);
     let audio_path = audio.to_string_lossy().to_string();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: segment_id.to_string(),
         audio_path: audio_path.clone(),
         raw_transcript: "human checked text".into(),
@@ -212,8 +212,8 @@ fn insert_machine_silver_segment_with_coverage(db: &Database, tmp: &TempDir, seg
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
-    db.write_segment_verdict(
+    db.insert_legacy_segment_fixture(&segment).unwrap();
+    db.write_legacy_machine_verdict_for_test(
         &segment.id,
         "jury_accept",
         Some("reference candidate"),
@@ -290,7 +290,7 @@ fn record_ready_agentic_promotion_report(
 fn production_export_blocks_on_validation_errors() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "missing-audio".into(),
         created_at: None,
         audio_path: "C:\\definitely\\missing\\audio.wav".into(),
@@ -371,7 +371,7 @@ fn production_export_blocks_when_warnings_exceed_threshold() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "empty-transcript".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -408,7 +408,7 @@ fn production_export_blocks_when_no_segments_are_training_ready() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "review-only".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -483,7 +483,7 @@ fn production_export_blocks_machine_ready_rows_without_hypothesis_coverage() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     let weak_evidence = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -491,7 +491,7 @@ fn production_export_blocks_machine_ready_rows_without_hypothesis_coverage() {
         "shouldCommit": true
     })
     .to_string();
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         &segment.id,
         "jury_accept",
         Some("reference candidate"),
@@ -526,7 +526,7 @@ fn production_export_allows_human_gold_without_hypothesis_coverage() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("human-gold.wav");
     write_test_wav(&audio, 900);
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "human-gold-seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -571,7 +571,7 @@ fn production_export_blocks_when_current_pcm_disagrees_with_import_identity() {
     let audio = tmp.path().join("changed-after-import.wav");
     write_test_wav(&audio, 500);
     let audio_path = audio.to_string_lossy().to_string();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "pcm-mismatch".into(),
         audio_path: audio_path.clone(),
         raw_transcript: "human checked text".into(),
@@ -696,7 +696,7 @@ fn a_revoked_clip_is_absent_from_the_bundles_data_files_manifest_and_card_alike(
     std::fs::write(&revoked, b"audio").unwrap();
     for (id, path, text) in [("keep-1", &keep, "دەقی مانەوە"), ("revoked-1", &revoked, "دەقی سڕاوە")]
     {
-        db.insert_segment_full(&SpeechSegment {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
             id: id.into(),
             audio_path: path.to_string_lossy().to_string(),
             raw_transcript: text.into(),
@@ -1099,7 +1099,7 @@ fn bundle_binds_each_source_recording_to_exact_file_bytes_without_leaking_its_ab
     std::fs::write(&audio, b"source-bytes-v1").unwrap();
     let audio_path = audio.to_string_lossy().to_string();
     for id in ["bound-b", "bound-a"] {
-        db.insert_segment_full(&SpeechSegment {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
             id: id.to_string(),
             audio_path: audio_path.clone(),
             raw_transcript: format!("text for {id}"),
@@ -1141,7 +1141,7 @@ fn processed_audio_provenance_is_captured_once_and_never_leaks_private_paths() {
     let audio = private_dir.join("processed.wav");
     std::fs::write(&audio, b"audio").unwrap();
     let audio_path = audio.to_string_lossy().to_string();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "processed-private-path".into(),
         audio_path: audio_path.clone(),
         raw_transcript: "reviewed text".into(),
@@ -1186,7 +1186,7 @@ fn publication_commit_gate_detects_a_withdrawal_after_preflight() {
     let audio = tmp.path().join("consent-race.wav");
     std::fs::write(&audio, b"audio").unwrap();
     let audio_path = audio.to_string_lossy().to_string();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "consent-race".to_string(),
         audio_path: audio_path.clone(),
         raw_transcript: "reviewed text".to_string(),
@@ -1218,7 +1218,7 @@ fn source_commit_gate_detects_same_size_byte_replacement_after_preflight() {
         duration_ms: 1000,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     persist_current_pcm_identity(&db, &audio.to_string_lossy());
     let segments = db.get_segments(None).unwrap();
     let preflight = capture_source_audio_bindings(&db, &segments, true).unwrap();
@@ -1242,14 +1242,14 @@ fn bundle_tables_stay_on_one_preflight_snapshot_after_insert_and_transcript_muta
         duration_ms: 1000,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&original).unwrap();
+    db.insert_legacy_segment_fixture(&original).unwrap();
     let snapshot = db.get_segments(None).unwrap();
     let digest = segment_snapshot_digest(&snapshot).unwrap();
 
     let mut changed = original.clone();
     changed.raw_transcript = "mutated live transcript".to_string();
-    db.insert_segment_full(&changed).unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&changed).unwrap();
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "late-row".to_string(),
         audio_path: tmp.path().join("late.wav").to_string_lossy().to_string(),
         raw_transcript: "late unvalidated transcript".to_string(),
@@ -1411,8 +1411,8 @@ fn bundle_excludes_holdout_gold_from_all_artifacts() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&mk("keep-seg", "/data/keep.wav", "KEEPMARKERTEXT")).unwrap();
-    db.insert_segment_full(&mk("hold-seg", "/data/holdout.wav", "HOLDOUTMARKERTEXT")).unwrap();
+    db.insert_legacy_segment_fixture(&mk("keep-seg", "/data/keep.wav", "KEEPMARKERTEXT")).unwrap();
+    db.insert_legacy_segment_fixture(&mk("hold-seg", "/data/holdout.wav", "HOLDOUTMARKERTEXT")).unwrap();
     db.upsert_source_transcript(&SourceTranscriptRecord {
         audio_path: "/data/holdout.wav".to_string(),
         model_id: "gemini-2.5-pro".to_string(),
@@ -1475,8 +1475,8 @@ fn bundle_manifest_count_excludes_placeholders_matching_the_shipped_data_files()
         verified,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&mk("real", "/data/real.wav", "دەقی ڕاست", true)).unwrap();
-    db.insert_segment_full(&mk("pending", "/data/pending.wav", "[Pending WSL 7B ASR]", false)).unwrap();
+    db.insert_legacy_segment_fixture(&mk("real", "/data/real.wav", "دەقی ڕاست", true)).unwrap();
+    db.insert_legacy_segment_fixture(&mk("pending", "/data/pending.wav", "[Pending WSL 7B ASR]", false)).unwrap();
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -1574,7 +1574,7 @@ fn draft_export_writes_complete_release_bundle() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -1712,7 +1712,7 @@ fn training_grade_details_records_hypothesis_coverage_evidence() {
         signal_anomaly_score: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     for (model_id, transcript, confidence) in [
         ("omniasr-ctc-300m", "coverage transcript", Some(0.91)),
         ("omniasr-ctc-1b", "[ASR unavailable: model missing]", Some(0.0)),
@@ -1792,7 +1792,7 @@ fn draft_export_preserves_agent_import_provenance() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     let evidence_json = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -1803,7 +1803,7 @@ fn draft_export_preserves_agent_import_provenance() {
         "shouldCommit": true
     })
     .to_string();
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         &segment.id,
         "jury_accept",
         Some("reference candidate"),
@@ -2168,7 +2168,7 @@ fn draft_export_includes_self_learning_preference_artifacts() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: segment.id.clone(),
         model_id: "omniasr-wsl-7b".to_string(),
@@ -2194,7 +2194,7 @@ fn draft_export_includes_self_learning_preference_artifacts() {
     let mut private_segment = segment.clone();
     private_segment.id = "revoked-learning-seg".into();
     private_segment.audio_path = private_audio_path.clone();
-    db.insert_segment_full(&private_segment).unwrap();
+    db.insert_legacy_segment_fixture(&private_segment).unwrap();
     db.connection()
         .execute(
             "UPDATE speech_segments SET verdict_transcript = 'PRIVATE REVOKED WRONG TEXT'
@@ -2288,7 +2288,7 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: segment.id.clone(),
         model_id: "omniasr-wsl-7b".to_string(),
@@ -2345,7 +2345,7 @@ fn draft_export_records_model_metadata_load_errors() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -2392,7 +2392,7 @@ fn draft_export_replaces_bundle_metadata_atomically() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),

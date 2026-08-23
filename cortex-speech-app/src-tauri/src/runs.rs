@@ -1016,7 +1016,7 @@ mod tests {
             "shouldCommit": true
         })
         .to_string();
-        db.write_segment_verdict(
+        db.write_legacy_machine_verdict_for_test(
             &segment.id,
             "jury_accept",
             Some("final candidate"),
@@ -1273,7 +1273,7 @@ mod tests {
             "shouldCommit": true
         })
         .to_string();
-        db.write_segment_verdict(
+        db.write_legacy_machine_verdict_for_test(
             &segment.id,
             "jury_accept",
             Some("final candidate"),

@@ -566,7 +566,7 @@ mod tests {
             alignment_json: None,
             duration_ms: 1000,
             speaker_id: None,
-            verified: true,
+            verified: false,
             confidence: None,
             ctc_score: None,
             clipping_ratio: None,
@@ -815,7 +815,7 @@ mod tests {
             verified: true,
             ..SpeechSegment::default()
         };
-        db.insert_segment(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
 
         let out = tmp.path().join("out");
         let result = export_audio_segments(
@@ -855,7 +855,7 @@ mod tests {
             is_gold: true,
             ..SpeechSegment::default()
         };
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
         record_test_phone_decision(&db, &seg.id, "edit", Some("known answer"), "Owner");
 
         let out = tmp.path().join("out");
@@ -884,8 +884,8 @@ mod tests {
             audio_path: wav_path.to_string_lossy().to_string(),
             raw_transcript: "machine draft".to_string(),
             normalized_transcript: Some("machine normalized".to_string()),
-            annotated_transcript: Some("older human draft".to_string()),
-            verified: true,
+            annotated_transcript: None,
+            verified: false,
             duration_ms: 1000,
             ..SpeechSegment::default()
         };
@@ -1015,7 +1015,7 @@ mod tests {
             raw_transcript: "short utterance".to_string(),
             duration_ms: 300,
             alignment_json: Some(meta.to_alignment_json()),
-            verified: true,
+            verified: false,
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
@@ -1066,7 +1066,7 @@ mod tests {
             raw_transcript: "clamped utterance".to_string(),
             duration_ms: 5000, // stored value claims 5 s; the decoded source only backs 1 s
             alignment_json: Some(meta.to_alignment_json()),
-            verified: true,
+            verified: false,
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();

@@ -127,25 +127,25 @@ fn test_full_pipeline_import_update_search_and_delete_boundaries() {
     let seg_440 = segments.iter().find(|s| s.audio_path.contains("step1")).unwrap();
     let seg_660 = segments.iter().find(|s| s.audio_path.contains("step2")).unwrap();
 
-    // Update phase: modify a transcript
+    // Machine update phase: the generic whole-row boundary may refresh a draft, but it must not
+    // relabel that draft as human verified at schema v60+.
     let mut updated = seg_440.clone();
     updated.raw_transcript = "manually edited transcript".to_string();
-    updated.verified = true;
     db.insert_segment(&updated).unwrap();
 
     let fetched = db.get_segment_by_id(&seg_440.id).unwrap().unwrap();
     assert_eq!(fetched.raw_transcript, "manually edited transcript");
-    assert!(fetched.verified);
+    assert!(!fetched.verified, "a generic machine update must not manufacture human verification");
 
     // Search phase: find the updated segment
     let results = db.search_segments("manually").unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, seg_440.id);
 
-    // Imported processing evidence is durable authority, so deleting that segment must fail closed.
-    let err = db.delete_segment(&seg_660.id).expect_err("an imported segment with durable evidence is append-only");
-    assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
-    assert!(db.get_segment_by_id(&seg_660.id).unwrap().is_some());
+    // This segment has only a machine draft: no human decision, campaign binding, or other durable
+    // review authority exists, so ordinary library cleanup remains allowed.
+    db.delete_segment(&seg_660.id).unwrap();
+    assert!(db.get_segment_by_id(&seg_660.id).unwrap().is_none());
 
     // A genuinely authority-free scratch row remains deletable; the guard is precise, not a blanket
     // ban on segment cleanup.
@@ -161,9 +161,8 @@ fn test_full_pipeline_import_update_search_and_delete_boundaries() {
     assert!(db.get_segment_by_id(&disposable.id).unwrap().is_none());
 
     let remaining = db.get_segments(None).unwrap();
-    assert_eq!(remaining.len(), 2);
+    assert_eq!(remaining.len(), 1);
     assert!(remaining.iter().any(|segment| segment.id == seg_440.id));
-    assert!(remaining.iter().any(|segment| segment.id == seg_660.id));
 }
 
 #[test]

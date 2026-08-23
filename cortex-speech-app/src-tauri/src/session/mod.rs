@@ -320,12 +320,14 @@ mod tests {
                 id: id.into(),
                 audio_path: format!("/audio/{id}.wav"),
                 raw_transcript: format!("fixture transcript {id}"),
-                verified,
+                verified: false,
                 ..SpeechSegment::default()
             })
             .unwrap();
+            if verified {
+                db.finalize_human_review(id, if id == "c" { "reject" } else { "accept" }, None, None, None).unwrap();
+            }
         }
-        db.record_human_decision("c", "reject", None, None).unwrap();
 
         let scanned = db.get_segments(None).unwrap();
         let state = super::SessionState::from_db(&db).unwrap();

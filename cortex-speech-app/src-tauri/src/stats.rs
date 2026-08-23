@@ -335,7 +335,7 @@ mod tests {
         db.initialize().unwrap();
         for i in 0..12 {
             let speaker = format!("SPEAKER_{i:02}");
-            db.insert_segment(&seg(&format!("s{i}"), 1_000, true, Some(&speaker), "x")).unwrap();
+            db.insert_legacy_segment_fixture(&seg(&format!("s{i}"), 1_000, true, Some(&speaker), "x")).unwrap();
         }
         assert_eq!(list_speakers(&db).unwrap().len(), 12, "every distinct speaker is returned");
         assert_eq!(compute_stats(&db).unwrap().top_speakers.len(), 10, "the dashboard summary stays capped at 10");
@@ -348,7 +348,7 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         for i in 0..4 {
-            db.insert_segment(&seg(&format!("d{i}"), 3_000, false, Some("A"), "x")).unwrap();
+            db.insert_legacy_segment_fixture(&seg(&format!("d{i}"), 3_000, false, Some("A"), "x")).unwrap();
         }
         // Decisions at 1s, 4s, 6s (within-session deltas 3s, 2s) then one 500s later (a break, excluded).
         db.record_human_decision("d0", "accept", None, Some(1_000)).unwrap();
@@ -366,7 +366,7 @@ mod tests {
     fn review_timing_is_empty_without_timed_decisions() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("s1", 3_000, false, None, "x")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("s1", 3_000, false, None, "x")).unwrap();
         let rt = compute_stats(&db).unwrap().review_timing;
         assert_eq!(rt.decisions_logged, 0);
         assert_eq!(rt.median_seconds, None);
@@ -392,7 +392,7 @@ mod tests {
             seg("s2", 8_000, true, Some("A"), "سڵاو"), // u10 bucket, 8 UTF-8 bytes
             seg("s3", 35_000, false, Some("B"), "x"), // over_30s bucket, 1 byte
         ] {
-            db.insert_segment(&s).unwrap();
+            db.insert_legacy_segment_fixture(&s).unwrap();
         }
         let st = compute_stats(&db).unwrap();
 
@@ -421,9 +421,9 @@ mod tests {
         // never overstates the verified count by folding rejected clips into it.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("good", 1000, true, Some("A"), "ڕاست")).unwrap(); // verified-good
-        db.insert_segment(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap(); // pending
-        db.insert_segment(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap(); // verified=true but rejected
+        db.insert_legacy_segment_fixture(&seg("good", 1000, true, Some("A"), "ڕاست")).unwrap(); // verified-good
+        db.insert_legacy_segment_fixture(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap(); // pending
+        db.insert_legacy_segment_fixture(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap(); // verified=true but rejected
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
 
         let st = compute_stats(&db).unwrap();
@@ -446,9 +446,9 @@ mod tests {
         // A test that only checked the average would have called this clean.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("keep1", 1000, true, Some("A"), "abcd")).unwrap(); // 4 bytes
-        db.insert_segment(&seg("keep2", 1000, false, Some("A"), "ef")).unwrap(); // 2 bytes, pending
-        db.insert_segment(&seg("bad", 1000, true, Some("A"), "ZZZZZZZZZZ")).unwrap(); // 10 bytes, rejected
+        db.insert_legacy_segment_fixture(&seg("keep1", 1000, true, Some("A"), "abcd")).unwrap(); // 4 bytes
+        db.insert_legacy_segment_fixture(&seg("keep2", 1000, false, Some("A"), "ef")).unwrap(); // 2 bytes, pending
+        db.insert_legacy_segment_fixture(&seg("bad", 1000, true, Some("A"), "ZZZZZZZZZZ")).unwrap(); // 10 bytes, rejected
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
 
         let st = compute_stats(&db).unwrap();
@@ -469,7 +469,7 @@ mod tests {
         // whatever stale text sat in annotated/raw.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("edited", 1000, true, Some("A"), "old")).unwrap(); // raw = 3 bytes
+        db.insert_legacy_segment_fixture(&seg("edited", 1000, true, Some("A"), "old")).unwrap(); // raw = 3 bytes
         db.connection()
             .execute(
                 "UPDATE speech_segments SET verdict_transcript='corrected', human_decision='edit' WHERE id='edited'",
@@ -498,14 +498,14 @@ mod tests {
         // second copy of the filter would drift in exactly the same way and prove nothing.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("good", 1000, true, Some("A"), "دەقی ڕاست")).unwrap();
-        db.insert_segment(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap();
-        db.insert_segment(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("good", 1000, true, Some("A"), "دەقی ڕاست")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap();
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
         // A clip whose EFFECTIVE transcript is still the ASR placeholder, marked verified. Export
         // refuses to publish it (it is not a transcript); the dashboard must not call it verified
         // either, or it reports progress the dataset does not contain.
-        db.insert_segment(&seg("hold", 1000, true, Some("A"), "[Pending WSL 7B ASR]")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("hold", 1000, true, Some("A"), "[Pending WSL 7B ASR]")).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("dataset.jsonl");

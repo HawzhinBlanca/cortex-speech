@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn dpo_legacy_example_requires_current_matching_verified_edit() {
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
         db.insert_segment(&SpeechSegment {
             id: "legacy-dpo".into(),
             audio_path: "/legacy-dpo.wav".into(),
@@ -731,7 +731,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61]);
 
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1);
         db.connection()
@@ -758,7 +758,7 @@ mod tests {
         // differ from annotated/raw. Memory evidence must be judged against what the human actually
         // accepted; comparing the prior draft to itself would invert this Confirm into an Override.
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
         let original = "ئەو ساڵە باش بوو";
         let accepted = "ئەو ساڵە خراپ بوو";
         let memory = crate::corrections::extract_substitution_memories(original, accepted)
@@ -774,7 +774,7 @@ mod tests {
                 params![memory.wrong_token, memory.human_token, memory.slot_key, memory.phonetic_key],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61]);
 
         db.insert_segment(&SpeechSegment {
             id: "accepted-hypothesis-segment".into(),
@@ -883,8 +883,8 @@ mod tests {
             agreement_score: Some(0.77),
             ..SpeechSegment::default()
         };
-        db.insert_segment(&segment).expect("insert segment");
-        db.write_segment_verdict(
+        db.insert_legacy_segment_fixture(&segment).expect("insert segment");
+        db.write_legacy_machine_verdict_for_test(
             "seg-learning",
             "jury_accept",
             Some("agent wrong text"),
@@ -989,7 +989,7 @@ mod tests {
             evidence_json: Some(evidence),
             ..SpeechSegment::default()
         };
-        db.insert_segment(&segment).expect("insert segment");
+        db.insert_legacy_segment_fixture(&segment).expect("insert segment");
         db.insert_hypothesis(&SegmentHypothesis {
             segment_id: "seg-stale-reference-learning".to_string(),
             model_id: "omniasr-wsl-7b".to_string(),
@@ -1073,8 +1073,8 @@ mod tests {
             agreement_score: Some(0.88),
             ..SpeechSegment::default()
         };
-        db.insert_segment(&segment).expect("insert segment");
-        db.write_segment_verdict(
+        db.insert_legacy_segment_fixture(&segment).expect("insert segment");
+        db.write_legacy_machine_verdict_for_test(
             "seg-reference-learning",
             "jury_accept",
             Some("agent wrong text"),
@@ -1313,7 +1313,7 @@ mod tests {
             annotated_transcript: Some("کوردی ڕاست".to_string()), // the human's typed fix
             ..SpeechSegment::default()
         };
-        db.insert_segment(&seg).expect("insert");
+        db.insert_legacy_segment_fixture(&seg).expect("insert");
         db.connection()
             .execute("UPDATE speech_segments SET human_decision='accept' WHERE id='c-anno'", [])
             .expect("accept");

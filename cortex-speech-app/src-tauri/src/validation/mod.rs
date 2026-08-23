@@ -379,7 +379,7 @@ mod tests {
         let mut s = make_seg("num-1", "/fake/num.wav", "تەمەنی ١٤ ساڵ");
         s.annotated_transcript = Some("تەمەنی ١٤ ساڵ".to_string()); // digit-form human reference
         s.normalized_transcript = Some("تەمەنی یەک چوار ساڵ".to_string()); // one-way verbalized
-        db.insert_segment(&s).unwrap();
+        db.insert_legacy_segment_fixture(&s).unwrap();
 
         let report = validate_dataset(&db).unwrap();
         let high_rate = |issues: &[ValidationIssue]| {
@@ -411,7 +411,7 @@ mod tests {
         db.initialize().unwrap();
         let mut seg = make_seg("annotated", "/fake/path.wav", "");
         seg.annotated_transcript = Some("دەقی دەستکارد".to_string());
-        db.insert_segment(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
         let report = validate_dataset(&db).unwrap();
         assert!(
             !report.warnings.iter().any(|i| i.category == IssueCategory::EmptyTranscript),
@@ -442,7 +442,7 @@ mod tests {
     fn test_validate_annotations() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&SpeechSegment {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
             annotated_transcript: Some("".to_string()),
             ..make_seg("test1", "/path.wav", "hello")
         })

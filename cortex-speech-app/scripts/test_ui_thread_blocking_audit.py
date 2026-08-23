@@ -81,7 +81,6 @@ OFFLOADED_HIGH = [
     "import_audio_file",
     "resume_interrupted_import",
     "batch_transcribe",
-    "batch_verify",
     "batch_assign_speaker",
     "batch_normalize",
     "run_wsl_refinement",

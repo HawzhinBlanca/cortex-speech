@@ -8338,11 +8338,20 @@ pub fn run_jury_pipeline_core_via(
     segment_ids: Vec<String>,
     data_dir: Option<&std::path::Path>,
 ) -> Result<serde_json::Value, String> {
-    // Champion-only production mode has exactly one ASR by design. Running a multi-ASR jury here
-    // either treats stale auxiliary rows as votes or immediately fails its two-model coverage guard.
-    // Both outcomes violate the owner's sole-champion contract. Leave every fresh draft for the human
-    // review flow and keep the stricter multi-model proof confined to explicit non-champion/export use.
-    if settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+    // Schema v60 retired every machine-verdict writer: paid review truth now crosses only the
+    // evidence-backed human-decision boundary. Continuing into the historical jury at v60+ would do
+    // expensive work and then fail the import on its first forbidden write. Champion-only production
+    // also has exactly one ASR, so a multi-ASR jury is meaningless even against an archival schema.
+    // Keep the old jury executable only for explicit pre-v60 diagnostics and leave current drafts for
+    // human review. This guard is deliberately at the shared core so directory, file, audiobook, and
+    // direct-command callers cannot drift apart.
+    let schema_version = crate::migrations::get_current_version(db).map_err(|error| error.to_string())?;
+    if schema_version >= 60 || settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+        let reason = if schema_version >= 60 {
+            "Schema v60+ sends machine drafts directly to the evidence-backed human review flow; machine jury writes are retired"
+        } else {
+            "Champion-only mode sends OmniASR 7B drafts directly to human review; auxiliary-ASR jury is not run"
+        };
         return Ok(serde_json::json!({
             "mode": "not_required",
             "totalInput": segment_ids.len(),
@@ -8354,7 +8363,7 @@ pub fn run_jury_pipeline_core_via(
             "t1Committed": 0,
             "t2Committed": 0,
             "humanInbox": segment_ids.len(),
-            "reason": "Champion-only mode sends OmniASR 7B drafts directly to human review; auxiliary-ASR jury is not run"
+            "reason": reason
         }));
     }
 
@@ -8771,6 +8780,13 @@ mod tests {
         }
     }
 
+    fn legacy_machine_db() -> crate::db::Database {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
+        db
+    }
+
     fn copied_database(source: &crate::db::Database) -> crate::db::Database {
         let mut copy = crate::db::Database::open(":memory:").unwrap();
         copy.initialize().unwrap();
@@ -9098,7 +9114,7 @@ mod tests {
         // review_effect_state with a different timestamp and test the wrong authority first.
         let correction_floor = crate::db::Database::open(":memory:").unwrap();
         correction_floor.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&correction_floor, 1).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::rollback(&correction_floor, 2).unwrap(), vec![61, 60]);
         correction_floor
             .connection()
             .execute(
@@ -9110,7 +9126,7 @@ mod tests {
                 ["a".repeat(64)],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60, 61]);
         let correction_target = copied_database(&correction_floor);
         correction_target
             .connection()
@@ -9937,12 +9953,12 @@ mod tests {
 
         let legacy = crate::db::Database::open(":memory:").unwrap();
         legacy.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&legacy, 1).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::rollback(&legacy, 2).unwrap(), vec![61, 60]);
         let mut legacy_segment = test_segment("flag-legacy-authority", "flag-legacy.wav", "machine draft");
         legacy_segment.verified = true;
         legacy_segment.annotated_transcript = Some("immutable legacy truth".into());
         legacy.insert_segment_full(&legacy_segment).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61]);
         legacy
             .record_review_flag("flag-legacy-authority", "legacy concern", "00000000-0000-4000-8000-000000000807")
             .unwrap();
@@ -9954,7 +9970,7 @@ mod tests {
     fn mixed_flag_decision_chains_preserve_exact_rationale_through_undo_and_restore() {
         let flag_then_decision = crate::db::Database::open(":memory:").unwrap();
         flag_then_decision.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&flag_then_decision, 1).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::rollback(&flag_then_decision, 2).unwrap(), vec![61, 60]);
         insert_canonical_pay_segment(&flag_then_decision, "rationale-flag-decision");
         flag_then_decision
             .write_segment_verdict(
@@ -9967,7 +9983,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&flag_then_decision).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::run_migrations(&flag_then_decision).unwrap(), vec![60, 61]);
         flag_then_decision
             .record_review_flag("rationale-flag-decision", "flag rationale", "00000000-0000-4000-8000-000000000808")
             .unwrap();
@@ -10016,7 +10032,7 @@ mod tests {
 
         let decision_then_flag = crate::db::Database::open(":memory:").unwrap();
         decision_then_flag.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&decision_then_flag, 1).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::rollback(&decision_then_flag, 2).unwrap(), vec![61, 60]);
         insert_canonical_pay_segment(&decision_then_flag, "rationale-decision-flag");
         decision_then_flag
             .write_segment_verdict(
@@ -10029,7 +10045,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&decision_then_flag).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::run_migrations(&decision_then_flag).unwrap(), vec![60, 61]);
         decision_then_flag.finalize_human_review("rationale-decision-flag", "accept", None, Some(2), None).unwrap();
         let effect_id: i64 = decision_then_flag
             .connection()
@@ -11916,8 +11932,7 @@ mod tests {
 
     #[test]
     fn source_reference_commit_runs_before_t0_auto_accept() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = real_source_audio(&dir, "source.wav", 4000);
         let mut segment = test_segment("seg-reference-first", &audio_path, "wrong local consensus");
@@ -12000,6 +12015,33 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_retires_machine_jury_even_for_an_auxiliary_diagnostic_selection() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let segment = test_segment("current-schema-no-jury", "/audio/diagnostic.wav", "diagnostic draft");
+        db.insert_segment(&segment).unwrap();
+
+        let settings = crate::settings::AppSettings {
+            asr_model_size: crate::settings::AsrModelSize::CTC300M,
+            multi_engine_hypotheses: true,
+            jury_cloud_opt_in: true,
+            llm_api_key: "must-not-be-used".to_string(),
+            ..crate::settings::AppSettings::default()
+        };
+        let report = run_jury_pipeline_core(&db, &settings, vec![segment.id.clone()]).unwrap();
+        let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+
+        assert_eq!(report["mode"], "not_required");
+        assert_eq!(report["humanInbox"].as_u64(), Some(1));
+        assert!(
+            report["reason"].as_str().unwrap_or("").contains("Schema v60+"),
+            "the handoff must explain the current trust boundary: {report}"
+        );
+        assert!(fresh.verdict.is_none(), "the retired machine jury must not author review truth");
+        assert!(!fresh.escalated, "the retired machine jury must not rewrite queue state");
+    }
+
+    #[test]
     fn autonomy_dial_governs_every_machine_commit_stage_not_just_t0() {
         // Round-24 hunt #1 (HIGH): under Observe/Propose the dial was enforced only inside
         // run_t0_gate — the SAME pipeline run then machine-committed 'jury_accept' via the
@@ -12007,8 +12049,7 @@ mod tests {
         // segments the dial promised to stage.
 
         // ── Propose: a committable reference selection must STAGE, never commit. ──
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "propose.wav");
         let segment = test_segment("seg-propose", &audio_path, "wrong local consensus");
@@ -12035,8 +12076,7 @@ mod tests {
         // ── Observe: the pipeline writes NOTHING — a pre-staged verdict survives untouched. ──
         // (Before the fix, the T2-disabled fallback REWROTE the verdict rationale and NULLed the
         // IRT confidence of every escalated segment fed back through the review loop.)
-        let db2 = crate::db::Database::open(":memory:").unwrap();
-        db2.initialize().unwrap();
+        let db2 = legacy_machine_db();
         let seg2 = test_segment("seg-observe", "/audio/observe.wav", "draft");
         db2.insert_segment(&seg2).unwrap();
         insert_hypothesis(&db2, &seg2.id, "omniasr-wsl-7b", "draft", 0.9);
@@ -12080,8 +12120,7 @@ mod tests {
     /// join is sorted, whatever the query hands back.
     #[test]
     fn the_consensus_provenance_string_is_canonical_not_insertion_ordered() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = real_source_audio(&dir, "reference-order.wav", 4000);
         let mut segment = test_segment("seg-reference-order", &audio_path, "wrong local consensus");
@@ -12107,8 +12146,7 @@ mod tests {
 
     #[test]
     fn agreeing_source_references_preserve_per_model_evidence() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = real_source_audio(&dir, "agreeing-references.wav", 4000);
         let mut segment = test_segment("seg-reference-agreement", &audio_path, "wrong local consensus");
@@ -12143,8 +12181,7 @@ mod tests {
 
     #[test]
     fn source_reference_guard_blocks_t0_and_t1_auto_commit_when_inconclusive() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "guarded.wav");
         let segment = test_segment("seg-reference-guard", &audio_path, "fluent local phrase");
@@ -12167,8 +12204,7 @@ mod tests {
 
     #[test]
     fn incomplete_source_reference_model_coverage_blocks_auto_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "incomplete-reference-coverage.wav");
         let segment = test_segment("seg-incomplete-reference-coverage", &audio_path, "wrong local consensus");
@@ -12196,8 +12232,7 @@ mod tests {
 
     #[test]
     fn stale_source_reference_audio_identity_blocks_automatic_jury_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio = dir.path().join("same-path-source.wav");
         std::fs::write(&audio, b"current-audio-bytes").unwrap();
@@ -12233,8 +12268,7 @@ mod tests {
 
     #[test]
     fn missing_source_reference_audio_identity_blocks_automatic_jury_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "legacy-source-reference.wav");
         let segment = test_segment("seg-legacy-source-reference", &audio_path, "wrong local consensus");
@@ -12268,8 +12302,7 @@ mod tests {
 
     #[test]
     fn incomplete_hypothesis_model_coverage_blocks_t0_and_t1_auto_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let audio_path = "/audio/one-hypothesis.wav";
         let segment = test_segment("seg-one-hypothesis", audio_path, "fluent single model phrase");
         db.insert_segment(&segment).unwrap();
@@ -12292,8 +12325,7 @@ mod tests {
 
     #[test]
     fn source_reference_disagreement_blocks_automatic_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "conflicting-references.wav");
         let segment = test_segment("seg-reference-conflict", &audio_path, "fluent local phrase");

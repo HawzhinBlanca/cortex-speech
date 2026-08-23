@@ -59,7 +59,8 @@ fn a_withdrawn_recording_is_dropped_from_the_local_export() {
         verified: true,
         ..SpeechSegment::default()
     };
-    db.insert_segments_batch(&[keep, drop]).unwrap();
+    db.insert_legacy_segment_fixture(&keep).unwrap();
+    db.insert_legacy_segment_fixture(&drop).unwrap();
 
     // Fail-before shape: BOTH rows export while consent stands.
     let before = NamedTempFile::new().unwrap();
@@ -163,7 +164,7 @@ fn the_shared_export_filter_drops_rejected_and_placeholder_rows() {
     placeholder.annotated_transcript = None;
     placeholder.human_decision = None;
     for s in [&good, &rejected, &placeholder] {
-        db.insert_segment_full(s).unwrap();
+        db.insert_legacy_segment_fixture(s).unwrap();
     }
     db.record_human_decision("drop-rejected", "reject", None, None).unwrap();
     let rejected = db.get_segment_by_id("drop-rejected").unwrap().unwrap();
@@ -191,7 +192,7 @@ fn insert_machine_silver_segment_with_hf_coverage(
     segment.clipping_ratio = Some(0.0);
     segment.rms_db = Some(-20.0);
     segment.snr_db = Some(20.0);
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     let evidence_json = serde_json::json!({
         "referenceModelId": "source-reference:gemini-2.5-pro",
         "selectedModelId": "omniasr-wsl-7b",
@@ -199,7 +200,7 @@ fn insert_machine_silver_segment_with_hf_coverage(
         "shouldCommit": true
     })
     .to_string();
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         &segment.id,
         "jury_accept",
         Some("reference candidate"),
@@ -778,7 +779,7 @@ fn hf_export_persists_splits_only_after_a_successful_write() {
 
     let mut seg = sample_segment("hf-split-1");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
     assert!(db.get_segment_by_id("hf-split-1").unwrap().unwrap().split.is_none(), "split unset before export");
 
     let out_dir = tempfile::tempdir().unwrap();
@@ -827,10 +828,10 @@ fn hf_export_excludes_holdout_gold_audio_from_training() {
 
     let mut hseg = sample_segment("hold-1");
     hseg.audio_path = holdout_path.clone();
-    db.insert_segment_full(&hseg).unwrap();
+    db.insert_legacy_segment_fixture(&hseg).unwrap();
     let mut kseg = sample_segment("keep-1");
     kseg.audio_path = keep_path;
-    db.insert_segment_full(&kseg).unwrap();
+    db.insert_legacy_segment_fixture(&kseg).unwrap();
 
     // Register the holdout clip's source as a holdout gold reference.
     crate::eval::import_gold_segments(
@@ -906,7 +907,7 @@ fn exclude_holdout_excludes_a_missing_audio_segment_fail_closed() {
     // A training segment at a DIFFERENT path whose audio file does NOT exist.
     let mut seg = sample_segment("missing-1");
     seg.audio_path = tmp_dir.path().join("moved_away.wav").to_string_lossy().to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let kept = exclude_unexportable_segments(&db, vec![seg]).unwrap();
     assert!(
@@ -945,11 +946,11 @@ fn dataset_export_excludes_holdout_gold_audio_from_training_tables() {
     let mut hseg = sample_segment("hold-x");
     hseg.audio_path = holdout_path.clone();
     hseg.raw_transcript = "SECRETHOLDOUTREF".into();
-    db.insert_segment_full(&hseg).unwrap();
+    db.insert_legacy_segment_fixture(&hseg).unwrap();
     let mut kseg = sample_segment("keep-x");
     kseg.audio_path = keep_path;
     kseg.raw_transcript = "KEPTTRAININGTEXT".into();
-    db.insert_segment_full(&kseg).unwrap();
+    db.insert_legacy_segment_fixture(&kseg).unwrap();
 
     crate::eval::import_gold_segments(
         &db,
@@ -994,10 +995,10 @@ fn plain_export_excludes_holdout_gold_audio() {
     let keep_path = write_wav("keep.wav", 1000);
     let mut hseg = sample_segment("hold-1");
     hseg.audio_path = holdout_path.clone();
-    db.insert_segment_full(&hseg).unwrap();
+    db.insert_legacy_segment_fixture(&hseg).unwrap();
     let mut kseg = sample_segment("keep-1");
     kseg.audio_path = keep_path;
-    db.insert_segment_full(&kseg).unwrap();
+    db.insert_legacy_segment_fixture(&kseg).unwrap();
     crate::eval::import_gold_segments(
         &db,
         vec![crate::eval::GoldSegmentInput { audio_path: holdout_path, reference: "ref".into(), is_holdout: true }],
@@ -1019,8 +1020,8 @@ fn plain_export_excludes_human_rejected_segments() {
     let db_tmp = NamedTempFile::new().unwrap();
     let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
     db.initialize().unwrap();
-    db.insert_segment_full(&sample_segment("keep-1")).unwrap();
-    db.insert_segment_full(&sample_segment("bad-1")).unwrap();
+    db.insert_legacy_segment_fixture(&sample_segment("keep-1")).unwrap();
+    db.insert_legacy_segment_fixture(&sample_segment("bad-1")).unwrap();
     // Reviewer marks it bad: a human 'reject' decision (verdict=human_reject) while verified stays true.
     db.record_human_decision("bad-1", "reject", None, None).unwrap();
 
@@ -1052,7 +1053,7 @@ fn export_parquet_writes_valid_file() {
     let mut seg = sample_segment("pq-1");
     // Approximate (energy-heuristic) per-word timing — the marker Parquet must ship (audit P1 #8).
     seg.alignment_quality = Some("energy_heuristic".to_string());
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let out_tmp = NamedTempFile::new().unwrap();
     let out_path = out_tmp.path().with_extension("parquet");
@@ -1084,7 +1085,7 @@ fn export_parquet_replaces_existing_file() {
     let db_tmp = NamedTempFile::new().unwrap();
     let db = Database::open(db_tmp.path().to_str().unwrap()).unwrap();
     db.initialize().unwrap();
-    db.insert_segment_full(&sample_segment("pq-replace")).unwrap();
+    db.insert_legacy_segment_fixture(&sample_segment("pq-replace")).unwrap();
 
     let tmp_dir = tempfile::tempdir().unwrap();
     let out_path = tmp_dir.path().join("dataset.parquet");
@@ -1192,7 +1193,7 @@ fn export_huggingface_writes_dataset_files() {
 
     let mut seg = sample_segment("hf-1");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings::default();
@@ -1241,7 +1242,7 @@ fn hf_readme_provenance_lists_stored_model_version_not_export_day_setting() {
     let mut seg = sample_segment("hf-prov"); // gold + HF-exportable, so it is WRITTEN
     seg.audio_path = wav_path.to_string_lossy().to_string();
     seg.model_version_id = Some("omniasr-ctc-300m@sha-test".to_string());
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     // Default settings -> asr_model_size == WSL7B (the export-day value the OLD card printed).
@@ -1268,7 +1269,7 @@ fn export_huggingface_counts_dropped_missing_audio() {
     // A segment whose source audio simply does not exist on disk.
     let mut seg = sample_segment("missing-1");
     seg.audio_path = "/nonexistent/does_not_exist.wav".to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings::default();
@@ -1311,20 +1312,20 @@ fn export_huggingface_dropped_unavailable_counts_only_exportable_rows() {
     writer.finalize().unwrap();
     let mut present = sample_segment("hf-present");
     present.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&present).unwrap();
+    db.insert_legacy_segment_fixture(&present).unwrap();
 
     // One UNAVAILABLE source carrying BOTH a training-ready seg and a non-training-ready REVIEW seg.
     let missing_path = "/nonexistent/does_not_exist.wav".to_string();
     let mut missing_ready = sample_segment("missing-ready");
     missing_ready.audio_path = missing_path.clone();
-    db.insert_segment_full(&missing_ready).unwrap();
+    db.insert_legacy_segment_fixture(&missing_ready).unwrap();
     let mut missing_review = sample_segment("missing-review");
     missing_review.audio_path = missing_path.clone();
     missing_review.raw_transcript.clear();
     missing_review.normalized_transcript = None;
     missing_review.annotated_transcript = None;
     missing_review.verified = false;
-    db.insert_segment_full(&missing_review).unwrap();
+    db.insert_legacy_segment_fixture(&missing_review).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1360,7 +1361,7 @@ fn export_huggingface_skips_rows_not_ready_for_training() {
 
     let mut ready = sample_segment("hf-ready");
     ready.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&ready).unwrap();
+    db.insert_legacy_segment_fixture(&ready).unwrap();
 
     let mut reject = sample_segment("hf-reject");
     reject.audio_path = wav_path.to_string_lossy().to_string();
@@ -1368,7 +1369,7 @@ fn export_huggingface_skips_rows_not_ready_for_training() {
     reject.normalized_transcript = None;
     reject.annotated_transcript = None;
     reject.verified = false;
-    db.insert_segment_full(&reject).unwrap();
+    db.insert_legacy_segment_fixture(&reject).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1416,11 +1417,11 @@ fn hf_export_drops_a_withdrawn_recording_but_keeps_an_undeclared_one() {
 
     let mut kept = sample_segment("hf-kept");
     kept.audio_path = paths[0].to_string_lossy().to_string();
-    db.insert_segment_full(&kept).unwrap();
+    db.insert_legacy_segment_fixture(&kept).unwrap();
 
     let mut withdrawn = sample_segment("hf-withdrawn");
     withdrawn.audio_path = paths[1].to_string_lossy().to_string();
-    db.insert_segment_full(&withdrawn).unwrap();
+    db.insert_legacy_segment_fixture(&withdrawn).unwrap();
 
     let settings =
         crate::settings::AppSettings { hf_speaker_disjoint: false, ..crate::settings::AppSettings::default() };
@@ -1469,10 +1470,10 @@ fn hf_metadata_rows_are_ordered_deterministically_by_source_path() {
     // Insert the z-source segment FIRST (non-sorted insertion order).
     let mut sz = sample_segment("seg-from-z");
     sz.audio_path = wav_z.to_string_lossy().to_string();
-    db.insert_segment_full(&sz).unwrap();
+    db.insert_legacy_segment_fixture(&sz).unwrap();
     let mut sa = sample_segment("seg-from-a");
     sa.audio_path = wav_a.to_string_lossy().to_string();
-    db.insert_segment_full(&sa).unwrap();
+    db.insert_legacy_segment_fixture(&sa).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings {
@@ -1513,14 +1514,14 @@ fn export_huggingface_skips_machine_ready_rows_without_hypothesis_coverage() {
     weak.clipping_ratio = Some(0.0);
     weak.rms_db = Some(-20.0);
     weak.snr_db = Some(20.0);
-    db.insert_segment_full(&weak).unwrap();
+    db.insert_legacy_segment_fixture(&weak).unwrap();
     let evidence_json = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
         "shouldCommit": true
     })
     .to_string();
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         &weak.id,
         "jury_accept",
         Some("reference candidate"),
@@ -1545,7 +1546,7 @@ fn export_huggingface_skips_machine_ready_rows_without_hypothesis_coverage() {
     write_silent_wav(&companion_wav);
     let mut good = sample_segment("hf-good-companion");
     good.audio_path = companion_wav.to_string_lossy().to_string();
-    db.insert_segment_full(&good).unwrap();
+    db.insert_legacy_segment_fixture(&good).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1584,7 +1585,7 @@ fn export_huggingface_skips_machine_ready_rows_without_ready_agentic_report() {
     write_silent_wav(&companion_wav);
     let mut good = sample_segment("hf-good-companion");
     good.audio_path = companion_wav.to_string_lossy().to_string();
-    db.insert_segment_full(&good).unwrap();
+    db.insert_legacy_segment_fixture(&good).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1777,7 +1778,7 @@ fn export_huggingface_replaces_metadata_files() {
 
     let mut seg = sample_segment("hf-atomic");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let train_dir = out_dir.path().join("data/train");
@@ -1832,7 +1833,7 @@ fn hf_reexport_removes_orphan_wav_when_a_reviewed_source_becomes_unavailable() {
         } else {
             keep_wav_path.to_string_lossy().to_string()
         };
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
     }
 
     let out_dir = tempfile::tempdir().unwrap();
@@ -1893,10 +1894,10 @@ fn hf_partial_reexport_keeps_a_consistent_snapshot_of_the_available_source() {
 
     let mut sa = sample_segment("seg-a");
     sa.audio_path = a_wav.to_string_lossy().to_string();
-    db.insert_segment_full(&sa).unwrap();
+    db.insert_legacy_segment_fixture(&sa).unwrap();
     let mut sb = sample_segment("seg-b");
     sb.audio_path = b_wav.to_string_lossy().to_string();
-    db.insert_segment_full(&sb).unwrap();
+    db.insert_legacy_segment_fixture(&sb).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings =
@@ -1966,7 +1967,7 @@ fn hf_reexport_with_zero_training_ready_segments_preserves_the_prior_export() {
     seg.audio_path = wav_path.to_string_lossy().to_string();
     seg.verified = false;
     seg.human_decision = None; // a MACHINE draft (sample_segment now models human gold)
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
     let stored = db.get_segment_by_id("not-ready-seg").unwrap().unwrap();
     assert!(
         !quality::training_grade_for_segment(&stored).training_ready,
@@ -2016,7 +2017,7 @@ fn hf_reexport_that_writes_zero_clips_because_all_sources_vanished_preserves_the
 
     let mut seg = sample_segment("vanish-seg");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let settings = crate::settings::AppSettings::default();
@@ -2101,7 +2102,7 @@ fn hf_metadata_csv_neutralizes_a_formula_lead_in_the_file_name_column() {
     write_silent_wav(&wav_path);
     let mut seg = sample_segment("hfdash");
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     export_huggingface_dataset(&db, out_dir.path(), &crate::settings::AppSettings::default()).unwrap();
@@ -2134,7 +2135,7 @@ fn hf_export_failure_midway_preserves_the_prior_dataset() {
     write_silent_wav(&wav_path);
     let mut seg = sample_segment(&"x".repeat(300));
     seg.audio_path = wav_path.to_string_lossy().to_string();
-    db.insert_segment_full(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     // A prior GOOD export already on disk.
     let out_dir = tempfile::tempdir().unwrap();
@@ -2184,7 +2185,7 @@ fn export_refuses_a_dataset_where_every_clip_collapsed_into_one_split() {
         let mut seg = sample_segment(&format!("collapse-{i}"));
         seg.audio_path = wav_path.to_string_lossy().to_string();
         seg.speaker_id = Some("Hawzhin".to_string()); // one real person across every recording
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
     }
 
     let out_dir = tempfile::tempdir().unwrap();

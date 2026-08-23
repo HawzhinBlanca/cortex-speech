@@ -46,7 +46,7 @@ def activate(*args, **kwargs):
         return activator.activate(*args, **kwargs)
 
 
-def seed(root: Path, *, schema: int = 60) -> tuple[Path, dict[str, object]]:
+def seed(root: Path, *, schema: int = 61) -> tuple[Path, dict[str, object]]:
     db_path = root / "cortex-speech.db"
     conn = sqlite3.connect(db_path)
     conn.executescript(
@@ -257,7 +257,7 @@ def test_existing_pilot_cannot_reset_its_baseline_after_any_durable_activity() -
         assert json.loads(policy_path.read_text(encoding="utf-8"))["after_review_event_id"] == 863
 
 
-def test_schema60_activation_imports_session_and_completed_hidden_keys_into_one_namespace() -> None:
+def test_schema61_activation_imports_session_and_completed_hidden_keys_into_one_namespace() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         db_path, _ = seed(root)
@@ -309,7 +309,7 @@ def test_schema60_activation_imports_session_and_completed_hidden_keys_into_one_
         assert result["afterReviewEventId"] == 863
 
 
-def test_schema60_activation_rolls_back_when_hidden_history_exceeds_quota_or_schema_is_inexact() -> None:
+def test_schema61_activation_rolls_back_when_hidden_history_exceeds_quota_or_schema_is_inexact() -> None:
     for mutation, expected in (
         ("over_quota", "lifetime set exceeds"),
         ("missing_trigger", "trigger(s) missing"),

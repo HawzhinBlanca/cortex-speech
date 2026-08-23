@@ -19,6 +19,9 @@ pub const SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY: &str = "review_campaign.seq
 pub const SEQUENTIAL_CAMPAIGN_MODE: &str = "sequential_first_pass";
 pub const SEQUENTIAL_CAMPAIGN_STATUS: &str = "first_pass_active";
 pub const SECOND_PASS_REVIEWER: &str = "Alle";
+
+type CampaignTransitionEvidence = (String, String, String, i64, i64, i64, i64, String);
+type PairedDecisionEvidence = (i64, String, Option<String>, i64, String, Option<String>);
 const MAX_REVIEWER_NAME: usize = 40;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -359,7 +362,7 @@ fn validate_progress_authority(
     if registry != Some(expected_registry) {
         return Err("review campaign registry does not exactly match the base policy".to_string());
     }
-    let transition: Option<(String, String, String, i64, i64, i64, i64, String)> = db
+    let transition: Option<CampaignTransitionEvidence> = db
         .connection()
         .query_row(
             "SELECT transition_id, from_phase, to_phase, max_review_event_id,
@@ -1137,7 +1140,7 @@ fn first_and_second_evidence(
     conn: &rusqlite::Connection,
     policy: &SequentialReviewCampaign,
     segment_id: &str,
-) -> Result<(i64, String, Option<String>, i64, String, Option<String>), String> {
+) -> Result<PairedDecisionEvidence, String> {
     conn.query_row(
         "SELECT event.id, first.action, first.decision_annotated_transcript,
                 second.id, second.action, second.submitted_transcript

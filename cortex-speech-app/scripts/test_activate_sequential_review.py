@@ -195,3 +195,20 @@ def test_interruption_between_session_promotion_and_pilot_retirement_resumes_saf
         assert result["campaign"] == policy
         assert not (root / POLICY_FILE).exists()
         assert not (root / REVOCATION_FILE).exists()
+
+
+def main() -> int:
+    tests = (
+        test_activation_preserves_history_and_token_but_retires_every_pilot_surface,
+        test_cas_and_foreign_reviewer_fail_before_any_live_mutation,
+        test_interruption_between_session_promotion_and_pilot_retirement_resumes_safely,
+    )
+    for test in tests:
+        test()
+        print(f"ok  {test.__name__}")
+    print("sequential review activation tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

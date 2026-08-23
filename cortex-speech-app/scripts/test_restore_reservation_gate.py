@@ -284,7 +284,7 @@ def test_every_writer_start_checks_restore_pending() -> None:
     # The lifecycle helper owns the check+register critical section. The lock MUST be acquired before
     # restore_pending() is read and held until the handle is registered; checking in either adapter
     # would reopen the race between the reservation and the background writer becoming visible.
-    lifecycle = _fn_body(couch, "fn start_on_port_with_session_lifecycle", span=12_000)
+    lifecycle = _fn_body(couch, "fn start_on_port_with_session_lifecycle", span=30_000)
     lock = lifecycle.find("let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());")
     pending = lifecycle.find("if crate::commands::restore_pending()")
     register = lifecycle.find("*guard = Some(handle);")

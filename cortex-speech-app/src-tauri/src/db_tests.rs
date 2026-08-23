@@ -402,15 +402,16 @@ fn update_normalized_transcript_is_targeted_and_avoids_the_whole_row_clobber() {
     // A missing row reports false, not an error.
     assert!(!db.update_normalized_transcript("ghost", "x").unwrap());
 
-    // Contrast — the BUG the fix removes: the old whole-row upsert of the STALE snapshot wipes the
-    // concurrent edit back to None.
+    // The schema-v60 generic machine upsert is now also review-safe: even a stale full row cannot
+    // name or erase the concurrent human annotation.
     let mut whole_row = stale.clone();
     whole_row.normalized_transcript = Some("NORMALIZED".to_string());
     db.insert_segment(&whole_row).unwrap();
-    let clobbered = db.get_segment_by_id("n1").unwrap().unwrap();
+    let preserved = db.get_segment_by_id("n1").unwrap().unwrap();
     assert_eq!(
-        clobbered.annotated_transcript, None,
-        "the whole-row upsert of the stale snapshot CLOBBERS the concurrent edit — what the targeted update avoids"
+        preserved.annotated_transcript.as_deref(),
+        Some("human fix"),
+        "the schema-v60 machine upsert must preserve review-owned truth even from a stale snapshot"
     );
 }
 
@@ -643,7 +644,7 @@ fn redecision_undo_restores_the_database_owned_prior_decision_exactly() {
     let mut owner = make_segment("s1", "/a.wav");
     owner.annotated_transcript = Some("owner gold کە کە".into());
     owner.verified = true;
-    db.insert_segment(&owner).unwrap();
+    db.insert_legacy_segment_fixture(&owner).unwrap();
     ensure_test_audio_content_hash(&db, "s1");
     db.record_human_decision("s1", "edit", Some("owner gold کە کە"), None).unwrap();
     let prior = db.get_segment_by_id("s1").unwrap().unwrap();
@@ -724,9 +725,9 @@ fn suspect_first_ranks_escalated_by_real_confidence_not_recency() {
     for id in ["confident", "shaky", "legacy"] {
         db.insert_segment(&make_segment(id, "/audio/s.wav")).unwrap();
     }
-    db.write_segment_verdict("confident", "escalated", None, None, None, Some(0.9), true).unwrap();
-    db.write_segment_verdict("shaky", "escalated", None, None, None, Some(0.2), true).unwrap();
-    db.write_segment_verdict("legacy", "escalated", None, None, None, None, true).unwrap();
+    db.write_legacy_machine_verdict_for_test("confident", "escalated", None, None, None, Some(0.9), true).unwrap();
+    db.write_legacy_machine_verdict_for_test("shaky", "escalated", None, None, None, Some(0.2), true).unwrap();
+    db.write_legacy_machine_verdict_for_test("legacy", "escalated", None, None, None, None, true).unwrap();
 
     let ordered: Vec<String> = db.get_segments_suspect_first(None).unwrap().into_iter().map(|s| s.id).collect();
     assert_eq!(
@@ -791,11 +792,11 @@ fn dedicated_connection_via_path_shares_committed_data() {
         "dedicated connection must see rows committed by the primary connection"
     );
 
-    // A verdict written through the dedicated connection persists to the same file and is visible
-    // back to the primary — so the jury writing through it loses nothing.
-    dedicated.write_segment_verdict("s1", "jury_accept", Some("hi"), None, None, Some(0.9), false).unwrap();
+    // A targeted write through the dedicated connection persists to the same file and is visible
+    // back to the primary. Machine jury verdicts are intentionally disabled at schema v60+.
+    assert!(dedicated.update_normalized_transcript("s1", "hi").unwrap());
     let seen = primary.get_segment_by_id("s1").unwrap().unwrap();
-    assert_eq!(seen.verdict.as_deref(), Some("jury_accept"));
+    assert_eq!(seen.normalized_transcript.as_deref(), Some("hi"));
 }
 
 #[test]
@@ -1068,7 +1069,11 @@ fn reviewed_rows_refuse_whole_row_and_asr_upserts_and_preserve_attribution() {
     let snapshot = db.get_segment_by_id("rt-1").unwrap().unwrap();
     assert_eq!(snapshot.reviewed_by.as_deref(), Some("Sara"));
     let error = db.insert_segment_full(&snapshot).unwrap_err();
-    assert!(error.to_string().contains("paid policy-3 source identity is immutable"), "{error}");
+    assert!(
+        error.to_string().contains("review-owned field")
+            || error.to_string().contains("paid policy-3 source identity is immutable"),
+        "{error}"
+    );
     assert_eq!(
         db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
         Some("Sara"),
@@ -1200,7 +1205,7 @@ fn stored_transcripts_are_nfc_canonicalized() {
     let mut seg = make_segment("nfc1", "/a.wav");
     seg.raw_transcript = decomposed.to_string();
     seg.annotated_transcript = Some(decomposed.to_string());
-    db.insert_segment(&seg).unwrap();
+    db.insert_legacy_segment_fixture(&seg).unwrap();
 
     let stored = db.get_segment_by_audio_path("/a.wav").unwrap().unwrap();
     assert_eq!(stored.raw_transcript, composed, "raw_transcript must be stored NFC-composed");
@@ -1225,14 +1230,14 @@ fn asr_and_consensus_updates_store_nfc_so_search_still_matches() {
             Some(decomposed),
             Some(0.9),
             Some("heuristic"),
-            Some("omniasr-ctc-300m"),
+            Some("omniasr-wsl-7b"),
             false,
         )
         .unwrap());
     let s1 = db.get_segment_by_audio_path("/u1.wav").unwrap().unwrap();
     assert_eq!(s1.raw_transcript, composed, "ASR-update raw_transcript must be stored NFC");
     assert_eq!(s1.confidence_source.as_deref(), Some("heuristic"));
-    assert_eq!(s1.model_version_id.as_deref(), Some("omniasr-ctc-300m"));
+    assert_eq!(s1.model_version_id.as_deref(), Some("omniasr-wsl-7b"));
     assert!(!s1.cloud_call);
     assert!(db.search_segments(composed).unwrap().iter().any(|s| s.id == "u1"), "NFC query must find it");
 
@@ -1731,19 +1736,22 @@ fn machine_verdict_never_overwrites_a_human_decision() {
     db.insert_segment(&make_segment("hv1", "/hv1.wav")).unwrap();
     db.record_human_decision("hv1", "accept", None, None).unwrap();
 
-    db.write_segment_verdict("hv1", "jury_accept", Some("machine consensus"), Some("r"), None, Some(0.9), true)
-        .unwrap();
+    assert!(
+        db.write_segment_verdict("hv1", "jury_accept", Some("machine consensus"), Some("r"), None, Some(0.9), false)
+            .is_err(),
+        "schema-v60+ must reject the late machine writer before it can touch human truth"
+    );
 
     let seg = db.get_segment_by_id("hv1").unwrap().unwrap();
     assert_eq!(seg.verdict.as_deref(), Some("human_accept"), "machine verdict clobbered the human decision");
     assert_eq!(seg.human_decision.as_deref(), Some("accept"), "human_decision must be preserved");
     assert!(!seg.escalated, "a human-accepted segment must not be re-escalated by a late machine write");
 
-    // Sanity: the SAME machine write DOES apply to a fresh (non-human) segment — the guard is targeted.
+    // Schema-v60+ disables the same writer for fresh rows too; human review is the only authority.
     db.insert_segment(&make_segment("hv2", "/hv2.wav")).unwrap();
-    db.write_segment_verdict("hv2", "jury_accept", Some("machine"), None, None, Some(0.8), false).unwrap();
+    assert!(db.write_segment_verdict("hv2", "jury_accept", Some("machine"), None, None, Some(0.8), false).is_err());
     let seg2 = db.get_segment_by_id("hv2").unwrap().unwrap();
-    assert_eq!(seg2.verdict.as_deref(), Some("jury_accept"), "a machine verdict must apply to a non-human segment");
+    assert_eq!(seg2.verdict, None, "a disabled machine writer must leave an open row untouched");
 }
 
 #[test]
@@ -1751,8 +1759,16 @@ fn exact_human_effect_undo_restores_the_prior_machine_state() {
     let db = make_db();
     db.insert_segment(&make_segment("cl1", "/cl1.wav")).unwrap();
     ensure_test_audio_content_hash(&db, "cl1");
-    db.write_segment_verdict("cl1", "jury_accept", Some("machine"), Some("machine rationale"), None, Some(0.8), true)
-        .unwrap();
+    db.write_legacy_machine_verdict_for_test(
+        "cl1",
+        "jury_accept",
+        Some("machine"),
+        Some("machine rationale"),
+        None,
+        Some(0.8),
+        false,
+    )
+    .unwrap();
     let prior = db.get_segment_by_id("cl1").unwrap().unwrap();
     db.record_human_decision("cl1", "edit", Some("human gold"), None).unwrap();
     assert_eq!(db.get_segment_by_id("cl1").unwrap().unwrap().verdict.as_deref(), Some("human_edit"));
@@ -1773,7 +1789,7 @@ fn exact_human_effect_undo_restores_the_prior_machine_state() {
 fn human_decision_undo_refuses_rationale_drift() {
     let db = make_db();
     db.insert_segment(&make_segment("undo-rationale-cas", "/undo-rationale-cas.wav")).unwrap();
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         "undo-rationale-cas",
         "jury_accept",
         Some("machine"),
@@ -1906,12 +1922,12 @@ fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
     }
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 1).unwrap(), vec![60]);
+    assert_eq!(crate::migrations::rollback(&legacy, 2).unwrap(), vec![61, 60]);
     let mut legacy_reviewed = make_segment("flag-legacy", "/flag-legacy.wav");
     legacy_reviewed.verified = true;
     legacy_reviewed.annotated_transcript = Some("immutable legacy truth".into());
     legacy.insert_segment_full(&legacy_reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60]);
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61]);
     let commit = legacy
         .record_review_flag("flag-legacy", "legacy row needs adjudication", "00000000-0000-4000-8000-000000000904")
         .expect("an exact immutable pre-v60 reviewed baseline remains flaggable");
@@ -2337,7 +2353,7 @@ fn batch_transcription_update_preserves_human_review_and_never_writes_annotation
             Some("fresh asr"),
             Some(0.9),
             Some("heuristic"),
-            Some("omniasr-ctc-300m"),
+            Some("omniasr-wsl-7b"),
             false,
         )
         .expect("update verified");
@@ -2362,7 +2378,7 @@ fn batch_transcription_update_preserves_human_review_and_never_writes_annotation
             Some("new asr"),
             Some(0.8),
             Some("heuristic"),
-            Some("omniasr-ctc-300m"),
+            Some("omniasr-wsl-7b"),
             false,
         )
         .expect("update fresh");
@@ -2371,7 +2387,7 @@ fn batch_transcription_update_preserves_human_review_and_never_writes_annotation
     assert_eq!(after.raw_transcript, "new asr");
     assert_eq!(after.annotated_transcript, None, "machine text must NEVER enter the human-only field");
     assert_eq!(after.confidence_source.as_deref(), Some("heuristic"));
-    assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-300m"));
+    assert_eq!(after.model_version_id.as_deref(), Some("omniasr-wsl-7b"));
     assert!(!after.cloud_call);
 
     // (d): an unverified row the user annotated (without verifying) keeps that annotation; only
@@ -2379,7 +2395,7 @@ fn batch_transcription_update_preserves_human_review_and_never_writes_annotation
     let mut annotated = make_segment("annot-1", "/c.wav");
     annotated.raw_transcript = "old".to_string();
     annotated.annotated_transcript = Some("user typed".to_string());
-    db.insert_segment(&annotated).expect("insert annotated");
+    db.insert_legacy_segment_fixture(&annotated).expect("insert historical annotated fixture");
     let updated = db
         .update_batch_transcription_if_unreviewed(
             "annot-1",
@@ -2387,7 +2403,7 @@ fn batch_transcription_update_preserves_human_review_and_never_writes_annotation
             Some("new asr"),
             Some(0.7),
             Some("real_posterior"),
-            Some("omniasr-ctc-1b"),
+            Some("omniasr-wsl-7b"),
             false,
         )
         .expect("update annotated");
@@ -2396,7 +2412,7 @@ fn batch_transcription_update_preserves_human_review_and_never_writes_annotation
     assert_eq!(after.annotated_transcript.as_deref(), Some("user typed"), "existing annotation preserved");
     assert_eq!(after.raw_transcript, "new asr", "raw ASR refreshed on an unverified row");
     assert_eq!(after.confidence_source.as_deref(), Some("real_posterior"));
-    assert_eq!(after.model_version_id.as_deref(), Some("omniasr-ctc-1b"));
+    assert_eq!(after.model_version_id.as_deref(), Some("omniasr-wsl-7b"));
 }
 
 #[test]
@@ -2666,19 +2682,16 @@ fn human_edit_learning_uses_agent_proposal_before_raw_asr() {
     let mut seg = make_segment("learn-agent", "/data/audio/learn-agent.wav");
     seg.raw_transcript = "raw wrong transcript".to_string();
     seg.normalized_transcript = Some("normalized wrong transcript".to_string());
-    seg.verdict = Some("jury_accept".to_string());
-    seg.verdict_transcript = Some("agent proposed transcript".to_string());
-    seg.escalated = true;
     db.insert_segment(&seg).expect("insert segment");
     ensure_test_audio_content_hash(&db, "learn-agent");
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         "learn-agent",
         "jury_accept",
         Some("agent proposed transcript"),
         Some("agent rationale"),
         None,
         Some(0.81),
-        true,
+        false,
     )
     .expect("write agent verdict");
 
@@ -2708,11 +2721,18 @@ fn human_edit_skips_learning_pair_when_proposal_matches_fix() {
     let db = make_db();
     let mut seg = make_segment("learn-same", "/data/audio/learn-same.wav");
     seg.raw_transcript = "same text".to_string();
-    seg.verdict_transcript = Some("same   text".to_string());
     db.insert_segment(&seg).expect("insert segment");
     ensure_test_audio_content_hash(&db, "learn-same");
-    db.write_segment_verdict("learn-same", "jury_accept", Some("same   text"), None, None, Some(0.9), true)
-        .expect("write agent verdict");
+    db.write_legacy_machine_verdict_for_test(
+        "learn-same",
+        "jury_accept",
+        Some("same   text"),
+        None,
+        None,
+        Some(0.9),
+        false,
+    )
+    .expect("write agent verdict");
 
     db.record_human_decision("learn-same", "edit", Some("same text"), None).expect("record human edit");
 
@@ -2738,7 +2758,7 @@ fn record_human_decision_uses_stored_pcm_hash_for_corrections_ledger() {
     let expected_hash = ensure_test_audio_content_hash(&db, "led-1");
     std::fs::write(&audio, b"different bytes after import").expect("mutate source after canonical import");
     // The agent verdict the human is about to override (captured into jury_verdict).
-    db.write_segment_verdict("led-1", "jury_accept", Some("agent guess"), None, None, Some(0.7), true)
+    db.write_legacy_machine_verdict_for_test("led-1", "jury_accept", Some("agent guess"), None, None, Some(0.7), false)
         .expect("write agent verdict");
 
     db.record_human_decision("led-1", "edit", Some("right text"), None).expect("record edit");
@@ -3213,7 +3233,7 @@ fn restore_stages_pending_migrations_and_foreign_keys_before_overwriting_live_da
     {
         let candidate = Database::open(migration_fail_path.to_str().unwrap()).unwrap();
         candidate.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&candidate, 3).unwrap(), vec![60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&candidate, 4).unwrap(), vec![61, 60, 59, 58]);
         candidate
             .connection()
             .execute_batch(
@@ -3629,12 +3649,12 @@ fn escalation_write_with_no_confidence_preserves_the_persisted_irt_confidence() 
     // the earlier signal; a caller WITH a signal must still win.
     let db = make_db();
     db.insert_segment(&make_segment("esc", "/audio/esc.wav")).unwrap();
-    db.write_segment_verdict("esc", "escalated", None, None, None, Some(0.83), true).unwrap();
-    db.write_segment_verdict("esc", "escalated", None, Some("cloud off"), None, None, true).unwrap();
+    db.write_legacy_machine_verdict_for_test("esc", "escalated", None, None, None, Some(0.83), true).unwrap();
+    db.write_legacy_machine_verdict_for_test("esc", "escalated", None, Some("cloud off"), None, None, true).unwrap();
     let seg = db.get_segment_by_id("esc").unwrap().unwrap();
     assert_eq!(seg.agreement_score, Some(0.83), "a None re-write must not destroy the IRT confidence");
     // A later write that CARRIES a signal still replaces it.
-    db.write_segment_verdict("esc", "escalated", None, None, None, Some(0.41), true).unwrap();
+    db.write_legacy_machine_verdict_for_test("esc", "escalated", None, None, None, Some(0.41), true).unwrap();
     let seg = db.get_segment_by_id("esc").unwrap().unwrap();
     assert_eq!(seg.agreement_score, Some(0.41));
 }
@@ -3647,8 +3667,9 @@ fn c4_precision_refuses_deleting_a_contradicted_auto_accept() {
     db.insert_segment(&make_segment("good", "/audio/g.wav")).unwrap();
     db.insert_segment(&make_segment("bad", "/audio/b.wav")).unwrap();
     // Two T0 auto-accepts; the human confirms one and contradicts the other.
-    db.write_segment_verdict("good", "auto_accept", Some("ok"), None, None, Some(0.9), false).unwrap();
-    db.write_segment_verdict("bad", "auto_accept", Some("wrong"), None, None, Some(0.9), false).unwrap();
+    db.write_legacy_machine_verdict_for_test("good", "auto_accept", Some("ok"), None, None, Some(0.9), false).unwrap();
+    db.write_legacy_machine_verdict_for_test("bad", "auto_accept", Some("wrong"), None, None, Some(0.9), false)
+        .unwrap();
     db.record_human_decision("good", "accept", None, None).unwrap();
     db.record_human_decision("bad", "reject", None, None).unwrap();
 
@@ -3709,12 +3730,12 @@ fn c3_calibration_count_excludes_human_rejected_verified_clips() {
     good.verified = true;
     good.annotated_transcript = Some("دەقی باش".to_string());
     good.snr_db = Some(20.0);
-    db.insert_segment(&good).unwrap();
+    db.insert_legacy_segment_fixture(&good).unwrap();
     let mut bad = make_segment("cal-bad", "/audio/cb.wav");
     bad.verified = true;
     bad.annotated_transcript = Some("دەقی خراپ".to_string());
     bad.snr_db = Some(20.0);
-    db.insert_segment(&bad).unwrap();
+    db.insert_legacy_segment_fixture(&bad).unwrap();
     // markBad keeps verified=true and sets the reject decision.
     db.conn
         .execute("UPDATE speech_segments SET human_decision='reject', verdict='human_reject' WHERE id='cal-bad'", [])
@@ -4154,7 +4175,7 @@ fn streamed_active_learning_ranking_matches_collect_then_sort() {
     // Mixed verified/unverified with varied confidence + ctc_score, so nonconformity actually spreads
     // and ties genuinely occur (every 5th clip shares a score with another).
     for i in 0..40 {
-        db.insert_segment(&SpeechSegment {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
             id: format!("s{i:03}"),
             audio_path: format!("/audio/{}.wav", i / 4),
             raw_transcript: format!("دەق {i}"),
@@ -4237,7 +4258,7 @@ fn renaming_the_agreement_column_preserves_its_values() {
     })
     .unwrap();
     // write_segment_verdict is the production path — insert_segment silently drops jury fields.
-    db.write_segment_verdict("s1", "escalated", None, None, None, Some(0.73), true).unwrap();
+    db.write_legacy_machine_verdict_for_test("s1", "escalated", None, None, None, Some(0.73), true).unwrap();
 
     let back = db.get_segment_by_id("s1").unwrap().unwrap();
     assert_eq!(back.agreement_score, Some(0.73), "the agreement value must survive the rename");
@@ -4393,7 +4414,7 @@ fn streaming_the_corpus_statistics_equals_collecting_them_first() {
     for i in 0..24 {
         let verified = i % 2 == 0;
         let annotated = i % 3 != 0;
-        db.insert_segment(&SpeechSegment {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
             id: format!("s{i:03}"),
             audio_path: format!("/audio/{}.wav", i / 4),
             raw_transcript: format!("خاڵی ژمارە {i}"),
@@ -4548,7 +4569,7 @@ fn suspect_first_ranks_poor_audio_ahead_of_high_agreement() {
     // Clean audio, high agreement — the genuinely least suspect row.
     db.insert_segment(&mk("clean", 30.0, 0.0)).unwrap();
     for (id, conf) in [("noisy", 0.97), ("clipped", 0.95), ("disputed", 0.20), ("clean", 0.99)] {
-        db.write_segment_verdict(id, "escalated", None, None, None, Some(conf), true).unwrap();
+        db.write_legacy_machine_verdict_for_test(id, "escalated", None, None, None, Some(conf), true).unwrap();
     }
 
     let order: Vec<String> = db.get_segments_suspect_first(None).unwrap().into_iter().map(|s| s.id).collect();
@@ -5504,7 +5525,7 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
     let db = make_db();
     let policy = "c".repeat(64);
     for id in ["pilot-result", "pilot-skip", "pilot-unreserved"] {
-        db.insert_segment_full(&make_hidden_check_segment(id, &format!("/{id}.wav"), "ڕاست")).unwrap();
+        db.insert_legacy_segment_fixture(&make_hidden_check_segment(id, &format!("/{id}.wav"), "ڕاست")).unwrap();
         ensure_test_audio_content_hash(&db, id);
     }
     db.reserve_review_pilot_hidden_keys(&policy, 0, "Sara", &["pilot-result".into(), "pilot-skip".into()], 2).unwrap();
@@ -5605,7 +5626,7 @@ fn pilot_spot_result_requires_exact_reservation_and_is_atomic_and_idempotent() {
 #[test]
 fn hidden_judgement_requires_current_playback_inside_its_atomic_write() {
     let db = make_db();
-    db.insert_segment_full(&make_hidden_check_segment("hidden-proof", "/hidden-proof.wav", "ڕاست")).unwrap();
+    db.insert_legacy_segment_fixture(&make_hidden_check_segment("hidden-proof", "/hidden-proof.wav", "ڕاست")).unwrap();
 
     let missing = db
         .record_spot_check_with_operation(
@@ -5684,7 +5705,7 @@ fn hidden_judgement_requires_current_playback_inside_its_atomic_write() {
 #[test]
 fn hidden_result_rechecks_the_canonical_answer_key_and_skip_remains_zero_credit() {
     let db = make_db();
-    db.insert_segment_full(&make_hidden_check_segment("hidden-key", "/hidden-key.wav", "کۆن")).unwrap();
+    db.insert_legacy_segment_fixture(&make_hidden_check_segment("hidden-key", "/hidden-key.wav", "کۆن")).unwrap();
     db.connection()
         .execute("UPDATE speech_segments SET verdict_transcript = 'نوێ' WHERE id = 'hidden-key'", [])
         .unwrap();
@@ -5735,7 +5756,7 @@ fn pilot_reservation_backfills_completed_v58_checks_before_minting_fresh_keys() 
     let db = make_db();
     let policy = "f".repeat(64);
     for (index, id) in ["completed-hidden-a", "completed-hidden-b"].into_iter().enumerate() {
-        db.insert_segment_full(&make_hidden_check_segment(id, &format!("/{id}.wav"), "ڕاست")).unwrap();
+        db.insert_legacy_segment_fixture(&make_hidden_check_segment(id, &format!("/{id}.wav"), "ڕاست")).unwrap();
         let reviewer = if index == 0 { "Sara" } else { "sARA" };
         let proof = full_playback_proof(&db, id, reviewer);
         db.record_spot_check_with_operation(
@@ -5792,9 +5813,9 @@ fn pilot_hidden_key_reservation_serializes_the_final_two_slots_across_connection
 }
 
 #[test]
-fn schema_v58_upgrades_through_v60_without_reinterpreting_live_baseline_863() {
+fn schema_v58_upgrades_through_v61_without_reinterpreting_live_baseline_863() {
     let db = make_db();
-    assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![60, 59]);
+    assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![61, 60, 59]);
     db.connection()
         .execute(
             "INSERT INTO review_events
@@ -5803,7 +5824,7 @@ fn schema_v58_upgrades_through_v60_without_reinterpreting_live_baseline_863() {
             [],
         )
         .unwrap();
-    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60]);
+    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60, 61]);
     let policy = "8".repeat(64);
     assert_eq!(
         db.reserve_review_pilot_hidden_keys(&policy, 863, "Sara", &["baseline-863-hidden".into()], 2).unwrap(),
@@ -6162,7 +6183,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     assert_refused(&db, "delete-spot");
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 1).unwrap(), vec![60]);
+    assert_eq!(crate::migrations::rollback(&legacy, 2).unwrap(), vec![61, 60]);
     let mut reviewed = make_segment("delete-legacy", "/delete-legacy.wav");
     reviewed.verified = true;
     reviewed.human_decision = Some("accept".into());
@@ -6170,7 +6191,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     reviewed.verdict_transcript = Some("legacy truth".into());
     reviewed.annotated_transcript = Some("legacy truth".into());
     legacy.insert_segment_full(&reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60]);
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61]);
     assert_refused(&legacy, "delete-legacy");
 
     db.insert_segment(&make_segment("delete-batch-clean", "/delete-batch-clean.wav")).unwrap();
@@ -6336,9 +6357,15 @@ fn segment_pages_use_stable_keysets_and_lightweight_rows() {
     ] {
         let mut segment = make_segment(id, &format!("/{id}.wav"));
         segment.alignment_json = Some(r#"{"version":1,"words":[]}"#.into());
-        segment.evidence_json = Some(r#"{"large":"payload"}"#.into());
+        // Keep the row deleted below authority-free. A different row carries the large review
+        // payload so the page still proves that projection is lightweight.
+        segment.evidence_json = (id == "b").then(|| r#"{"large":"payload"}"#.into());
         segment.created_at = Some(created.to_string());
-        db.insert_segment_full(&segment).unwrap();
+        if segment.evidence_json.is_some() {
+            db.insert_legacy_segment_fixture(&segment).unwrap();
+        } else {
+            db.insert_segment_full(&segment).unwrap();
+        }
     }
 
     let first = db.get_segments_page(None, None, "newest", 2, None).unwrap();
@@ -6455,7 +6482,7 @@ fn the_escalation_queue_obeys_the_voice_focus() {
     for id in ["host-1", "guest-1", "host-2"] {
         let mut s = make_segment(id, &format!("/{id}.wav"));
         s.escalated = true;
-        db.insert_segment_full(&s).unwrap();
+        db.insert_legacy_segment_fixture(&s).unwrap();
     }
     let focus: std::collections::HashSet<String> = ["host-1", "host-2"].iter().map(|s| s.to_string()).collect();
 
@@ -6487,7 +6514,7 @@ fn every_segment_sort_walks_each_row_exactly_once() {
         segment.escalated = index == 3;
         segment.agreement_score = Some(0.3 + index as f64 * 0.1);
         segment.snr_db = Some(if index == 2 { 2.0 } else { 20.0 });
-        db.insert_segment(&segment).unwrap();
+        db.insert_legacy_segment_fixture(&segment).unwrap();
     }
 
     for sort in ["newest", "oldest", "duration", "verified", "confidence", "activeLearning", "suspectFirst"] {

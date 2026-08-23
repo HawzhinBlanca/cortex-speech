@@ -1787,7 +1787,7 @@ impl Database {
                  denoised=excluded.denoised,
                  diarized=excluded.diarized,
                  vad_backend=excluded.vad_backend,
-                 speaker_change_score=excluded.speaker_change_score,
+                 speaker_change_score=COALESCE(excluded.speaker_change_score, speech_segments.speaker_change_score),
                  updated_at=datetime('now')",
             params![
                 segment.id,
@@ -2195,6 +2195,18 @@ impl Database {
         Ok(())
     }
 
+    /// Insert an exact historical row for a unit-test fixture.
+    ///
+    /// Schema v60 deliberately forbids generic production writers from authoring review-owned
+    /// columns. A number of export, migration, and statistics tests still need to construct legacy
+    /// rows so their read-side behaviour can be verified. Keeping that capability behind
+    /// `cfg(test)` preserves those fixtures without weakening the production boundary or teaching
+    /// tests to disable triggers with ad-hoc SQL.
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_segment_fixture(&self, seg: &SpeechSegment) -> AppResult<()> {
+        self.insert_segment_full_unchecked(seg)
+    }
+
     /// Legacy batch verification cannot create schema-v60 human truth: every production review must
     /// have an immutable decision effect (or belong to the frozen pre-v60 authority snapshot).
     pub fn update_verified(&self, _id: &str, _verified: bool) -> AppResult<bool> {
@@ -2332,7 +2344,10 @@ impl Database {
                              denoised=excluded.denoised,
                              diarized=excluded.diarized,
                              vad_backend=excluded.vad_backend,
-                             speaker_change_score=excluded.speaker_change_score,
+                             speaker_change_score=COALESCE(
+                                 excluded.speaker_change_score,
+                                 speech_segments.speaker_change_score
+                             ),
                              updated_at=datetime('now')",
                     )
                 })

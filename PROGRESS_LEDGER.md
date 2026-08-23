@@ -11034,3 +11034,24 @@ and unrelated to `3694999`: live watchdog intentionally disabled during import, 
 commit `e68c9f9` changed reject pay to zero while an existing canonical Couch test still requires a
 reject to count as reviewed audio. Do not edit the money rule/test/canon by implication; owner
 authorization remains `change canon: review compensation`.
+
+## 2026-08-23 — schema-61 release-gate convergence
+
+Hardened the Rubar-first/Alle-second Lamo campaign without contacting reviewers, starting services,
+or loading a GPU. Production review ownership remains fail-closed: generic machine writers cannot
+author or overwrite human decisions, and historical test data now enters only through explicit
+test-only legacy fixtures. Fixed a real stale machine-upsert defect that could erase an existing
+`speaker_change_score` when an unrelated update carried no new measurement.
+
+Fresh automated evidence from the working release candidate: the complete Rust library suite passed
+1,508 tests with 0 failures (8 explicitly isolated hardware/benchmark tests); all 209 database tests,
+69 command/recovery tests, and 19 jury tests passed; frontend typecheck reported 0 errors and warnings;
+292 Vitest tests passed; ESLint, Prettier, and the Vite production build passed. All 101 Python policy
+scripts passed. The wider all-target run then exposed two directory-import failures: schema-v60
+imports still entered the retired machine-jury path and failed on its first forbidden verdict write.
+The shared jury core now makes every current-schema caller a no-write human-review handoff, so file,
+directory, audiobook, and direct-command paths cannot drift; the 10-test import E2E suite and a new
+schema-boundary regression pass. The remaining integration/property/soak targets also pass after
+their historical fixtures were made explicit instead of weakening schema-v60 production guards.
+`cargo fmt --check`, all-target clippy with warnings denied, and `git diff --check` are green. Source baseline:
+`4b9965486836cd33f3b9eb1e97a439065472c19e`.

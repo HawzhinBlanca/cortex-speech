@@ -245,12 +245,15 @@ fn run() -> Result<serde_json::Value, String> {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     match run() {
-        Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())),
+        Ok(value) => {
+            println!("{}", serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()));
+            std::process::ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("campaign_admin: {error}");
-            std::process::exit(2);
+            std::process::ExitCode::from(2)
         }
     }
 }

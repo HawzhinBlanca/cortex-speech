@@ -597,7 +597,6 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
     required = [
         'tracing::error!("Batch transcribe DB prefetch failed: {error}")',
         'let segments = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;',
-        'tracing::error!("Batch verify DB update failed for {id}: {error}")',
         'tracing::error!("Batch speaker assignment DB update failed for {id}: {error}")',
         '.get_segments_by_ids(&segment_ids)\n        .map_err(|e| e.to_string())?',
         'let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',

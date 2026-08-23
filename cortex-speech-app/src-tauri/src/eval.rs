@@ -1408,7 +1408,7 @@ mod tests {
         // micro-CER + CI) over a row that never ships (export_dataset drops it via is_human_rejected).
         let db = open_mem_db();
         for (id, decision, verdict) in [("acc", "edit", "jury_edit"), ("rej", "reject", "human_reject")] {
-            db.insert_segment(&crate::db::SpeechSegment {
+            db.insert_legacy_segment_fixture(&crate::db::SpeechSegment {
                 id: id.to_string(),
                 audio_path: format!("/clips/{id}.wav"),
                 raw_transcript: "خاو".to_string(),
@@ -1463,7 +1463,8 @@ mod tests {
             )
             .unwrap();
 
-        db.write_segment_verdict("s1", "jury_edit", Some("دەقی جوری"), None, None, None, false).unwrap();
+        db.write_legacy_machine_verdict_for_test("s1", "jury_edit", Some("دەقی جوری"), None, None, None, false)
+            .unwrap();
         db.record_human_decision("s1", "edit", Some("دەقی مرۆڤ"), None).unwrap();
 
         let (jury, human): (Option<String>, Option<String>) = db

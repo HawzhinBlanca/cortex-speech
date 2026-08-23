@@ -817,12 +817,7 @@ def audit_active_hidden_state(
                    ON event.segment_id = key.segment_id
                   AND event.reviewer = key.reviewer COLLATE NOCASE
                 WHERE key.policy_sha256 = ? AND key.after_review_event_id = ?
-                  AND NOT (
-                      event.id > key.after_review_event_id AND (
-                          event.source = 'couch_spot_check'
-                          OR (event.source = 'couch' AND event.action = 'skip')
-                      )
-                  )
+                  AND event.id <= key.after_review_event_id
                 ORDER BY event.id
                 LIMIT 1""",
             (digest, baseline),

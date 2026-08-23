@@ -22,7 +22,7 @@ session and every phase change must be proven again against the exact live files
 Run PowerShell from the repository root:
 
 ```powershell
-$Repo = 'C:\Users\Wareen\Desktop\cortex-speech\cortex-speech-app'
+$Repo = (Get-Location).Path
 $Data = Join-Path $env:APPDATA 'cortex-speech'
 $Db = Join-Path $Data 'cortex-speech.db'
 $Focus = Join-Path $Data 'voice_focus.json'

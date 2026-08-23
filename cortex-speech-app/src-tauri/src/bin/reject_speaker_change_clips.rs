@@ -73,7 +73,7 @@ fn run(data_dir: &Path, apply: bool) -> Result<(), String> {
     // Selection and finalization must observe one generation. `--apply` therefore shares the
     // desktop's exclusive instance lock instead of writing beside a live app/restore.
     let _instance_lock = if apply {
-        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(&data_dir).map_err(|error| {
+        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(data_dir).map_err(|error| {
             format!(
                 "Cannot apply bulk rejection while Cortex is running: {error}. Stop review and close the app first."
             )

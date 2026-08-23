@@ -433,7 +433,7 @@ mod tests {
         seg.is_gold = true;
         seg.agreement_score = Some(0.9);
         seg.rationale = Some("reviewed".to_string());
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
 
         let err = db.delete_segment("g1").expect_err("reviewed/gold authority must be append-only");
         assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
@@ -468,7 +468,7 @@ mod tests {
         seg.human_decision = Some("edit".to_string());
         seg.verdict = Some("human_edit".to_string());
         seg.verdict_transcript = Some("دەقی ڕاست".to_string());
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
         db.connection()
             .execute(
                 "UPDATE speech_segments
@@ -514,7 +514,7 @@ mod tests {
         let mut seg = make_segment("mx1", "دەق");
         // 0.4121: a clip the owner heard as turn-taking in the blind listening pass.
         seg.speaker_change_score = Some(0.4121);
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
 
         let snapshot = db.get_segment_by_id("mx1").unwrap().unwrap();
         assert_eq!(snapshot.speaker_change_score, Some(0.4121), "the score is stored before the delete");
@@ -597,7 +597,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         // Persist the fully-provenanced row, then read it back as the snapshot the delete would capture.
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
         let snapshot = db.get_segment_by_id("prov1").unwrap().unwrap();
         assert_eq!(snapshot.verdict.as_deref(), Some("human_edit"));
         assert_eq!(snapshot.created_at.as_deref(), Some("2020-01-02 03:04:05"));

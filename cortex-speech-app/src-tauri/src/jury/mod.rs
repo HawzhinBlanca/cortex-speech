@@ -923,6 +923,13 @@ mod tests {
         }
     }
 
+    fn legacy_machine_db() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
+        db
+    }
+
     /// The four escalation causes must be DISTINGUISHABLE, and each must fire only on its own cause.
     ///
     /// P1.2. `has_hard_distrust_veto` returned a bool, so "the audio is unusable", "only one model
@@ -1202,7 +1209,7 @@ mod tests {
     fn few_shot_legacy_example_requires_current_verified_edit_with_matching_text() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 1).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
         db.insert_segment(&make_seg("legacy-example", "wrong draft")).unwrap();
         db.insert_segment(&make_seg("legacy-query", "human fix")).unwrap();
         db.connection()
@@ -1220,7 +1227,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61]);
 
         assert_eq!(get_few_shot_examples(&db, "legacy-query", 10).unwrap().len(), 1);
         db.connection()
@@ -1347,8 +1354,7 @@ mod tests {
     #[test]
     fn run_t0_gate_observe_writes_no_verdict_unlike_actconfirm() {
         use crate::settings::AutonLevel;
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         db.insert_segment(&make_seg("s-dial", "کوردستان")).unwrap();
         // Two disagreeing hypotheses -> the base gate escalates this segment.
         for (m, t) in [("gemini", "کوردستان"), ("asr-1b", "ئێران")] {
@@ -1385,7 +1391,10 @@ mod tests {
         db.insert_segment(&make_seg("s-hv", "raw text")).unwrap();
         db.record_human_decision("s-hv", "accept", None, None).unwrap();
 
-        write_verdict(&db, "s-hv", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        assert!(
+            write_verdict(&db, "s-hv", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).is_err(),
+            "schema-v60+ machine verdicts fail before touching human truth"
+        );
 
         let seg = db.get_segment_by_id("s-hv").unwrap().unwrap();
         assert_eq!(seg.verdict.as_deref(), Some("human_accept"), "T0 write_verdict clobbered the human decision");
@@ -1400,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn write_verdict_never_touches_a_flag_verified_row_and_preserves_its_own_proposal() {
+    fn write_verdict_is_disabled_for_flag_verified_and_open_rows() {
         // Audit #17: the guard checked human_decision/verdict but not `verified` — a clip the human
         // closed out with the verify flag alone still had its verdict columns restamped by the jury.
         // Audit #18: parity with db::write_segment_verdict — the machine's own committed text is
@@ -1411,21 +1420,23 @@ mod tests {
 
         db.insert_segment(&make_seg("s-flag", "raw text")).unwrap();
         db.update_verified_for_test("s-flag", true).unwrap();
-        write_verdict(&db, "s-flag", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        assert!(write_verdict(&db, "s-flag", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9))
+            .is_err());
         let seg = db.get_segment_by_id("s-flag").unwrap().unwrap();
         assert_eq!(seg.verdict, None, "a flag-verified row must not be restamped by the machine jury");
 
         db.insert_segment(&make_seg("s-open", "raw text")).unwrap();
-        write_verdict(&db, "s-open", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        assert!(write_verdict(&db, "s-open", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9))
+            .is_err());
         let jt: Option<String> = db
             .connection()
             .query_row("SELECT jury_transcript FROM speech_segments WHERE id = 's-open'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(jt.as_deref(), Some("machine consensus"), "the jury's own proposal is preserved (v48 parity)");
+        assert_eq!(jt, None, "a disabled writer must leave the open row untouched");
     }
 
     #[test]
-    fn write_verdict_records_t0_t1_in_decision_verdicts() {
+    fn disabled_write_verdict_records_no_t0_t1_classification() {
         // P1.2: the IRT-consensus jury path previously wrote NO decision_verdicts row, so auto-accepts
         // from the main jury were invisible to the C4 auto-accept-precision denominator. Now
         // AutoAccept -> T0_ACCEPT, Escalated -> T1_ESCALATE, and a late write over a human decision
@@ -1437,9 +1448,9 @@ mod tests {
         db.insert_segment(&make_seg("hv", "raw c")).unwrap();
         db.record_human_decision("hv", "accept", None, None).unwrap();
 
-        write_verdict(&db, "t0", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).unwrap();
-        write_verdict(&db, "t1", Verdict::Escalated, None, None, None, None).unwrap();
-        write_verdict(&db, "hv", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).unwrap();
+        assert!(write_verdict(&db, "t0", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).is_err());
+        assert!(write_verdict(&db, "t1", Verdict::Escalated, None, None, None, None).is_err());
+        assert!(write_verdict(&db, "hv", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).is_err());
 
         let count_of = |id: &str, verd: &str| -> i64 {
             db.connection()
@@ -1450,8 +1461,8 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(count_of("t0", "T0_ACCEPT"), 1, "AutoAccept must record a T0 verdict row");
-        assert_eq!(count_of("t1", "T1_ESCALATE"), 1, "Escalated must record a T1 verdict row");
+        assert_eq!(count_of("t0", "T0_ACCEPT"), 0, "a disabled writer records no T0 verdict row");
+        assert_eq!(count_of("t1", "T1_ESCALATE"), 0, "a disabled writer records no T1 verdict row");
         let hv_rows: i64 = db
             .connection()
             .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = 'hv'", [], |r| r.get(0))
@@ -1466,8 +1477,7 @@ mod tests {
         // calibrate ANY SNR bucket, the gate must fail closed (escalate) rather than auto-accept against
         // an uncalibrated/clean-dominated threshold borrowed from another condition.
         use crate::settings::AutonLevel;
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         db.insert_segment(&make_seg("s-uncal", "کوردستان")).unwrap(); // snr_db None → unknown bucket (4)
         for (m, t) in [("omniasr-ctc-300m", "کوردستان"), ("omniasr-ctc-1b", "کوردستان")] {
             db.insert_hypothesis(&SegmentHypothesis {
