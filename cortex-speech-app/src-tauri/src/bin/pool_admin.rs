@@ -30,6 +30,17 @@ struct VoiceInventory {
     invalid_segments: Vec<String>,
 }
 
+fn voice_inventory_ready(report: &VoiceInventory) -> bool {
+    // A long prepared WAV is intentionally split into multiple bounded review clips. Completeness is
+    // therefore every disk WAV matched at least once and every resulting segment exact/usable—not the
+    // false assumption that WAV count must equal segment count.
+    report.disk_wavs == report.matched_files
+        && report.matched_segments >= report.disk_wavs
+        && report.matched_segments == report.usable_7b_segments
+        && report.missing_files.is_empty()
+        && report.invalid_segments.is_empty()
+}
+
 fn usage() -> &'static str {
     "Usage:\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin status --db <cortex-speech.db>"
 }
@@ -225,14 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "inventory" | "activate" => {
             let specs = voice_specs(&args)?;
             let (reports, members) = inventory(&db, &specs)?;
-            let ready = reports.iter().all(|report| {
-                report.disk_wavs == report.matched_files
-                    && report.disk_wavs == report.matched_segments
-                    && report.disk_wavs == report.usable_7b_segments
-                    && report.matched_segments == report.usable_7b_segments
-                    && report.missing_files.is_empty()
-                    && report.invalid_segments.is_empty()
-            });
+            let ready = reports.iter().all(voice_inventory_ready);
             if command == "inventory" {
                 println!(
                     "{}",
@@ -279,4 +283,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err(usage().into()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report() -> VoiceInventory {
+        VoiceInventory {
+            voice_name: "Kawa".into(),
+            directory: r"D:\Kawa_TTS_Dataset\wavs".into(),
+            disk_wavs: 2,
+            matched_files: 2,
+            matched_segments: 3,
+            usable_7b_segments: 3,
+            missing_files: Vec::new(),
+            invalid_segments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn long_wavs_may_expand_to_multiple_exact_review_segments() {
+        assert!(voice_inventory_ready(&report()));
+    }
+
+    #[test]
+    fn readiness_fails_for_a_missing_wav_or_any_invalid_segment() {
+        let mut missing = report();
+        missing.matched_files = 1;
+        assert!(!voice_inventory_ready(&missing));
+
+        let mut invalid = report();
+        invalid.invalid_segments.push("segment:wrong-model".into());
+        assert!(!voice_inventory_ready(&invalid));
+    }
 }

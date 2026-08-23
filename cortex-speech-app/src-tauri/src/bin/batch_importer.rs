@@ -55,8 +55,9 @@ fn is_exact_champion_segment(segment: &cortex_speech_app_lib::db::SpeechSegment,
 
 /// Import final, one-character WAVs two files at a time so the two warm 7B workers receive genuinely
 /// concurrent work. Each worker owns its SQLite connection; all durable journal bookkeeping stays on
-/// the coordinator connection. A wave is joined before its results are accepted, and any non-champion
-/// or non-1:1 result is removed and halts the run.
+/// the coordinator connection. A wave is joined before its results are accepted, and any empty or
+/// non-champion result is removed and halts the run. A prepared WAV may still exceed the app's maximum
+/// review duration, in which case multiple source-span segments are the correct lossless result.
 fn import_prepared_voice_parallel(
     pipeline: &ProcessingPipeline,
     db: &Database,
@@ -90,7 +91,10 @@ fn import_prepared_voice_parallel(
         let existing = db
             .get_segments_by_ids(&existing_ids)
             .map_err(|error| format!("cannot read existing rows for {}: {error}", file.display()))?;
-        if existing.len() == 1 && is_exact_champion_segment(&existing[0], &champion_model_id) {
+        if existing.len() == existing_ids.len()
+            && !existing.is_empty()
+            && existing.iter().all(|segment| is_exact_champion_segment(segment, &champion_model_id))
+        {
             db.mark_import_file_done(&job_id, &path_text)
                 .map_err(|error| format!("cannot journal existing file {}: {error}", file.display()))?;
             succeeded += 1;
@@ -101,7 +105,6 @@ fn import_prepared_voice_parallel(
             continue;
         }
 
-        // This directory is declared prepared and therefore must be 1 WAV -> 1 exact champion row.
         // Delete only the incomplete/non-canonical stage; the database's review-authority trigger
         // refuses this operation if any human evidence exists, turning that case into a hard stop.
         db.delete_segments_batch(&existing_ids)
@@ -157,7 +160,8 @@ fn import_prepared_voice_parallel(
             let segments = result.map_err(|error| {
                 format!("prepared import HALTED at {} after {succeeded}/{total} completed: {error}", file.display())
             })?;
-            let valid = segments.len() == 1 && is_exact_champion_segment(&segments[0], &champion_model_id);
+            let valid = !segments.is_empty()
+                && segments.iter().all(|segment| is_exact_champion_segment(segment, &champion_model_id));
             if !valid {
                 let ids: Vec<String> = segments.iter().map(|segment| segment.id.clone()).collect();
                 if let Err(error) = db.delete_segments_batch(&ids) {
@@ -167,7 +171,7 @@ fn import_prepared_voice_parallel(
                     ));
                 }
                 return Err(format!(
-                    "prepared import HALTED: {} produced {} row(s), but exactly one local {champion_model_id} row is required",
+                    "prepared import HALTED: {} produced {} row(s), but one or more local {champion_model_id} rows are required",
                     file.display(),
                     segments.len()
                 ));
