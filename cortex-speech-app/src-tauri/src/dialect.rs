@@ -55,6 +55,12 @@ const SOURCE_DIALECTS: &[(&str, &str)] = &[
     // `kawa_harvest_report.json`. Keep the exact output-folder mapping so Sorani-only reviewers are
     // never handed it after the voice-organized pool imports the final WAVs.
     (r"Kawa_TTS_Dataset", HAWLERI),
+    // The owner's authoritative dataset registry records the prepared Halwest voice as
+    // "Standard Sorani" at this exact source folder (Obsidian Brain / Projects /
+    // Kurdish Sorani Dataset.md, updated 2026-08-23). The local harvest report proves the speaker
+    // and folder but omits dialect, so bind the precise owner-registered folder rather than infer
+    // from the speaker name or filename.
+    (r"Halwest_TTS_Dataset", SORANI),
 ];
 
 /// The dialect of the recording this clip was cut from, or `None` when the source is not mapped.
@@ -223,6 +229,14 @@ mod tests {
         assert!(!reviewer_may_judge(Some(&sorani_only), r"D:\x\KBHP-EP07.wav"));
         assert!(!reviewer_may_judge(Some(&sorani_only), r"D:\Kawa_TTS_Dataset\wavs\kawa_0001.wav"));
         assert!(reviewer_may_judge(Some(&sorani_only), r"C:\x\SoraniVoice_PC_\clip.wav"));
+    }
+
+    #[test]
+    fn owner_registered_halwest_folder_is_sorani() {
+        let path = r"D:\Halwest_TTS_Dataset\wavs\halwest_000001.wav";
+        assert_eq!(dialect_of(path), Some(SORANI));
+        assert!(reviewer_may_judge(Some(&[SORANI.to_string()]), path));
+        assert!(!reviewer_may_judge(Some(&[HAWLERI.to_string()]), path));
     }
 
     #[test]
