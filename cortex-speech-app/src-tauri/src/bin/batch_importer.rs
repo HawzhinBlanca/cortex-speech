@@ -109,23 +109,36 @@ fn import_prepared_voice_parallel(
         pending.push(file);
     }
 
-    for wave in pending.chunks(file_concurrency) {
+    if pending.is_empty() {
+        db.complete_import_job(&job_id).map_err(|error| format!("cannot complete prepared import journal: {error}"))?;
+        return Ok((total, succeeded));
+    }
+
+    // Run the full startup/integrity validation sequentially exactly once per worker. Opening both
+    // inside each concurrent wave made their FTS integrity probes race each other for SQLite locks;
+    // the second correctly failed closed, but no inference concurrency was reached. The validated
+    // connections themselves are Send and remain owned by one worker slot at a time below.
+    let worker_count = file_concurrency.min(pending.len());
+    let mut worker_databases = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
+        worker_databases
+            .push(Database::open_with_retry(&db_path.to_string_lossy()).map_err(|error| {
+                format!("prepared worker {} database validation failed: {error}", worker_index + 1)
+            })?);
+    }
+
+    for wave in pending.chunks(worker_count) {
         let outcomes: Vec<(PathBuf, Result<Vec<cortex_speech_app_lib::db::SpeechSegment>, String>)> =
             std::thread::scope(|scope| {
-                let handles: Vec<_> = wave
-                    .iter()
-                    .cloned()
-                    .map(|file| {
+                let handles: Vec<_> = worker_databases
+                    .iter_mut()
+                    .zip(wave.iter().cloned())
+                    .map(|(worker_db, file)| {
                         let worker_pipeline = pipeline.clone();
-                        let worker_db_path = db_path.to_path_buf();
                         scope.spawn(move || {
-                            let result = Database::open_with_retry(&worker_db_path.to_string_lossy())
-                                .map_err(|error| format!("worker database open failed: {error}"))
-                                .and_then(|worker_db| {
-                                    worker_pipeline
-                                        .process_single_file(&file, &worker_db)
-                                        .map_err(|error| error.to_string())
-                                });
+                            let result = worker_pipeline
+                                .process_single_file(&file, worker_db)
+                                .map_err(|error| error.to_string());
                             (file, result)
                         })
                     })
