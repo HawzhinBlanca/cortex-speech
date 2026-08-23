@@ -1437,6 +1437,13 @@ impl ProcessingPipeline {
         Path::new(&self.db_path).parent().map(|dir| dir.join("source_transcripts"))
     }
 
+    fn source_reference_enabled(&self) -> bool {
+        // Both the persisted choice and the revocable live consent must agree. Keep status reporting
+        // on the exact same predicate as the upload gate so the UI never claims an external reference
+        // is running when this import is champion-only.
+        self.settings.jury_cloud_opt_in && self.consent.jury_cloud()
+    }
+
     /// The Gemini key for the whole-file reference transcript, read from the ENCRYPTED store.
     ///
     /// NOT `settings.llm_api_key`, which is where this used to look. `AppSettings::load` deliberately
@@ -1546,7 +1553,7 @@ impl ProcessingPipeline {
         db: &Database,
     ) -> AppResult<Vec<SourceTranscriptRecord>> {
         // Snapshot AND live consent: a withdrawal after this import began must stop the upload.
-        if !self.settings.jury_cloud_opt_in || !self.consent.jury_cloud() {
+        if !self.source_reference_enabled() {
             return Ok(Vec::new());
         }
         let Some(api_key) = self.jury_cloud_api_key() else {
@@ -1792,21 +1799,24 @@ impl ProcessingPipeline {
                 status: "Processing...".into(),
             });
             self.set_import_status(idx + 1, total, &fname);
-            callback(PipelineEvent::Phase { phase: "reference_transcribing".into() });
-            callback(agent_stage(
-                "source_reference",
-                "running",
-                fname.clone(),
-                "Building whole-file reference transcript",
-                idx + 1,
-                total,
-            ));
-            callback(PipelineEvent::Progress {
-                current: idx + 1,
-                total,
-                file: fname.clone(),
-                status: "Building whole-file reference transcript".into(),
-            });
+            let source_reference_enabled = self.source_reference_enabled();
+            if source_reference_enabled {
+                callback(PipelineEvent::Phase { phase: "reference_transcribing".into() });
+                callback(agent_stage(
+                    "source_reference",
+                    "running",
+                    fname.clone(),
+                    "Building whole-file reference transcript",
+                    idx + 1,
+                    total,
+                ));
+                callback(PipelineEvent::Progress {
+                    current: idx + 1,
+                    total,
+                    file: fname.clone(),
+                    status: "Building whole-file reference transcript".into(),
+                });
+            }
 
             let meta = crate::telemetry::Tracer::metadata(vec![
                 ("file", fname.clone()),
@@ -1833,14 +1843,16 @@ impl ProcessingPipeline {
                 Ok(segments) => {
                     callback(PipelineEvent::Phase { phase: "transcribing".into() });
                     let segment_count = segments.len();
-                    callback(agent_stage(
-                        "source_reference",
-                        "completed",
-                        fname.clone(),
-                        "Whole-file source reference stage completed or reused",
-                        idx + 1,
-                        total,
-                    ));
+                    if source_reference_enabled {
+                        callback(agent_stage(
+                            "source_reference",
+                            "completed",
+                            fname.clone(),
+                            "Whole-file source reference stage completed or reused",
+                            idx + 1,
+                            total,
+                        ));
+                    }
                     callback(agent_stage(
                         "audio_chunking",
                         "completed",
@@ -2072,43 +2084,63 @@ impl ProcessingPipeline {
         // both voices into one chunk under one confident SPEAKER_0x (owner hit this twice reviewing,
         // 2026-08-17). The judge can only REFUSE a merge — with CAM++ absent it returns None and the
         // plan is exactly the historical silence-only one.
-        let mut diarization_guard = self.lock_diarization_service();
-        // Rebuild when unset OR cached-INACTIVE (see the denoiser site below): caching an inactive
-        // service ignored a CAM++ model downloaded mid-session until an app restart. Cheap while absent.
-        if diarization_guard.as_ref().map_or(true, |s| !s.is_available()) {
-            // Per-file (round-26): resolve_root_for avoids resolved_dir()'s all-or-nothing orphan of the
-            // bundled-only campp speaker model once the user downloads OmniASR into the user dir.
-            let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
-            *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
+        // Do not even construct optional Sherpa services when their setting is off. Apart from wasting
+        // RAM/CPU, constructing an unused denoiser used to probe the CUDA execution provider and emit a
+        // frightening "CUDA not enabled" diagnostic during a champion-only import. More importantly,
+        // disabled must mean the model cannot influence chunking or audio bytes—not merely that its
+        // output is ignored later.
+        let mut diarization_guard = None;
+        if self.settings.enable_diarization {
+            let mut guard = self.lock_diarization_service();
+            // Rebuild when unset OR cached-INACTIVE (see the denoiser site below): caching an inactive
+            // service ignored a CAM++ model downloaded mid-session until an app restart. Cheap while absent.
+            if guard.as_ref().map_or(true, |s| !s.is_available()) {
+                // Per-file (round-26): resolve_root_for avoids resolved_dir()'s all-or-nothing orphan of the
+                // bundled-only campp speaker model once the user downloads OmniASR into the user dir.
+                let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
+                *guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
+            }
+            diarization_guard = Some(guard);
         }
-        let embedding_service = diarization_guard
-            .as_ref()
-            .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
+        let embedding_service = diarization_guard.as_ref().and_then(|guard| guard.as_ref());
 
-        let judge = crate::diarization::speaker_turn_judge(embedding_service, sample_rate);
-        let (chunk_ranges, vad_backend) = chunking::plan_speech_chunks_with_judge(
-            &pcm,
-            sample_rate,
-            self.settings.vad_threshold,
-            self.settings.min_segment_duration_ms,
-            self.settings.max_segment_duration_ms,
-            Some(&judge),
-        )?;
+        let (chunk_ranges, vad_backend) = if let Some(service) = embedding_service {
+            let judge = crate::diarization::speaker_turn_judge(service, sample_rate);
+            chunking::plan_speech_chunks_with_judge(
+                &pcm,
+                sample_rate,
+                self.settings.vad_threshold,
+                self.settings.min_segment_duration_ms,
+                self.settings.max_segment_duration_ms,
+                Some(&judge),
+            )?
+        } else {
+            chunking::plan_speech_chunks(
+                &pcm,
+                sample_rate,
+                self.settings.vad_threshold,
+                self.settings.min_segment_duration_ms,
+                self.settings.max_segment_duration_ms,
+            )?
+        };
 
-        let mut denoiser_guard = self.lock_denoiser_service();
-        // Rebuild when unset OR cached-INACTIVE: an inactive service means the model was absent when it
-        // was first built, so caching that pass-through for the whole session ignored a denoiser
-        // downloaded mid-session until an app restart (hunt-10 #3) — and the export's fresh-service
-        // denoising flag then read `true` over un-denoised audio. The absent-path rebuild is a cheap
-        // path.exists() stat; once the model appears the load runs once and is_active() latches true.
-        if denoiser_guard.as_ref().map_or(true, |s| !s.is_active()) {
-            // Per-file (round-26): resolved_dir() is all-or-nothing, so a bundled-only or user-downloaded
-            // denoiser is orphaned once OmniASR flips the root. resolve_root_for loads it from wherever it is.
-            let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
-            *denoiser_guard = Some(crate::denoiser::DenoiserService::new(&model_dir));
+        let mut denoiser_guard = None;
+        if self.settings.enable_denoising {
+            let mut guard = self.lock_denoiser_service();
+            // Rebuild when unset OR cached-INACTIVE: an inactive service means the model was absent when it
+            // was first built, so caching that pass-through for the whole session ignored a denoiser
+            // downloaded mid-session until an app restart (hunt-10 #3) — and the export's fresh-service
+            // denoising flag then read `true` over un-denoised audio. The absent-path rebuild is a cheap
+            // path.exists() stat; once the model appears the load runs once and is_active() latches true.
+            if guard.as_ref().map_or(true, |s| !s.is_active()) {
+                // Per-file (round-26): resolved_dir() is all-or-nothing, so a bundled-only or user-downloaded
+                // denoiser is orphaned once OmniASR flips the root. resolve_root_for loads it from wherever it is.
+                let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
+                *guard = Some(crate::denoiser::DenoiserService::new(&model_dir));
+            }
+            denoiser_guard = Some(guard);
         }
-        let denoiser_service =
-            denoiser_guard.as_ref().ok_or_else(|| AppError::Other("Failed to initialize denoiser service".into()))?;
+        let denoiser_service = denoiser_guard.as_ref().and_then(|guard| guard.as_ref());
 
         // Once per file — see the parameter's doc on build_segments_from_pcm.
         let file_hash = crate::cache::TranscriptCache::compute_hash(path).ok();
@@ -2251,33 +2283,45 @@ impl ProcessingPipeline {
             // Service before planning, same reorder and same reason as the non-streaming sibling: the
             // planner asks who is speaking before agreeing to a silence-approved merge. The rebuild
             // policy (at most one attempt per file) is unchanged — the block simply moved up.
-            let mut diarization_guard = self.lock_diarization_service();
-            // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
-            // don't re-attempt an unloadable CAM++ every window — at most once per file). See the
-            // non-streaming sibling site.
-            if should_rebuild_streaming_service(
-                diarization_guard.is_some(),
-                diarization_guard.as_ref().is_some_and(|s| s.is_available()),
-                diarization_rebuild_tried,
-            ) {
-                diarization_rebuild_tried = true;
-                // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
-                let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
-                *diarization_guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
+            let mut diarization_guard = None;
+            if self.settings.enable_diarization {
+                let mut guard = self.lock_diarization_service();
+                // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
+                // don't re-attempt an unloadable CAM++ every window — at most once per file). See the
+                // non-streaming sibling site.
+                if should_rebuild_streaming_service(
+                    guard.is_some(),
+                    guard.as_ref().is_some_and(|s| s.is_available()),
+                    diarization_rebuild_tried,
+                ) {
+                    diarization_rebuild_tried = true;
+                    // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
+                    let model_dir = self.model_manager.resolve_root_for(crate::models::CAMPP_MODEL);
+                    *guard = Some(crate::diarization::SpeakerEmbeddingService::new(&model_dir));
+                }
+                diarization_guard = Some(guard);
             }
-            let embedding_service = diarization_guard
-                .as_ref()
-                .ok_or_else(|| AppError::Other("Failed to initialize diarization service".into()))?;
+            let embedding_service = diarization_guard.as_ref().and_then(|guard| guard.as_ref());
 
-            let judge = crate::diarization::speaker_turn_judge(embedding_service, sample_rate);
-            let (mut chunk_ranges, vad_backend) = chunking::plan_speech_chunks_with_judge(
-                &pcm,
-                sample_rate,
-                self.settings.vad_threshold,
-                self.settings.min_segment_duration_ms,
-                self.settings.max_segment_duration_ms,
-                Some(&judge),
-            )?;
+            let (mut chunk_ranges, vad_backend) = if let Some(service) = embedding_service {
+                let judge = crate::diarization::speaker_turn_judge(service, sample_rate);
+                chunking::plan_speech_chunks_with_judge(
+                    &pcm,
+                    sample_rate,
+                    self.settings.vad_threshold,
+                    self.settings.min_segment_duration_ms,
+                    self.settings.max_segment_duration_ms,
+                    Some(&judge),
+                )?
+            } else {
+                chunking::plan_speech_chunks(
+                    &pcm,
+                    sample_rate,
+                    self.settings.vad_threshold,
+                    self.settings.min_segment_duration_ms,
+                    self.settings.max_segment_duration_ms,
+                )?
+            };
 
             // Hold back the boundary-touching tail of every non-final window for the next round so the
             // splitter can later cut it on a pause. Carry from the last chunk's START all the way to the
@@ -2305,23 +2349,25 @@ impl ProcessingPipeline {
                 on_chunk(global_chunk, estimated_total.max(global_chunk));
             };
 
-            let mut denoiser_guard = self.lock_denoiser_service();
-            // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
-            // don't re-attempt an unloadable GTCRN every window — at most once per file). See the
-            // non-streaming sibling site.
-            if should_rebuild_streaming_service(
-                denoiser_guard.is_some(),
-                denoiser_guard.as_ref().is_some_and(|s| s.is_active()),
-                denoiser_rebuild_tried,
-            ) {
-                denoiser_rebuild_tried = true;
-                // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
-                let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
-                *denoiser_guard = Some(crate::denoiser::DenoiserService::new(&model_dir));
+            let mut denoiser_guard = None;
+            if self.settings.enable_denoising {
+                let mut guard = self.lock_denoiser_service();
+                // Rebuild when unset, OR when cached-inactive AND we have not yet tried this file (P1.4b:
+                // don't re-attempt an unloadable GTCRN every window — at most once per file). See the
+                // non-streaming sibling site.
+                if should_rebuild_streaming_service(
+                    guard.is_some(),
+                    guard.as_ref().is_some_and(|s| s.is_active()),
+                    denoiser_rebuild_tried,
+                ) {
+                    denoiser_rebuild_tried = true;
+                    // Per-file (round-26): see the sibling site — resolve_root_for avoids the all-or-nothing orphan.
+                    let model_dir = self.model_manager.resolve_root_for(crate::models::DENOISER_MODEL);
+                    *guard = Some(crate::denoiser::DenoiserService::new(&model_dir));
+                }
+                denoiser_guard = Some(guard);
             }
-            let denoiser_service = denoiser_guard
-                .as_ref()
-                .ok_or_else(|| AppError::Other("Failed to initialize denoiser service".into()))?;
+            let denoiser_service = denoiser_guard.as_ref().and_then(|guard| guard.as_ref());
 
             let (window_segs, window_pcm_cache) = self.build_segments_from_pcm(
                 path,
@@ -2436,8 +2482,8 @@ impl ProcessingPipeline {
         chunk_ranges: &[(usize, usize)],
         vad_backend: crate::audio::VadBackend,
         cancel: Option<&CancellationToken>,
-        embedding_service: &crate::diarization::SpeakerEmbeddingService,
-        denoiser_service: &crate::denoiser::DenoiserService,
+        embedding_service: Option<&crate::diarization::SpeakerEmbeddingService>,
+        denoiser_service: Option<&crate::denoiser::DenoiserService>,
         on_chunk: &mut impl FnMut(usize, usize),
         // When `Some`, this is the STREAMING path: diarization clustering is DEFERRED — one embedding
         // per retained segment is appended here (in segment order) so the caller can cluster the WHOLE
@@ -2464,7 +2510,7 @@ impl ProcessingPipeline {
             None
         };
 
-        let (diarization_labels, chunk_embeddings) = if self.settings.enable_diarization {
+        let (diarization_labels, chunk_embeddings) = if let Some(embedding_service) = embedding_service {
             // chunk_ranges are in GLOBAL sample coordinates, but `pcm` is the window-local buffer in
             // the streaming path (global_base_sample > 0). Embeddings slice `pcm` directly, so rebase
             // the ranges to local coords first — exactly like the transcription slice below. Without
@@ -2497,7 +2543,7 @@ impl ProcessingPipeline {
         // process() is a silent pass-through — warn loudly so the un-denoised reality is visible. The
         // run config separately records denoising=false (see runs::config_from_settings) so provenance
         // is honest; this log surfaces it to the operator.
-        if self.settings.enable_denoising && !denoiser_service.is_active() {
+        if self.settings.enable_denoising && !denoiser_service.is_some_and(|service| service.is_active()) {
             tracing::warn!(
                 "Denoising is enabled in settings but the denoiser model is not loaded — audio is NOT being denoised (download the denoiser model to enable AI cleanup)"
             );
@@ -2540,7 +2586,7 @@ impl ProcessingPipeline {
             // empty or junk transcripts due to near-zero token activations.
             audio::normalize_pcm_rms(&mut f32_pcm, -20.0);
 
-            if self.settings.enable_denoising {
+            if let Some(denoiser_service) = denoiser_service {
                 let timer = crate::inference::InferenceTimer::start("denoiser");
                 f32_pcm = denoiser_service.process(&f32_pcm, audio::TARGET_SAMPLE_RATE);
                 timer.finish(true);
@@ -2720,8 +2766,8 @@ impl ProcessingPipeline {
                 // at export instead of recomputing from export-day model state (H3). For diarization,
                 // `is_available()` reflects whether the CAM++ pass ran, independent of whether THIS
                 // segment received a label (streaming defers labeling; single-speaker files get one id).
-                denoised: Some(self.settings.enable_denoising && denoiser_service.is_active()),
-                diarized: Some(self.settings.enable_diarization && embedding_service.is_available()),
+                denoised: Some(denoiser_service.is_some_and(|service| service.is_active())),
+                diarized: Some(embedding_service.is_some_and(|service| service.is_available())),
                 // P0.4: the VAD backend that ACTUALLY produced this file/window's regions (silero / energy
                 // fallback / none for the short whole-buffer path) — surfaced from the detector, not a
                 // path-exists probe (a corrupt Silero falls back to energy at runtime).
@@ -3194,21 +3240,24 @@ impl ProcessingPipeline {
         let _status_guard = ImportStatusGuard(self);
 
         let db = self.open_db()?;
-        on_event(PipelineEvent::Phase { phase: "reference_transcribing".into() });
-        on_event(agent_stage(
-            "source_reference",
-            "running",
-            fname.clone(),
-            "Building whole-file reference transcript",
-            0,
-            estimated_chunks,
-        ));
-        on_event(PipelineEvent::Progress {
-            current: 0,
-            total: estimated_chunks,
-            file: fname.clone(),
-            status: "Building whole-file reference transcript".into(),
-        });
+        let source_reference_enabled = self.source_reference_enabled();
+        if source_reference_enabled {
+            on_event(PipelineEvent::Phase { phase: "reference_transcribing".into() });
+            on_event(agent_stage(
+                "source_reference",
+                "running",
+                fname.clone(),
+                "Building whole-file reference transcript",
+                0,
+                estimated_chunks,
+            ));
+            on_event(PipelineEvent::Progress {
+                current: 0,
+                total: estimated_chunks,
+                file: fname.clone(),
+                status: "Building whole-file reference transcript".into(),
+            });
+        }
         let mut chunks_done = 0usize;
         // Imports always use the configured primary engine. Optional cloud tools may be invoked only
         // through their explicit per-segment actions; a consent toggle can never replace the 7B
@@ -3238,14 +3287,16 @@ impl ProcessingPipeline {
             Ok(segments) => {
                 self.set_import_status(segments.len(), segments.len(), &fname);
                 let segment_count = segments.len();
-                on_event(agent_stage(
-                    "source_reference",
-                    "completed",
-                    fname.clone(),
-                    "Whole-file source reference stage completed or reused",
-                    1,
-                    1,
-                ));
+                if source_reference_enabled {
+                    on_event(agent_stage(
+                        "source_reference",
+                        "completed",
+                        fname.clone(),
+                        "Whole-file source reference stage completed or reused",
+                        1,
+                        1,
+                    ));
+                }
                 on_event(agent_stage(
                     "audio_chunking",
                     "completed",

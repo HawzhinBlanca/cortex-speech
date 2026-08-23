@@ -4,7 +4,7 @@ use cortex_speech_app_lib::fingerprint::AudioFingerprint;
 use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
-use cortex_speech_app_lib::settings::AppSettings;
+use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize, LlmMode};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -38,7 +38,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // This binary persists production drafts, so it must share the desktop's champion-only loader;
     // raw `load()` is reserved for explicit offline diagnostic tools.
-    let settings = AppSettings::load_production(&app_data_dir.join("settings.json"));
+    let mut settings = AppSettings::load_production(&app_data_dir.join("settings.json"));
+
+    let mut args = std::env::args().skip(1);
+    let first_arg = args.next();
+    let (prepared_voice, target_dir) = match first_arg.as_deref() {
+        Some("--prepared-voice") => (true, args.next().map(PathBuf::from)),
+        Some(path) => (false, Some(PathBuf::from(path))),
+        None => (
+            std::env::var_os("CORTEX_IMPORT_PREPARED_VOICE").as_deref() == Some(std::ffi::OsStr::new("1")),
+            std::env::var_os("CORTEX_IMPORT_DIR").map(PathBuf::from),
+        ),
+    };
+    if args.next().is_some() {
+        return Err("Usage: batch_importer [--prepared-voice] <audio-directory>".into());
+    }
+
+    // Prepared voice datasets are already one-speaker, cleaned, and chunked. This mode removes every
+    // optional inference path that could waste CPU/RAM, alter the prepared audio, or confuse model
+    // provenance. The production loader above already forces the champion; repeat the invariant here
+    // so a future settings refactor fails closed at this executable boundary.
+    if prepared_voice {
+        settings.enforce_desktop_asr_canon();
+        settings.multi_engine_hypotheses = false;
+        settings.use_finetuned_asr = false;
+        settings.enable_diarization = false;
+        settings.enable_denoising = false;
+        settings.auto_align = false;
+        settings.assign_speaker_from_filename = false;
+        settings.llm_mode = LlmMode::None;
+        settings.cloud_llm_opt_in = false;
+        settings.jury_cloud_opt_in = false;
+        settings.ger_refinement_enabled = false;
+        println!(
+            "Prepared-voice mode: OmniASR-7B champion only; auxiliary ASR, cloud reference/refinement, diarization, denoising, and forced alignment are disabled."
+        );
+    }
+    if settings.asr_model_size != AsrModelSize::WSL7B || settings.multi_engine_hypotheses || settings.use_finetuned_asr
+    {
+        return Err("Production batch import refused: OmniASR-7B is not the sole ASR engine.".into());
+    }
 
     let normalizer = Arc::new(SoraniNormalizer::new());
     let cache = Arc::new(TranscriptCache::new(1000));
@@ -54,10 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_manager,
     );
 
-    let target_dir =
-        std::env::args().nth(1).map(PathBuf::from).or_else(|| std::env::var_os("CORTEX_IMPORT_DIR").map(PathBuf::from));
     let Some(target_dir) = target_dir else {
-        return Err("Usage: batch_importer <audio-directory> or set CORTEX_IMPORT_DIR.".into());
+        return Err("Usage: batch_importer [--prepared-voice] <audio-directory> or set CORTEX_IMPORT_DIR.".into());
     };
 
     println!("Importing directory: {}", target_dir.display());
