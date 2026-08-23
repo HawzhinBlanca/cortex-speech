@@ -22,7 +22,7 @@ fn detached_read_snapshot_cannot_mutate_its_source_database() {
         db.initialize().unwrap();
     }
     let snapshot = Database::open_detached_read_snapshot(path.to_str().unwrap()).unwrap();
-    assert_eq!(crate::migrations::validate_applied_history(snapshot.connection()).unwrap(), 61);
+    assert_eq!(crate::migrations::validate_applied_history(snapshot.connection()).unwrap(), 62);
     snapshot.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).unwrap();
     assert_eq!(snapshot.integrity_check().unwrap(), "ok", "FTS5 validation runs on the writable private copy");
     drop(snapshot);
@@ -1922,12 +1922,12 @@ fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
     }
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 2).unwrap(), vec![61, 60]);
+    assert_eq!(crate::migrations::rollback(&legacy, 3).unwrap(), vec![62, 61, 60]);
     let mut legacy_reviewed = make_segment("flag-legacy", "/flag-legacy.wav");
     legacy_reviewed.verified = true;
     legacy_reviewed.annotated_transcript = Some("immutable legacy truth".into());
     legacy.insert_segment_full(&legacy_reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61]);
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62]);
     let commit = legacy
         .record_review_flag("flag-legacy", "legacy row needs adjudication", "00000000-0000-4000-8000-000000000904")
         .expect("an exact immutable pre-v60 reviewed baseline remains flaggable");
@@ -3233,7 +3233,7 @@ fn restore_stages_pending_migrations_and_foreign_keys_before_overwriting_live_da
     {
         let candidate = Database::open(migration_fail_path.to_str().unwrap()).unwrap();
         candidate.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&candidate, 4).unwrap(), vec![61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&candidate, 5).unwrap(), vec![62, 61, 60, 59, 58]);
         candidate
             .connection()
             .execute_batch(
@@ -5813,9 +5813,9 @@ fn pilot_hidden_key_reservation_serializes_the_final_two_slots_across_connection
 }
 
 #[test]
-fn schema_v58_upgrades_through_v61_without_reinterpreting_live_baseline_863() {
+fn schema_v58_upgrades_through_v62_without_reinterpreting_live_baseline_863() {
     let db = make_db();
-    assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![61, 60, 59]);
+    assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![62, 61, 60, 59]);
     db.connection()
         .execute(
             "INSERT INTO review_events
@@ -5824,7 +5824,7 @@ fn schema_v58_upgrades_through_v61_without_reinterpreting_live_baseline_863() {
             [],
         )
         .unwrap();
-    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60, 61]);
+    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60, 61, 62]);
     let policy = "8".repeat(64);
     assert_eq!(
         db.reserve_review_pilot_hidden_keys(&policy, 863, "Sara", &["baseline-863-hidden".into()], 2).unwrap(),
@@ -6183,7 +6183,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     assert_refused(&db, "delete-spot");
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 2).unwrap(), vec![61, 60]);
+    assert_eq!(crate::migrations::rollback(&legacy, 3).unwrap(), vec![62, 61, 60]);
     let mut reviewed = make_segment("delete-legacy", "/delete-legacy.wav");
     reviewed.verified = true;
     reviewed.human_decision = Some("accept".into());
@@ -6191,7 +6191,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     reviewed.verdict_transcript = Some("legacy truth".into());
     reviewed.annotated_transcript = Some("legacy truth".into());
     legacy.insert_segment_full(&reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61]);
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62]);
     assert_refused(&legacy, "delete-legacy");
 
     db.insert_segment(&make_segment("delete-batch-clean", "/delete-batch-clean.wav")).unwrap();

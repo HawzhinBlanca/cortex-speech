@@ -53,7 +53,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> Result
     serde_json::from_slice(&bytes).map_err(|error| format!("invalid {label} {}: {error}", path.display()))
 }
 
-const CAMPAIGN_SCHEMA_VERSION: i64 = 61;
+const MIN_CAMPAIGN_SCHEMA_VERSION: i64 = 61;
 
 fn open_database(path: &Path, read_only: bool) -> Result<(Database, i64), String> {
     let path = path.to_str().ok_or_else(|| "database path is not valid Unicode".to_string())?;
@@ -65,9 +65,9 @@ fn open_database(path: &Path, read_only: bool) -> Result<(Database, i64), String
 }
 
 fn require_campaign_schema(schema_version: i64, command: &str) -> Result<(), String> {
-    if schema_version != CAMPAIGN_SCHEMA_VERSION {
+    if schema_version < MIN_CAMPAIGN_SCHEMA_VERSION {
         return Err(format!(
-            "{command} requires schema {CAMPAIGN_SCHEMA_VERSION}, found schema {schema_version}; start the tested release once to perform the normal application migration, then retry"
+            "{command} requires schema {MIN_CAMPAIGN_SCHEMA_VERSION} or newer, found schema {schema_version}; start the tested release once to perform the normal application migration, then retry"
         ));
     }
     Ok(())

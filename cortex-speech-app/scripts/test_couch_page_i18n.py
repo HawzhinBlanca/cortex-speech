@@ -63,6 +63,9 @@ UNREVIEWED_SORANI = {
     # Dialect routing (owner instruction 2026-08-16): shown to a reviewer restricted to a dialect
     # that currently has no clips. New Sorani, NOT natively reviewed — on the owner's read list.
     "noDialectWork",
+    # Flexible pool completion is reviewer-specific, never a claim that the corpus or an assigned
+    # task is complete. New Sorani, NOT natively reviewed — on the owner's read list.
+    "poolDone",
     # v47 speaker-change badge. New Sorani, NOT yet natively reviewed — it goes on the owner's list
     # with the other seven.
     "speakerChange",

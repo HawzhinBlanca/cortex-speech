@@ -51,6 +51,10 @@ const SOURCE_DIALECTS: &[(&str, &str)] = &[
     // they appear. The alternative is remembering to add a line per folder, and forgetting means the
     // clips are transcribed and then served to NOBODY — silently, because unmapped fails closed.
     (r"ZAR_Lamo", SORANI),
+    // The prepared Kawa single-speaker set declares `"dialect": "Sorani-Hawleri"` in its own
+    // `kawa_harvest_report.json`. Keep the exact output-folder mapping so Sorani-only reviewers are
+    // never handed it after the voice-organized pool imports the final WAVs.
+    (r"Kawa_TTS_Dataset", HAWLERI),
 ];
 
 /// The dialect of the recording this clip was cut from, or `None` when the source is not mapped.
@@ -217,6 +221,7 @@ mod tests {
         // nothing else. With a roster in place they get nothing rather than the wrong dialect.
         let sorani_only = vec![SORANI.to_string()];
         assert!(!reviewer_may_judge(Some(&sorani_only), r"D:\x\KBHP-EP07.wav"));
+        assert!(!reviewer_may_judge(Some(&sorani_only), r"D:\Kawa_TTS_Dataset\wavs\kawa_0001.wav"));
         assert!(reviewer_may_judge(Some(&sorani_only), r"C:\x\SoraniVoice_PC_\clip.wav"));
     }
 

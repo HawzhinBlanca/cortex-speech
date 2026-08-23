@@ -45,6 +45,7 @@ use crate::db::{
     HIDDEN_ANSWER_KEY_CHANGED, PLAYBACK_EVIDENCE_CHANGED, REVIEW_PILOT_LIMIT_REACHED,
 };
 use base64::Engine as _;
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -175,6 +176,9 @@ struct CouchState {
     undo: HashMap<String, Vec<UndoEntry>>,
     /// Separate from first-pass undo so Alle can never route an undo into Rubar's corpus effect.
     independent_undo: HashMap<String, Vec<IndependentUndoEntry>>,
+    /// Independent observations made in the flexible pool. Kept separate from the retired sequential
+    /// campaign namespace so an Undo can never cross from one evidence system into the other.
+    pool_undo: HashMap<String, Vec<IndependentUndoEntry>>,
     /// Client operation UUIDs currently crossing the normal-decision transaction. This closes the
     /// in-process preflight/INSERT race for two tabs replaying the same outbox item and, critically,
     /// ensures they share one provisional undo inverse rather than racing it away on one failure.
@@ -253,6 +257,9 @@ struct CouchState {
     /// mints no pseudo-gold hidden checks; its database-bound contract blocks every export until an
     /// independent second pass exists. Any live policy/focus drift pauses the request path.
     campaign_policy: Option<crate::review_campaign::SequentialReviewCampaign>,
+    /// Immutable voice-organized pool bound at Start. Any database mismatch pauses review; no reviewer
+    /// is assigned a phase or quota, and every name on the live roster may draw from the same pool.
+    pool_policy: Option<crate::review_pool::ReviewPool>,
 }
 
 impl CouchState {
@@ -1068,10 +1075,19 @@ where
         None => None,
     };
     let preflight_db = Database::open(&db_path).map_err(|e| format!("Couch Review cannot open the library: {e}"))?;
-    let configured_campaign = crate::review_campaign::load(&preflight_db)
-        .map_err(|error| format!("sequential review campaign cannot start: {error}"))?;
-    if configured_pilot.is_some() && configured_campaign.is_some() {
-        return Err("controlled pilot and sequential review campaign cannot be active together".to_string());
+    let configured_pool = crate::review_pool::load(&preflight_db)
+        .map_err(|error| format!("flexible review pool cannot start: {error}"))?;
+    // The flexible pool explicitly supersedes the old Rubar→Alle serving policy. Its historical
+    // setting and any evidence remain in SQLite (and continue blocking generic export), but they no
+    // longer constrain the live roster or queue once an immutable pool is active.
+    let configured_campaign = if configured_pool.is_some() {
+        None
+    } else {
+        crate::review_campaign::load(&preflight_db)
+            .map_err(|error| format!("sequential review campaign cannot start: {error}"))?
+    };
+    if configured_pilot.is_some() && (configured_campaign.is_some() || configured_pool.is_some()) {
+        return Err("controlled pilot cannot be active with another review policy".to_string());
     }
     if let Some(policy) = configured_pilot.as_ref() {
         if !policy.matches_session(&names) {
@@ -1213,6 +1229,7 @@ where
         session_issued,
         pilot_policy: configured_pilot,
         campaign_policy: configured_campaign,
+        pool_policy: configured_pool,
         ..CouchState::default()
     }));
     // One accept thread per reviewer. tiny_http hands a request to whichever thread is free, so a
@@ -2313,12 +2330,39 @@ fn remember_phone_undo(
     effect_event_id: i64,
 ) {
     let mut guard = lock_state(state);
+    // The UI exposes one "Undo last" operation. Once a canonical decision lands, an older independent
+    // pool observation is no longer the last action and must not win routing merely because it has its
+    // own stack.
+    guard.pool_undo.remove(reviewer);
     let stack = guard.undo.entry(reviewer.to_string()).or_default();
     if !stack.iter().any(|entry| entry.effect_event_id == effect_event_id) {
         stack.push(UndoEntry {
             operation_id: operation_id.to_string(),
             seg_id: segment_id.to_string(),
             effect_event_id,
+        });
+    }
+    let overflow = stack.len().saturating_sub(UNDO_DEPTH);
+    if overflow > 0 {
+        stack.drain(0..overflow);
+    }
+}
+
+fn remember_pool_undo(
+    state: &Mutex<CouchState>,
+    reviewer: &str,
+    operation_id: &str,
+    segment_id: &str,
+    decision_id: i64,
+) {
+    let mut guard = lock_state(state);
+    guard.undo.remove(reviewer);
+    let stack = guard.pool_undo.entry(reviewer.to_string()).or_default();
+    if !stack.iter().any(|entry| entry.decision_id == decision_id) {
+        stack.push(IndependentUndoEntry {
+            operation_id: operation_id.to_string(),
+            seg_id: segment_id.to_string(),
+            decision_id,
         });
     }
     let overflow = stack.len().saturating_sub(UNDO_DEPTH);
@@ -2509,15 +2553,23 @@ fn active_campaign_policy(
     reviewer: &str,
     state: &Mutex<CouchState>,
 ) -> Result<Option<crate::review_campaign::SequentialReviewCampaign>, String> {
-    let (bound, data_dir, live_names) = {
+    let (bound, pool_bound, data_dir, live_names) = {
         let guard = lock_state(state);
         let names: Vec<String> = if guard.pairing_codes.is_empty() {
             guard.reviewers.values().cloned().collect()
         } else {
             guard.pairing_codes.values().cloned().collect()
         };
-        (guard.campaign_policy.clone(), guard.session_store.as_ref().map(|(dir, _)| dir.clone()), names)
+        (
+            guard.campaign_policy.clone(),
+            guard.pool_policy.clone(),
+            guard.session_store.as_ref().map(|(dir, _)| dir.clone()),
+            names,
+        )
     };
+    if pool_bound.is_some() {
+        return Ok(None);
+    }
     let current = crate::review_campaign::load(db)?;
     if current != bound {
         return Err(
@@ -2538,6 +2590,25 @@ fn active_campaign_policy(
         crate::review_campaign::validate_focus(dir, policy)?;
     }
     Ok(current)
+}
+
+/// Re-prove the immutable pool registry on every queue/decision boundary. Membership tables are
+/// append-only and digest-bound, so equality with the Start snapshot proves that reviewers are still
+/// playing against exactly the same voice-organized clip set.
+fn active_pool_policy(
+    db: &Database,
+    state: &Mutex<CouchState>,
+) -> Result<Option<crate::review_pool::ReviewPool>, String> {
+    let bound = { lock_state(state).pool_policy.clone() };
+    let matches = match bound.as_ref() {
+        Some(policy) => crate::review_pool::registry_matches(db, policy)?,
+        None => crate::review_pool::load(db)?.is_none(),
+    };
+    if !matches {
+        return Err("review pool changed during this session; review is paused until the owner stops and restarts it"
+            .to_string());
+    }
+    Ok(bound)
 }
 
 /// Remaining review-action slots for this reviewer, validated against the global count as well.
@@ -2650,7 +2721,13 @@ fn lock_pilot_decision_commit() -> std::sync::MutexGuard<'static, ()> {
 /// known id without fetching a queue first. Re-reading here preserves the policy files' hot-reload
 /// contract and makes a change effective on the next decision as well as the next queue fetch.
 fn reviewer_policy(reviewer: &str, state: &Mutex<CouchState>) -> Result<ReviewerPolicy, String> {
-    let dir = { lock_state(state).session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone()) };
+    let (dir, pool_focus) = {
+        let guard = lock_state(state);
+        (
+            guard.session_store.as_ref().map(|(data_dir, _db_path)| data_dir.clone()),
+            guard.pool_policy.as_ref().map(crate::review_pool::ReviewPool::segment_ids),
+        )
+    };
     let allowed_dialects = match dir.as_ref().map(|d| crate::dialect::load_roster(d)) {
         Some(Err(e)) => return Err(format!("policy file broken, no clips served: {e}")),
         // Matched the way the session layer matches names (trim + ASCII case), never an exact
@@ -2658,7 +2735,12 @@ fn reviewer_policy(reviewer: &str, state: &Mutex<CouchState>) -> Result<Reviewer
         Some(Ok(roster)) => crate::dialect::allowed_for(&roster, reviewer).cloned(),
         None => None,
     };
-    let focus = crate::voice_focus::resolve(dir.as_deref())?;
+    // Once the database-bound pool is active it is the single focus authority. The legacy one-voice
+    // JSON remains historical evidence but cannot silently narrow this three-voice pool back to Lamo.
+    let focus = match pool_focus {
+        Some(ids) => Some(ids),
+        None => crate::voice_focus::resolve(dir.as_deref())?,
+    };
     Ok((allowed_dialects, focus))
 }
 
@@ -2703,11 +2785,15 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
+    let pool_policy = match active_pool_policy(db, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
     let campaign_policy = match active_campaign_policy(db, reviewer, state) {
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
-    if pilot_policy.is_some() && campaign_policy.is_some() {
+    if pilot_policy.is_some() && (campaign_policy.is_some() || pool_policy.is_some()) {
         return err_reply(503, "conflicting paid-review policies are active");
     }
     let pilot_slots = match pilot_policy.as_ref() {
@@ -2765,10 +2851,14 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     } else {
         None
     };
-    let pending_result = match campaign_policy.as_ref().filter(|policy| policy.is_blinded_second_pass()) {
-        Some(policy) => crate::review_campaign::independent_pending_segment_ids(db, policy)
+    let pending_result = match pool_policy.as_ref() {
+        Some(pool) => crate::review_pool::pending_segment_ids(db, pool, reviewer, allowed_dialects.as_deref())
             .map_err(crate::error::AppError::Validation),
-        None => db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_deref()),
+        None => match campaign_policy.as_ref().filter(|policy| policy.is_blinded_second_pass()) {
+            Some(policy) => crate::review_campaign::independent_pending_segment_ids(db, policy)
+                .map_err(crate::error::AppError::Validation),
+            None => db.pending_segment_ids_focused(allowed_dialects.as_deref(), focus.as_deref()),
+        },
     };
     let pending_ids = match pending_result {
         Ok(ids) => ids,
@@ -2841,6 +2931,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     // their historical best-effort behaviour, while a real durable reviewer link must never receive
     // unmeasured work after its hidden-key pool runs dry.
     let require_complete_spot_checks = campaign_policy.is_none()
+        && pool_policy.is_none()
         && guard.session_store.is_some()
         && (!guard.pairing_codes.is_empty() || !guard.reviewers.is_empty());
     drop(guard);
@@ -2867,13 +2958,18 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 // Alle's independent pass is genuinely blind: the backend serves the champion raw
                 // draft even though speech_segments now contains Rubar's first-pass correction.
                 // This is a data boundary, not a presentation hint.
-                "text": if campaign_policy.as_ref().is_some_and(|policy| policy.is_blinded_second_pass()) {
+                "text": if pool_policy.is_some()
+                    || campaign_policy.as_ref().is_some_and(|policy| policy.is_blinded_second_pass()) {
                     s.raw_transcript.clone()
                 } else {
                     review_text(s)
                 },
                 "durationMs": s.duration_ms,
-                "speakerId": s.speaker_id,
+                "speakerId": pool_policy
+                    .as_ref()
+                    .and_then(|pool| pool.voice_for(&s.id))
+                    .map(str::to_string)
+                    .or_else(|| s.speaker_id.clone()),
                 "speakerChange": holds_a_speaker_change(s),
                 // The row's change-fingerprint at serve time; the page echoes it on the decision so
                 // a draft replaced by a background writer in between is refused, never recorded.
@@ -2897,10 +2993,10 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         // something. A reviewer must not be able to coast just because their batches came out short.
         let work_len = queue.len();
         let cadence_wanted = work_len.div_ceil(SPOT_CHECK_EVERY);
-        let selected: SpotCheckSelection = if campaign_policy.is_some() {
-            // This campaign's quality authority is an independent later pass, not synthetic or
-            // circular hidden keys. The database-bound policy keeps every first-pass result
-            // provisional and blocks export/training until that second pass is complete.
+        let selected: SpotCheckSelection = if campaign_policy.is_some() || pool_policy.is_some() {
+            // These workflows use real independent reviews as their quality authority, not synthetic
+            // or circular hidden keys. In pool mode every actual judgement must count toward the
+            // clip's visible coverage; swallowing one as a hidden test would make that claim false.
             Ok(None)
         } else if let Some(policy) = pilot_policy.as_ref() {
             (|| {
@@ -3058,7 +3154,11 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                             // make the check unpassable-by-failing: there would be nothing to catch.
                             "text": seg.raw_transcript,
                             "durationMs": seg.duration_ms,
-                            "speakerId": seg.speaker_id,
+                            "speakerId": pool_policy
+                                .as_ref()
+                                .and_then(|pool| pool.voice_for(&seg.id))
+                                .map(str::to_string)
+                                .or_else(|| seg.speaker_id.clone()),
                             // Computed exactly as for work clips. A spot check that carried this
                             // field differently would be spottable, and a reviewer who can spot the
                             // test is not being tested.
@@ -3147,6 +3247,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         "pendingTotal": pending_total,
         "pilotRemainingReviewActions": pilot_slots,
         "campaignPhase": campaign_policy.as_ref().map(|policy| policy.phase().as_str()),
+        "reviewPool": pool_policy.is_some(),
         // "there is no work in YOUR dialect", not "everything is reviewed".
         "noWorkInYourDialect": restricted_and_empty,
     });
@@ -3961,6 +4062,231 @@ fn api_independent_decision(
     )
 }
 
+/// Record a second-or-later pool judgement without mutating the canonical first answer. The queue
+/// always serves the raw OmniASR-7B draft in pool mode, keeping this observation independent from the
+/// correction already stored on `speech_segments`.
+fn api_pool_decision(
+    db: &Database,
+    parsed: &DecisionBody,
+    reviewer: &str,
+    state: &Mutex<CouchState>,
+    pool: &crate::review_pool::ReviewPool,
+) -> Reply {
+    let Some(operation_id) = parsed.operation_id.as_deref() else {
+        return err_reply(400, "operationId is required — reload this page before deciding");
+    };
+    let Ok(uuid) = uuid::Uuid::parse_str(operation_id) else {
+        return err_reply(400, "operationId must be a canonical UUID");
+    };
+    if uuid.hyphenated().to_string() != operation_id {
+        return err_reply(400, "operationId must be a lowercase hyphenated UUID");
+    }
+    let operation_payload_hash = decision_operation_payload_hash(&parsed.id, &parsed.action, &parsed.text, reviewer);
+    match crate::review_pool::operation(db, operation_id) {
+        Ok(Some(receipt))
+            if receipt.pool_id == pool.pool_id
+                && receipt.segment_id == parsed.id
+                && receipt.reviewer.eq_ignore_ascii_case(reviewer)
+                && receipt.operation_payload_hash == operation_payload_hash =>
+        {
+            remember_pool_undo(state, reviewer, operation_id, &receipt.segment_id, receipt.decision_id);
+            forget_work_audio_assignment(state, &parsed.id, reviewer);
+            return json_reply_with_accounting(
+                200,
+                serde_json::json!({
+                    "ok": true,
+                    "duplicate": true,
+                    "poolDecisionId": receipt.decision_id,
+                }),
+                db,
+                reviewer,
+            );
+        }
+        Ok(Some(_)) => return err_reply(409, "operation UUID is already bound to another pool decision"),
+        Ok(None) => {}
+        Err(error) => return err_reply(500, &format!("pool operation lookup failed: {error}")),
+    }
+    // One UUID has one meaning across every review namespace.
+    match db.review_operation(operation_id) {
+        Ok(Some(_)) => return err_reply(409, "operation UUID is already bound to a canonical decision"),
+        Ok(None) => {}
+        Err(error) => return err_reply(500, &format!("operation receipt lookup failed: {error}")),
+    }
+    match crate::review_campaign::independent_operation(db, operation_id) {
+        Ok(Some(_)) => return err_reply(409, "operation UUID is already bound to a legacy independent decision"),
+        Ok(None) => {}
+        Err(error) => return err_reply(500, &format!("legacy operation receipt lookup failed: {error}")),
+    }
+
+    let (segment, current_revision) = match db.get_segment_by_id_with_revision(&parsed.id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return err_reply(404, "no such segment"),
+        Err(error) => return err_reply(500, &error.to_string()),
+    };
+    let Some(row_version) = parsed.row_version.as_deref() else {
+        return err_reply(400, "rowVersion is required — reload this clip before deciding");
+    };
+    let Ok(served_revision) = row_version.parse::<i64>() else {
+        return err_reply(400, "rowVersion is invalid — reload this clip before deciding");
+    };
+    if served_revision != current_revision {
+        return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
+    }
+    if !lock_state(state).served_work.contains(&(parsed.id.clone(), reviewer.to_string())) {
+        return err_reply(409, "pool review requires this clip to be served first — reload the queue");
+    }
+    let current_pool = match active_pool_policy(db, state) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => return err_reply(503, "review pool is no longer active"),
+        Err(error) => return err_reply(503, &error),
+    };
+    if &current_pool != pool {
+        return err_reply(503, "review pool changed while this decision was being checked");
+    }
+    if !pool.contains(&parsed.id) {
+        forget_work_audio_assignment(state, &parsed.id, reviewer);
+        return err_reply(403, "this clip is outside the active review pool");
+    }
+    let (allowed_dialects, focus) = match reviewer_policy(reviewer, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if !reviewer_policy_allows(allowed_dialects.as_deref(), focus.as_deref(), &segment) {
+        forget_work_audio_assignment(state, &parsed.id, reviewer);
+        return err_reply(403, "this clip is outside your current review pool — reload your queue");
+    }
+    match crate::review_pool::reviewer_already_saw(db, &parsed.id, reviewer) {
+        Ok(true) => return err_reply(409, "you already reviewed this clip — reload for another one"),
+        Ok(false) => {}
+        Err(error) => return err_reply(503, &error),
+    }
+
+    let (action, submitted_transcript): (&str, Option<String>) = match parsed.action.as_str() {
+        "skip" => ("skip", None),
+        "bad" => ("reject", None),
+        "accept" | "edit" => {
+            let text = parsed.text.trim().to_string();
+            if text.is_empty() {
+                return err_reply(400, "empty transcript");
+            }
+            if text.starts_with('[') && text.ends_with(']') {
+                return err_reply(400, "placeholder transcript cannot be verified");
+            }
+            let submitted_key = crate::normalizer::learning_text_key(&crate::db::to_nfc(&text));
+            let raw_key = crate::normalizer::learning_text_key(&crate::db::to_nfc(segment.raw_transcript.trim()));
+            (if submitted_key == raw_key { "accept" } else { "edit" }, Some(text))
+        }
+        other => return err_reply(400, &format!("unknown action '{other}'")),
+    };
+    if parsed.heard_ms.is_some_and(|value| value < 0) || parsed.clip_duration_ms.is_some_and(|value| value < 0) {
+        return err_reply(400, "playback counters must not be negative");
+    }
+
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let (content_hash, source_span) = if action == "skip" {
+        (None, None)
+    } else {
+        let content_hash = match db.segment_audio_content_hash(&parsed.id) {
+            Ok(Some(value)) => value,
+            Ok(None) => return err_reply(503, "playback identity is unavailable for this clip"),
+            Err(error) => return err_reply(500, &format!("playback identity lookup failed: {error}")),
+        };
+        let source_span = match db.segment_source_span(&parsed.id) {
+            Ok(Some(value)) => value,
+            Ok(None) => return err_reply(503, "playback source span is unavailable for this clip"),
+            Err(error) => return err_reply(500, &format!("playback source-span lookup failed: {error}")),
+        };
+        let Some(heard_ms) = parsed.heard_ms else {
+            return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: listen to the clip before deciding");
+        };
+        let receipt = crate::db::PlaybackReceipt {
+            segment_id: parsed.id.clone(),
+            segment_revision: served_revision,
+            audio_content_hash: content_hash.clone(),
+            reviewer: Some(reviewer.to_string()),
+            session_id: None,
+            started_at_ms: now_ms,
+            played_ms: heard_ms,
+            clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0),
+            source_start_ms: None,
+            source_end_ms: None,
+        };
+        match db.record_playback_receipt_if_at_revision(&receipt, served_revision) {
+            Ok(true) => {}
+            Ok(false) => return err_reply(409, "this clip changed since it was served — reload for the fresh draft"),
+            Err(error) => return err_reply(500, &format!("playback receipt not recorded: {error}")),
+        }
+        match db.has_sufficient_playback_evidence(&parsed.id, served_revision, &content_hash, Some(reviewer)) {
+            Ok(true) => {}
+            Ok(false) => {
+                return err_reply(
+                    428,
+                    &db.require_playback_evidence(&parsed.id, served_revision, &content_hash, Some(reviewer))
+                        .err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
+                )
+            }
+            Err(error) => return err_reply(500, &format!("playback evidence check failed: {error}")),
+        }
+        (Some(content_hash), Some(source_span))
+    };
+
+    {
+        let mut guard = lock_state(state);
+        if guard.holder(&parsed.id, Instant::now()).is_some_and(|who| who != reviewer) {
+            return err_reply(409, "another reviewer is working on this clip");
+        }
+        if !guard.in_flight_operations.insert(operation_id.to_string()) {
+            return err_reply(503, "this operation is still being saved — retrying is safe");
+        }
+    }
+    let input = crate::review_pool::PoolDecisionInput {
+        segment_id: &parsed.id,
+        reviewer,
+        action,
+        submitted_transcript: submitted_transcript.as_deref(),
+        served_transcript: segment.raw_transcript.trim(),
+        served_revision,
+        audio_content_hash: content_hash.as_deref(),
+        source_start_ms: source_span.map(|span| span.0),
+        source_end_ms: source_span.map(|span| span.1),
+        duration_ms: segment.duration_ms,
+        requested_action: &parsed.action,
+        requested_transcript: &parsed.text,
+        operation_id,
+        operation_payload_hash: &operation_payload_hash,
+        created_at_ms: now_ms,
+    };
+    let committed = crate::review_pool::record_decision(db, pool, &input);
+    lock_state(state).in_flight_operations.remove(operation_id);
+    let decision_id = match committed {
+        Ok(Some(id)) => id,
+        Ok(None) => return err_reply(409, "this clip changed while the decision was being saved — reload"),
+        Err(error) => match crate::review_pool::operation(db, operation_id) {
+            Ok(Some(receipt))
+                if receipt.pool_id == pool.pool_id
+                    && receipt.segment_id == parsed.id
+                    && receipt.reviewer.eq_ignore_ascii_case(reviewer)
+                    && receipt.operation_payload_hash == operation_payload_hash =>
+            {
+                receipt.decision_id
+            }
+            Ok(Some(_)) => return err_reply(409, "operation UUID is already bound to another pool decision"),
+            Ok(None) if error.contains("duplicated") || error.contains("independent") => {
+                return err_reply(409, "this clip already has your review — reload for another one")
+            }
+            Ok(None) => return err_reply(500, &error),
+            Err(lookup_error) => {
+                return err_reply(500, &format!("{error}; operation receipt lookup failed: {lookup_error}"))
+            }
+        },
+    };
+    remember_pool_undo(state, reviewer, operation_id, &parsed.id, decision_id);
+    forget_work_audio_assignment(state, &parsed.id, reviewer);
+    json_reply_with_accounting(200, serde_json::json!({ "ok": true, "poolDecisionId": decision_id }), db, reviewer)
+}
+
 /// Record one phone decision through the shared human-decision path. Verdict, provenance/learning
 /// effects, annotation, and verification commit atomically; an accepted response can never leave a
 /// decided-but-pending row. The decision is attributed to `reviewer`, and refused outright on a clip
@@ -3985,6 +4311,32 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     if let Some(claimed) = parsed.reviewer.as_deref() {
         if !claimed.eq_ignore_ascii_case(reviewer) {
             return err_reply(409, &format!("this decision was made by {claimed}, not {reviewer}"));
+        }
+    }
+    let early_pool = match active_pool_policy(db, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if let Some(pool) = early_pool.as_ref() {
+        // Pool mode never mints synthetic hidden checks: every real judgement contributes to visible
+        // coverage. A remembered pre-pool check on a verified clip therefore becomes an ordinary,
+        // append-only pool observation rather than swallowing the review as a score-only event.
+        let pool_replay = parsed
+            .operation_id
+            .as_deref()
+            .map(|operation_id| crate::review_pool::operation(db, operation_id))
+            .transpose();
+        let pool_replay = match pool_replay {
+            Ok(receipt) => receipt.is_some(),
+            Err(error) => return err_reply(500, &error),
+        };
+        let already_canonical = match db.get_segment_by_id(&parsed.id) {
+            Ok(Some(segment)) => segment.verified && segment.human_decision.is_some(),
+            Ok(None) => false,
+            Err(error) => return err_reply(500, &error.to_string()),
+        };
+        if pool_replay || already_canonical {
+            return api_pool_decision(db, &parsed, reviewer, state, pool);
         }
     }
     let early_campaign = match active_campaign_policy(db, reviewer, state) {
@@ -4051,7 +4403,14 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
-    if pilot_policy.is_some() && campaign_policy.is_some() {
+    let pool_policy = match active_pool_policy(db, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if pool_policy != early_pool {
+        return err_reply(503, "review pool changed while this decision was being checked");
+    }
+    if pilot_policy.is_some() && (campaign_policy.is_some() || pool_policy.is_some()) {
         return err_reply(503, "conflicting paid-review policies are active");
     }
     let pilot_namespace = match pilot_policy.as_ref() {
@@ -4209,6 +4568,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     if current_campaign_policy != campaign_policy {
         return err_reply(503, "sequential review campaign changed while this decision was being checked");
     }
+    let current_pool_policy = match active_pool_policy(db, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if current_pool_policy != pool_policy {
+        return err_reply(503, "review pool changed while this decision was being checked");
+    }
     match pilot_policy.as_ref() {
         Some(policy) if parsed.pilot_after_review_event_id != Some(policy.after_review_event_id) => {
             return err_reply(409, "controlled review pilot changed — reload the queue before deciding")
@@ -4354,6 +4720,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         };
         if current_campaign != campaign_policy {
             return err_reply(503, "sequential review campaign changed while this decision was being committed");
+        }
+        let current_pool = match active_pool_policy(db, state) {
+            Ok(policy) => policy,
+            Err(error) => return err_reply(503, &error),
+        };
+        if current_pool != pool_policy {
+            return err_reply(503, "review pool changed while this decision was being committed");
         }
         if let Some(policy) = current.as_ref() {
             match pilot_remaining_slots(db, reviewer, policy) {
@@ -4888,7 +5261,94 @@ fn api_independent_undo(
     )
 }
 
+fn api_pool_undo(
+    db: &Database,
+    reviewer: &str,
+    state: &Mutex<CouchState>,
+    pool: &crate::review_pool::ReviewPool,
+) -> Reply {
+    let entry = lock_state(state).pool_undo.get_mut(reviewer).and_then(|stack| stack.pop());
+    let entry = match entry {
+        Some(entry) => entry,
+        None => match crate::review_pool::latest_decision(db, &pool.pool_id, reviewer) {
+            Ok(Some((decision_id, seg_id, operation_id, _))) => {
+                IndependentUndoEntry { operation_id, seg_id, decision_id }
+            }
+            Ok(None) => return err_reply(409, "nothing to undo"),
+            Err(error) => return err_reply(500, &format!("pool undo target lookup failed: {error}")),
+        },
+    };
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    if let Err(error) =
+        crate::review_pool::reverse_decision(db, pool, entry.decision_id, reviewer, &entry.operation_id, now_ms)
+    {
+        lock_state(state).pool_undo.entry(reviewer.to_string()).or_default().push(entry);
+        return err_reply(500, &error);
+    }
+    let id = entry.seg_id.clone();
+    remember_pool_undo(state, reviewer, &entry.operation_id, &entry.seg_id, entry.decision_id);
+    {
+        let mut guard = lock_state(state);
+        guard.leases.insert(id.clone(), (reviewer.to_string(), Instant::now()));
+        guard.served_work.insert((id.clone(), reviewer.to_string()));
+    }
+    let row_version = db
+        .get_segment_by_id_with_revision(&id)
+        .ok()
+        .flatten()
+        .map(|(_, revision)| revision)
+        .unwrap_or_default()
+        .to_string();
+    json_reply_with_accounting(
+        200,
+        serde_json::json!({ "id": id, "rowVersion": row_version, "independent": true, "reviewPool": true }),
+        db,
+        reviewer,
+    )
+}
+
 fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+    let pool = match active_pool_policy(db, state) {
+        Ok(policy) => policy,
+        Err(error) => return err_reply(503, &error),
+    };
+    if let Some(pool) = pool.as_ref() {
+        let (has_pool_token, has_canonical_token) = {
+            let guard = lock_state(state);
+            (
+                guard.pool_undo.get(reviewer).is_some_and(|stack| !stack.is_empty()),
+                guard.undo.get(reviewer).is_some_and(|stack| !stack.is_empty()),
+            )
+        };
+        if has_pool_token && !has_canonical_token {
+            return api_pool_undo(db, reviewer, state, pool);
+        }
+        if !has_pool_token && !has_canonical_token {
+            let pool_latest = match crate::review_pool::latest_decision(db, &pool.pool_id, reviewer) {
+                Ok(value) => value,
+                Err(error) => return err_reply(500, &error),
+            };
+            let canonical_latest: Result<Option<i64>, _> = db
+                .connection()
+                .query_row(
+                    "SELECT event.timestamp_ms
+                   FROM effective_human_decision_effects_v60 effect
+                   JOIN review_events event ON event.id=effect.review_event_id
+                  WHERE effect.reviewer=?1 COLLATE NOCASE
+                  ORDER BY effect.id DESC LIMIT 1",
+                    [reviewer],
+                    |row| row.get(0),
+                )
+                .optional();
+            let canonical_latest = match canonical_latest {
+                Ok(value) => value,
+                Err(error) => return err_reply(500, &format!("canonical undo order cannot be read: {error}")),
+            };
+            if pool_latest.as_ref().is_some_and(|(_, _, _, at)| canonical_latest.is_none_or(|other| *at >= other)) {
+                return api_pool_undo(db, reviewer, state, pool);
+            }
+        }
+    }
     let campaign = match active_campaign_policy(db, reviewer, state) {
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
@@ -5583,6 +6043,7 @@ mod tests {
     struct CouchStateTestSnapshot {
         undo: HashMap<String, Vec<UndoTestSnapshot>>,
         independent_undo: HashMap<String, Vec<UndoTestSnapshot>>,
+        pool_undo: HashMap<String, Vec<UndoTestSnapshot>>,
         in_flight_operations: HashSet<String>,
         leases: HashMap<String, (String, Instant)>,
         served_work: HashSet<(String, String)>,
@@ -5597,6 +6058,7 @@ mod tests {
         skipped: HashMap<String, HashSet<String>>,
         pilot_policy: Option<crate::review_pilot::ReviewPilotPolicy>,
         campaign_policy: Option<crate::review_campaign::SequentialReviewCampaign>,
+        pool_policy: Option<crate::review_pool::ReviewPool>,
     }
 
     fn snapshot_couch_state(state: &Mutex<CouchState>) -> CouchStateTestSnapshot {
@@ -5628,6 +6090,19 @@ mod tests {
                     )
                 })
                 .collect(),
+            pool_undo: state
+                .pool_undo
+                .iter()
+                .map(|(reviewer, entries)| {
+                    (
+                        reviewer.clone(),
+                        entries
+                            .iter()
+                            .map(|entry| (entry.operation_id.clone(), entry.seg_id.clone(), entry.decision_id))
+                            .collect(),
+                    )
+                })
+                .collect(),
             in_flight_operations: state.in_flight_operations.clone(),
             leases: state.leases.clone(),
             served_work: state.served_work.clone(),
@@ -5642,6 +6117,7 @@ mod tests {
             skipped: state.skipped.clone(),
             pilot_policy: state.pilot_policy.clone(),
             campaign_policy: state.campaign_policy.clone(),
+            pool_policy: state.pool_policy.clone(),
         }
     }
 
@@ -5756,6 +6232,109 @@ mod tests {
             .unwrap();
         let (code, ..) = api_queue(&db, "Rubar", &state);
         assert_eq!(code, 503, "focus drift must pause the live queue");
+    }
+
+    #[test]
+    fn flexible_pool_is_voice_named_coverage_first_and_preserves_the_first_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let champion_id = "omniasr-7b-pool-test";
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: champion_id.into(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.into(),
+                model_card_name: Some("pool test champion".into()),
+                checkpoint_sha256: "c".repeat(64),
+                checkpoint_path: "/test/pool-champion.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "owner-full-rights".into(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [champion_id]).unwrap();
+        let mut reviewed = seg("pool-reviewed", "champion reviewed draft");
+        reviewed.model_version_id = Some(champion_id.into());
+        let mut unreviewed = seg("pool-unreviewed", "champion unreviewed draft");
+        unreviewed.model_version_id = Some(champion_id.into());
+        db.insert_segment(&reviewed).unwrap();
+        db.insert_segment(&unreviewed).unwrap();
+        let first_revision = db.segment_review_revision("pool-reviewed").unwrap().unwrap();
+        let first_operation = "30000000-0000-4000-8000-000000000001";
+        let first_hash =
+            crate::db::review_operation_payload_hash("pool-reviewed", "edit", "Rubar first truth", "Rubar");
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "pool-reviewed",
+            "edit",
+            Some("Rubar first truth"),
+            "Rubar",
+            first_revision,
+            first_operation,
+            &first_hash,
+        )
+        .unwrap()
+        .unwrap();
+        let pool = crate::review_pool::activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174001",
+            &[
+                crate::review_pool::PoolMemberInput { segment_id: "pool-reviewed".into(), voice_name: "Lamo".into() },
+                crate::review_pool::PoolMemberInput {
+                    segment_id: "pool-unreviewed".into(),
+                    voice_name: "Halwest".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-rubar".into(), "Rubar".into()), ("pair-alle".into(), "Alle".into())]),
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            pool_policy: Some(pool.clone()),
+            ..CouchState::default()
+        });
+
+        let (code, _, body, ..) = api_queue(&db, "Alle", &state);
+        assert_eq!(code, 200, "pool queue failed: {}", String::from_utf8_lossy(&body));
+        let queue: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(queue["reviewPool"], true);
+        assert_eq!(queue["items"][0]["id"], "pool-unreviewed", "zero-coverage clips must be offered first");
+        assert_eq!(queue["items"][0]["speakerId"], "Halwest");
+        assert_eq!(queue["items"][1]["id"], "pool-reviewed");
+        assert_eq!(queue["items"][1]["speakerId"], "Lamo");
+        assert_eq!(queue["items"][1]["text"], "champion reviewed draft", "later reviews stay blind to Rubar's answer");
+
+        let row_version = queue["items"][1]["rowVersion"].as_str().unwrap();
+        let decision = serde_json::json!({
+            "id": "pool-reviewed",
+            "action": "edit",
+            "text": "Alle independent truth",
+            "rowVersion": row_version,
+            "heardMs": 1_500,
+            "clipDurationMs": 1_500,
+        });
+        let (code, _, body, ..) = api_decision(&db, decision.to_string().as_bytes(), "Alle", &state);
+        assert_eq!(code, 200, "pool decision failed: {}", String::from_utf8_lossy(&body));
+        let canonical = db.get_segment_by_id("pool-reviewed").unwrap().unwrap();
+        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
+        assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rubar first truth"));
+        let lamo = crate::review_pool::coverage_by_voice(&db)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.voice_name == "Lamo")
+            .unwrap();
+        assert_eq!(lamo.two_reviews, 1, "Rubar plus Alle must calculate as two distinct reviews");
+        assert!(!crate::review_pool::pending_segment_ids(&db, &pool, "Alle", None)
+            .unwrap()
+            .contains(&"pool-reviewed".to_string()));
+
+        let (code, _, body, ..) = api_undo(&db, "Alle", &state);
+        assert_eq!(code, 200, "pool undo failed: {}", String::from_utf8_lossy(&body));
+        assert!(crate::review_pool::pending_segment_ids(&db, &pool, "Alle", None)
+            .unwrap()
+            .contains(&"pool-reviewed".to_string()));
+        let canonical = db.get_segment_by_id("pool-reviewed").unwrap().unwrap();
+        assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
+        assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rubar first truth"));
     }
 
     #[test]
@@ -6658,12 +7237,12 @@ mod tests {
         // nothing written to the corpus. The clip stayed pending and was swallowed again every batch.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![62, 61, 60]);
         let mut gold = seg("g1", "دەقی خاو");
         gold.annotated_transcript = Some("دەقی ڕاست".into());
         gold.verified = true;
         db.insert_segment(&gold).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62]);
         let state = state();
 
         // It was handed to Sara as a check while it was still verified.
@@ -7540,8 +8119,8 @@ mod tests {
     /// `is_gold` matters: without it a peer's fresh correction would qualify as an answer key.
     fn gold_seg(db: &Database, id: &str, wrong_draft: &str, human_answer: &str) {
         assert_eq!(
-            crate::migrations::rollback(db, 2).unwrap(),
-            vec![61, 60],
+            crate::migrations::rollback(db, 3).unwrap(),
+            vec![62, 61, 60],
             "gold test authority must be created before the v60 legacy snapshot"
         );
         let mut s = seg(id, wrong_draft);
@@ -7551,7 +8130,7 @@ mod tests {
         s.verdict = Some("human_edit".into());
         s.verdict_transcript = Some(human_answer.into());
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60, 61]);
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60, 61, 62]);
     }
 
     #[test]
@@ -9590,7 +10169,7 @@ mod tests {
         // insert_segment_full so the row returns to its pre-decision snapshot losslessly.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _p) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![62, 61, 60]);
 
         // Persist the jury columns with insert_segment_full (insert_segment would drop them).
         let mut s = seg("esc1", "دەق یەک");
@@ -9599,7 +10178,7 @@ mod tests {
         s.verified = false;
         s.is_gold = false;
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62]);
 
         let state = state();
         let body = serde_json::json!({"heardMs": 600_000,  "id": "esc1", "action": "accept", "text": "دەق یەک" });

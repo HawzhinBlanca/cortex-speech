@@ -11,7 +11,7 @@ Any crash after mutation begins therefore
 leaves Couch unable to resume, never unrestricted.
 
 For a pre-v59 library, establish durable revocation before the offline maintenance migration. Once
-schema 60 and foreign keys are clean, inspect and activate with the printed event id::
+schema 62 and foreign keys are clean, inspect and activate with the printed event id::
 
     python scripts/activate_review_pilot.py --prepare-maintenance-revocation
     python scripts/activate_review_pilot.py --inspect
@@ -66,7 +66,7 @@ HIDDEN_QC_PER_REVIEWER = 2
 TOTAL_HIDDEN_QC = len(REVIEWERS) * HIDDEN_QC_PER_REVIEWER
 MAX_COMPENSATED_UI_ACTIONS = TOTAL_CAP + TOTAL_HIDDEN_QC
 COUCH_PORT = 8737
-REQUIRED_SCHEMA = 60
+REQUIRED_SCHEMA = 62
 
 
 def default_data_dir() -> Path:

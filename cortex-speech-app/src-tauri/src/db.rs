@@ -1431,7 +1431,7 @@ pub(crate) fn rejected_transcript_for_learning(corrected: &str, candidates: &[Op
 }
 
 impl Database {
-    fn with_full_sync<T>(&self, operation: impl FnOnce() -> AppResult<T>) -> AppResult<T> {
+    pub(crate) fn with_full_sync<T>(&self, operation: impl FnOnce() -> AppResult<T>) -> AppResult<T> {
         self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
         let result = operation();
         let reset = self.conn.execute_batch("PRAGMA synchronous=NORMAL;");

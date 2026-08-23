@@ -63,7 +63,8 @@
     "retry": "Retry",
     "linkExpired": "This link has expired. Ask for a new one — anything you already saved is safe, and anything still waiting to send will go through on the new link.",
     "allDone": "All clips reviewed!",
-    "noDialectWork": "No clips are assigned to you right now. Nothing to do — you will be told when there are.",
+    "poolDone": "You have reviewed every clip currently available to you.",
+    "noDialectWork": "No playable clips are available for your dialects right now. You can stop here.",
     "heldByOthers": "{n} clip(s) are with the other reviewers. Refresh later.",
     "loadingMore": "Loading clips…",
     "queued": "Queued — it will send when you are back online",
@@ -97,7 +98,8 @@
     "retry": "دووبارە",
     "linkExpired": "ئەم بەستەرە بەسەرچووە. داوای بەستەرێکی نوێ بکە — هەرچی پاشەکەوتت کردووە پارێزراوە، و هەرچی چاوەڕێی ناردنە بە بەستەرە نوێیەکە دەنێردرێت.",
     "allDone": "هەموو پارچەکان پێداچوونەوەیان بۆ کرا!",
-    "noDialectWork": "لە ئێستادا هیچ پارچەیەک بۆ تۆ دانەنراوە. شتێک نییە بۆ کردن — کاتێک هەبوو پێت دەڵێین.",
+    "poolDone": "تۆ پێداچوونەوەت بۆ هەموو ئەو پارچانە کردووە کە ئێستا بۆت بەردەستن.",
+    "noDialectWork": "ئێستا هیچ پارچەیەکی گونجاو بۆ زاراوەکانت بەردەست نییە. دەتوانیت لێرە بوەستیت.",
     "heldByOthers": "{n} پارچە لای پێداچوونەوەرانی تر ماوە. دواتر تازەی بکەرەوە.",
     "loadingMore": "بارکردنی پارچەکان…",
     "queued": "لە ڕیزدایە — کاتێک گەڕایتەوە سەر ئینتەرنێت دەنێردرێت",
@@ -131,6 +133,7 @@
     "retry": "retry",
     "linkExpired": null,
     "allDone": "review.allDone",
+    "poolDone": null,
     "noDialectWork": null,
     "heldByOthers": null,
     "loadingMore": null,
@@ -494,6 +497,9 @@
   let accountingAvailable = null;
   // Restricted to a dialect that currently has no clips — NOT the same as finishing the corpus.
   let noDialectWork = false;
+  // Flexible pool mode means an empty reviewer-specific queue is personal completion, not a claim
+  // that the whole corpus is finished or that an owner assigned this person a task.
+  let reviewPool = false;
   function fmtDuration(ms) {
     const s = Math.round(ms / 1000);
     if (s < 60) return `${s}s`;
@@ -610,6 +616,7 @@
     // Nor when this reviewer simply has no clips in their DIALECT. Congratulating someone for
     // finishing a corpus they were never served any of is the same lie in a third costume — and it
     // would hide the real state from the owner, who needs to know they are idle for a reason.
+    if (reviewPool) { $('done').textContent = '🎉 ' + t('poolDone'); return; }
     if (noDialectWork) { $('done').textContent = t('noDialectWork'); return; }
     $('done').textContent = '🎉 ' + t('allDone');
   }
@@ -1136,6 +1143,7 @@
       // progress line falls back to per-batch counting when it is.
       pendingTotal = Number(res.pendingTotal) || 0;
       noDialectWork = res.noWorkInYourDialect === true;
+      reviewPool = res.reviewPool === true;
       applyAccounting(res);
       // Recomputed on EVERY load: a fetch that brings work back re-arms the refetch, so a reviewer who
       // drains one batch, sees the finished screen, and later reloads is not stuck with a stale verdict.

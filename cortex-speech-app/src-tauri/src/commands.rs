@@ -2460,7 +2460,7 @@ fn take_mandatory_pre_restore_snapshot(
 /// These rows are irreversible review/payment evidence, not ordinary dataset state. A restore may
 /// add rows, but it may never make any exact pre-restore row disappear or change one of its values.
 /// Keep this list explicit so adding another monetary/audit authority requires a conscious review.
-const DURABLE_REVIEW_RESTORE_TABLES: [&str; 19] = [
+const DURABLE_REVIEW_RESTORE_TABLES: [&str; 29] = [
     "review_pilot_hidden_keys",
     "review_events",
     "spot_checks",
@@ -2480,6 +2480,16 @@ const DURABLE_REVIEW_RESTORE_TABLES: [&str; 19] = [
     "legacy_corrections_v60",
     "legacy_reviewed_segments_v60",
     "legacy_machine_verdict_segments_v60",
+    "review_campaign_registry",
+    "review_campaign_focus",
+    "review_campaign_transitions",
+    "independent_review_decisions",
+    "independent_review_reversals",
+    "review_campaign_adjudications",
+    "review_pool_registry",
+    "review_pool_members",
+    "review_pool_decisions",
+    "review_pool_reversals",
 ];
 
 const EFFECT_BOUND_AGENT_EXAMPLES_RESTORE_PROJECTION: &str =
@@ -2712,6 +2722,16 @@ fn has_durable_review_activity(db: &crate::db::Database) -> Result<bool, String>
         "legacy_corrections_v60",
         "legacy_reviewed_segments_v60",
         "legacy_machine_verdict_segments_v60",
+        "review_campaign_registry",
+        "review_campaign_focus",
+        "review_campaign_transitions",
+        "independent_review_decisions",
+        "independent_review_reversals",
+        "review_campaign_adjudications",
+        "review_pool_registry",
+        "review_pool_members",
+        "review_pool_decisions",
+        "review_pool_reversals",
     ] {
         let exists: bool = db
             .connection()
@@ -5540,6 +5560,8 @@ fn validate_restore_target_semantics(db: &crate::db::Database) -> Result<(), Str
     validate_playback_receipt_semantics(db)?;
     crate::review_campaign::load(db)
         .map_err(|error| format!("database restore refused: sequential campaign authority is invalid: {error}"))?;
+    crate::review_pool::load(db)
+        .map_err(|error| format!("database restore refused: flexible review-pool authority is invalid: {error}"))?;
     Ok(())
 }
 
@@ -8783,7 +8805,7 @@ mod tests {
     fn legacy_machine_db() -> crate::db::Database {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 2).unwrap(), vec![61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![62, 61, 60]);
         db
     }
 
@@ -9114,7 +9136,7 @@ mod tests {
         // review_effect_state with a different timestamp and test the wrong authority first.
         let correction_floor = crate::db::Database::open(":memory:").unwrap();
         correction_floor.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&correction_floor, 2).unwrap(), vec![61, 60]);
+        assert_eq!(crate::migrations::rollback(&correction_floor, 3).unwrap(), vec![62, 61, 60]);
         correction_floor
             .connection()
             .execute(
@@ -9126,7 +9148,7 @@ mod tests {
                 ["a".repeat(64)],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60, 61]);
+        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60, 61, 62]);
         let correction_target = copied_database(&correction_floor);
         correction_target
             .connection()
@@ -9953,12 +9975,12 @@ mod tests {
 
         let legacy = crate::db::Database::open(":memory:").unwrap();
         legacy.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&legacy, 2).unwrap(), vec![61, 60]);
+        assert_eq!(crate::migrations::rollback(&legacy, 3).unwrap(), vec![62, 61, 60]);
         let mut legacy_segment = test_segment("flag-legacy-authority", "flag-legacy.wav", "machine draft");
         legacy_segment.verified = true;
         legacy_segment.annotated_transcript = Some("immutable legacy truth".into());
         legacy.insert_segment_full(&legacy_segment).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61]);
+        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62]);
         legacy
             .record_review_flag("flag-legacy-authority", "legacy concern", "00000000-0000-4000-8000-000000000807")
             .unwrap();
@@ -9970,7 +9992,7 @@ mod tests {
     fn mixed_flag_decision_chains_preserve_exact_rationale_through_undo_and_restore() {
         let flag_then_decision = crate::db::Database::open(":memory:").unwrap();
         flag_then_decision.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&flag_then_decision, 2).unwrap(), vec![61, 60]);
+        assert_eq!(crate::migrations::rollback(&flag_then_decision, 3).unwrap(), vec![62, 61, 60]);
         insert_canonical_pay_segment(&flag_then_decision, "rationale-flag-decision");
         flag_then_decision
             .write_segment_verdict(
@@ -9983,7 +10005,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&flag_then_decision).unwrap(), vec![60, 61]);
+        assert_eq!(crate::migrations::run_migrations(&flag_then_decision).unwrap(), vec![60, 61, 62]);
         flag_then_decision
             .record_review_flag("rationale-flag-decision", "flag rationale", "00000000-0000-4000-8000-000000000808")
             .unwrap();
@@ -10032,7 +10054,7 @@ mod tests {
 
         let decision_then_flag = crate::db::Database::open(":memory:").unwrap();
         decision_then_flag.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&decision_then_flag, 2).unwrap(), vec![61, 60]);
+        assert_eq!(crate::migrations::rollback(&decision_then_flag, 3).unwrap(), vec![62, 61, 60]);
         insert_canonical_pay_segment(&decision_then_flag, "rationale-decision-flag");
         decision_then_flag
             .write_segment_verdict(
@@ -10045,7 +10067,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&decision_then_flag).unwrap(), vec![60, 61]);
+        assert_eq!(crate::migrations::run_migrations(&decision_then_flag).unwrap(), vec![60, 61, 62]);
         decision_then_flag.finalize_human_review("rationale-decision-flag", "accept", None, Some(2), None).unwrap();
         let effect_id: i64 = decision_then_flag
             .connection()
