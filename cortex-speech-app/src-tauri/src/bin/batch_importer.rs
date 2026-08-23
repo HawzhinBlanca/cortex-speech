@@ -5,6 +5,8 @@ use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
 use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize, LlmMode};
+use cortex_speech_app_lib::{quality, review_pool};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,6 +15,199 @@ fn app_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("cortex-speech")))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("cortex-speech"))
+}
+
+fn collect_prepared_wavs(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    fn visit(directory: &Path, depth: usize, wavs: &mut Vec<PathBuf>) -> Result<(), String> {
+        if depth > 32 {
+            return Err(format!("prepared voice directory nesting exceeds 32 levels at {}", directory.display()));
+        }
+        let entries = std::fs::read_dir(directory)
+            .map_err(|error| format!("cannot read prepared voice directory {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read entry under {}: {error}", directory.display()))?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if kind.is_dir() {
+                visit(&path, depth + 1, wavs)?;
+            } else if kind.is_file() && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+            {
+                wavs.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut wavs = Vec::new();
+    visit(directory, 0, &mut wavs)?;
+    wavs.sort_unstable();
+    if wavs.is_empty() {
+        return Err(format!("no WAV files found in prepared voice directory {}", directory.display()));
+    }
+    Ok(wavs)
+}
+
+fn is_exact_champion_segment(segment: &cortex_speech_app_lib::db::SpeechSegment, champion_model_id: &str) -> bool {
+    segment.model_version_id.as_deref() == Some(champion_model_id)
+        && !segment.cloud_call
+        && !quality::is_placeholder_transcript(&segment.raw_transcript)
+}
+
+/// Import final, one-character WAVs two files at a time so the two warm 7B workers receive genuinely
+/// concurrent work. Each worker owns its SQLite connection; all durable journal bookkeeping stays on
+/// the coordinator connection. A wave is joined before its results are accepted, and any non-champion
+/// or non-1:1 result is removed and halts the run.
+fn import_prepared_voice_parallel(
+    pipeline: &ProcessingPipeline,
+    db: &Database,
+    db_path: &Path,
+    target_dir: &Path,
+) -> Result<(usize, usize), String> {
+    let files = collect_prepared_wavs(target_dir)?;
+    let total = files.len();
+    let champion_model_id = review_pool::current_champion_7b_model_id(db)?;
+    let job_id = db
+        .begin_import_job(&target_dir.to_string_lossy(), total)
+        .map_err(|error| format!("cannot create prepared import journal: {error}"))?;
+    let file_concurrency = std::env::var("CORTEX_7B_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| (1..=2).contains(value))
+        .unwrap_or(2);
+    println!("Prepared-file concurrency: {file_concurrency} (one file per warm GPU worker).");
+
+    let mut succeeded = 0usize;
+    let mut pending = Vec::new();
+    for file in files {
+        let path_text = file.to_string_lossy().to_string();
+        let existing_ids = db
+            .segment_ids_for_audio_path(&path_text)
+            .map_err(|error| format!("cannot inspect existing rows for {}: {error}", file.display()))?;
+        if existing_ids.is_empty() {
+            pending.push(file);
+            continue;
+        }
+        let existing = db
+            .get_segments_by_ids(&existing_ids)
+            .map_err(|error| format!("cannot read existing rows for {}: {error}", file.display()))?;
+        if existing.len() == 1 && is_exact_champion_segment(&existing[0], &champion_model_id) {
+            db.mark_import_file_done(&job_id, &path_text)
+                .map_err(|error| format!("cannot journal existing file {}: {error}", file.display()))?;
+            succeeded += 1;
+            println!(
+                "Progress: {succeeded}/{total} - {} - Exact champion row reused",
+                file.file_name().and_then(|name| name.to_str()).unwrap_or("unknown")
+            );
+            continue;
+        }
+
+        // This directory is declared prepared and therefore must be 1 WAV -> 1 exact champion row.
+        // Delete only the incomplete/non-canonical stage; the database's review-authority trigger
+        // refuses this operation if any human evidence exists, turning that case into a hard stop.
+        db.delete_segments_batch(&existing_ids)
+            .map_err(|error| format!("cannot replace invalid staged rows for {}: {error}", file.display()))?;
+        pending.push(file);
+    }
+
+    for wave in pending.chunks(file_concurrency) {
+        let outcomes: Vec<(PathBuf, Result<Vec<cortex_speech_app_lib::db::SpeechSegment>, String>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .cloned()
+                    .map(|file| {
+                        let worker_pipeline = pipeline.clone();
+                        let worker_db_path = db_path.to_path_buf();
+                        scope.spawn(move || {
+                            let result = Database::open_with_retry(&worker_db_path.to_string_lossy())
+                                .map_err(|error| format!("worker database open failed: {error}"))
+                                .and_then(|worker_db| {
+                                    worker_pipeline
+                                        .process_single_file(&file, &worker_db)
+                                        .map_err(|error| error.to_string())
+                                });
+                            (file, result)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            (PathBuf::from("<panicked prepared worker>"), Err("prepared import worker panicked".into()))
+                        })
+                    })
+                    .collect()
+            });
+
+        for (file, result) in outcomes {
+            let segments = result.map_err(|error| {
+                format!("prepared import HALTED at {} after {succeeded}/{total} completed: {error}", file.display())
+            })?;
+            let valid = segments.len() == 1 && is_exact_champion_segment(&segments[0], &champion_model_id);
+            if !valid {
+                let ids: Vec<String> = segments.iter().map(|segment| segment.id.clone()).collect();
+                if let Err(error) = db.delete_segments_batch(&ids) {
+                    return Err(format!(
+                        "prepared import produced invalid rows for {} and rollback failed: {error}",
+                        file.display()
+                    ));
+                }
+                return Err(format!(
+                    "prepared import HALTED: {} produced {} row(s), but exactly one local {champion_model_id} row is required",
+                    file.display(),
+                    segments.len()
+                ));
+            }
+            let path_text = file.to_string_lossy().to_string();
+            db.mark_import_file_done(&job_id, &path_text)
+                .map_err(|error| format!("cannot journal completed file {}: {error}", file.display()))?;
+            succeeded += 1;
+            println!(
+                "Progress: {succeeded}/{total} - {} - OmniASR-7B champion complete",
+                file.file_name().and_then(|name| name.to_str()).unwrap_or("unknown")
+            );
+        }
+    }
+
+    db.complete_import_job(&job_id).map_err(|error| format!("cannot complete prepared import journal: {error}"))?;
+    Ok((total, succeeded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_reuse_requires_exact_local_champion_evidence() {
+        let mut segment = cortex_speech_app_lib::db::SpeechSegment {
+            raw_transcript: "دەنگێکی ڕاستەقینە".into(),
+            model_version_id: Some("champion-v1".into()),
+            ..Default::default()
+        };
+        assert!(is_exact_champion_segment(&segment, "champion-v1"));
+
+        segment.cloud_call = true;
+        assert!(!is_exact_champion_segment(&segment, "champion-v1"));
+        segment.cloud_call = false;
+        segment.raw_transcript = "[Pending WSL 7B ASR]".into();
+        assert!(!is_exact_champion_segment(&segment, "champion-v1"));
+        segment.raw_transcript = "دەنگ".into();
+        assert!(!is_exact_champion_segment(&segment, "different-deployment"));
+    }
+
+    #[test]
+    fn prepared_inventory_accepts_only_wavs_and_is_deterministic() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested directory");
+        std::fs::write(root.path().join("b.WAV"), b"wave").expect("wav b");
+        std::fs::write(nested.join("a.wav"), b"wave").expect("wav a");
+        std::fs::write(root.path().join("ignore.mp3"), b"not selected").expect("other file");
+
+        let files = collect_prepared_wavs(root.path()).expect("collect prepared wavs");
+        assert_eq!(files, vec![root.path().join("b.WAV"), nested.join("a.wav")]);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -98,6 +293,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("Importing directory: {}", target_dir.display());
+
+    if prepared_voice {
+        let (total, succeeded) = import_prepared_voice_parallel(&pipeline, &db, &db_path, &target_dir)?;
+        if total != succeeded {
+            return Err(format!("Prepared import incomplete: {succeeded}/{total} WAVs completed").into());
+        }
+        println!("Completed: Total {total}, Succeeded {succeeded}, Failed 0");
+        println!("Batch Importer Finished!");
+        return Ok(());
+    }
 
     // import_directory returns Ok(()) even when every file failed or the dir has zero audio files
     // (per-file faults only emit PipelineEvent::Error). Capture the final tally so this binary's EXIT
