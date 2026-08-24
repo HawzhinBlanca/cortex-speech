@@ -79,6 +79,20 @@ public static class CortexProbeCerts {
 # The one line a drill reads. Printed for every decision so a test asserts the CHOICE, not a side effect.
 function Report([string]$action) { Write-Output "WATCHDOG-ACTION: $action" }
 
+function Get-Sha256Hex([string]$path) {
+    # Do not depend on PowerShell module autoload during crash recovery. `Get-FileHash` is supplied
+    # by Microsoft.PowerShell.Utility and was unavailable in a real handover subprocess even though
+    # it existed interactively. The framework primitive is always present in the supported runtime.
+    $stream = [System.IO.File]::OpenRead($path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return -join @($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
 # Logging must never be able to stop the watchdog. With $ErrorActionPreference = 'Stop' a failed
 # Add-Content (full disk, the log opened by an editor, a locked profile) threw and aborted the run
 # BEFORE the kill/relaunch below — so the one condition most likely to take the app down was also the
@@ -125,7 +139,7 @@ function Get-VerifiedActiveRelease {
             @([string]$value.watchdogScript, [string]$value.watchdogSha256)
         )
         foreach ($check in $checks) {
-            $actualSha = (Get-FileHash -LiteralPath $check[0] -Algorithm SHA256).Hash.ToLowerInvariant()
+            $actualSha = Get-Sha256Hex $check[0]
             if ($actualSha -ne $check[1]) { throw "release artifact hash mismatch: $($check[0])" }
         }
         return $value

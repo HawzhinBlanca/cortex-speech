@@ -178,7 +178,9 @@ def test_watchdog_and_server_pin_the_release_boundary() -> None:
     controller = SUBJECT.read_text(encoding="utf-8")
     assert release.POINTER_FILE in watchdog
     assert "Get-VerifiedActiveRelease" in watchdog
-    assert "Get-FileHash" in watchdog
+    assert "function Get-Sha256Hex" in watchdog
+    assert "$actualSha = Get-Sha256Hex $check[0]" in watchdog
+    assert "(Get-FileHash" not in watchdog
     assert release.WATCHDOG_TASK == "CortexPrivateProductionWatchdog"
     assert release.LEGACY_WATCHDOG_TASK == "CortexWatchdog"
     assert '"-TaskName",\n        WATCHDOG_TASK' in controller

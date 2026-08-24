@@ -11099,3 +11099,11 @@ regression, waits after force-stop, and registers a separate user-owned
 `CortexPrivateProductionWatchdog` bound to the immutable release while leaving the protected legacy
 task available only for pre-migration fallback. Its logon trigger is explicitly scoped to the current
 interactive Windows principal; the prior unscoped “any user” trigger required administrator rights.
+
+The second handover reached schema 63 and candidate launch, then the watchdog correctly refused to
+bless the active pointer because its hash verifier depended on module-autoloaded `Get-FileHash`, which
+was unavailable in that real subprocess. Automatic recovery restored the pinned schema-62 snapshot,
+preserved the failed v63 database in `recovery-quarantine`, relaunched the fallback, and re-proved both
+links with 877 events and zero pool decisions unchanged. The watchdog now computes SHA-256 directly
+through `System.Security.Cryptography.SHA256`; a full valid immutable pointer passed in a throwaway
+profile, while the malformed-pointer refusal regression remains green.
