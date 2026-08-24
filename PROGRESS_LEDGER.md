@@ -1,5 +1,14 @@
 # Cortex Speech — Progress Ledger
 
+> **CURRENT PRIVATE-PRODUCTION AUTHORITY — 2026-08-24:** The June Wave-0 scorecard and “Current
+> Focus” sections immediately below are historical charter lineage, not the live reviewer-system
+> verdict. Current operational authority is
+> [`cortex-speech-app/docs/PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md`](cortex-speech-app/docs/PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md),
+> the active immutable release pointer, and the generated schema-2 pool certification. The active
+> reviewer line is release `8ef5d3c1b29e-8a999c88e220-2ad63448136e`; it is review-ready, while the
+> human-reviewed dataset is correctly not final. Never use an older score, machine-state paragraph,
+> hidden-check requirement, model route, focus, or roster below as current production instruction.
+
 ## 1. Overall 10/10 Gate Status
 
 * **Stop Condition (`verify-10` checker)**: **GREEN — narrow M0/M1 gate only** (`make verify-10` exits 0: manifest sync, asset presence, ledger schema, license-compatibility). This is **NOT** the full-charter 10/10. **Honest grade as of 2026-07-09: ≈7/10** (36-agent adversarially-verified audit, [docs/TRUE_RATING_2026-07-09.md](docs/TRUE_RATING_2026-07-09.md)); lineage 6.5 (07-02) → 6.5 (07-06 deep-check) → ~7.0 (07-09). The scorecard table below is the ORIGINAL Wave-0 blueprint scorecard, retained for history; the current per-dimension grades live in the 07-09 rating doc. The remaining gap to a declared 10/10 is owner-gated measurement (P2.2 benchmark → marathon → retrain cycle → P7 re-audit).
@@ -11135,3 +11144,24 @@ hardware-or-model-isolated ignored; pool-admin binary 6/6; frontend 292/292; Pla
 with warnings denied, and `git diff --check` green. The complete 103-file Python run passed every
 technical policy and deliberately red-marked only this ledger as four commits stale; this entry closes
 that administrative gate before the final exact rerun and controlled handover.
+
+## 2026-08-24 — final release and completion-audit correction
+
+Commit `8ef5d3c1b29e41ea926bcf8ab22e3b8b2e68334d` was built as immutable release
+`8ef5d3c1b29e-8a999c88e220-2ad63448136e`, passed the live-sized schema-63 clone, and completed a
+protected same-schema handover. Independent live proof after exposure: exactly one active release
+process; database integrity healthy with zero foreign-key violations; 20,323/20,323 audio clips and
+20,323/20,323 exact rights; preserved Rubar and Alle local/Funnel credentials; valid WAV and
+idempotency probes; queue p95 153.54 ms and 150.97 ms; fresh local and `F:` snapshots; and watchdog
+result zero on its five-minute clock. No GPU or ASR inference ran.
+
+The final requirement audit then reproduced a real proof defect: the export crash tests shared one
+process-global `AtomicBool`, so parallel Rust scheduling could make a normal export consume another
+test's fault or make the crash test miss it. The first unforced run failed 3/19 for exactly that
+cross-test contamination. Commit `18423dee480ac5bcff577d02c5d22b02415afc68` scopes the one-shot
+fault to the calling test thread and removes a second process-global environment mutation from the
+7B semaphore test. The original 19-test selection then passed 20/20; the six export tests passed five
+consecutive 16-thread repetitions; the full Rust library passed 1,535/1,535 with eight intentional
+hardware/model ignores; pool-admin 6/6 and batch-importer 3/3 passed; strict all-target/all-feature
+Clippy, formatting, and diff integrity passed. This audit-only correction preserves production
+semantics, so the known-good reviewer release was deliberately not interrupted or replaced.

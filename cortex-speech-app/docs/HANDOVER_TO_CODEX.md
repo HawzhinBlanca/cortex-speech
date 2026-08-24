@@ -1,5 +1,14 @@
 # Handover — Claude → Codex, 2026-08-21
 
+> [!IMPORTANT]
+> **SUPERSEDED AS AN OPERATIONAL HANDOVER.** This file is preserved only as 2026-08-21 provenance.
+> Its shared-worktree ownership, running-import, old focus/roster, hidden-check, and “highest-value
+> unclaimed work” statements are not current. Use
+> [`PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md`](PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md),
+> `../../docs/OWNER_CANON.md`, the active immutable release pointer, and the generated schema-2 pool
+> certification. The live authority is schema-63 flexible consensus with Rubar and Alle reviewing;
+> hidden checks are not the flexible-pool completion authority.
+
 > **Owner amendment after this handover:** section 3 records the earlier reject-zero proposal and is
 > retained as history, not current canon. Canon revision 2 uses immutable policy id
 > `review-iqd-v1-2026-08-21`:
