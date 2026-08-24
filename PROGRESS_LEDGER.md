@@ -11263,3 +11263,21 @@ zero integrity/dedup risk, and fresh local/offsite snapshots. Human progress rem
 judgments, zero resolutions, and 0/20 playback canary decisions. The active release was deliberately
 not restarted, and no live database write, GPU, model server, ASR inference, or synthetic judgment was
 used.
+
+## 2026-08-24 — bounded master fuzz proof completed
+
+Commit `bc1b5f7b5c186f83f7a15b2b7eaa74627ec8dd52` closes the last interrupted engineering
+proof from the schema-65 master sweep. The Windows gate now uses `wsl --exec`, a per-checkout ext4
+Cargo cache, one all-target ASAN build, and direct execution of the exact built harnesses. Runtime
+corpus/artifacts remain derived Linux-cache state; committed corpus seeds are copied read-only. The
+gate rejects an empty target list, build failure, timeout, unsafe target name, nonzero exit, missing
+`DONE`, and even an exit-zero `#0 DONE` result.
+
+Measured final run: cache 149,597 iterations; diff 106,129; normalizer 41,326; validation 5,398,283;
+total 5,695,335 with zero crashes. All 106 Python policy scripts, including five fail-closed fuzz
+policy assertions, passed on the final code. Live read-only certification remained `reviewReady=true`
+at schema 65 with all 162 contract objects exact, quick/full integrity `ok`, zero foreign keys,
+16,990/16,990 canonical audio, exact rights 20,323/20,323, zero dedup risk, fresh verified local and
+`F:` snapshots, Alle/Rubar authenticating, and supervision green with 424.8 GB free. Human progress stayed
+two Rubar judgments, zero resolutions, and 0/20 post-release playback decisions. No reviewer restart,
+live database write, GPU, model server, ASR inference, or synthetic judgment occurred.

@@ -29,6 +29,12 @@ the v65 trigger replacement; runtime probes hash-verify and select the immutable
 instead of requiring a mutable developer build; and two stale Rust fixtures now follow the
 champion-only model fallback and schema-65 rollback boundary. No production runtime code changed, so
 the healthy reviewer release was not restarted.
+Fuzz-proof correction `bc1b5f7b5c186f83f7a15b2b7eaa74627ec8dd52` makes the final deep gate
+bounded and repeatable on Windows: WSL stores only derived ASAN build/runtime state in a
+per-checkout Linux cache, builds all four harnesses once, executes the exact built binaries without
+cargo-fuzz's redundant second Cargo build, preserves its ASAN/artifact/corpus semantics, and refuses
+exit-zero runs without a positive libFuzzer `DONE` iteration count. The measured final run completed
+5,695,335 iterations across cache, diff, normalizer, and validation with zero crashes.
 
 > **Superseded evidence correction:** an initial schema-64 handover refused exposure because the
 > Python snapshot manifest omitted the two schema-64 dedup authority counts. No reviewer data was
@@ -75,7 +81,7 @@ Primary evidence: `src-tauri/src/review_pool.rs` tests
 | Future imports isolated and champion-only | PASS | Batch importer requires an explicit existing staging data root, rejects live/ancestor/descendant/alias paths, and accepts only exact local OmniASR-7B champion evidence. |
 | Migration/future-schema/partial-failure tests | PASS | Real v62→v63, v63→v64, and v64→v65 paths, restart/reapply, reversible down paths, atomic failure, incomplete-history refusal, and future-schema refusal. |
 | Retry/restart/network/concurrency durability | PASS | 1,000 lost-response retries across 20 DB reopen cycles; 25 forced process crashes; concurrent reviewer hammer and mid-session restart tests; zero duplicated authority. |
-| Clean engineering verification | PASS | Rust library 1,541 passed, 0 failed, 8 intentional hardware/model/isolated-benchmark ignores; counted aggregate 1,649 tests across 43 binaries; pool-admin 6/6; importer 3/3; frontend 292/292 and browser E2E 97/97; all 105 Python policy scripts; schema-65 snapshot 26/26, restore 21/21, release 11/11; strict Clippy/format/lint/typecheck/build green. |
+| Clean engineering verification | PASS | Rust library 1,541 passed, 0 failed, 8 intentional hardware/model/isolated-benchmark ignores; counted aggregate 1,649 tests across 43 binaries; pool-admin 6/6; importer 3/3; frontend 292/292 and browser E2E 97/97; all 106 Python policy scripts; four ASAN fuzz targets / 5,695,335 iterations / zero crashes; schema-65 snapshot 26/26, restore 21/21, release 11/11; strict Clippy/format/lint/typecheck/build green. |
 
 ## Live checkpoint
 
@@ -96,6 +102,14 @@ Alle and Rubar both authenticated through Funnel, supervision passed, and the ac
 binary completed 2,389 positive-control-backed offline workload loops with zero non-loopback backend
 TCP endpoints. Human state remained two genuine Rubar judgments, zero resolved clips, and 0/20
 post-release playback decisions; these numbers were not fabricated or backdated.
+
+The post-`bc1b5f7` read-only checkpoint remained review-ready: schema 65 and all 162 protected
+contract objects matched; quick/full integrity returned `ok`; foreign-key violations, missing audio,
+rights gaps, revocations, and unconfirmed duplicate risk were zero. Alle and Rubar authenticated,
+supervision passed with 424.8 GB free, and verified local/offsite snapshots were 253/251 seconds old.
+Human state was still two Rubar judgments, zero resolutions, and 0/20 current-release playback
+decisions. The reviewer process was not restarted and no live write, GPU, model server, or ASR
+inference was used.
 
 ## External completion gates
 
