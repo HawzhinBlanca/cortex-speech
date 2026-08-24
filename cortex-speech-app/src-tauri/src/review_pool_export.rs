@@ -22,7 +22,7 @@ const TTS_SAMPLE_RATE: u32 = 24_000;
 const ASR_SAMPLE_RATE: u32 = 16_000;
 
 #[cfg(test)]
-static FAIL_AFTER_CERTIFICATION_BEFORE_PUBLICATION: AtomicBool = AtomicBool::new(false);
+static FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -242,6 +242,63 @@ fn sync_tree(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+fn tree_inventory(root: &Path) -> AppResult<BTreeMap<String, bool>> {
+    fn walk(root: &Path, directory: &Path, inventory: &mut BTreeMap<String, bool>) -> AppResult<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
+                return Err(AppError::Validation(format!(
+                    "export tree contains an unsupported filesystem entry: {}",
+                    path.display()
+                )));
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| AppError::Validation("export inventory escaped its root".to_string()))?
+                .to_str()
+                .ok_or_else(|| AppError::Validation("export inventory contains a non-Unicode path".to_string()))?
+                .replace('\\', "/");
+            inventory.insert(relative, kind.is_dir());
+            if kind.is_dir() {
+                walk(root, &path, inventory)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut inventory = BTreeMap::new();
+    walk(root, root, &mut inventory)?;
+    Ok(inventory)
+}
+
+fn verify_exact_tree(expected: &Path, published: &Path) -> AppResult<()> {
+    if !published.is_dir() {
+        return Err(AppError::Validation(format!(
+            "existing export destination is not a directory: {}",
+            published.display()
+        )));
+    }
+    let expected_inventory = tree_inventory(expected)?;
+    let published_inventory = tree_inventory(published)?;
+    if published_inventory != expected_inventory {
+        return Err(AppError::Validation(format!(
+            "existing export destination has a different file inventory: {}",
+            published.display()
+        )));
+    }
+    for (relative, is_directory) in expected_inventory {
+        if !is_directory && sha256_file(&expected.join(&relative))? != sha256_file(&published.join(&relative))? {
+            return Err(AppError::Validation(format!(
+                "existing export destination differs at {relative}: {}",
+                published.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn write_sha256sums(root: &Path, relative_files: &[String]) -> AppResult<String> {
     let path = root.join("SHA256SUMS");
     let mut writer = BufWriter::new(File::create(&path)?);
@@ -272,8 +329,11 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
     let output_value =
         crate::validation::input::validate_output_path(&options.output_dir).map_err(AppError::Validation)?;
     let output = PathBuf::from(output_value);
-    if output.exists() {
-        return Err(AppError::Validation(format!("export destination already exists: {}", output.display())));
+    if output.exists() && !output.is_dir() {
+        return Err(AppError::Validation(format!(
+            "export destination already exists and is not a directory: {}",
+            output.display()
+        )));
     }
     let parent = output
         .parent()
@@ -553,6 +613,27 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
         }
 
         let existing = review_pool::voice_certificate(db, voice_name).map_err(AppError::Validation)?;
+        let certificate_value = |app_git_sha: &str, created_at_ms: i64| {
+            serde_json::json!({
+                "schemaVersion": POOL_EXPORT_SCHEMA_VERSION,
+                "poolId": pool.pool_id,
+                "poolFocusSha256": pool.focus_sha256,
+                "voiceName": voice_name,
+                "championModelVersionId": pool.champion_model_version_id,
+                "championDeploymentSha256": pool.champion_deployment_sha256,
+                "resolutionSha256": authority.resolution_sha256,
+                "reviewerSha256": authority.reviewer_sha256,
+                "rightsSha256": rights_sha256,
+                "audioSha256": audio_sha256,
+                "exportManifestSha256": manifest_sha256,
+                "exportSha256sumsSha256": sha256sums_sha256,
+                "retainedSegments": retained_rows.len(),
+                "rejectedSegments": rejected_rows.len(),
+                "totalDurationMs": total_duration_ms,
+                "appGitSha": app_git_sha,
+                "createdAtMs": created_at_ms,
+            })
+        };
         let (certificate_json, certificate_sha256, created_at_ms) = if let Some(certificate) = &existing {
             let same = certificate.pool_id == pool.pool_id
                 && certificate.resolution_sha256 == authority.resolution_sha256
@@ -569,7 +650,43 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                     "voice {voice_name} has an immutable certificate for different export evidence"
                 )));
             }
+            let parsed: serde_json::Value = serde_json::from_str(&certificate.certificate_json)
+                .map_err(|error| AppError::Validation(format!("stored voice certificate is invalid JSON: {error}")))?;
+            if parsed != certificate_value(&certificate.app_git_sha, certificate.created_at_ms)
+                || sha256_bytes(certificate.certificate_json.as_bytes()) != certificate.certificate_sha256
+            {
+                return Err(AppError::Validation(format!(
+                    "voice {voice_name} has an internally inconsistent immutable certificate"
+                )));
+            }
             (certificate.certificate_json.clone(), certificate.certificate_sha256.clone(), certificate.created_at_ms)
+        } else if output.is_dir() {
+            // A complete destination without a database row is the only legal residue of a process
+            // dying after the atomic directory rename but before SQLite certification. Reuse its
+            // original timestamp/certificate bytes only when every evidence field is exact; the
+            // full tree comparison below then proves this is recovery, never adoption of foreign data.
+            let json = fs::read_to_string(output.join("certificate.json")).map_err(|error| {
+                AppError::Validation(format!(
+                    "existing export destination has no readable recovery certificate: {error}"
+                ))
+            })?;
+            let parsed: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
+                AppError::Validation(format!("existing export recovery certificate is invalid JSON: {error}"))
+            })?;
+            let created_at_ms =
+                parsed.get("createdAtMs").and_then(serde_json::Value::as_i64).filter(|value| *value > 0).ok_or_else(
+                    || AppError::Validation("existing export recovery certificate has no valid timestamp".into()),
+                )?;
+            // Recovery deliberately requires the same immutable binary that published the tree.
+            // Trusting appGitSha from a mutable orphan directory would let a filesystem edit forge
+            // provenance. The versioned publishing release remains available for exact recovery.
+            if parsed != certificate_value(crate::GIT_SHA, created_at_ms) {
+                return Err(AppError::Validation(
+                    "existing export recovery certificate does not match current voice authority".into(),
+                ));
+            }
+            let digest = sha256_bytes(json.as_bytes());
+            (json, digest, created_at_ms)
         } else {
             let created_at_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -577,25 +694,7 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                 .as_millis();
             let created_at_ms = i64::try_from(created_at_ms)
                 .map_err(|_| AppError::Validation("system clock exceeds SQLite integer range".to_string()))?;
-            let certificate_value = serde_json::json!({
-                "schemaVersion": POOL_EXPORT_SCHEMA_VERSION,
-                "poolId": pool.pool_id,
-                "poolFocusSha256": pool.focus_sha256,
-                "voiceName": voice_name,
-                "championModelVersionId": pool.champion_model_version_id,
-                "championDeploymentSha256": pool.champion_deployment_sha256,
-                "resolutionSha256": authority.resolution_sha256,
-                "reviewerSha256": authority.reviewer_sha256,
-                "rightsSha256": rights_sha256,
-                "audioSha256": audio_sha256,
-                "exportManifestSha256": manifest_sha256,
-                "exportSha256sumsSha256": sha256sums_sha256,
-                "retainedSegments": retained_rows.len(),
-                "rejectedSegments": rejected_rows.len(),
-                "totalDurationMs": total_duration_ms,
-                "appGitSha": crate::GIT_SHA,
-                "createdAtMs": created_at_ms,
-            });
+            let certificate_value = certificate_value(crate::GIT_SHA, created_at_ms);
             let json = serde_json::to_string(&certificate_value).map_err(|error| AppError::Other(error.to_string()))?;
             let digest = sha256_bytes(json.as_bytes());
             (json, digest, created_at_ms)
@@ -612,17 +711,26 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             .map_err(|error| AppError::Other(error.to_string()))?,
         )?;
         sync_tree(&staging)?;
-        // Move the fully synced tree to a still-hidden commit name before touching database
-        // authority. Publishing the final name first left a process-crash window where a directory
-        // containing `_COMPLETE.json` was visible even though SQLite had no voice certificate. The
-        // hidden tree may survive a crash, but a final visible tree never can without a durable
-        // certificate. A retry deterministically rebuilds and publishes from the existing certificate.
-        let certifying = parent.join(format!(".{leaf}.certifying-{}", uuid::Uuid::new_v4().hyphenated()));
-        fs::rename(&staging, &certifying)?;
-        crate::atomic_file::fsync_parent_dir(&certifying);
+        if output.exists() {
+            verify_exact_tree(&staging, &output)?;
+        } else {
+            // Publication is one same-filesystem rename of a fully written, fully verified tree.
+            // If the process dies immediately afterward, the artifact is complete but certification
+            // remains conservatively absent; rerunning this exact command verifies every byte and
+            // finishes the database commit without replacing the artifact.
+            fs::rename(&staging, &output)?;
+            crate::atomic_file::fsync_parent_dir(&output);
+            #[cfg(test)]
+            if FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.swap(false, Ordering::SeqCst) {
+                return Err(AppError::Validation(format!(
+                    "injected crash window after atomic publication; certification remains absent for {}",
+                    output.display()
+                )));
+            }
+        }
 
         if existing.is_none() {
-            let registration = review_pool::record_voice_certificate(
+            review_pool::record_voice_certificate(
                 db,
                 &review_pool::VoiceCertificateInput {
                     voice_name,
@@ -639,29 +747,13 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                     total_duration_ms,
                     created_at_ms,
                 },
-            );
-            if let Err(error) = registration {
-                let quarantine = parent.join(format!(".{leaf}.uncertified-{}", uuid::Uuid::new_v4().hyphenated()));
-                let quarantine_note = match fs::rename(&certifying, &quarantine) {
-                    Ok(()) => format!("; unpublished artifact preserved at {}", quarantine.display()),
-                    Err(rename_error) => {
-                        format!("; WARNING: could not quarantine {}: {rename_error}", certifying.display())
-                    }
-                };
-                return Err(AppError::Validation(format!(
-                    "export files were complete but database certification failed: {error}{quarantine_note}"
-                )));
-            }
+            )
+            .map_err(|error| {
+                AppError::Validation(format!(
+                    "export is atomically published but database certification failed; rerun the same command to recover: {error}"
+                ))
+            })?;
         }
-        #[cfg(test)]
-        if FAIL_AFTER_CERTIFICATION_BEFORE_PUBLICATION.swap(false, Ordering::SeqCst) {
-            return Err(AppError::Validation(format!(
-                "injected crash window after durable certification; unpublished artifact preserved at {}",
-                certifying.display()
-            )));
-        }
-        fs::rename(&certifying, &output)?;
-        crate::atomic_file::fsync_parent_dir(&output);
         Ok(PoolDatasetResult {
             output_dir: output.to_string_lossy().to_string(),
             pool_id: pool.pool_id,
@@ -870,6 +962,16 @@ mod tests {
         assert_eq!(second.manifest_sha256, first.manifest_sha256);
         assert_eq!(second.sha256sums_sha256, first.sha256sums_sha256);
         assert_eq!(second.certificate_sha256, first.certificate_sha256);
+
+        let exact_retry = export_voice(
+            &db,
+            &PoolDatasetOptions {
+                output_dir: first_output.to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(exact_retry.certificate_sha256, first.certificate_sha256);
     }
 
     #[test]
@@ -931,10 +1033,10 @@ mod tests {
     }
 
     #[test]
-    fn certificate_commit_precedes_atomic_publication_and_a_crash_window_is_retryable() {
+    fn atomic_publication_precedes_certificate_and_a_crash_window_is_retryable() {
         let (directory, db) = fixture();
         let output = directory.path().join("crash-window");
-        FAIL_AFTER_CERTIFICATION_BEFORE_PUBLICATION.store(true, Ordering::SeqCst);
+        FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.store(true, Ordering::SeqCst);
 
         let error = export_voice(
             &db,
@@ -942,15 +1044,13 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("after durable certification"), "unexpected injected failure: {error}");
-        assert!(!output.exists(), "the final export name must remain absent until after certification");
-        assert!(review_pool::voice_certificate(&db, "Lamo").unwrap().is_some());
-        let hidden = fs::read_dir(directory.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".crash-window.certifying-"))
-            .count();
-        assert_eq!(hidden, 1, "a complete hidden artifact must survive for crash diagnosis");
+        assert!(error.contains("after atomic publication"), "unexpected injected failure: {error}");
+        assert!(output.join("_COMPLETE.json").is_file(), "publication must be all-or-nothing and self-verifying");
+        assert!(output.join("certificate.json").is_file());
+        assert!(
+            review_pool::voice_certificate(&db, "Lamo").unwrap().is_none(),
+            "a crash may not make final certification claim that publication completed"
+        );
 
         let retried = export_voice(
             &db,
@@ -964,5 +1064,35 @@ mod tests {
         );
         assert!(output.join("_COMPLETE.json").is_file());
         assert!(output.join("certificate.json").is_file());
+        assert_eq!(
+            review_pool::voice_certificate(&db, "Lamo").unwrap().unwrap().certificate_sha256,
+            retried.certificate_sha256,
+            "the retry must certify the exact already-published bytes"
+        );
+    }
+
+    #[test]
+    fn crash_recovery_refuses_a_tampered_published_tree_without_certifying_it() {
+        let (directory, db) = fixture();
+        let output = directory.path().join("tampered-crash-window");
+        FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.store(true, Ordering::SeqCst);
+        export_voice(
+            &db,
+            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+        )
+        .unwrap_err();
+        fs::write(output.join("unexpected.txt"), b"not part of the certified export").unwrap();
+
+        let error = export_voice(
+            &db,
+            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("different file inventory"), "unexpected refusal: {error}");
+        assert!(
+            review_pool::voice_certificate(&db, "Lamo").unwrap().is_none(),
+            "tampered crash residue must never become certified"
+        );
     }
 }

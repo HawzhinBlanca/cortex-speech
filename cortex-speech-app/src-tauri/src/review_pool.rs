@@ -1253,8 +1253,11 @@ pub fn record_voice_certificate(
             return Err(format!("voice certificate {label} digest is invalid"));
         }
     }
-    serde_json::from_str::<serde_json::Value>(input.certificate_json)
+    let certificate_value = serde_json::from_str::<serde_json::Value>(input.certificate_json)
         .map_err(|error| format!("voice certificate JSON is invalid: {error}"))?;
+    if certificate_value.get("appGitSha").and_then(serde_json::Value::as_str) != Some(crate::GIT_SHA) {
+        return Err("voice certificate JSON does not match its app Git SHA".to_string());
+    }
     let actual_certificate_sha: String =
         Sha256::digest(input.certificate_json.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect();
     if actual_certificate_sha != input.certificate_sha256 {
