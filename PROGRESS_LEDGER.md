@@ -11097,4 +11097,5 @@ watchdog was re-enabled and the aborted journal/recovery task were cleared only 
 re-proved. The replacement uses a flat exact-path transport with a real renamed-`ping.exe` termination
 regression, waits after force-stop, and registers a separate user-owned
 `CortexPrivateProductionWatchdog` bound to the immutable release while leaving the protected legacy
-task available only for pre-migration fallback.
+task available only for pre-migration fallback. Its logon trigger is explicitly scoped to the current
+interactive Windows principal; the prior unscoped “any user” trigger required administrator rights.

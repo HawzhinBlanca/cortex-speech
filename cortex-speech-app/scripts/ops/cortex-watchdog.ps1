@@ -155,7 +155,12 @@ if ($Register) {
     # Two triggers: at logon (the autostart), and a repeating clock (the healer). Task Scheduler
     # caps a repetition trigger's duration; (New-TimeSpan -Days 3650) is rejected on Win11, so the
     # logon trigger carries an indefinite repetition instead.
-    $logon = New-ScheduledTaskTrigger -AtLogOn
+    # An unscoped AtLogOn trigger means "any user" and requires administrator rights. Production
+    # review runs only in this interactive user's WebView2 session, so bind the trigger to the exact
+    # logged-on principal. This is both least privilege and independently registerable during a
+    # recovery-safe handover.
+    $currentPrincipal = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $logon = New-ScheduledTaskTrigger -AtLogOn -User $currentPrincipal
     $logon.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
         -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
     # Battery flags are ON by default and would silently disable the whole watchdog the moment Windows
