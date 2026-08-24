@@ -649,6 +649,18 @@ impl Wsl7bGate {
     /// Poison-tolerant like every other lock in this crate.
     fn acquire(&self, cancel: Option<&std::sync::atomic::AtomicBool>) -> Option<Wsl7bPermit<'_>> {
         let limit = wsl_7b_concurrency();
+        self.acquire_with_limit(cancel, limit)
+    }
+
+    /// Explicit-limit core used by the environment-routed production entrypoint and deterministic
+    /// unit tests. Keeping environment mutation out of parallel tests prevents an unrelated 7B test
+    /// from temporarily changing the process-wide production limit observed by another test.
+    fn acquire_with_limit(
+        &self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        limit: usize,
+    ) -> Option<Wsl7bPermit<'_>> {
+        debug_assert!((1..=8).contains(&limit));
         let mut in_flight = self.in_flight.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while *in_flight >= limit {
             if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {

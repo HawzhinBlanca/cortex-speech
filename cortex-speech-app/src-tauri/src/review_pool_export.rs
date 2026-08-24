@@ -9,12 +9,12 @@ use crate::error::{AppError, AppResult};
 use crate::review_pool::{self, SegmentResolution};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const POOL_EXPORT_SCHEMA_VERSION: u32 = 1;
@@ -22,7 +22,23 @@ const TTS_SAMPLE_RATE: u32 = 24_000;
 const ASR_SAMPLE_RATE: u32 = 16_000;
 
 #[cfg(test)]
-static FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    // Rust executes tests in parallel inside one process. A process-global fault flag lets an
+    // unrelated export consume another test's injected crash, making the crash-safety proof flaky.
+    // Export is synchronous, so thread-local one-shot injection models the exact call boundary while
+    // keeping parallel fixtures isolated.
+    static FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn arm_publication_crash() {
+    FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn take_publication_crash() -> bool {
+    FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.with(|flag| flag.replace(false))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -721,7 +737,7 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             fs::rename(&staging, &output)?;
             crate::atomic_file::fsync_parent_dir(&output);
             #[cfg(test)]
-            if FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.swap(false, Ordering::SeqCst) {
+            if take_publication_crash() {
                 return Err(AppError::Validation(format!(
                     "injected crash window after atomic publication; certification remains absent for {}",
                     output.display()
@@ -1036,7 +1052,7 @@ mod tests {
     fn atomic_publication_precedes_certificate_and_a_crash_window_is_retryable() {
         let (directory, db) = fixture();
         let output = directory.path().join("crash-window");
-        FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.store(true, Ordering::SeqCst);
+        arm_publication_crash();
 
         let error = export_voice(
             &db,
@@ -1075,7 +1091,7 @@ mod tests {
     fn crash_recovery_refuses_a_tampered_published_tree_without_certifying_it() {
         let (directory, db) = fixture();
         let output = directory.path().join("tampered-crash-window");
-        FAIL_AFTER_PUBLICATION_BEFORE_CERTIFICATION.store(true, Ordering::SeqCst);
+        arm_publication_crash();
         export_voice(
             &db,
             &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
@@ -1094,5 +1110,19 @@ mod tests {
             review_pool::voice_certificate(&db, "Lamo").unwrap().is_none(),
             "tampered crash residue must never become certified"
         );
+    }
+
+    #[test]
+    fn publication_crash_injection_is_thread_local() {
+        let armed = std::thread::spawn(|| {
+            arm_publication_crash();
+            assert!(take_publication_crash(), "the arming thread must observe its one-shot fault");
+            assert!(!take_publication_crash(), "the fault must be consumed exactly once");
+        });
+        let clean = std::thread::spawn(|| {
+            assert!(!take_publication_crash(), "one test thread must never inherit another thread's export fault");
+        });
+        armed.join().unwrap();
+        clean.join().unwrap();
     }
 }

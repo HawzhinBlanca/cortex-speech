@@ -1351,17 +1351,14 @@ fn revoke_consent_now_never_grants() {
 fn the_7b_gate_admits_exactly_its_permit_count_at_once() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // SAFETY: single-threaded at this point; the worker threads below start after it is set.
-    std::env::set_var("CORTEX_7B_CONCURRENCY", "2");
-    assert_eq!(super::wsl_7b_concurrency(), 2, "the env var must reach the gate");
-
+    let gate = super::Wsl7bGate::new();
     let in_flight = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
         for _ in 0..8 {
             scope.spawn(|| {
-                let _permit = super::WSL_7B_GATE.acquire(None).expect("uncancelled acquire always yields a permit");
+                let _permit = gate.acquire_with_limit(None, 2).expect("uncancelled acquire always yields a permit");
                 let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 // Long enough that every thread overlaps if the gate lets them.
@@ -1375,8 +1372,6 @@ fn the_7b_gate_admits_exactly_its_permit_count_at_once() {
     assert!(observed <= 2, "gate admitted {observed} at once, above its 2 permits — requests would queue and time out");
     assert_eq!(observed, 2, "gate never admitted 2 at once, so a second replica would sit idle");
     assert_eq!(in_flight.load(Ordering::SeqCst), 0, "every permit must be returned on drop");
-
-    std::env::remove_var("CORTEX_7B_CONCURRENCY");
 }
 
 /// An unusable CORTEX_7B_CONCURRENCY must fall back to 1 — the SAFE end. Over-admitting reintroduces
