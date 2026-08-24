@@ -27,6 +27,7 @@ from typing import Any
 from check_spot_check_pool import PolicyBroken, active_flexible_pool
 from pilot_focus_contract import (
     CANONICAL_IDENTITY_KIND,
+    PLAYBACK_GUARD_VERSION,
     canonical_audio_work_id,
     canonical_reviewer_work_id,
     canonical_source_span,
@@ -71,6 +72,21 @@ REQUIRED_TRIGGERS = {
     "human_decision_effect_reversals_immutable_update",
     "human_decision_effect_reversals_immutable_delete",
 }
+
+
+# Second-pass judging commits to its own append-only tables and never touches review_events, so the
+# ledger has nothing to price and no credit ever appears.  The ledger is not wrong — it paid exactly
+# what it was told to pay — the work is simply unrecorded, and the reviewer's phone shows a flat
+# balance with no sign of it.  Every entry is (table, its reversal table); the effective row set is
+# the decision minus its reversal, exactly as effective_review_pool_decisions_v62 /
+# effective_independent_review_decisions_v61 define it.
+UNPAID_DECISION_TABLES = (
+    ("review_pool_decisions", "review_pool_reversals"),
+    ("independent_review_decisions", "independent_review_reversals"),
+)
+# skip carries 0 basis points under review-iqd-v1-2026-08-21, so an uncredited skip is not unpaid
+# work; counting it would inflate the very number the owner has to decide on.
+PAYABLE_WEIGHT_ACTIONS = ("accept", "edit", "reject")
 
 
 def _default_data_dir() -> Path:
@@ -268,12 +284,76 @@ def _canonical_focus_status(row: sqlite3.Row) -> tuple[bool, str, str | None]:
     return True, reason, work_id
 
 
+def _uncredited_second_pass_decisions(
+    connection: sqlite3.Connection,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Count durable, playback-evidenced second-pass decisions that carry no ledger credit.
+
+    Reported, never failed.  Whether a pool/blinded second pass is payable at all is an OWNER
+    decision under `review-iqd-v1-2026-08-21`, and the rate table is canon: this gate may not mint,
+    backfill, or reprice a single micro-IQD.  Failing here would leave the sweep permanently RED with
+    no canon-legal remedy, which is exactly the pressure that gets gates weakened.  So it warns
+    loudly instead — the ledger's own arithmetic contract, which this gate does enforce fail-closed,
+    is untouched by this section.
+
+    The only linkage a credit could ever have to one of these decisions is the shared operation id,
+    so that is what is joined; a decision reversed by its append-only reversal table is not
+    outstanding work.
+    """
+    tables = {
+        str(row["name"]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    uncredited: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for table, reversals in UNPAID_DECISION_TABLES:
+        if table not in tables or reversals not in tables:
+            continue
+        placeholders = ",".join("?" for _ in PAYABLE_WEIGHT_ACTIONS)
+        grouped = connection.execute(
+            f"""SELECT lower(trim(decision.reviewer)) AS reviewer, COUNT(*) AS decisions,
+                       COALESCE(SUM(decision.duration_ms), 0) AS duration_ms
+                  FROM {table} decision
+                 WHERE decision.action IN ({placeholders})
+                   AND decision.playback_guard_version = ?
+                   AND NOT EXISTS (SELECT 1 FROM {reversals} reversal
+                                    WHERE reversal.decision_id = decision.id)
+                   AND NOT EXISTS (SELECT 1 FROM review_compensation_ledger ledger
+                                     JOIN review_events event ON event.id = ledger.review_event_id
+                                    WHERE event.operation_id = decision.operation_id)
+                 GROUP BY 1
+                 ORDER BY 1""",
+            (*PAYABLE_WEIGHT_ACTIONS, PLAYBACK_GUARD_VERSION),
+        ).fetchall()
+        if not grouped:
+            continue
+        decisions = sum(int(row["decisions"]) for row in grouped)
+        duration_ms = sum(int(row["duration_ms"]) for row in grouped)
+        uncredited.extend(
+            {
+                "table": table,
+                "reviewer": str(row["reviewer"]),
+                "decisions": int(row["decisions"]),
+                "durationMs": int(row["duration_ms"]),
+            }
+            for row in grouped
+        )
+        per_reviewer = ", ".join(f"{row['reviewer']}={row['decisions']}" for row in grouped)
+        warnings.append(
+            f"UNPAID WORK: {decisions} playback-evidenced decisions on {table} carry no ledger "
+            f"credit (owner decision pending: pay or declare unpaid); {duration_ms} ms across "
+            f"{len(grouped)} reviewers [{per_reviewer}]"
+        )
+    return uncredited, warnings
+
+
 def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
     errors: list[str] = []
     evidence: dict[str, Any] = {
         "database": str(db_path.resolve()),
         "focus": str(focus_path.resolve()),
         "policyVersion": POLICY_VERSION,
+        "uncreditedSecondPassDecisions": [],
+        "warnings": [],
     }
     if not db_path.is_file():
         return {**evidence, "ok": False, "errors": [f"database not found: {db_path}"]}
@@ -303,6 +383,14 @@ def audit(db_path: Path, focus_path: Path) -> dict[str, Any]:
         return {**evidence, "ok": False, "errors": [f"cannot open database read-only: {error}"]}
 
     with connection:
+        # Scanned before the schema gate below can return early: the pool/blinded decision tables
+        # only exist from migrations 61 and 62, so on every database new enough to hold unpaid
+        # second-pass work the exact-schema-60 check bails out first and this section would never
+        # run where it matters most.
+        uncredited, uncredited_warnings = _uncredited_second_pass_decisions(connection)
+        evidence["uncreditedSecondPassDecisions"] = uncredited
+        evidence["warnings"] = uncredited_warnings
+
         try:
             schema_version = int(
                 connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
@@ -790,6 +878,10 @@ def main(argv: list[str] | None = None) -> int:
     if result is None:
         result = audit(db_path, focus_path)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    # Repeated on stderr so the unpaid-work banner survives in the sweep log even when the JSON body
+    # is scrolled past; a PASS whose report nobody reads is how invisible work stays invisible.
+    for warning in result.get("warnings", []):
+        print(warning, file=sys.stderr)
     return 0 if result["ok"] else 1
 
 

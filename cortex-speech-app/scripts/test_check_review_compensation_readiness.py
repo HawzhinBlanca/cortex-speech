@@ -440,6 +440,131 @@ class CompensationReadinessGateTests(unittest.TestCase):
                  VALUES (2, 2, 's1', 'Rubar', 'couch', 'accept', 2)"""
         )
 
+    def create_pool_decision_tables(self, connection: sqlite3.Connection) -> None:
+        """Mirror the migration-62 second-pass tables the gate must now look at."""
+        connection.executescript(
+            """
+            CREATE TABLE review_pool_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, pool_id TEXT NOT NULL,
+                segment_id TEXT NOT NULL, reviewer TEXT NOT NULL, action TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL, operation_id TEXT NOT NULL UNIQUE,
+                playback_guard_version TEXT NOT NULL DEFAULT 'content-hash-raw-counter-v3'
+            );
+            CREATE TABLE review_pool_reversals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, decision_id INTEGER NOT NULL UNIQUE,
+                operation_id TEXT NOT NULL UNIQUE, reviewer TEXT NOT NULL
+            );
+            """
+        )
+
+    def insert_pool_decision(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        decision_id: int,
+        operation_id: str,
+        reviewer: str = "Rubar",
+        action: str = "edit",
+        duration_ms: int = 1000,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO review_pool_decisions
+                   (id, pool_id, segment_id, reviewer, action, duration_ms, operation_id)
+                 VALUES (?, 'pool-1', 's1', ?, ?, ?, ?)""",
+            (decision_id, reviewer, action, duration_ms, operation_id),
+        )
+
+    def test_uncredited_pool_decision_is_reported_as_unpaid_work_without_minting_pay(self):
+        connection = sqlite3.connect(self.db)
+        self.create_pool_decision_tables(connection)
+        self.insert_pool_decision(
+            connection, decision_id=1, operation_id="55555555-5555-4555-8555-555555555555"
+        )
+        self.insert_pool_decision(
+            connection,
+            decision_id=2,
+            operation_id="66666666-6666-4666-8666-666666666666",
+            reviewer="Alle",
+            action="reject",
+            duration_ms=2000,
+        )
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 0, report)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(len(report["warnings"]), 1, report)
+        self.assertIn(
+            "2 playback-evidenced decisions on review_pool_decisions carry no ledger credit "
+            "(owner decision pending: pay or declare unpaid)",
+            report["warnings"][0],
+        )
+        self.assertIn("3000 ms across 2 reviewers", report["warnings"][0])
+        self.assertEqual(
+            report["uncreditedSecondPassDecisions"],
+            [
+                {
+                    "table": "review_pool_decisions",
+                    "reviewer": "alle",
+                    "decisions": 1,
+                    "durationMs": 2000,
+                },
+                {
+                    "table": "review_pool_decisions",
+                    "reviewer": "rubar",
+                    "decisions": 1,
+                    "durationMs": 1000,
+                },
+            ],
+            report,
+        )
+        # Visibility only: the owner-set policy must not have paid anything on its own.
+        self.assertEqual(report["totalEarnedMicroIqd"], 5_000_000)
+
+    def test_reversed_and_skipped_pool_decisions_are_not_reported_as_unpaid_work(self):
+        connection = sqlite3.connect(self.db)
+        self.create_pool_decision_tables(connection)
+        self.insert_pool_decision(
+            connection, decision_id=1, operation_id="55555555-5555-4555-8555-555555555555"
+        )
+        connection.execute(
+            "INSERT INTO review_pool_reversals (decision_id, operation_id, reviewer) "
+            "VALUES (1, '77777777-7777-4777-8777-777777777777', 'Rubar')"
+        )
+        self.insert_pool_decision(
+            connection,
+            decision_id=2,
+            operation_id="66666666-6666-4666-8666-666666666666",
+            action="skip",
+        )
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["warnings"], [], report)
+        self.assertEqual(report["uncreditedSecondPassDecisions"], [], report)
+
+    def test_credited_pool_decision_stays_quiet(self):
+        connection = sqlite3.connect(self.db)
+        self.create_pool_decision_tables(connection)
+        # Event 1 already carries entry-1 in the ledger; sharing its operation id is the only way a
+        # pool decision could ever be credited, so this row is paid work and must not be flagged.
+        self.insert_pool_decision(
+            connection, decision_id=1, operation_id="11111111-1111-4111-8111-111111111111"
+        )
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["warnings"], [], report)
+        self.assertEqual(report["uncreditedSecondPassDecisions"], [], report)
+
     def test_valid_ledger_and_focus_pass(self):
         code, report = self.run_gate()
         self.assertEqual(code, 0, report)
