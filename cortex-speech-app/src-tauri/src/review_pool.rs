@@ -233,6 +233,9 @@ struct DedupSelectionEvidence {
     confidence_ppm: Option<i64>,
 }
 
+type DedupSelectionKey = (bool, Reverse<i64>, bool, i64, bool, i64, bool, Reverse<i64>, String, String);
+type RegistryDedupRow = (String, i64, String, String, String, i64, Option<String>, i64);
+
 #[derive(Debug, Clone)]
 pub struct OwnerAdjudicationInput<'a> {
     pub segment_id: &'a str,
@@ -422,10 +425,7 @@ fn scaled(value: Option<f64>, multiplier: f64) -> Option<i64> {
     value.filter(|value| value.is_finite()).map(|value| (value * multiplier).round() as i64)
 }
 
-fn selection_key(
-    segment_id: &str,
-    evidence: &DedupSelectionEvidence,
-) -> (bool, Reverse<i64>, bool, i64, bool, i64, bool, Reverse<i64>, String, String) {
+fn selection_key(segment_id: &str, evidence: &DedupSelectionEvidence) -> DedupSelectionKey {
     (
         evidence.snr_milli_db.is_none(),
         Reverse(evidence.snr_milli_db.unwrap_or_default()),
@@ -878,7 +878,7 @@ pub fn apply_dedup_manifest(db: &Database, manifest_json: &str) -> Result<PoolDe
     }
     manifest_value
         .as_object_mut()
-        .expect("dedup root was proved to be an object")
+        .ok_or_else(|| "review-pool dedup manifest root changed while hashing".to_string())?
         .insert("manifestSha256".to_string(), serde_json::Value::String(claimed_sha256.clone()));
     let canonical_manifest = String::from_utf8(canonical_json_bytes(&manifest_value)?)
         .map_err(|_| "review-pool dedup manifest is not canonical UTF-8".to_string())?;
@@ -1021,22 +1021,25 @@ pub fn apply_dedup_manifest(db: &Database, manifest_json: &str) -> Result<PoolDe
             return Err(format!("dedup family {} would retire more than one reviewed clip", family.family_id));
         }
         if let Some(reviewed) = actual_reviewed.first() {
-            if *reviewed != &family.canonical_segment_id
+            if *reviewed != family.canonical_segment_id
                 || family.canonical_selection_reason != "preserve-human-review-evidence"
             {
                 return Err(format!("dedup family {} does not preserve its reviewed member", family.family_id));
             }
             reviewed_canonical_members += 1;
         } else {
-            let expected = segment_ids
+            let mut ranked_members = Vec::with_capacity(segment_ids.len());
+            for segment_id in &segment_ids {
+                let evidence = selection
+                    .get(segment_id.as_str())
+                    .ok_or_else(|| format!("dedup member {segment_id} lost its validated selection evidence"))?;
+                ranked_members.push((selection_key(segment_id, evidence), segment_id));
+            }
+            let expected = ranked_members
                 .iter()
-                .min_by_key(|segment_id| {
-                    selection_key(
-                        segment_id,
-                        selection.get(segment_id.as_str()).expect("selection evidence was validated"),
-                    )
-                })
-                .expect("dedup family has at least two members");
+                .min_by_key(|(key, _)| key)
+                .map(|(_, segment_id)| *segment_id)
+                .ok_or_else(|| format!("dedup family {} has no selectable member", family.family_id))?;
             if *expected != family.canonical_segment_id
                 || family.canonical_selection_reason != "best-measured-audio-quality-then-stable-identity"
             {
@@ -1217,7 +1220,7 @@ pub fn registry_matches(db: &Database, bound: &ReviewPool) -> Result<bool, Strin
                 && bound.review_segment_count == bound.focus_segment_count
         }));
     }
-    let current: Option<(String, i64, String, String, String, i64, Option<String>, i64)> = db
+    let current: Option<RegistryDedupRow> = db
         .connection()
         .query_row(
             "SELECT registry.pool_id,
