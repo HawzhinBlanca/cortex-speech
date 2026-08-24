@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -246,6 +247,94 @@ def servable_clips(
     return out
 
 
+def active_pool_queue_counts(
+    data_dir: Path,
+    db_path: Path,
+    reviewers: list[str],
+    roster: dict[str, list[str]],
+) -> dict[str, int] | None:
+    """Use the active release's exact Rust queue authority when a flexible pool exists.
+
+    Flexible-pool mode deliberately supersedes ``voice_focus.json``. Reapplying that historical
+    one-voice allow-list in this checker made a healthy 16,990-clip pool look like a 6,922-clip Lamo
+    queue even though the server correctly served the immutable three-voice pool. The hash-bound
+    ``pool_admin probe`` calls the same ``review_pool::pending_segment_ids`` implementation as Couch,
+    including effective reviewer decisions, two/three-review resolution, duplicate exclusions,
+    dialect restrictions, playable audio, and idempotency authority.
+    """
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        registry_exists = con.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='review_pool_registry'"
+        ).fetchone()[0]
+        if registry_exists == 0:
+            return None
+        registry_rows = con.execute("SELECT COUNT(*) FROM review_pool_registry").fetchone()[0]
+    except sqlite3.Error as error:
+        raise PolicyBroken(f"review-pool authority cannot be read: {error}") from error
+    finally:
+        con.close()
+    if registry_rows == 0:
+        return None
+    if registry_rows != 1:
+        raise PolicyBroken(f"review_pool_registry has {registry_rows} rows instead of exactly one")
+
+    try:
+        from release_private_production import active_pointer, defaults
+
+        _default_data, release_root = defaults()
+        manifest = active_pointer(data_dir, release_root)
+    except Exception as error:  # noqa: BLE001 - a broken release boundary is a queue failure
+        raise PolicyBroken(f"active flexible-pool release cannot be verified: {error}") from error
+    if manifest is None:
+        raise PolicyBroken("a flexible review pool exists without an immutable active release")
+
+    counts: dict[str, int] = {}
+    for reviewer in reviewers:
+        command = [
+            str(manifest["poolAdminExe"]),
+            "probe",
+            "--db",
+            str(db_path),
+            "--reviewer",
+            reviewer,
+        ]
+        for dialect in allowed_for(roster, reviewer) or []:
+            command.extend(["--dialect", dialect])
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "no diagnostic").strip()
+                raise PolicyBroken(f"canonical pool probe failed for {reviewer}: {detail}")
+            payload = json.loads(result.stdout, parse_constant=_reject_nonfinite)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise PolicyBroken(f"canonical pool probe is unreadable for {reviewer}: {error}") from error
+        count = payload.get("availableClips") if isinstance(payload, dict) else None
+        if (
+            type(count) is not int
+            or count < 0
+            or payload.get("readOnly") is not True
+            or payload.get("reviewer") != reviewer
+            or payload.get("passes") is not True
+            or payload.get("sampleAudioValidWav") is not True
+            or payload.get("submissionIdempotencyAuthority") is not True
+        ):
+            raise PolicyBroken(f"canonical pool probe returned invalid authority for {reviewer}")
+        counts[reviewer] = count
+    return counts
+
+
+def evaluate_pool_queues(counts: dict[str, int], warn_below: int = RUNWAY_WARN_CLIPS) -> tuple[list[str], list[str]]:
+    """Return the same zero-work failures/runway warnings from exact reviewer-specific pool counts."""
+    problems = [f"{reviewer} has a live link and ZERO clips to review." for reviewer, count in counts.items() if count == 0]
+    warnings = [
+        f"{reviewer} has only {count} clips left — import more soon."
+        for reviewer, count in counts.items()
+        if 0 < count < warn_below
+    ]
+    return problems, warnings
+
+
 def wrong_dialect_decisions(db_path: Path, roster: dict[str, list[str]], table: list[tuple[str, str]]) -> dict[str, int]:
     """Current, attributed decisions outside the reviewer's present dialect scope.
 
@@ -324,17 +413,26 @@ def main() -> int:
     table = source_dialects((_repo_root() / "src-tauri" / "src" / "dialect.rs").read_text(encoding="utf-8"))
     try:
         roster = load_roster(data_dir)
-        focus = load_focus(data_dir)
+        pool_counts = active_pool_queue_counts(data_dir, db_path, reviewers, roster)
+        focus = None if pool_counts is not None else load_focus(data_dir)
     except PolicyBroken as e:
         # The server 503s every queue while a policy file is broken, so every live link is dead.
         print("REVIEWER QUEUES: FAIL", flush=True)
         print(f"  - {e} — the server serves NOTHING to any reviewer until this file is fixed", flush=True)
         return 1
-    clips = servable_clips(db_path, table, focus)
-    if focus is not None:
-        print(f"voice focus ACTIVE: queues narrowed to {len(focus)} clip id(s)", flush=True)
-
-    problems, warnings = evaluate_queues(reviewers=reviewers, roster=roster, clips=clips, table=table)
+    clips: list[tuple[str, int]] = []
+    if pool_counts is not None:
+        problems, warnings = evaluate_pool_queues(pool_counts)
+        print(
+            "review pool ACTIVE: exact reviewer queues "
+            + ", ".join(f"{reviewer}={count}" for reviewer, count in sorted(pool_counts.items())),
+            flush=True,
+        )
+    else:
+        clips = servable_clips(db_path, table, focus)
+        if focus is not None:
+            print(f"voice focus ACTIVE: queues narrowed to {len(focus)} clip id(s)", flush=True)
+        problems, warnings = evaluate_queues(reviewers=reviewers, roster=roster, clips=clips, table=table)
 
     offenders = wrong_dialect_decisions(db_path, roster, table)
     if offenders:
@@ -361,7 +459,7 @@ def main() -> int:
 
     print(
         f"REVIEWER QUEUES: OK ({len(reviewers)} live link(s), every one has clips to review; "
-        f"{len(clips)} servable pending)",
+        f"{sum(pool_counts.values()) if pool_counts is not None else len(clips)} reviewer-eligible pending)",
         flush=True,
     )
     return 0

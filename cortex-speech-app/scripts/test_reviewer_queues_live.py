@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_reviewer_queues_live import (  # noqa: E402
     PolicyBroken,
+    evaluate_pool_queues,
     allowed_for,
     dialect_of,
     evaluate_queues,
@@ -139,6 +140,15 @@ def test_a_thin_queue_warns_without_failing() -> None:
     )
     assert problems == []
     assert len(warnings) == 1 and "only 3 clips" in warnings[0]
+
+
+def test_flexible_pool_counts_are_reviewer_specific_and_zero_fails() -> None:
+    problems, warnings = evaluate_pool_queues({"Alle": 120, "Rubar": 0}, warn_below=100)
+    assert len(problems) == 1 and "Rubar" in problems[0] and "ZERO" in problems[0]
+    assert warnings == []
+    problems, warnings = evaluate_pool_queues({"Alle": 99, "Rubar": 101}, warn_below=100)
+    assert problems == []
+    assert len(warnings) == 1 and "Alle" in warnings[0] and "99" in warnings[0]
 
 
 def test_unmapped_clips_fail_closed_and_are_not_counted_as_work() -> None:
