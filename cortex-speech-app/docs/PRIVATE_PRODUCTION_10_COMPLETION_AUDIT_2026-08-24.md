@@ -22,6 +22,13 @@ review certification, deferred compensation, and playback evidence while preserv
 legacy-mode rule. Queue-proof correction `3aca5885867bc77a87fe669cbee48556a84a04a5` makes the
 standalone runway checker select the same immutable flexible-pool authority as the server instead of
 reapplying the superseded 6,922-ID Lamo JSON focus.
+Master-verifier correction `0983d54eef9acde19c2fe6265017dd83e28ccec5` closes four proof drifts
+found by an unabridged sweep: the duplicate audit now verifies the v64 manifest/exclusion counts and
+audits only the canonical overlay; the schema contract replays migrations 57 and 60-65, including
+the v65 trigger replacement; runtime probes hash-verify and select the immutable active release
+instead of requiring a mutable developer build; and two stale Rust fixtures now follow the
+champion-only model fallback and schema-65 rollback boundary. No production runtime code changed, so
+the healthy reviewer release was not restarted.
 
 > **Superseded evidence correction:** an initial schema-64 handover refused exposure because the
 > Python snapshot manifest omitted the two schema-64 dedup authority counts. No reviewer data was
@@ -68,7 +75,7 @@ Primary evidence: `src-tauri/src/review_pool.rs` tests
 | Future imports isolated and champion-only | PASS | Batch importer requires an explicit existing staging data root, rejects live/ancestor/descendant/alias paths, and accepts only exact local OmniASR-7B champion evidence. |
 | Migration/future-schema/partial-failure tests | PASS | Real v62→v63, v63→v64, and v64→v65 paths, restart/reapply, reversible down paths, atomic failure, incomplete-history refusal, and future-schema refusal. |
 | Retry/restart/network/concurrency durability | PASS | 1,000 lost-response retries across 20 DB reopen cycles; 25 forced process crashes; concurrent reviewer hammer and mid-session restart tests; zero duplicated authority. |
-| Clean engineering verification | PASS | Rust 1,541 passed, 0 failed, 8 intentional hardware/model/isolated-benchmark ignores; pool-admin 6/6; importer 3/3; frontend 292/292 and browser E2E 97/97; all 104 Python policy scripts; schema-65 snapshot 26/26, restore 21/21, release 11/11; strict Clippy/format/lint/typecheck/build green. |
+| Clean engineering verification | PASS | Rust library 1,541 passed, 0 failed, 8 intentional hardware/model/isolated-benchmark ignores; counted aggregate 1,649 tests across 43 binaries; pool-admin 6/6; importer 3/3; frontend 292/292 and browser E2E 97/97; all 105 Python policy scripts; schema-65 snapshot 26/26, restore 21/21, release 11/11; strict Clippy/format/lint/typecheck/build green. |
 
 ## Live checkpoint
 
@@ -80,6 +87,15 @@ both sampled valid WAV data and proved submission idempotency. Both links authen
 local HTTPS and Funnel, the 14-assertion supervision gate passed, and the watchdog's last result was
 zero. Fresh schema-65 snapshots verified on local and `F:` storage; the offsite snapshot restored in
 3.925 seconds. No GPU, WSL model process, or ASR transcript was changed.
+
+The post-`0983d54` read-only checkpoint again reported schema 65, quick/full integrity `ok`, zero
+foreign keys, 16,990/16,990 canonical audio, exact rights on 20,323/20,323 source rows, zero
+unconfirmed duplicate risk, and fresh verified local/offsite snapshots. The canonical duplicate
+gate independently rescanned all 16,990 eligible clips and found zero cross-file duplicate content.
+Alle and Rubar both authenticated through Funnel, supervision passed, and the active immutable
+binary completed 2,389 positive-control-backed offline workload loops with zero non-loopback backend
+TCP endpoints. Human state remained two genuine Rubar judgments, zero resolved clips, and 0/20
+post-release playback decisions; these numbers were not fabricated or backdated.
 
 ## External completion gates
 

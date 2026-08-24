@@ -11232,3 +11232,34 @@ audio, exact rights, zero dedup risk, and `reviewReady=true`. The mode-aware que
 read-only. Fresh verified local and `F:` schema-65 snapshots satisfy the ten-minute RPO, and snapshot
 `F:/cortex-backups/snapshots/snapshot_1787574862` restored alone in 3.925 seconds. The watchdog is
 enabled with last result zero. Human resolution remains incomplete; no GPU or ASR inference ran.
+
+## 2026-08-24 — schema-65 master-verifier reality check
+
+An unabridged master sweep against the live private-production boundary exposed proof drift that
+smaller focused suites had not shown. The legacy duplicate gate included all 3,333 already excluded
+audit rows and falsely called the certified dedup manifest a new import; the schema-contract gate was
+hardcoded to schema 60; runtime gates searched only the mutable developer target although production
+intentionally runs a hash-pinned immutable release; and two Rust integration fixtures still assumed
+pre-schema-65 migration/model state. The training snapshot and challenger gates were also confirmed
+to be genuinely incomplete—not verifier defects—because the existing sealed fine-tune pack has no
+trained challenger binding or measured verdict.
+
+Commit `0983d54eef9acde19c2fe6265017dd83e28ccec5` fixes the proof boundary without changing reviewer
+runtime semantics. Duplicate auditing first validates source/canonical/exclusion/risk counts and then
+scans only the canonical overlay; missing or inconsistent authority remains red. Schema verification
+replays migrations 57 and 60-65 in order and binds 162 exact objects, including the v65 replacement
+trigger. Runtime discovery validates pointer containment, executable SHA-256, and baked git SHA before
+exporting the active immutable executable to probes. The quality fixture now rolls schema 65 back six
+steps to its intended schema-59 legacy boundary, and model-status testing no longer assumes optional
+300M/1B artifacts must be absent.
+
+Measured proof: the live schema contract is green at schema 65; the canonical 16,990-clip duplicate
+scan reports zero cross-file duplicate content; all 105 Python policy scripts pass; Clippy, formatting,
+syntax, and diff integrity pass; the counted Rust aggregate ran 1,649 tests across 43 binaries with a
+1,541/0/8 library result; and the exact active binary passed a positive-control egress probe with
+2,389 offline workload loops and zero non-loopback backend TCP endpoints. Final live readback kept
+`reviewReady=true`, both Alle/Rubar links authenticating, supervision green, complete audio/rights,
+zero integrity/dedup risk, and fresh local/offsite snapshots. Human progress remains two Rubar
+judgments, zero resolutions, and 0/20 playback canary decisions. The active release was deliberately
+not restarted, and no live database write, GPU, model server, ASR inference, or synthetic judgment was
+used.
