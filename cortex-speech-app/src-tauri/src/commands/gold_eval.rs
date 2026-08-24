@@ -36,6 +36,24 @@ pub async fn import_gold_segments(
     .await
 }
 
+/// Stamp on every `eval_runs` row whose hypotheses came from the renderer rather than from this app
+/// running an engine. Unstamped rows are reserved for the closed loop (`run_gold_eval_asr`), which
+/// derives both the text and the label from the registered champion.
+pub const EXTERNAL_HYPOTHESIS_MODEL_PREFIX: &str = "external-hypotheses:";
+
+/// Label an eval row built from caller-supplied text. `run_gold_eval` lets the caller choose the
+/// hypotheses AND the model label, so without this an XSS'd or scripted renderer mints a durable row
+/// reading `omniasr-wsl-7b — CER 0.00%` (hypotheses = the references) that is indistinguishable in the
+/// eval history from a measured champion run, and that `scorecard` would happily select as a baseline.
+/// The prefix keeps such a row readable and honest instead: visibly not a measurement.
+pub fn external_hypothesis_label(model_id: &str) -> String {
+    if model_id.starts_with(EXTERNAL_HYPOTHESIS_MODEL_PREFIX) {
+        model_id.to_string()
+    } else {
+        format!("{EXTERNAL_HYPOTHESIS_MODEL_PREFIX}{model_id}")
+    }
+}
+
 #[tauri::command]
 pub async fn run_gold_eval(
     state: State<'_, AppState>,
@@ -43,6 +61,7 @@ pub async fn run_gold_eval(
     hypotheses: Vec<(String, String)>,
 ) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval")?;
+    let model_id = external_hypothesis_label(&model_id);
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
@@ -94,4 +113,25 @@ pub async fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Res
         crate::eval::import_verified_segments_as_gold(&db).map_err(|e| e.to_string())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_supplied_eval_rows_cannot_wear_a_measured_model_label() {
+        // The champion's own registry id must never be reachable as a label for renderer-supplied text.
+        let stamped = external_hypothesis_label("omniasr-wsl-7b");
+        assert!(
+            stamped.starts_with(EXTERNAL_HYPOTHESIS_MODEL_PREFIX),
+            "an eval row built from caller text must be stamped, not labeled as a measurement: {stamped}"
+        );
+        assert_ne!(stamped, "omniasr-wsl-7b");
+        assert!(stamped.contains("omniasr-wsl-7b"), "the caller's claimed label stays readable: {stamped}");
+
+        // Idempotent: a re-submitted stamped label must not grow a second prefix, and a caller that
+        // spoofs the prefix buys nothing — the row still reads as caller-supplied either way.
+        assert_eq!(external_hypothesis_label(&stamped), stamped);
+    }
 }

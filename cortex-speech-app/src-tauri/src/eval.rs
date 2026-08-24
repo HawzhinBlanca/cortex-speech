@@ -1039,15 +1039,6 @@ pub fn load_eval_run_and_recompute(
     Ok(Some((recomputed_run, seg_results)))
 }
 
-/// Run the gold-set eval end-to-end by producing each hypothesis through `transcribe`.
-///
-/// Closed-loop counterpart to [`run_gold_eval`]: instead of trusting caller-supplied
-/// hypotheses, the closure produces a hypothesis from each gold segment — in production
-/// this runs the real ASR engine on the segment audio (see
-/// `ProcessingPipeline::run_gold_eval_asr`). The loop is generic over the transcriber so
-/// it is fully unit-testable without loading any model. Segments whose transcription
-/// fails are logged and skipped — never silently scored as an empty hypothesis, which
-/// would understate WER/CER.
 /// Seeded utterance-bootstrap 95% CI on a MICRO (ratio-of-sums) rate.
 ///
 /// P0 #1 of the 2026-08-03 deep audit asks a published accuracy record to carry a confidence interval,
@@ -1101,25 +1092,34 @@ const EVAL_BOOTSTRAP_SAMPLES: usize = 3000;
 /// Fixed so the interval is reproducible from the run id alone; same value the published scorecard used.
 const EVAL_BOOTSTRAP_SEED: u64 = 42;
 
+/// Run the gold-set eval end-to-end by producing each hypothesis through `transcribe`.
+///
+/// Closed-loop counterpart to [`run_gold_eval`]: instead of trusting caller-supplied hypotheses, the
+/// closure produces a hypothesis from each gold segment — in production this runs the real ASR engine
+/// on the segment audio (see `ProcessingPipeline::run_gold_eval_asr`). The loop is generic over the
+/// transcriber so it is fully unit-testable without loading any model.
+///
+/// A per-clip transcription failure is a HARD STOP (owner rule 2026-08-11): the first error aborts the
+/// run and NO eval row is written. This used to tally failures into a `tracing::warn!` and then score
+/// the SURVIVORS — and since the persisted `eval_runs` row carries only the survivor count, a champion
+/// that flaked on the 200 hardest of 348 gold clips durably published a "gold CER" measured on the 148
+/// easiest, with nothing in the UI or eval history saying so. A partly-measured run that looks
+/// finished is worse than one that stopped.
 pub fn run_gold_eval_with_transcriber<F>(db: &Database, model_id: &str, mut transcribe: F) -> AppResult<EvalRunResult>
 where
     F: FnMut(&GoldSegment) -> AppResult<String>,
 {
     let gold = list_gold_segments(db)?;
-    let total = gold.len();
-    let mut hypotheses: Vec<(String, String)> = Vec::with_capacity(total);
-    let mut failed = 0usize;
+    let mut hypotheses: Vec<(String, String)> = Vec::with_capacity(gold.len());
     for seg in &gold {
-        match transcribe(seg) {
-            Ok(hyp) => hypotheses.push((seg.id.clone(), hyp)),
-            Err(e) => {
-                failed += 1;
-                tracing::warn!("gold eval: transcription failed for {} ({}): {e}", seg.id, seg.audio_path);
-            }
-        }
-    }
-    if failed > 0 {
-        tracing::warn!("gold eval: {failed}/{total} segments failed to transcribe and were skipped");
+        let hyp = transcribe(seg).map_err(|e| {
+            crate::error::AppError::Other(format!(
+                "Gold eval halted: transcription failed for {} ({}): {e}. No eval row was written — a \
+                 CER scored on the clips that happened to survive is not this model's CER.",
+                seg.id, seg.audio_path
+            ))
+        })?;
+        hypotheses.push((seg.id.clone(), hyp));
     }
     run_gold_eval(db, model_id, hypotheses)
 }
@@ -2563,33 +2563,48 @@ mod tests {
     }
 
     #[test]
-    fn run_gold_eval_with_transcriber_skips_failures_without_scoring_them() {
+    fn run_gold_eval_with_transcriber_halts_on_the_first_failure_without_writing_a_row() {
         let db = open_mem_db();
         import_gold_segments(
             &db,
             vec![
+                GoldSegmentInput { audio_path: "/missing.wav".into(), reference: "ئەمە".into(), is_holdout: true },
                 GoldSegmentInput {
                     audio_path: "/tmp/ok.wav".into(), reference: "کوردستان".into(), is_holdout: true
                 },
-                GoldSegmentInput { audio_path: "/missing.wav".into(), reference: "ئەمە".into(), is_holdout: true },
             ],
         )
         .unwrap();
 
-        let result = run_gold_eval_with_transcriber(&db, "partial-asr", |seg| {
-            if seg.audio_path.contains("missing") {
+        // Fail on the FIRST clip the loop reaches, whichever it is: `list_gold_segments` orders by a
+        // second-resolution `created_at`, so two rows imported in the same test tick have no defined
+        // order and keying the failure on a path would flake.
+        let mut calls = 0usize;
+        let mut failed_path = String::new();
+        let err = run_gold_eval_with_transcriber(&db, "partial-asr", |seg| {
+            calls += 1;
+            if calls == 1 {
+                failed_path = seg.audio_path.clone();
                 Err(crate::error::AppError::Other("decode failed".into()))
             } else {
                 Ok("کوردستان".to_string())
             }
         })
-        .unwrap();
+        .expect_err("a per-clip transcription failure must halt the gold eval, not score the survivors");
 
-        // Only the successfully-transcribed segment is scored; the failed one is skipped,
-        // not counted as an empty hypothesis (which would understate accuracy).
-        assert_eq!(result.run.num_segs, 1);
-        assert_eq!(result.segments.len(), 1);
-        assert!(result.run.wer < 0.01);
+        // The message must name the clip and the cause, so the halt is actionable rather than a tally.
+        let msg = err.to_string();
+        assert!(msg.contains(&failed_path), "halt must name the failing clip: {msg}");
+        assert!(msg.contains("decode failed"), "halt must carry the underlying cause: {msg}");
+        assert_eq!(calls, 1, "the run stops at the FIRST failure; it does not keep transcribing");
+
+        // The core of the finding: no durable eval row may survive a partly-transcribed run. Before the
+        // fix this wrote a normal-looking eval_runs row whose CER was measured on the survivors only,
+        // with the failure count living in the log and nowhere else.
+        assert!(
+            list_eval_runs(&db).unwrap().is_empty(),
+            "a halted gold eval must leave NO eval_runs row — a survivor-only CER is not the model's CER"
+        );
     }
 
     #[test]
