@@ -332,13 +332,17 @@ def test_audio_confirmation_ignores_same_file_pairs_and_splits_true_components()
     ]
     group = [[("a1", "one.wav"), ("a2", "one.wav"), ("b", "two.wav"), ("c", "three.wav")]]
 
-    def verdict(left, right):
+    def verdict(left, right, left_rate, right_rate):
+        assert left_rate == right_rate == 16_000
         names = frozenset((left, right))
         if names == frozenset(("one.wav", "two.wav")):
             return True
         return False
 
-    with mock.patch("check_dataset_duplicates._clip_pcm", side_effect=lambda path, _: Path(path).name):
+    with mock.patch(
+        "check_dataset_duplicates._clip_pcm",
+        side_effect=lambda path, _: (Path(path).name, 16_000),
+    ):
         with mock.patch("check_dataset_duplicates.audio_says_duplicate", side_effect=verdict) as audio:
             confirmed, unconfirmed, repeats = confirm_groups_with_audio(group, rows)
     assert confirmed == [[("a1", "one.wav"), ("a2", "one.wav"), ("b", "two.wav")]], confirmed

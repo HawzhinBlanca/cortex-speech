@@ -298,10 +298,13 @@ def _vectorized_rule_b(
 
 
 def _clip_pcm(audio_path: str, alignment_json: str):
-    """The clip's own samples, mono, or None when they cannot be read.
+    """The clip's own samples as `(mono, samplerate)`, or None when they cannot be read.
 
     Reads only the clip's span out of the source file rather than the whole recording — these are
     audiobook chapters, and decoding every one to compare two sentences would make the gate unusable.
+
+    The rate travels WITH the samples because the library holds both the 48 kHz masters and 16 kHz
+    WAVs of the same material: a caller that assumes one rate compares two different clocks.
     """
     try:
         import numpy as np
@@ -326,19 +329,24 @@ def _clip_pcm(audio_path: str, alignment_json: str):
     except Exception:
         return None
     mono = data.mean(axis=1)
-    if not mono.size:
-        return None
-    if info.samplerate != 16_000:
-        target_frames = round(mono.size * 16_000 / info.samplerate)
-        if target_frames <= 0:
-            return None
-        source_positions = np.arange(mono.size, dtype="float64")
-        target_positions = np.arange(target_frames, dtype="float64") * info.samplerate / 16_000
-        mono = np.interp(target_positions, source_positions, mono).astype("float32")
-    return mono
+    return (mono, int(info.samplerate)) if mono.size else None
 
 
-def audio_correlation(a, b) -> float | None:
+def _resampled(x, src_rate: int, dst_rate: int, np):
+    """`x` on `dst_rate`'s clock, by linear interpolation — no new dependency for one downsample."""
+    if src_rate == dst_rate:
+        return x.astype("float64")
+    n = int(round(x.size * dst_rate / src_rate))
+    if n <= 0:
+        return x[:0].astype("float64")
+    return np.interp(
+        np.arange(n, dtype="float64") * (src_rate / dst_rate),
+        np.arange(x.size, dtype="float64"),
+        x.astype("float64"),
+    )
+
+
+def audio_correlation(a, b, a_rate: int = 16000, b_rate: int = 16000) -> float | None:
     """The exact normalized waveform score used by the duplicate verdict, or no verdict."""
     try:
         import numpy as np
@@ -346,8 +354,10 @@ def audio_correlation(a, b) -> float | None:
         return None
     if a is None or b is None or a.size == 0 or b.size == 0:
         return None
-    if abs(a.size - b.size) / 16_000 * 1000 > AUDIO_DURATION_TOLERANCE_MS:
+    if abs(a.size / a_rate - b.size / b_rate) * 1000 > AUDIO_DURATION_TOLERANCE_MS:
         return 0.0
+    rate = min(a_rate, b_rate)
+    a, b = _resampled(a, a_rate, rate, np), _resampled(b, b_rate, rate, np)
     n = min(a.size, b.size)
     x, y = a[:n].astype("float64"), b[:n].astype("float64")
     x -= x.mean()
@@ -358,13 +368,13 @@ def audio_correlation(a, b) -> float | None:
     return float(np.dot(x, y)) / denom
 
 
-def audio_says_duplicate(a, b) -> bool | None:
+def audio_says_duplicate(a, b, a_rate: int = 16000, b_rate: int = 16000) -> bool | None:
     """True/False when the audio can decide, None when it cannot be read.
 
     None is deliberately NOT False: a clip whose audio is missing must never be silently declared
     clean — the caller reports it as unconfirmed and keeps failing on it.
     """
-    correlation = audio_correlation(a, b)
+    correlation = audio_correlation(a, b, a_rate, b_rate)
     return None if correlation is None else correlation >= AUDIO_DUPLICATE_CORRELATION
 
 
@@ -407,11 +417,16 @@ def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False):
                     continue
                 compared += 1
                 score = None
+                pa, pb = pcm_for(group[i][0]), pcm_for(group[j][0])
                 if include_proof:
-                    score = audio_correlation(pcm_for(group[i][0]), pcm_for(group[j][0]))
+                    score = (
+                        audio_correlation(pa[0], pb[0], pa[1], pb[1]) if pa and pb else None
+                    )
                     verdict = None if score is None else score >= AUDIO_DUPLICATE_CORRELATION
                 else:
-                    verdict = audio_says_duplicate(pcm_for(group[i][0]), pcm_for(group[j][0]))
+                    verdict = (
+                        audio_says_duplicate(pa[0], pb[0], pa[1], pb[1]) if pa and pb else None
+                    )
                 if verdict is True:
                     true_edges.append((i, j, score))
                     union(i, j)
