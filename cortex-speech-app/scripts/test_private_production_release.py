@@ -187,6 +187,8 @@ def test_watchdog_and_server_pin_the_release_boundary() -> None:
     assert "Wait-Process -Id $left.Id -Timeout 10" in controller
     assert "Cortex app process did not stop after the force deadline" in controller
     assert "New-ScheduledTaskTrigger -AtLogOn -User $currentPrincipal" in watchdog
+    assert "$clock = New-ScheduledTaskTrigger -Once" in watchdog
+    assert "-Trigger @($logon, $clock)" in watchdog
     assert release.MAINTENANCE_FILE in couch
     probe = couch.index('if path == "/api/claim/probe"')
     maintenance = couch.index("if maintenance", probe)

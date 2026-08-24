@@ -175,15 +175,19 @@ if ($Register) {
     # recovery-safe handover.
     $currentPrincipal = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $logon = New-ScheduledTaskTrigger -AtLogOn -User $currentPrincipal
-    $logon.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+    # A repeating AtLogOn trigger registered after the user already logged on has no NextRunTime
+    # until the next sign-in. That left a newly deployed reviewer line unmonitored for the rest of
+    # the current session. Keep the logon trigger for future interactive sessions and add a separate
+    # clock trigger that starts within one minute of registration and repeats indefinitely.
+    $clock = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5)
     # Battery flags are ON by default and would silently disable the whole watchdog the moment Windows
     # believes it is on battery — which includes a desktop behind a UPS, exactly the machine most
     # likely to be running this. An always-on server must not stop healing itself during a power event.
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $logon `
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($logon, $clock) `
         -Settings $settings -Force | Out-Null
     Write-Log "registered (exe: $exe)"
     Write-Output "$TaskName registered: at-logon + every 5 minutes, run-only-when-logged-on."

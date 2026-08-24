@@ -47,6 +47,7 @@ def evaluate_supervision(
     *,
     watchdog_state: str | None,
     watchdog_starts_when_available: bool | None = None,
+    watchdog_has_current_repetition: bool | None = None,
     session_expected: bool,
     reviewer_count: int,
     couch_status: int | None,
@@ -83,6 +84,13 @@ def evaluate_supervision(
             f"drifted from scripts/ops/cortex-watchdog.ps1, which registers it WITH -StartWhenAvailable. "
             f"Re-register: powershell -ExecutionPolicy Bypass -File "
             f"cortex-speech-app/scripts/ops/cortex-watchdog.ps1 -Register"
+        )
+    elif watchdog_has_current_repetition is False:
+        problems.append(
+            f"{WATCHDOG_TASK} is enabled but has no active five-minute clock trigger for the current "
+            f"login session. A logon-only trigger registered after sign-in has no next run, leaving "
+            f"reviewers unsupervised until the owner signs out and back in. Re-register the active "
+            f"release watchdog to install both its user-scoped logon trigger and immediate clock."
         )
 
     if session_expected:
@@ -124,6 +132,38 @@ def _watchdog_starts_when_available() -> bool | None:
             ],
             capture_output=True,
             text=True,
+        )
+    except (OSError, FileNotFoundError):
+        return None
+    if out.returncode != 0:
+        return None
+    answer = out.stdout.strip().lower()
+    if answer in {"true", "false"}:
+        return answer == "true"
+    return None
+
+
+def _watchdog_has_current_repetition() -> bool | None:
+    """Whether an enabled five-minute time trigger starts no later than five minutes from now."""
+    script = f"""
+$task = Get-ScheduledTask -TaskName '{WATCHDOG_TASK}' -ErrorAction SilentlyContinue
+if ($null -eq $task) {{ exit 0 }}
+$cutoff = (Get-Date).AddMinutes(5)
+$valid = @($task.Triggers | Where-Object {{
+    $_.Enabled -and
+    $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and
+    $_.Repetition.Interval -eq 'PT5M' -and
+    $_.StartBoundary -and
+    ([datetime]$_.StartBoundary) -le $cutoff
+}})
+if ($valid.Count -gt 0) {{ 'true' }} else {{ 'false' }}
+"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            errors="replace",
         )
     except (OSError, FileNotFoundError):
         return None
@@ -258,6 +298,7 @@ def main() -> int:
     problems = evaluate_supervision(
         watchdog_state=_watchdog_state(),
         watchdog_starts_when_available=_watchdog_starts_when_available(),
+        watchdog_has_current_repetition=_watchdog_has_current_repetition(),
         session_expected=reviewer_count > 0,
         reviewer_count=reviewer_count,
         couch_status=_couch_status() if reviewer_count > 0 else None,
