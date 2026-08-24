@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -720,16 +721,75 @@ def _probe_fuzz():
     return None
 
 
+def _wsl_fuzz_cache_key():
+    """Stable per-checkout cache key; Cargo fingerprints the exact source/toolchain inside it."""
+    checkout = os.path.normcase(str(SRC_TAURI.resolve())).encode("utf-8")
+    return hashlib.sha256(checkout).hexdigest()[:16]
+
+
 def _fuzz_cmd(argstr):
-    """`cargo +nightly fuzz <argstr>` — natively, or through a WSL login shell on Windows."""
+    """`cargo +nightly fuzz <argstr>` with one fast, content-verified WSL build cache."""
+    args = shlex.split(argstr)
+    if not args:
+        raise ValueError("cargo fuzz command cannot be empty")
     if sys.platform == "win32":
-        return ["wsl", "--", "bash", "-lc", f"cd {_wsl_path(SRC_TAURI)} && cargo +nightly fuzz {argstr}"]
-    return ["cargo", "+nightly", "fuzz", *argstr.split()]
+        # Building ASAN artifacts under /mnt/c is both dramatically slower and prone to recompiling
+        # the full Tauri dependency graph for every target. Keep only build artifacts on WSL's ext4
+        # filesystem; source and corpora remain in the checkout. The path is per checkout, and Cargo's
+        # own fingerprints still bind every artifact to the exact source, lockfile, flags and toolchain.
+        cache_key = _wsl_fuzz_cache_key()
+        command = " ".join(shlex.quote(part) for part in args)
+        shell = (
+            "set -euo pipefail; "
+            f'cache_dir="${{XDG_CACHE_HOME:-$HOME/.cache}}/cortex-speech/fuzz/{cache_key}"; '
+            'mkdir -p "$cache_dir"; export CARGO_TARGET_DIR="$cache_dir"; '
+            f"cd {shlex.quote(_wsl_path(SRC_TAURI))}; exec cargo +nightly fuzz {command}"
+        )
+        # `--exec` is material: plain `--` lets WSL's default shell expand `$cache_dir` once before
+        # bash receives this script, turning the fail-closed cache path into an empty string.
+        return ["wsl", "--exec", "bash", "-lc", shell]
+    return ["cargo", "+nightly", "fuzz", *args]
+
+
+def _fuzz_run_cmd(target):
+    """Run an already-built harness; WSL avoids cargo-fuzz's redundant second Cargo build."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", target):
+        raise ValueError(f"unsafe cargo fuzz target name: {target!r}")
+    if sys.platform != "win32":
+        return _fuzz_cmd(f"run {shlex.quote(target)} -- -max_total_time=30")
+
+    cache_key = _wsl_fuzz_cache_key()
+    fuzz_dir = _wsl_path(SRC_TAURI / "fuzz")
+    # cargo-fuzz's own exec_fuzz first builds, then launches `cargo run`, which can rebuild this
+    # large Tauri library even when the harness was just built. We already built every target above,
+    # so execute that exact ASAN binary directly. Preserve cargo-fuzz 0.13.2's runtime defaults:
+    # its corpus seeding and detect_odr_violation=0 ASAN option. Runtime corpus/artifacts stay in
+    # the Linux cache so a proof run cannot dirty the checkout or retrigger Tauri's build script.
+    shell = (
+        "set -euo pipefail; "
+        f'cache_dir="${{XDG_CACHE_HOME:-$HOME/.cache}}/cortex-speech/fuzz/{cache_key}"; '
+        f'fuzz_dir={shlex.quote(fuzz_dir)}; target={shlex.quote(target)}; '
+        'binary="$cache_dir/x86_64-unknown-linux-gnu/release/$target"; '
+        'source_corpus="$fuzz_dir/corpus/$target"; '
+        'artifacts="$cache_dir/runtime-artifacts/$target"; '
+        'corpus="$cache_dir/runtime-corpus/$target"; '
+        'test -x "$binary"; mkdir -p "$artifacts" "$corpus"; '
+        'if [[ -d "$source_corpus" ]]; then cp -a "$source_corpus/." "$corpus/"; fi; '
+        'if [[ -n "${ASAN_OPTIONS:-}" ]]; then '
+        'export ASAN_OPTIONS="${ASAN_OPTIONS}:detect_odr_violation=0"; '
+        'else export ASAN_OPTIONS="detect_odr_violation=0"; fi; '
+        'exec "$binary" -artifact_prefix="$artifacts/" -max_total_time=30 "$corpus"'
+    )
+    return ["wsl", "--exec", "bash", "-lc", shell]
 
 
 def _fn_fuzz_smoke():
     """30s smoke per fuzz target; PASS only if EVERY target actually ran and was crash-free."""
-    lst = subprocess.run(_fuzz_cmd("list"), capture_output=True, text=True)
+    try:
+        lst = subprocess.run(_fuzz_cmd("list"), capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        print("  [ERR] cargo fuzz list timed out after 180s")
+        return False
     targets = [t for t in lst.stdout.split() if t]
     # Fail LOUD on an empty target list. A run that enumerates nothing would otherwise sail
     # through the loop below and return True — a vacuous pass, which is exactly the class of
@@ -739,11 +799,40 @@ def _fn_fuzz_smoke():
         print("  [ERR] cargo fuzz list failed or found no targets - refusing to report a pass")
         return False
     print(f"  {len(targets)} targets: {', '.join(targets)}")
+
+    # One Cargo invocation builds all harnesses and their shared dependency graph. Calling `run`
+    # cold for each target separately caused repeated multi-hundred-crate ASAN builds on this rig.
+    try:
+        build = subprocess.run(_fuzz_cmd("build"), capture_output=True, text=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        print("  [ERR] cargo fuzz build timed out after 3600s")
+        return False
+    if build.returncode != 0:
+        print("  [ERR] cargo fuzz build failed")
+        for line in (build.stderr or build.stdout).splitlines()[-20:]:
+            print(f"    {line}")
+        return False
+
     for t in targets:
-        r = subprocess.run(_fuzz_cmd(f"run {t} -- -max_total_time=30"), capture_output=True, text=True)
-        print(f"  fuzz {t}: {'ok' if r.returncode == 0 else 'CRASH/FAIL'}")
-        if r.returncode != 0:
-            for line in (r.stderr or r.stdout).splitlines()[-10:]:
+        try:
+            r = subprocess.run(
+                _fuzz_run_cmd(t),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  fuzz {t}: TIMEOUT after 300s")
+            return False
+        output = (r.stdout or "") + "\n" + (r.stderr or "")
+        done = re.search(r"(?m)^#(\d+)\s+.*\bDONE\b", output)
+        iterations = int(done.group(1)) if done else 0
+        actually_ran = iterations > 0
+        ok = r.returncode == 0 and actually_ran
+        detail = f"ok ({iterations:,} iterations)" if ok else "CRASH/FAIL/NO-RUN-EVIDENCE"
+        print(f"  fuzz {t}: {detail}")
+        if not ok:
+            for line in output.splitlines()[-20:]:
                 print(f"    {line}")
             return False
     return True
