@@ -1,7 +1,7 @@
 //! Deterministic, crash-safe ASR/TTS export for one completed flexible-pool voice.
 //!
 //! This authority is deliberately separate from the legacy sequential-campaign exporter. It accepts
-//! only a fully resolved v63 voice, exact owner rights, the pool-bound OmniASR-7B identity, and audio
+//! only a fully resolved v64 voice, exact owner rights, the pool-bound OmniASR-7B identity, and audio
 //! bytes that still reproduce the canonical PCM identity captured when the pool was activated.
 
 use crate::db::{Database, RecordingRights};
@@ -17,7 +17,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const POOL_EXPORT_SCHEMA_VERSION: u32 = 1;
+const POOL_EXPORT_SCHEMA_VERSION: u32 = 2;
 const TTS_SAMPLE_RATE: u32 = 24_000;
 const ASR_SAMPLE_RATE: u32 = 16_000;
 
@@ -342,6 +342,32 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
     let pool = review_pool::load(db)
         .map_err(AppError::Validation)?
         .ok_or_else(|| AppError::Validation("review pool is not active".to_string()))?;
+    let dedup = review_pool::dedup_status(db).map_err(AppError::Validation)?;
+    let dedup_manifest_sha256 = dedup
+        .manifest_sha256
+        .as_deref()
+        .filter(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| {
+            AppError::Validation("review-pool export requires an applied immutable dedup manifest".to_string())
+        })?;
+    let dedup_algorithm_id = dedup.algorithm_id.as_deref().ok_or_else(|| {
+        AppError::Validation("review-pool export requires a bound duplicate-detection algorithm".to_string())
+    })?;
+    if !dedup.applied
+        || dedup_algorithm_id != "cortex-cross-file-waveform-correlation-v1"
+        || dedup.unconfirmed_risk_count != 0
+        || dedup.source_segment_count != pool.focus_segment_count
+        || dedup.canonical_segment_count != pool.review_segment_count
+        || dedup.excluded_segment_count != pool.excluded_duplicate_count
+        || dedup.duplicate_family_count != pool.duplicate_family_count
+        || pool.dedup_manifest_sha256.as_deref() != Some(dedup_manifest_sha256)
+    {
+        return Err(AppError::Validation(
+            "review-pool export duplicate authority does not match the immutable active pool".to_string(),
+        ));
+    }
     let voice_name = options.voice_name.trim();
     if voice_name.is_empty() || voice_name.chars().any(char::is_control) {
         return Err(AppError::Validation("voice name must be a non-blank printable label".to_string()));
@@ -589,11 +615,19 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             "schemaVersion": POOL_EXPORT_SCHEMA_VERSION,
             "poolId": pool.pool_id,
             "poolFocusSha256": pool.focus_sha256,
+            "sourcePoolSegmentCount": dedup.source_segment_count,
+            "canonicalReviewSegmentCount": dedup.canonical_segment_count,
+            "excludedDuplicateSegmentCount": dedup.excluded_segment_count,
+            "duplicateFamilyCount": dedup.duplicate_family_count,
+            "dedupManifestSha256": dedup_manifest_sha256,
+            "dedupAlgorithmId": dedup_algorithm_id,
+            "dedupUnconfirmedRiskCount": dedup.unconfirmed_risk_count,
             "voiceName": voice_name,
             "championModelVersionId": pool.champion_model_version_id,
             "championDeploymentSha256": pool.champion_deployment_sha256,
             "resolutionSha256": authority.resolution_sha256,
             "reviewerSha256": authority.reviewer_sha256,
+            "decisionAndReviewerEvidenceSha256": authority.reviewer_sha256,
             "rightsSha256": rights_sha256,
             "audioSha256": audio_sha256,
             "retainedSegments": retained_rows.len(),
@@ -638,11 +672,19 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                 "schemaVersion": POOL_EXPORT_SCHEMA_VERSION,
                 "poolId": pool.pool_id,
                 "poolFocusSha256": pool.focus_sha256,
+                "sourcePoolSegmentCount": dedup.source_segment_count,
+                "canonicalReviewSegmentCount": dedup.canonical_segment_count,
+                "excludedDuplicateSegmentCount": dedup.excluded_segment_count,
+                "duplicateFamilyCount": dedup.duplicate_family_count,
+                "dedupManifestSha256": dedup_manifest_sha256,
+                "dedupAlgorithmId": dedup_algorithm_id,
+                "dedupUnconfirmedRiskCount": dedup.unconfirmed_risk_count,
                 "voiceName": voice_name,
                 "championModelVersionId": pool.champion_model_version_id,
                 "championDeploymentSha256": pool.champion_deployment_sha256,
                 "resolutionSha256": authority.resolution_sha256,
                 "reviewerSha256": authority.reviewer_sha256,
+                "decisionAndReviewerEvidenceSha256": authority.reviewer_sha256,
                 "rightsSha256": rights_sha256,
                 "audioSha256": audio_sha256,
                 "exportManifestSha256": manifest_sha256,
@@ -843,12 +885,26 @@ mod tests {
         let bounded_master = directory.path().join("bounded-master.wav");
         let full_master = directory.path().join("full-master.wav");
         let reject_master = directory.path().join("reject-master.wav");
+        let duplicate_master = directory.path().join("duplicate-master.wav");
         write_master(&bounded_master, 2_000, 0);
         write_master(&full_master, 1_000, 1);
         write_master(&reject_master, 1_000, 2);
+        write_master(&duplicate_master, 2_000, 0);
+        let mut duplicate_reader = hound::WavReader::open(&duplicate_master).unwrap();
+        let duplicate_spec = duplicate_reader.spec();
+        let mut duplicate_samples = duplicate_reader.samples::<i16>().collect::<Result<Vec<_>, _>>().unwrap();
+        drop(duplicate_reader);
+        duplicate_samples[100] = duplicate_samples[100].saturating_add(1);
+        let mut duplicate_writer = hound::WavWriter::create(&duplicate_master, duplicate_spec).unwrap();
+        for sample in duplicate_samples {
+            duplicate_writer.write_sample(sample).unwrap();
+        }
+        duplicate_writer.finalize().unwrap();
         let bounded_hash = crate::export_bundle::current_canonical_pcm_blake3(&bounded_master).unwrap();
         let full_hash = crate::export_bundle::current_canonical_pcm_blake3(&full_master).unwrap();
         let reject_hash = crate::export_bundle::current_canonical_pcm_blake3(&reject_master).unwrap();
+        let duplicate_hash = crate::export_bundle::current_canonical_pcm_blake3(&duplicate_master).unwrap();
+        assert_ne!(duplicate_hash, bounded_hash);
 
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -866,18 +922,26 @@ mod tests {
         )
         .unwrap();
         db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [TEST_CHAMPION]).unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
+        let mut duplicate_segment = reviewed_segment("duplicate", &duplicate_master, 500, 1_500, false);
+        duplicate_segment.annotated_transcript = None;
+        duplicate_segment.verdict = None;
+        duplicate_segment.verdict_transcript = None;
+        duplicate_segment.human_decision = None;
+        duplicate_segment.reviewed_by = None;
+        duplicate_segment.verified = false;
         for (segment, audio_hash) in [
             (reviewed_segment("bounded", &bounded_master, 500, 1_500, false), bounded_hash.as_str()),
             (reviewed_segment("full", &full_master, 0, 1_000, false), full_hash.as_str()),
             (reviewed_segment("rejected", &reject_master, 0, 1_000, true), reject_hash.as_str()),
+            (duplicate_segment, duplicate_hash.as_str()),
         ] {
             db.insert_segment_full(&segment).unwrap();
             db.connection()
                 .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id=?2", [audio_hash, &segment.id])
                 .unwrap();
         }
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
         let pool = review_pool::activate(
             &db,
             "123e4567-e89b-42d3-a456-426614174070",
@@ -885,9 +949,107 @@ mod tests {
                 review_pool::PoolMemberInput { segment_id: "bounded".into(), voice_name: "Lamo".into() },
                 review_pool::PoolMemberInput { segment_id: "full".into(), voice_name: "Lamo".into() },
                 review_pool::PoolMemberInput { segment_id: "rejected".into(), voice_name: "Lamo".into() },
+                review_pool::PoolMemberInput { segment_id: "duplicate".into(), voice_name: "Lamo".into() },
             ],
         )
         .unwrap();
+        review_pool::stamp_owner_supplied_pool_rights(&db).unwrap();
+        let segment_ids = vec!["bounded".to_string(), "duplicate".to_string()];
+        let proof_edges = vec![serde_json::json!({
+            "leftSegmentId": "bounded",
+            "rightSegmentId": "duplicate",
+            "correlationPpm": 1_000_000,
+        })];
+        let family_material = serde_json::json!({
+            "poolId": &pool.pool_id,
+            "proofEdges": &proof_edges,
+            "segmentIds": &segment_ids,
+        });
+        let family_id: String = Sha256::digest(review_pool::canonical_json_bytes(&family_material).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let raw_sha256 = review_pool::normalized_text_sha256(RAW);
+        let mut dedup_manifest = serde_json::json!({
+            "manifestSchema": 1,
+            "algorithm": {
+                "id": "cortex-cross-file-waveform-correlation-v1",
+                "minimumTextCharacters": 25,
+                "offsetToleranceMs": 500,
+                "minimumTextSimilarityPpm": 900_000,
+                "audioDurationToleranceMs": 120,
+                "minimumWaveformCorrelationPpm": 980_000,
+                "comparisonSampleRateHz": 16_000,
+            },
+            "pool": {
+                "poolId": &pool.pool_id,
+                "sourceFocusSegmentCount": pool.focus_segment_count,
+                "sourceFocusSha256": &pool.focus_sha256,
+                "championModelVersionId": &pool.champion_model_version_id,
+                "championDeploymentSha256": &pool.champion_deployment_sha256,
+            },
+            "summary": {
+                "candidateTextGroups": 1,
+                "clearedRepeatedTextGroups": 0,
+                "duplicateFamilies": 1,
+                "excludedMembers": 1,
+                "canonicalMembers": 3,
+                "unconfirmedRiskGroups": 0,
+                "reviewedCanonicalMembers": 1,
+            },
+            "families": [{
+                "familyId": family_id,
+                "voiceName": "Lamo",
+                "canonicalSegmentId": "bounded",
+                "canonicalSelectionReason": "preserve-human-review-evidence",
+                "members": [{
+                    "segmentId": "bounded",
+                    "voiceName": "Lamo",
+                    "sourceFileName": "bounded-master.wav",
+                    "rawTranscriptSha256": &raw_sha256,
+                    "audioContentHash": &bounded_hash,
+                    "sourceStartMs": 500,
+                    "sourceEndMs": 1_500,
+                    "durationMs": 1_000,
+                    "reviewEvidenceCount": 1,
+                    "snrMilliDb": null,
+                    "clippingPpm": null,
+                    "signalAnomalyPpm": null,
+                    "confidencePpm": null,
+                    "canonical": true,
+                }, {
+                    "segmentId": "duplicate",
+                    "voiceName": "Lamo",
+                    "sourceFileName": "duplicate-master.wav",
+                    "rawTranscriptSha256": &raw_sha256,
+                    "audioContentHash": &duplicate_hash,
+                    "sourceStartMs": 500,
+                    "sourceEndMs": 1_500,
+                    "durationMs": 1_000,
+                    "reviewEvidenceCount": 0,
+                    "snrMilliDb": null,
+                    "clippingPpm": null,
+                    "signalAnomalyPpm": null,
+                    "confidencePpm": null,
+                    "canonical": false,
+                }],
+                "proofEdges": proof_edges,
+            }],
+            "generatedAtMs": 1,
+        });
+        let dedup_sha256: String = Sha256::digest(review_pool::canonical_json_bytes(&dedup_manifest).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        dedup_manifest
+            .as_object_mut()
+            .unwrap()
+            .insert("manifestSha256".into(), serde_json::Value::String(dedup_sha256));
+        let dedup_json = String::from_utf8(review_pool::canonical_json_bytes(&dedup_manifest).unwrap()).unwrap();
+        let dedup = review_pool::apply_dedup_manifest(&db, &dedup_json).unwrap();
+        assert_eq!(dedup.source_segment_count, 4);
+        assert_eq!(dedup.canonical_segment_count, 3);
+        assert_eq!(dedup.excluded_segment_count, 1);
         for (index, (id, hash, start, end, reject)) in [
             ("bounded", bounded_hash.as_str(), 500, 1_500, false),
             ("full", full_hash.as_str(), 0, 1_000, false),
@@ -922,7 +1084,6 @@ mod tests {
             .unwrap()
             .unwrap();
         }
-        review_pool::stamp_owner_supplied_pool_rights(&db).unwrap();
         (directory, db)
     }
 
@@ -950,6 +1111,20 @@ mod tests {
             review_pool::voice_certificate(&db, "Lamo").unwrap().unwrap().certificate_sha256,
             first.certificate_sha256
         );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(first_output.join("manifest.json")).unwrap()).unwrap();
+        let certificate: serde_json::Value =
+            serde_json::from_slice(&fs::read(first_output.join("certificate.json")).unwrap()).unwrap();
+        for value in [&manifest, &certificate] {
+            assert_eq!(value["schemaVersion"], 2);
+            assert_eq!(value["sourcePoolSegmentCount"], 4);
+            assert_eq!(value["canonicalReviewSegmentCount"], 3);
+            assert_eq!(value["excludedDuplicateSegmentCount"], 1);
+            assert_eq!(value["duplicateFamilyCount"], 1);
+            assert_eq!(value["dedupUnconfirmedRiskCount"], 0);
+            assert_eq!(value["dedupAlgorithmId"], "cortex-cross-file-waveform-correlation-v1");
+            assert_eq!(value["decisionAndReviewerEvidenceSha256"], value["reviewerSha256"]);
+        }
 
         let tts = read_jsonl(&first_output.join("tts/metadata.jsonl"));
         assert_eq!(tts.len(), 2);
@@ -968,6 +1143,10 @@ mod tests {
         assert_eq!(asr_reader.spec().channels, 1);
         assert_eq!(asr_reader.duration(), 16_000);
         assert_eq!(read_jsonl(&first_output.join("exclusions.jsonl"))[0]["id"], "rejected");
+        assert!(
+            !read_jsonl(&first_output.join("rights.jsonl")).iter().any(|row| row["id"] == "duplicate"),
+            "proven non-canonical duplicates must be absent from every export surface"
+        );
         assert_eq!(fs::read_dir(first_output.join("tts/audio_24k")).unwrap().count(), 2);
 
         let second_output = directory.path().join("export-two");
@@ -1113,6 +1292,38 @@ mod tests {
         assert!(
             review_pool::voice_certificate(&db, "Lamo").unwrap().is_none(),
             "tampered crash residue must never become certified"
+        );
+    }
+
+    #[test]
+    fn stored_certificate_is_revalidated_and_database_tampering_fails_closed() {
+        let (directory, db) = fixture();
+        export_voice(
+            &db,
+            &PoolDatasetOptions {
+                output_dir: directory.path().join("certified").to_string_lossy().to_string(),
+                voice_name: "Lamo".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(review_pool::voice_certificate(&db, "Lamo").unwrap().is_some());
+
+        // SQLite's immutable trigger prevents ordinary tampering. Dropping it here models low-level
+        // database corruption or an operator bypass and proves that read-only certification still
+        // refuses the row instead of trusting its presence.
+        db.connection().execute("DROP TRIGGER review_pool_voice_certificates_immutable_update", []).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE review_pool_voice_certificates
+                    SET certificate_json=json_set(certificate_json, '$.canonicalReviewSegmentCount', 999)
+                  WHERE voice_name='Lamo'",
+                [],
+            )
+            .unwrap();
+        let error = review_pool::voice_certificate(&db, "Lamo").unwrap_err();
+        assert!(
+            error.contains("complete v64 pool authority") || error.contains("digest"),
+            "unexpected certificate refusal: {error}"
         );
     }
 

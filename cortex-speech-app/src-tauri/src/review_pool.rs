@@ -407,13 +407,13 @@ fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Resu
     Ok(())
 }
 
-fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+pub(crate) fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     write_canonical_json(value, &mut output)?;
     Ok(output)
 }
 
-fn normalized_text_sha256(value: &str) -> String {
+pub(crate) fn normalized_text_sha256(value: &str) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     Sha256::digest(normalized.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1930,11 +1930,120 @@ pub fn voice_authority_digests(db: &Database, voice_name: &str) -> Result<VoiceA
     })
 }
 
+fn validate_voice_certificate_evidence(
+    db: &Database,
+    pool: &ReviewPool,
+    input: &VoiceCertificateInput<'_>,
+    app_git_sha: &str,
+) -> Result<(), String> {
+    let voice_name = input.voice_name.trim();
+    if voice_name.is_empty()
+        || input.total_duration_ms < 0
+        || input.created_at_ms <= 0
+        || app_git_sha.len() != 40
+        || !app_git_sha.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("voice certificate has invalid identity, duration, timestamp, or build provenance".to_string());
+    }
+    for (label, value) in [
+        ("resolution", input.resolution_sha256),
+        ("rights", input.rights_sha256),
+        ("audio", input.audio_sha256),
+        ("reviewer", input.reviewer_sha256),
+        ("export manifest", input.export_manifest_sha256),
+        ("export checksums", input.export_sha256sums_sha256),
+        ("certificate", input.certificate_sha256),
+    ] {
+        if !valid_lower_sha256(value) {
+            return Err(format!("voice certificate {label} digest is invalid"));
+        }
+    }
+    let certificate_value = serde_json::from_str::<serde_json::Value>(input.certificate_json)
+        .map_err(|error| format!("voice certificate JSON is invalid: {error}"))?;
+    let dedup = dedup_status(db)?;
+    let expected_u64 = |value: usize| u64::try_from(value).ok();
+    let certificate_matches_authority = certificate_value.get("schemaVersion").and_then(serde_json::Value::as_u64)
+        == Some(2)
+        && certificate_value.get("poolId").and_then(serde_json::Value::as_str) == Some(pool.pool_id.as_str())
+        && certificate_value.get("poolFocusSha256").and_then(serde_json::Value::as_str)
+            == Some(pool.focus_sha256.as_str())
+        && certificate_value.get("sourcePoolSegmentCount").and_then(serde_json::Value::as_u64)
+            == expected_u64(dedup.source_segment_count)
+        && certificate_value.get("canonicalReviewSegmentCount").and_then(serde_json::Value::as_u64)
+            == expected_u64(dedup.canonical_segment_count)
+        && certificate_value.get("excludedDuplicateSegmentCount").and_then(serde_json::Value::as_u64)
+            == expected_u64(dedup.excluded_segment_count)
+        && certificate_value.get("duplicateFamilyCount").and_then(serde_json::Value::as_u64)
+            == expected_u64(dedup.duplicate_family_count)
+        && certificate_value.get("dedupManifestSha256").and_then(serde_json::Value::as_str)
+            == dedup.manifest_sha256.as_deref()
+        && certificate_value.get("dedupAlgorithmId").and_then(serde_json::Value::as_str)
+            == dedup.algorithm_id.as_deref()
+        && certificate_value.get("dedupUnconfirmedRiskCount").and_then(serde_json::Value::as_u64)
+            == expected_u64(dedup.unconfirmed_risk_count)
+        && certificate_value.get("voiceName").and_then(serde_json::Value::as_str) == Some(voice_name)
+        && certificate_value.get("championModelVersionId").and_then(serde_json::Value::as_str)
+            == Some(pool.champion_model_version_id.as_str())
+        && certificate_value.get("championDeploymentSha256").and_then(serde_json::Value::as_str)
+            == Some(pool.champion_deployment_sha256.as_str())
+        && certificate_value.get("resolutionSha256").and_then(serde_json::Value::as_str)
+            == Some(input.resolution_sha256)
+        && certificate_value.get("reviewerSha256").and_then(serde_json::Value::as_str) == Some(input.reviewer_sha256)
+        && certificate_value.get("decisionAndReviewerEvidenceSha256").and_then(serde_json::Value::as_str)
+            == Some(input.reviewer_sha256)
+        && certificate_value.get("rightsSha256").and_then(serde_json::Value::as_str) == Some(input.rights_sha256)
+        && certificate_value.get("audioSha256").and_then(serde_json::Value::as_str) == Some(input.audio_sha256)
+        && certificate_value.get("exportManifestSha256").and_then(serde_json::Value::as_str)
+            == Some(input.export_manifest_sha256)
+        && certificate_value.get("exportSha256sumsSha256").and_then(serde_json::Value::as_str)
+            == Some(input.export_sha256sums_sha256)
+        && certificate_value.get("retainedSegments").and_then(serde_json::Value::as_u64)
+            == expected_u64(input.retained_segments)
+        && certificate_value.get("rejectedSegments").and_then(serde_json::Value::as_u64)
+            == expected_u64(input.rejected_segments)
+        && certificate_value.get("totalDurationMs").and_then(serde_json::Value::as_i64)
+            == Some(input.total_duration_ms)
+        && certificate_value.get("appGitSha").and_then(serde_json::Value::as_str) == Some(app_git_sha)
+        && certificate_value.get("createdAtMs").and_then(serde_json::Value::as_i64) == Some(input.created_at_ms);
+    if !dedup.applied
+        || dedup.unconfirmed_risk_count != 0
+        || dedup.source_segment_count != pool.focus_segment_count
+        || dedup.canonical_segment_count != pool.review_segment_count
+        || pool.dedup_manifest_sha256.as_deref() != dedup.manifest_sha256.as_deref()
+        || !certificate_matches_authority
+    {
+        return Err("voice certificate JSON does not match its complete v64 pool authority".to_string());
+    }
+    let actual_certificate_sha: String =
+        Sha256::digest(input.certificate_json.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect();
+    if actual_certificate_sha != input.certificate_sha256 {
+        return Err("voice certificate JSON does not match its digest".to_string());
+    }
+    let authority = voice_authority_digests(db, voice_name)?;
+    if authority.resolution_sha256 != input.resolution_sha256 || authority.reviewer_sha256 != input.reviewer_sha256 {
+        return Err("voice certificate does not match current review authority".to_string());
+    }
+    let resolutions = segment_resolutions(db, Some(voice_name))?;
+    if resolutions.iter().any(|row| !matches!(row.status.as_str(), "resolved" | "ownerResolved")) {
+        return Err(format!("voice {voice_name} is not fully resolved"));
+    }
+    let retained = resolutions.iter().filter(|row| row.final_action.as_deref() == Some("retain")).count();
+    let rejected = resolutions.iter().filter(|row| row.final_action.as_deref() == Some("reject")).count();
+    if retained != input.retained_segments
+        || rejected != input.rejected_segments
+        || retained + rejected != resolutions.len()
+    {
+        return Err("voice certificate counts do not match resolved review outcomes".to_string());
+    }
+    Ok(())
+}
+
 pub fn voice_certificate(db: &Database, voice_name: &str) -> Result<Option<VoiceCertificateRecord>, String> {
     if crate::migrations::get_current_version(db).map_err(|error| error.to_string())? < REVIEW_POOL_SCHEMA_VERSION {
         return Ok(None);
     }
-    db.connection()
+    let certificate = db
+        .connection()
         .query_row(
             "SELECT id, pool_id, voice_name, resolution_sha256, rights_sha256, audio_sha256,
                     reviewer_sha256, export_manifest_sha256, export_sha256sums_sha256,
@@ -1966,7 +2075,35 @@ pub fn voice_certificate(db: &Database, voice_name: &str) -> Result<Option<Voice
             },
         )
         .optional()
-        .map_err(|error| format!("review-pool voice certificate cannot be read: {error}"))
+        .map_err(|error| format!("review-pool voice certificate cannot be read: {error}"))?;
+    let Some(certificate) = certificate else {
+        return Ok(None);
+    };
+    let pool = load(db)?.ok_or_else(|| "voice certificate exists without an active review pool".to_string())?;
+    if certificate.pool_id != pool.pool_id {
+        return Err("voice certificate belongs to another active review pool".to_string());
+    }
+    validate_voice_certificate_evidence(
+        db,
+        &pool,
+        &VoiceCertificateInput {
+            voice_name: &certificate.voice_name,
+            resolution_sha256: &certificate.resolution_sha256,
+            rights_sha256: &certificate.rights_sha256,
+            audio_sha256: &certificate.audio_sha256,
+            reviewer_sha256: &certificate.reviewer_sha256,
+            export_manifest_sha256: &certificate.export_manifest_sha256,
+            export_sha256sums_sha256: &certificate.export_sha256sums_sha256,
+            certificate_json: &certificate.certificate_json,
+            certificate_sha256: &certificate.certificate_sha256,
+            retained_segments: certificate.retained_segments,
+            rejected_segments: certificate.rejected_segments,
+            total_duration_ms: certificate.total_duration_ms,
+            created_at_ms: certificate.created_at_ms,
+        },
+        &certificate.app_git_sha,
+    )?;
+    Ok(Some(certificate))
 }
 
 pub fn record_voice_certificate(
@@ -1975,48 +2112,7 @@ pub fn record_voice_certificate(
 ) -> Result<VoiceCertificateRecord, String> {
     let pool = load(db)?.ok_or_else(|| "review pool is not active".to_string())?;
     let voice_name = input.voice_name.trim();
-    if voice_name.is_empty() || input.total_duration_ms < 0 || input.created_at_ms <= 0 {
-        return Err("voice certificate has invalid identity, duration, or timestamp".to_string());
-    }
-    for (label, value) in [
-        ("resolution", input.resolution_sha256),
-        ("rights", input.rights_sha256),
-        ("audio", input.audio_sha256),
-        ("reviewer", input.reviewer_sha256),
-        ("export manifest", input.export_manifest_sha256),
-        ("export checksums", input.export_sha256sums_sha256),
-        ("certificate", input.certificate_sha256),
-    ] {
-        if !valid_lower_sha256(value) {
-            return Err(format!("voice certificate {label} digest is invalid"));
-        }
-    }
-    let certificate_value = serde_json::from_str::<serde_json::Value>(input.certificate_json)
-        .map_err(|error| format!("voice certificate JSON is invalid: {error}"))?;
-    if certificate_value.get("appGitSha").and_then(serde_json::Value::as_str) != Some(crate::GIT_SHA) {
-        return Err("voice certificate JSON does not match its app Git SHA".to_string());
-    }
-    let actual_certificate_sha: String =
-        Sha256::digest(input.certificate_json.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect();
-    if actual_certificate_sha != input.certificate_sha256 {
-        return Err("voice certificate JSON does not match its digest".to_string());
-    }
-    let authority = voice_authority_digests(db, voice_name)?;
-    if authority.resolution_sha256 != input.resolution_sha256 || authority.reviewer_sha256 != input.reviewer_sha256 {
-        return Err("voice certificate does not match current review authority".to_string());
-    }
-    let resolutions = segment_resolutions(db, Some(voice_name))?;
-    if resolutions.iter().any(|row| !matches!(row.status.as_str(), "resolved" | "ownerResolved")) {
-        return Err(format!("voice {voice_name} is not fully resolved"));
-    }
-    let retained = resolutions.iter().filter(|row| row.final_action.as_deref() == Some("retain")).count();
-    let rejected = resolutions.iter().filter(|row| row.final_action.as_deref() == Some("reject")).count();
-    if retained != input.retained_segments
-        || rejected != input.rejected_segments
-        || retained + rejected != resolutions.len()
-    {
-        return Err("voice certificate counts do not match resolved review outcomes".to_string());
-    }
+    validate_voice_certificate_evidence(db, &pool, input, crate::GIT_SHA)?;
     if let Some(existing) = voice_certificate(db, voice_name)? {
         if existing.certificate_sha256 == input.certificate_sha256 {
             return Ok(existing);
