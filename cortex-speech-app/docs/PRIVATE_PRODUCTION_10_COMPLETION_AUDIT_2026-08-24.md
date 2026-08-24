@@ -10,7 +10,9 @@ implemented and measured. The active immutable reviewer release is
 `8ef5d3c1b29e41ea926bcf8ab22e3b8b2e68334d`. Audit correction
 `18423dee480ac5bcff577d02c5d22b02415afc68` improves parallel test isolation without changing the
 reviewer API, database schema, pool, model route, or runtime consensus behavior; the live release was
-not interrupted for this proof-only correction.
+not interrupted for this proof-only correction. Operational proof correction
+`cfa403162582b799c50bcb070c70d4a47f2f8d12` makes the link gate and release controller explicitly
+mode-aware; it also changes no reviewer-runtime semantics and required no live handover.
 
 This is a measured private-production result, not a claim of universal flawlessness, public-store
 readiness, or a completed dataset.
@@ -41,7 +43,7 @@ Primary evidence: `src-tauri/src/review_pool.rs` tests
 | Preserve links, sessions, decisions, operation IDs, outbox, and undo | PASS | Real Rubar/Alle localhost and Funnel authentication, valid WAV and idempotency probes after the v63 handover; 877 historical events preserved and no synthetic pool decisions created. |
 | Stop resolved circulation; allow exactly one third review | PASS | Review-pool queue and full 16-pair action matrix tests; concurrent HTTP reviewer tests; live queues show unresolved work without synthetic resolution. |
 | Queue p95 ≤750 ms; commit p95 ≤500 ms | PASS | Live-sized release: Rubar 153.54 ms, Alle 150.97 ms; two-reviewer decision commit 4.889 ms. |
-| Mode-aware verification | PASS | Flexible pool certifies independent resolution authority; legacy mandatory hidden-check rules remain only for their applicable sequential/pilot modes. |
+| Mode-aware verification | PASS | `--require-private-production` proves the exact flexible-pool registry, complete membership, distinct durable reviewers, exact database binding, fixed port, and absence of a simultaneous legacy pilot; pre-pool databases retain the exact legacy fallback. Fresh local and Funnel checks authenticated Alle and Rubar read-only. |
 | Safe deployment and compatible rollback | PASS | Immutable hash-bound release, pre-migration snapshot, maintenance marker, clone preflight, post-exposure auth/queue/audio/idempotency/supervision gates, and schema-aware rollback controller tests. |
 | Exact owner rights, fail closed on conflicts/revocation | PASS | 20,323/20,323 live exact rights; idempotent/scoped/conflict/revocation Rust tests. |
 | Per-voice certificates and independent finalization | PASS (implementation) | Certificate binds pool/focus/champion/deployment/rights/audio/resolution/reviewers/export; each voice is independently selected. Runtime certificates correctly wait for completed human resolution. |

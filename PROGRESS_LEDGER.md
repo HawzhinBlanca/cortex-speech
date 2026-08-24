@@ -11165,3 +11165,15 @@ consecutive 16-thread repetitions; the full Rust library passed 1,535/1,535 with
 hardware/model ignores; pool-admin 6/6 and batch-importer 3/3 passed; strict all-target/all-feature
 Clippy, formatting, and diff integrity passed. This audit-only correction preserves production
 semantics, so the known-good reviewer release was deliberately not interrupted or replaced.
+
+The final operational audit then found one mode drift in the proof harness, not in the reviewer
+runtime: the standalone live-link checker supported generic flexible-pool authentication, but the
+master verification command still demanded the retired legacy pilot-policy file. Commit
+`cfa403162582b799c50bcb070c70d4a47f2f8d12` adds one fail-closed
+`--require-private-production` contract shared by the live-link checker, release controller, and
+master verifier. It requires the exact schema-63 pool registry, complete immutable membership,
+distinct durable reviewer identities, exact database binding, fixed port, and no simultaneous legacy
+pilot policy; pre-pool databases still fall back to the exact legacy contract. Twenty focused policy
+tests and nine release-controller tests passed. Fresh read-only checks authenticated Alle and Rubar
+through both local HTTPS and the public Funnel without minting sessions, taking leases, or changing
+review data. This proof-only correction also requires no live release interruption.
