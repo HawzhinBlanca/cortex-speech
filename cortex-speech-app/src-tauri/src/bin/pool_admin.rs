@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const CERTIFICATION_REPORT_SCHEMA: u32 = 2;
+const CERTIFICATION_REPORT_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone)]
 struct VoiceSpec {
@@ -68,12 +68,13 @@ fn voice_inventory_ready(report: &VoiceInventory) -> bool {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <DISPOSABLE-clone.db> --iterations <1..500> --confirm-disposable\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
+    "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin apply-dedup --db <cortex-speech.db> --manifest <review-pool-dedup.json>\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <DISPOSABLE-clone.db> --iterations <1..500> --confirm-disposable\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
 }
 
 const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
 const DIRECT_READ_COMMANDS: &[&str] = &["inventory", "status", "probe", "benchmark"];
-const WRITE_COMMANDS: &[&str] = &["migrate", "activate", "benchmark-commit", "stamp-rights", "adjudicate", "export"];
+const WRITE_COMMANDS: &[&str] =
+    &["migrate", "activate", "apply-dedup", "benchmark-commit", "stamp-rights", "adjudicate", "export"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseAccess {
@@ -355,15 +356,27 @@ fn reviewer_voice_totals(db: &Database) -> Result<Vec<serde_json::Value>, String
                    JOIN speech_segments segment ON segment.id=member.segment_id
                   WHERE segment.verified=1
                     AND segment.human_decision IN ('accept','edit','reject')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                         WHERE exclusion.pool_id=member.pool_id AND exclusion.segment_id=member.segment_id
+                    )
                  UNION ALL
                  SELECT member.voice_name, trim(decision.reviewer), decision.action
                    FROM effective_independent_review_decisions_v61 decision
                    JOIN review_pool_members member ON member.segment_id=decision.segment_id
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                         WHERE exclusion.pool_id=member.pool_id AND exclusion.segment_id=member.segment_id
+                    )
                  UNION ALL
                  SELECT member.voice_name, trim(decision.reviewer), decision.action
                    FROM effective_review_pool_decisions_v62 decision
                    JOIN review_pool_members member
                      ON member.pool_id=decision.pool_id AND member.segment_id=decision.segment_id
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                         WHERE exclusion.pool_id=member.pool_id AND exclusion.segment_id=member.segment_id
+                    )
              )
              SELECT voice_name, lower(reviewer), MIN(reviewer),
                     SUM(CASE WHEN action='skip' THEN 0 ELSE 1 END),
@@ -394,6 +407,10 @@ fn audio_coverage(db: &Database) -> Result<serde_json::Value, String> {
             "SELECT member.voice_name, segment.audio_path, COUNT(*)
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                     WHERE exclusion.pool_id=member.pool_id AND exclusion.segment_id=member.segment_id
+              )
               GROUP BY member.voice_name, segment.audio_path
               ORDER BY member.voice_name, segment.audio_path",
         )
@@ -622,6 +639,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    if command == "apply-dedup" {
+        let manifest_path = PathBuf::from(value_after(&args, "--manifest")?);
+        let manifest_json = std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("cannot read dedup manifest {}: {error}", manifest_path.display()))?;
+        let status = review_pool::apply_dedup_manifest(&db, &manifest_json)?;
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+
     match command {
         "status" => {
             let pool = review_pool::load(&db)?;
@@ -631,6 +657,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "poolId": pool.pool_id,
                     "focusSegmentCount": pool.focus_segment_count,
                     "focusSha256": pool.focus_sha256,
+                    "reviewSegmentCount": pool.review_segment_count,
+                    "excludedDuplicateCount": pool.excluded_duplicate_count,
+                    "duplicateFamilyCount": pool.duplicate_family_count,
+                    "dedupManifestSha256": pool.dedup_manifest_sha256,
+                    "dedup": review_pool::dedup_status(&db)?,
                     "championModelVersionId": pool.champion_model_version_id,
                     "championDeploymentSha256": pool.champion_deployment_sha256,
                     "coverageByVoice": review_pool::coverage_by_voice(&db)?,
@@ -656,6 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let resolutions = review_pool::segment_resolutions(&db, None)?;
             let resolution_authority = resolution_authority_totals(&resolutions);
             let resolution_summary = review_pool::resolution_summary(&db)?;
+            let dedup = review_pool::dedup_status(&db)?;
             let rights = review_pool::rights_coverage(&db)?;
             let audio = audio_coverage(&db)?;
             let quick_check = sqlite_check(&db, "quick_check")?;
@@ -684,7 +716,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let free_disk_bytes = cortex_speech_app_lib::health::free_disk_bytes_for(data_dir);
             let disk_healthy = free_disk_bytes.is_some_and(|bytes| bytes >= 20 * 1024 * 1024 * 1024);
             let audio_healthy = audio.get("allAvailable").and_then(serde_json::Value::as_bool) == Some(true);
-            let review_ready = database_healthy && audio_healthy && local_fresh && offsite_fresh && disk_healthy;
+            let dedup_healthy = dedup.applied
+                && dedup.unconfirmed_risk_count == 0
+                && dedup.source_segment_count
+                    == dedup.canonical_segment_count.saturating_add(dedup.excluded_segment_count);
+            let review_ready =
+                database_healthy && audio_healthy && local_fresh && offsite_fresh && disk_healthy && dedup_healthy;
             let all_resolved = resolution_summary.resolved_clips == resolution_summary.total_clips
                 && resolution_summary.needs_first_or_second_review == 0
                 && resolution_summary.needs_third_review == 0
@@ -739,10 +776,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "poolId": pool.pool_id,
                     "focusSegmentCount": pool.focus_segment_count,
                     "focusSha256": pool.focus_sha256,
+                    "reviewSegmentCount": pool.review_segment_count,
+                    "excludedDuplicateCount": pool.excluded_duplicate_count,
+                    "duplicateFamilyCount": pool.duplicate_family_count,
+                    "dedupManifestSha256": pool.dedup_manifest_sha256,
                     "championModelVersionId": pool.champion_model_version_id,
                     "championDeploymentSha256": pool.champion_deployment_sha256,
                 },
                 "resolutionSummary": resolution_summary,
+                "dedup": dedup,
                 "resolutionAuthority": resolution_authority,
                 "coverageByVoice": coverage,
                 "voiceOutcomes": voice_outcomes,
@@ -767,6 +809,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 "gates": {
                     "reviewReady": review_ready,
+                    "duplicateExclusionsBound": dedup_healthy,
                     "allClipsResolved": all_resolved,
                     "rightsComplete": rights.all_exact,
                     "everyVoiceCertified": every_voice_certified,

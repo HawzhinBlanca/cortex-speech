@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import sys
+import difflib
+import random
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -90,6 +93,81 @@ def test_offsets_within_the_encoder_padding_bucket_still_match() -> None:
         ("b", r"D:\x\two.flac", near, TEXT, 0),
     ]
     assert len(duplicate_groups(rows)) == 1
+
+
+def test_transitive_offset_cluster_does_not_compare_pairs_more_than_500ms_apart() -> None:
+    # 0 -> 400 -> 800 ms is one connected cluster, but the endpoints are not at the same source
+    # position. The old all-pairs flush compared them anyway and could manufacture a false duplicate.
+    near_but_not_exact = TEXT.replace("درێژییەکەی", "درێژییەکی")
+    unrelated = "ئەم دەقە ناوەڕۆکێکی جیاوازی هەیە و تەنها بۆ پڕکردنەوەی تاقیکردنەوەکەیە"
+    rows = [
+        ("a", r"D:\x\one.flac", '{"source_start_ms": 0}', TEXT, 0),
+        ("bridge", r"D:\x\bridge.flac", '{"source_start_ms": 400}', unrelated, 0),
+        ("c", r"D:\x\three.flac", '{"source_start_ms": 800}', near_but_not_exact, 0),
+    ]
+    assert duplicate_groups(rows) == []
+
+
+def test_vectorized_rule_b_keeps_the_exact_matcher_semantics() -> None:
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("    (skipped: numpy absent — large live clusters fail closed rather than scan forever)")
+        return
+
+    drifted = TEXT.replace("تەواوی", "تەڵاوی")
+    different = "ئەمە دەقێکی جیاواز و درێژە کە نابێت وەک دووبارە ناسێنرێت لە تاقیکردنەوەدا"
+    rows = [
+        ("a", r"D:\x\one.flac", ALIGN, TEXT, 0),
+        ("b", r"D:\x\two.flac", ALIGN, drifted, 0),
+        ("c", r"D:\x\three.flac", ALIGN, different, 0),
+    ]
+    with mock.patch("check_dataset_duplicates.RULE_B_VECTOR_THRESHOLD", 2):
+        groups = duplicate_groups(rows)
+    assert groups == [[("a", "one.flac"), ("b", "two.flac")]], groups
+
+
+def test_vectorized_prefilters_never_drop_a_90_percent_sequence_match() -> None:
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("    (skipped: numpy absent — large live clusters fail closed rather than scan forever)")
+        return
+
+    rng = random.Random(20260824)
+    alphabet = "ابتپجچحخدرڕزژسشعغفقکگلمنهوەیێ "
+    rows = []
+    expected = set()
+    for index in range(40):
+        original = "".join(rng.choice(alphabet) for _ in range(rng.randint(40, 90)))
+        changed = list(original)
+        # Two substitutions keep these fixtures safely above the production 90% predicate while
+        # exercising character and four-gram bounds rather than exact-text Rule A.
+        for position in rng.sample(range(len(changed)), 2):
+            replacement = rng.choice(alphabet)
+            while replacement == changed[position]:
+                replacement = rng.choice(alphabet)
+            changed[position] = replacement
+        changed = "".join(changed)
+        assert difflib.SequenceMatcher(None, original, changed).ratio() >= 0.90
+        left, right = f"left-{index}", f"right-{index}"
+        rows.extend(
+            [
+                (left, rf"D:\x\left-{index}.wav", ALIGN, original, 0),
+                (right, rf"D:\x\right-{index}.wav", ALIGN, changed, 0),
+            ]
+        )
+        expected.add(frozenset((left, right)))
+
+    with mock.patch("check_dataset_duplicates.RULE_B_VECTOR_THRESHOLD", 2):
+        groups = duplicate_groups(rows)
+    actual_pairs = {
+        frozenset((group[i][0], group[j][0]))
+        for group in groups
+        for i in range(len(group))
+        for j in range(i + 1, len(group))
+    }
+    assert expected <= actual_pairs, (len(expected), len(actual_pairs))
 
 
 # ── RULE C: the audio decides (2026-08-18) ──────────────────────────────────────────────────────
@@ -184,6 +262,29 @@ def test_unreadable_audio_is_never_declared_clean() -> None:
     confirmed, unconfirmed, repeats = confirm_groups_with_audio(groups, rows)
     assert not confirmed and not repeats, (confirmed, repeats)
     assert len(unconfirmed) == 1, unconfirmed
+
+
+def test_audio_confirmation_ignores_same_file_pairs_and_splits_true_components() -> None:
+    rows = [
+        ("a1", r"D:\x\one.wav", ALIGN, TEXT, 0),
+        ("a2", r"D:\x\one.wav", ALIGN, TEXT, 0),
+        ("b", r"D:\x\two.wav", ALIGN, TEXT, 0),
+        ("c", r"D:\x\three.wav", ALIGN, TEXT, 0),
+    ]
+    group = [[("a1", "one.wav"), ("a2", "one.wav"), ("b", "two.wav"), ("c", "three.wav")]]
+
+    def verdict(left, right):
+        names = frozenset((left, right))
+        if names == frozenset(("one.wav", "two.wav")):
+            return True
+        return False
+
+    with mock.patch("check_dataset_duplicates._clip_pcm", side_effect=lambda path, _: Path(path).name):
+        with mock.patch("check_dataset_duplicates.audio_says_duplicate", side_effect=verdict) as audio:
+            confirmed, unconfirmed, repeats = confirm_groups_with_audio(group, rows)
+    assert confirmed == [[("a1", "one.wav"), ("a2", "one.wav"), ("b", "two.wav")]], confirmed
+    assert not unconfirmed and not repeats
+    assert audio.call_count == 5  # six total pairs minus the one same-file pair
 
 
 def main() -> int:

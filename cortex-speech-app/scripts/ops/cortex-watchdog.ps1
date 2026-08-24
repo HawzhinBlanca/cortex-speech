@@ -112,27 +112,33 @@ function Get-VerifiedActiveRelease {
         $expected = @(
             'schema', 'releaseId', 'expectedDatabaseSchema', 'appGitSha', 'createdAtUtc',
             'directory', 'appExe', 'poolAdminExe', 'appSha256', 'poolAdminSha256',
-            'watchdogScript', 'watchdogSha256', 'operationsSha256'
+            'watchdogScript', 'watchdogSha256', 'operationsSha256',
+            'dedupManifest', 'dedupManifestSha256'
         )
         $actual = @($value.PSObject.Properties.Name)
         $missing = @($expected | Where-Object { $_ -notin $actual })
         $extra = @($actual | Where-Object { $_ -notin $expected })
         if ($missing.Count -or $extra.Count) { throw "release pointer fields do not match schema 1" }
-        if ($value.schema -ne 1 -or $value.expectedDatabaseSchema -ne 63) {
-            throw 'release pointer does not require private-production database schema 63'
+        if ($value.schema -ne 1 -or $value.expectedDatabaseSchema -ne 64) {
+            throw 'release pointer does not require private-production database schema 64'
         }
         if ([string]$value.appGitSha -notmatch '^[0-9a-f]{40}$') { throw 'release pointer git SHA is invalid' }
-        foreach ($field in @('appSha256', 'poolAdminSha256', 'watchdogSha256', 'operationsSha256')) {
+        foreach ($field in @('appSha256', 'poolAdminSha256', 'watchdogSha256', 'operationsSha256', 'dedupManifestSha256')) {
             if ([string]$value.$field -notmatch '^[0-9a-f]{64}$') { throw "release pointer $field is invalid" }
         }
         $directory = (Resolve-Path -LiteralPath ([string]$value.directory) -ErrorAction Stop).Path.TrimEnd('\')
-        foreach ($field in @('appExe', 'poolAdminExe', 'watchdogScript')) {
+        foreach ($field in @('appExe', 'poolAdminExe', 'watchdogScript', 'dedupManifest')) {
             $resolved = (Resolve-Path -LiteralPath ([string]$value.$field) -ErrorAction Stop).Path
             if (-not $resolved.StartsWith($directory + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "release pointer $field escapes its immutable release directory"
             }
             $value.$field = $resolved
         }
+        $dedup = Get-Content -LiteralPath ([string]$value.dedupManifest) -Raw | ConvertFrom-Json
+        if ($dedup.manifestSchema -ne 1 -or [string]$dedup.manifestSha256 -ne [string]$value.dedupManifestSha256) {
+            throw 'release dedup manifest identity does not match the pointer'
+        }
+        if ($dedup.summary.unconfirmedRiskGroups -ne 0) { throw 'release dedup manifest has unresolved risk' }
         $checks = @(
             @([string]$value.appExe, [string]$value.appSha256),
             @([string]$value.poolAdminExe, [string]$value.poolAdminSha256),
@@ -259,7 +265,7 @@ if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
     Report 'alive'
     if ($DryRun) { exit 0 }
-    # v63 private-production certification. This is a read-only SQLite/filesystem report: it does not
+    # v64 private-production certification. This is a read-only SQLite/filesystem report: it does not
     # fetch a queue, take a lease, mark a clip seen, or touch reviewer history. Run it on the same
     # five-minute clock as liveness while a reviewer session is expected. A failed certification does
     # NOT trigger the destructive restart path (restarting cannot repair missing audio/rights/backups),

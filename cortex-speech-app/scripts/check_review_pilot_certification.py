@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail-closed final certificate for the active review mode.
 
-Flexible schema-63 production intentionally has no hidden-check pilot. In that mode this gate
+Flexible schema-64 production intentionally has no hidden-check pilot. In that mode this gate
 validates the immutable active release, runs its exact hash-bound ``pool_admin certify`` binary on a
 detached database copy, and requires review-ready database/audio/rights/disk/snapshot authority. It
 does not confuse review readiness with a completed dataset.
@@ -181,8 +181,8 @@ def flexible_report_issues(
             return {}
         return value
 
-    if report.get("reportSchema") != 2:
-        errors.append("certification report schema is not exactly 2")
+    if report.get("reportSchema") != 3:
+        errors.append("certification report schema is not exactly 3")
     if report.get("readOnly") is not True:
         errors.append("certification does not identify itself as read-only")
     if not _exact_nonnegative_int(report.get("generatedAtEpochSecs")) or report.get("generatedAtEpochSecs") == 0:
@@ -192,11 +192,36 @@ def flexible_report_issues(
     if report.get("databaseSchemaVersion") != EXPECTED_SCHEMA:
         errors.append(f"certification database schema is not exactly {EXPECTED_SCHEMA}")
 
+    dedup = mapping("dedup")
+    canonical_count = dedup.get("canonicalSegmentCount")
+    excluded_count = dedup.get("excludedSegmentCount")
+    if (
+        dedup.get("applied") is not True
+        or dedup.get("algorithmId") != "cortex-cross-file-waveform-correlation-v1"
+        or dedup.get("manifestSha256") != manifest.get("dedupManifestSha256")
+        or dedup.get("sourceSegmentCount") != clip_count
+        or not _exact_nonnegative_int(canonical_count)
+        or not _exact_nonnegative_int(excluded_count)
+        or not _exact_nonnegative_int(dedup.get("duplicateFamilyCount"))
+        or dedup.get("unconfirmedRiskCount") != 0
+        or (
+            _exact_nonnegative_int(canonical_count)
+            and _exact_nonnegative_int(excluded_count)
+            and canonical_count + excluded_count != clip_count
+        )
+    ):
+        errors.append("certification duplicate-exclusion authority is incomplete or inconsistent")
+    canonical_count = canonical_count if _exact_nonnegative_int(canonical_count) else -1
+
     pool_report = mapping("pool")
     if (
         pool_report.get("poolId") != pool_id
         or pool_report.get("focusSegmentCount") != clip_count
         or pool_report.get("focusSha256") != focus_sha256
+        or pool_report.get("reviewSegmentCount") != canonical_count
+        or pool_report.get("excludedDuplicateCount") != excluded_count
+        or pool_report.get("duplicateFamilyCount") != dedup.get("duplicateFamilyCount")
+        or pool_report.get("dedupManifestSha256") != dedup.get("manifestSha256")
         or pool_report.get("championModelVersionId") != champion_model_id
         or pool_report.get("championDeploymentSha256") != champion_deployment_sha256
     ):
@@ -215,8 +240,8 @@ def flexible_report_issues(
         summary_values = None
     else:
         summary_values = {field: int(summary[field]) for field in summary_fields}
-        if summary_values["totalClips"] != clip_count:
-            errors.append("certification resolution total does not match pool membership")
+        if summary_values["totalClips"] != canonical_count:
+            errors.append("certification resolution total does not match canonical pool membership")
         classified = (
             summary_values["resolvedClips"]
             + summary_values["needsFirstOrSecondReview"]
@@ -264,8 +289,8 @@ def flexible_report_issues(
                 errors.append("certification per-voice review buckets are invalid")
             elif _exact_nonnegative_int(total) and sum(row[field] for field in review_buckets) != total:
                 errors.append("certification per-voice review buckets do not partition the voice")
-        if voice_total != clip_count:
-            errors.append("certification per-voice coverage does not exactly cover the pool")
+        if voice_total != canonical_count:
+            errors.append("certification per-voice coverage does not exactly cover the canonical pool")
 
         outcomes = report.get("voiceOutcomes")
         if not isinstance(outcomes, dict) or set(outcomes) != names:
@@ -302,7 +327,7 @@ def flexible_report_issues(
     audio = mapping("audio")
     if (
         audio.get("allAvailable") is not True
-        or audio.get("clips") != clip_count
+        or audio.get("clips") != canonical_count
         or audio.get("missingClips") != 0
         or audio.get("missingRecordings") != 0
     ):
@@ -361,11 +386,15 @@ def flexible_report_issues(
             errors.append(f"certification {label} snapshot is not fresh and verified")
 
     gates = mapping("gates")
-    if gates.get("reviewReady") is not True or gates.get("rightsComplete") is not True:
+    if (
+        gates.get("reviewReady") is not True
+        or gates.get("rightsComplete") is not True
+        or gates.get("duplicateExclusionsBound") is not True
+    ):
         errors.append("certification review-readiness gates are not green")
     if summary_values is not None:
         all_resolved = (
-            summary_values["resolvedClips"] == clip_count
+            summary_values["resolvedClips"] == canonical_count
             and summary_values["needsFirstOrSecondReview"] == 0
             and summary_values["needsThirdReview"] == 0
             and summary_values["ownerConflicts"] == 0

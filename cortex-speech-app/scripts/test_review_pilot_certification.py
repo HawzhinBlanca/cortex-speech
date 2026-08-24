@@ -37,17 +37,31 @@ CONTENT_HASH = "a" * 64
 
 def flexible_report() -> dict[str, object]:
     return {
-        "reportSchema": 2,
+        "reportSchema": 3,
         "readOnly": True,
         "generatedAtEpochSecs": 1_700_000_000,
         "appGitSha": "b" * 40,
-        "databaseSchemaVersion": 63,
+        "databaseSchemaVersion": 64,
         "pool": {
             "poolId": "123e4567-e89b-42d3-a456-426614174000",
             "focusSegmentCount": 2,
             "focusSha256": "a" * 64,
+            "reviewSegmentCount": 2,
+            "excludedDuplicateCount": 0,
+            "duplicateFamilyCount": 0,
+            "dedupManifestSha256": "d" * 64,
             "championModelVersionId": "omniasr-7b-test",
             "championDeploymentSha256": "c" * 64,
+        },
+        "dedup": {
+            "applied": True,
+            "algorithmId": "cortex-cross-file-waveform-correlation-v1",
+            "manifestSha256": "d" * 64,
+            "sourceSegmentCount": 2,
+            "canonicalSegmentCount": 2,
+            "excludedSegmentCount": 0,
+            "duplicateFamilyCount": 0,
+            "unconfirmedRiskCount": 0,
         },
         "resolutionSummary": {
             "totalClips": 2,
@@ -114,6 +128,7 @@ def flexible_report() -> dict[str, object]:
         },
         "gates": {
             "reviewReady": True,
+            "duplicateExclusionsBound": True,
             "allClipsResolved": False,
             "rightsComplete": True,
             "everyVoiceCertified": False,
@@ -127,6 +142,7 @@ def flexible_manifest(root: Path) -> dict[str, object]:
         "appGitSha": "b" * 40,
         "appExe": str(root / "app.exe"),
         "poolAdminExe": str(root / "pool_admin.exe"),
+        "dedupManifestSha256": "d" * 64,
     }
 
 

@@ -131,6 +131,10 @@ fn load_rows(db: &Database, pool_id: &str, voice_name: &str) -> AppResult<Vec<Po
            FROM review_pool_members member
            JOIN speech_segments segment ON segment.id=member.segment_id
           WHERE member.pool_id=?1 AND member.voice_name=?2 COLLATE BINARY
+            AND NOT EXISTS (
+                SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                 WHERE exclusion.pool_id=member.pool_id AND exclusion.segment_id=member.segment_id
+            )
           ORDER BY member.segment_id",
     )?;
     let rows = statement

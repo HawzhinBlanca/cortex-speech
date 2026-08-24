@@ -7,7 +7,7 @@ effective post-cutoff event, append-only triggers, durable schema-v60 hidden-key
 24-action pilot ceiling, signed re-decision/reversal arithmetic, and canonical audio identity for
 every focused clip.
 
-Flexible schema-63 pool compensation is operationally deferred by owner canon. In that mode the gate
+Flexible schema-64 pool compensation is operationally deferred by owner canon. In that mode the gate
 does not invent pay: it proves the legacy pilot is absent, the immutable legacy policy/schema remain
 intact, and no flexible-pool decision has leaked into the legacy review-event or compensation ledger
 namespace. A source migration or a green boolean alone is never accepted as live evidence.
@@ -132,8 +132,8 @@ def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
             connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
         )
         evidence["schemaVersion"] = schema_version
-        if schema_version != 63:
-            errors.append(f"flexible compensation audit requires exact schema 63, found {schema_version}")
+        if schema_version != 64:
+            errors.append(f"flexible compensation audit requires exact schema 64, found {schema_version}")
 
         policy_rows = connection.execute(
             """SELECT effective_after_event_id, base_rate_micro_iqd_per_hour,

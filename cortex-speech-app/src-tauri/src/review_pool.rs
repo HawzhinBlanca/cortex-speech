@@ -7,13 +7,16 @@
 
 use crate::db::Database;
 use rusqlite::OptionalExtension;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 const REVIEW_POOL_BASE_SCHEMA_VERSION: i64 = 62;
 pub const REVIEW_POOL_SCHEMA_VERSION: i64 = 63;
+const REVIEW_POOL_DEDUP_SCHEMA_VERSION: i64 = 64;
 pub const REVIEW_POOL_PLAYBACK_GUARD: &str = "content-hash-raw-counter-v3";
 const DESKTOP_REVIEWER_KEY: &str = "@desktop-owner";
 pub const OWNER_RIGHTS_LICENSE: &str = "owner-full-rights";
@@ -27,6 +30,10 @@ pub struct ReviewPool {
     pub pool_id: String,
     pub focus_segment_count: usize,
     pub focus_sha256: String,
+    pub review_segment_count: usize,
+    pub excluded_duplicate_count: usize,
+    pub duplicate_family_count: usize,
+    pub dedup_manifest_sha256: Option<String>,
     pub champion_model_version_id: String,
     pub champion_deployment_sha256: String,
     members: Arc<HashMap<String, PoolMemberEvidence>>,
@@ -118,6 +125,112 @@ pub struct PoolResolutionSummary {
     pub needs_first_or_second_review: usize,
     pub needs_third_review: usize,
     pub owner_conflicts: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolDedupStatus {
+    pub applied: bool,
+    pub algorithm_id: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub source_segment_count: usize,
+    pub canonical_segment_count: usize,
+    pub excluded_segment_count: usize,
+    pub duplicate_family_count: usize,
+    pub unconfirmed_risk_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DedupManifest {
+    manifest_schema: u32,
+    algorithm: DedupAlgorithm,
+    pool: DedupPoolIdentity,
+    summary: DedupSummary,
+    families: Vec<DedupFamily>,
+    generated_at_ms: i64,
+    manifest_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DedupAlgorithm {
+    id: String,
+    minimum_text_characters: u32,
+    offset_tolerance_ms: i64,
+    minimum_text_similarity_ppm: i64,
+    audio_duration_tolerance_ms: i64,
+    minimum_waveform_correlation_ppm: i64,
+    comparison_sample_rate_hz: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DedupPoolIdentity {
+    pool_id: String,
+    source_focus_segment_count: usize,
+    source_focus_sha256: String,
+    champion_model_version_id: String,
+    champion_deployment_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DedupSummary {
+    candidate_text_groups: usize,
+    cleared_repeated_text_groups: usize,
+    duplicate_families: usize,
+    excluded_members: usize,
+    canonical_members: usize,
+    unconfirmed_risk_groups: usize,
+    reviewed_canonical_members: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DedupFamily {
+    family_id: String,
+    voice_name: String,
+    canonical_segment_id: String,
+    canonical_selection_reason: String,
+    members: Vec<DedupMember>,
+    proof_edges: Vec<DedupProofEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DedupMember {
+    segment_id: String,
+    voice_name: String,
+    source_file_name: String,
+    raw_transcript_sha256: String,
+    audio_content_hash: String,
+    source_start_ms: i64,
+    source_end_ms: i64,
+    duration_ms: i64,
+    review_evidence_count: usize,
+    snr_milli_db: Option<i64>,
+    clipping_ppm: Option<i64>,
+    signal_anomaly_ppm: Option<i64>,
+    confidence_ppm: Option<i64>,
+    canonical: bool,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DedupProofEdge {
+    left_segment_id: String,
+    right_segment_id: String,
+    correlation_ppm: i64,
+}
+
+#[derive(Debug, Clone)]
+struct DedupSelectionEvidence {
+    source_file_name: String,
+    snr_milli_db: Option<i64>,
+    clipping_ppm: Option<i64>,
+    signal_anomaly_ppm: Option<i64>,
+    confidence_ppm: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +365,81 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<(), String> {
+    match value {
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
+        serde_json::Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        serde_json::Value::String(value) => output.extend_from_slice(
+            serde_json::to_string(value)
+                .map_err(|error| format!("dedup manifest string cannot be serialized: {error}"))?
+                .as_bytes(),
+        ),
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                output.extend_from_slice(
+                    serde_json::to_string(key)
+                        .map_err(|error| format!("dedup manifest key cannot be serialized: {error}"))?
+                        .as_bytes(),
+                );
+                output.push(b':');
+                write_canonical_json(&values[key], output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn normalized_text_sha256(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    Sha256::digest(normalized.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn scaled(value: Option<f64>, multiplier: f64) -> Option<i64> {
+    value.filter(|value| value.is_finite()).map(|value| (value * multiplier).round() as i64)
+}
+
+fn selection_key(
+    segment_id: &str,
+    evidence: &DedupSelectionEvidence,
+) -> (bool, Reverse<i64>, bool, i64, bool, i64, bool, Reverse<i64>, String, String) {
+    (
+        evidence.snr_milli_db.is_none(),
+        Reverse(evidence.snr_milli_db.unwrap_or_default()),
+        evidence.clipping_ppm.is_none(),
+        evidence.clipping_ppm.unwrap_or_default(),
+        evidence.signal_anomaly_ppm.is_none(),
+        evidence.signal_anomaly_ppm.unwrap_or_default(),
+        evidence.confidence_ppm.is_none(),
+        Reverse(evidence.confidence_ppm.unwrap_or_default()),
+        evidence.source_file_name.to_lowercase(),
+        segment_id.to_string(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ReviewOutcome {
     Retain(String),
@@ -354,6 +542,165 @@ fn member_evidence(members: &HashMap<String, PoolMemberEvidence>) -> Result<(usi
     }
     let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
     Ok((rows.len(), digest))
+}
+
+fn load_dedup_binding(
+    db: &Database,
+    pool_id: &str,
+    source_count: usize,
+    source_sha256: &str,
+) -> Result<(PoolDedupStatus, HashSet<String>), String> {
+    let schema_version = crate::migrations::get_current_version(db).map_err(|error| error.to_string())?;
+    if schema_version < REVIEW_POOL_DEDUP_SCHEMA_VERSION {
+        return Ok((
+            PoolDedupStatus {
+                applied: false,
+                algorithm_id: None,
+                manifest_sha256: None,
+                source_segment_count: source_count,
+                canonical_segment_count: source_count,
+                excluded_segment_count: 0,
+                duplicate_family_count: 0,
+                unconfirmed_risk_count: 0,
+            },
+            HashSet::new(),
+        ));
+    }
+    let manifest: Option<(String, String, i64, i64, i64, i64, i64)> = db
+        .connection()
+        .query_row(
+            "SELECT algorithm_id, manifest_sha256, source_focus_segment_count,
+                    family_count, excluded_count, canonical_count, unconfirmed_risk_count
+               FROM review_pool_dedup_manifests WHERE pool_id=?1",
+            [pool_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )
+        .optional()
+        .map_err(|error| format!("review-pool dedup manifest cannot be read: {error}"))?;
+    let Some((
+        algorithm_id,
+        manifest_sha256,
+        manifest_source_count,
+        family_count,
+        excluded_count,
+        canonical_count,
+        unconfirmed,
+    )) = manifest
+    else {
+        let orphan_exclusions: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_pool_duplicate_exclusions", [], |row| row.get(0))
+            .map_err(|error| format!("review-pool duplicate exclusions cannot be counted: {error}"))?;
+        if orphan_exclusions != 0 {
+            return Err("review-pool duplicate exclusions exist without their manifest".to_string());
+        }
+        return Ok((
+            PoolDedupStatus {
+                applied: false,
+                algorithm_id: None,
+                manifest_sha256: None,
+                source_segment_count: source_count,
+                canonical_segment_count: source_count,
+                excluded_segment_count: 0,
+                duplicate_family_count: 0,
+                unconfirmed_risk_count: 0,
+            },
+            HashSet::new(),
+        ));
+    };
+    if algorithm_id != "cortex-cross-file-waveform-correlation-v1"
+        || !valid_lower_sha256(&manifest_sha256)
+        || usize::try_from(manifest_source_count).ok() != Some(source_count)
+        || !valid_lower_sha256(source_sha256)
+        || excluded_count < 0
+        || canonical_count < 1
+        || family_count < 0
+        || unconfirmed != 0
+        || manifest_source_count != excluded_count + canonical_count
+    {
+        return Err("review-pool dedup manifest has invalid summary authority".to_string());
+    }
+    let stored_source_sha256: String = db
+        .connection()
+        .query_row("SELECT source_focus_sha256 FROM review_pool_dedup_manifests WHERE pool_id=?1", [pool_id], |row| {
+            row.get(0)
+        })
+        .map_err(|error| format!("review-pool dedup source digest cannot be read: {error}"))?;
+    if stored_source_sha256 != source_sha256 {
+        return Err("review-pool dedup manifest belongs to another source-pool digest".to_string());
+    }
+    let mut statement = db
+        .connection()
+        .prepare(
+            "SELECT exclusion.segment_id
+               FROM review_pool_duplicate_exclusions exclusion
+               JOIN review_pool_members member
+                 ON member.pool_id=exclusion.pool_id AND member.segment_id=exclusion.segment_id
+               JOIN review_pool_members canonical
+                 ON canonical.pool_id=exclusion.pool_id
+                AND canonical.segment_id=exclusion.canonical_segment_id
+              WHERE exclusion.pool_id=?1
+                AND member.voice_name=canonical.voice_name COLLATE BINARY
+                AND NOT EXISTS (
+                    SELECT 1 FROM review_pool_duplicate_exclusions nested
+                     WHERE nested.pool_id=exclusion.pool_id
+                       AND nested.segment_id=exclusion.canonical_segment_id
+                )
+              ORDER BY exclusion.segment_id",
+        )
+        .map_err(|error| format!("review-pool duplicate exclusions cannot be prepared: {error}"))?;
+    let excluded: HashSet<String> = statement
+        .query_map([pool_id], |row| row.get(0))
+        .map_err(|error| format!("review-pool duplicate exclusions cannot be read: {error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("review-pool duplicate exclusion is unreadable: {error}"))?;
+    if usize::try_from(excluded_count).ok() != Some(excluded.len())
+        || usize::try_from(canonical_count).ok() != source_count.checked_sub(excluded.len())
+    {
+        return Err("review-pool duplicate exclusions do not match their manifest summary".to_string());
+    }
+    let excluded_with_authority: bool = db
+        .connection()
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                 JOIN speech_segments segment ON segment.id=exclusion.segment_id
+                WHERE segment.verified=1
+                  AND segment.human_decision IN
+                      ('accept','edit','reject','human_accept','human_edit','human_reject')
+             ) OR EXISTS(
+                 SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                 JOIN effective_review_pool_decisions_v62 decision
+                   ON decision.pool_id=exclusion.pool_id AND decision.segment_id=exclusion.segment_id
+             ) OR EXISTS(
+                 SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                 JOIN effective_independent_review_decisions_v61 decision
+                   ON decision.segment_id=exclusion.segment_id
+             ) OR EXISTS(
+                 SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                 JOIN review_pool_owner_adjudications adjudication
+                   ON adjudication.pool_id=exclusion.pool_id AND adjudication.segment_id=exclusion.segment_id
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("review-pool excluded authority cannot be checked: {error}"))?;
+    if excluded_with_authority {
+        return Err("review-pool duplicate exclusion would discard existing review authority".to_string());
+    }
+    Ok((
+        PoolDedupStatus {
+            applied: true,
+            algorithm_id: Some(algorithm_id),
+            manifest_sha256: Some(manifest_sha256),
+            source_segment_count: source_count,
+            canonical_segment_count: usize::try_from(canonical_count).unwrap_or(usize::MAX),
+            excluded_segment_count: excluded.len(),
+            duplicate_family_count: usize::try_from(family_count).unwrap_or(usize::MAX),
+            unconfirmed_risk_count: 0,
+        },
+        excluded,
+    ))
 }
 
 fn current_champion_7b_identity(db: &Database) -> Result<crate::registry::DeploymentIdentity, String> {
@@ -477,11 +824,19 @@ pub fn load(db: &Database) -> Result<Option<ReviewPool>, String> {
     if members.values().any(|member| member.model_version_id != champion_model_version_id) {
         return Err("review pool contains a draft from outside its frozen champion identity".to_string());
     }
+    let (dedup, excluded_member_ids) = load_dedup_binding(db, &pool_id, actual_count, &actual_sha256)?;
+    members.retain(|segment_id, _| !excluded_member_ids.contains(segment_id));
+    audio_paths.retain(|segment_id, _| !excluded_member_ids.contains(segment_id));
+    playable_member_ids.retain(|segment_id| !excluded_member_ids.contains(segment_id));
     let member_ids = Arc::new(members.keys().cloned().collect());
     let pool = ReviewPool {
         pool_id,
         focus_segment_count: actual_count,
         focus_sha256: actual_sha256,
+        review_segment_count: members.len(),
+        excluded_duplicate_count: dedup.excluded_segment_count,
+        duplicate_family_count: dedup.duplicate_family_count,
+        dedup_manifest_sha256: dedup.manifest_sha256,
         champion_model_version_id,
         champion_deployment_sha256,
         members: Arc::new(members),
@@ -493,17 +848,374 @@ pub fn load(db: &Database) -> Result<Option<ReviewPool>, String> {
     Ok(Some(pool))
 }
 
+pub fn dedup_status(db: &Database) -> Result<PoolDedupStatus, String> {
+    let pool = load(db)?.ok_or_else(|| "review pool is not active".to_string())?;
+    let (status, _) = load_dedup_binding(db, &pool.pool_id, pool.focus_segment_count, &pool.focus_sha256)?;
+    Ok(status)
+}
+
+pub fn apply_dedup_manifest(db: &Database, manifest_json: &str) -> Result<PoolDedupStatus, String> {
+    if crate::migrations::get_current_version(db).map_err(|error| error.to_string())? < REVIEW_POOL_DEDUP_SCHEMA_VERSION
+    {
+        return Err("review-pool duplicate exclusions require schema 64".to_string());
+    }
+    let mut manifest_value: serde_json::Value = serde_json::from_str(manifest_json)
+        .map_err(|error| format!("review-pool dedup manifest JSON is invalid: {error}"))?;
+    let claimed_sha256 = manifest_value
+        .get("manifestSha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| valid_lower_sha256(value))
+        .ok_or_else(|| "review-pool dedup manifest has no valid payload digest".to_string())?
+        .to_string();
+    manifest_value
+        .as_object_mut()
+        .ok_or_else(|| "review-pool dedup manifest root must be an object".to_string())?
+        .remove("manifestSha256");
+    let actual_sha256: String =
+        Sha256::digest(canonical_json_bytes(&manifest_value)?).iter().map(|byte| format!("{byte:02x}")).collect();
+    if actual_sha256 != claimed_sha256 {
+        return Err("review-pool dedup manifest payload does not match its digest".to_string());
+    }
+    manifest_value
+        .as_object_mut()
+        .expect("dedup root was proved to be an object")
+        .insert("manifestSha256".to_string(), serde_json::Value::String(claimed_sha256.clone()));
+    let canonical_manifest = String::from_utf8(canonical_json_bytes(&manifest_value)?)
+        .map_err(|_| "review-pool dedup manifest is not canonical UTF-8".to_string())?;
+    let manifest: DedupManifest = serde_json::from_value(manifest_value)
+        .map_err(|error| format!("review-pool dedup manifest contract is invalid: {error}"))?;
+    if manifest.manifest_sha256 != claimed_sha256 {
+        return Err("review-pool dedup manifest digest field changed while parsing".to_string());
+    }
+
+    let pool = load(db)?.ok_or_else(|| "review pool is not active".to_string())?;
+    let existing: Option<String> = db
+        .connection()
+        .query_row("SELECT manifest_sha256 FROM review_pool_dedup_manifests WHERE pool_id=?1", [&pool.pool_id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|error| format!("existing review-pool dedup manifest cannot be read: {error}"))?;
+    if let Some(existing) = existing {
+        return if existing == claimed_sha256 {
+            dedup_status(db)
+        } else {
+            Err("active review pool already has a different immutable dedup manifest".to_string())
+        };
+    }
+    if manifest.manifest_schema != 1
+        || manifest.generated_at_ms <= 0
+        || manifest.algorithm.id != "cortex-cross-file-waveform-correlation-v1"
+        || manifest.algorithm.minimum_text_characters != 25
+        || manifest.algorithm.offset_tolerance_ms != 500
+        || manifest.algorithm.minimum_text_similarity_ppm != 900_000
+        || manifest.algorithm.audio_duration_tolerance_ms != 120
+        || manifest.algorithm.minimum_waveform_correlation_ppm != 980_000
+        || manifest.algorithm.comparison_sample_rate_hz != 16_000
+        || manifest.pool.pool_id != pool.pool_id
+        || manifest.pool.source_focus_segment_count != pool.focus_segment_count
+        || manifest.pool.source_focus_sha256 != pool.focus_sha256
+        || manifest.pool.champion_model_version_id != pool.champion_model_version_id
+        || manifest.pool.champion_deployment_sha256 != pool.champion_deployment_sha256
+        || manifest.summary.unconfirmed_risk_groups != 0
+        || manifest.summary.duplicate_families != manifest.families.len()
+        || manifest.summary.candidate_text_groups
+            < manifest.summary.cleared_repeated_text_groups + manifest.summary.duplicate_families
+        || manifest.summary.canonical_members + manifest.summary.excluded_members != pool.focus_segment_count
+    {
+        return Err("review-pool dedup manifest does not match the frozen pool or algorithm canon".to_string());
+    }
+    let certificate_count: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM review_pool_voice_certificates", [], |row| row.get(0))
+        .map_err(|error| format!("review-pool certificates cannot be counted: {error}"))?;
+    if certificate_count != 0 {
+        return Err("duplicate exclusions cannot be applied after a voice certificate exists".to_string());
+    }
+
+    let reviewers = reviewer_sets(db)?;
+    let adjudications = owner_adjudications_on(db.connection())?;
+    let mut selection_statement = db
+        .connection()
+        .prepare(
+            "SELECT id, audio_path, snr_db, clipping_ratio, signal_anomaly_score, confidence
+               FROM speech_segments
+              WHERE EXISTS (SELECT 1 FROM review_pool_members member WHERE member.segment_id=id)",
+        )
+        .map_err(|error| format!("dedup selection evidence cannot be prepared: {error}"))?;
+    let selection_rows = selection_statement
+        .query_map([], |row| {
+            let path: String = row.get(1)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                DedupSelectionEvidence {
+                    source_file_name: Path::new(&path)
+                        .file_name()
+                        .map(|value| value.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    snr_milli_db: scaled(row.get(2)?, 1_000.0),
+                    clipping_ppm: scaled(row.get(3)?, 1_000_000.0),
+                    signal_anomaly_ppm: scaled(row.get(4)?, 1_000_000.0),
+                    confidence_ppm: scaled(row.get(5)?, 1_000_000.0),
+                },
+            ))
+        })
+        .map_err(|error| format!("dedup selection evidence cannot be read: {error}"))?;
+    let selection: HashMap<String, DedupSelectionEvidence> = selection_rows
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("dedup selection evidence is unreadable: {error}"))?;
+
+    let mut all_family_members = HashSet::new();
+    let mut exclusions: Vec<(String, String, String)> = Vec::new();
+    let mut reviewed_canonical_members = 0usize;
+    for family in &manifest.families {
+        if !valid_lower_sha256(&family.family_id) || family.members.len() < 2 || family.voice_name.trim().is_empty() {
+            return Err("review-pool dedup family has invalid identity or cardinality".to_string());
+        }
+        let mut segment_ids: Vec<String> = family.members.iter().map(|member| member.segment_id.clone()).collect();
+        segment_ids.sort_unstable();
+        if segment_ids.windows(2).any(|window| window[0] == window[1])
+            || !segment_ids.iter().all(|segment_id| all_family_members.insert(segment_id.clone()))
+        {
+            return Err("review-pool dedup families contain duplicate segment membership".to_string());
+        }
+        let member_ids: HashSet<_> = segment_ids.iter().cloned().collect();
+        let canonical_flags: Vec<_> = family.members.iter().filter(|member| member.canonical).collect();
+        if canonical_flags.len() != 1 || canonical_flags[0].segment_id != family.canonical_segment_id {
+            return Err(format!("dedup family {} has ambiguous canonical membership", family.family_id));
+        }
+        let mut actual_reviewed = Vec::new();
+        for member in &family.members {
+            let frozen = pool
+                .members
+                .get(&member.segment_id)
+                .ok_or_else(|| format!("dedup member {} is outside the active source pool", member.segment_id))?;
+            let selection_evidence = selection
+                .get(&member.segment_id)
+                .ok_or_else(|| format!("dedup member {} has no selection evidence", member.segment_id))?;
+            let review_count = reviewers.get(&member.segment_id).map_or(0, |value| value.judged.len())
+                + adjudications.get(&member.segment_id).map_or(0, Vec::len);
+            if member.voice_name != family.voice_name
+                || frozen.voice_name != family.voice_name
+                || member.raw_transcript_sha256 != normalized_text_sha256(&frozen.raw_transcript)
+                || member.audio_content_hash != frozen.audio_content_hash
+                || member.source_start_ms != frozen.source_start_ms
+                || member.source_end_ms != frozen.source_end_ms
+                || member.duration_ms != frozen.duration_ms
+                || member.review_evidence_count != review_count
+                || member.source_file_name != selection_evidence.source_file_name
+                || member.snr_milli_db != selection_evidence.snr_milli_db
+                || member.clipping_ppm != selection_evidence.clipping_ppm
+                || member.signal_anomaly_ppm != selection_evidence.signal_anomaly_ppm
+                || member.confidence_ppm != selection_evidence.confidence_ppm
+            {
+                return Err(format!("dedup member {} does not match frozen pool evidence", member.segment_id));
+            }
+            if review_count != 0 {
+                actual_reviewed.push(member.segment_id.as_str());
+            }
+        }
+        if actual_reviewed.len() > 1 {
+            return Err(format!("dedup family {} would retire more than one reviewed clip", family.family_id));
+        }
+        if let Some(reviewed) = actual_reviewed.first() {
+            if *reviewed != &family.canonical_segment_id
+                || family.canonical_selection_reason != "preserve-human-review-evidence"
+            {
+                return Err(format!("dedup family {} does not preserve its reviewed member", family.family_id));
+            }
+            reviewed_canonical_members += 1;
+        } else {
+            let expected = segment_ids
+                .iter()
+                .min_by_key(|segment_id| {
+                    selection_key(
+                        segment_id,
+                        selection.get(segment_id.as_str()).expect("selection evidence was validated"),
+                    )
+                })
+                .expect("dedup family has at least two members");
+            if *expected != family.canonical_segment_id
+                || family.canonical_selection_reason != "best-measured-audio-quality-then-stable-identity"
+            {
+                return Err(format!("dedup family {} canonical selection is not deterministic", family.family_id));
+            }
+        }
+
+        let edge_order: Vec<_> = family
+            .proof_edges
+            .iter()
+            .map(|edge| (edge.left_segment_id.as_str(), edge.right_segment_id.as_str()))
+            .collect();
+        let mut sorted_edge_order = edge_order.clone();
+        sorted_edge_order.sort_unstable();
+        if edge_order != sorted_edge_order {
+            return Err(format!("dedup family {} proof edges are not canonical-order", family.family_id));
+        }
+        let index: HashMap<_, _> = segment_ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+        let mut parent: Vec<usize> = (0..segment_ids.len()).collect();
+        fn find(parent: &mut [usize], mut index: usize) -> usize {
+            while parent[index] != index {
+                parent[index] = parent[parent[index]];
+                index = parent[index];
+            }
+            index
+        }
+        for edge in &family.proof_edges {
+            if edge.left_segment_id == edge.right_segment_id
+                || !member_ids.contains(&edge.left_segment_id)
+                || !member_ids.contains(&edge.right_segment_id)
+                || !(980_000..=1_000_001).contains(&edge.correlation_ppm)
+            {
+                return Err(format!("dedup family {} has invalid waveform proof", family.family_id));
+            }
+            let left = index[edge.left_segment_id.as_str()];
+            let right = index[edge.right_segment_id.as_str()];
+            let left_root = find(&mut parent, left);
+            let right_root = find(&mut parent, right);
+            if left_root != right_root {
+                parent[right_root] = left_root;
+            }
+        }
+        let root = find(&mut parent, 0);
+        if (1..segment_ids.len()).any(|index| find(&mut parent, index) != root) {
+            return Err(format!("dedup family {} waveform proof is disconnected", family.family_id));
+        }
+        let family_material = serde_json::json!({
+            "poolId": &pool.pool_id,
+            "proofEdges": &family.proof_edges,
+            "segmentIds": &segment_ids,
+        });
+        let actual_family_id: String =
+            Sha256::digest(canonical_json_bytes(&family_material)?).iter().map(|byte| format!("{byte:02x}")).collect();
+        if actual_family_id != family.family_id {
+            return Err(format!("dedup family {} does not match its proof digest", family.family_id));
+        }
+        for member in &family.members {
+            if !member.canonical {
+                if member.review_evidence_count != 0 {
+                    return Err(format!("dedup exclusion {} has review evidence", member.segment_id));
+                }
+                exclusions.push((
+                    member.segment_id.clone(),
+                    family.canonical_segment_id.clone(),
+                    family.family_id.clone(),
+                ));
+            }
+        }
+    }
+    exclusions.sort_unstable();
+    if exclusions.len() != manifest.summary.excluded_members
+        || pool.focus_segment_count - exclusions.len() != manifest.summary.canonical_members
+        || reviewed_canonical_members != manifest.summary.reviewed_canonical_members
+    {
+        return Err("review-pool dedup manifest summary does not match validated families".to_string());
+    }
+
+    with_pool_full_sync(db, || {
+        let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("review-pool dedup application cannot lock the database: {error}"))?;
+        tx.execute(
+            "INSERT INTO review_pool_dedup_manifests
+                (pool_id, source_focus_segment_count, source_focus_sha256, algorithm_id,
+                 family_count, excluded_count, canonical_count, unconfirmed_risk_count,
+                 manifest_json, manifest_sha256, app_git_sha, created_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                &pool.pool_id,
+                i64::try_from(pool.focus_segment_count).map_err(|_| "source pool is too large".to_string())?,
+                &pool.focus_sha256,
+                &manifest.algorithm.id,
+                i64::try_from(manifest.summary.duplicate_families)
+                    .map_err(|_| "duplicate family count is too large".to_string())?,
+                i64::try_from(exclusions.len()).map_err(|_| "duplicate exclusion count is too large".to_string())?,
+                i64::try_from(manifest.summary.canonical_members)
+                    .map_err(|_| "canonical member count is too large".to_string())?,
+                &canonical_manifest,
+                &claimed_sha256,
+                crate::GIT_SHA,
+                manifest.generated_at_ms,
+            ],
+        )
+        .map_err(|error| format!("review-pool dedup manifest cannot be committed: {error}"))?;
+        {
+            let mut statement = tx
+                .prepare(
+                    "INSERT INTO review_pool_duplicate_exclusions
+                        (pool_id, segment_id, canonical_segment_id, family_id, created_at_ms)
+                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|error| format!("review-pool duplicate exclusion writer cannot be prepared: {error}"))?;
+            for (segment_id, canonical_segment_id, family_id) in &exclusions {
+                statement
+                    .execute(rusqlite::params![
+                        &pool.pool_id,
+                        segment_id,
+                        canonical_segment_id,
+                        family_id,
+                        manifest.generated_at_ms,
+                    ])
+                    .map_err(|error| format!("duplicate exclusion {segment_id} cannot be committed: {error}"))?;
+            }
+        }
+        let committed: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM review_pool_duplicate_exclusions WHERE pool_id=?1",
+                [&pool.pool_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("committed duplicate exclusions cannot be counted: {error}"))?;
+        if usize::try_from(committed).ok() != Some(exclusions.len()) {
+            return Err("review-pool duplicate exclusion transaction is incomplete".to_string());
+        }
+        tx.commit().map_err(|error| format!("review-pool dedup application cannot commit: {error}"))?;
+        Ok(())
+    })?;
+    dedup_status(db)
+}
+
 /// Cheap request-boundary validation for a pool that was fully digest-verified at Start.
 /// The registry and member rows are immutable under schema 62, so checking the bound registry
 /// identity and member count avoids re-reading and re-hashing tens of thousands of rows on every
 /// queue fetch and decision without weakening the fail-closed session binding.
 pub fn registry_matches(db: &Database, bound: &ReviewPool) -> Result<bool, String> {
-    if crate::migrations::get_current_version(db).map_err(|error| error.to_string())? < REVIEW_POOL_BASE_SCHEMA_VERSION
-    {
+    let schema_version = crate::migrations::get_current_version(db).map_err(|error| error.to_string())?;
+    if schema_version < REVIEW_POOL_BASE_SCHEMA_VERSION {
         return Ok(false);
     }
     let current_champion = current_champion_7b_identity(db)?;
-    let current: Option<(String, i64, String, String, String, i64)> = db
+    if schema_version < REVIEW_POOL_DEDUP_SCHEMA_VERSION {
+        let current: Option<(String, i64, String, String, String, i64)> = db
+            .connection()
+            .query_row(
+                "SELECT registry.pool_id, registry.focus_segment_count, registry.focus_sha256,
+                        registry.champion_model_version_id, registry.champion_deployment_sha256,
+                        COUNT(member.segment_id)
+                   FROM review_pool_registry registry
+                   LEFT JOIN review_pool_members member ON member.pool_id=registry.pool_id
+                  WHERE registry.singleton_key=1
+                  GROUP BY registry.pool_id, registry.focus_segment_count, registry.focus_sha256,
+                           registry.champion_model_version_id, registry.champion_deployment_sha256",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()
+            .map_err(|error| format!("review pool registry cannot be revalidated: {error}"))?;
+        return Ok(current.is_some_and(|(pool_id, count, sha256, model_id, deployment_sha256, member_count)| {
+            pool_id == bound.pool_id
+                && usize::try_from(count).ok() == Some(bound.focus_segment_count)
+                && sha256 == bound.focus_sha256
+                && model_id == bound.champion_model_version_id
+                && deployment_sha256 == bound.champion_deployment_sha256
+                && current_champion.model_version_id == bound.champion_model_version_id
+                && current_champion.deployment_sha256 == bound.champion_deployment_sha256
+                && member_count == count
+                && bound.dedup_manifest_sha256.is_none()
+                && bound.excluded_duplicate_count == 0
+                && bound.review_segment_count == bound.focus_segment_count
+        }));
+    }
+    let current: Option<(String, i64, String, String, String, i64, Option<String>, i64)> = db
         .connection()
         .query_row(
             "SELECT registry.pool_id,
@@ -511,27 +1223,47 @@ pub fn registry_matches(db: &Database, bound: &ReviewPool) -> Result<bool, Strin
                     registry.focus_sha256,
                     registry.champion_model_version_id,
                     registry.champion_deployment_sha256,
-                    COUNT(member.segment_id)
+                    COUNT(member.segment_id),
+                    (SELECT manifest_sha256 FROM review_pool_dedup_manifests
+                      WHERE pool_id=registry.pool_id),
+                    (SELECT COUNT(*) FROM review_pool_duplicate_exclusions exclusion
+                      WHERE exclusion.pool_id=registry.pool_id)
                FROM review_pool_registry registry
                LEFT JOIN review_pool_members member ON member.pool_id=registry.pool_id
               WHERE registry.singleton_key=1
               GROUP BY registry.pool_id, registry.focus_segment_count, registry.focus_sha256,
                        registry.champion_model_version_id, registry.champion_deployment_sha256",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| format!("review pool registry cannot be revalidated: {error}"))?;
-    Ok(current.is_some_and(|(pool_id, count, sha256, model_id, deployment_sha256, member_count)| {
-        pool_id == bound.pool_id
-            && usize::try_from(count).ok() == Some(bound.focus_segment_count)
-            && sha256 == bound.focus_sha256
-            && model_id == bound.champion_model_version_id
-            && deployment_sha256 == bound.champion_deployment_sha256
-            && current_champion.model_version_id == bound.champion_model_version_id
-            && current_champion.deployment_sha256 == bound.champion_deployment_sha256
-            && member_count == count
-    }))
+    Ok(current.is_some_and(
+        |(pool_id, count, sha256, model_id, deployment_sha256, member_count, dedup_sha256, excluded_count)| {
+            pool_id == bound.pool_id
+                && usize::try_from(count).ok() == Some(bound.focus_segment_count)
+                && sha256 == bound.focus_sha256
+                && model_id == bound.champion_model_version_id
+                && deployment_sha256 == bound.champion_deployment_sha256
+                && current_champion.model_version_id == bound.champion_model_version_id
+                && current_champion.deployment_sha256 == bound.champion_deployment_sha256
+                && member_count == count
+                && dedup_sha256 == bound.dedup_manifest_sha256
+                && usize::try_from(excluded_count).ok() == Some(bound.excluded_duplicate_count)
+                && usize::try_from(count - excluded_count).ok() == Some(bound.review_segment_count)
+        },
+    ))
 }
 
 /// Create the one immutable pool generation. Repeating the exact request is an idempotent success;
@@ -1018,6 +1750,10 @@ pub fn pending_segment_ids(
                FROM review_pool_members member
                JOIN speech_segments segment ON segment.id=member.segment_id
               WHERE member.pool_id=?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM review_pool_duplicate_exclusions exclusion
+                     WHERE exclusion.pool_id=member.pool_id AND exclusion.segment_id=member.segment_id
+                )
                 AND TRIM(COALESCE(segment.raw_transcript, '')) <> ''
                 AND NOT (TRIM(segment.raw_transcript) LIKE '[%]')",
         )
@@ -1857,9 +2593,9 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
         db.insert_segment_full(&reviewed_segment("clip", &audio, "Rubar", first_text)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
             .unwrap();
@@ -1870,6 +2606,127 @@ mod tests {
         )
         .unwrap();
         (dir, db, pool)
+    }
+
+    fn two_clip_pool(reviewed_segment_id: Option<&str>) -> (tempfile::TempDir, Database, ReviewPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
+        for id in ["a", "b"] {
+            let audio = dir.path().join(format!("{id}.wav"));
+            std::fs::write(&audio, b"wav").unwrap();
+            let row = if reviewed_segment_id == Some(id) {
+                reviewed_segment(id, &audio, "Rubar", "دەقی دروست")
+            } else {
+                segment(id, &audio, None)
+            };
+            db.insert_segment_full(&row).unwrap();
+        }
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='a'", ["a".repeat(64)])
+            .unwrap();
+        db.connection()
+            .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='b'", ["b".repeat(64)])
+            .unwrap();
+        let pool = activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174051",
+            &[
+                PoolMemberInput { segment_id: "a".into(), voice_name: "Lamo".into() },
+                PoolMemberInput { segment_id: "b".into(), voice_name: "Lamo".into() },
+            ],
+        )
+        .unwrap();
+        (dir, db, pool)
+    }
+
+    fn dedup_manifest(pool: &ReviewPool, canonical: &str, reviewed: Option<&str>, generated_at_ms: i64) -> String {
+        let segment_ids = vec!["a".to_string(), "b".to_string()];
+        let proof_edges = vec![serde_json::json!({
+            "leftSegmentId": "a",
+            "rightSegmentId": "b",
+            "correlationPpm": 1_000_000,
+        })];
+        let family_material = serde_json::json!({
+            "poolId": &pool.pool_id,
+            "proofEdges": &proof_edges,
+            "segmentIds": &segment_ids,
+        });
+        let family_id: String = Sha256::digest(canonical_json_bytes(&family_material).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let members: Vec<_> = segment_ids
+            .iter()
+            .map(|segment_id| {
+                let frozen = pool.members.get(segment_id).unwrap();
+                serde_json::json!({
+                    "segmentId": segment_id,
+                    "voiceName": &frozen.voice_name,
+                    "sourceFileName": format!("{segment_id}.wav"),
+                    "rawTranscriptSha256": normalized_text_sha256(&frozen.raw_transcript),
+                    "audioContentHash": &frozen.audio_content_hash,
+                    "sourceStartMs": frozen.source_start_ms,
+                    "sourceEndMs": frozen.source_end_ms,
+                    "durationMs": frozen.duration_ms,
+                    "reviewEvidenceCount": usize::from(reviewed == Some(segment_id.as_str())),
+                    "snrMilliDb": null,
+                    "clippingPpm": null,
+                    "signalAnomalyPpm": null,
+                    "confidencePpm": null,
+                    "canonical": canonical == segment_id,
+                })
+            })
+            .collect();
+        let reason = if reviewed.is_some() {
+            "preserve-human-review-evidence"
+        } else {
+            "best-measured-audio-quality-then-stable-identity"
+        };
+        let mut value = serde_json::json!({
+            "manifestSchema": 1,
+            "algorithm": {
+                "id": "cortex-cross-file-waveform-correlation-v1",
+                "minimumTextCharacters": 25,
+                "offsetToleranceMs": 500,
+                "minimumTextSimilarityPpm": 900_000,
+                "audioDurationToleranceMs": 120,
+                "minimumWaveformCorrelationPpm": 980_000,
+                "comparisonSampleRateHz": 16_000,
+            },
+            "pool": {
+                "poolId": &pool.pool_id,
+                "sourceFocusSegmentCount": pool.focus_segment_count,
+                "sourceFocusSha256": &pool.focus_sha256,
+                "championModelVersionId": &pool.champion_model_version_id,
+                "championDeploymentSha256": &pool.champion_deployment_sha256,
+            },
+            "summary": {
+                "candidateTextGroups": 1,
+                "clearedRepeatedTextGroups": 0,
+                "duplicateFamilies": 1,
+                "excludedMembers": 1,
+                "canonicalMembers": 1,
+                "unconfirmedRiskGroups": 0,
+                "reviewedCanonicalMembers": usize::from(reviewed.is_some()),
+            },
+            "families": [{
+                "familyId": family_id,
+                "voiceName": "Lamo",
+                "canonicalSegmentId": canonical,
+                "canonicalSelectionReason": reason,
+                "members": members,
+                "proofEdges": proof_edges,
+            }],
+            "generatedAtMs": generated_at_ms,
+        });
+        let digest: String =
+            Sha256::digest(canonical_json_bytes(&value).unwrap()).iter().map(|byte| format!("{byte:02x}")).collect();
+        value.as_object_mut().unwrap().insert("manifestSha256".into(), serde_json::Value::String(digest));
+        String::from_utf8(canonical_json_bytes(&value).unwrap()).unwrap()
     }
 
     fn decide(db: &Database, pool: &ReviewPool, reviewer: &str, text: &str, operation_id: &str, at: i64) -> i64 {
@@ -1918,6 +2775,76 @@ mod tests {
         assert_eq!(member_evidence(&a).unwrap(), member_evidence(&b).unwrap());
         let changed = HashMap::from([("a".to_string(), evidence("Halwest")), ("b".to_string(), evidence("Kawa"))]);
         assert_ne!(member_evidence(&a).unwrap().1, member_evidence(&changed).unwrap().1);
+    }
+
+    #[test]
+    fn dedup_manifest_is_idempotent_and_removes_only_the_proven_duplicate_from_review() {
+        let (_dir, db, source_pool) = two_clip_pool(None);
+        let manifest = dedup_manifest(&source_pool, "a", None, 1_000);
+        let status = apply_dedup_manifest(&db, &manifest).unwrap();
+        assert!(status.applied);
+        assert_eq!(status.source_segment_count, 2);
+        assert_eq!(status.canonical_segment_count, 1);
+        assert_eq!(status.excluded_segment_count, 1);
+        assert_eq!(status.duplicate_family_count, 1);
+        assert_eq!(apply_dedup_manifest(&db, &manifest).unwrap(), status, "exact retry must be idempotent");
+
+        let canonical_pool = load(&db).unwrap().unwrap();
+        assert_eq!(canonical_pool.focus_segment_count, 2);
+        assert_eq!(canonical_pool.review_segment_count, 1);
+        assert!(canonical_pool.contains("a"));
+        assert!(!canonical_pool.contains("b"));
+        assert!(registry_matches(&db, &canonical_pool).unwrap());
+        assert_eq!(pending_segment_ids(&db, &canonical_pool, "Alle", None).unwrap(), vec!["a"]);
+        assert!(db
+            .connection()
+            .execute("UPDATE review_pool_dedup_manifests SET created_at_ms=created_at_ms+1", [])
+            .is_err());
+        assert!(db
+            .connection()
+            .execute("DELETE FROM review_pool_duplicate_exclusions WHERE segment_id='b'", [])
+            .is_err());
+        assert!(record_decision(
+            &db,
+            &canonical_pool,
+            &PoolDecisionInput {
+                segment_id: "b",
+                reviewer: "Alle",
+                action: "accept",
+                submitted_transcript: None,
+                served_transcript: "دەقی چامپیۆن",
+                served_revision: 0,
+                audio_content_hash: Some(&"b".repeat(64)),
+                source_start_ms: Some(0),
+                source_end_ms: Some(1_000),
+                duration_ms: 1_000,
+                requested_action: "accept",
+                requested_transcript: "دەقی چامپیۆن",
+                operation_id: "123e4567-e89b-42d3-a456-426614174052",
+                operation_payload_hash: &"c".repeat(64),
+                created_at_ms: 2_000,
+            },
+        )
+        .unwrap_err()
+        .contains("outside the active review pool"));
+        assert!(crate::migrations::rollback(&db, 1).unwrap_err().to_string().contains("CHECK constraint failed"));
+    }
+
+    #[test]
+    fn dedup_manifest_must_preserve_the_only_reviewed_member_and_is_immutable() {
+        let (_dir, db, source_pool) = two_clip_pool(Some("b"));
+        let wrong = dedup_manifest(&source_pool, "a", Some("b"), 1_000);
+        assert!(apply_dedup_manifest(&db, &wrong).unwrap_err().contains("does not preserve its reviewed member"));
+        assert!(!dedup_status(&db).unwrap().applied, "failed validation must write nothing");
+
+        let correct = dedup_manifest(&source_pool, "b", Some("b"), 2_000);
+        let applied = apply_dedup_manifest(&db, &correct).unwrap();
+        assert!(applied.applied);
+        let different = dedup_manifest(&source_pool, "b", Some("b"), 3_000);
+        assert!(apply_dedup_manifest(&db, &different).unwrap_err().contains("different immutable dedup manifest"));
+        let canonical_pool = load(&db).unwrap().unwrap();
+        assert!(!canonical_pool.contains("a"));
+        assert!(canonical_pool.contains("b"));
     }
 
     #[test]
@@ -1988,10 +2915,10 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
         db.insert_segment_full(&segment("first", &first_audio, Some("Rubar"))).unwrap();
         db.insert_segment_full(&segment("second", &second_audio, None)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
         db.connection()
             .execute(
                 "UPDATE speech_segments

@@ -2460,7 +2460,7 @@ fn take_mandatory_pre_restore_snapshot(
 /// These rows are irreversible review/payment evidence, not ordinary dataset state. A restore may
 /// add rows, but it may never make any exact pre-restore row disappear or change one of its values.
 /// Keep this list explicit so adding another monetary/audit authority requires a conscious review.
-const DURABLE_REVIEW_RESTORE_TABLES: [&str; 29] = [
+const DURABLE_REVIEW_RESTORE_TABLES: [&str; 33] = [
     "review_pilot_hidden_keys",
     "review_events",
     "spot_checks",
@@ -2490,6 +2490,10 @@ const DURABLE_REVIEW_RESTORE_TABLES: [&str; 29] = [
     "review_pool_members",
     "review_pool_decisions",
     "review_pool_reversals",
+    "review_pool_owner_adjudications",
+    "review_pool_voice_certificates",
+    "review_pool_dedup_manifests",
+    "review_pool_duplicate_exclusions",
 ];
 
 const EFFECT_BOUND_AGENT_EXAMPLES_RESTORE_PROJECTION: &str =
@@ -2732,6 +2736,10 @@ fn has_durable_review_activity(db: &crate::db::Database) -> Result<bool, String>
         "review_pool_members",
         "review_pool_decisions",
         "review_pool_reversals",
+        "review_pool_owner_adjudications",
+        "review_pool_voice_certificates",
+        "review_pool_dedup_manifests",
+        "review_pool_duplicate_exclusions",
     ] {
         let exists: bool = db
             .connection()

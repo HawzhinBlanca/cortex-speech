@@ -29,6 +29,14 @@ def seed_source(root: Path) -> None:
     migrations = root / "src-tauri" / "src" / "migrations"
     migrations.mkdir(parents=True)
     (migrations / "mod.rs").write_text("// migration ledger\n", encoding="utf-8")
+    dedup = {
+        "manifestSchema": 1,
+        "summary": {"unconfirmedRiskGroups": 0},
+    }
+    dedup["manifestSha256"] = hashlib.sha256(
+        json.dumps(dedup, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    (root / release.DEDUP_MANIFEST_FILE).write_text(json.dumps(dedup), encoding="utf-8")
 
 
 def seed_candidate(root: Path, app: bytes = b"candidate-app", admin: bytes = b"candidate-admin") -> None:
@@ -50,7 +58,7 @@ def test_stage_is_atomic_versioned_and_hash_bound() -> None:
         final = Path(manifest["directory"])
         assert final.name == (
             f"{git_sha[:12]}-{hashlib.sha256(b'candidate-app').hexdigest()[:12]}-"
-            f"{release.operations_bundle_sha256(source)[:12]}"
+            f"{release.operations_bundle_sha256(source)[:12]}-{manifest['dedupManifestSha256'][:12]}"
         )
         assert manifest["appSha256"] == hashlib.sha256(b"candidate-app").hexdigest()
         assert manifest["poolAdminSha256"] == hashlib.sha256(b"candidate-admin").hexdigest()
@@ -112,14 +120,14 @@ def test_candidate_inside_live_release_root_is_refused() -> None:
             raise AssertionError("a build inside the live release root is not an isolated candidate")
 
 
-def test_schema_rollback_policy_never_destroys_new_v63_work() -> None:
-    assert release.rollback_policy(62, 63, 2, 2, None) == "restore-pre-migration"
-    assert release.rollback_policy(62, 62, 2, 2, None) == "resume-pre-migration"
-    assert release.rollback_policy(62, 63, 2, 3, None) == "preserve-v63"
-    assert release.rollback_policy(63, 63, 20, 20, 63) == "binary-only"
-    assert release.rollback_policy(63, 63, 20, 21, 63) == "binary-only"
-    assert release.rollback_policy(63, 63, 20, 20, None) == "blocked"
-    assert release.rollback_policy(62, 62, 2, 3, None) == "blocked"
+def test_schema_rollback_policy_never_destroys_new_v64_work() -> None:
+    assert release.rollback_policy(63, 64, 2, 2, None) == "restore-pre-migration"
+    assert release.rollback_policy(63, 63, 2, 2, None) == "resume-pre-migration"
+    assert release.rollback_policy(63, 64, 2, 3, None) == "preserve-v64"
+    assert release.rollback_policy(64, 64, 20, 20, 64) == "binary-only"
+    assert release.rollback_policy(64, 64, 20, 21, 64) == "binary-only"
+    assert release.rollback_policy(64, 64, 20, 20, None) == "blocked"
+    assert release.rollback_policy(63, 63, 2, 3, None) == "blocked"
 
 
 def test_stop_app_targets_one_exact_executable_and_waits_for_exit() -> None:
@@ -152,8 +160,8 @@ def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
         data.mkdir()
         snapshot.mkdir()
         for path, version, marker in (
-            (data / "cortex-speech.db", 63, "failed-v63"),
-            (snapshot / "cortex-speech.db", 62, "known-good-v62"),
+            (data / "cortex-speech.db", 64, "failed-v64"),
+            (snapshot / "cortex-speech.db", 63, "known-good-v63"),
         ):
             connection = sqlite3.connect(path)
             connection.executescript(
@@ -164,11 +172,11 @@ def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
             connection.execute("INSERT INTO marker VALUES(?)", (marker,))
             connection.commit()
             connection.close()
-        preserved = release.restore_database(snapshot, data, 62)
-        assert release.database_schema(data / "cortex-speech.db") == 62
-        assert release.database_schema(preserved) == 63
+        preserved = release.restore_database(snapshot, data, 63)
+        assert release.database_schema(data / "cortex-speech.db") == 63
+        assert release.database_schema(preserved) == 64
         connection = sqlite3.connect(data / "cortex-speech.db")
-        assert connection.execute("SELECT value FROM marker").fetchone()[0] == "known-good-v62"
+        assert connection.execute("SELECT value FROM marker").fetchone()[0] == "known-good-v63"
         connection.close()
 
 

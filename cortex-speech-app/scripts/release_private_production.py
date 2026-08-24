@@ -28,11 +28,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-EXPECTED_SCHEMA = 63
+EXPECTED_SCHEMA = 64
 POINTER_FILE = "active-private-production-release.json"
 JOURNAL_FILE = "pending-private-production-release.json"
 MAINTENANCE_FILE = "private-production-maintenance.json"
 RELEASE_MANIFEST_FILE = "release-manifest.json"
+DEDUP_MANIFEST_FILE = "review-pool-dedup-manifest.json"
 LEGACY_WATCHDOG_TASK = "CortexWatchdog"
 WATCHDOG_TASK = "CortexPrivateProductionWatchdog"
 RESTORE_TASK = "CortexDailyRestoreDrill"
@@ -53,7 +54,10 @@ MANIFEST_FIELDS = {
     "watchdogScript",
     "watchdogSha256",
     "operationsSha256",
+    "dedupManifest",
+    "dedupManifestSha256",
 }
+LEGACY_V63_MANIFEST_FIELDS = MANIFEST_FIELDS - {"dedupManifest", "dedupManifestSha256"}
 PROFILE_STATE = (
     "settings.json",
     "champion.json",
@@ -129,6 +133,25 @@ def validate_artifact(path: Path, label: str) -> Path:
     return resolved
 
 
+def validate_dedup_manifest(path: Path) -> tuple[Path, str]:
+    resolved = validate_artifact(path, "review-pool dedup manifest")
+    value = load_json(resolved)
+    claimed = value.get("manifestSha256")
+    summary = value.get("summary")
+    if value.get("manifestSchema") != 1 or not isinstance(claimed, str) or not SHA64.fullmatch(claimed):
+        raise ReleaseError("review-pool dedup manifest identity is invalid")
+    if not isinstance(summary, dict) or summary.get("unconfirmedRiskGroups") != 0:
+        raise ReleaseError("review-pool dedup manifest has unresolved risk")
+    payload = dict(value)
+    payload.pop("manifestSha256", None)
+    actual = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if actual != claimed:
+        raise ReleaseError("review-pool dedup manifest payload does not match its digest")
+    return resolved, claimed
+
+
 def operations_bundle_sha256(root: Path) -> str:
     """Bind every staged operational script plus the canonical migration ledger."""
     files = [
@@ -151,18 +174,22 @@ def operations_bundle_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_manifest(value: dict[str, Any], *, expected_root: Path | None = None) -> dict[str, Any]:
+def validate_manifest(
+    value: dict[str, Any], *, expected_root: Path | None = None, allow_legacy_v63: bool = False
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ReleaseError("release manifest must be one JSON object")
-    if set(value) != MANIFEST_FIELDS:
+    legacy_v63 = allow_legacy_v63 and set(value) == LEGACY_V63_MANIFEST_FIELDS
+    if set(value) != MANIFEST_FIELDS and not legacy_v63:
         raise ReleaseError(
             f"release manifest fields are invalid (missing={sorted(MANIFEST_FIELDS - set(value))}, "
             f"extra={sorted(set(value) - MANIFEST_FIELDS)})"
         )
     if type(value["schema"]) is not int or value["schema"] != 1:
         raise ReleaseError("release manifest schema must be integer 1")
-    if type(value["expectedDatabaseSchema"]) is not int or value["expectedDatabaseSchema"] != EXPECTED_SCHEMA:
-        raise ReleaseError(f"release manifest must require database schema {EXPECTED_SCHEMA}")
+    required_schema = 63 if legacy_v63 else EXPECTED_SCHEMA
+    if type(value["expectedDatabaseSchema"]) is not int or value["expectedDatabaseSchema"] != required_schema:
+        raise ReleaseError(f"release manifest must require database schema {required_schema}")
     if not isinstance(value["appGitSha"], str) or not SHA40.fullmatch(value["appGitSha"]):
         raise ReleaseError("release manifest appGitSha is invalid")
     directory = Path(str(value["directory"])).resolve(strict=True)
@@ -186,6 +213,13 @@ def validate_manifest(value: dict[str, Any], *, expected_root: Path | None = Non
         raise ReleaseError("operationsSha256 is invalid")
     if operations_bundle_sha256(directory) != operations_sha:
         raise ReleaseError("the staged operations bundle does not match its release SHA-256")
+    if not legacy_v63:
+        dedup_path = Path(str(value["dedupManifest"]))
+        if not is_within(dedup_path, directory):
+            raise ReleaseError("dedupManifest escapes the immutable release directory")
+        _, dedup_sha = validate_dedup_manifest(dedup_path)
+        if dedup_sha != value["dedupManifestSha256"]:
+            raise ReleaseError("the staged dedup manifest does not match its release digest")
     return value
 
 
@@ -204,7 +238,13 @@ def copy_source_bundle(source_root: Path, stage: Path) -> None:
     shutil.copy2(migrations, migration_target / "mod.rs")
 
 
-def stage_release(candidate_dir: Path, source_root: Path, release_root: Path, git_sha: str) -> dict[str, Any]:
+def stage_release(
+    candidate_dir: Path,
+    source_root: Path,
+    release_root: Path,
+    git_sha: str,
+    dedup_manifest: Path | None = None,
+) -> dict[str, Any]:
     if not SHA40.fullmatch(git_sha):
         raise ReleaseError("--git-sha must be the exact lowercase 40-character release commit")
     candidate_dir = candidate_dir.resolve(strict=True)
@@ -214,10 +254,11 @@ def stage_release(candidate_dir: Path, source_root: Path, release_root: Path, gi
         raise ReleaseError("candidate build must be outside the live immutable release root")
     app_source = validate_artifact(candidate_dir / "cortex-speech-app.exe", "candidate app")
     admin_source = validate_artifact(candidate_dir / "pool_admin.exe", "candidate pool_admin")
+    dedup_source, dedup_sha = validate_dedup_manifest(dedup_manifest or source_root / DEDUP_MANIFEST_FILE)
     app_sha = sha256_file(app_source)
     admin_sha = sha256_file(admin_source)
     operations_sha = operations_bundle_sha256(source_root)
-    release_id = f"{git_sha[:12]}-{app_sha[:12]}-{operations_sha[:12]}"
+    release_id = f"{git_sha[:12]}-{app_sha[:12]}-{operations_sha[:12]}-{dedup_sha[:12]}"
     final = release_root / release_id
     if final.exists():
         manifest = validate_manifest(load_json(final / RELEASE_MANIFEST_FILE), expected_root=release_root)
@@ -230,6 +271,7 @@ def stage_release(candidate_dir: Path, source_root: Path, release_root: Path, gi
     try:
         shutil.copy2(app_source, stage / "cortex-speech-app.exe")
         shutil.copy2(admin_source, stage / "pool_admin.exe")
+        shutil.copy2(dedup_source, stage / DEDUP_MANIFEST_FILE)
         copy_source_bundle(source_root, stage)
         if operations_bundle_sha256(stage) != operations_sha:
             raise ReleaseError("staged operations bundle changed while it was copied")
@@ -249,6 +291,8 @@ def stage_release(candidate_dir: Path, source_root: Path, release_root: Path, gi
             "watchdogScript": str(final / "scripts" / "ops" / "cortex-watchdog.ps1"),
             "watchdogSha256": sha256_file(watchdog),
             "operationsSha256": operations_sha,
+            "dedupManifest": str(final / DEDUP_MANIFEST_FILE),
+            "dedupManifestSha256": dedup_sha,
         }
         atomic_json(stage / RELEASE_MANIFEST_FILE, manifest)
         stage.rename(final)
@@ -326,12 +370,16 @@ def preflight_clone(data_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 shutil.copy2(source, clone / name)
         admin = str(manifest["poolAdminExe"])
         run_json([admin, "migrate", "--db", str(clone / "cortex-speech.db")], timeout=300)
+        run_json(
+            [admin, "apply-dedup", "--db", str(clone / "cortex-speech.db"), "--manifest", str(manifest["dedupManifest"])],
+            timeout=600,
+        )
         rights = run_json([admin, "stamp-rights", "--db", str(clone / "cortex-speech.db")], timeout=300)
         report = run_json([admin, "certify", "--db", str(clone / "cortex-speech.db"), "--full-integrity"], timeout=600)
         if report.get("appGitSha") != manifest["appGitSha"]:
             raise ReleaseError("candidate pool_admin is not built from the declared release commit")
         if report.get("databaseSchemaVersion") != EXPECTED_SCHEMA:
-            raise ReleaseError("candidate did not migrate the live-sized clone to schema 63")
+            raise ReleaseError(f"candidate did not migrate the live-sized clone to schema {EXPECTED_SCHEMA}")
         if report.get("database", {}).get("healthy") is not True:
             raise ReleaseError("candidate clone database certification failed")
         if report.get("audio", {}).get("allAvailable") is not True:
@@ -470,13 +518,13 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
         probe = run_json(probe_command, timeout=180)
         count = probe.get("availableClips")
         if type(count) is not int or count <= 0:
-            raise ReleaseError(f"canonical v63 queue is empty for reviewer {reviewer}")
+            raise ReleaseError(f"canonical v64 queue is empty for reviewer {reviewer}")
         if (
             probe.get("passes") is not True
             or probe.get("sampleAudioValidWav") is not True
             or probe.get("submissionIdempotencyAuthority") is not True
         ):
-            raise ReleaseError(f"canonical v63 audio/idempotency probe failed for reviewer {reviewer}")
+            raise ReleaseError(f"canonical v64 audio/idempotency probe failed for reviewer {reviewer}")
         benchmark_command = [
             str(manifest["poolAdminExe"]),
             "benchmark",
@@ -491,7 +539,7 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
             benchmark_command.extend(["--dialect", dialect])
         benchmark = run_json(benchmark_command, timeout=180)
         if benchmark.get("passes") is not True:
-            raise ReleaseError(f"canonical v63 queue latency failed for reviewer {reviewer}")
+            raise ReleaseError(f"canonical v64 queue latency failed for reviewer {reviewer}")
         available[reviewer] = count
     return available
 
@@ -571,7 +619,7 @@ def rollback_policy(source_schema: int, current_schema: int, baseline_id: int, c
     if current_id > baseline_id:
         if current_schema == EXPECTED_SCHEMA and previous_schema == EXPECTED_SCHEMA:
             return "binary-only"
-        return "preserve-v63" if current_schema == EXPECTED_SCHEMA else "blocked"
+        return "preserve-v64" if current_schema == EXPECTED_SCHEMA else "blocked"
     if source_schema < EXPECTED_SCHEMA and current_schema == EXPECTED_SCHEMA:
         return "restore-pre-migration"
     if source_schema < EXPECTED_SCHEMA and current_schema == source_schema:
@@ -590,7 +638,7 @@ def write_maintenance(data_dir: Path, release_id: str) -> None:
 
 def active_pointer(data_dir: Path, release_root: Path) -> dict[str, Any] | None:
     path = data_dir / POINTER_FILE
-    return validate_manifest(load_json(path), expected_root=release_root) if path.is_file() else None
+    return validate_manifest(load_json(path), expected_root=release_root, allow_legacy_v63=True) if path.is_file() else None
 
 
 def register_release_tasks(manifest: dict[str, Any]) -> None:
@@ -615,7 +663,7 @@ def recover(data_dir: Path, release_root: Path) -> bool:
     if previous is not None:
         if not isinstance(previous, dict):
             raise ReleaseError("release journal previousActive is invalid")
-        previous = validate_manifest(previous, expected_root=release_root)
+        previous = validate_manifest(previous, expected_root=release_root, allow_legacy_v63=True)
     source_schema = int(journal["sourceSchema"])
     baseline = int(journal["baselinePoolDecisionId"])
     db = data_dir / "cortex-speech.db"
@@ -665,14 +713,14 @@ def recover(data_dir: Path, release_root: Path) -> bool:
         if preserved is None:
             print(f"RELEASE RECOVERY: resumed unchanged schema v{source_schema} fallback")
         else:
-            print(f"RELEASE RECOVERY: restored schema v{source_schema}; failed v63 database preserved at {preserved}")
+            print(f"RELEASE RECOVERY: restored schema v{source_schema}; failed v64 database preserved at {preserved}")
         return True
 
-    target = previous if mode == "binary-only" else candidate if mode == "preserve-v63" else None
+    target = previous if mode == "binary-only" else candidate if mode == "preserve-v64" else None
     if target is None:
         raise ReleaseError(
             "automatic rollback is blocked: restoring an older database could destroy reviewer work, "
-            "and no schema-63-compatible last-known-good release is available"
+            "and no schema-64-compatible last-known-good release is available"
         )
     atomic_json(data_dir / POINTER_FILE, target)
     launch_app(Path(str(target["appExe"])))
@@ -687,7 +735,7 @@ def recover(data_dir: Path, release_root: Path) -> bool:
     (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)
     journal_path.unlink(missing_ok=True)
     unregister_task(RECOVERY_TASK)
-    print(f"RELEASE RECOVERY: activated schema-63-compatible release {target['releaseId']} without restoring the database")
+    print(f"RELEASE RECOVERY: activated schema-64-compatible release {target['releaseId']} without restoring the database")
     return True
 
 
@@ -702,15 +750,15 @@ def deploy(args: argparse.Namespace) -> int:
     if (data_dir / JOURNAL_FILE).exists():
         raise ReleaseError("a prior release handover is unfinished; run the recover command first")
     source_schema = database_schema(db)
-    if source_schema not in {62, EXPECTED_SCHEMA}:
-        raise ReleaseError(f"deployment accepts only the proven v62->v63 or v63->v63 path, not schema v{source_schema}")
+    if source_schema not in {63, EXPECTED_SCHEMA}:
+        raise ReleaseError(f"deployment accepts only the proven v63->v64 or v64->v64 path, not schema v{source_schema}")
     session_reviewers(data_dir)
     previous = active_pointer(data_dir, release_root)
     if source_schema < EXPECTED_SCHEMA and previous is not None:
-        raise ReleaseError("a schema-62 database cannot be bound to a schema-63 active release pointer")
+        raise ReleaseError("a schema-63 database cannot be bound to a schema-64 active release pointer")
     if source_schema == EXPECTED_SCHEMA and previous is None:
-        raise ReleaseError("a schema-63 deployment requires a versioned last-known-good active release")
-    manifest = stage_release(args.candidate_dir, args.source_root, release_root, args.git_sha)
+        raise ReleaseError("a schema-64 deployment requires a versioned last-known-good active release")
+    manifest = stage_release(args.candidate_dir, args.source_root, release_root, args.git_sha, args.dedup_manifest)
     print(f"STAGED_RELEASE={manifest['releaseId']}")
     preflight = preflight_clone(data_dir, manifest)
     audio = preflight["certification"]["audio"]
@@ -725,7 +773,7 @@ def deploy(args: argparse.Namespace) -> int:
     fallback_app = args.fallback_app.resolve(strict=True) if args.fallback_app else None
     fallback_watchdog = args.fallback_watchdog.resolve(strict=True) if args.fallback_watchdog else None
     if previous is None and (fallback_app is None or fallback_watchdog is None):
-        raise ReleaseError("the first managed v62->v63 deployment requires --fallback-app and --fallback-watchdog")
+        raise ReleaseError("the first managed v63->v64 deployment requires --fallback-app and --fallback-watchdog")
 
     baseline = max_pool_decision_id(db)
     journal: dict[str, Any] = {
@@ -762,7 +810,11 @@ def deploy(args: argparse.Namespace) -> int:
         admin = str(manifest["poolAdminExe"])
         migration = run_json([admin, "migrate", "--db", str(db)], timeout=600)
         if migration.get("afterSchemaVersion") != EXPECTED_SCHEMA:
-            raise ReleaseError("live migration did not reach schema 63")
+            raise ReleaseError(f"live migration did not reach schema {EXPECTED_SCHEMA}")
+        run_json(
+            [admin, "apply-dedup", "--db", str(db), "--manifest", str(manifest["dedupManifest"])],
+            timeout=600,
+        )
         run_json([admin, "stamp-rights", "--db", str(db)], timeout=600)
         certification = certify_live(data_dir, manifest)
         queues = prove_canonical_queues(data_dir, manifest)
@@ -792,7 +844,7 @@ def deploy(args: argparse.Namespace) -> int:
         (data_dir / JOURNAL_FILE).unlink(missing_ok=True)
         unregister_task(RECOVERY_TASK)
         print(
-            f"PRIVATE_PRODUCTION_RELEASE=READY release={manifest['releaseId']} schema=63 "
+            f"PRIVATE_PRODUCTION_RELEASE=READY release={manifest['releaseId']} schema={EXPECTED_SCHEMA} "
             f"reviewers={','.join(queues)} reviewReady={certification['gates']['reviewReady']}"
         )
         return 0
@@ -826,6 +878,7 @@ def parser() -> argparse.ArgumentParser:
         target.add_argument("--git-sha", required=True)
         target.add_argument("--data-dir", type=Path, default=default_data)
         target.add_argument("--release-root", type=Path, default=default_releases)
+        target.add_argument("--dedup-manifest", type=Path, required=True)
     deploy_parser.add_argument("--fallback-app", type=Path)
     deploy_parser.add_argument("--fallback-watchdog", type=Path)
     recover_parser = commands.add_parser("recover", help="resume the fail-closed recovery journal")
