@@ -835,6 +835,14 @@ def test_schema61_evidence_includes_every_campaign_authority_table() -> None:
     )
 
 
+def test_schema63_evidence_includes_pool_decisions_resolutions_and_certificates() -> None:
+    at_62 = snapshot.evidence_tables_for_schema(62)
+    at_63 = snapshot.evidence_tables_for_schema(63)
+    assert at_62[-len(snapshot.POOL_COUNT_TABLES) :] == snapshot.POOL_COUNT_TABLES
+    assert snapshot.POOL_RESOLUTION_COUNT_TABLES[0] not in at_62
+    assert at_63[-len(snapshot.POOL_RESOLUTION_COUNT_TABLES) :] == snapshot.POOL_RESOLUTION_COUNT_TABLES
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
     for test in tests:

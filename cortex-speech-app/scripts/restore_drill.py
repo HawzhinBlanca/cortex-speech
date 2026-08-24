@@ -60,6 +60,18 @@ CAMPAIGN_EVIDENCE_TABLES = (
     "independent_review_reversals",
     "review_campaign_adjudications",
 )
+POOL_SCHEMA_VERSION = 62
+POOL_EVIDENCE_TABLES = (
+    "review_pool_registry",
+    "review_pool_members",
+    "review_pool_decisions",
+    "review_pool_reversals",
+)
+POOL_RESOLUTION_SCHEMA_VERSION = 63
+POOL_RESOLUTION_EVIDENCE_TABLES = (
+    "review_pool_owner_adjudications",
+    "review_pool_voice_certificates",
+)
 FILE_ROW_FIELDS = {"path", "sizeBytes", "sha256"}
 SCHEMA_FIELDS = {
     1: {"schema", "reviewPilotPolicyStateSchema", "createdAtEpochSecs", "appGitSha", "files"},
@@ -85,13 +97,17 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Preserve old evidence shapes and bind all durable authority added at v59/v61."""
+    """Preserve old evidence shapes and bind every durable review authority through v63."""
 
     tables = BASE_EVIDENCE_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
         tables += (HIDDEN_KEY_TABLE,)
     if schema_version >= CAMPAIGN_SCHEMA_VERSION:
         tables += CAMPAIGN_EVIDENCE_TABLES
+    if schema_version >= POOL_SCHEMA_VERSION:
+        tables += POOL_EVIDENCE_TABLES
+    if schema_version >= POOL_RESOLUTION_SCHEMA_VERSION:
+        tables += POOL_RESOLUTION_EVIDENCE_TABLES
     return tables
 
 

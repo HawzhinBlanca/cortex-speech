@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import check_spot_check_pool as spot_gate  # noqa: E402
 from check_spot_check_pool import (  # noqa: E402
+    active_flexible_pool,
     available_keys_by_reviewer,
     learning_key,
     load_pilot_served_checks,
@@ -194,6 +195,41 @@ def delete_v60_event(conn: sqlite3.Connection, event_id: int) -> None:
 def test_learning_key_matches_the_rust_whitespace_and_case_contract() -> None:
     assert learning_key("  Hello\t WORLD ") == "hello world"
     assert learning_key("دەقی   ڕاست") == learning_key("دەقی ڕاست")
+
+
+def test_flexible_pool_uses_independent_authority_without_hidden_key_capacity() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE review_pool_registry(
+            singleton_key INTEGER PRIMARY KEY, pool_id TEXT,
+            focus_segment_count INTEGER, focus_sha256 TEXT
+        );
+        CREATE TABLE review_pool_members(pool_id TEXT, segment_id TEXT);
+        CREATE TABLE review_pool_decisions(id INTEGER);
+        CREATE TABLE review_pool_reversals(id INTEGER);
+        INSERT INTO review_pool_registry VALUES(
+            1, '123e4567-e89b-42d3-a456-426614174000', 2,
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        );
+        INSERT INTO review_pool_members VALUES
+            ('123e4567-e89b-42d3-a456-426614174000', 'a'),
+            ('123e4567-e89b-42d3-a456-426614174000', 'b');
+        """
+    )
+    assert active_flexible_pool(conn) == (
+        "123e4567-e89b-42d3-a456-426614174000",
+        2,
+        "a" * 64,
+    )
+    conn.execute("DELETE FROM review_pool_members WHERE segment_id='b'")
+    try:
+        active_flexible_pool(conn)
+    except Exception as error:
+        assert "1/2" in str(error), error
+    else:
+        raise AssertionError("incomplete flexible-pool authority was accepted")
+    conn.close()
 
 
 def test_capacity_is_per_reviewer_focus_dialect_and_prior_score() -> None:

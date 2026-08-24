@@ -835,6 +835,32 @@ struct SnapshotRowCounts {
     model_versions: u64,
     import_jobs: u64,
     import_job_files: u64,
+    #[serde(default)]
+    review_pilot_hidden_keys: Option<u64>,
+    #[serde(default)]
+    review_campaign_registry: Option<u64>,
+    #[serde(default)]
+    review_campaign_focus: Option<u64>,
+    #[serde(default)]
+    review_campaign_transitions: Option<u64>,
+    #[serde(default)]
+    independent_review_decisions: Option<u64>,
+    #[serde(default)]
+    independent_review_reversals: Option<u64>,
+    #[serde(default)]
+    review_campaign_adjudications: Option<u64>,
+    #[serde(default)]
+    review_pool_registry: Option<u64>,
+    #[serde(default)]
+    review_pool_members: Option<u64>,
+    #[serde(default)]
+    review_pool_decisions: Option<u64>,
+    #[serde(default)]
+    review_pool_reversals: Option<u64>,
+    #[serde(default)]
+    review_pool_owner_adjudications: Option<u64>,
+    #[serde(default)]
+    review_pool_voice_certificates: Option<u64>,
 }
 
 fn safe_manifest_name(name: &str) -> Result<(), String> {
@@ -903,6 +929,13 @@ fn inspect_schema2_database_evidence(path: &Path) -> Result<SnapshotDatabaseEvid
     let schema_version: i64 = connection
         .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))
         .map_err(|error| format!("schema-2 snapshot migration history is unavailable: {error}"))?;
+    let count_from = |introduced_in: i64, table: &str| -> Result<Option<u64>, String> {
+        if schema_version >= introduced_in {
+            nonnegative(table).map(Some)
+        } else {
+            Ok(None)
+        }
+    };
     Ok(SnapshotDatabaseEvidence {
         quick_check: read_pragma_strings(&connection, "PRAGMA quick_check")?,
         integrity_check: read_pragma_strings(&connection, "PRAGMA integrity_check")?,
@@ -916,6 +949,19 @@ fn inspect_schema2_database_evidence(path: &Path) -> Result<SnapshotDatabaseEvid
             model_versions: nonnegative("model_versions")?,
             import_jobs: nonnegative("import_jobs")?,
             import_job_files: nonnegative("import_job_files")?,
+            review_pilot_hidden_keys: count_from(59, "review_pilot_hidden_keys")?,
+            review_campaign_registry: count_from(61, "review_campaign_registry")?,
+            review_campaign_focus: count_from(61, "review_campaign_focus")?,
+            review_campaign_transitions: count_from(61, "review_campaign_transitions")?,
+            independent_review_decisions: count_from(61, "independent_review_decisions")?,
+            independent_review_reversals: count_from(61, "independent_review_reversals")?,
+            review_campaign_adjudications: count_from(61, "review_campaign_adjudications")?,
+            review_pool_registry: count_from(62, "review_pool_registry")?,
+            review_pool_members: count_from(62, "review_pool_members")?,
+            review_pool_decisions: count_from(62, "review_pool_decisions")?,
+            review_pool_reversals: count_from(62, "review_pool_reversals")?,
+            review_pool_owner_adjudications: count_from(63, "review_pool_owner_adjudications")?,
+            review_pool_voice_certificates: count_from(63, "review_pool_voice_certificates")?,
         },
     })
 }
@@ -1019,7 +1065,11 @@ pub(crate) fn inspect_optional_state_for_restore(
     }
 }
 
-pub(crate) fn verify_snapshot_manifest_for_restore(snapshot_dir: &Path) -> Result<bool, String> {
+/// Verify the complete recovery contract without mutating the snapshot tree.
+///
+/// Public so the read-only private-production certifier can reject a fresh-looking directory whose
+/// manifest, database evidence, or file hashes no longer verify. Restore uses this same authority.
+pub fn verify_snapshot_manifest_for_restore(snapshot_dir: &Path) -> Result<bool, String> {
     let manifest_path = snapshot_dir.join(MANIFEST_FILE);
     let raw = match fs::read(&manifest_path) {
         Ok(raw) => raw,
@@ -1706,6 +1756,12 @@ mod tests {
         let schema1: serde_json::Value =
             serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
         let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
+        assert_eq!(evidence.schema_version, 63);
+        assert_eq!(evidence.row_counts.review_pilot_hidden_keys, Some(0));
+        assert_eq!(evidence.row_counts.review_campaign_registry, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_registry, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_owner_adjudications, Some(0));
+        assert_eq!(evidence.row_counts.review_pool_voice_certificates, Some(0));
         let schema2 = serde_json::json!({
             "schema": 2,
             "createdAtEpochSecs": 1000,
@@ -2034,7 +2090,7 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![62, 61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![63, 62, 61, 60, 59, 58]);
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pre-upgrade-row".to_string(),
             audio_path: "/must-survive.wav".to_string(),
@@ -2054,7 +2110,7 @@ mod tests {
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("an established v57 profile requires a pin");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 62);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 63);
         assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the migration pin must be self-verifying");
         let pinned = Database::open(pin.join(DB_FILE).to_string_lossy().as_ref()).unwrap();
         assert_eq!(crate::migrations::get_current_version(&pinned).unwrap(), 57);
@@ -2072,12 +2128,12 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![62, 61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![63, 62, 61, 60, 59, 58]);
 
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("a v57 profile requires a complete safety pin even when config uses defaults");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 62);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 63);
         for state in OPTIONAL_SNAPSHOT_STATE {
             assert_eq!(std::fs::read(pin.join(state.absent_file)).unwrap(), state.absent_bytes);
         }

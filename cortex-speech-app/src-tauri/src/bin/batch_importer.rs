@@ -191,42 +191,6 @@ fn import_prepared_voice_parallel(
     Ok((total, succeeded))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prepared_reuse_requires_exact_local_champion_evidence() {
-        let mut segment = cortex_speech_app_lib::db::SpeechSegment {
-            raw_transcript: "دەنگێکی ڕاستەقینە".into(),
-            model_version_id: Some("champion-v1".into()),
-            ..Default::default()
-        };
-        assert!(is_exact_champion_segment(&segment, "champion-v1"));
-
-        segment.cloud_call = true;
-        assert!(!is_exact_champion_segment(&segment, "champion-v1"));
-        segment.cloud_call = false;
-        segment.raw_transcript = "[Pending WSL 7B ASR]".into();
-        assert!(!is_exact_champion_segment(&segment, "champion-v1"));
-        segment.raw_transcript = "دەنگ".into();
-        assert!(!is_exact_champion_segment(&segment, "different-deployment"));
-    }
-
-    #[test]
-    fn prepared_inventory_accepts_only_wavs_and_is_deterministic() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let nested = root.path().join("nested");
-        std::fs::create_dir(&nested).expect("nested directory");
-        std::fs::write(root.path().join("b.WAV"), b"wave").expect("wav b");
-        std::fs::write(nested.join("a.wav"), b"wave").expect("wav a");
-        std::fs::write(root.path().join("ignore.mp3"), b"not selected").expect("other file");
-
-        let files = collect_prepared_wavs(root.path()).expect("collect prepared wavs");
-        assert_eq!(files, vec![root.path().join("b.WAV"), nested.join("a.wav")]);
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     println!("Starting Batch Importer...");
@@ -377,4 +341,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Batch Importer Finished!");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_reuse_requires_exact_local_champion_evidence() {
+        let mut segment = cortex_speech_app_lib::db::SpeechSegment {
+            raw_transcript: "دەنگێکی ڕاستەقینە".into(),
+            model_version_id: Some("champion-v1".into()),
+            ..Default::default()
+        };
+        assert!(is_exact_champion_segment(&segment, "champion-v1"));
+
+        segment.cloud_call = true;
+        assert!(!is_exact_champion_segment(&segment, "champion-v1"));
+        segment.cloud_call = false;
+        segment.raw_transcript = "[Pending WSL 7B ASR]".into();
+        assert!(!is_exact_champion_segment(&segment, "champion-v1"));
+        segment.raw_transcript = "دەنگ".into();
+        assert!(!is_exact_champion_segment(&segment, "different-deployment"));
+    }
+
+    #[test]
+    fn prepared_inventory_accepts_only_wavs_and_is_deterministic() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested directory");
+        std::fs::write(root.path().join("b.WAV"), b"wave").expect("wav b");
+        std::fs::write(nested.join("a.wav"), b"wave").expect("wav a");
+        std::fs::write(root.path().join("ignore.mp3"), b"not selected").expect("other file");
+
+        let files = collect_prepared_wavs(root.path()).expect("collect prepared wavs");
+        assert_eq!(files, vec![root.path().join("b.WAV"), nested.join("a.wav")]);
+    }
 }

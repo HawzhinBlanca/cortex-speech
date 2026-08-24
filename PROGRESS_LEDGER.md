@@ -11055,3 +11055,35 @@ schema-boundary regression pass. The remaining integration/property/soak targets
 their historical fixtures were made explicit instead of weakening schema-v60 production guards.
 `cargo fmt --check`, all-target clippy with warnings denied, and `git diff --check` are green. Source baseline:
 `4b9965486836cd33f3b9eb1e97a439065472c19e`.
+
+## 2026-08-24 — schema-63 private-production hardening in isolated worktree
+
+Implemented and verified the flexible-pool resolution authority in the isolated
+`codex/review-production-v63` worktree without touching the live database or GPUs. Any two distinct
+eligible reviewers with an exact matching keep/reject outcome resolve a clip; disagreement admits one
+blinded third judgment; any matching pair among three resolves; three distinct outcomes require an
+append-only owner adjudication; skip is non-judgmental; undo invalidates dependent authority and
+requeues. Resolved clips leave the queue and no fourth review is served.
+
+Added fail-closed exact owner-rights stamping, immutable per-voice certificates, deterministic staged
+ASR/TTS export, read-only certification, five-minute watchdog certification, and an isolated daily
+restore drill. On the live-sized clone, queue p95 measured 542.413 ms for Rubar and 537.993 ms for
+Alle against the 750 ms gate; two-reviewer decision commit p95 measured 4.889 ms against the 500 ms
+gate. A real offsite snapshot restored and verified in 3.355 seconds against the five-minute RTO.
+
+Release-boundary hardening now stages an immutable, hash-bound app/admin/operations bundle outside
+the live tree, migrates and certifies a live-sized clone first, gates exposure behind a maintenance
+marker, and journals every handover phase. The watchdog refuses malformed or tampered active-release
+pointers. Recovery restores the pinned v62 snapshot only when no v63 judgment exists; after the first
+v63 judgment it preserves that database and permits only a verified schema-63-compatible binary
+rollback. A staged rehearsal passed at schema 63 with all 20,323 audio clips present and exact rights
+coverage. Canonical read-only probes found 20,321 available clips for Rubar and 17,374 for Alle,
+materialized a valid 223,916-byte RIFF/WAVE clip, and verified live submission idempotency authority.
+
+Final isolated verification: Rust library 1,527 passed / 0 failed / 8 intentionally ignored
+hardware/isolated-benchmark tests; binary tests passed; strict Clippy and Rust formatting passed;
+Tauri integration passed; the synthetic soak passed; frontend 292 passed with lint, formatting,
+typecheck (0 errors/warnings), and production build green; all 103 Python policy scripts passed,
+including the 13-branch watchdog drill, 24 recovery-snapshot tests, 19 restore tests, and 8 immutable
+release-controller tests. `git diff --check` is green. No live production mutation or GPU use occurred
+at this checkpoint; commit-bound release build and controlled handover remain next.

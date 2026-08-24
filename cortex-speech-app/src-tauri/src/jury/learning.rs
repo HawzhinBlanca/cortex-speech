@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn dpo_legacy_example_requires_current_matching_verified_edit() {
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![63, 62, 61, 60]);
         db.insert_segment(&SpeechSegment {
             id: "legacy-dpo".into(),
             audio_path: "/legacy-dpo.wav".into(),
@@ -731,7 +731,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63]);
 
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1);
         db.connection()
@@ -758,7 +758,7 @@ mod tests {
         // differ from annotated/raw. Memory evidence must be judged against what the human actually
         // accepted; comparing the prior draft to itself would invert this Confirm into an Override.
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![63, 62, 61, 60]);
         let original = "ئەو ساڵە باش بوو";
         let accepted = "ئەو ساڵە خراپ بوو";
         let memory = crate::corrections::extract_substitution_memories(original, accepted)
@@ -774,7 +774,7 @@ mod tests {
                 params![memory.wrong_token, memory.human_token, memory.slot_key, memory.phonetic_key],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63]);
 
         db.insert_segment(&SpeechSegment {
             id: "accepted-hypothesis-segment".into(),

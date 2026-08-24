@@ -654,6 +654,16 @@ def test_schema61_evidence_requires_every_campaign_authority_table() -> None:
     )
 
 
+def test_schema63_evidence_requires_pool_decisions_resolutions_and_certificates() -> None:
+    at_62 = drill_module.evidence_tables_for_schema(62)
+    assert at_62[-len(drill_module.POOL_EVIDENCE_TABLES) :] == drill_module.POOL_EVIDENCE_TABLES
+    at_63 = drill_module.evidence_tables_for_schema(63)
+    assert at_63[-len(drill_module.POOL_RESOLUTION_EVIDENCE_TABLES) :] == (
+        drill_module.POOL_RESOLUTION_EVIDENCE_TABLES
+    )
+    assert set(drill_module.POOL_EVIDENCE_TABLES + drill_module.POOL_RESOLUTION_EVIDENCE_TABLES) <= set(at_63)
+
+
 def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
     for test in tests:

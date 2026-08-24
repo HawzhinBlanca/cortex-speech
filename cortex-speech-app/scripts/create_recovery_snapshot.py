@@ -82,6 +82,18 @@ CAMPAIGN_COUNT_TABLES = (
     "independent_review_reversals",
     "review_campaign_adjudications",
 )
+POOL_SCHEMA_VERSION = 62
+POOL_COUNT_TABLES = (
+    "review_pool_registry",
+    "review_pool_members",
+    "review_pool_decisions",
+    "review_pool_reversals",
+)
+POOL_RESOLUTION_SCHEMA_VERSION = 63
+POOL_RESOLUTION_COUNT_TABLES = (
+    "review_pool_owner_adjudications",
+    "review_pool_voice_certificates",
+)
 MANIFEST_FIELDS = {
     "schema",
     "createdAtEpochSecs",
@@ -109,13 +121,17 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Keep old evidence shapes exact while binding v59/v61 authority when present."""
+    """Keep old evidence shapes exact while binding every review authority through v63."""
 
     tables = BASE_COUNT_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
         tables += (HIDDEN_KEY_TABLE,)
     if schema_version >= CAMPAIGN_SCHEMA_VERSION:
         tables += CAMPAIGN_COUNT_TABLES
+    if schema_version >= POOL_SCHEMA_VERSION:
+        tables += POOL_COUNT_TABLES
+    if schema_version >= POOL_RESOLUTION_SCHEMA_VERSION:
+        tables += POOL_RESOLUTION_COUNT_TABLES
     return tables
 
 

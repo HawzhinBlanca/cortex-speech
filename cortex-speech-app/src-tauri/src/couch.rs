@@ -126,6 +126,11 @@ const LISTENER_RELEASE_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 /// version of this hazard was caught live — see `stop`).
 const ACCEPT_POLL: Duration = Duration::from_millis(250);
 const TLS_IDENTITY_FILE: &str = "couch_tls_identity.json";
+/// Present only during a controlled private-production handover. The read-only pairing probe remains
+/// available so the candidate can prove every durable link, but no queue, audio, claim, renewal,
+/// decision, or undo route is exposed until the release controller removes this file after all gates
+/// pass. Reading it per request makes exposure an atomic filesystem decision with no restart race.
+const PRIVATE_PRODUCTION_MAINTENANCE_FILE: &str = "private-production-maintenance.json";
 const COUCH_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How stale a session's persisted issue time may get before a page load rewrites it. Small next to
 /// `COUCH_SESSION_TTL`, so the durable expiry tracks the in-memory one closely, and large enough that
@@ -2164,6 +2169,17 @@ fn handle_request(
         };
     }
 
+    let maintenance = {
+        let guard = lock_state(state);
+        guard
+            .session_store
+            .as_ref()
+            .is_some_and(|(data_dir, _)| data_dir.join(PRIVATE_PRODUCTION_MAINTENANCE_FILE).is_file())
+    };
+    if maintenance {
+        return (err_reply(503, "Cortex Review is completing a protected release handover; retry shortly"), None);
+    }
+
     // Reject a declared oversized body before authentication or body parsing. The patched parser
     // drains an abandoned connection through a fixed buffer, so even usize::MAX cannot allocate from
     // this untrusted value; this explicit 413 also avoids waiting for bytes that will never be sent.
@@ -2897,6 +2913,12 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
         }
         if serving.len() >= serving_limit {
             continue; // keep counting what is left, but hand out no more this round
+        }
+        if let Some(pool) = pool_policy.as_ref() {
+            if let Err(error) = pool.verify_audio_available(&id) {
+                tracing::error!("Couch Review pool paused before lease because selected audio is unavailable: {error}");
+                return err_reply(503, "Review is temporarily paused: selected audio is unavailable");
+            }
         }
         guard.leases.insert(id.clone(), (reviewer.to_string(), now));
         serving.push(id);
@@ -5344,7 +5366,7 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
                 Ok(value) => value,
                 Err(error) => return err_reply(500, &format!("canonical undo order cannot be read: {error}")),
             };
-            if pool_latest.as_ref().is_some_and(|(_, _, _, at)| canonical_latest.is_none_or(|other| *at >= other)) {
+            if pool_latest.as_ref().is_some_and(|(_, _, _, at)| canonical_latest.map_or(true, |other| *at >= other)) {
                 return api_pool_undo(db, reviewer, state, pool);
             }
         }
@@ -7237,12 +7259,12 @@ mod tests {
         // nothing written to the corpus. The clip stayed pending and was swallowed again every batch.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![63, 62, 61, 60]);
         let mut gold = seg("g1", "دەقی خاو");
         gold.annotated_transcript = Some("دەقی ڕاست".into());
         gold.verified = true;
         db.insert_segment(&gold).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63]);
         let state = state();
 
         // It was handed to Sara as a check while it was still verified.
@@ -8119,8 +8141,8 @@ mod tests {
     /// `is_gold` matters: without it a peer's fresh correction would qualify as an answer key.
     fn gold_seg(db: &Database, id: &str, wrong_draft: &str, human_answer: &str) {
         assert_eq!(
-            crate::migrations::rollback(db, 3).unwrap(),
-            vec![62, 61, 60],
+            crate::migrations::rollback(db, 4).unwrap(),
+            vec![63, 62, 61, 60],
             "gold test authority must be created before the v60 legacy snapshot"
         );
         let mut s = seg(id, wrong_draft);
@@ -8130,7 +8152,7 @@ mod tests {
         s.verdict = Some("human_edit".into());
         s.verdict_transcript = Some(human_answer.into());
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60, 61, 62]);
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60, 61, 62, 63]);
     }
 
     #[test]
@@ -8437,6 +8459,35 @@ mod tests {
         let _ = respond_with_cookie(request, reply.clone(), cookie);
         let _ = client.join();
         reply
+    }
+
+    #[test]
+    fn private_production_maintenance_blocks_data_but_not_the_read_only_link_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("maintenance-clip", "دەقی تاقیکردنەوە")).unwrap();
+        let state = Mutex::new(CouchState {
+            reviewers: HashMap::from([("cookie".to_string(), "Rubar".to_string())]),
+            pairing_codes: HashMap::from([("pairing".to_string(), "Rubar".to_string())]),
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            ..CouchState::default()
+        });
+        let maintenance = tmp.path().join(PRIVATE_PRODUCTION_MAINTENANCE_FILE);
+        std::fs::write(&maintenance, b"{}\n").unwrap();
+
+        assert_eq!(route_for_test(&db, &state, "cookie").0, 503, "no queue may escape before release gates pass");
+        assert_eq!(
+            api_claim_probe(br#"{"token":"pairing"}"#, &state).0,
+            200,
+            "the non-mutating authentication probe must remain available during handover"
+        );
+
+        std::fs::remove_file(maintenance).unwrap();
+        let after = route_for_test(&db, &state, "cookie");
+        assert!(
+            !String::from_utf8_lossy(&after.2).contains("protected release handover"),
+            "removing the marker must atomically leave the maintenance refusal path"
+        );
     }
 
     #[test]
@@ -10169,7 +10220,7 @@ mod tests {
         // insert_segment_full so the row returns to its pre-decision snapshot losslessly.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _p) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 3).unwrap(), vec![62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 4).unwrap(), vec![63, 62, 61, 60]);
 
         // Persist the jury columns with insert_segment_full (insert_segment would drop them).
         let mut s = seg("esc1", "دەق یەک");
@@ -10178,7 +10229,7 @@ mod tests {
         s.verified = false;
         s.is_gold = false;
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63]);
 
         let state = state();
         let body = serde_json::json!({"heardMs": 600_000,  "id": "esc1", "action": "accept", "text": "دەق یەک" });

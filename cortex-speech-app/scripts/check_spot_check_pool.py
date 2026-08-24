@@ -1,4 +1,4 @@
-"""Gate: the hidden spot-check mechanism must be ABLE TO FIRE, on the live database.
+"""Gate the quality authority selected by the live review mode.
 
 Spot checks are the only instrument that measures whether a reviewer is LISTENING rather than
 tapping "looks good". They work by re-serving a clip whose correct answer is already known and
@@ -17,9 +17,11 @@ counter moved, and `spot_checks` still showed 5 rows from an earlier era: the QC
 being structurally incapable of firing. That is the vacuous-gate class this repo keeps finding, and
 it had been silently true across 288 decisions.
 
-An empty pool is therefore a FAILURE, not a quiet zero. Fixing it is an owner action, not a code
-change: adjudicate clips at the DESKTOP (which leaves `reviewed_by` NULL) or flag adjudicated clips
-`is_gold = 1`, so keys exist to grade against.
+An empty key pool is therefore a FAILURE for ordinary/controlled single-review serving, not a quiet
+zero. Flexible review-pool mode is different by design: every clip requires two distinct effective
+human outcomes and a third on disagreement, so `couch.rs` deliberately serves no synthetic/hidden
+rows there. In that mode this gate verifies the immutable pool authority instead of demanding keys
+the serving path will never consume.
 
 Run:  python scripts/check_spot_check_pool.py [db_path]   (env CORTEX_DB overrides)
 """
@@ -147,6 +149,54 @@ def default_db_path() -> str:
 def learning_key(text: str) -> str:
     """Mirror `normalizer::learning_text_key`: lowercase plus whitespace collapse only."""
     return " ".join((text or "").lower().split())
+
+
+def active_flexible_pool(conn: sqlite3.Connection) -> tuple[str, int, str] | None:
+    """Return a structurally valid active pool, or fail closed on partial/orphan authority."""
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name IN "
+            "('review_pool_registry','review_pool_members','review_pool_decisions','review_pool_reversals')"
+        )
+    }
+    if not tables:
+        return None
+    required = {
+        "review_pool_registry",
+        "review_pool_members",
+        "review_pool_decisions",
+        "review_pool_reversals",
+    }
+    if tables != required:
+        raise PolicyBroken(f"flexible review-pool schema is partial: {sorted(tables)}")
+    registry = conn.execute(
+        "SELECT pool_id, focus_segment_count, focus_sha256 FROM review_pool_registry ORDER BY singleton_key"
+    ).fetchall()
+    orphan_count = int(
+        conn.execute(
+            "SELECT (SELECT COUNT(*) FROM review_pool_members)"
+            "+(SELECT COUNT(*) FROM review_pool_decisions)"
+            "+(SELECT COUNT(*) FROM review_pool_reversals)"
+        ).fetchone()[0]
+    )
+    if not registry:
+        if orphan_count:
+            raise PolicyBroken("flexible review-pool evidence exists without its immutable registry")
+        return None
+    if len(registry) != 1:
+        raise PolicyBroken(f"flexible review pool has {len(registry)} registry rows")
+    pool_id, expected_count, focus_sha256 = registry[0]
+    member_count = int(
+        conn.execute("SELECT COUNT(*) FROM review_pool_members WHERE pool_id=?", (pool_id,)).fetchone()[0]
+    )
+    if member_count != int(expected_count) or member_count <= 0:
+        raise PolicyBroken(
+            f"flexible review-pool membership is {member_count}/{expected_count}; independent authority is incomplete"
+        )
+    if len(str(focus_sha256)) != 64 or any(ch not in "0123456789abcdef" for ch in str(focus_sha256)):
+        raise PolicyBroken("flexible review-pool focus digest is invalid")
+    return str(pool_id), member_count, str(focus_sha256)
 
 
 def serving_constants(couch_rs: str) -> tuple[int, int]:
@@ -360,6 +410,28 @@ def main() -> int:
             conn.close()
             print(f"FAIL: reviewer pilot hidden-key state cannot be evaluated: {error}")
             return 1
+
+    try:
+        flexible_pool = active_flexible_pool(conn)
+    except PolicyBroken as error:
+        conn.rollback()
+        conn.close()
+        print(f"FAIL: flexible review-pool authority cannot be evaluated: {error}")
+        return 1
+    if flexible_pool is not None:
+        if pilot_policy is not None:
+            conn.rollback()
+            conn.close()
+            print("FAIL: controlled hidden-check pilot and flexible review pool are active together")
+            return 1
+        pool_id, member_count, focus_sha256 = flexible_pool
+        conn.rollback()
+        conn.close()
+        print(f"active review mode     : flexible independent pool {pool_id}")
+        print(f"pool authority         : {member_count} immutable clips / {focus_sha256}")
+        print("quality authority      : two distinct outcomes; third blinded review on disagreement")
+        print("SPOT-CHECK CAPACITY: NOT APPLICABLE — independent pool authority is structurally ready")
+        return 0
 
     decisions = conn.execute(
         f"SELECT COUNT(*) FROM speech_segments WHERE verified = 1 AND {HUMAN_DECIDED}"

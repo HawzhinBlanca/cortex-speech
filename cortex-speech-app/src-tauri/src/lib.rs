@@ -62,6 +62,7 @@ pub mod registry;
 pub mod review_campaign;
 pub mod review_pilot;
 pub mod review_pool;
+pub mod review_pool_export;
 pub mod runs;
 pub mod scorecard;
 pub mod secret_redaction;

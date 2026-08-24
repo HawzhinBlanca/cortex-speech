@@ -31,17 +31,19 @@ param([switch]$Register, [switch]$DryRun)
 
 $ErrorActionPreference = 'Stop'
 $repoApp = Resolve-Path (Join-Path $PSScriptRoot '..\..')   # cortex-speech-app/
+$dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
+$port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
+$logDir = Join-Path $dataDir 'logs'
+$log = Join-Path $logDir 'watchdog.log'
 # CORTEX_WATCHDOG_EXE exists for the same reason the DATA_DIR/PORT overrides do: the three branches
 # that depend on a LIVE process could only ever be drilled when the real app happened to be running,
 # so the coverage of the force-kill decision — the most dangerous line in the availability path — was
 # a coin toss on machine state. With the exe path overridable, the drill points this at a harmless
 # decoy process it starts itself and reaches all three deterministically. Production is unaffected
-# when unset.
-$exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } else {
-    Join-Path $repoApp 'src-tauri\target\release\cortex-speech-app.exe'
-}
-$dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
-$port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
+# when unset. Private production adds one stronger source: an atomically published, hash-bound active
+# release manifest in the data profile. A mutable cargo target is only a compatibility fallback before
+# the first managed release. Once the pointer exists, a malformed/tampered pointer is a hard stop; it
+# must never silently fall back to whichever binary a later build happened to overwrite.
 # TLS FIRST, then plain HTTP. Couch Review serves TLS on every interface with a self-signed
 # certificate it generates locally, so an http:// probe against it does not fail cleanly — it comes
 # back as "corrupt message of type InvalidContentType", which this script read as a DEAD PORT and
@@ -69,9 +71,6 @@ public static class CortexProbeCerts {
 } catch {
     # Already loaded in this session, or the type exists — either way the callback is set.
 }
-$logDir = Join-Path $dataDir 'logs'
-$log = Join-Path $logDir 'watchdog.log'
-
 # The one line a drill reads. Printed for every decision so a test asserts the CHOICE, not a side effect.
 function Report([string]$action) { Write-Output "WATCHDOG-ACTION: $action" }
 
@@ -85,6 +84,65 @@ function Write-Log([string]$msg) {
         Add-Content -Path $log -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg)
     } catch { }
 }
+
+function Get-VerifiedActiveRelease {
+    $pointerPath = Join-Path $dataDir 'active-private-production-release.json'
+    if (-not (Test-Path -LiteralPath $pointerPath)) { return $null }
+    try {
+        $value = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
+        $expected = @(
+            'schema', 'releaseId', 'expectedDatabaseSchema', 'appGitSha', 'createdAtUtc',
+            'directory', 'appExe', 'poolAdminExe', 'appSha256', 'poolAdminSha256',
+            'watchdogScript', 'watchdogSha256', 'operationsSha256'
+        )
+        $actual = @($value.PSObject.Properties.Name)
+        $missing = @($expected | Where-Object { $_ -notin $actual })
+        $extra = @($actual | Where-Object { $_ -notin $expected })
+        if ($missing.Count -or $extra.Count) { throw "release pointer fields do not match schema 1" }
+        if ($value.schema -ne 1 -or $value.expectedDatabaseSchema -ne 63) {
+            throw 'release pointer does not require private-production database schema 63'
+        }
+        if ([string]$value.appGitSha -notmatch '^[0-9a-f]{40}$') { throw 'release pointer git SHA is invalid' }
+        foreach ($field in @('appSha256', 'poolAdminSha256', 'watchdogSha256', 'operationsSha256')) {
+            if ([string]$value.$field -notmatch '^[0-9a-f]{64}$') { throw "release pointer $field is invalid" }
+        }
+        $directory = (Resolve-Path -LiteralPath ([string]$value.directory) -ErrorAction Stop).Path.TrimEnd('\')
+        foreach ($field in @('appExe', 'poolAdminExe', 'watchdogScript')) {
+            $resolved = (Resolve-Path -LiteralPath ([string]$value.$field) -ErrorAction Stop).Path
+            if (-not $resolved.StartsWith($directory + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "release pointer $field escapes its immutable release directory"
+            }
+            $value.$field = $resolved
+        }
+        $checks = @(
+            @([string]$value.appExe, [string]$value.appSha256),
+            @([string]$value.poolAdminExe, [string]$value.poolAdminSha256),
+            @([string]$value.watchdogScript, [string]$value.watchdogSha256)
+        )
+        foreach ($check in $checks) {
+            $actualSha = (Get-FileHash -LiteralPath $check[0] -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha -ne $check[1]) { throw "release artifact hash mismatch: $($check[0])" }
+        }
+        return $value
+    } catch {
+        Report 'blocked (active release pointer invalid)'
+        Write-Log "active release pointer refused: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+$activeRelease = if ($env:CORTEX_WATCHDOG_EXE) { $null } else { Get-VerifiedActiveRelease }
+$packagedExe = Join-Path $repoApp 'cortex-speech-app.exe'
+$legacyExe = Join-Path $repoApp 'src-tauri\target\release\cortex-speech-app.exe'
+$packagedPoolAdmin = Join-Path $repoApp 'pool_admin.exe'
+$legacyPoolAdmin = Join-Path $repoApp 'src-tauri\target\release\pool_admin.exe'
+$exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } elseif ($null -ne $activeRelease) {
+    [string]$activeRelease.appExe
+} elseif (Test-Path -LiteralPath $packagedExe) { $packagedExe } else { $legacyExe }
+$poolAdmin = if ($env:CORTEX_WATCHDOG_POOL_ADMIN) { $env:CORTEX_WATCHDOG_POOL_ADMIN } elseif ($null -ne $activeRelease) {
+    [string]$activeRelease.poolAdminExe
+} elseif (Test-Path -LiteralPath $packagedPoolAdmin) { $packagedPoolAdmin } else { $legacyPoolAdmin }
+$session = Join-Path $dataDir 'couch_session.json'
 
 if ($Register) {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
@@ -173,9 +231,40 @@ if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
     Report 'alive'
     if ($DryRun) { exit 0 }
+    # v63 private-production certification. This is a read-only SQLite/filesystem report: it does not
+    # fetch a queue, take a lease, mark a clip seen, or touch reviewer history. Run it on the same
+    # five-minute clock as liveness while a reviewer session is expected. A failed certification does
+    # NOT trigger the destructive restart path (restarting cannot repair missing audio/rights/backups),
+    # but it suppresses the dead-man success ping and leaves an actionable report in the data profile.
+    $certHealthy = $true
+    $dbPath = Join-Path $dataDir 'cortex-speech.db'
+    if ((Test-Path -LiteralPath $session) -and (Test-Path -LiteralPath $poolAdmin) -and (Test-Path -LiteralPath $dbPath)) {
+        $certError = Join-Path $logDir 'pool-certification.stderr.log'
+        $certOutput = @(& $poolAdmin certify --db $dbPath --require-review-ready 2> $certError)
+        $certExit = $LASTEXITCODE
+        if ($certOutput.Count -gt 0) {
+            try {
+                if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
+                $certPath = Join-Path $logDir 'pool-certification.json'
+                $certTemp = Join-Path $logDir ('.pool-certification-' + [guid]::NewGuid().ToString('N') + '.tmp')
+                [System.IO.File]::WriteAllText($certTemp, (($certOutput -join [Environment]::NewLine) + [Environment]::NewLine))
+                Move-Item -LiteralPath $certTemp -Destination $certPath -Force
+            } catch {
+                $certHealthy = $false
+                Write-Log "pool certification output could not be published: $($_.Exception.Message)"
+            }
+        }
+        if ($certExit -ne 0) {
+            $certHealthy = $false
+            $reason = try { (Get-Content -LiteralPath $certError -Raw -ErrorAction Stop).Trim() } catch { 'no stderr detail' }
+            Write-Log "pool certification FAILED (exit $certExit): $reason"
+        } else {
+            Write-Log 'pool certification OK (review-ready)'
+        }
+    }
     # Optional dead-man ping: silence at healthchecks.io alerts the owner's phone.
     $hcFile = Join-Path $dataDir 'healthcheck.url'
-    if (Test-Path $hcFile) {
+    if ($certHealthy -and (Test-Path $hcFile)) {
         $hc = (Get-Content $hcFile -TotalCount 1).Trim()
         if ($hc -match '^https://') {
             try { Invoke-WebRequest -Uri $hc -UseBasicParsing -TimeoutSec 10 | Out-Null } catch {}
@@ -192,7 +281,6 @@ if ($alive) {
 #     HEALTHY state — killing it here would resurrect-loop the app every 5 minutes and make Stop
 #     feel haunted. Leave a running app alone; only launch if the process itself is gone
 #     (the autostart half of this task).
-$session = Join-Path $dataDir 'couch_session.json'
 # Matched by PATH, not by name. `Get-Process -Name cortex-speech-app` force-kills ANY process with
 # that name — a second checkout, a debug build, an installed copy under Program Files — while the
 # relaunch below only ever starts THIS one. The watchdog would happily kill a build it is not
