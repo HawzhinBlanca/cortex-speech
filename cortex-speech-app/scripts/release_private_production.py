@@ -754,8 +754,12 @@ def deploy(args: argparse.Namespace) -> int:
         raise ReleaseError(f"deployment accepts only the proven v63->v64 or v64->v64 path, not schema v{source_schema}")
     session_reviewers(data_dir)
     previous = active_pointer(data_dir, release_root)
-    if source_schema < EXPECTED_SCHEMA and previous is not None:
-        raise ReleaseError("a schema-63 database cannot be bound to a schema-64 active release pointer")
+    if (
+        source_schema < EXPECTED_SCHEMA
+        and previous is not None
+        and previous.get("expectedDatabaseSchema") != source_schema
+    ):
+        raise ReleaseError("the active release pointer is not compatible with the pre-migration database")
     if source_schema == EXPECTED_SCHEMA and previous is None:
         raise ReleaseError("a schema-64 deployment requires a versioned last-known-good active release")
     manifest = stage_release(args.candidate_dir, args.source_root, release_root, args.git_sha, args.dedup_manifest)
