@@ -57,7 +57,11 @@ export interface AgentPipelineStageEvent {
 }
 
 export interface BatchProgressEvent {
-  type: 'started' | 'progress' | 'completed';
+  // 'halted' is the champion hard stop (owner rule 2026-08-11): batch_transcribe emits it INSTEAD of
+  // 'completed' and it is the run's only terminal event. Leaving it out of this union is why the UI
+  // sat at "transcribing" forever after a halt and never named the cause.
+  type: 'started' | 'progress' | 'completed' | 'halted';
+  haltedBy?: string;
   total: number;
   current?: number;
   file?: string;
@@ -129,7 +133,13 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
     assign_speaker: { partial: 'events.batchSpeakerPartial', success: 'events.speakerAssigned' },
     normalize: { partial: 'events.batchNormalizePartial', success: 'events.normalized' },
   };
-  if (payload.cancelled) {
+  // Checked FIRST, and as an error carrying its cause: a hard-stopped run must never be softened into
+  // the cancelled warning or a "{ok} OK, {failed} failed" partial tally. Canon 2026-08-11 — a
+  // partly-drafted dataset that looks finished is worse than a run that stopped, so the cause the
+  // backend named in haltedBy is the one thing the user has to see.
+  if (payload.type === 'halted') {
+    notifications.error(tr('errors.transcriptionFailed'), { detail: payload.haltedBy });
+  } else if (payload.cancelled) {
     notifications.warning(tr('events.batchCancelled'));
   } else if (payload.operation && batchOps[payload.operation]) {
     const keys = batchOps[payload.operation];
@@ -269,7 +279,9 @@ export async function startEventListeners() {
         total,
         percent: total > 0 ? Math.round((current / total) * 100) : 0,
       });
-    } else if (payload.type === 'completed') {
+    } else if (payload.type === 'completed' || payload.type === 'halted') {
+      // Both are terminal, so both must clear isProcessing/pipelinePhase/batchProgress and end the
+      // operation — a halt that skipped this left the app stuck "transcribing" with no way back.
       void refreshAfterBatch(payload);
     }
   });

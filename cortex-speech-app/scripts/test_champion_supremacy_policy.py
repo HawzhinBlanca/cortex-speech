@@ -25,6 +25,7 @@ SRC = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
 PIPELINE = SRC / "pipeline.rs"
 COMMANDS = SRC / "commands.rs"
 SETTINGS = SRC / "settings.rs"
+EVENTS = Path(__file__).resolve().parents[1] / "src" / "lib" / "events.ts"
 
 
 def _fn_body(text: str, signature: str) -> str:
@@ -172,6 +173,50 @@ def test_batch_transcribe_hard_stops_on_the_first_failure() -> None:
     assert "break;" in text[halt:halt + 300], "the hard-stop check does not actually stop the loop"
 
 
+def test_the_ui_surfaces_the_hard_stop_instead_of_swallowing_it() -> None:
+    """The frontend half of the hard stop. Only the Rust emit was pinned — which is why this shipped.
+
+    `batch_transcribe`'s terminal emit is `type: "halted"` + `haltedBy`, and it is the ONLY terminal
+    event for the run. `events.ts` typed the union as started|progress|completed and branched on
+    exactly those three, so "halted" matched nothing: the segment list never refreshed, isProcessing
+    stayed true, batchProgress stayed 'running' and pipelinePhase stayed 'transcribing' forever, and
+    the cause canon REQUIRES be reported was never shown. A hard stop the user cannot see is the
+    silent fallback this whole policy exists to forbid.
+    """
+    text = EVENTS.read_text(encoding="utf-8")
+
+    start = text.find("export interface BatchProgressEvent {")
+    assert start != -1, "BatchProgressEvent is gone — this gate would pass vacuously"
+    iface = text[start : text.index("\n}", start)]
+    # The `type:` line itself, not the interface text: the explanatory comment above it also spells
+    # 'halted', and a substring scan over the whole block passed while the union had lost the member.
+    union = re.search(r"(?m)^\s*type:\s*(.+);$", iface)
+    assert union and "'halted'" in union.group(1), "the BatchProgressEvent type union dropped 'halted'"
+    assert "haltedBy" in iface, "BatchProgressEvent no longer carries the halt cause"
+
+    body_start = text.find("async function refreshAfterBatch(")
+    assert body_start != -1, "refreshAfterBatch is gone — this gate would pass vacuously"
+    body = text[body_start : text.index("\n}", body_start)]
+    halted = body.find("payload.type === 'halted'")
+    assert halted != -1, "refreshAfterBatch no longer distinguishes a halted run from a completed one"
+    assert "notifications.error" in body and "payload.haltedBy" in body, (
+        "a halted batch must reach the user as an ERROR naming its cause, not a silent state reset"
+    )
+    for softer in ("notifications.success", "notifications.warning"):
+        assert halted < body.index(softer), (
+            f"{softer} is evaluated before the halted branch — a hard-stopped run would be reported "
+            "as a success or a partial tally, exactly the 'looks finished' failure this policy bans"
+        )
+
+    listen_start = text.find("listen<BatchProgressEvent>('batch-progress'")
+    assert listen_start != -1, "the batch-progress listener is gone — this gate would pass vacuously"
+    listener = text[listen_start : text.index("unlisteners.push(unlistenBatch)", listen_start)]
+    assert "'halted'" in listener and "refreshAfterBatch" in listener, (
+        "the batch-progress listener ignores 'halted' again — the terminal state (isProcessing, "
+        "pipelinePhase, batchProgress, endOperation) would never clear after a hard stop"
+    )
+
+
 def main() -> None:
     test_champion_is_the_factory_default_and_auxiliary_models_default_off()
     test_selecting_the_champion_cannot_be_overridden_by_the_small_model()
@@ -180,6 +225,7 @@ def main() -> None:
     test_champion_review_cannot_consume_stale_auxiliary_votes()
     test_the_finetuned_override_yields_to_the_champion()
     test_batch_transcribe_hard_stops_on_the_first_failure()
+    test_the_ui_surfaces_the_hard_stop_instead_of_swallowing_it()
     print("champion supremacy + hard stop policy passed")
 
 
