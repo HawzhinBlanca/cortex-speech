@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from unittest import mock
 from pilot_focus_contract import contract_for_ids, verify_controlled_pilot_focus
 
 SCRIPT = Path(__file__).with_name("check_reviewer_links_live.py")
+RELEASE = SCRIPT.with_name("release_private_production.py")
 VERIFY_10 = SCRIPT.parents[2] / "scripts" / "verify_10.py"
 TEST_FOCUS_IDS = ("focus-a", "focus-b")
 TEST_FOCUS_CONTRACT = contract_for_ids(TEST_FOCUS_IDS)
@@ -27,6 +29,32 @@ def write_test_focus(root: Path) -> None:
         json.dumps({"name": "test", "segment_ids": list(TEST_FOCUS_IDS)}),
         encoding="utf-8",
     )
+
+
+def write_flexible_pool_db(root: Path) -> str:
+    pool_id = "123e4567-e89b-42d3-a456-426614174000"
+    connection = sqlite3.connect(root / "cortex-speech.db")
+    connection.executescript(
+        """
+        CREATE TABLE review_pool_registry (
+            pool_id TEXT NOT NULL,
+            focus_segment_count INTEGER NOT NULL,
+            focus_sha256 TEXT NOT NULL
+        );
+        CREATE TABLE review_pool_members (pool_id TEXT NOT NULL, segment_id TEXT NOT NULL);
+        """
+    )
+    connection.execute(
+        "INSERT INTO review_pool_registry(pool_id, focus_segment_count, focus_sha256) VALUES (?,?,?)",
+        (pool_id, 2, "a" * 64),
+    )
+    connection.executemany(
+        "INSERT INTO review_pool_members(pool_id, segment_id) VALUES (?,?)",
+        [(pool_id, "clip-a"), (pool_id, "clip-b")],
+    )
+    connection.commit()
+    connection.close()
+    return pool_id
 
 
 def load_gate():
@@ -40,6 +68,67 @@ def load_gate():
 
 
 class ReviewerLinksPolicyTests(unittest.TestCase):
+    def test_private_production_mode_detects_the_exact_flexible_pool(self):
+        gate = load_gate()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            pool_id = write_flexible_pool_db(root)
+            self.assertEqual(gate.active_flexible_pool(root), pool_id)
+            connection = sqlite3.connect(root / "cortex-speech.db")
+            connection.execute("DELETE FROM review_pool_members WHERE segment_id='clip-b'")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(RuntimeError, "membership is 1/2"):
+                gate.active_flexible_pool(root)
+
+    def test_private_production_probe_accepts_flexible_pool_without_legacy_pilot(self):
+        gate = load_gate()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_flexible_pool_db(root)
+            database = root / "cortex-speech.db"
+            (root / "couch_session.json").write_text(
+                json.dumps(
+                    {
+                        "reviewers": {"protected-a": "Alle", "protected-r": "Rubar"},
+                        "db_path": str(database),
+                        "pilot_policy": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def decrypt(value):
+                return {"protected-a": "token-a", "protected-r": "token-r"}[value]
+
+            def probe(_base, path, body=None, **_kwargs):
+                self.assertEqual(path, "/api/claim/probe")
+                reviewer = {"token-a": "Alle", "token-r": "Rubar"}[json.loads(body)["token"]]
+                return 200, None, json.dumps(
+                    {
+                        "reviewer": reviewer,
+                        "pilotPolicy": None,
+                        "dbBindingSha256": hashlib.sha256(str(database).encode("utf-8")).hexdigest(),
+                        "durableStateMatches": True,
+                    }
+                ).encode()
+
+            argv = [
+                str(SCRIPT),
+                "--base-url",
+                "https://127.0.0.1:8737",
+                "--data-dir",
+                raw,
+                "--require-private-production",
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(gate, "dpapi_unprotect", side_effect=decrypt),
+                mock.patch.object(gate, "request", side_effect=probe),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(gate.main(), 0)
+
     def test_funnel_discovery_requires_one_enabled_route_to_the_exact_port(self):
         gate = load_gate()
         status = {
@@ -590,8 +679,12 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
         self.assertIn(str(SCRIPT), payload)
         self.assertIn("--funnel", payload)
         self.assertIn("--port 8737", payload)
-        self.assertIn("--require-links", payload)
-        self.assertIn("--require-pilot", payload)
+        self.assertIn("--require-private-production", payload)
+        self.assertNotIn("--require-pilot", payload)
+
+    def test_release_controller_uses_the_same_mode_aware_link_gate(self):
+        payload = RELEASE.read_text(encoding="utf-8")
+        self.assertIn('"--require-private-production"', payload)
 
 
 if __name__ == "__main__":

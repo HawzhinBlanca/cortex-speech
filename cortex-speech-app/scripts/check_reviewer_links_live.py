@@ -25,7 +25,12 @@ NEVER PRINTS A TOKEN. The credential is the identity; a token in a log or a term
 reviewer's identity leaked, so only names and outcomes are printed.
 
 Production release run:
-  python scripts/check_reviewer_links_live.py --funnel --require-links --require-pilot
+  python scripts/check_reviewer_links_live.py --funnel --require-private-production
+
+`--require-private-production` is mode-aware: an active flexible pool requires its immutable pool
+registry and forbids a simultaneous legacy pilot policy; without a flexible pool it requires the
+exact controlled-pilot contract. `--require-pilot` remains available only for explicit legacy-pilot
+diagnostics.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ import ctypes.wintypes as wintypes
 import hashlib
 import json
 import os
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -131,6 +137,57 @@ def required_pilot_policy(root: Path) -> tuple[dict[str, object], set[str]]:
     validated = validate_pilot_policy(policy, "controlled pilot policy")
     verify_controlled_pilot_focus(root)
     return validated
+
+
+def active_flexible_pool(root: Path) -> str | None:
+    """Return the exact active pool id, or None when this is a pre-pool legacy database."""
+
+    database = (root / "cortex-speech.db").resolve(strict=True)
+    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN DEFERRED")
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('review_pool_registry','review_pool_members')"
+            )
+        }
+        if not tables:
+            return None
+        if tables != {"review_pool_registry", "review_pool_members"}:
+            raise RuntimeError(f"flexible review-pool schema is partial: {sorted(tables)}")
+        registry = connection.execute(
+            "SELECT pool_id, focus_segment_count, focus_sha256 FROM review_pool_registry"
+        ).fetchall()
+        if not registry:
+            member_count = connection.execute("SELECT COUNT(*) FROM review_pool_members").fetchone()[0]
+            if member_count:
+                raise RuntimeError("flexible review-pool membership exists without its registry")
+            return None
+        if len(registry) != 1:
+            raise RuntimeError(f"flexible review pool has {len(registry)} registry rows")
+        pool_id, expected_count, focus_sha256 = registry[0]
+        member_count = connection.execute(
+            "SELECT COUNT(*) FROM review_pool_members WHERE pool_id=?", (pool_id,)
+        ).fetchone()[0]
+        if type(expected_count) is not int or expected_count <= 0 or member_count != expected_count:
+            raise RuntimeError(
+                f"flexible review-pool membership is {member_count}/{expected_count}; authority is incomplete"
+            )
+        if (
+            not isinstance(pool_id, str)
+            or len(pool_id) != 36
+            or not isinstance(focus_sha256, str)
+            or len(focus_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in focus_sha256)
+        ):
+            raise RuntimeError("flexible review-pool registry identity is invalid")
+        return pool_id
+    except sqlite3.Error as error:
+        raise RuntimeError(f"flexible review-pool authority cannot be read: {error}") from error
+    finally:
+        connection.close()
 
 
 def validate_saved_session_shape(payload: dict[str, object]) -> None:
@@ -368,12 +425,22 @@ def main() -> int:
     parser.add_argument(
         "--require-pilot",
         action="store_true",
-        help=f"require the exact {'/'.join(PILOT_REVIEWERS)} controlled-pilot policy and link roster",
+        help=f"legacy only: require the exact {'/'.join(PILOT_REVIEWERS)} controlled-pilot policy and link roster",
+    )
+    parser.add_argument(
+        "--require-private-production",
+        action="store_true",
+        help="require the active flexible-pool mode, or the exact legacy pilot when no pool exists",
     )
     args = parser.parse_args()
     root = args.data_dir.resolve()
-    if args.require_pilot and args.port != 8737:
-        print("REVIEWER LINKS: FAIL — controlled production pilot must use Couch port 8737")
+    if args.require_pilot and args.require_private_production:
+        print("REVIEWER LINKS: FAIL — choose mode-aware private production or explicit legacy pilot, not both")
+        return 1
+    if args.require_private_production:
+        args.require_links = True
+    if (args.require_pilot or args.require_private_production) and args.port != 8737:
+        print("REVIEWER LINKS: FAIL — private production must use Couch port 8737")
         return 1
     try:
         base = (
@@ -435,7 +502,29 @@ def main() -> int:
         print("REVIEWER LINKS: FAIL — the durable reviewer-link map is invalid")
         return 1
     remembered_policy: dict[str, object] | None = None
-    if args.require_pilot:
+    flexible_pool_id: str | None = None
+    require_pilot = args.require_pilot
+    if args.require_private_production:
+        try:
+            flexible_pool_id = active_flexible_pool(root)
+        except (OSError, RuntimeError) as error:
+            print(f"REVIEWER LINKS: FAIL — {error}")
+            return 1
+        require_pilot = flexible_pool_id is None
+        expected_db = root / "cortex-speech.db"
+        recorded_db = payload.get("db_path")
+        if not isinstance(recorded_db, str) or canonical_path(Path(recorded_db)) != canonical_path(expected_db):
+            print("REVIEWER LINKS: FAIL — the remembered session is bound to a different database")
+            return 1
+        actual_reviewers = [name.strip().lower() for name in links.values()]
+        if len(set(actual_reviewers)) != len(actual_reviewers):
+            print("REVIEWER LINKS: FAIL — the durable session repeats one reviewer identity")
+            return 1
+        if flexible_pool_id is not None:
+            if payload.get("pilot_policy") is not None or (root / "review_pilot_policy.json").exists():
+                print("REVIEWER LINKS: FAIL — flexible pool and legacy controlled-pilot policy are active together")
+                return 1
+    if require_pilot:
         try:
             policy, required_reviewers = required_pilot_policy(root)
         except RuntimeError as error:
@@ -511,7 +600,7 @@ def main() -> int:
             failures.append(f"{name}: the server bound this link to the wrong identity")
             rows.append((name, "WRONG IDENTITY"))
             continue
-        if args.require_pilot:
+        if require_pilot:
             try:
                 live_policy, _ = validate_pilot_policy(probe.get("pilotPolicy"), "running pilot policy")
             except RuntimeError as error:
@@ -522,6 +611,10 @@ def main() -> int:
                 failures.append(f"{name}: the running server is bound to a different pilot policy")
                 rows.append((name, "WRONG LIVE PILOT POLICY"))
                 continue
+        elif flexible_pool_id is not None and probe.get("pilotPolicy") is not None:
+            failures.append(f"{name}: the running server still exposes a legacy pilot policy in flexible-pool mode")
+            rows.append((name, "WRONG LIVE REVIEW MODE"))
+            continue
         live_db_binding = probe.get("dbBindingSha256")
         expected_db_binding = hashlib.sha256(payload["db_path"].encode("utf-8")).hexdigest()
         if live_db_binding != expected_db_binding:

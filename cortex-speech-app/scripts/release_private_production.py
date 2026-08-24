@@ -498,7 +498,7 @@ def prove_canonical_queues(data_dir: Path, manifest: dict[str, Any]) -> dict[str
 
 def prove_links(data_dir: Path, manifest: dict[str, Any], *, funnel: bool) -> None:
     script = Path(str(manifest["directory"])) / "scripts" / "check_reviewer_links_live.py"
-    command = [sys.executable, str(script), "--data-dir", str(data_dir), "--require-links"]
+    command = [sys.executable, str(script), "--data-dir", str(data_dir), "--require-private-production"]
     command.append("--funnel" if funnel else "--base-url")
     if not funnel:
         command.append("https://127.0.0.1:8737")
