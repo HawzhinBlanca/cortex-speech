@@ -11218,3 +11218,17 @@ all binary tests, strict Clippy and formatting, snapshot 26/26, restore 21/21, r
 integrity 12/12, compensation 34/34, final-certification 24/24, and watchdog 13/13 passed. The live
 schema-64 reviewer service and GPUs remained untouched; exact-commit build, clone preflight, and
 protected handover remain pending.
+
+The protected v64→v65 handover and a subsequent same-schema proof-tool release both passed live-sized
+clone preflight before exposure. Active release
+`3aca5885867b-3e1014f35b6f-af72e4ccbf6a-363def17e69f` is built from exact commit
+`3aca5885867bc77a87fe669cbee48556a84a04a5`; app/admin/operations SHA-256 values are
+`3e1014f35b6f542312e25ebc3e095be8c754fa00d7edc78c9e1a3ef777f41605`,
+`b3cc0dfd35163f1512d399da6f8cbc119e92c88d5fa4ef20192a53bde3361a7b`, and
+`af72e4ccbf6a7ae9eb5b988197073096d4ec6d439c32fa019b158604837c6378`. Independent live proof found
+one exact listener, schema 65 quick/full integrity `ok`, zero foreign keys, 16,990/16,990 canonical
+audio, exact rights, zero dedup risk, and `reviewReady=true`. The mode-aware queue proof reports Alle
+14,041 and Rubar 16,988 eligible clips after dialect policy; both local and Funnel links authenticate
+read-only. Fresh verified local and `F:` schema-65 snapshots satisfy the ten-minute RPO, and snapshot
+`F:/cortex-backups/snapshots/snapshot_1787574862` restored alone in 3.925 seconds. The watchdog is
+enabled with last result zero. Human resolution remains incomplete; no GPU or ASR inference ran.

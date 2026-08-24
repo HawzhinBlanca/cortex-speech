@@ -6,10 +6,12 @@
 
 The engineering requirements that can be completed without human judgments or GPU availability are
 implemented and measured. The active immutable reviewer release is
-`fc22c10ef3e3-2f497f1e313b-7397aefdff6f-363def17e69f`, built from
-`fc22c10ef3e3cb680fc85e2eaa12fc5737633150`. Schema 64 binds the immutable 20,323-row
+`3aca5885867b-3e1014f35b6f-af72e4ccbf6a-363def17e69f`, built from
+`3aca5885867bc77a87fe669cbee48556a84a04a5`. Schema 65 binds the immutable 20,323-row
 source pool to 16,990 canonical review clips, excludes 3,333 duplicate aliases across 2,903
-families, and reports zero unconfirmed duplicate risk. Audit correction
+families, and reports zero unconfirmed duplicate risk. Schema 65 also preserves rights-revocation
+and metadata lineage on excluded duplicate audit rows without allowing those rows to gain review
+authority. Audit correction
 `18423dee480ac5bcff577d02c5d22b02415afc68` improves parallel test isolation without changing the
 reviewer API, database schema, pool, model route, or runtime consensus behavior; the live release was
 not interrupted for this proof-only correction. Operational proof correction
@@ -17,7 +19,9 @@ not interrupted for this proof-only correction. Operational proof correction
 mode-aware; it also changes no reviewer-runtime semantics and required no live handover.
 Master-proof correction `bd9235fb572d2e849f0ad7a7d869764b7a5f254f` extends that selection to
 review certification, deferred compensation, and playback evidence while preserving every strict
-legacy-mode rule.
+legacy-mode rule. Queue-proof correction `3aca5885867bc77a87fe669cbee48556a84a04a5` makes the
+standalone runway checker select the same immutable flexible-pool authority as the server instead of
+reapplying the superseded 6,922-ID Lamo JSON focus.
 
 > **Superseded evidence correction:** an initial schema-64 handover refused exposure because the
 > Python snapshot manifest omitted the two schema-64 dedup authority counts. No reviewer data was
@@ -50,31 +54,32 @@ Primary evidence: `src-tauri/src/review_pool.rs` tests
 
 | Plan requirement | Result | Authoritative evidence |
 |---|---|---|
-| Isolated schema-63/64 engineering and clone-first migration | PASS | Dedicated `codex/review-production-v63` worktree; fresh external build roots; live-sized clone preflights passed before protected handovers. |
+| Isolated schema-63/64/65 engineering and clone-first migration | PASS | Dedicated `codex/review-production-v63` worktree; external build roots; live-sized clone preflights passed before protected handovers. |
 | Preserve links, sessions, decisions, operation IDs, outbox, and undo | PASS | Real Rubar/Alle localhost and Funnel authentication, valid WAV and idempotency probes after the v63 handover; 877 historical events preserved and no synthetic pool decisions created. |
 | Stop resolved circulation; allow exactly one third review | PASS | Review-pool queue and full 16-pair action matrix tests; concurrent HTTP reviewer tests; live queues show unresolved work without synthetic resolution. |
 | Queue p95 ≤750 ms; commit p95 ≤500 ms | PASS | Live-sized release: Rubar 153.54 ms, Alle 150.97 ms; two-reviewer decision commit 4.889 ms. |
-| Mode-aware verification | PASS (implementation) | Links, final review authority, compensation, and playback now select the live mode. Flexible mode proves the hash-bound release/admin, pool/champion/voice/report consistency, deferred-pay namespace isolation, and effective pool playback evidence; legacy mode retains its exact hidden canary and ledger rules. Fresh local/Funnel authentication, live certification, and deferred-pay audit pass. The genuine post-release playback sample is still 0/20 and remains an external evidence gate. |
+| Mode-aware verification | PASS (implementation) | Links, queues, final review authority, compensation, and playback select the live mode. Flexible mode proves the hash-bound release/admin, exact reviewer-specific pool queue, champion/voice/report consistency, deferred-pay namespace isolation, and effective pool playback evidence; legacy mode retains its exact hidden canary and ledger rules. Fresh local/Funnel authentication and live certification pass. The genuine post-release playback sample remains an external evidence gate. |
 | Safe deployment and compatible rollback | PASS | Immutable hash-bound release, pre-migration snapshot, maintenance marker, clone preflight, post-exposure auth/queue/audio/idempotency/supervision gates, and schema-aware rollback controller tests. |
 | Exact owner rights, fail closed on conflicts/revocation | PASS | Live certification reports exact rights for every active owner recording; idempotent/scoped/conflict/revocation Rust tests pass. |
 | Per-voice certificates and independent finalization | PASS (implementation) | Certificate binds pool/focus/champion/deployment/rights/audio/resolution/reviewers/export; each voice is independently selected. Runtime certificates correctly wait for completed human resolution. |
 | Pool-native ASR/TTS export | PASS (implementation) | Reject exclusion; ASR 16 kHz mono PCM16; TTS 24 kHz PCM16; whole-master byte preservation; exact-sample bounded extraction; deterministic manifest; sync and atomic publication; tamper/crash recovery tests. |
-| Read-only five-minute certification | PASS | Report schema 2 separates consensus, owner adjudication, and conflicts; watchdog publishes without taking leases or mutating the source DB. |
-| Local and `F:` RPO ≤10 min; daily isolated RTO ≤5 min | PASS | Fixed nine-minute monotonic capture deadlines; fresh verified live local/offsite snapshots; scheduled restore result zero; latest schema-64 offsite restore measured 3.778 s. |
+| Read-only five-minute certification | PASS | Report schema 3 separates consensus, owner adjudication, conflicts, and duplicate authority; watchdog publishes without taking leases or mutating the source DB. |
+| Local and `F:` RPO ≤10 min; daily isolated RTO ≤5 min | PASS | Fixed nine-minute monotonic capture deadlines; fresh verified live local/offsite schema-65 snapshots; scheduled restore result zero; post-release offsite restore measured 3.925 s. |
 | Future imports isolated and champion-only | PASS | Batch importer requires an explicit existing staging data root, rejects live/ancestor/descendant/alias paths, and accepts only exact local OmniASR-7B champion evidence. |
-| Migration/future-schema/partial-failure tests | PASS | Real v62→v63 and v63→v64 paths, restart/reapply, reversible down paths, atomic failure, incomplete-history refusal, and future-schema refusal. |
+| Migration/future-schema/partial-failure tests | PASS | Real v62→v63, v63→v64, and v64→v65 paths, restart/reapply, reversible down paths, atomic failure, incomplete-history refusal, and future-schema refusal. |
 | Retry/restart/network/concurrency durability | PASS | 1,000 lost-response retries across 20 DB reopen cycles; 25 forced process crashes; concurrent reviewer hammer and mid-session restart tests; zero duplicated authority. |
-| Clean engineering verification | PASS | Rust 1,539 passed, 0 failed, 8 intentional hardware/model ignores; pool-admin 6/6; importer 3/3; frontend build and prior 292/292 plus browser E2E 97/97 remain green; schema-64 snapshot 26/26, restore 21/21, release 9/9; strict Clippy/format/lint/typecheck/build green. The `fc22c10` delta is Python operations/tests only and was clean-built into an exact-commit release. |
+| Clean engineering verification | PASS | Rust 1,541 passed, 0 failed, 8 intentional hardware/model/isolated-benchmark ignores; pool-admin 6/6; importer 3/3; frontend 292/292 and browser E2E 97/97; all 104 Python policy scripts; schema-65 snapshot 26/26, restore 21/21, release 11/11; strict Clippy/format/lint/typecheck/build green. |
 
 ## Live checkpoint
 
-Independent post-deploy certification reported exact commit `fc22c10ef3e3cb680fc85e2eaa12fc5737633150`,
-schema 64, healthy quick/full integrity, zero foreign keys, complete canonical audio and rights,
+Independent post-deploy certification reported exact commit `3aca5885867bc77a87fe669cbee48556a84a04a5`,
+schema 65, healthy quick/full integrity, zero foreign keys, complete canonical audio and rights,
 `reviewReady=true`, 16,990 unresolved canonical clips, zero owner conflicts, and zero owner
-adjudications. Rubar had 16,988 eligible clips and Alle 16,990; both sampled valid WAV data and proved
-submission idempotency. Both links authenticated read-only, the 14-assertion supervision gate passed,
-and the first post-deploy five-minute watchdog run returned zero. No GPU, WSL model process, or ASR
-transcript was changed.
+adjudications. With the live dialect policy applied, Rubar had 16,988 eligible clips and Alle 14,041;
+both sampled valid WAV data and proved submission idempotency. Both links authenticated read-only over
+local HTTPS and Funnel, the 14-assertion supervision gate passed, and the watchdog's last result was
+zero. Fresh schema-65 snapshots verified on local and `F:` storage; the offsite snapshot restored in
+3.925 seconds. No GPU, WSL model process, or ASR transcript was changed.
 
 ## External completion gates
 
