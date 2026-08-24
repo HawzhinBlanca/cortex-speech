@@ -59,6 +59,17 @@ def seed_profile(root: Path, *, schema_version: int = 59, policy: bool = True) -
     )
     if schema_version >= snapshot.HIDDEN_KEY_SCHEMA_VERSION:
         create_hidden_key_authority(con)
+    authority_tables: tuple[str, ...] = ()
+    if schema_version >= snapshot.CAMPAIGN_SCHEMA_VERSION:
+        authority_tables += snapshot.CAMPAIGN_COUNT_TABLES
+    if schema_version >= snapshot.POOL_SCHEMA_VERSION:
+        authority_tables += snapshot.POOL_COUNT_TABLES
+    if schema_version >= snapshot.POOL_RESOLUTION_SCHEMA_VERSION:
+        authority_tables += snapshot.POOL_RESOLUTION_COUNT_TABLES
+    if schema_version >= snapshot.POOL_DEDUP_SCHEMA_VERSION:
+        authority_tables += snapshot.POOL_DEDUP_COUNT_TABLES
+    for table in authority_tables:
+        con.execute(f'CREATE TABLE "{table}"(id INTEGER PRIMARY KEY)')
     con.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         [
@@ -841,6 +852,40 @@ def test_schema63_evidence_includes_pool_decisions_resolutions_and_certificates(
     assert at_62[-len(snapshot.POOL_COUNT_TABLES) :] == snapshot.POOL_COUNT_TABLES
     assert snapshot.POOL_RESOLUTION_COUNT_TABLES[0] not in at_62
     assert at_63[-len(snapshot.POOL_RESOLUTION_COUNT_TABLES) :] == snapshot.POOL_RESOLUTION_COUNT_TABLES
+
+
+def test_schema64_snapshot_binds_duplicate_authority_and_rejects_manifest_tampering() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        data = base / "data"
+        data.mkdir()
+        seed_profile(data, schema_version=64, policy=False)
+        connection = sqlite3.connect(data / snapshot.DB_FILE)
+        connection.execute("INSERT INTO review_pool_dedup_manifests VALUES(1)")
+        connection.executemany(
+            "INSERT INTO review_pool_duplicate_exclusions VALUES(?)", [(1,), (2,), (3,)]
+        )
+        connection.commit()
+        connection.close()
+
+        local, evidence = snapshot.promote_snapshot(
+            data, label="schema64", expected_foreign_keys=0, repo_root=base
+        )
+        assert evidence["rowCounts"]["review_pool_dedup_manifests"] == 1
+        assert evidence["rowCounts"]["review_pool_duplicate_exclusions"] == 3
+        snapshot.verify_tree(local, expected_evidence=evidence, expected_foreign_keys=0)
+
+        payload = load_manifest(local)
+        del payload["databaseEvidence"]["rowCounts"]["review_pool_duplicate_exclusions"]
+        write_manifest(local, payload)
+        assert_verify_refuses(local, evidence, "rowCounts fields are invalid")
+
+
+def test_schema64_evidence_includes_duplicate_authority_only_at_v64() -> None:
+    at_63 = snapshot.evidence_tables_for_schema(63)
+    at_64 = snapshot.evidence_tables_for_schema(64)
+    assert not set(snapshot.POOL_DEDUP_COUNT_TABLES) & set(at_63)
+    assert at_64[-len(snapshot.POOL_DEDUP_COUNT_TABLES) :] == snapshot.POOL_DEDUP_COUNT_TABLES
 
 
 def main() -> int:

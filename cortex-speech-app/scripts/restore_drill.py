@@ -72,6 +72,11 @@ POOL_RESOLUTION_EVIDENCE_TABLES = (
     "review_pool_owner_adjudications",
     "review_pool_voice_certificates",
 )
+POOL_DEDUP_SCHEMA_VERSION = 64
+POOL_DEDUP_EVIDENCE_TABLES = (
+    "review_pool_dedup_manifests",
+    "review_pool_duplicate_exclusions",
+)
 FILE_ROW_FIELDS = {"path", "sizeBytes", "sha256"}
 SCHEMA_FIELDS = {
     1: {"schema", "reviewPilotPolicyStateSchema", "createdAtEpochSecs", "appGitSha", "files"},
@@ -97,7 +102,7 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Preserve old evidence shapes and bind every durable review authority through v63."""
+    """Preserve old evidence shapes and bind every durable review authority through v64."""
 
     tables = BASE_EVIDENCE_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
@@ -108,6 +113,8 @@ def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
         tables += POOL_EVIDENCE_TABLES
     if schema_version >= POOL_RESOLUTION_SCHEMA_VERSION:
         tables += POOL_RESOLUTION_EVIDENCE_TABLES
+    if schema_version >= POOL_DEDUP_SCHEMA_VERSION:
+        tables += POOL_DEDUP_EVIDENCE_TABLES
     return tables
 
 

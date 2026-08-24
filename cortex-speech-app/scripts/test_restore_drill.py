@@ -75,6 +75,17 @@ def seed_tree(
     )
     if db_schema >= drill_module.HIDDEN_KEY_SCHEMA_VERSION:
         create_hidden_key_authority(connection)
+    authority_tables: tuple[str, ...] = ()
+    if db_schema >= drill_module.CAMPAIGN_SCHEMA_VERSION:
+        authority_tables += drill_module.CAMPAIGN_EVIDENCE_TABLES
+    if db_schema >= drill_module.POOL_SCHEMA_VERSION:
+        authority_tables += drill_module.POOL_EVIDENCE_TABLES
+    if db_schema >= drill_module.POOL_RESOLUTION_SCHEMA_VERSION:
+        authority_tables += drill_module.POOL_RESOLUTION_EVIDENCE_TABLES
+    if db_schema >= drill_module.POOL_DEDUP_SCHEMA_VERSION:
+        authority_tables += drill_module.POOL_DEDUP_EVIDENCE_TABLES
+    for table in authority_tables:
+        connection.execute(f'CREATE TABLE "{table}"(id INTEGER PRIMARY KEY)')
     connection.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         [
@@ -662,6 +673,33 @@ def test_schema63_evidence_requires_pool_decisions_resolutions_and_certificates(
         drill_module.POOL_RESOLUTION_EVIDENCE_TABLES
     )
     assert set(drill_module.POOL_EVIDENCE_TABLES + drill_module.POOL_RESOLUTION_EVIDENCE_TABLES) <= set(at_63)
+
+
+def test_schema64_restore_binds_duplicate_authority_and_rejects_count_tampering() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        seed_tree(root, policy=False, db_schema=64)
+        connection = sqlite3.connect(root / drill_module.DB_FILE)
+        connection.execute("INSERT INTO review_pool_dedup_manifests VALUES(1)")
+        connection.executemany(
+            "INSERT INTO review_pool_duplicate_exclusions VALUES(?)", [(1,), (2,), (3,)]
+        )
+        connection.commit()
+        connection.close()
+        payload = write_manifest(root, 2)
+        assert drill_module.drill(root) == []
+        payload["databaseEvidence"]["rowCounts"]["review_pool_duplicate_exclusions"] = 2
+        write_payload(root, payload)
+        assert_refused(root, "databaseEvidence does not exactly match")
+
+
+def test_schema64_evidence_requires_duplicate_authority_only_at_v64() -> None:
+    at_63 = drill_module.evidence_tables_for_schema(63)
+    at_64 = drill_module.evidence_tables_for_schema(64)
+    assert not set(drill_module.POOL_DEDUP_EVIDENCE_TABLES) & set(at_63)
+    assert at_64[-len(drill_module.POOL_DEDUP_EVIDENCE_TABLES) :] == (
+        drill_module.POOL_DEDUP_EVIDENCE_TABLES
+    )
 
 
 def main() -> int:

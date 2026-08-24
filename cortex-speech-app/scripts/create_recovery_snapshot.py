@@ -94,6 +94,11 @@ POOL_RESOLUTION_COUNT_TABLES = (
     "review_pool_owner_adjudications",
     "review_pool_voice_certificates",
 )
+POOL_DEDUP_SCHEMA_VERSION = 64
+POOL_DEDUP_COUNT_TABLES = (
+    "review_pool_dedup_manifests",
+    "review_pool_duplicate_exclusions",
+)
 MANIFEST_FIELDS = {
     "schema",
     "createdAtEpochSecs",
@@ -121,7 +126,7 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Keep old evidence shapes exact while binding every review authority through v63."""
+    """Keep old evidence shapes exact while binding every review authority through v64."""
 
     tables = BASE_COUNT_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:
@@ -132,6 +137,8 @@ def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
         tables += POOL_COUNT_TABLES
     if schema_version >= POOL_RESOLUTION_SCHEMA_VERSION:
         tables += POOL_RESOLUTION_COUNT_TABLES
+    if schema_version >= POOL_DEDUP_SCHEMA_VERSION:
+        tables += POOL_DEDUP_COUNT_TABLES
     return tables
 
 
