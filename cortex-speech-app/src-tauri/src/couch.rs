@@ -386,6 +386,19 @@ fn normalize_reviewers(names: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// ONE definition of "the same person", used everywhere a reviewer name is matched against another.
+///
+/// `normalize_reviewers` trims but deliberately PRESERVES the casing the owner typed, and the review
+/// columns are `COLLATE NOCASE`, so "rubar" and "Rubar" are one reviewer to the roster and to the
+/// database. Every `==` that slipped in disagreed, and each one failed silently: a re-typed roster
+/// minted a FRESH pairing token (so every link already sent answers "link expired"), dropped the
+/// restored cookie sessions (installed phone shortcuts die), and dropped the remembered served-check
+/// pairs (the outstanding check 409s and its score is lost). That is exactly the shape of the
+/// six-reviewers-silent outage of 2026-08-20, reachable by re-typing one name.
+fn same_reviewer(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
 /// The name used when the owner starts the server without naming anyone.
 const DEFAULT_REVIEWER: &str = "owner";
 
@@ -1145,7 +1158,8 @@ where
     let tokens: HashMap<String, String> = names
         .iter()
         .map(|name| {
-            let existing = remembered.pairing.iter().find(|(_, n)| n == &name).map(|(t, _)| t.clone());
+            let existing =
+                remembered.pairing.iter().find(|(_, n)| same_reviewer(n.as_str(), name)).map(|(t, _)| t.clone());
             let token = existing
                 .unwrap_or_else(|| format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()));
             (token, name.clone())
@@ -1204,10 +1218,25 @@ where
     let shutdown = Arc::new(AtomicBool::new(false));
     // Rehydrate the served spot-check set for names still on the roster, so a check outstanding
     // across the restart is recognized and scored when its answer arrives instead of 409ing.
-    let mut spot_checks: HashSet<(String, String)> =
-        served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
-    let pilot_spot_checks: HashSet<(String, String)> =
-        durable_pilot_served_checks.into_iter().filter(|(_, name)| names.contains(name)).collect();
+    //
+    // RE-KEYED onto the roster's current spelling, not merely filtered by it. Every later lookup is an
+    // exact tuple match (`spot_checks.contains(&(id, reviewer))`), so a pair rehydrated under
+    // yesterday's casing would be invisible to the reviewer it belongs to — the check would be
+    // outstanding on the phone and unknown to the server.
+    let mut spot_checks: HashSet<(String, String)> = served_checks
+        .into_iter()
+        .filter_map(|(segment_id, name)| {
+            let current = names.iter().find(|current| same_reviewer(current.as_str(), &name))?;
+            Some((segment_id, current.clone()))
+        })
+        .collect();
+    let pilot_spot_checks: HashSet<(String, String)> = durable_pilot_served_checks
+        .into_iter()
+        .filter_map(|(segment_id, name)| {
+            let current = names.iter().find(|current| same_reviewer(current.as_str(), &name))?;
+            Some((segment_id, current.clone()))
+        })
+        .collect();
     // The remembered file is now only a cache. A lost/repaired file is rebuilt from SQLite, and a
     // stale remembered key had to be transactionally imported above before it can authorize audio.
     spot_checks.extend(pilot_spot_checks.iter().cloned());
@@ -1216,8 +1245,18 @@ where
     // browser holds a valid cookie the server has never heard of, answers 401, and the page reports
     // "link expired" for a link that is fine — the amnesia that silenced six of eight reviewers.
     // Filtered by name so a reviewer REMOVED from the roster does not keep a working session.
-    let restored: HashMap<String, (String, SystemTime)> =
-        remembered.sessions.into_iter().filter(|(_, (name, _))| names.contains(name)).collect();
+    // Also re-keyed onto the current spelling: the session's reviewer String is copied onto every row
+    // this cookie decides, and attribution must read the same everywhere.
+    let restored: HashMap<String, (String, SystemTime)> = remembered
+        .sessions
+        .into_iter()
+        .filter_map(|(token, (name, issued))| {
+            names
+                .iter()
+                .find(|current| same_reviewer(current.as_str(), &name))
+                .map(|current| (token, (current.clone(), issued)))
+        })
+        .collect();
     let reviewers: HashMap<String, String> =
         restored.iter().map(|(token, (name, _))| (token.clone(), name.clone())).collect();
     let session_issued: HashMap<String, SystemTime> =
@@ -1752,7 +1791,11 @@ fn api_claim(body: &[u8], state: &Mutex<CouchState>) -> (Reply, Option<String>) 
     let _persist = lock_session_persist();
     let (reviewer, session_token, proposed_reviewers, proposed_session_issued, snapshot, inject_persist_failure) = {
         let guard = lock_state(state);
-        let reviewer = guard.pairing_codes.get(&parsed.token).or_else(|| guard.reviewers.get(&parsed.token)).cloned();
+        // PAIRING CREDENTIALS ONLY, the same boundary `api_claim_probe` enforces. A session cookie is
+        // not a durable reviewer link: accepting one here let an already-issued cookie be traded for
+        // fresh cookies indefinitely, outliving the eviction and revocation that the pairing secret
+        // governs — and it made the two endpoints disagree about what a credential is.
+        let reviewer = guard.pairing_codes.get(&parsed.token).cloned();
         let Some(reviewer) = reviewer else {
             // Same answer as every other bad credential: no hint whether the token was close.
             return (err_reply(401, "unauthorized"), None);
@@ -3084,16 +3127,31 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 // These work ids were leased above but no batch is being served. Release only this
                 // reviewer's batch so another request is not told the work is held while the paid
                 // line is correctly paused on the same quality-capacity failure.
-                let mut guard = lock_state(state);
-                for id in &serving {
-                    if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
-                        guard.leases.remove(id);
-                    }
-                }
+                release_unserved_leases(state, &serving, reviewer);
                 return err_reply(503, &format!("Review is temporarily paused: {error}"));
             }
             Ok(Some((candidates, pilot_quota))) => {
                 let wanted = candidates.len();
+                // STAMP FIRST, before anything is reserved or recorded. The row stamp is a second,
+                // fallible read that used to degrade to JSON null through `.ok().flatten()` — and a
+                // work clip ALWAYS carries one, so a null `rowVersion` is a payload shape only a trap
+                // clip can have: a fingerprint. It is also self-defeating, because the decide path
+                // refuses a missing rowVersion ("reload this clip"), leaving the check undecidable and
+                // its score unearnable. A failed read is a retryable 503 instead.
+                let mut checks: Vec<(SpeechSegment, String)> = Vec::with_capacity(wanted);
+                for segment in candidates {
+                    match db.segment_row_stamp(&segment.id) {
+                        Ok(Some(stamp)) => checks.push((segment, stamp)),
+                        other => {
+                            tracing::error!(
+                                "Couch Review could not stamp hidden check {}; the batch was refused: {other:?}",
+                                segment.id
+                            );
+                            release_unserved_leases(state, &serving, reviewer);
+                            return err_reply(503, "Review is temporarily paused: a hidden check could not be stamped");
+                        }
+                    }
+                }
                 if let Some(quota) = pilot_quota {
                     let Some(policy) = pilot_policy.as_ref() else {
                         return err_reply(503, "Review is temporarily paused: pilot key has no active policy");
@@ -3107,7 +3165,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                             )
                         }
                     };
-                    let candidate_ids: Vec<String> = candidates.iter().map(|segment| segment.id.clone()).collect();
+                    let candidate_ids: Vec<String> = checks.iter().map(|(segment, _)| segment.id.clone()).collect();
                     let authorized = match db.reserve_review_pilot_hidden_keys(
                         &policy_sha256,
                         policy.after_review_event_id,
@@ -3117,12 +3175,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                     ) {
                         Ok(ids) => ids.into_iter().collect::<HashSet<_>>(),
                         Err(error) => {
-                            let mut guard = lock_state(state);
-                            for id in &serving {
-                                if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
-                                    guard.leases.remove(id);
-                                }
-                            }
+                            release_unserved_leases(state, &serving, reviewer);
                             return err_reply(
                                 503,
                                 &format!("Review is temporarily paused: hidden-check reservation failed ({error})"),
@@ -3130,25 +3183,26 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                         }
                     };
                     if candidate_ids.iter().any(|id| !authorized.contains(id)) {
-                        let mut guard = lock_state(state);
-                        for id in &serving {
-                            if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
-                                guard.leases.remove(id);
-                            }
-                        }
+                        release_unserved_leases(state, &serving, reviewer);
                         return err_reply(503, "Review is temporarily paused: hidden-check reservation is incomplete");
                     }
                 }
-                // Serialize remembered-file mirror writes so an older cache snapshot cannot replace
-                // a newer one. SQLite has already committed the pilot authority above; this file is
-                // now restart convenience only and may be rebuilt from the database.
+                // Serialize remembered-file mirror writes so an older cache snapshot cannot replace a
+                // newer one. Pilot only: SQLite has already committed the pilot authority above, so
+                // that file is restart convenience and may be rebuilt from the database. The ordinary
+                // namespace reserves nothing durable — see the persist branch below.
                 let _pilot_persist = pilot_quota.map(|_| lock_session_persist());
                 let mut guard = lock_state(state);
                 let mut grew = false;
-                for (idx, seg) in candidates.into_iter().enumerate() {
+                // Exactly the keys THIS request minted, so an unserved batch can put the set back the
+                // way it found it. A key left behind for a clip the reviewer never received would make
+                // a later ordinary serve of that same clip score as a hidden check.
+                let mut minted: Vec<(String, String)> = Vec::new();
+                for (idx, (seg, row_stamp)) in checks.into_iter().enumerate() {
                     let key = (seg.id.clone(), reviewer.to_string());
                     if guard.spot_checks.insert(key.clone()) {
                         grew = true;
+                        minted.push(key.clone());
                     }
                     if pilot_quota.is_some() && guard.pilot_spot_checks.insert(key.clone()) {
                         grew = true;
@@ -3185,8 +3239,9 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                             // field differently would be spottable, and a reviewer who can spot the
                             // test is not being tested.
                             "speakerChange": holds_a_speaker_change(&seg),
-                            // Same field as work clips for the same indistinguishability reason.
-                            "rowVersion": db.segment_row_stamp(&seg.id).ok().flatten(),
+                            // Same field as work clips for the same indistinguishability reason —
+                            // resolved above, never degraded to null.
+                            "rowVersion": row_stamp,
                             "pilotAfterReviewEventId": pilot_policy.as_ref().map(|policy| policy.after_review_event_id),
                         }),
                     );
@@ -3194,9 +3249,18 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                 let pilot_snapshot = (pilot_quota.is_some() && grew).then(|| snapshot_session_save(&guard)).flatten();
                 #[cfg(test)]
                 let inject_pilot_save_failure = pilot_quota.is_some() && grew && guard.fail_session_persist;
-                // Persist the cache when possible. A failure no longer rolls back or rejects a queue:
-                // the exact assignments are already FULL-synchronous in SQLite and the next request
-                // or process start deterministically rehydrates this mirror from that authority.
+                // Persist the assignment. Under the PILOT namespace this file is a mirror only — the
+                // exact assignments are already FULL-synchronous in the durable pilot table reserved
+                // above, and the next request or process start rehydrates the mirror from that
+                // authority — so a failure is logged and the queue still goes out.
+                //
+                // The ordinary namespace has NO such reservation: this file is the only durable record
+                // that these clips were served as checks. The app restarts 4-9 times a day, and a
+                // restart rehydrates `spot_checks` from the stale file WITHOUT the pair — so the
+                // reviewer's answer takes the `was_served_as_spot_check == false` path, 409s "already
+                // reviewed", and the score is lost with nothing in the log to explain it. Refuse the
+                // batch instead: a retryable 503 costs a reload, a silent unrecorded check costs a
+                // measurement nobody can reconstruct.
                 drop(guard);
                 if grew {
                     let saved = if pilot_quota.is_some() {
@@ -3223,6 +3287,21 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
                         if pilot_quota.is_some() {
                             tracing::warn!(
                                 "controlled hidden-check session mirror was not saved; SQLite remains authoritative: {error}"
+                            );
+                        } else {
+                            tracing::error!(
+                                "Couch Review refused a batch because its hidden-check assignment could not be saved: {error}"
+                            );
+                            {
+                                let mut guard = lock_state(state);
+                                for key in minted {
+                                    guard.spot_checks.remove(&key);
+                                }
+                            }
+                            release_unserved_leases(state, &serving, reviewer);
+                            return err_reply(
+                                503,
+                                "Review is temporarily paused: the hidden-check assignment could not be saved",
                             );
                         }
                     }
@@ -3727,6 +3806,33 @@ fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
     json_reply(200, serde_json::json!({ "ok": true, "ttlSeconds": LEASE_TTL.as_secs() }))
 }
 
+/// Hand back the work this reviewer was provisionally leased when the batch is NOT going to be served.
+///
+/// Only this reviewer's leases, and only if still theirs: another request must not be told the work is
+/// held by someone who is being handed an error instead of a queue.
+fn release_unserved_leases(state: &Mutex<CouchState>, serving: &[String], reviewer: &str) {
+    let mut guard = lock_state(state);
+    for id in serving {
+        if guard.leases.get(id).is_some_and(|(who, _)| who == reviewer) {
+            guard.leases.remove(id);
+        }
+    }
+}
+
+/// Text a human must never be able to VERIFY as gold, for every decide path on this server.
+///
+/// `quality::is_placeholder_transcript` is the DECLARED authority on what a placeholder is, and the
+/// three decide guards used to re-implement it as "empty or `[bracketed]`" instead. That copy drifted:
+/// the authority also refuses a bare "n/a" / "null" (case-insensitively), and a reviewer typing either
+/// one had it accepted and minted as a human-verified transcript, which the export then shipped.
+///
+/// The bracket test is kept as a strict ADDITION, not a replacement — it still refuses any `[...]`
+/// marker a future importer invents before the authority has been taught about it.
+fn refuses_verification_as_placeholder(text: &str) -> bool {
+    let trimmed = text.trim();
+    crate::quality::is_placeholder_transcript(trimmed) || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+}
+
 /// Whether this reviewer's decision is ALREADY STORED on the row (P1.2).
 ///
 /// A phone on the edge of Wi-Fi drops requests. If the write lands but the response is lost, the page
@@ -3745,7 +3851,7 @@ fn api_renew(body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
 /// Recognizing that legacy half-row lets replay finish only annotation/verification without minting a
 /// duplicate learning pair. Callers pair this with `prev.verified` to distinguish complete repeats.
 fn is_repeat_of_stored_decision(prev: &SpeechSegment, reviewer: &str, decision: &str, text: Option<&str>) -> bool {
-    if prev.reviewed_by.as_deref() != Some(reviewer) {
+    if !prev.reviewed_by.as_deref().is_some_and(|stored| same_reviewer(stored, reviewer)) {
         return false;
     }
     match (decision, text) {
@@ -3967,7 +4073,7 @@ fn api_independent_decision(
             if text.is_empty() {
                 return err_reply(400, "empty transcript");
             }
-            if text.starts_with('[') && text.ends_with(']') {
+            if refuses_verification_as_placeholder(&text) {
                 return err_reply(400, "placeholder transcript cannot be verified");
             }
             let submitted_key = crate::normalizer::learning_text_key(&crate::db::to_nfc(&text));
@@ -4191,7 +4297,7 @@ fn api_pool_decision(
             if text.is_empty() {
                 return err_reply(400, "empty transcript");
             }
-            if text.starts_with('[') && text.ends_with(']') {
+            if refuses_verification_as_placeholder(&text) {
                 return err_reply(400, "placeholder transcript cannot be verified");
             }
             let submitted_key = crate::normalizer::learning_text_key(&crate::db::to_nfc(&text));
@@ -4472,7 +4578,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 }
                 // Same guard as the desktop editor: a placeholder draft ("[Pending WSL 7B ASR]" /
                 // "[ASR unavailable…]") must never be verified as gold.
-                if text.starts_with('[') && text.ends_with(']') {
+                if refuses_verification_as_placeholder(&text) {
                     return err_reply(400, "placeholder transcript cannot be verified");
                 }
                 // Pay/corpus semantics follow a MATERIAL transcript change, not byte trivia. NFC
@@ -5089,7 +5195,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     //
     // The SAME reviewer is exempt: correcting your own decision is a genuine re-review, and the
     // retry case above has already been answered.
-    if prev.verified && prev.reviewed_by.as_deref() != Some(reviewer) {
+    if prev.verified && !prev.reviewed_by.as_deref().is_some_and(|stored| same_reviewer(stored, reviewer)) {
         return match prev.reviewed_by.as_deref() {
             Some(other) => err_reply(409, &format!("already reviewed by {other}")),
             None => err_reply(409, "already reviewed at the desktop"),
@@ -5370,6 +5476,7 @@ fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
                 Ok(value) => value,
                 Err(error) => return err_reply(500, &format!("canonical undo order cannot be read: {error}")),
             };
+            // map_or, not is_none_or: the latter is stable only since 1.82 and this crate's MSRV is 1.81.
             if pool_latest.as_ref().is_some_and(|(_, _, _, at)| canonical_latest.map_or(true, |other| *at >= other)) {
                 return api_pool_undo(db, reviewer, state, pool);
             }
@@ -7094,6 +7201,45 @@ mod tests {
         assert_eq!(code, 428, "carried-forward evidence is personal; another reviewer must still listen");
     }
 
+    #[test]
+    fn a_retyped_reviewer_still_owns_their_own_stored_decision() {
+        // The same identity law at the decide path. Case-sensitive `reviewed_by` comparisons made a
+        // re-typed reviewer a STRANGER to their own row: the dropped-response retry stopped counting
+        // as a repeat (a second undo entry and a second DPO learning pair distilled from one human
+        // correction), and the late-submit guard refused their own re-review with "already reviewed
+        // by Rubar" — an unresolvable 409 against themselves.
+        assert!(same_reviewer("Rubar", " rubar "));
+        assert!(!same_reviewer("Rubar", "Alle"));
+
+        let mut prev = seg("d1", "دەقی خام");
+        prev.reviewed_by = Some("Rubar".to_string());
+        prev.human_decision = Some("edit".to_string());
+        prev.verdict_transcript = Some("دەقی ڕاست".to_string());
+        assert!(is_repeat_of_stored_decision(&prev, "rubar", "edit", Some("دەقی ڕاست")), "one person, one decision");
+        assert!(!is_repeat_of_stored_decision(&prev, "Alle", "edit", Some("دەقی ڕاست")), "still not somebody else");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("d1", "دەقی خام")).unwrap();
+        let state = state();
+        let first = serde_json::json!({
+            "id": "d1", "action": "edit", "text": "یەکەم", "heardMs": 1_500, "clipDurationMs": 1_500,
+        });
+        assert_eq!(api_decision(&db, first.to_string().as_bytes(), "Rubar", &state).0, 200);
+        let again = serde_json::json!({
+            "id": "d1", "action": "edit", "text": "دووەم", "heardMs": 1_500, "clipDurationMs": 1_500,
+        });
+        let (code, _, body, ..) = api_decision(&db, again.to_string().as_bytes(), "rubar", &state);
+        assert_eq!(
+            code,
+            200,
+            "correcting your own verdict is a re-review, not a collision: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let row = db.get_segment_by_id("d1").unwrap().unwrap();
+        assert_eq!(row.verdict_transcript.as_deref(), Some("دووەم"), "the re-review landed");
+    }
+
     /// A decision sent with no heard-time reports nothing, and must not fabricate evidence.
     #[test]
     fn a_phone_decision_without_reported_playback_mints_no_receipt() {
@@ -8317,6 +8463,101 @@ mod tests {
         assert_eq!(code, 200, "adding a genuine answer key unpauses the next fetch without a restart");
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["items"].as_array().unwrap().len(), 2, "one work clip plus its required hidden check");
+        assert!(
+            payload["items"].as_array().unwrap().iter().all(|item| item["rowVersion"].is_string()),
+            "a null rowVersion is a shape only a trap clip can have, and the decide path refuses it anyway"
+        );
+    }
+
+    #[test]
+    fn an_unsavable_ordinary_hidden_check_refuses_the_batch_instead_of_losing_the_score() {
+        // The ORDINARY namespace reserves nothing in SQLite: couch_session.json is the only durable
+        // record that these clips went out as hidden checks. The serve used to go out anyway on a save
+        // failure, and silently — the warn fired only when a pilot quota was active. This machine
+        // restarts 4-9 times a day, so `spot_checks` then rehydrated WITHOUT the pair, the reviewer's
+        // answer took the was_served_as_spot_check=false path, and the 409 "already reviewed" lost a
+        // QC score with nothing in the log to explain it.
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("paid-work", "دەقی کار")).unwrap();
+        gold_seg(&db, "quality-key", "دەقی هەڵە", "دەقی ڕاست");
+        let state = Mutex::new(CouchState {
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            pairing_codes: HashMap::from([("test-token".to_string(), "Sara".to_string())]),
+            reviewers: HashMap::from([("sara-cookie".to_string(), "Sara".to_string())]),
+            session_issued: HashMap::from([("sara-cookie".to_string(), SystemTime::now())]),
+            // Deterministic durable-save failure: one live cookie in the generation cannot be
+            // protected, which is exactly how `persist_session_state` fails in production.
+            fail_cookie_protection_for: Some("sara-cookie".to_string()),
+            ..CouchState::default()
+        });
+
+        let (code, _, body, ..) = api_queue(&db, "Sara", &state);
+        assert_eq!(code, 503, "a hidden check whose only durable record failed must not be served");
+        assert!(
+            String::from_utf8_lossy(&body).contains("could not be saved"),
+            "the reviewer gets a retryable operational reason: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let guard = lock_state(&state);
+        assert!(
+            guard.spot_checks.is_empty(),
+            "an unserved assignment must not linger — it would re-score a later ordinary serve of the same clip"
+        );
+        assert!(guard.leases.is_empty(), "a batch refused before delivery hands its work back to the pool");
+        assert!(guard.served_work.is_empty(), "no delivery receipt is minted for a batch nobody received");
+    }
+
+    #[test]
+    fn the_decide_guard_refuses_every_placeholder_the_declared_authority_knows() {
+        // The three decide guards re-implemented `quality::is_placeholder_transcript` as "empty or
+        // [bracketed]" and drifted from it: a bare "n/a" or "null" was accepted and minted as a
+        // human-verified transcript, which the export then shipped as a training row.
+        assert!(refuses_verification_as_placeholder("n/a"));
+        assert!(refuses_verification_as_placeholder(" N/A "));
+        assert!(refuses_verification_as_placeholder("NULL"));
+        assert!(refuses_verification_as_placeholder("[Pending WSL 7B ASR]"));
+        // The bracket test is kept as a strict addition, so a marker the authority has not been
+        // taught about is still refused.
+        assert!(refuses_verification_as_placeholder("[something new]"));
+        assert!(!refuses_verification_as_placeholder("دەقی ڕاست"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        db.insert_segment(&seg("ph1", "دەقی ئەسڵی")).unwrap();
+        let state = state();
+        for text in ["n/a", "N/A", "null", "[Pending WSL 7B ASR]"] {
+            let body = serde_json::json!({
+                "id": "ph1", "action": "edit", "text": text,
+                "heardMs": 1_500, "clipDurationMs": 1_500,
+            });
+            let (code, _, reply, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+            assert_eq!(code, 400, "{text:?} must never be verifiable as gold");
+            assert!(String::from_utf8_lossy(&reply).contains("placeholder"));
+        }
+        assert!(!db.get_segment_by_id("ph1").unwrap().unwrap().verified, "no placeholder reached the row");
+    }
+
+    #[test]
+    fn a_live_session_cookie_is_not_a_pairing_credential_at_claim() {
+        // `api_claim_probe` already refuses a cookie copied out of `reviewers` — "a cookie is not a
+        // durable reviewer link". `api_claim` accepted one, so the two endpoints disagreed about what
+        // a credential is and an issued cookie could be traded for fresh cookies forever.
+        let state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-secret".to_string(), "Sara".to_string())]),
+            reviewers: HashMap::from([("sara-cookie".to_string(), "Sara".to_string())]),
+            session_issued: HashMap::from([("sara-cookie".to_string(), SystemTime::now())]),
+            ..CouchState::default()
+        });
+
+        let (reply, cookie) = api_claim(br#"{"token":"sara-cookie"}"#, &state);
+        assert_eq!(reply.0, 401, "a session cookie must not mint a second session");
+        assert!(cookie.is_none(), "and it must set no cookie");
+        assert_eq!(api_claim_probe(br#"{"token":"sara-cookie"}"#, &state), claim_probe_denied(), "both agree");
+
+        let (reply, cookie) = api_claim(br#"{"token":"pair-secret"}"#, &state);
+        assert_eq!(reply.0, 200, "the pairing secret is still the way in — this is a closed door, not a broken lock");
+        assert!(cookie.is_some());
     }
 
     #[test]
@@ -8644,6 +8885,8 @@ mod tests {
         let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
         let port = server.server_addr().to_ip().unwrap().port();
         let state = Arc::new(Mutex::new(CouchState {
+            // The link's PAIRING secret — the only credential /api/claim accepts.
+            pairing_codes: HashMap::from([("goodtoken".to_string(), "Sara".to_string())]),
             reviewers: HashMap::from([("goodtoken".to_string(), "Sara".to_string())]),
             ..CouchState::default()
         }));
@@ -8708,6 +8951,8 @@ mod tests {
         let server = Arc::new(tiny_http::Server::http(("127.0.0.1", 0)).unwrap());
         let port = server.server_addr().to_ip().unwrap().port();
         let state = Arc::new(Mutex::new(CouchState {
+            // The link's PAIRING secret — the only credential /api/claim accepts.
+            pairing_codes: HashMap::from([("goodtoken".to_string(), "Sara".to_string())]),
             reviewers: HashMap::from([("goodtoken".to_string(), "Sara".to_string())]),
             ..CouchState::default()
         }));
@@ -9423,6 +9668,58 @@ mod tests {
         assert!(
             std::net::TcpListener::bind(("0.0.0.0", port)).is_ok(),
             "every just-started thread and the listener must be torn down before Start returns"
+        );
+    }
+
+    #[test]
+    fn a_retyped_reviewer_name_keeps_the_link_the_session_and_the_outstanding_check() {
+        // `normalize_reviewers` trims but PRESERVES typed casing, and the review columns are
+        // COLLATE NOCASE — so "rubar" and "Rubar" are one reviewer everywhere except in the three
+        // `==` comparisons the resume path used to make. Re-typing one name in Settings therefore
+        // minted a fresh pairing token (every link already sent answers "link expired"), dropped the
+        // restored cookie sessions (installed phone shortcuts die), and dropped the remembered
+        // served-check pairs (the outstanding check 409s and its score is lost). That is exactly the
+        // six-reviewers-silent shape of 2026-08-20, reachable by re-typing a name.
+        let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("retyped-roster.db").to_string_lossy().to_string();
+        Database::open(&db_path).unwrap().initialize().unwrap();
+        let pairing = HashMap::from([("rubar-pair".to_string(), "Rubar".to_string())]);
+        let spot_checks = HashSet::from([("hidden-1".to_string(), "Rubar".to_string())]);
+        let sessions = HashMap::from([("rubar-cookie".to_string(), ("Rubar".to_string(), SystemTime::now()))]);
+        save_session(tmp.path(), &pairing, &db_path, &spot_checks, &HashSet::new(), &sessions, None).unwrap();
+        let port_probe = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        // The owner re-types the roster in a different case. Same person.
+        let started = start_on_port_with_session_lifecycle(
+            db_path.clone(),
+            vec!["rubar".into()],
+            port,
+            Some(tmp.path().to_path_buf()),
+            save_session_snapshot,
+            clear_session_revocation,
+        );
+        // Read the durable generation BEFORE Stop: Stop plants the revocation marker, after which
+        // `load_session` correctly refuses to read anything.
+        let resumed = load_session(tmp.path(), &db_path);
+        let _ = stop_with_data_dir(Some(tmp.path()));
+
+        let started = started.expect("a re-typed roster still starts");
+        let link = started.reviewers.first().expect("the reviewer keeps a link");
+        assert!(link.url.contains("#t=rubar-pair"), "the already-sent link must keep working: {}", link.url);
+        let resumed = resumed.expect("the durable generation is readable");
+        assert_eq!(resumed.pairing.get("rubar-pair").map(String::as_str), Some("rubar"));
+        assert!(
+            resumed.spot_checks.contains(&("hidden-1".to_string(), "rubar".to_string())),
+            "the outstanding hidden check must survive, re-keyed onto the roster's current spelling: {:?}",
+            resumed.spot_checks
+        );
+        assert_eq!(
+            resumed.sessions.get("rubar-cookie").map(|(name, _)| name.as_str()),
+            Some("rubar"),
+            "the installed phone shortcut's cookie must still be a live session"
         );
     }
 
