@@ -78,7 +78,10 @@ export function createAutosaveController<T extends object>(
     const merged = { ...fresh, ...entry.fields } as T;
     return deps.save(merged, entry.fields, entry.id).then(
       () => {
-        if (pending === entry) pending = null;
+        // Only clear the queue when no NEW debounce is riding this same entry: a same-segment edit
+        // scheduled while this save was in flight merged into `entry` and armed a fresh timer, and
+        // nulling `pending` here would let the next re-key's `clearTimer()` drop that edit unsaved.
+        if (pending === entry && timer === null) pending = null;
         deps.onState?.('saved');
       },
       (error) => {

@@ -220,6 +220,42 @@ describe('autosave controller', () => {
     vi.useRealTimers();
   });
 
+  // Latent until a second autosaved field existed, but the class is dataset loss: an edit typed while
+  // the previous save was in flight merged into the SAME entry, then the in-flight save's `.then`
+  // cleared `pending` — so the next segment switch took the "nothing pending" branch and its
+  // clearTimer() dropped that edit unsaved. The queue is only clear once no timer rides the entry.
+  it('keeps a same-segment edit queued when it is typed during an in-flight save', async () => {
+    vi.useFakeTimers();
+    const saved: Array<Record<string, unknown>> = [];
+    let resolveSave!: () => void;
+    let target: string | null = 'A';
+    const ctrl = createAutosaveController<Row>({
+      targetId: () => target,
+      getRow: (id) => ({ id, text: 'orig' }),
+      save: (_row, fields) =>
+        new Promise<void>((resolve) => {
+          saved.push({ ...fields });
+          resolveSave = resolve;
+        }),
+      debounceMs: 1000,
+    });
+
+    ctrl.schedule({ text: 'edit-1' });
+    await vi.advanceTimersByTimeAsync(1000); // the debounce fires: edit-1 is in flight
+    ctrl.schedule({ text: 'edit-2' }); // same segment, typed while that save is still open
+    resolveSave(); // edit-1 lands
+    await vi.advanceTimersByTimeAsync(0); // let the save's .then run
+
+    target = 'B'; // the user moves to another clip and edits it, re-keying the debounce
+    ctrl.schedule({ text: 'b-edit' });
+    await vi.runAllTimersAsync();
+
+    const texts = saved.map((f) => f.text);
+    expect(texts).toContain('edit-2'); // fail-before: dropped by the re-key's clearTimer()
+    expect(texts).toContain('b-edit');
+    vi.useRealTimers();
+  });
+
   it('reports an error and returns to idle when the save fails', async () => {
     vi.useFakeTimers();
     const rows = new Map<string, Row>([['A', { id: 'A', text: 'a' }]]);

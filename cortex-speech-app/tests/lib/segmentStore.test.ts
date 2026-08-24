@@ -227,6 +227,43 @@ describe('segmentStore', () => {
       expect(get(libraryLoadError)).toBe('a newer load already failed');
     });
 
+    it('drops a hydrate response that a newer load superseded', async () => {
+      // hydrate() writes the fetched row back into the store AFTER an await. A slow get_segment
+      // resolving once a fresher load() has already replaced that row reverted it to the pre-reload
+      // snapshot — and the next Save-speaker then persists the reverted value. Same last-call-wins
+      // guard load()/loadMore() use. Fail-before: the store row reads 'stale' here.
+      let releaseHydrate!: () => void;
+      invokeMock.mockImplementation(((command: string) => {
+        if (command === 'get_dataset_certificate') return Promise.resolve({ threshold: 0.35 });
+        if (command === 'get_dataset_stats')
+          return Promise.resolve({
+            totalSegments: 1,
+            verifiedCount: 0,
+            pendingCount: 1,
+            totalDurationSeconds: 1,
+          });
+        if (command === 'get_segment')
+          return new Promise<SpeechSegment>((resolve) => {
+            releaseHydrate = () => resolve(makeSeg('a', { speakerId: 'stale' }));
+          });
+        if (command === 'get_segments_page')
+          return Promise.resolve({
+            items: [makeSeg('a', { speakerId: 'fresh' })],
+            total: 1,
+            nextCursor: null,
+          });
+        return Promise.reject(new Error(`unexpected ${command}`));
+      }) as typeof invoke);
+
+      const hydrating = segments.hydrate('a');
+      await segments.load(); // a newer load replaces the row while the hydrate is in flight
+      releaseHydrate();
+
+      // The caller still receives the row it asked for; only the store WRITE is dropped.
+      await expect(hydrating).resolves.toMatchObject({ speakerId: 'stale' });
+      expect(get(segments)[0].speakerId).toBe('fresh');
+    });
+
     it('binds the active view scope into every page request', async () => {
       filterVerified.set(true);
       searchQuery.set('hello');

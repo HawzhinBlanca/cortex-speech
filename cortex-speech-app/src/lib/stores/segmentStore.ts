@@ -87,7 +87,12 @@ function createSegmentsStore() {
       }
     },
     async hydrate(segmentId: string): Promise<SpeechSegment> {
+      const seq = loadSeq;
       const hydrated = await api.getSegment(segmentId);
+      // Same last-call-wins guard the page loads use: a slow getSegment resolving AFTER a newer load
+      // would revert that row to the pre-reload snapshot, and the next Save-speaker then persists the
+      // reverted value. The caller still gets the row it asked for; only the store write is dropped.
+      if (seq !== loadSeq) return hydrated;
       update((current) => current.map((row) => (row.id === segmentId ? hydrated : row)));
       return hydrated;
     },

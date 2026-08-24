@@ -551,8 +551,10 @@
 
   function originalText(seg: SpeechSegment): string {
     // VERBATIM LAW (2026-08-12): the reviewer corrects the human draft else the champion's verbatim
-    // output — never the LLM-refined paraphrase column.
-    return seg.annotatedTranscript ?? seg.rawTranscript ?? '';
+    // output — never the LLM-refined paraphrase column. A BLANK annotated column is ABSENT, not a
+    // human draft: `??` only falls through on null, so an empty/whitespace annotated row masked the
+    // champion raw draft and served the reviewer an empty editor (canon: human ▸ annotated ▸ raw).
+    return seg.annotatedTranscript?.trim() ? seg.annotatedTranscript : (seg.rawTranscript ?? '');
   }
 
   // Plain (non-reactive) cache of in-progress edits keyed by segment id, so switching clips — via

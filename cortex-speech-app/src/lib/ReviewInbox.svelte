@@ -227,9 +227,8 @@
     if (!current || isSubmitting || current.humanDecision) return;
     // Snapshot the target before the await — currentIndex/current can change mid-flight if the user
     // clicks another rail item (the rail is not disabled during submit), which would otherwise stamp
-    // this decision onto the wrong segment's queue slot.
+    // this decision onto the wrong segment. applyCommittedRow puts the committed row back BY ID.
     const cur = current;
-    const idx = currentIndex;
     isSubmitting = true;
     try {
       // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
@@ -255,7 +254,7 @@
           operationId: crypto.randomUUID(),
         },
       ];
-      queue[idx] = commit.segment;
+      applyCommittedRow(commit.segment);
       statusMsg = $t('inbox.status.accepted');
       advance();
     } catch (e) {
@@ -290,7 +289,6 @@
       return;
     }
     const cur = current;
-    const idx = currentIndex;
     const text = editText.trim();
     isSubmitting = true;
     try {
@@ -317,7 +315,7 @@
           operationId: crypto.randomUUID(),
         },
       ];
-      queue[idx] = commit.segment;
+      applyCommittedRow(commit.segment);
       isEditing = false;
       statusMsg = $t('inbox.status.edited');
       advance();
@@ -335,7 +333,6 @@
 
     if (!current || isSubmitting || current.humanDecision) return;
     const cur = current;
-    const idx = currentIndex;
     isSubmitting = true;
     try {
       // Post the listening receipt BEFORE the verdict: the backend resolves this segment's
@@ -361,7 +358,7 @@
           operationId: crypto.randomUUID(),
         },
       ];
-      queue[idx] = commit.segment;
+      applyCommittedRow(commit.segment);
       statusMsg = $t('inbox.status.rejected');
       advance();
     } catch (e) {
@@ -393,7 +390,6 @@
   async function flag() {
     if (!current || isSubmitting || current.humanDecision) return;
     const cur = current;
-    const idx = currentIndex;
     isSubmitting = true;
     try {
       const commit = await api.recordReviewFlag(cur.id, 'Flagged for second-pass adjudication');
@@ -407,7 +403,7 @@
           operationId: crypto.randomUUID(),
         },
       ];
-      queue[idx] = commit.segment;
+      applyCommittedRow(commit.segment);
       statusMsg = $t('inbox.status.flagged');
       advance();
     } catch (e) {
@@ -471,6 +467,15 @@
     if (currentIndex < queue.length - 1) {
       currentIndex++;
     }
+  }
+
+  // Write a committed row back BY ID, never by an index snapshotted before the IPC: loadQueue() can
+  // replace `queue` mid-flight, where the old index either stamps the decided row onto a DIFFERENT
+  // undecided segment (hiding it from the reviewer) or, past the new end, punches an `undefined` hole
+  // the rail's {#each} then throws on. Gone from the queue = drop the write, exactly as undo() does.
+  function applyCommittedRow(seg: SpeechSegment) {
+    const idx = queue.findIndex((s) => s.id === seg.id);
+    if (idx >= 0) queue[idx] = seg;
   }
 
   // ── Keyboard handler ─────────────────────────────────────────────────────────

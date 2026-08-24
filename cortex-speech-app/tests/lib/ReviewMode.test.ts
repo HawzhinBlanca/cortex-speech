@@ -381,6 +381,38 @@ describe('ReviewMode windowed queue', () => {
     );
     await waitFor(() => expect(mocks.getSegment).toHaveBeenCalledTimes(2));
   });
+  it('falls through a BLANK annotated column to the champion raw draft', async () => {
+    // VERBATIM LAW precedence is human ▸ annotated ▸ raw, and a blank annotated column is ABSENT.
+    // `??` only falls through on null, so a whitespace-only annotated row masked the champion draft
+    // and opened an EMPTY editor — the reviewer then retypes (or accepts) text nobody drafted.
+    // Fail-before: the editor holds '   ' here.
+    const blank = { ...segment(), annotatedTranscript: '   ' };
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...blank, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+    });
+    mocks.getSegment.mockResolvedValue(blank);
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue(blank.rawTranscript);
+  });
+
+  it('still prefers a real annotated (human) transcript over the raw draft', async () => {
+    const annotated = { ...segment(), annotatedTranscript: 'دەقی مرۆیی' };
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...annotated, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+    });
+    mocks.getSegment.mockResolvedValue(annotated);
+
+    render(ReviewMode);
+    expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('دەقی مرۆیی');
+  });
+
   it('refuses to record a verdict when the clip audio could not be played', async () => {
     // AUDIT FIND 2026-08-17: the player showed its error banner while Accept/Save stayed live, so a
     // clip whose audio failed (missing permission, corrupt container, decode failure) could be marked
