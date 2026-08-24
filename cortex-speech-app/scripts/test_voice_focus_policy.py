@@ -135,8 +135,13 @@ def _import_job_fixture(tmp: Path) -> tuple[str, str, str]:
     source = tmp / "lamo-final" / "wavs"
     source.mkdir(parents=True)
     champion_id = "omniasr-7b-test"
+    # Deliberately STALE. champion.json is the app's startup mirror, rewritten on every launch, so in
+    # the register-first/restart-second window it names a model the registry no longer champions. The
+    # merge must resolve the champion from model_versions below; a mirror that agreed with the
+    # registry could not tell the two sources apart.
     (tmp / "champion.json").write_text(
-        json.dumps({"champions": {"omniasr-7b": {"modelVersionId": champion_id}}}), encoding="utf-8"
+        json.dumps({"champions": {"omniasr-7b": {"modelVersionId": "omniasr-7b-stale-mirror"}}}),
+        encoding="utf-8",
     )
     (tmp / "voice_focus.json").write_text(
         json.dumps({"name": "Existing", "segment_ids": ["old-a", "old-b"]}, indent=2), encoding="utf-8"
@@ -152,7 +157,13 @@ def _import_job_fixture(tmp: Path) -> tuple[str, str, str]:
         );
         CREATE TABLE segment_hypotheses(segment_id TEXT, model_version_id TEXT, transcript TEXT);
         CREATE TABLE review_events(segment_id TEXT);
+        CREATE TABLE model_versions(
+          id TEXT PRIMARY KEY, family TEXT, checkpoint_sha256 TEXT, status TEXT
+        );
         """
+    )
+    con.execute(
+        "INSERT INTO model_versions VALUES(?,'omniasr-7b',?,'champion')", (champion_id, "c" * 64)
     )
     job = "job-1"
     con.execute("INSERT INTO import_jobs VALUES(?,?,2,'completed')", (job, str(source)))
@@ -215,6 +226,21 @@ def test_import_job_merge_refuses_stale_focus_and_nonchampion_rows() -> None:
         con.close()
         bad = _run(tmp, *_merge_job_args(tmp, job, digest, current_sha))
         assert bad.returncode == 1 and "matching local champion" in bad.stdout
+        assert not list(tmp.glob("voice_focus.pre-import-merge-*.json"))
+
+
+def test_import_job_merge_fails_closed_when_the_registry_has_no_champion() -> None:
+    """The registry, not the startup mirror, says who the champion is — and an unresolvable registry
+    refuses instead of certifying drafts against whatever champion.json happens to still name."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        job, digest, current_sha = _import_job_fixture(tmp)
+        con = sqlite3.connect(tmp / "cortex-speech.db")
+        con.execute("UPDATE model_versions SET status='rolled_back'")
+        con.commit()
+        con.close()
+        r = _run(tmp, *_merge_job_args(tmp, job, digest, current_sha))
+        assert r.returncode == 1 and "exactly one omniasr-7b champion" in r.stdout, r.stdout + r.stderr
         assert not list(tmp.glob("voice_focus.pre-import-merge-*.json"))
 
 

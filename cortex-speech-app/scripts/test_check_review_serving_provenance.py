@@ -49,6 +49,7 @@ class Fixture:
             CREATE TABLE speech_segments (
                 id TEXT PRIMARY KEY,
                 raw_transcript TEXT,
+                annotated_transcript TEXT,
                 human_decision TEXT,
                 verified INTEGER NOT NULL DEFAULT 0
             );
@@ -57,7 +58,7 @@ class Fixture:
                 model_id TEXT NOT NULL,
                 transcript TEXT
             );
-            CREATE TABLE review_events (segment_id TEXT NOT NULL);
+            CREATE TABLE review_events (segment_id TEXT NOT NULL, action TEXT NOT NULL);
             CREATE TABLE decision_log (segment_id TEXT NOT NULL, human_decision TEXT);
             """
         )
@@ -81,6 +82,16 @@ class Fixture:
         self.conn.execute(
             "INSERT INTO segment_hypotheses VALUES (?, ?, ?)",
             (segment_id, model_id, hypothesis),
+        )
+        self.conn.commit()
+
+    def review_event(self, segment_id: str, action: str):
+        self.conn.execute("INSERT INTO review_events VALUES (?, ?)", (segment_id, action))
+        self.conn.commit()
+
+    def annotate(self, segment_id: str, text: str):
+        self.conn.execute(
+            "UPDATE speech_segments SET annotated_transcript = ? WHERE id = ?", (text, segment_id)
         )
         self.conn.commit()
 
@@ -191,6 +202,56 @@ class ChampionFallbackTests(unittest.TestCase):
         self.fx.segment("legacy-after-rotation", "old words", gate.LEGACY_ALIAS_MODEL_ID, "old words")
         self.fx.segment("new-current", "new words", "omniasr-7b-new", "new words")
         self.assertEqual(self.failures(), [("legacy-after-rotation", "no champion hypothesis")])
+
+
+class SkippedClipTests(unittest.TestCase):
+    """A skipped clip is still a served, machine-drafted clip — both invariants must still hold on it.
+
+    Both NOT EXISTS clauses used to exempt any row carrying ANY ``review_events`` row, and a skip
+    writes exactly that: the skip audit path records the event and writes NOTHING to the segment,
+    while the clip stays pending in every queue. So every clip a reviewer had ever skipped was exempt
+    from both invariants, and a recurrence of the 2026-08-12 machine-writer bug on exactly those rows
+    would have printed "all invariants hold".
+    """
+
+    def setUp(self):
+        self.fx = Fixture()
+        self.fx.champion(
+            gate.PROVEN_LEGACY_CANONICAL_MODEL_ID,
+            gate.PROVEN_LEGACY_DEPLOYMENT_SHA256,
+        )
+
+    def tearDown(self):
+        self.fx.close()
+
+    def fallbacks(self):
+        return gate.non_champion_fallbacks(self.fx.conn, gate.current_champion_model_ids(self.fx.conn))
+
+    def test_a_skip_does_not_excuse_machine_text_in_the_human_only_field(self):
+        self.fx.segment("skipped", "دەقی شەمپیۆن", gate.PROVEN_LEGACY_CANONICAL_MODEL_ID, "دەقی شەمپیۆن")
+        self.fx.review_event("skipped", "skip")
+        self.fx.annotate("skipped", "machine paraphrase")
+        self.assertEqual(gate.human_field_violations(self.fx.conn), [("skipped",)])
+
+    def test_a_real_decision_still_counts_as_human_evidence(self):
+        for action in ("accept", "edit", "reject"):
+            with self.subTest(action=action):
+                self.fx.conn.execute("DELETE FROM review_events")
+                self.fx.conn.execute("DELETE FROM speech_segments")
+                self.fx.segment(action, "دەقی شەمپیۆن", gate.PROVEN_LEGACY_CANONICAL_MODEL_ID, "دەقی شەمپیۆن")
+                self.fx.review_event(action, action)
+                self.fx.annotate(action, "human correction")
+                self.assertEqual(gate.human_field_violations(self.fx.conn), [])
+
+    def test_a_skip_does_not_excuse_non_champion_fallback_text(self):
+        self.fx.segment("skipped-drift", "served words", gate.PROVEN_LEGACY_CANONICAL_MODEL_ID, "other words")
+        self.fx.review_event("skipped-drift", "skip")
+        self.assertEqual(self.fallbacks(), [("skipped-drift", "raw != champion")])
+
+    def test_a_real_decision_still_excuses_the_fallback_check(self):
+        self.fx.segment("decided-drift", "served words", gate.PROVEN_LEGACY_CANONICAL_MODEL_ID, "other words")
+        self.fx.review_event("decided-drift", "edit")
+        self.assertEqual(self.fallbacks(), [])
 
 
 if __name__ == "__main__":

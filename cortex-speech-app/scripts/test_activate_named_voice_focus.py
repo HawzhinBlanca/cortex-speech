@@ -17,6 +17,7 @@ from pilot_focus_contract import focus_evidence, load_voice_focus_ids
 
 JOB_ID = "11111111-1111-1111-1111-111111111111"
 MODEL_ID = "omniasr-7b-test"
+MODEL_SHA256 = "c" * 64
 OLD_FOCUS = {"lamo-a", "lamo-b", "other-c"}
 TARGET = {"lamo-a", "lamo-b"}
 
@@ -41,6 +42,10 @@ def seed(root: Path) -> tuple[Path, Path, dict[str, object]]:
             id INTEGER PRIMARY KEY, segment_id TEXT NOT NULL, reviewer TEXT NOT NULL,
             action TEXT NOT NULL, source TEXT NOT NULL
         );
+        CREATE TABLE model_versions(
+            id TEXT PRIMARY KEY, family TEXT NOT NULL,
+            checkpoint_sha256 TEXT NOT NULL, status TEXT NOT NULL
+        );
         CREATE TABLE review_compensation_policies(policy_version TEXT PRIMARY KEY);
         INSERT INTO review_compensation_policies VALUES('review-iqd-v1-2026-08-21');
         INSERT INTO review_events VALUES(875, 'legacy', 'Rubar', 'edit', 'couch');
@@ -56,6 +61,9 @@ def seed(root: Path) -> tuple[Path, Path, dict[str, object]]:
     conn.executemany(
         "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
         source_migrations(DEFAULT_MIGRATIONS),
+    )
+    conn.execute(
+        "INSERT INTO model_versions VALUES(?, 'omniasr-7b', ?, 'champion')", (MODEL_ID, MODEL_SHA256)
     )
     conn.execute("INSERT INTO import_jobs VALUES(?, ?, 2, 'completed')", (JOB_ID, str(source)))
     for segment_id, path in paths.items():
@@ -95,8 +103,12 @@ def seed(root: Path) -> tuple[Path, Path, dict[str, object]]:
         json.dumps({"name": "mixed", "activated_at": "old", "segment_ids": sorted(OLD_FOCUS)}),
         encoding="utf-8",
     )
+    # Deliberately STALE: champion.json is the startup mirror the app rewrites on every launch, so in
+    # the register-first/restart-second window it names a model the registry no longer champions.
+    # Activation must read model_versions instead — a fixture that agreed with the mirror could not
+    # tell the two sources apart.
     (root / "champion.json").write_text(
-        json.dumps({"champions": {"omniasr-7b": {"modelVersionId": MODEL_ID}}}),
+        json.dumps({"champions": {"omniasr-7b": {"modelVersionId": "omniasr-7b-stale-mirror"}}}),
         encoding="utf-8",
     )
     return db_path, source, old_campaign
@@ -202,8 +214,38 @@ def test_interruption_after_database_commit_resumes_without_double_revision() ->
         assert result["clips"] == 2
 
 
+def test_registry_not_the_startup_mirror_decides_which_drafts_are_champion() -> None:
+    """A registry with no usable champion refuses; the stale mirror never rescues it."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path, source, old_campaign = seed(root)
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE model_versions SET status = 'rolled_back'")
+        conn.commit()
+        conn.close()
+        before_db = sha256_file(db_path)
+        try:
+            activate(
+                root,
+                db_path,
+                speaker_name="Lamo",
+                import_job_id=JOB_ID,
+                expected_current_campaign_id=str(old_campaign["campaign_id"]),
+                expected_max_review_event_id=875,
+                expected_source_dir=source,
+                check_runtime=False,
+            )
+        except RuntimeError as error:
+            assert "exactly one omniasr-7b champion" in str(error), error
+        else:
+            raise AssertionError("an unresolvable registry champion was accepted")
+        assert sha256_file(db_path) == before_db
+        assert load_voice_focus_ids(root) == OLD_FOCUS
+
+
 if __name__ == "__main__":
     test_success_is_exact_history_preserving_and_session_byte_preserving()
     test_stale_event_boundary_fails_before_live_mutation()
     test_interruption_after_database_commit_resumes_without_double_revision()
+    test_registry_not_the_startup_mirror_decides_which_drafts_are_champion()
     print("named-voice activation tests: PASS")

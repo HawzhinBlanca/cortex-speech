@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from activate_review_pilot import acquire_cortex_lock
+from check_review_serving_provenance import ChampionRegistryError, current_champion_model_ids
 
 MAX_DISAGREEMENTS = 1
 
@@ -113,19 +114,21 @@ def merge_import_job(args: argparse.Namespace, focus_path: Path) -> int:
         return 1
 
     db_path = args.data_dir / "cortex-speech.db"
-    champion_path = args.data_dir / "champion.json"
-    if not db_path.is_file() or not champion_path.is_file():
-        print("REFUSED: live database or champion pointer is missing")
-        return 1
-    try:
-        pointer = json.loads(champion_path.read_text(encoding="utf-8"))
-        champion_id = pointer["champions"]["omniasr-7b"]["modelVersionId"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-        print(f"REFUSED: champion pointer cannot identify omn​​iasr-7b: {error}")
+    if not db_path.is_file():
+        print("REFUSED: live database is missing")
         return 1
 
     conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
     try:
+        # The registry names the champion. `champion.json` is only its startup mirror, rewritten on
+        # every app launch, so in the register-first/restart-second window it names a champion
+        # `model_versions` no longer does — and this merge would then reject valid new-champion drafts
+        # or admit rows the registry has demoted. Anything but exactly one champion row fails closed.
+        try:
+            champion_ids = current_champion_model_ids(conn)
+        except ChampionRegistryError as error:
+            print(f"REFUSED: {error}")
+            return 1
         job = conn.execute(
             "SELECT dir, total_files, status FROM import_jobs WHERE id = ?", (args.merge_import_job,)
         ).fetchone()
@@ -180,7 +183,7 @@ def merge_import_job(args: argparse.Namespace, focus_path: Path) -> int:
         if verified or human or reviewer or events:
             problems.append(f"segment {seg_id} has human/review state and is not a fresh campaign row")
             break
-        if cloud or model != champion_id or hyp_count != 1 or matching_hyp != 1:
+        if cloud or model not in champion_ids or hyp_count != 1 or matching_hyp != 1:
             problems.append(f"segment {seg_id} is not bound to exactly one matching local champion hypothesis")
             break
     selection_digest = ids_sha256(selected)

@@ -174,6 +174,15 @@ def legacy_finalizable_reviews(con: sqlite3.Connection) -> tuple[list[dict], lis
 
 
 def run(args: argparse.Namespace) -> int:
+    for pattern in args.stamp_like:
+        # Canon stamps OWNER-supplied audio as owner-full-rights; FLEURS and Common Voice carry their
+        # own licence. A pattern that is nothing but wildcards matches every audio_path, so it would
+        # claim those third-party corpora as the owner's — the exact blanket stamp the --stamp-like
+        # flag exists to prevent. Refuse it before any database work.
+        if not pattern.replace("%", "").replace("_", "").strip():
+            print(f"REFUSED: --stamp-like {pattern!r} matches every audio_path; name the owner's recordings")
+            return 2
+
     con = sqlite3.connect(args.db)
     try:
         if args.apply:

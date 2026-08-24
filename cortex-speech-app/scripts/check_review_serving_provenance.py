@@ -12,7 +12,7 @@ never said reached human reviewers labeled as the draft.
 The law this gate enforces, on the LIVE database, at the serving path's own precedence:
 
   1. ``annotated_transcript`` is human-only: a non-empty value requires human evidence on that row
-     (a review event, a recorded human_decision, or verified=1).
+     (a decision-bearing review event, a recorded human_decision, or verified=1).
   2. Every clip with NO human evidence must fall back to text the CURRENT registry champion
      actually produced: its ``raw_transcript`` must byte-match (modulo surrounding whitespace) a
      stored hypothesis carrying that champion's content-addressed id. The one pre-registry id is
@@ -50,6 +50,20 @@ ASR_CHAMPION_FAMILY = "omniasr-7b"
 LEGACY_ALIAS_MODEL_ID = "omniasr-wsl-7b"
 PROVEN_LEGACY_CANONICAL_MODEL_ID = "omniasr-7b-legacy-c348ade8a816"
 PROVEN_LEGACY_DEPLOYMENT_SHA256 = "ae33143ec8b25f45e393f4aa484c3a3d165850f0dc15e95254dd6e4cb4c05cbf"
+
+
+# A skip is the explicit NO-VERDICT: `couch.rs` records the event and writes NOTHING to the row, and
+# the clip stays pending for everyone (the focused queue filters on `verified`). So "this segment has
+# a review_events row" is NOT evidence a human touched its text — every clip a reviewer ever skipped
+# would otherwise be exempt from both invariants below, and a recurrence of the 2026-08-12
+# machine-writer bug could fill `annotated_transcript` on exactly those still-served rows unseen.
+# Only decision-bearing actions count, spelled the way the app's own queries spell them.
+_NO_DECISION_EVENT = """
+          NOT EXISTS (
+                SELECT 1 FROM review_events e
+                WHERE e.segment_id = s.id AND e.action IN ('accept', 'edit', 'reject')
+          )
+"""
 
 
 class ChampionRegistryError(RuntimeError):
@@ -124,13 +138,13 @@ def default_db_path() -> str:
 def human_field_violations(conn: sqlite3.Connection) -> list:
     """Rows where the human-only field is populated with no human evidence anywhere."""
     return conn.execute(
-        """
+        f"""
         SELECT s.id
         FROM speech_segments s
         WHERE TRIM(COALESCE(s.annotated_transcript, '')) <> ''
           AND COALESCE(s.human_decision, '') = ''
           AND s.verified = 0
-          AND NOT EXISTS (SELECT 1 FROM review_events e WHERE e.segment_id = s.id)
+          AND {_NO_DECISION_EVENT}
           AND NOT EXISTS (
                 SELECT 1 FROM decision_log d
                 WHERE d.segment_id = s.id AND COALESCE(d.human_decision, '') <> ''
@@ -160,7 +174,7 @@ def non_champion_fallbacks(conn: sqlite3.Connection, champion_model_ids: tuple[s
         FROM speech_segments s
         WHERE COALESCE(s.human_decision, '') = ''
           AND s.verified = 0
-          AND NOT EXISTS (SELECT 1 FROM review_events e WHERE e.segment_id = s.id)
+          AND {_NO_DECISION_EVENT}
           AND NOT EXISTS (
                 SELECT 1 FROM decision_log d
                 WHERE d.segment_id = s.id AND COALESCE(d.human_decision, '') <> ''

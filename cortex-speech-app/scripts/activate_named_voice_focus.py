@@ -37,10 +37,10 @@ from activate_sequential_review import (
     campaign_policy,
     validate_campaign,
 )
+from check_review_serving_provenance import current_champion_model_ids
 from check_reviewer_links_live import strict_json_loads, validate_saved_session_shape
 from pilot_focus_contract import VOICE_FOCUS_FILE, focus_evidence, load_voice_focus_ids
 
-CHAMPION_FILE = "champion.json"
 MARKER_REASON = "named_voice_focus_activation"
 
 
@@ -67,16 +67,6 @@ def _active_campaign(conn: sqlite3.Connection) -> dict[str, object]:
     if row is None:
         raise RuntimeError("no active sequential first-pass campaign exists")
     return validate_campaign(strict_json_loads(str(row[0])))
-
-
-def _champion_model_id(data_dir: Path) -> str:
-    document = _load_json_object(data_dir / CHAMPION_FILE, CHAMPION_FILE)
-    champions = document.get("champions")
-    record = champions.get("omniasr-7b") if isinstance(champions, dict) else None
-    model_id = record.get("modelVersionId") if isinstance(record, dict) else None
-    if not isinstance(model_id, str) or not model_id.strip():
-        raise RuntimeError("champion.json has no bound OmniASR-7B modelVersionId")
-    return model_id
 
 
 def _validate_speaker_name(value: str) -> str:
@@ -107,7 +97,6 @@ def _count_target_review_events(conn: sqlite3.Connection, segment_ids: set[str])
 
 def _load_import_segments(
     conn: sqlite3.Connection,
-    data_dir: Path,
     job_id: str,
     expected_source_dir: Path | None,
 ) -> tuple[dict[str, object], list[sqlite3.Row]]:
@@ -147,14 +136,18 @@ def _load_import_segments(
     missing_audio = [path for path in paths if not Path(path).is_file()]
     if missing_audio:
         raise RuntimeError(f"named-voice import has {len(missing_audio)} missing WAV(s); first={missing_audio[:3]}")
-    champion = _champion_model_id(data_dir)
+    # The registry is the champion, not `champion.json` — that file is only the startup mirror the app
+    # rewrites on every launch, so during the documented register-first/restart-second window it names
+    # a champion `model_versions` no longer does. Resolving it here on the same connection fails closed
+    # on any ambiguous registry state instead of certifying drafts against a stale pointer.
+    champions = current_champion_model_ids(conn)
     bad_drafts = [
         str(row["id"])
         for row in rows
         if not str(row["raw_transcript"] or "").strip()
         or (str(row["raw_transcript"]).startswith("[") and str(row["raw_transcript"]).endswith("]"))
     ]
-    wrong_models = [str(row["id"]) for row in rows if str(row["model_version_id"] or "") != champion]
+    wrong_models = [str(row["id"]) for row in rows if str(row["model_version_id"] or "") not in champions]
     if bad_drafts:
         raise RuntimeError(f"named-voice import has {len(bad_drafts)} blank/placeholder draft(s)")
     if wrong_models:
@@ -186,7 +179,7 @@ def activate(
         session_path = data_dir / SESSION_FILE
         focus_path = data_dir / VOICE_FOCUS_FILE
         marker_path = data_dir / REVOCATION_FILE
-        for path in (db_path, session_path, focus_path, data_dir / CHAMPION_FILE):
+        for path in (db_path, session_path, focus_path):
             if not path.is_file():
                 raise RuntimeError(f"required named-voice input is missing: {path}")
         session = _load_json_object(session_path, SESSION_FILE)
@@ -213,7 +206,7 @@ def activate(
                 )
             before_history = _review_history_digest(conn)
             current = _active_campaign(conn)
-            job, rows = _load_import_segments(conn, data_dir, import_job_id, expected_source_dir)
+            job, rows = _load_import_segments(conn, import_job_id, expected_source_dir)
             ids = {str(row["id"]) for row in rows}
             reviewed = _count_target_review_events(conn, ids)
             if reviewed:
