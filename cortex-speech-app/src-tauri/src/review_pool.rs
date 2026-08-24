@@ -919,8 +919,10 @@ pub fn apply_dedup_manifest(db: &Database, manifest_json: &str) -> Result<PoolDe
         || manifest.pool.champion_deployment_sha256 != pool.champion_deployment_sha256
         || manifest.summary.unconfirmed_risk_groups != 0
         || manifest.summary.duplicate_families != manifest.families.len()
-        || manifest.summary.candidate_text_groups
-            < manifest.summary.cleared_repeated_text_groups + manifest.summary.duplicate_families
+        // One transcript-candidate group can split into several disconnected waveform families.
+        // Therefore family count is not bounded by candidate-group count; only the number of groups
+        // cleared as harmless repeated text must fit inside the original candidate population.
+        || manifest.summary.candidate_text_groups < manifest.summary.cleared_repeated_text_groups
         || manifest.summary.canonical_members + manifest.summary.excluded_members != pool.focus_segment_count
     {
         return Err("review-pool dedup manifest does not match the frozen pool or algorithm canon".to_string());
