@@ -349,7 +349,12 @@ def _probe_branch_protection():
     """SKIP honestly without gh or without auth — never a silent pass."""
     if not shutil.which("gh"):
         return "gh CLI not installed (branch protection is a REMOTE fact; nothing local can prove it)"
-    status = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    # timeout: `gh auth status` reaches the network. Unbounded, a wedged gh hangs the WHOLE sweep
+    # here in the probe — before any gate has run — with nothing on stdout to say why.
+    try:
+        status = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "`gh auth status` did not answer within 60s - cannot read branch protection"
     if status.returncode != 0:
         return "gh is not authenticated (`gh auth login`) - cannot read branch protection"
     return None
@@ -607,6 +612,12 @@ def _probe_champion_7b():
     A reachable port proves a listener, not the champion: this now speaks the protocol — sends
     {"op": "health"} and requires status=ready AND the exact deploymentSha256 the live
     champion.json pins. A wrong or half-loaded model on the right port is a FAILURE, not a pass.
+
+    And it says FAILURE in the status, not only in the prose: the two verdicts that mean the WRONG
+    THING IS ANSWERING (identity mismatch, a reply that is not the champion protocol) return
+    (FAIL, reason). Reported as a bare reason they became SKIP-ENV — "environment not ready" — which
+    is precisely the 494/494-wrong-engine signal this probe was strengthened to raise. Absence and
+    BUSY stay SKIP-ENV: those really are machine state.
     """
     import json as _json
     import os as _os
@@ -628,7 +639,7 @@ def _probe_champion_7b():
     try:
         reply = _json.loads(bytes(buf).split(b"\n", 1)[0].decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
-        return f"7B server answered on {port} but its health reply is unparseable ({exc}) — NOT the champion protocol"
+        return FAIL, f"7B server answered on {port} but its health reply is unparseable ({exc}) — NOT the champion protocol"
     if reply.get("code") == "BUSY":
         return "7B server is saturated and returned BUSY without identity — retry when health can prove the champion pin"
     if reply.get("status") != "ready":
@@ -643,8 +654,9 @@ def _probe_champion_7b():
         served = reply.get("deploymentSha256")
         if served != pinned:
             return (
+                FAIL,
                 f"7B server on {port} serves deployment {str(served)[:12]}… but the live champion pin is "
-                f"{pinned[:12]}… — the WRONG MODEL is answering the champion port"
+                f"{pinned[:12]}… — the WRONG MODEL is answering the champion port",
             )
     return None
 
@@ -995,11 +1007,20 @@ os.environ["NODE_OPTIONS"] = (os.environ.get("NODE_OPTIONS", "") + " " + _node_r
 
 
 def run_gate(name, kind, payload, cwd, probe, timeout=3600):
-    """Run one gate; returns (status, seconds, detail). Full cmd output -> LOG_DIR/<gate>.log."""
+    """Run one gate; returns (status, seconds, detail). Full cmd output -> LOG_DIR/<gate>.log.
+
+    A probe returns None (runnable), a reason string (SKIP-ENV: the environment cannot run this leg),
+    or an explicit (status, reason) pair when what it found is a real defect rather than missing
+    machine state — see `_probe_champion_7b`.
+    """
     if probe:
-        reason = probe()
-        if reason:
-            return SKIP_ENV, 0.0, reason
+        try:
+            verdict = probe()
+        except Exception as e:  # noqa: BLE001 - one broken probe must not abort the remaining gates
+            return FAIL, 0.0, f"probe crashed: {e}"
+        if verdict:
+            status, reason = verdict if isinstance(verdict, tuple) else (SKIP_ENV, verdict)
+            return status, 0.0, reason
     if kind == "not-built":
         return NOT_BUILT, 0.0, payload
     t0 = time.perf_counter()
@@ -1011,14 +1032,21 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
         return (PASS if ok else FAIL), time.perf_counter() - t0, ""
     # kind == "cmd"
     retried = ""
+    first_attempt = ""
     try:
         r = subprocess.run(
             payload, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout
         )
         # LNK1104 on system libs is a Windows file-lock (AV scan) flake, not a code failure:
-        # retry exactly once, and say so — both attempts land in the log.
+        # retry exactly once, and say so — both attempts land in the log. Keeping the first one is
+        # the point: without it a repeat flake is invisible, and the retry's own output cannot be
+        # compared against what it replaced.
         if r.returncode != 0 and "LNK1104" in (r.stdout or "") + (r.stderr or ""):
             retried = " [retried once after LNK1104 linker file-lock flake]"
+            first_attempt = (
+                f"--- first attempt (exit {r.returncode}, LNK1104 linker file-lock flake) ---\n"
+                f"{r.stdout or ''}\n{r.stderr or ''}\n\n"
+            )
             r = subprocess.run(
                 payload, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout
             )
@@ -1029,7 +1057,8 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{name}.log"
     log_path.write_text(
-        f"$ {payload}\n(exit {r.returncode}, {secs:.1f}s)\n\n--- stdout ---\n{r.stdout or ''}"
+        f"$ {payload}\n(exit {r.returncode}, {secs:.1f}s){retried}\n\n{first_attempt}"
+        f"--- stdout ---\n{r.stdout or ''}"
         f"\n--- stderr ---\n{r.stderr or ''}",
         encoding="utf-8",
         errors="replace",
