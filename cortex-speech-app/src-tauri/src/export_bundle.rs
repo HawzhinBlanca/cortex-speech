@@ -913,7 +913,6 @@ fn export_dataset_bundle_inner(
     let library_snapshot = db.get_segments(None)?;
     let library_snapshot_digest = segment_snapshot_digest(&library_snapshot)?;
     let validation_report = validation::validate_segments_with_settings(&library_snapshot, settings)?;
-    let quality_report = quality::compute_quality_from_segments_with_settings(&library_snapshot, settings);
     let validation_gate = BlockingValidationIssues {
         blocked: !validation_report.errors.is_empty() || validation_report.warnings.len() > warning_threshold,
         error_count: validation_report.errors.len(),
@@ -951,6 +950,14 @@ fn export_dataset_bundle_inner(
     // data files (and with dataset.json's embedded total_segments), a dishonest number the honesty law forbids.
     let segments: Vec<crate::db::SpeechSegment> =
         segments.into_iter().filter(|s| !quality::is_effective_placeholder(s)).collect();
+    // The SHIPPED quality_report.json describes what this bundle CONTAINS, so it is computed from the
+    // selected rows — after the holdout/rejected/placeholder filters above. Computed from the raw
+    // library snapshot it reported a totalSegments (plus empty/low-confidence counts and duration
+    // quartiles) over rows the bundle deliberately drops, contradicting dataset.json's own
+    // total_segments and the manifest inside the very same artifact. The validation GATE above keeps
+    // reading the whole library on purpose: it is a check on the library, not a description of the
+    // bundle.
+    let quality_report = quality::compute_quality_from_segments_with_settings(&segments, settings);
     let processed_audio_notices = export::processed_audio_notices(db, &segments)?;
     let selected_segment_ids = segments.iter().map(|segment| segment.id.clone()).collect::<BTreeSet<_>>();
     let dpo_export = crate::jury::learning::build_dpo_dataset_for_segment_ids(db, &selected_segment_ids)?;
@@ -1884,3 +1891,69 @@ fn write_text(path: &Path, text: &str) -> AppResult<()> {
 #[cfg(test)]
 #[path = "export_bundle_tests.rs"]
 mod tests;
+
+/// Regression for the shipped quality report's scope. A separate module from the `#[path]`-included
+/// `export_bundle_tests.rs` only so the fix and its gate stay in one file.
+#[cfg(test)]
+mod quality_report_scope_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn quality_report_describes_the_bundle_not_the_whole_library() {
+        // quality_report.json was computed from the RAW library snapshot, before the holdout, rejected
+        // and placeholder filters — so the bundle shipped a totalSegments (plus empty/low-confidence
+        // counts and duration quartiles) over rows its own dataset.json and manifest exclude. Two
+        // numbers, one population: the artifacts must not contradict each other.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let tmp = TempDir::new().unwrap();
+
+        for (id, name, text, decision) in [
+            ("keep-1", "keep.wav", "دەقی مانەوە", Some("accept")),
+            ("rejected-1", "rejected.wav", "دەقی خراپ", None),
+            ("pending-1", "pending.wav", "[Pending WSL 7B ASR]", None),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, b"audio").unwrap();
+            db.insert_legacy_segment_fixture(&SpeechSegment {
+                id: id.into(),
+                audio_path: path.to_string_lossy().to_string(),
+                raw_transcript: text.into(),
+                // Human-only field by canon: only the reviewed row carries one.
+                annotated_transcript: decision.map(|_| text.to_string()),
+                duration_ms: 1200,
+                speaker_id: Some("spk1".into()),
+                verified: true,
+                human_decision: decision.map(str::to_string),
+                clipping_ratio: Some(0.0),
+                rms_db: Some(-20.0),
+                snr_db: Some(20.0),
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        }
+        // Reject through the production path, so the row carries exactly the columns "mark bad" writes.
+        db.record_human_decision("rejected-1", "reject", None, None).unwrap();
+
+        let models = ModelManager::new(tmp.path().join("models"));
+        let out = tmp.path().join("bundle");
+        export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+
+        let quality_report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("quality_report.json")).unwrap()).unwrap();
+        let dataset: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("dataset.json")).unwrap()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+
+        let rows = dataset["segments"].as_array().expect("dataset.json carries a segments array").len();
+        assert_eq!(rows, 1, "only the accepted clip may be written");
+        assert_eq!(manifest["segmentCount"].as_u64(), Some(rows as u64));
+        assert_eq!(
+            quality_report["totalSegments"].as_u64(),
+            Some(rows as u64),
+            "the shipped quality report must describe the rows this bundle contains: {quality_report}"
+        );
+    }
+}

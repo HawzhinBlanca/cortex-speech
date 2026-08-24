@@ -254,12 +254,20 @@ pub(crate) fn export_audio_ref(audio_path: &str) -> &str {
     audio_path.rsplit(['/', '\\']).next().unwrap_or(audio_path)
 }
 
+/// `unreadable_source_audio_counts_as_verified` exists for ONE caller: the `dropped_unavailable`
+/// tally, which must answer "would this row have been written had the audio been there?". Every other
+/// gate below reads only the grade and DB records, but the source-reference identity check opens and
+/// re-hashes the source file — so on an unmounted drive it refused every SILVER commit-evidence row,
+/// and those rows were then dropped WITHOUT being counted (dataset_infos.json reporting
+/// droppedUnavailableAudio = 0 while the export path promises the drop "is counted, not silent").
+/// The WRITE path always passes `false` and stays fail-closed.
 fn is_training_ready_for_huggingface_export(
     db: &Database,
     segment: &SpeechSegment,
     grade: &TrainingGradeReport,
     ready_agentic_segment_ids: &BTreeSet<String>,
     required_source_reference_models: &[String],
+    unreadable_source_audio_counts_as_verified: bool,
 ) -> AppResult<bool> {
     if !grade.training_ready {
         return Ok(false);
@@ -292,6 +300,7 @@ fn is_training_ready_for_huggingface_export(
                 db,
                 segment,
                 required_source_reference_models,
+                unreadable_source_audio_counts_as_verified,
             )?
         {
             return Ok(false);
@@ -315,6 +324,7 @@ fn source_reference_identity_verified_for_huggingface_export(
     db: &Database,
     segment: &SpeechSegment,
     required_source_reference_models: &[String],
+    unreadable_source_audio_counts_as_verified: bool,
 ) -> AppResult<bool> {
     let references = db.get_source_transcripts_for_audio(&segment.audio_path)?;
     if references.is_empty() {
@@ -326,7 +336,7 @@ fn source_reference_identity_verified_for_huggingface_export(
             return Ok(false);
         };
         if !crate::agentic::is_usable_source_reference_transcript(&reference.transcript_text)
-            || !source_reference_record_matches_current_audio(reference)
+            || !source_reference_record_matches_current_audio(reference, unreadable_source_audio_counts_as_verified)
         {
             return Ok(false);
         }
@@ -334,7 +344,12 @@ fn source_reference_identity_verified_for_huggingface_export(
     Ok(true)
 }
 
-fn source_reference_record_matches_current_audio(reference: &SourceTranscriptRecord) -> bool {
+fn source_reference_record_matches_current_audio(
+    reference: &SourceTranscriptRecord,
+    unreadable_source_audio_counts_as_verified: bool,
+) -> bool {
+    // A record with no stored identity at all is refused in BOTH modes: that is a property of the
+    // record, not of the audio, so the tally must skip it exactly as the write loop does.
     let Some(stored_hash) = reference.audio_content_hash.as_deref().map(str::trim).filter(|value| !value.is_empty())
     else {
         return false;
@@ -342,9 +357,12 @@ fn source_reference_record_matches_current_audio(reference: &SourceTranscriptRec
     let Some(stored_size) = reference.audio_size_bytes else {
         return false;
     };
-    let Ok(current_identity) = crate::pipeline::source_audio_identity(std::path::Path::new(&reference.audio_path))
-    else {
-        return false;
+    let current_identity = match crate::pipeline::source_audio_identity(std::path::Path::new(&reference.audio_path)) {
+        Ok(identity) => identity,
+        // Bytes that are not there cannot be compared. Writing: fail closed. COUNTING the rows an
+        // unavailable source cost us: the answer is "it would have been written" — otherwise the drive
+        // being unmounted is precisely what hides the loss it caused.
+        Err(_) => return unreadable_source_audio_counts_as_verified,
     };
     stored_hash == current_identity.content_hash && stored_size == current_identity.size_bytes
 }
@@ -380,7 +398,7 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
 
 /// Remove every segment that must never leave this machine, whatever the caller is writing.
 ///
-/// TWO independent exclusions, because both were being missed one caller at a time:
+/// THREE independent exclusions, because each was being missed one caller at a time:
 ///
 /// 1. HELD-OUT GOLD (by audio_path OR content hash) — so a TRAINING export cannot leak the eval
 ///    set's reference transcripts and contaminate the very set the promotion gate measures against.
@@ -398,6 +416,9 @@ fn ready_agentic_huggingface_segment_ids(db: &Database) -> AppResult<BTreeSet<St
 ///    false: it was verified on the paths that commit touched and generalised from them. It is true
 ///    now, and it is true HERE rather than at five call sites, because a rule enforced per-caller is
 ///    a rule that gets missed by the sixth caller.
+///
+/// 3. SPOT-CHECK ANSWER KEYS (`is_gold`) — hidden review traps with a known answer. `export_audio`
+///    was the only caller that refused them, so every tabular/HF/bundle export shipped the key.
 ///
 /// The name says "unexportable", not "holdout", so it cannot quietly under-describe what it drops
 /// the next time a reason is added.
@@ -422,6 +443,16 @@ pub(crate) fn exclude_unexportable_segments(
         }
         if crate::quality::is_effective_placeholder(&seg) {
             tracing::info!(segment_id = %seg.id, "export: dropping placeholder-only segment");
+            continue;
+        }
+        // An `is_gold` row is a hidden spot-check ANSWER KEY (owner canon: the phone must never be
+        // served its own answer key). `human_export_label` in export_audio refused those rows on its
+        // own — and only there, so every tabular/HF/bundle exporter shipped the key verbatim. Same
+        // shape as the withdrawal rule above: enforced at the root, not at whichever caller remembered.
+        // The holdout filter below does NOT cover this — it keys on the separate `gold_segments` table,
+        // and a flagged answer key need not be registered there.
+        if seg.is_gold {
+            tracing::info!(segment_id = %seg.id, "export: dropping is_gold answer-key segment");
             continue;
         }
         kept.push(seg);
@@ -1017,6 +1048,7 @@ pub fn export_huggingface_dataset(
                 &grade,
                 &ready_agentic_segment_ids,
                 &required_source_reference_models,
+                false,
             )?
         {
             has_exportable_row = true;
@@ -1172,8 +1204,15 @@ pub fn export_huggingface_dataset(
                 // pass the same training-ready + HF-export gate the write loop applies below. A source's
                 // non-training-ready REVIEW rows are skipped regardless of availability, so counting them
                 // here inflated droppedUnavailableAudio (dataset_infos.json) and mislabeled REVIEW rows as
-                // lost "training-ready" segments in the operator warnings. is_training_ready_for_huggingface_export
-                // reads only the grade + DB records, never the audio, so it is valid for an unavailable source.
+                // lost "training-ready" segments in the operator warnings.
+                //
+                // Every gate in is_training_ready_for_huggingface_export reads only the grade + DB records
+                // EXCEPT one: a SILVER row carrying source-reference commit evidence re-hashes its source
+                // audio to prove the stored identity still matches. On an unmounted drive that check cannot
+                // run, so it refused — and the rows the missing drive actually cost us went uncounted while
+                // dataset_infos.json reported droppedUnavailableAudio = 0. Pass `true` so an UNREADABLE
+                // source counts as "would have been written"; a readable-but-STALE identity still does not
+                // (this closure also runs for a present-but-undecodable source, where the hash succeeds).
                 let count_exportable = |segs: &[&SpeechSegment]| -> AppResult<usize> {
                     let mut n = 0usize;
                     for &seg in segs {
@@ -1184,6 +1223,7 @@ pub fn export_huggingface_dataset(
                             &grade,
                             &ready_agentic_segment_ids,
                             &required_source_reference_models,
+                            true,
                         )? {
                             n += 1;
                         }
@@ -1238,6 +1278,7 @@ pub fn export_huggingface_dataset(
                             &grade,
                             &ready_agentic_segment_ids,
                             &required_source_reference_models,
+                            false,
                         )? {
                             tracing::warn!(
                                     "Skipping segment {} in HF export: machine training-ready row is missing multi-model hypothesis coverage, ready agentic promotion coverage, or configured source-reference model coverage/current audio identity",
@@ -1812,3 +1853,67 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
 #[cfg(test)]
 #[path = "export_tests.rs"]
 mod tests;
+
+/// Regressions for the two shared-root export rules fixed in this file. A separate module from the
+/// `#[path]`-included `export_tests.rs` only so the fix and its gate stay in one file.
+#[cfg(test)]
+mod shared_exclusion_tests {
+    use super::*;
+
+    #[test]
+    fn an_is_gold_answer_key_is_excluded_at_the_shared_export_root() {
+        // The spot-check answer key was refused by export_audio's own `human_export_label` and by
+        // nothing else, so the tabular/HuggingFace/bundle exporters all shipped it. Enforced at the
+        // shared root now, which is the only place every exporter routes through.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        let keep = SpeechSegment {
+            id: "keep".to_string(),
+            audio_path: "/kept.wav".to_string(),
+            raw_transcript: "دەقی یەکەم".to_string(),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        };
+        let answer_key = SpeechSegment {
+            id: "answer-key".to_string(),
+            audio_path: "/key.wav".to_string(),
+            raw_transcript: "وەڵامی نهێنی".to_string(),
+            duration_ms: 1000,
+            is_gold: true,
+            ..SpeechSegment::default()
+        };
+
+        let kept = exclude_unexportable_segments(&db, vec![keep, answer_key]).unwrap();
+        let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["keep"], "an is_gold answer key must never leave the app: {ids:?}");
+    }
+
+    #[test]
+    fn unreadable_source_audio_is_counted_as_would_have_been_written_but_never_written() {
+        // The dropped_unavailable tally asks "would this row have been written had the audio been
+        // there?". The identity check re-hashes the source file, so on an unmounted drive it refused —
+        // and dataset_infos.json then reported droppedUnavailableAudio = 0 while the export path
+        // promises the drop "is counted, not silent".
+        let missing = SourceTranscriptRecord {
+            audio_path: "/definitely/not/mounted/source.wav".to_string(),
+            model_id: "reference-model".to_string(),
+            audio_content_hash: Some("abc123".to_string()),
+            audio_size_bytes: Some(4096),
+            transcript_path: "/refs/source.txt".to_string(),
+            transcript_text: "دەقی سەرچاوە".to_string(),
+            created_at: None,
+        };
+        assert!(!source_reference_record_matches_current_audio(&missing, false), "the WRITE gate stays fail-closed");
+        assert!(
+            source_reference_record_matches_current_audio(&missing, true),
+            "the tally must count a row only an unreadable source blocked"
+        );
+
+        // A record with NO stored identity is refused in BOTH modes: that is a property of the record,
+        // not of the audio, so leniency must not smuggle it into the count either.
+        let legacy = SourceTranscriptRecord { audio_content_hash: None, audio_size_bytes: None, ..missing };
+        assert!(!source_reference_record_matches_current_audio(&legacy, false));
+        assert!(!source_reference_record_matches_current_audio(&legacy, true));
+    }
+}
