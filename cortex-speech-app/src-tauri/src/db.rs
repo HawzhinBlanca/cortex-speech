@@ -1273,6 +1273,39 @@ const VALID_SPLITS: &[&str] = &["train", "validation", "test"];
 /// on one clip.
 const REVIEW_SESSION_GAP_MS: i64 = 300_000; // 5 minutes
 
+/// SQL mirror of [`crate::quality::is_placeholder_transcript`] (plus empty) for one transcript column
+/// expression — the ONE definition every SQL site must use.
+///
+/// The couch queue used to narrow on `[%]` alone while the Rust authority also calls a trimmed,
+/// case-insensitive `n/a` / `null` a placeholder. An `n/a` draft therefore passed the queue filter and
+/// was served to a PAID reviewer, who could blind-accept it into a verified gold row without the
+/// champion ever having drafted the clip. Generated from one place so the two cannot drift again;
+/// `LOWER`/`LIKE` here are ASCII-folding, matching `eq_ignore_ascii_case` on the Rust side.
+pub(crate) fn placeholder_or_empty_transcript_sql(column: &str) -> String {
+    format!(
+        "(TRIM(COALESCE({column}, '')) = '' \
+         OR TRIM(COALESCE({column}, '')) LIKE '[%]' \
+         OR LOWER(TRIM(COALESCE({column}, ''))) IN ('n/a', 'null'))"
+    )
+}
+
+/// Refuse to persist a blank ASR draft over an existing one.
+///
+/// The blank-transcript-overwrite class has been fixed twice at the CALL SITE (batch_transcribe's
+/// match-guard, the WSL refine loop's skip) and came back both times, because an engine that returns
+/// `Ok("")` on a quiet clip looks like success to every new caller. The guard belongs at the shared
+/// persist boundary: the `verified = 0` fence protects human rows, not a good unreviewed champion
+/// draft. An error, not `Ok(false)` — a blank result is an ASR failure, and canon says a per-clip
+/// failure is a HARD STOP, never something that reads as a review race.
+fn refuse_blank_asr_persist(segment_id: &str, raw_transcript: &str) -> AppResult<()> {
+    if raw_transcript.trim().is_empty() {
+        return Err(AppError::Validation(format!(
+            "refusing to persist a blank ASR transcript for segment {segment_id}: an empty draft is a failed transcription, not a result"
+        )));
+    }
+    Ok(())
+}
+
 const SEGMENT_SELECT_COLUMNS: &str = "id, created_at, audio_path, raw_transcript, normalized_transcript,
                     annotated_transcript, alignment_json, duration_ms, speaker_id, verified,
                     confidence, ctc_score, clipping_ratio, rms_db, snr_db, split, signal_anomaly_score,
@@ -2067,6 +2100,22 @@ impl Database {
                 previous.id
             )));
         }
+        // A human who decided AFTER the batch now owns this row's text. The undo names only ASR
+        // columns, so it would put the pre-batch machine draft back UNDERNEATH a live human verdict —
+        // the reviewer's accept/edit would then stand against text they never saw, and the couch's
+        // served/approved key would no longer match the row. Refuse instead: the batch it is undoing
+        // was itself superseded by a decision, so there is nothing safe left to restore.
+        let human_landed_after_batch = (current.verified && !previous.verified)
+            || (current.is_gold && !previous.is_gold)
+            || (current.human_decision.is_some() && previous.human_decision.is_none())
+            || (current.verdict.is_some() && previous.verdict.is_none())
+            || (current.annotated_transcript.is_some() && previous.annotated_transcript.is_none());
+        if human_landed_after_batch {
+            return Err(AppError::Validation(format!(
+                "Cannot undo batch transcription for segment {}: a human decision landed after the batch",
+                previous.id
+            )));
+        }
         let raw_nfc = to_nfc(&previous.raw_transcript);
         let normalized_nfc = previous.normalized_transcript.as_deref().map(to_nfc);
         self.conn.execute(
@@ -2327,7 +2376,7 @@ impl Database {
                 .transpose()?;
             let mut machine_stmt = schema_v60
                 .then(|| {
-                    self.conn.prepare(
+                    self.conn.prepare(&format!(
                         "INSERT INTO speech_segments
                             (id, created_at, audio_path, raw_transcript, normalized_transcript,
                              alignment_json, duration_ms, speaker_id, confidence, ctc_score,
@@ -2366,8 +2415,8 @@ impl Database {
                                  excluded.speaker_change_score,
                                  speech_segments.speaker_change_score
                              ),
-                             updated_at=datetime('now')",
-                    )
+                             updated_at=datetime('now')"
+                    ))
                 })
                 .transpose()?;
             for seg in segments {
@@ -2663,6 +2712,7 @@ impl Database {
         model_version_id: Option<&str>,
         cloud_call: bool,
     ) -> AppResult<bool> {
+        refuse_blank_asr_persist(segment_id, raw_transcript)?;
         // NFC-canonicalize before writing the FTS-indexed columns, exactly like insert_segment /
         // update_segment. The WSL 7B branch feeds raw ASR output here, which can arrive decomposed;
         // storing a non-NFC form fragments the search index so the text can't be found.
@@ -2848,6 +2898,7 @@ impl Database {
         model_version_id: Option<&str>,
         cloud_call: bool,
     ) -> AppResult<bool> {
+        refuse_blank_asr_persist(segment_id, raw_transcript)?;
         let raw_nfc = to_nfc(raw_transcript);
         let normalized_nfc = normalized_transcript.map(to_nfc);
         let rows_changed = self.conn.execute(
@@ -3951,7 +4002,14 @@ impl Database {
     /// The score, audit event, and compensation consequence share one transaction. Grading never
     /// alters the corpus row, but losing the pay event after accepting a score would still lose real
     /// reviewer work and make a dropped-response retry impossible to reconcile.
-    pub fn record_spot_check(
+    ///
+    /// TEST-ONLY, like its `record_spot_check_with_operation` sibling: it passes `operation: None`,
+    /// which clears `enforce_production_proof` inside `record_spot_check_inner` — a PAID ledger write
+    /// with no operation identity and no playback proof behind it. Nothing in the shipped app calls
+    /// it (couch goes through `record_pilot_spot_check_with_operation_request`), so it is compiled out
+    /// of the production binary rather than left there as a proof-free way to move money.
+    #[cfg(test)]
+    pub(crate) fn record_spot_check(
         &self,
         segment_id: &str,
         reviewer: &str,
@@ -4525,12 +4583,15 @@ impl Database {
         // progress history. The event's snapshot wins; the live row backfills events
         // that predate v56; an event whose clip is gone AND predates the snapshot stays 0 rather
         // than invented.
+        // COLLATE NOCASE like every money and limit path: the ledger pays one reviewer whose name was
+        // typed with different casing as ONE person, so an activity total that split them would
+        // disagree with the balance shown beside it on the same screen.
         Ok(self.conn.query_row(
             "SELECT COALESCE(SUM(d), 0)
                FROM (SELECT MAX(COALESCE(e.duration_ms, s.duration_ms, 0)) AS d
                        FROM review_events e
                        LEFT JOIN speech_segments s ON s.id = e.segment_id
-                      WHERE e.reviewer = ?1 AND e.action IN ('accept', 'edit', 'reject')
+                      WHERE e.reviewer = ?1 COLLATE NOCASE AND e.action IN ('accept', 'edit', 'reject')
                       GROUP BY e.segment_id)",
             params![reviewer],
             |row| row.get(0),
@@ -4642,122 +4703,135 @@ impl Database {
                 "review compensation settlement requires reviewer and payout reference".into(),
             ));
         }
-        self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
-        let tx = self.conn.unchecked_transaction()?;
-        Self::verify_review_pay_policy_tx(&tx)?;
-        // A payout provider can succeed while its HTTP response is lost. Retrying the same durable
-        // reference must return the original allocation, not fail the now-advanced boundary or mint
-        // another settlement. Reusing a reference for different parameters is a hard error.
-        let existing: Option<ReviewCompensationSettlement> = tx
-            .query_row(
-                "SELECT settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
-                        through_ledger_id_inclusive, allocated_micro_iqd, payout_reference
-                   FROM review_compensation_settlements WHERE payout_reference = ?1",
-                params![payout_reference],
-                |row| {
-                    Ok(ReviewCompensationSettlement {
-                        settlement_id: row.get(0)?,
-                        policy_version: row.get(1)?,
-                        reviewer: row.get(2)?,
-                        from_ledger_id_exclusive: row.get(3)?,
-                        through_ledger_id_inclusive: row.get(4)?,
-                        allocated_micro_iqd: row.get(5)?,
-                        payout_reference: row.get(6)?,
-                    })
-                },
-            )
-            .optional()?;
-        if let Some(existing) = existing {
-            tx.rollback()?;
-            self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-            if existing.policy_version == REVIEW_PAY_POLICY_VERSION
-                && existing.reviewer.eq_ignore_ascii_case(reviewer)
-                && existing.through_ledger_id_inclusive == through_ledger_id_inclusive
-            {
-                return Ok(existing);
+        // `with_full_sync` rather than a raw PRAGMA pair: the three explicit early returns lowered
+        // `synchronous` again, but every `?` between them (policy check, the four queries, the INSERT,
+        // the commit) returned with the SHARED connection still pinned at FULL for the rest of the
+        // process — one failed settlement silently taxing every later write with an extra fsync.
+        // BEGIN IMMEDIATE like the other money writers: the boundary is read and then extended, so a
+        // DEFERRED transaction could have a second connection allocate the same ledger range in the
+        // window between the MAX() read and the INSERT.
+        self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            Self::verify_review_pay_policy_tx(&tx)?;
+            // A payout provider can succeed while its HTTP response is lost. Retrying the same durable
+            // reference must return the original allocation, not fail the now-advanced boundary or mint
+            // another settlement. Reusing a reference for different parameters is a hard error.
+            let existing: Option<ReviewCompensationSettlement> = tx
+                .query_row(
+                    "SELECT settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                            through_ledger_id_inclusive, allocated_micro_iqd, payout_reference
+                       FROM review_compensation_settlements WHERE payout_reference = ?1",
+                    params![payout_reference],
+                    |row| {
+                        Ok(ReviewCompensationSettlement {
+                            settlement_id: row.get(0)?,
+                            policy_version: row.get(1)?,
+                            reviewer: row.get(2)?,
+                            from_ledger_id_exclusive: row.get(3)?,
+                            through_ledger_id_inclusive: row.get(4)?,
+                            allocated_micro_iqd: row.get(5)?,
+                            payout_reference: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                tx.rollback()?;
+                if existing.policy_version == REVIEW_PAY_POLICY_VERSION
+                    && existing.reviewer.eq_ignore_ascii_case(reviewer)
+                    && existing.through_ledger_id_inclusive == through_ledger_id_inclusive
+                {
+                    return Ok(existing);
+                }
+                return Err(AppError::Validation(format!(
+                    "payout reference {payout_reference:?} is already bound to a different settlement"
+                )));
             }
-            return Err(AppError::Validation(format!(
-                "payout reference {payout_reference:?} is already bound to a different settlement"
-            )));
-        }
-        let from_ledger_id_exclusive: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(through_ledger_id_inclusive), 0)
-               FROM review_compensation_settlements
-              WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE",
-            params![REVIEW_PAY_POLICY_VERSION, reviewer],
-            |row| row.get(0),
-        )?;
-        if through_ledger_id_inclusive <= from_ledger_id_exclusive {
-            tx.rollback()?;
-            self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-            return Err(AppError::Validation(format!(
-                "settlement boundary {through_ledger_id_inclusive} must exceed prior boundary {from_ledger_id_exclusive}"
-            )));
-        }
-        let (entry_count, allocated_micro_iqd): (i64, i64) = tx.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(delta_micro_iqd), 0)
-               FROM review_compensation_ledger
-              WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE
-                AND id > ?3 AND id <= ?4",
-            params![REVIEW_PAY_POLICY_VERSION, reviewer, from_ledger_id_exclusive, through_ledger_id_inclusive],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if entry_count == 0 {
-            tx.rollback()?;
-            self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-            return Err(AppError::Validation("settlement range contains no ledger entries for this reviewer".into()));
-        }
-        let settlement_id = uuid::Uuid::new_v4().to_string();
-        tx.execute(
-            "INSERT INTO review_compensation_settlements
-                (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
-                 through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            let from_ledger_id_exclusive: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(through_ledger_id_inclusive), 0)
+                   FROM review_compensation_settlements
+                  WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE",
+                params![REVIEW_PAY_POLICY_VERSION, reviewer],
+                |row| row.get(0),
+            )?;
+            if through_ledger_id_inclusive <= from_ledger_id_exclusive {
+                tx.rollback()?;
+                return Err(AppError::Validation(format!(
+                    "settlement boundary {through_ledger_id_inclusive} must exceed prior boundary {from_ledger_id_exclusive}"
+                )));
+            }
+            let (entry_count, allocated_micro_iqd): (i64, i64) = tx.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(delta_micro_iqd), 0)
+                   FROM review_compensation_ledger
+                  WHERE policy_version = ?1 AND reviewer = ?2 COLLATE NOCASE
+                    AND id > ?3 AND id <= ?4",
+                params![REVIEW_PAY_POLICY_VERSION, reviewer, from_ledger_id_exclusive, through_ledger_id_inclusive],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if entry_count == 0 {
+                tx.rollback()?;
+                return Err(AppError::Validation(
+                    "settlement range contains no ledger entries for this reviewer".into(),
+                ));
+            }
+            let settlement_id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO review_compensation_settlements
+                    (settlement_id, policy_version, reviewer, from_ledger_id_exclusive,
+                     through_ledger_id_inclusive, allocated_micro_iqd, payout_reference)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    settlement_id,
+                    REVIEW_PAY_POLICY_VERSION,
+                    reviewer,
+                    from_ledger_id_exclusive,
+                    through_ledger_id_inclusive,
+                    allocated_micro_iqd,
+                    payout_reference,
+                ],
+            )?;
+            tx.commit()?;
+            self.track_write()?;
+            Ok(ReviewCompensationSettlement {
                 settlement_id,
-                REVIEW_PAY_POLICY_VERSION,
-                reviewer,
+                policy_version: REVIEW_PAY_POLICY_VERSION.to_string(),
+                reviewer: reviewer.to_string(),
                 from_ledger_id_exclusive,
                 through_ledger_id_inclusive,
                 allocated_micro_iqd,
-                payout_reference,
-            ],
-        )?;
-        tx.commit()?;
-        self.conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-        self.track_write()?;
-        Ok(ReviewCompensationSettlement {
-            settlement_id,
-            policy_version: REVIEW_PAY_POLICY_VERSION.to_string(),
-            reviewer: reviewer.to_string(),
-            from_ledger_id_exclusive,
-            through_ledger_id_inclusive,
-            allocated_micro_iqd,
-            payout_reference: payout_reference.to_string(),
+                payout_reference: payout_reference.to_string(),
+            })
         })
     }
 
     pub fn reviewer_throughput(&self) -> AppResult<Vec<ReviewerThroughput>> {
+        // Grouped by the CASE-FOLDED name, and ordered the same way, like every money and limit path.
+        // Keyed on the raw string, "Sara" and "sara" became two reviewers with half the clips each
+        // while the ledger paid them as one — and the ORDER BY has to fold too, or the interleaved
+        // timestamps of the two spellings would break the per-session gap windowing below.
         let mut stmt = self.conn.prepare(
             "SELECT reviewer, segment_id, timestamp_ms FROM review_events
              WHERE action IN ('accept', 'edit', 'reject')
-             ORDER BY reviewer ASC, timestamp_ms ASC",
+             ORDER BY reviewer COLLATE NOCASE ASC, timestamp_ms ASC",
         )?;
         let rows =
             stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?;
 
-        let mut by_reviewer: std::collections::BTreeMap<String, (std::collections::BTreeSet<String>, Vec<i64>)> =
-            std::collections::BTreeMap::new();
+        // folded key -> (display spelling, distinct segments, timestamps)
+        type ReviewerRuns = (String, std::collections::BTreeSet<String>, Vec<i64>);
+        let mut by_reviewer: std::collections::BTreeMap<String, ReviewerRuns> = std::collections::BTreeMap::new();
         for row in rows {
             let (reviewer, segment, ts) = row?;
-            let entry = by_reviewer.entry(reviewer).or_default();
-            entry.0.insert(segment);
-            entry.1.push(ts);
+            let entry = by_reviewer
+                .entry(reviewer.to_ascii_lowercase())
+                .or_insert_with(|| (reviewer.clone(), std::collections::BTreeSet::new(), Vec::new()));
+            entry.1.insert(segment);
+            entry.2.push(ts);
         }
 
         let mut out: Vec<ReviewerThroughput> = by_reviewer
-            .into_iter()
-            .map(|(reviewer, (segments, stamps))| {
+            .into_values()
+            .map(|(reviewer, segments, stamps)| {
                 let mut deltas: Vec<i64> =
                     stamps.windows(2).map(|w| w[1] - w[0]).filter(|&d| d > 0 && d <= REVIEW_SESSION_GAP_MS).collect();
                 deltas.sort_unstable();
@@ -4798,19 +4872,23 @@ impl Database {
         let rows = stmt
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
         // segment -> (reviewer -> action), BTreeMap so the emitted TSV is byte-identical run to run.
+        // Keyed on the CASE-FOLDED name like every money and limit path: with the raw string, one
+        // person spelled two ways rated "both sides" of a clip and kappa measured them against
+        // themselves. `reviewers` maps that folded key back to a display spelling for the report.
         let mut by_segment: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
             std::collections::BTreeMap::new();
-        let mut reviewers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut reviewers: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
         for row in rows {
             let (segment, reviewer, action) = row?;
-            reviewers.insert(reviewer.clone());
-            by_segment.entry(segment).or_default().insert(reviewer, action);
+            let key = reviewer.to_ascii_lowercase();
+            reviewers.entry(key.clone()).or_insert(reviewer);
+            by_segment.entry(segment).or_default().insert(key, action);
         }
 
         // The pair sharing the most clips. Ties break on the (sorted) names so the choice is
         // deterministic — a report that silently picked a different pair on each run would make two
         // kappa numbers incomparable for no visible reason.
-        let names: Vec<&String> = reviewers.iter().collect();
+        let names: Vec<&String> = reviewers.keys().collect();
         let mut best: Option<(usize, &String, &String)> = None;
         for (ai, a) in names.iter().enumerate() {
             for b in names.iter().skip(ai + 1) {
@@ -4831,17 +4909,19 @@ impl Database {
             return Ok(None);
         };
 
-        let mut tsv = format!("{a}\t{b}\n");
+        // Report the human-readable spelling, never the folded grouping key.
+        let (rater_a, rater_b) = (reviewers[a].clone(), reviewers[b].clone());
+        let mut tsv = format!("{rater_a}\t{rater_b}\n");
         for actions in by_segment.values() {
             if let (Some(la), Some(lb)) = (actions.get(a.as_str()), actions.get(b.as_str())) {
                 tsv.push_str(&format!("{la}\t{lb}\n"));
             }
         }
         let other_reviewers: Vec<String> =
-            reviewers.iter().filter(|r| *r != a && *r != b).map(|r| r.to_string()).collect();
+            reviewers.iter().filter(|(key, _)| *key != a && *key != b).map(|(_, name)| name.clone()).collect();
         Ok(Some(AgreementExport {
-            rater_a: a.to_string(),
-            rater_b: b.to_string(),
+            rater_a,
+            rater_b,
             items,
             tsv,
             path: String::new(), // filled in by the command that writes it
@@ -4948,9 +5028,10 @@ impl Database {
     /// closed for imports and nobody can reach them; an INTERRUPTED import leaves them behind, which
     /// is exactly what happened on 2026-08-14 (36 orphaned placeholder rows).
     ///
-    /// Matched in SQL as `[...]` — the same shape the decide guard rejects — so the two cannot
-    /// disagree. `quality::is_placeholder_transcript` remains the authority on what a placeholder
-    /// IS; this is the cheap narrowing that keeps the id-only query fast (P1.3).
+    /// Matched in SQL by `placeholder_or_empty_transcript_sql`, which mirrors
+    /// `quality::is_placeholder_transcript` — the authority on what a placeholder IS — so the two
+    /// cannot disagree. It used to be an inline `[%]`-only test, which served the `n/a` and `null`
+    /// drafts the authority rejects to a PAID reviewer (2026-08-25 audit M11).
     ///
     /// OLDEST FIRST, deliberately (2026-08-14). This was newest-first, which quietly buries the work
     /// the owner actually wants finished: after importing 27 hours of new podcast audio the queue
@@ -4994,13 +5075,13 @@ impl Database {
         allowed_dialects: Option<&[String]>,
         focus: Option<&std::collections::HashSet<String>>,
     ) -> AppResult<Vec<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, audio_path FROM speech_segments
              WHERE verified = 0
-               AND TRIM(COALESCE(raw_transcript, '')) <> ''
-               AND NOT (TRIM(raw_transcript) LIKE '[%]')
+               AND NOT {}
              ORDER BY created_at ASC, id ASC",
-        )?;
+            placeholder_or_empty_transcript_sql("raw_transcript")
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut ids = Vec::new();
         // Both checks are memoised per DISTINCT PATH: 13,797 clips come from 32 recordings, so this
@@ -5880,16 +5961,34 @@ impl Database {
         idempotency_key: Option<&str>,
         total: Option<i64>,
     ) -> AppResult<crate::jobs::Job> {
-        if let Some(key) = idempotency_key {
-            if let Some(existing) = self.get_job_by_idempotency_key(key)? {
-                return Ok(existing);
+        // Check-then-insert with nothing holding the gap is only dedup for the caller that wins: the
+        // loser used to get a raw UNIQUE-constraint error instead of the job the winner created —
+        // exactly the retry this function exists to absorb. One savepoint (the sibling
+        // `begin_running_payload_job`'s idiom) plus insert-then-select-on-conflict closes it.
+        self.conn.execute("SAVEPOINT create_or_get_job", [])?;
+        let result: AppResult<crate::jobs::Job> = (|| {
+            self.conn.execute(
+                "INSERT INTO jobs (id, kind, idempotency_key, total, state) VALUES (?1, ?2, ?3, ?4, 'queued')
+                 ON CONFLICT DO NOTHING",
+                params![id, kind, idempotency_key, total],
+            )?;
+            if let Some(key) = idempotency_key {
+                if let Some(existing) = self.get_job_by_idempotency_key(key)? {
+                    return Ok(existing);
+                }
+            }
+            self.get_job(id)?.ok_or_else(|| AppError::Other(format!("job {id} vanished immediately after insert")))
+        })();
+        match result {
+            Ok(job) => {
+                self.release_savepoint("create_or_get_job")?;
+                Ok(job)
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("create_or_get_job");
+                Err(error)
             }
         }
-        self.conn.execute(
-            "INSERT INTO jobs (id, kind, idempotency_key, total, state) VALUES (?1, ?2, ?3, ?4, 'queued')",
-            params![id, kind, idempotency_key, total],
-        )?;
-        self.get_job(id)?.ok_or_else(|| AppError::Other(format!("job {id} vanished immediately after insert")))
     }
 
     /// Fetch the durable payload for a payload-owning job kind. A NULL payload is an integrity error:
@@ -8166,13 +8265,17 @@ impl Database {
     /// Resume uses it to tell an ADOPTABLE finished file from a crash-interrupted stage: rows are
     /// committed before the champion pass fills them, so "rows exist" alone proved nothing — the
     /// 2026-08-14 incident left 36 placeholder rows that every later resume would have adopted as a
-    /// completed file (found again by the 2026-08-20 external review). Same `[%]` narrowing the
-    /// review-queue exclusion uses, so the two cannot disagree about what a placeholder is.
+    /// completed file (found again by the 2026-08-20 external review). Same
+    /// `placeholder_or_empty_transcript_sql` the review-queue exclusion uses, so the two cannot
+    /// disagree about what a placeholder is.
     pub fn audio_path_has_placeholder_rows(&self, audio_path: &str) -> AppResult<bool> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM speech_segments
-             WHERE audio_path = ?1
-               AND (TRIM(COALESCE(raw_transcript, '')) LIKE '[%]' OR TRIM(COALESCE(raw_transcript, '')) = '')",
+            &format!(
+                "SELECT COUNT(*) FROM speech_segments
+                 WHERE audio_path = ?1
+                   AND {}",
+                placeholder_or_empty_transcript_sql("raw_transcript")
+            ),
             params![audio_path],
             |r| r.get(0),
         )?;
@@ -9154,6 +9257,258 @@ fn move_sqlite_sidecar(original_db: &Path, backup_db: &Path, suffix: &str) {
 
 fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", db_path.display(), suffix))
+}
+
+/// Regression gates for the 2026-08-25 deep-audit findings in this file. Kept here rather than in
+/// `db_tests.rs` so the fix and the proof it stays fixed live in one file.
+#[cfg(test)]
+mod audit_20260825_tests {
+    use super::*;
+
+    fn db() -> Database {
+        let database = Database::open(":memory:").unwrap();
+        database.initialize().unwrap();
+        database
+    }
+
+    fn machine_segment(id: &str, audio_path: &str, raw: &str) -> SpeechSegment {
+        SpeechSegment {
+            id: id.to_string(),
+            audio_path: audio_path.to_string(),
+            raw_transcript: raw.to_string(),
+            duration_ms: 4_000,
+            ..SpeechSegment::default()
+        }
+    }
+
+    /// M11. The queue's SQL narrowing and `quality::is_placeholder_transcript` must agree EXACTLY.
+    /// They did not: SQL tested `[%]` only, so an `n/a` draft passed the filter and was served to a
+    /// paid reviewer who could blind-accept it into gold without the champion ever drafting the clip.
+    #[test]
+    fn placeholder_sql_agrees_with_the_rust_placeholder_authority() {
+        let database = db();
+        let cases = [
+            "",
+            "   ",
+            "n/a",
+            "N/A",
+            "  NuLl  ",
+            "null",
+            "[Pending WSL 7B ASR]",
+            "[ASR unavailable: model load failed]",
+            "سڵاو، چۆنی باشی؟",
+            "a real transcript a human would keep",
+        ];
+        for (i, text) in cases.iter().enumerate() {
+            database.insert_segment(&machine_segment(&format!("p{i:02}"), &format!("/audio/p{i}.wav"), text)).unwrap();
+        }
+
+        let sql =
+            format!("SELECT id FROM speech_segments WHERE {}", placeholder_or_empty_transcript_sql("raw_transcript"));
+        let mut stmt = database.connection().prepare(&sql).unwrap();
+        let flagged: std::collections::HashSet<String> =
+            stmt.query_map([], |row| row.get::<_, String>(0)).unwrap().map(Result::unwrap).collect();
+
+        for (i, text) in cases.iter().enumerate() {
+            let authority = crate::quality::is_placeholder_transcript(text) || text.trim().is_empty();
+            assert_eq!(
+                flagged.contains(&format!("p{i:02}")),
+                authority,
+                "the SQL fragment and quality::is_placeholder_transcript disagree about {text:?} — a \
+                 placeholder either reaches a paid reviewer or a real transcript is dropped from the queue"
+            );
+        }
+    }
+
+    /// M11, at the SERVING path: the couch queue itself must not hand an `n/a` draft to a reviewer.
+    #[test]
+    fn the_couch_queue_never_serves_a_placeholder_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = db();
+        for (id, text) in
+            [("real", "دەقێکی ڕاستەقینە"), ("na", "n/a"), ("nul", "NULL"), ("bracket", "[Pending WSL 7B ASR]")]
+        {
+            // The queue also refuses clips whose audio is gone, so every fixture gets a real file.
+            let audio = temp.path().join(format!("{id}.wav"));
+            std::fs::write(&audio, b"RIFF").unwrap();
+            database.insert_segment(&machine_segment(id, audio.to_str().unwrap(), text)).unwrap();
+        }
+        assert_eq!(database.pending_segment_ids().unwrap(), vec!["real".to_string()]);
+    }
+
+    /// The twice-fixed blank-transcript-overwrite class, now fenced at the shared persist boundary
+    /// instead of only at each call site.
+    #[test]
+    fn a_blank_draft_is_refused_at_both_shared_asr_persist_boundaries() {
+        let database = db();
+        database.insert_segment(&machine_segment("blank", "/blank.wav", "a good champion draft")).unwrap();
+
+        for blank in ["", "   ", "\n\t "] {
+            let refine = database
+                .update_asr_transcript_if_unreviewed("blank", blank, None, Some(0.9), None, None, false)
+                .unwrap_err();
+            assert!(refine.to_string().contains("blank ASR transcript"), "{refine}");
+            let batch = database
+                .update_batch_transcription_if_unreviewed("blank", blank, None, Some(0.9), None, None, false)
+                .unwrap_err();
+            assert!(batch.to_string().contains("blank ASR transcript"), "{batch}");
+        }
+
+        let row = database.get_segment_by_id("blank").unwrap().unwrap();
+        assert_eq!(row.raw_transcript, "a good champion draft", "the good draft must survive every blank write");
+        let fresh = database
+            .update_asr_transcript_if_unreviewed("blank", "a fresh draft", None, Some(0.9), None, None, false)
+            .unwrap();
+        assert!(fresh, "a real draft must still persist — the guard is about blankness, not about writing");
+    }
+
+    /// Undo of a batch transcription names only ASR columns, so applying it after a human decided
+    /// would swap the transcript out from under a live verdict. Refuse instead.
+    #[test]
+    fn batch_transcription_undo_refuses_when_a_human_decided_after_the_batch() {
+        let database = db();
+        database.insert_segment(&machine_segment("undo", "/undo.wav", "pre-batch draft")).unwrap();
+        let pre_batch = database.get_segment_by_id("undo").unwrap().unwrap();
+
+        assert!(database
+            .update_batch_transcription_if_unreviewed("undo", "batch draft", None, Some(0.7), None, None, false)
+            .unwrap());
+        assert!(database.update_verified_for_test("undo", true).unwrap());
+
+        let error = database.restore_batch_transcription_snapshot(&pre_batch).unwrap_err();
+        assert!(error.to_string().contains("human decision landed after the batch"), "{error}");
+        assert_eq!(
+            database.get_segment_by_id("undo").unwrap().unwrap().raw_transcript,
+            "batch draft",
+            "the row the human judged must be exactly what stays on disk"
+        );
+
+        // Without a later human decision the undo still works — this is a fence, not a removal.
+        database.insert_segment(&machine_segment("undo2", "/undo2.wav", "pre-batch draft")).unwrap();
+        let pre_batch2 = database.get_segment_by_id("undo2").unwrap().unwrap();
+        assert!(database
+            .update_batch_transcription_if_unreviewed("undo2", "batch draft", None, Some(0.7), None, None, false)
+            .unwrap());
+        database.restore_batch_transcription_snapshot(&pre_batch2).unwrap();
+        assert_eq!(database.get_segment_by_id("undo2").unwrap().unwrap().raw_transcript, "pre-batch draft");
+    }
+
+    /// Activity/throughput/agreement read reviewer identity the same way money does — COLLATE NOCASE.
+    /// Case-sensitive, one person spelled two ways showed half their work beside the full balance.
+    #[test]
+    fn reviewer_activity_reads_fold_case_like_the_money_paths() {
+        let database = db();
+        for (i, spelling) in ["Sara", "sara"].into_iter().enumerate() {
+            let id = format!("act{i}");
+            database.insert_segment(&machine_segment(&id, &format!("/act{i}.wav"), "text")).unwrap();
+            // Written straight to the audit trail: `record_review_event` is the zero-credit skip path,
+            // and the paid writers need playback proof this fixture is not about.
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO review_events (segment_id, reviewer, action, source, timestamp_ms, duration_ms)
+                     VALUES (?1, ?2, 'accept', 'desktop', ?3, 4000)",
+                    params![id, spelling, 1_000 + i as i64 * 60_000],
+                )
+                .unwrap();
+            // Both spellings answer the SAME clip: case-sensitively that looked like two raters
+            // agreeing with each other, which is one person's kappa against themselves.
+            database
+                .connection()
+                .execute(
+                    "INSERT INTO spot_checks
+                        (segment_id, reviewer, action, submitted_transcript, expected_transcript, noticed, cer)
+                     VALUES ('act0', ?1, 'accept', 'x', 'x', 1, 0.0)",
+                    params![spelling],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(database.reviewed_audio_ms("Sara").unwrap(), 8_000, "both spellings are one reviewer's activity");
+        assert_eq!(database.reviewed_audio_ms("SARA").unwrap(), 8_000);
+
+        let throughput = database.reviewer_throughput().unwrap();
+        assert_eq!(throughput.len(), 1, "one human must not appear twice: {throughput:?}");
+        assert_eq!(throughput[0].clips, 2);
+
+        // Two spellings of one person are not two raters, so there is no agreement pair to report.
+        assert!(
+            database.agreement_sample().unwrap().is_none(),
+            "kappa must never measure a reviewer against their own other spelling"
+        );
+    }
+
+    /// The settlement writer raises `synchronous=FULL` on the SHARED connection. Every exit path has
+    /// to lower it again — the `?` returns included, which the three explicit early returns missed.
+    #[test]
+    fn a_failed_settlement_restores_synchronous_on_the_shared_connection() {
+        // A real file, not `:memory:` — `synchronous` is exactly the durability knob a memory database
+        // has no reason to honour, and this test is about the knob.
+        let temp = tempfile::tempdir().unwrap();
+        let database = Database::open(temp.path().join("pay.db").to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        database.insert_segment(&machine_segment("pay", "/pay.wav", "text")).unwrap();
+        database
+            .connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                (entry_id, entry_key, policy_version, canonical_work_id, canonical_identity_kind,
+                 reviewer, segment_id, source, compensation_action, effective_decision, duration_ms,
+                 rate_basis_points, entitlement_micro_iqd, delta_micro_iqd, corrected_entitlement_ms,
+                 delta_corrected_ms)
+             VALUES ('e1', 'k1', ?1, 'pay', 'segment_id', 'Sara', 'pay', 'couch', 'accept', 'accept',
+                     4000, 1000, 2000, 2000, 0, 0)",
+                params![REVIEW_PAY_POLICY_VERSION],
+            )
+            .unwrap();
+
+        // Boundary 5 is past the last ledger id, so the settlement trigger ABORTs the INSERT — the
+        // `?` path that used to leave the connection pinned at FULL for the rest of the process.
+        let error = database.record_review_compensation_settlement("Sara", 5, "payout-1").unwrap_err();
+        assert!(error.to_string().contains("range/amount is invalid"), "{error}");
+        let synchronous: i64 = database.connection().query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(synchronous, 1, "a failed money write must leave the shared connection at NORMAL, not FULL");
+
+        // The happy path still settles, and still restores the pragma.
+        let settlement = database.record_review_compensation_settlement("Sara", 1, "payout-2").unwrap();
+        assert_eq!(settlement.allocated_micro_iqd, 2_000, "the settled amount is unchanged by this fix");
+        let synchronous: i64 = database.connection().query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(synchronous, 1);
+    }
+
+    /// `create_or_get_job` must absorb the retry it exists for even when it loses the check-then-insert
+    /// race: the loser used to receive a raw UNIQUE-constraint error instead of the winner's job.
+    #[test]
+    fn create_or_get_job_returns_the_existing_job_when_its_insert_conflicts() {
+        let database = db();
+        let first = database.create_or_get_job("job-a", "import", Some("key-1"), Some(10)).unwrap();
+
+        // The lost race: a second caller passed the existence check before the winner committed, so it
+        // reaches the INSERT with a fresh id and the SAME idempotency key.
+        let second = database.create_or_get_job("job-b", "import", Some("key-1"), Some(10)).unwrap();
+        assert_eq!(second.id, first.id, "the retry must resume the existing job, not fail or duplicate it");
+
+        let jobs: i64 = database.connection().query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0)).unwrap();
+        assert_eq!(jobs, 1, "no duplicate job row may be created");
+
+        // A genuinely new key still creates a job.
+        let other = database.create_or_get_job("job-c", "import", Some("key-2"), None).unwrap();
+        assert_eq!(other.id, "job-c");
+    }
+
+    /// `record_spot_check` writes the PAID ledger with `operation: None`, which clears
+    /// `enforce_production_proof` — no operation identity, no playback evidence. Nothing in the app
+    /// calls it, so it must not be compiled into the production binary at all.
+    #[test]
+    fn the_proof_free_spot_check_writer_is_not_in_the_production_binary() {
+        let source = include_str!("db.rs");
+        let at = source.find("fn record_spot_check(").expect("record_spot_check must still exist");
+        assert!(
+            source[..at].lines().rev().take(4).any(|line| line.trim() == "#[cfg(test)]"),
+            "record_spot_check lost its #[cfg(test)] gate — a proof-free paid-ledger writer is back in \
+             the shipped app. Either gate it again or route it through the playback-proof writers."
+        );
+    }
 }
 
 #[cfg(test)]
