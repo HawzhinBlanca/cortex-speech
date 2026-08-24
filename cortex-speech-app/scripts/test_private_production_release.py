@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -121,6 +122,29 @@ def test_schema_rollback_policy_never_destroys_new_v63_work() -> None:
     assert release.rollback_policy(62, 62, 2, 3, None) == "blocked"
 
 
+def test_stop_app_targets_one_exact_executable_and_waits_for_exit() -> None:
+    if os.name != "nt":
+        return
+    ping = Path(os.environ["WINDIR"]) / "System32" / "ping.exe"
+    with tempfile.TemporaryDirectory() as raw:
+        decoy = Path(raw) / "cortex-speech-app.exe"
+        shutil.copy2(ping, decoy)
+        process = subprocess.Popen(
+            [str(decoy), "127.0.0.1", "-t"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            release.stop_app([decoy], force_after_seconds=1)
+            assert process.wait(timeout=3) is not None
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+
+
 def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
@@ -151,9 +175,15 @@ def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
 def test_watchdog_and_server_pin_the_release_boundary() -> None:
     watchdog = (APP / "scripts" / "ops" / "cortex-watchdog.ps1").read_text(encoding="utf-8")
     couch = (APP / "src-tauri" / "src" / "couch.rs").read_text(encoding="utf-8")
+    controller = SUBJECT.read_text(encoding="utf-8")
     assert release.POINTER_FILE in watchdog
     assert "Get-VerifiedActiveRelease" in watchdog
     assert "Get-FileHash" in watchdog
+    assert release.WATCHDOG_TASK == "CortexPrivateProductionWatchdog"
+    assert release.LEGACY_WATCHDOG_TASK == "CortexWatchdog"
+    assert '"-TaskName",\n        WATCHDOG_TASK' in controller
+    assert "Wait-Process -Id $left.Id -Timeout 10" in controller
+    assert "Cortex app process did not stop after the force deadline" in controller
     assert release.MAINTENANCE_FILE in couch
     probe = couch.index('if path == "/api/claim/probe"')
     maintenance = couch.index("if maintenance", probe)

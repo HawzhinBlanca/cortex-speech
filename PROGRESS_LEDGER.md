@@ -11087,3 +11087,14 @@ typecheck (0 errors/warnings), and production build green; all 103 Python policy
 including the 13-branch watchdog drill, 24 recovery-snapshot tests, 19 restore tests, and 8 immutable
 release-controller tests. `git diff --check` is green. No live production mutation or GPU use occurred
 at this checkpoint; commit-bound release build and controlled handover remain next.
+
+The first controlled handover attempt then failed closed before snapshot or migration. Windows
+PowerShell 5 represented the controller's one-element JSON executable list as a nested `Object[]`, so
+the exact-path stop filter matched nothing and the still-running v62 app retained `cortex.lock`.
+Recovery also could not overwrite the administrator-owned legacy `CortexWatchdog` task. The live app,
+schema 62, 877 review events, zero pool decisions, port, and both links remained unchanged; the legacy
+watchdog was re-enabled and the aborted journal/recovery task were cleared only after those facts were
+re-proved. The replacement uses a flat exact-path transport with a real renamed-`ping.exe` termination
+regression, waits after force-stop, and registers a separate user-owned
+`CortexPrivateProductionWatchdog` bound to the immutable release while leaving the protected legacy
+task available only for pre-migration fallback.

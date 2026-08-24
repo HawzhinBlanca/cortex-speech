@@ -33,7 +33,8 @@ POINTER_FILE = "active-private-production-release.json"
 JOURNAL_FILE = "pending-private-production-release.json"
 MAINTENANCE_FILE = "private-production-maintenance.json"
 RELEASE_MANIFEST_FILE = "release-manifest.json"
-WATCHDOG_TASK = "CortexWatchdog"
+LEGACY_WATCHDOG_TASK = "CortexWatchdog"
+WATCHDOG_TASK = "CortexPrivateProductionWatchdog"
 RESTORE_TASK = "CortexDailyRestoreDrill"
 RECOVERY_TASK = "CortexReleaseRecovery"
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -370,9 +371,12 @@ def stop_app(executables: list[Path], *, force_after_seconds: int = 8) -> None:
     targets = {str(path.resolve()).lower() for path in executables if path and path.exists()}
     if not targets:
         return
-    env = dict(os.environ, CORTEX_RELEASE_TARGETS=json.dumps(sorted(targets)))
+    # Windows PowerShell 5 wraps a one-element JSON array as one nested Object[], so `-contains`
+    # compares an array object to the process path and silently matches nothing. Windows paths cannot
+    # contain newlines; a newline-delimited exact-path list stays flat in every supported PowerShell.
+    env = dict(os.environ, CORTEX_RELEASE_TARGETS="\n".join(sorted(targets)))
     script = r"""
-$targets = @(ConvertFrom-Json $env:CORTEX_RELEASE_TARGETS)
+$targets = @($env:CORTEX_RELEASE_TARGETS -split "`n" | Where-Object { $_ })
 $processes = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue | Where-Object {
     $_.Path -and ($targets -contains $_.Path.ToLowerInvariant())
 })
@@ -382,6 +386,11 @@ $left = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue | Wh
     $_.Path -and ($targets -contains $_.Path.ToLowerInvariant())
 })
 foreach ($process in $left) { Stop-Process -Id $process.Id -Force }
+if ($left.Count) { Wait-Process -Id $left.Id -Timeout 10 -ErrorAction SilentlyContinue }
+$survivors = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and ($targets -contains $_.Path.ToLowerInvariant())
+})
+if ($survivors.Count) { throw "Cortex app process did not stop after the force deadline" }
 """
     env["CORTEX_RELEASE_STOP_TIMEOUT"] = str(force_after_seconds)
     run(["powershell.exe", "-NoProfile", "-Command", script], timeout=force_after_seconds + 30, env=env)
@@ -586,7 +595,12 @@ def active_pointer(data_dir: Path, release_root: Path) -> dict[str, Any] | None:
 
 def register_release_tasks(manifest: dict[str, Any]) -> None:
     root = Path(str(manifest["directory"]))
-    powershell_file(root / "scripts" / "ops" / "cortex-watchdog.ps1", "-Register")
+    powershell_file(
+        root / "scripts" / "ops" / "cortex-watchdog.ps1",
+        "-Register",
+        "-TaskName",
+        WATCHDOG_TASK,
+    )
     powershell_file(root / "scripts" / "ops" / "cortex-daily-restore-drill.ps1", "-Register")
 
 
@@ -616,6 +630,7 @@ def recover(data_dir: Path, release_root: Path) -> bool:
     )
     write_maintenance(data_dir, str(candidate["releaseId"]))
     task_change(WATCHDOG_TASK, False, allow_missing=True)
+    task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
     stop_paths = [Path(str(candidate["appExe"]))]
     if previous:
         stop_paths.append(Path(str(previous["appExe"])))
@@ -632,15 +647,19 @@ def recover(data_dir: Path, release_root: Path) -> bool:
         (data_dir / POINTER_FILE).unlink(missing_ok=True)
         (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)
         fallback_watchdog = Path(str(journal.get("fallbackWatchdog", "")))
-        if fallback_watchdog.is_file():
-            powershell_file(fallback_watchdog, "-Register")
+        if not fallback_watchdog.is_file():
+            raise ReleaseError("pre-migration rollback has no verified fallback watchdog")
+        unregister_task(WATCHDOG_TASK)
+        # The pre-managed watchdog may be an administrator-owned task. The logged-on reviewer
+        # account can safely disable/enable it but cannot replace its action. Re-enable the proven
+        # legacy task instead of trying to overwrite protected Task Scheduler authority.
+        task_change(LEGACY_WATCHDOG_TASK, True)
         if fallback_app is None or not fallback_app.is_file():
             raise ReleaseError("pre-migration rollback has no verified fallback app")
         launch_app(fallback_app)
         wait_for_server(8737)
         prove_links(data_dir, candidate, funnel=False)
         prove_links(data_dir, candidate, funnel=True)
-        task_change(WATCHDOG_TASK, True)
         journal_path.unlink(missing_ok=True)
         unregister_task(RECOVERY_TASK)
         if preserved is None:
@@ -664,6 +683,7 @@ def recover(data_dir: Path, release_root: Path) -> bool:
     prove_canonical_queues(data_dir, target)
     register_release_tasks(target)
     task_change(WATCHDOG_TASK, True)
+    task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
     (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)
     journal_path.unlink(missing_ok=True)
     unregister_task(RECOVERY_TASK)
@@ -726,7 +746,8 @@ def deploy(args: argparse.Namespace) -> int:
     atomic_json(data_dir / JOURNAL_FILE, journal)
     recovery = Path(str(manifest["directory"])) / "scripts" / "ops" / "cortex-release-recovery.ps1"
     powershell_file(recovery, "-Register")
-    task_change(WATCHDOG_TASK, False)
+    task_change(LEGACY_WATCHDOG_TASK, False)
+    task_change(WATCHDOG_TASK, False, allow_missing=True)
 
     try:
         current_app = Path(str(previous["appExe"])) if previous else fallback_app
@@ -757,6 +778,7 @@ def deploy(args: argparse.Namespace) -> int:
         prove_links(data_dir, manifest, funnel=True)
         register_release_tasks(manifest)
         task_change(WATCHDOG_TASK, True)
+        task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
         if max_pool_decision_id(db) != baseline:
             raise ReleaseError("review decision history changed before candidate exposure")
         (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)

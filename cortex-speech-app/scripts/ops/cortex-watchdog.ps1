@@ -27,7 +27,12 @@
 # and it could not be: proving it for real means pressing Stop, which deletes the session file and
 # revokes the owner's live link. Ports and paths are overridable for the same reason — a drill must
 # never touch the real profile. Production behaviour is unchanged when neither is set.
-param([switch]$Register, [switch]$DryRun)
+param(
+    [switch]$Register,
+    [switch]$DryRun,
+    [ValidateSet('CortexWatchdog', 'CortexPrivateProductionWatchdog')]
+    [string]$TaskName = 'CortexWatchdog'
+)
 
 $ErrorActionPreference = 'Stop'
 $repoApp = Resolve-Path (Join-Path $PSScriptRoot '..\..')   # cortex-speech-app/
@@ -159,10 +164,10 @@ if ($Register) {
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName 'CortexWatchdog' -Action $action -Trigger $logon `
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $logon `
         -Settings $settings -Force | Out-Null
     Write-Log "registered (exe: $exe)"
-    Write-Output "CortexWatchdog registered: at-logon + every 5 minutes, run-only-when-logged-on."
+    Write-Output "$TaskName registered: at-logon + every 5 minutes, run-only-when-logged-on."
     exit 0
 }
 
