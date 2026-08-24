@@ -700,6 +700,7 @@ def test_schema64_evidence_requires_duplicate_authority_only_at_v64() -> None:
     assert at_64[-len(drill_module.POOL_DEDUP_EVIDENCE_TABLES) :] == (
         drill_module.POOL_DEDUP_EVIDENCE_TABLES
     )
+    assert drill_module.evidence_tables_for_schema(65) == at_64
 
 
 def main() -> int:

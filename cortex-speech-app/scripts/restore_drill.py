@@ -102,7 +102,7 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def evidence_tables_for_schema(schema_version: int) -> tuple[str, ...]:
-    """Preserve old evidence shapes and bind every durable review authority through v64."""
+    """Preserve old evidence shapes and bind every durable review authority through v65."""
 
     tables = BASE_EVIDENCE_TABLES
     if schema_version >= HIDDEN_KEY_SCHEMA_VERSION:

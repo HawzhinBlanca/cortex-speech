@@ -41,7 +41,7 @@ def flexible_report() -> dict[str, object]:
         "readOnly": True,
         "generatedAtEpochSecs": 1_700_000_000,
         "appGitSha": "b" * 40,
-        "databaseSchemaVersion": 64,
+        "databaseSchemaVersion": 65,
         "pool": {
             "poolId": "123e4567-e89b-42d3-a456-426614174000",
             "focusSegmentCount": 2,

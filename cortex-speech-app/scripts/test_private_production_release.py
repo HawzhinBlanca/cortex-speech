@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 APP = Path(__file__).resolve().parent.parent
 SUBJECT = APP / "scripts" / "release_private_production.py"
@@ -120,14 +121,34 @@ def test_candidate_inside_live_release_root_is_refused() -> None:
             raise AssertionError("a build inside the live release root is not an isolated candidate")
 
 
-def test_schema_rollback_policy_never_destroys_new_v64_work() -> None:
-    assert release.rollback_policy(63, 64, 2, 2, None) == "restore-pre-migration"
+def test_schema_rollback_policy_never_destroys_new_v65_work() -> None:
+    assert release.rollback_policy(63, 65, 2, 2, None) == "restore-pre-migration"
     assert release.rollback_policy(63, 63, 2, 2, None) == "resume-pre-migration"
-    assert release.rollback_policy(63, 64, 2, 3, None) == "preserve-v64"
-    assert release.rollback_policy(64, 64, 20, 20, 64) == "binary-only"
-    assert release.rollback_policy(64, 64, 20, 21, 64) == "binary-only"
-    assert release.rollback_policy(64, 64, 20, 20, None) == "blocked"
+    assert release.rollback_policy(63, 65, 2, 3, None) == "preserve-current"
+    assert release.rollback_policy(64, 65, 20, 20, 64) == "restore-pre-migration"
+    assert release.rollback_policy(64, 64, 20, 20, 64) == "resume-pre-migration"
+    assert release.rollback_policy(64, 65, 20, 21, 64) == "preserve-current"
+    assert release.rollback_policy(65, 65, 20, 20, 65) == "binary-only"
+    assert release.rollback_policy(65, 65, 20, 21, 65) == "binary-only"
+    assert release.rollback_policy(65, 65, 20, 20, 64) == "blocked"
     assert release.rollback_policy(63, 63, 2, 3, None) == "blocked"
+
+
+def test_schema64_release_is_accepted_only_as_a_compatible_previous_boundary() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        source, candidate, releases = base / "source", base / "candidate", base / "releases"
+        seed_source(source)
+        seed_candidate(candidate)
+        manifest = release.stage_release(candidate, source, releases, "e" * 40)
+        manifest["expectedDatabaseSchema"] = 64
+        assert release.validate_manifest(manifest, expected_root=releases, allow_compatible_previous=True) == manifest
+        try:
+            release.validate_manifest(manifest, expected_root=releases)
+        except release.ReleaseError as error:
+            assert "database schema" in str(error)
+        else:
+            raise AssertionError("a schema-64 release must not be accepted as a schema-65 candidate")
 
 
 def test_stop_app_targets_one_exact_executable_and_waits_for_exit() -> None:
@@ -160,8 +181,8 @@ def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
         data.mkdir()
         snapshot.mkdir()
         for path, version, marker in (
-            (data / "cortex-speech.db", 64, "failed-v64"),
-            (snapshot / "cortex-speech.db", 63, "known-good-v63"),
+            (data / "cortex-speech.db", 65, "failed-v65"),
+            (snapshot / "cortex-speech.db", 64, "known-good-v64"),
         ):
             connection = sqlite3.connect(path)
             connection.executescript(
@@ -172,12 +193,81 @@ def test_restore_preserves_failed_database_and_verifies_snapshot() -> None:
             connection.execute("INSERT INTO marker VALUES(?)", (marker,))
             connection.commit()
             connection.close()
-        preserved = release.restore_database(snapshot, data, 63)
-        assert release.database_schema(data / "cortex-speech.db") == 63
-        assert release.database_schema(preserved) == 64
+        preserved = release.restore_database(snapshot, data, 64)
+        assert release.database_schema(data / "cortex-speech.db") == 64
+        assert release.database_schema(preserved) == 65
         connection = sqlite3.connect(data / "cortex-speech.db")
-        assert connection.execute("SELECT value FROM marker").fetchone()[0] == "known-good-v63"
+        assert connection.execute("SELECT value FROM marker").fetchone()[0] == "known-good-v64"
         connection.close()
+
+
+def test_recovery_restores_schema64_and_reactivates_managed_previous_release() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        source, releases, data, snapshot = (
+            base / "source",
+            base / "releases",
+            base / "data",
+            base / "snapshot",
+        )
+        seed_source(source)
+        candidate_dir, previous_dir = base / "candidate", base / "previous"
+        seed_candidate(candidate_dir, b"candidate-v65", b"candidate-admin-v65")
+        seed_candidate(previous_dir, b"previous-v64", b"previous-admin-v64")
+        candidate = release.stage_release(candidate_dir, source, releases, "a" * 40)
+        previous = release.stage_release(previous_dir, source, releases, "b" * 40)
+        previous["expectedDatabaseSchema"] = 64
+        data.mkdir()
+        snapshot.mkdir()
+        for path, version, marker in (
+            (data / "cortex-speech.db", 65, "failed-v65"),
+            (snapshot / "cortex-speech.db", 64, "known-good-v64"),
+        ):
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, description TEXT);"
+                f"INSERT INTO schema_migrations VALUES({version}, 'test');"
+                "CREATE TABLE review_pool_decisions(id INTEGER PRIMARY KEY);"
+                "CREATE TABLE marker(value TEXT);"
+            )
+            connection.execute("INSERT INTO marker VALUES(?)", (marker,))
+            connection.commit()
+            connection.close()
+        release.atomic_json(
+            data / release.JOURNAL_FILE,
+            {
+                "schema": 1,
+                "phase": "migrated",
+                "startedAtUtc": release.utc_now(),
+                "sourceSchema": 64,
+                "baselinePoolDecisionId": 0,
+                "candidate": candidate,
+                "previousActive": previous,
+                "fallbackApp": None,
+                "fallbackWatchdog": None,
+                "snapshotDir": str(snapshot),
+            },
+        )
+        calls: list[tuple[str, object]] = []
+        with (
+            mock.patch.object(release, "task_change"),
+            mock.patch.object(release, "stop_app"),
+            mock.patch.object(release, "launch_app", side_effect=lambda path: calls.append(("launch", path))),
+            mock.patch.object(release, "wait_for_server"),
+            mock.patch.object(
+                release, "certify_live", side_effect=lambda _data, manifest: calls.append(("certify", manifest))
+            ),
+            mock.patch.object(release, "prove_links"),
+            mock.patch.object(release, "prove_canonical_queues"),
+            mock.patch.object(release, "register_release_tasks"),
+            mock.patch.object(release, "unregister_task"),
+        ):
+            assert release.recover(data, releases)
+        assert release.database_schema(data / "cortex-speech.db") == 64
+        assert json.loads((data / release.POINTER_FILE).read_text(encoding="utf-8"))["releaseId"] == previous["releaseId"]
+        assert calls == [("launch", Path(previous["appExe"])), ("certify", previous)]
+        assert not (data / release.MAINTENANCE_FILE).exists()
+        assert not (data / release.JOURNAL_FILE).exists()
 
 
 def test_watchdog_and_server_pin_the_release_boundary() -> None:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail-closed final certificate for the active review mode.
 
-Flexible schema-64 production intentionally has no hidden-check pilot. In that mode this gate
+Flexible schema-65 production intentionally has no hidden-check pilot. In that mode this gate
 validates the immutable active release, runs its exact hash-bound ``pool_admin certify`` binary on a
 detached database copy, and requires review-ready database/audio/rights/disk/snapshot authority. It
 does not confuse review readiness with a completed dataset.

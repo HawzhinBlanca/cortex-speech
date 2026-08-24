@@ -922,7 +922,7 @@ mod tests {
         )
         .unwrap();
         db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [TEST_CHAMPION]).unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![65, 64, 63, 62, 61, 60]);
         let mut duplicate_segment = reviewed_segment("duplicate", &duplicate_master, 500, 1_500, false);
         duplicate_segment.annotated_transcript = None;
         duplicate_segment.verdict = None;
@@ -941,7 +941,7 @@ mod tests {
                 .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id=?2", [audio_hash, &segment.id])
                 .unwrap();
         }
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65]);
         let pool = review_pool::activate(
             &db,
             "123e4567-e89b-42d3-a456-426614174070",

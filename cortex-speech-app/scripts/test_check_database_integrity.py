@@ -141,8 +141,8 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         self.assertEqual(report["quickCheck"], ["ok"])
         self.assertEqual(report["integrityCheck"], ["ok"])
         self.assertEqual(report["foreignKeyViolations"], 0)
-        self.assertEqual(report["schemaVersion"], 64)
-        self.assertEqual(report["migrationHistoryEntries"], 64)
+        self.assertEqual(report["schemaVersion"], 65)
+        self.assertEqual(report["migrationHistoryEntries"], 65)
         self.assertEqual(report["v58HypothesisArchiveRows"], 0)
         self.assertEqual(report["v58Loop0ArchiveRows"], 0)
         self.assertEqual(report["v58ImmutableTriggers"], 6)
@@ -334,8 +334,8 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
         self.assertEqual(report["schemaVersion"], 59)
-        self.assertEqual(report["requiredSchemaVersion"], 64)
-        self.assertTrue(any("missing=[60, 61, 62, 63, 64]" in error for error in report["errors"]), report)
+        self.assertEqual(report["requiredSchemaVersion"], 65)
+        self.assertTrue(any("missing=[60, 61, 62, 63, 64, 65]" in error for error in report["errors"]), report)
 
     def test_missing_middle_history_or_wrong_description_is_red(self):
         connection = sqlite3.connect(self.db)
@@ -345,7 +345,7 @@ class DatabaseIntegrityGateTests(unittest.TestCase):
         connection.close()
         code, report = self.run_gate()
         self.assertEqual(code, 1, report)
-        self.assertEqual(report["schemaVersion"], 64, "MAX alone would falsely green this fixture")
+        self.assertEqual(report["schemaVersion"], 65, "MAX alone would falsely green this fixture")
         self.assertTrue(any("missing=[23]" in error for error in report["errors"]), report)
         self.assertTrue(any("descriptionMismatch=[31]" in error for error in report["errors"]), report)
 

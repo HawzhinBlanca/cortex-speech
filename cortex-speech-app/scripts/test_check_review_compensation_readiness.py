@@ -252,6 +252,8 @@ class CompensationReadinessGateTests(unittest.TestCase):
         connection.executescript(
             """
             INSERT INTO schema_migrations VALUES (63, 'flexible pool fixture');
+            INSERT INTO schema_migrations VALUES (64, 'dedup fixture');
+            INSERT INTO schema_migrations VALUES (65, 'rights-lineage fixture');
             CREATE TABLE review_pool_registry(
                 singleton_key INTEGER, pool_id TEXT, focus_segment_count INTEGER,
                 focus_sha256 TEXT, created_at TEXT

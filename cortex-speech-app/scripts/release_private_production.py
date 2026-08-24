@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-EXPECTED_SCHEMA = 64
+EXPECTED_SCHEMA = 65
+COMPATIBLE_PREVIOUS_SCHEMA = 64
 POINTER_FILE = "active-private-production-release.json"
 JOURNAL_FILE = "pending-private-production-release.json"
 MAINTENANCE_FILE = "private-production-maintenance.json"
@@ -175,11 +176,11 @@ def operations_bundle_sha256(root: Path) -> str:
 
 
 def validate_manifest(
-    value: dict[str, Any], *, expected_root: Path | None = None, allow_legacy_v63: bool = False
+    value: dict[str, Any], *, expected_root: Path | None = None, allow_compatible_previous: bool = False
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ReleaseError("release manifest must be one JSON object")
-    legacy_v63 = allow_legacy_v63 and set(value) == LEGACY_V63_MANIFEST_FIELDS
+    legacy_v63 = allow_compatible_previous and set(value) == LEGACY_V63_MANIFEST_FIELDS
     if set(value) != MANIFEST_FIELDS and not legacy_v63:
         raise ReleaseError(
             f"release manifest fields are invalid (missing={sorted(MANIFEST_FIELDS - set(value))}, "
@@ -187,9 +188,13 @@ def validate_manifest(
         )
     if type(value["schema"]) is not int or value["schema"] != 1:
         raise ReleaseError("release manifest schema must be integer 1")
-    required_schema = 63 if legacy_v63 else EXPECTED_SCHEMA
-    if type(value["expectedDatabaseSchema"]) is not int or value["expectedDatabaseSchema"] != required_schema:
-        raise ReleaseError(f"release manifest must require database schema {required_schema}")
+    required_schemas = (
+        {63}
+        if legacy_v63
+        else ({COMPATIBLE_PREVIOUS_SCHEMA, EXPECTED_SCHEMA} if allow_compatible_previous else {EXPECTED_SCHEMA})
+    )
+    if type(value["expectedDatabaseSchema"]) is not int or value["expectedDatabaseSchema"] not in required_schemas:
+        raise ReleaseError(f"release manifest must require database schema in {sorted(required_schemas)}")
     if not isinstance(value["appGitSha"], str) or not SHA40.fullmatch(value["appGitSha"]):
         raise ReleaseError("release manifest appGitSha is invalid")
     directory = Path(str(value["directory"])).resolve(strict=True)
@@ -619,7 +624,7 @@ def rollback_policy(source_schema: int, current_schema: int, baseline_id: int, c
     if current_id > baseline_id:
         if current_schema == EXPECTED_SCHEMA and previous_schema == EXPECTED_SCHEMA:
             return "binary-only"
-        return "preserve-v64" if current_schema == EXPECTED_SCHEMA else "blocked"
+        return "preserve-current" if current_schema == EXPECTED_SCHEMA else "blocked"
     if source_schema < EXPECTED_SCHEMA and current_schema == EXPECTED_SCHEMA:
         return "restore-pre-migration"
     if source_schema < EXPECTED_SCHEMA and current_schema == source_schema:
@@ -638,7 +643,7 @@ def write_maintenance(data_dir: Path, release_id: str) -> None:
 
 def active_pointer(data_dir: Path, release_root: Path) -> dict[str, Any] | None:
     path = data_dir / POINTER_FILE
-    return validate_manifest(load_json(path), expected_root=release_root, allow_legacy_v63=True) if path.is_file() else None
+    return validate_manifest(load_json(path), expected_root=release_root, allow_compatible_previous=True) if path.is_file() else None
 
 
 def register_release_tasks(manifest: dict[str, Any]) -> None:
@@ -663,7 +668,7 @@ def recover(data_dir: Path, release_root: Path) -> bool:
     if previous is not None:
         if not isinstance(previous, dict):
             raise ReleaseError("release journal previousActive is invalid")
-        previous = validate_manifest(previous, expected_root=release_root, allow_legacy_v63=True)
+        previous = validate_manifest(previous, expected_root=release_root, allow_compatible_previous=True)
     source_schema = int(journal["sourceSchema"])
     baseline = int(journal["baselinePoolDecisionId"])
     db = data_dir / "cortex-speech.db"
@@ -692,6 +697,23 @@ def recover(data_dir: Path, release_root: Path) -> bool:
         if mode == "restore-pre-migration":
             snapshot = Path(str(journal.get("snapshotDir", ""))).resolve(strict=True)
             preserved = restore_database(snapshot, data_dir, source_schema)
+        if previous is not None and int(previous["expectedDatabaseSchema"]) == source_schema:
+            atomic_json(data_dir / POINTER_FILE, previous)
+            launch_app(Path(str(previous["appExe"])))
+            wait_for_server(8737)
+            certify_live(data_dir, previous)
+            prove_links(data_dir, previous, funnel=False)
+            prove_links(data_dir, previous, funnel=True)
+            prove_canonical_queues(data_dir, previous)
+            register_release_tasks(previous)
+            task_change(WATCHDOG_TASK, True)
+            task_change(LEGACY_WATCHDOG_TASK, False, allow_missing=True)
+            (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)
+            journal_path.unlink(missing_ok=True)
+            unregister_task(RECOVERY_TASK)
+            action = "resumed" if preserved is None else f"restored; failed schema-v{current_schema} database preserved at {preserved}"
+            print(f"RELEASE RECOVERY: {action} managed schema-v{source_schema} release {previous['releaseId']}")
+            return True
         (data_dir / POINTER_FILE).unlink(missing_ok=True)
         (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)
         fallback_watchdog = Path(str(journal.get("fallbackWatchdog", "")))
@@ -713,14 +735,14 @@ def recover(data_dir: Path, release_root: Path) -> bool:
         if preserved is None:
             print(f"RELEASE RECOVERY: resumed unchanged schema v{source_schema} fallback")
         else:
-            print(f"RELEASE RECOVERY: restored schema v{source_schema}; failed v64 database preserved at {preserved}")
+            print(f"RELEASE RECOVERY: restored schema v{source_schema}; failed schema-v{current_schema} database preserved at {preserved}")
         return True
 
-    target = previous if mode == "binary-only" else candidate if mode == "preserve-v64" else None
+    target = previous if mode == "binary-only" else candidate if mode == "preserve-current" else None
     if target is None:
         raise ReleaseError(
             "automatic rollback is blocked: restoring an older database could destroy reviewer work, "
-            "and no schema-64-compatible last-known-good release is available"
+            f"and no schema-{EXPECTED_SCHEMA}-compatible last-known-good release is available"
         )
     atomic_json(data_dir / POINTER_FILE, target)
     launch_app(Path(str(target["appExe"])))
@@ -735,7 +757,10 @@ def recover(data_dir: Path, release_root: Path) -> bool:
     (data_dir / MAINTENANCE_FILE).unlink(missing_ok=True)
     journal_path.unlink(missing_ok=True)
     unregister_task(RECOVERY_TASK)
-    print(f"RELEASE RECOVERY: activated schema-64-compatible release {target['releaseId']} without restoring the database")
+    print(
+        f"RELEASE RECOVERY: activated schema-{EXPECTED_SCHEMA}-compatible release "
+        f"{target['releaseId']} without restoring the database"
+    )
     return True
 
 
@@ -750,8 +775,11 @@ def deploy(args: argparse.Namespace) -> int:
     if (data_dir / JOURNAL_FILE).exists():
         raise ReleaseError("a prior release handover is unfinished; run the recover command first")
     source_schema = database_schema(db)
-    if source_schema not in {63, EXPECTED_SCHEMA}:
-        raise ReleaseError(f"deployment accepts only the proven v63->v64 or v64->v64 path, not schema v{source_schema}")
+    if source_schema not in {63, COMPATIBLE_PREVIOUS_SCHEMA, EXPECTED_SCHEMA}:
+        raise ReleaseError(
+            f"deployment accepts only the proven v63/v{COMPATIBLE_PREVIOUS_SCHEMA}->v{EXPECTED_SCHEMA} "
+            f"or v{EXPECTED_SCHEMA}->v{EXPECTED_SCHEMA} path, not schema v{source_schema}"
+        )
     session_reviewers(data_dir)
     previous = active_pointer(data_dir, release_root)
     if (
@@ -761,7 +789,9 @@ def deploy(args: argparse.Namespace) -> int:
     ):
         raise ReleaseError("the active release pointer is not compatible with the pre-migration database")
     if source_schema == EXPECTED_SCHEMA and previous is None:
-        raise ReleaseError("a schema-64 deployment requires a versioned last-known-good active release")
+        raise ReleaseError(
+            f"a schema-{EXPECTED_SCHEMA} deployment requires a versioned last-known-good active release"
+        )
     manifest = stage_release(args.candidate_dir, args.source_root, release_root, args.git_sha, args.dedup_manifest)
     print(f"STAGED_RELEASE={manifest['releaseId']}")
     preflight = preflight_clone(data_dir, manifest)
@@ -777,7 +807,9 @@ def deploy(args: argparse.Namespace) -> int:
     fallback_app = args.fallback_app.resolve(strict=True) if args.fallback_app else None
     fallback_watchdog = args.fallback_watchdog.resolve(strict=True) if args.fallback_watchdog else None
     if previous is None and (fallback_app is None or fallback_watchdog is None):
-        raise ReleaseError("the first managed v63->v64 deployment requires --fallback-app and --fallback-watchdog")
+        raise ReleaseError(
+            f"the first managed pre-v{EXPECTED_SCHEMA} deployment requires --fallback-app and --fallback-watchdog"
+        )
 
     baseline = max_pool_decision_id(db)
     journal: dict[str, Any] = {

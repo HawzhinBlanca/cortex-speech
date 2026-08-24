@@ -2694,9 +2694,9 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![65, 64, 63, 62, 61, 60]);
         db.insert_segment_full(&reviewed_segment("clip", &audio, "Rubar", first_text)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65]);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
             .unwrap();
@@ -2714,7 +2714,7 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![65, 64, 63, 62, 61, 60]);
         for id in ["a", "b"] {
             let audio = dir.path().join(format!("{id}.wav"));
             std::fs::write(&audio, b"wav").unwrap();
@@ -2725,7 +2725,7 @@ mod tests {
             };
             db.insert_segment_full(&row).unwrap();
         }
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65]);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='a'", ["a".repeat(64)])
             .unwrap();
@@ -2928,7 +2928,41 @@ mod tests {
         )
         .unwrap_err()
         .contains("outside the active review pool"));
-        assert!(crate::migrations::rollback(&db, 1).unwrap_err().to_string().contains("CHECK constraint failed"));
+        assert!(crate::migrations::rollback(&db, 2).unwrap_err().to_string().contains("CHECK constraint failed"));
+    }
+
+    #[test]
+    fn excluded_duplicates_retain_rights_revocation_lineage_but_not_review_authority() {
+        let (_dir, db, source_pool) = two_clip_pool(None);
+        let manifest = dedup_manifest(&source_pool, "a", None, 1_000);
+        apply_dedup_manifest(&db, &manifest).unwrap();
+        let before_revision: i64 = db
+            .connection()
+            .query_row("SELECT review_revision FROM speech_segments WHERE id='b'", [], |row| row.get(0))
+            .unwrap();
+
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET rights_revoked_at='2026-08-24T00:00:00Z', updated_at=datetime('now')
+                  WHERE id='b'",
+                [],
+            )
+            .expect("excluded duplicate must retain non-review rights-revocation lineage");
+        let (revoked_at, after_revision): (String, i64) = db
+            .connection()
+            .query_row("SELECT rights_revoked_at, review_revision FROM speech_segments WHERE id='b'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(revoked_at, "2026-08-24T00:00:00Z");
+        assert_eq!(after_revision, before_revision + 1, "metadata changes retain the CAS lineage");
+        assert!(db
+            .connection()
+            .execute("UPDATE speech_segments SET verified=1 WHERE id='b'", [])
+            .expect_err("excluded duplicate must never gain canonical review evidence")
+            .to_string()
+            .contains("excluded duplicate clip cannot receive canonical review evidence"));
     }
 
     #[test]
@@ -3016,10 +3050,10 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 5).unwrap(), vec![64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![65, 64, 63, 62, 61, 60]);
         db.insert_segment_full(&segment("first", &first_audio, Some("Rubar"))).unwrap();
         db.insert_segment_full(&segment("second", &second_audio, None)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65]);
         db.connection()
             .execute(
                 "UPDATE speech_segments

@@ -886,6 +886,7 @@ def test_schema64_evidence_includes_duplicate_authority_only_at_v64() -> None:
     at_64 = snapshot.evidence_tables_for_schema(64)
     assert not set(snapshot.POOL_DEDUP_COUNT_TABLES) & set(at_63)
     assert at_64[-len(snapshot.POOL_DEDUP_COUNT_TABLES) :] == snapshot.POOL_DEDUP_COUNT_TABLES
+    assert snapshot.evidence_tables_for_schema(65) == at_64
 
 
 def main() -> int:

@@ -1762,7 +1762,7 @@ mod tests {
         let schema1: serde_json::Value =
             serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
         let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
-        assert_eq!(evidence.schema_version, 64);
+        assert_eq!(evidence.schema_version, 65);
         assert_eq!(evidence.row_counts.review_pilot_hidden_keys, Some(0));
         assert_eq!(evidence.row_counts.review_campaign_registry, Some(0));
         assert_eq!(evidence.row_counts.review_pool_registry, Some(0));
@@ -2098,7 +2098,7 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![64, 63, 62, 61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![65, 64, 63, 62, 61, 60, 59, 58]);
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pre-upgrade-row".to_string(),
             audio_path: "/must-survive.wav".to_string(),
@@ -2118,7 +2118,7 @@ mod tests {
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("an established v57 profile requires a pin");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 64);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 65);
         assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the migration pin must be self-verifying");
         let pinned = Database::open(pin.join(DB_FILE).to_string_lossy().as_ref()).unwrap();
         assert_eq!(crate::migrations::get_current_version(&pinned).unwrap(), 57);
@@ -2136,12 +2136,12 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![64, 63, 62, 61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![65, 64, 63, 62, 61, 60, 59, 58]);
 
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("a v57 profile requires a complete safety pin even when config uses defaults");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 64);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 65);
         for state in OPTIONAL_SNAPSHOT_STATE {
             assert_eq!(std::fs::read(pin.join(state.absent_file)).unwrap(), state.absent_bytes);
         }
