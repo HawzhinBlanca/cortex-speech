@@ -71,18 +71,22 @@ fn usage() -> &'static str {
     "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <DISPOSABLE-clone.db> --iterations <1..500> --confirm-disposable\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
 }
 
-const READ_COMMANDS: &[&str] = &["inventory", "status", "certify", "probe", "benchmark"];
+const DETACHED_READ_COMMANDS: &[&str] = &["certify"];
+const DIRECT_READ_COMMANDS: &[&str] = &["inventory", "status", "probe", "benchmark"];
 const WRITE_COMMANDS: &[&str] = &["migrate", "activate", "benchmark-commit", "stamp-rights", "adjudicate", "export"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseAccess {
-    ReadOnly,
+    DetachedRead,
+    DirectRead,
     LockedWrite,
 }
 
 fn command_database_access(command: &str) -> Result<DatabaseAccess, String> {
-    if READ_COMMANDS.contains(&command) {
-        Ok(DatabaseAccess::ReadOnly)
+    if DETACHED_READ_COMMANDS.contains(&command) {
+        Ok(DatabaseAccess::DetachedRead)
+    } else if DIRECT_READ_COMMANDS.contains(&command) {
+        Ok(DatabaseAccess::DirectRead)
     } else if WRITE_COMMANDS.contains(&command) {
         Ok(DatabaseAccess::LockedWrite)
     } else {
@@ -572,14 +576,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    // Certification, status, inventory, probe, and queue benchmark are observational tools. Opening them
-    // through the normal startup path could change WAL pragmas or invoke corruption recovery on the
-    // live database. The source is opened with SQLite READ_ONLY + query_only inside one stable read
-    // transaction: accidental writes fail, not merely disappear into a disposable copy, and the
-    // five-minute certifier does not copy the entire production DB into RAM. Only instance-locked
-    // writer commands receive source write authority.
+    // Observational tools must never use the startup/recovery opener. Ordinary reads use SQLite's
+    // source-enforced READ_ONLY flag and one stable transaction. Certification needs a detached,
+    // writable in-memory copy because this build of SQLite's FTS5 integrity validation performs an
+    // internal write even for PRAGMA quick_check/integrity_check; source READ_ONLY correctly refuses
+    // that operation and would produce a false corruption report. The backup is WAL-consistent and
+    // any internal or accidental write stays disposable. Only instance-locked commands receive source
+    // write authority.
     let db = match database_access {
-        DatabaseAccess::ReadOnly => Database::open_read_only(&db_path.to_string_lossy())?,
+        DatabaseAccess::DetachedRead => Database::open_detached_read_snapshot(&db_path.to_string_lossy())?,
+        DatabaseAccess::DirectRead => Database::open_read_only(&db_path.to_string_lossy())?,
         DatabaseAccess::LockedWrite => Database::open_with_retry(&db_path.to_string_lossy())?,
     };
     if command == "migrate" {
@@ -1042,14 +1048,19 @@ mod tests {
 
     #[test]
     fn every_admin_command_has_an_explicit_read_or_locked_write_boundary() {
-        for command in READ_COMMANDS {
-            assert_eq!(command_database_access(command), Ok(DatabaseAccess::ReadOnly), "{command}");
+        for command in DETACHED_READ_COMMANDS {
+            assert_eq!(command_database_access(command), Ok(DatabaseAccess::DetachedRead), "{command}");
+        }
+        for command in DIRECT_READ_COMMANDS {
+            assert_eq!(command_database_access(command), Ok(DatabaseAccess::DirectRead), "{command}");
         }
         for command in WRITE_COMMANDS {
             assert_eq!(command_database_access(command), Ok(DatabaseAccess::LockedWrite), "{command}");
         }
         assert!(command_database_access("unknown").is_err());
-        assert!(READ_COMMANDS.iter().all(|command| !WRITE_COMMANDS.contains(command)));
+        assert!(DETACHED_READ_COMMANDS.iter().all(|command| !DIRECT_READ_COMMANDS.contains(command)));
+        assert!(DETACHED_READ_COMMANDS.iter().all(|command| !WRITE_COMMANDS.contains(command)));
+        assert!(DIRECT_READ_COMMANDS.iter().all(|command| !WRITE_COMMANDS.contains(command)));
     }
 
     #[test]

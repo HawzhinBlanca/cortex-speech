@@ -1504,8 +1504,7 @@ impl Database {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.execute_batch(
-            "PRAGMA query_only=ON;
-             PRAGMA foreign_keys=ON;
+            "PRAGMA foreign_keys=ON;
              PRAGMA cache_size=-64000;
              PRAGMA busy_timeout=10000;
              BEGIN DEFERRED;",

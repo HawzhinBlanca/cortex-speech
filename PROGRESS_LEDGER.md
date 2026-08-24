@@ -11107,3 +11107,31 @@ preserved the failed v63 database in `recovery-quarantine`, relaunched the fallb
 links with 877 events and zero pool decisions unchanged. The watchdog now computes SHA-256 directly
 through `System.Security.Cryptography.SHA256`; a full valid immutable pointer passed in a throwaway
 profile, while the malformed-pointer refusal regression remains green.
+
+## 2026-08-24 — final non-human private-production boundary audit
+
+Starting from tested release `0a22485` and source-hardening commit `040e544`, audited every remaining
+non-human Milestone 1–3 boundary while the known-good reviewer release stayed live and GPUs remained
+untouched. Future production imports now require an existing explicit `CORTEX_APP_DATA_DIR` that is
+canonical-path separate from the live profile; missing, aliased, nested, ancestor, and live paths fail
+closed. `pool_admin` now classifies every command before database access: writers require the shared
+instance lock, ordinary observations use an OS/SQLite `READ_ONLY` stable transaction, and five-minute
+certification uses a WAL-consistent disposable in-memory snapshot because the bundled SQLite FTS5
+integrity validator performs an internal write and otherwise reports false corruption. Certification
+schema 2 separately reports human consensus, owner adjudication, and unresolved conflict totals.
+
+The rotating snapshot loop no longer sleeps ten minutes after a completed capture, which accumulated
+backup-duration drift beyond the ten-minute RPO. It advances from fixed monotonic deadlines on a
+nine-minute cadence, leaving a one-minute capture/jitter margin while retaining ten snapshots locally
+and off-drive.
+
+The first staged candidate was refused before deployment when its clone certification reported the
+FTS5/query-only incompatibility. The live database and reviewer server were not touched. Reproduction
+on a persistent live-sized clone proved source audio 20,323/20,323, exact rights 20,323/20,323, and
+healthy SQLite only when certification used the writable detached copy; focused regressions now pin
+that exact access split. Full post-correction evidence: Rust library 1,534 passed / 0 failed / 8
+hardware-or-model-isolated ignored; pool-admin binary 6/6; frontend 292/292; Playwright 97/97; typecheck
+0 errors and 0 warnings; ESLint, production Vite build, Rust formatting, all-target/all-feature Clippy
+with warnings denied, and `git diff --check` green. The complete 103-file Python run passed every
+technical policy and deliberately red-marked only this ledger as four commits stale; this entry closes
+that administrative gate before the final exact rerun and controlled handover.

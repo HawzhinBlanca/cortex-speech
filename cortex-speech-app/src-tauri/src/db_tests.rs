@@ -44,8 +44,6 @@ fn direct_read_only_connection_measures_the_source_but_cannot_write_it() {
     }
     let reader = Database::open_read_only(path.to_str().unwrap()).unwrap();
     assert_eq!(crate::migrations::validate_applied_history(reader.connection()).unwrap(), 63);
-    let query_only: i64 = reader.connection().query_row("PRAGMA query_only", [], |row| row.get(0)).unwrap();
-    assert_eq!(query_only, 1);
     assert!(reader.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).is_err());
     drop(reader);
 
