@@ -290,20 +290,28 @@ impl NativeKurdishAsrEngine {
         // a recognizer but decodes every clip to the WRONG graphemes, persisted as trustworthy, so it must
         // fail the same gate as a tampered ONNX.
         let (model_pin, tokens_pin) = match config.model_size {
-            AsrModelSize::CTC300M => {
-                (Some(crate::models::OMNIASR_CTC_300M_MODEL), Some(crate::models::OMNIASR_CTC_300M_TOKENS))
+            AsrModelSize::CTC300M => (crate::models::OMNIASR_CTC_300M_MODEL, crate::models::OMNIASR_CTC_300M_TOKENS),
+            AsrModelSize::CTC1B => (crate::models::OMNIASR_CTC_1B_MODEL, crate::models::OMNIASR_CTC_1B_TOKENS),
+            // The champion is a WSL server, never a local ONNX: its identity is proven by the exact
+            // `{model id, deploymentSha256}` handshake in `engine_runtime::LoadedChampionHealth::matches`,
+            // and no pinned digest exists for `models/omniasr-wsl-7b/`. Files found there would therefore
+            // load UNVERIFIED, and every clip they decoded would be stamped with the champion's own
+            // provenance id (`omniasr-wsl-7b`, pipeline.rs) — a silent identity forgery of the one piece
+            // of fixed infrastructure canon says must be exact. Absence is the normal case and already
+            // degraded gracefully above; PRESENCE is a hard stop, never an unpinned load.
+            AsrModelSize::WSL7B => {
+                return Err(format!(
+                    "refusing to load unpinned native model files under the champion's provenance id: {} — the \
+                     OmniASR-7B champion runs in WSL and is verified by its deploymentSha256 handshake, never \
+                     from this directory",
+                    model_path.display()
+                ))
             }
-            AsrModelSize::CTC1B => {
-                (Some(crate::models::OMNIASR_CTC_1B_MODEL), Some(crate::models::OMNIASR_CTC_1B_TOKENS))
-            }
-            AsrModelSize::WSL7B => (None, None), // no pinned digest for this size -> cannot verify
         };
         for (path, pin) in [(&model_path, model_pin), (&tokens_path, tokens_pin)] {
-            if let Some(pin) = pin {
-                if let Err(e) = crate::models::verify_model_path_runtime(path, pin) {
-                    tracing::error!("ASR model integrity check failed: {e}");
-                    return Err(e);
-                }
+            if let Err(e) = crate::models::verify_model_path_runtime(path, pin) {
+                tracing::error!("ASR model integrity check failed: {e}");
+                return Err(e);
             }
         }
 
@@ -1688,6 +1696,33 @@ mod tests {
             let lang_opt = stream.get_option("language");
             assert_eq!(lang_opt, "ckb");
         }
+    }
+
+    #[test]
+    fn unpinned_files_under_the_champions_provenance_id_are_refused_not_loaded() {
+        // The champion is fixed infrastructure whose identity is the deploymentSha256 handshake, so
+        // `models/omniasr-wsl-7b/` has no pinned digest. Before this gate, anything dropped there passed
+        // a bare exists() check and loaded UNVERIFIED while every clip it decoded was stamped
+        // `omniasr-wsl-7b` — the champion's own provenance id.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (model, tokens) = omniasr_model_paths(tmp.path(), &AsrModelSize::WSL7B);
+        write_sized_file(&model, 4096);
+        write_sized_file(&tokens, CTC_MIN_TOKEN_BYTES);
+        let config = AsrLoadConfig { model_size: AsrModelSize::WSL7B, enable_gpu: false, ..AsrLoadConfig::default() };
+
+        // Matched rather than `expect_err`: the Ok variant is the engine itself, which is not Debug.
+        let error = match NativeKurdishAsrEngine::new_with_config(tmp.path(), &config) {
+            Ok(_) => panic!("unpinned files carrying the champion's provenance id must never build a recognizer"),
+            Err(error) => error,
+        };
+        assert!(error.contains("deploymentSha256"), "the refusal must name the real identity check: {error}");
+
+        // An EMPTY directory is the normal installation and must still degrade gracefully — the champion
+        // simply does not live here — rather than turn every start into an error.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let engine = NativeKurdishAsrEngine::new_with_config(empty.path(), &config)
+            .expect("an absent local 7B directory is the normal case, not a failure");
+        assert!(!engine.is_available());
     }
 
     fn write_sized_file(path: &Path, size_bytes: u64) {

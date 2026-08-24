@@ -257,6 +257,16 @@ static PROMOTION_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// in that state would turn an explicitly unverified rollback into a silently serving deployment.
 static PROMOTION_RECOVERY_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set when a start OUTSIDE the supervision loop succeeded (the Start button, or a promotion/rollback
+/// restart). The loop consumes it on its next tick and arms a fresh warm-up grace. Without it those
+/// starts are invisible to the supervision state, so a tick landing seconds later probes a port that is
+/// not answering yet and tree-kills the owner's freshly started champion mid-load.
+static EXTERNAL_START_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_external_start() {
+    EXTERNAL_START_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub(crate) struct PromotionLease;
 
 impl Drop for PromotionLease {
@@ -584,6 +594,13 @@ fn ensure_start_allowed(during_promotion: bool) -> Result<(), String> {
     if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("app is shutting down — not starting the champion server".to_string());
     }
+    // The lease's exclusion of the supervisor and the Start button used to be check-then-act at each
+    // caller, so a tick or a click that passed its own check just before the saga acquired the lease
+    // could still spawn into the middle of a promotion. Re-check here, the one choke point every start
+    // routes through.
+    if !during_promotion && PROMOTION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("champion restart is owned by an active promotion/recovery".to_string());
+    }
     if !during_promotion && PROMOTION_RECOVERY_BLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("champion start is blocked because promotion recovery is unverified".to_string());
     }
@@ -636,10 +653,9 @@ fn start_child(app: &tauri::AppHandle, during_promotion: bool) -> Result<(), Str
 /// Restart the exact registry-selected deployment. Used by owner-approved promotion/rollback and
 /// by the Start button; no detached PowerShell process or model-dir environment is involved.
 pub fn restart_current_champion(app: &tauri::AppHandle) -> Result<(), String> {
-    if PROMOTION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err("champion restart is owned by an active promotion/recovery".to_string());
-    }
-    start_child(app, false)
+    start_child(app, false)?;
+    note_external_start();
+    Ok(())
 }
 
 /// Only the production promotion runtime may restart while it holds [`PromotionLease`].
@@ -647,7 +663,9 @@ pub(crate) fn restart_current_champion_for_promotion(app: &tauri::AppHandle) -> 
     if !PROMOTION_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("promotion restart requires the active promotion lease".to_string());
     }
-    start_child(app, true)
+    start_child(app, true)?;
+    note_external_start();
+    Ok(())
 }
 
 /// App-exit hook: refuse any further starts (closing the Exit-vs-tick race), then kill the child.
@@ -697,14 +715,28 @@ pub fn spawn_supervision_loop(app: tauri::AppHandle) {
                 continue;
             }
             was_enabled = true;
+            // The owner (Start button) or a promotion just started the champion behind our back. Adopt
+            // it with a fresh warm-up instead of probing a still-loading server and tree-killing it.
+            if EXTERNAL_START_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                state.manual_start(t0.elapsed());
+                gave_up_logged = false;
+            }
             let health_app = app.clone();
             let healthy =
                 tokio::task::spawn_blocking(move || exact_champion_ready(&health_app, Duration::from_secs(3)))
                     .await
                     .unwrap_or(false);
-            match state.tick(healthy, t0.elapsed()) {
+            let decision = state.tick(healthy, t0.elapsed());
+            match decision {
                 Decision::Restart => {
                     if let Err(e) = start_child(&app, false) {
+                        // The tick already committed the attempt and armed the 6-minute warm-up sized for
+                        // a successfully spawned ~30 GB load. A deterministic INSTANT spawn failure
+                        // (champion.json absent, cortex_7b_server.py unresolvable — the measured
+                        // 2026-08-18 class) would otherwise burn a whole warm-up window per attempt, so
+                        // GaveUp for a condition knowable at the first spawn takes ~50 minutes while the
+                        // state label reads "starting"/"recovering" the entire time. Charge it now.
+                        state.on_start_failed(t0.elapsed());
                         tracing::warn!("Champion supervision: start failed: {e}");
                     }
                 }
@@ -779,6 +811,68 @@ mod tests {
         assert!(ensure_start_allowed(true).is_ok(), "the saga must be able to restart candidate or incumbent");
         PROMOTION_RECOVERY_BLOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(champion_operational_block_reason().is_none());
+    }
+
+    #[test]
+    fn an_active_promotion_is_refused_at_the_start_choke_point() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        PROMOTION_RECOVERY_BLOCKED.store(false, std::sync::atomic::Ordering::SeqCst);
+        PROMOTION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let lease = acquire_promotion_lease().expect("the saga owns the lease");
+        // Previously only `restart_current_champion` checked, so the supervision tick could spawn into
+        // the middle of a promotion — and even the Start button's check was check-then-act.
+        let err = ensure_start_allowed(false).expect_err("supervisor and Start must both be excluded");
+        assert!(err.contains("promotion"), "{err}");
+        assert!(ensure_start_allowed(true).is_ok(), "the saga itself must still restart candidate or incumbent");
+        drop(lease);
+        assert!(ensure_start_allowed(false).is_ok(), "releasing the lease restores ordinary starts");
+    }
+
+    #[test]
+    fn an_external_start_re_arms_the_warmup_so_the_next_tick_cannot_kill_it() {
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        EXTERNAL_START_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+        note_external_start();
+        assert!(
+            EXTERNAL_START_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst),
+            "a Start-button/promotion restart must be visible to the supervision loop"
+        );
+        // Consuming it is exactly what the loop does: a fresh warm-up, so the next unhealthy tick WAITS
+        // instead of tree-killing a champion that is still loading ~30 GB of weights.
+        let mut state = SupervisionState::new(SupervisorPolicy::default(), WARMUP);
+        state.manual_start(Duration::from_secs(100));
+        assert_eq!(state.tick(false, Duration::from_secs(115)), Decision::Wait(WARMUP - Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn an_instant_start_failure_is_charged_now_not_after_the_warmup_grace() {
+        use crate::engine_supervisor::Breaker;
+
+        let mut state = SupervisionState::new(SupervisorPolicy::default(), WARMUP);
+        assert_eq!(state.tick(false, Duration::ZERO), Decision::Restart);
+        // start_child returned Err instantly: champion.json absent or cortex_7b_server.py unresolvable.
+        state.on_start_failed(Duration::ZERO);
+        assert_eq!(
+            state.supervisor().consecutive_failures(),
+            1,
+            "a spawn that never happened must not consume the warm-up meant for a loading server"
+        );
+        // The very next tick is real backoff, not a six-minute Wait for a process that does not exist.
+        assert_eq!(state.tick(false, Duration::from_secs(1)), Decision::Wait(Duration::from_secs(1)));
+
+        let mut now = TICK;
+        while state.breaker() != Breaker::GaveUp && now < Duration::from_secs(60 * 60) {
+            if state.tick(false, now) == Decision::Restart {
+                state.on_start_failed(now);
+            }
+            now += TICK;
+        }
+        assert_eq!(state.breaker(), Breaker::GaveUp, "a deterministic spawn failure must reach GaveUp");
+        assert!(
+            now < 3 * WARMUP,
+            "GaveUp took {now:?}: a spawn error must use the backoff/breaker math, not a warm-up window per attempt"
+        );
     }
 
     #[test]
