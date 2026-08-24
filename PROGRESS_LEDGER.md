@@ -11177,3 +11177,24 @@ pilot policy; pre-pool databases still fall back to the exact legacy contract. T
 tests and nine release-controller tests passed. Fresh read-only checks authenticated Alle and Rubar
 through both local HTTPS and the public Funnel without minting sessions, taking leases, or changing
 review data. This proof-only correction also requires no live release interruption.
+
+A deeper master-verifier run then reproduced two more legacy-only false blockers. The final review
+certificate demanded the retired 8,278-ID controlled-pilot focus, and compensation readiness demanded
+the absent pilot policy. The playback canary read only legacy `review_events`, so no future schema-63
+pool judgment could ever satisfy its 20-decision evidence bar. Commit
+`bd9235fb572d2e849f0ad7a7d869764b7a5f254f` selects all three authorities by the active review mode.
+Flexible production now hash-verifies the immutable active release and its own `pool_admin`, requires
+a fresh full-integrity report with internally consistent pool/champion/voice/resolution/audio/rights/
+disk/snapshot authority, proves legacy pay remains immutable but operationally deferred with zero
+post-pool event/ledger leakage, and audits effective pool decisions against their exact served
+revision, decoded-PCM hash, source span, duration, guard version, and playback receipt. Pre-pool mode
+retains every strict legacy canary and compensation requirement.
+
+Focused proof: review-mode certification 24/24, compensation 34/34, playback 35/35, and all 103
+Python policy files passed, including the full watchdog drill. The real flexible-mode certificate is
+green (`reviewReady=true`, `finalDatasetReady=false`); deferred compensation is green with zero
+post-pool legacy events, ledger entries, operation collisions, or foreign-key violations. The
+listening evidence gate is now truthfully reachable but remains externally incomplete at 0/20
+post-release decisions across two reviewer browsers. Reviewers satisfy that through ordinary game
+play; engineering does not fabricate or backdate it. No live database, reviewer server, or GPU was
+changed, so the healthy immutable release was deliberately not restarted.

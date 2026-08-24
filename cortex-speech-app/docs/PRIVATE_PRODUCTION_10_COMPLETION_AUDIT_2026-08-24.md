@@ -13,6 +13,9 @@ reviewer API, database schema, pool, model route, or runtime consensus behavior;
 not interrupted for this proof-only correction. Operational proof correction
 `cfa403162582b799c50bcb070c70d4a47f2f8d12` makes the link gate and release controller explicitly
 mode-aware; it also changes no reviewer-runtime semantics and required no live handover.
+Master-proof correction `bd9235fb572d2e849f0ad7a7d869764b7a5f254f` extends that selection to
+review certification, deferred compensation, and playback evidence while preserving every strict
+legacy-mode rule.
 
 This is a measured private-production result, not a claim of universal flawlessness, public-store
 readiness, or a completed dataset.
@@ -43,7 +46,7 @@ Primary evidence: `src-tauri/src/review_pool.rs` tests
 | Preserve links, sessions, decisions, operation IDs, outbox, and undo | PASS | Real Rubar/Alle localhost and Funnel authentication, valid WAV and idempotency probes after the v63 handover; 877 historical events preserved and no synthetic pool decisions created. |
 | Stop resolved circulation; allow exactly one third review | PASS | Review-pool queue and full 16-pair action matrix tests; concurrent HTTP reviewer tests; live queues show unresolved work without synthetic resolution. |
 | Queue p95 ≤750 ms; commit p95 ≤500 ms | PASS | Live-sized release: Rubar 153.54 ms, Alle 150.97 ms; two-reviewer decision commit 4.889 ms. |
-| Mode-aware verification | PASS | `--require-private-production` proves the exact flexible-pool registry, complete membership, distinct durable reviewers, exact database binding, fixed port, and absence of a simultaneous legacy pilot; pre-pool databases retain the exact legacy fallback. Fresh local and Funnel checks authenticated Alle and Rubar read-only. |
+| Mode-aware verification | PASS (implementation) | Links, final review authority, compensation, and playback now select the live mode. Flexible mode proves the hash-bound release/admin, pool/champion/voice/report consistency, deferred-pay namespace isolation, and effective pool playback evidence; legacy mode retains its exact hidden canary and ledger rules. Fresh local/Funnel authentication, live certification, and deferred-pay audit pass. The genuine post-release playback sample is still 0/20 and remains an external evidence gate. |
 | Safe deployment and compatible rollback | PASS | Immutable hash-bound release, pre-migration snapshot, maintenance marker, clone preflight, post-exposure auth/queue/audio/idempotency/supervision gates, and schema-aware rollback controller tests. |
 | Exact owner rights, fail closed on conflicts/revocation | PASS | 20,323/20,323 live exact rights; idempotent/scoped/conflict/revocation Rust tests. |
 | Per-voice certificates and independent finalization | PASS (implementation) | Certificate binds pool/focus/champion/deployment/rights/audio/resolution/reviewers/export; each voice is independently selected. Runtime certificates correctly wait for completed human resolution. |
@@ -72,7 +75,10 @@ These are real remaining work, not engineering defects to fabricate away:
 2. Reach zero three-way conflicts, missing audio, rights gaps, integrity errors, and stale snapshots.
 3. Kawa requires another Hawleri-capable reviewer besides Rubar; Rubar cannot self-confirm.
 4. After each voice resolves, run its real certificate/export and record the resulting digests.
-5. When GPUs are free and sufficient human gold exists, execute one champion-versus-challenger cycle
+5. Accumulate at least 20 ordinary post-release non-skip decisions across two reviewer browsers; the
+   mode-aware playback gate must prove every one against its immutable pool decision and canonical
+   listening receipt. Current release window: 0/20. No synthetic or backdated evidence is allowed.
+6. When GPUs are free and sufficient human gold exists, execute one champion-versus-challenger cycle
    using only the fine-tuned OmniASR-7B family. Promotion requires a measured win; an honest rejection
    is a valid completed cycle.
 
