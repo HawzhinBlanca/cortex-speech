@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Fail-closed final certificate for the Rubar/Alle paid-review canary.
+"""Fail-closed final certificate for the active review mode.
 
-Capacity readiness is not completion.  This read-only gate stays red until the one active schema-60
-policy proves, in one durable history, exactly ten corpus decisions and two hidden-QC decisions per
-reviewer, zero skips, 2/2 hidden results at CER 0, playback evidence for all 24 UI decisions, and one
-valid compensation ledger consequence/operation receipt per decision.  It never claims or leases
-work and never writes the database, session, focus, policy, app, model service, or GPU state.
+Flexible schema-63 production intentionally has no hidden-check pilot. In that mode this gate
+validates the immutable active release, runs its exact hash-bound ``pool_admin certify`` binary on a
+detached database copy, and requires review-ready database/audio/rights/disk/snapshot authority. It
+does not confuse review readiness with a completed dataset.
+
+Without an active flexible pool, the original controlled-pilot contract remains unchanged: exactly
+ten corpus decisions and two hidden-QC decisions per reviewer, zero skips, hidden 2/2 at CER 0,
+playback evidence for all 24 UI decisions, and one valid compensation ledger consequence/operation
+receipt per decision. Neither path claims or leases work or writes the live database, session,
+focus, policy, app, model service, or GPU state.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from check_playback_enforcement_readiness import (
     source_span_duration_issue,
 )
 from check_review_compensation_readiness import POLICY_VERSION, audit as audit_compensation
+from check_spot_check_pool import PolicyBroken, active_flexible_pool as structurally_active_flexible_pool
 from pilot_focus_contract import (
     CANONICAL_IDENTITY_KIND,
     PLAYBACK_GUARD_VERSION,
@@ -64,6 +70,7 @@ from review_pilot_hidden_contract import (
     policy_sha256,
     read_policy,
 )
+from release_private_production import EXPECTED_SCHEMA, ReleaseError, active_pointer, run_json
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +108,13 @@ def default_data_dir() -> Path:
     return Path(appdata) / "cortex-speech"
 
 
+def default_release_root() -> Path:
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        raise RuntimeError("LOCALAPPDATA is not set; pass --release-root explicitly")
+    return Path(localappdata) / "CortexSpeech" / "private-production-releases"
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -115,6 +129,302 @@ def connect_read_only(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA query_only = ON")
     connection.execute("BEGIN")
     return connection
+
+
+def _exact_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+FlexiblePoolIdentity = tuple[str, int, str, str, str]
+
+
+def active_flexible_pool_identity(connection: sqlite3.Connection) -> FlexiblePoolIdentity | None:
+    """Add champion identity to the independently checked structural pool authority."""
+
+    structural = structurally_active_flexible_pool(connection)
+    if structural is None:
+        return None
+    pool_id, clip_count, focus_sha256 = structural
+    rows = connection.execute(
+        "SELECT champion_model_version_id, champion_deployment_sha256 "
+        "FROM review_pool_registry WHERE pool_id=?",
+        (pool_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        raise PolicyBroken("flexible review-pool champion identity is not uniquely bound")
+    model_id, deployment_sha256 = rows[0]
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise PolicyBroken("flexible review-pool champion model identity is blank")
+    if (
+        not isinstance(deployment_sha256, str)
+        or len(deployment_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in deployment_sha256)
+    ):
+        raise PolicyBroken("flexible review-pool champion deployment digest is invalid")
+    return pool_id, clip_count, focus_sha256, model_id, deployment_sha256
+
+
+def flexible_report_issues(
+    report: dict[str, Any],
+    pool: FlexiblePoolIdentity,
+    manifest: dict[str, Any],
+) -> list[str]:
+    """Refuse a syntactically green report whose internal authority is inconsistent."""
+
+    errors: list[str] = []
+    pool_id, clip_count, focus_sha256, champion_model_id, champion_deployment_sha256 = pool
+
+    def mapping(name: str) -> dict[str, Any]:
+        value = report.get(name)
+        if not isinstance(value, dict):
+            errors.append(f"certification {name} is not one object")
+            return {}
+        return value
+
+    if report.get("reportSchema") != 2:
+        errors.append("certification report schema is not exactly 2")
+    if report.get("readOnly") is not True:
+        errors.append("certification does not identify itself as read-only")
+    if not _exact_nonnegative_int(report.get("generatedAtEpochSecs")) or report.get("generatedAtEpochSecs") == 0:
+        errors.append("certification generation time is invalid")
+    if report.get("appGitSha") != manifest.get("appGitSha"):
+        errors.append("certification and active immutable release git identities disagree")
+    if report.get("databaseSchemaVersion") != EXPECTED_SCHEMA:
+        errors.append(f"certification database schema is not exactly {EXPECTED_SCHEMA}")
+
+    pool_report = mapping("pool")
+    if (
+        pool_report.get("poolId") != pool_id
+        or pool_report.get("focusSegmentCount") != clip_count
+        or pool_report.get("focusSha256") != focus_sha256
+        or pool_report.get("championModelVersionId") != champion_model_id
+        or pool_report.get("championDeploymentSha256") != champion_deployment_sha256
+    ):
+        errors.append("certification pool identity does not match the live immutable registry")
+
+    summary = mapping("resolutionSummary")
+    summary_fields = (
+        "totalClips",
+        "resolvedClips",
+        "needsFirstOrSecondReview",
+        "needsThirdReview",
+        "ownerConflicts",
+    )
+    if not all(_exact_nonnegative_int(summary.get(field)) for field in summary_fields):
+        errors.append("certification resolution totals are not exact non-negative integers")
+        summary_values = None
+    else:
+        summary_values = {field: int(summary[field]) for field in summary_fields}
+        if summary_values["totalClips"] != clip_count:
+            errors.append("certification resolution total does not match pool membership")
+        classified = (
+            summary_values["resolvedClips"]
+            + summary_values["needsFirstOrSecondReview"]
+            + summary_values["needsThirdReview"]
+            + summary_values["ownerConflicts"]
+        )
+        if classified != summary_values["totalClips"]:
+            errors.append("certification resolution categories do not exactly partition the pool")
+
+    authority = mapping("resolutionAuthority")
+    authority_fields = ("consensusAgreements", "ownerAdjudications", "unresolvedConflicts")
+    if not all(_exact_nonnegative_int(authority.get(field)) for field in authority_fields):
+        errors.append("certification resolution authority totals are invalid")
+    elif summary_values is not None:
+        if authority["consensusAgreements"] + authority["ownerAdjudications"] != summary_values["resolvedClips"]:
+            errors.append("certification resolved total disagrees with consensus/owner authority")
+        if authority["unresolvedConflicts"] != summary_values["ownerConflicts"]:
+            errors.append("certification conflict totals disagree")
+
+    coverage = report.get("coverageByVoice")
+    if not isinstance(coverage, list) or not coverage:
+        errors.append("certification has no per-voice coverage")
+    else:
+        voice_total = 0
+        names: set[str] = set()
+        coverage_totals: dict[str, int] = {}
+        for row in coverage:
+            if not isinstance(row, dict):
+                errors.append("certification has a malformed per-voice coverage row")
+                continue
+            name = row.get("voiceName")
+            total = row.get("totalClips")
+            if not isinstance(name, str) or not name.strip() or name in names:
+                errors.append("certification per-voice identities are blank or duplicated")
+            else:
+                names.add(name)
+            if not _exact_nonnegative_int(total):
+                errors.append("certification per-voice clip total is invalid")
+            else:
+                voice_total += total
+                if isinstance(name, str) and name.strip():
+                    coverage_totals[name] = total
+            review_buckets = ("zeroReviews", "oneReview", "twoReviews", "threeOrMoreReviews")
+            if not all(_exact_nonnegative_int(row.get(field)) for field in review_buckets):
+                errors.append("certification per-voice review buckets are invalid")
+            elif _exact_nonnegative_int(total) and sum(row[field] for field in review_buckets) != total:
+                errors.append("certification per-voice review buckets do not partition the voice")
+        if voice_total != clip_count:
+            errors.append("certification per-voice coverage does not exactly cover the pool")
+
+        outcomes = report.get("voiceOutcomes")
+        if not isinstance(outcomes, dict) or set(outcomes) != names:
+            errors.append("certification voice outcomes do not match per-voice coverage")
+        else:
+            for name, row in outcomes.items():
+                if not isinstance(row, dict):
+                    errors.append(f"certification outcome for {name} is malformed")
+                    continue
+                numeric = (
+                    "total",
+                    "retained",
+                    "rejected",
+                    "unresolved",
+                    "consensusAgreements",
+                    "ownerAdjudications",
+                    "unresolvedConflicts",
+                )
+                if not all(_exact_nonnegative_int(row.get(field)) for field in numeric):
+                    errors.append(f"certification outcome totals for {name} are invalid")
+                    continue
+                resolved = row["retained"] + row["rejected"]
+                if (
+                    row["total"] != coverage_totals.get(name)
+                    or resolved + row["unresolved"] != row["total"]
+                    or row["consensusAgreements"] + row["ownerAdjudications"] != resolved
+                ):
+                    errors.append(f"certification outcome totals for {name} are internally inconsistent")
+
+    reviewer_totals = report.get("reviewerVoiceTotals")
+    if not isinstance(reviewer_totals, list):
+        errors.append("certification reviewer/voice totals are not a list")
+
+    audio = mapping("audio")
+    if (
+        audio.get("allAvailable") is not True
+        or audio.get("clips") != clip_count
+        or audio.get("missingClips") != 0
+        or audio.get("missingRecordings") != 0
+    ):
+        errors.append("certification audio coverage is incomplete or inconsistent")
+
+    rights = mapping("rights")
+    if (
+        rights.get("allExact") is not True
+        or rights.get("exactRows") != clip_count
+        or rights.get("segmentRows") != clip_count
+        or rights.get("conflictingRows") != 0
+        or rights.get("revokedRows") != 0
+        or rights.get("unstampedRows") != 0
+    ):
+        errors.append("certification owner-rights coverage is incomplete or conflicting")
+
+    database = mapping("database")
+    if (
+        database.get("healthy") is not True
+        or database.get("quickCheck") != ["ok"]
+        or database.get("fullIntegrityCheck") != ["ok"]
+        or database.get("foreignKeyViolations") != 0
+    ):
+        errors.append("certification database integrity is not fully healthy")
+
+    disk = mapping("disk")
+    if (
+        disk.get("healthy") is not True
+        or not _exact_nonnegative_int(disk.get("freeBytes"))
+        or not _exact_nonnegative_int(disk.get("minimumFreeBytes"))
+        or disk.get("minimumFreeBytes") == 0
+        or (
+            _exact_nonnegative_int(disk.get("freeBytes"))
+            and _exact_nonnegative_int(disk.get("minimumFreeBytes"))
+            and disk["freeBytes"] < disk["minimumFreeBytes"]
+        )
+    ):
+        errors.append("certification writable-disk reserve is unhealthy")
+
+    snapshots = mapping("snapshots")
+    for label in ("local", "offsite"):
+        snapshot = snapshots.get(label)
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("fresh") is not True
+            or snapshot.get("verified") is not True
+            or not _exact_nonnegative_int(snapshot.get("ageSecs"))
+            or not _exact_nonnegative_int(snapshot.get("targetRpoSecs"))
+            or snapshot.get("targetRpoSecs") == 0
+            or (
+                _exact_nonnegative_int(snapshot.get("ageSecs"))
+                and _exact_nonnegative_int(snapshot.get("targetRpoSecs"))
+                and snapshot["ageSecs"] > snapshot["targetRpoSecs"]
+            )
+        ):
+            errors.append(f"certification {label} snapshot is not fresh and verified")
+
+    gates = mapping("gates")
+    if gates.get("reviewReady") is not True or gates.get("rightsComplete") is not True:
+        errors.append("certification review-readiness gates are not green")
+    if summary_values is not None:
+        all_resolved = (
+            summary_values["resolvedClips"] == clip_count
+            and summary_values["needsFirstOrSecondReview"] == 0
+            and summary_values["needsThirdReview"] == 0
+            and summary_values["ownerConflicts"] == 0
+        )
+        if gates.get("allClipsResolved") is not all_resolved:
+            errors.append("certification all-resolved gate disagrees with resolution totals")
+        final_ready = (
+            gates.get("reviewReady") is True
+            and all_resolved
+            and gates.get("rightsComplete") is True
+            and gates.get("everyVoiceCertified") is True
+        )
+        if gates.get("finalDatasetReady") is not final_ready:
+            errors.append("certification final-ready gate disagrees with its component authority")
+    return errors
+
+
+def certify_flexible_pool(
+    data_dir: Path,
+    db_path: Path,
+    release_root: Path,
+    pool: FlexiblePoolIdentity,
+    *,
+    explicit_exe: Path | None = None,
+) -> int:
+    """Certify the active flexible mode with the exact immutable release tool."""
+
+    try:
+        manifest = active_pointer(data_dir, release_root)
+        if manifest is None:
+            raise ReleaseError("the flexible pool has no active immutable release pointer")
+        if explicit_exe is not None and explicit_exe.resolve(strict=True) != Path(
+            str(manifest["appExe"])
+        ).resolve(strict=True):
+            raise ReleaseError("the explicitly requested executable is not the active immutable release")
+        report = run_json(
+            [
+                str(manifest["poolAdminExe"]),
+                "certify",
+                "--db",
+                str(db_path),
+                "--full-integrity",
+                "--require-review-ready",
+            ],
+            timeout=600,
+        )
+        errors = flexible_report_issues(report, pool, manifest)
+    except (OSError, ReleaseError, ValueError) as error:
+        errors = [f"flexible-pool certification cannot be proved: {error}"]
+        report = {}
+    payload = {
+        "ok": not errors,
+        "status": "READY" if not errors else "BLOCKED",
+        "mode": "flexible-pool",
+        "errors": errors,
+        "evidence": report,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if not errors else 1
 
 
 def _canonical_query_rows(
@@ -783,6 +1093,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
+    parser.add_argument("--release-root", type=Path)
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
 
     try:
@@ -793,14 +1105,57 @@ def main(argv: list[str] | None = None) -> int:
     db_path = data_dir / "cortex-speech.db"
     focus_path = data_dir / "voice_focus.json"
     errors: list[str] = []
+
+    if not db_path.is_file():
+        print(
+            json.dumps(
+                {"ok": False, "status": "BLOCKED", "errors": [f"database not found: {db_path}"]},
+                indent=2,
+            )
+        )
+        return 1
+    try:
+        connection = connect_read_only(db_path)
+        try:
+            pool = active_flexible_pool_identity(connection)
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, PolicyBroken) as error:
+        print(
+            json.dumps(
+                {"ok": False, "status": "BLOCKED", "errors": [f"active review mode cannot be proved: {error}"]},
+                indent=2,
+            )
+        )
+        return 1
+    if pool is not None:
+        if (data_dir / "review_pilot_policy.json").exists():
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "BLOCKED",
+                        "mode": "conflicting",
+                        "errors": ["flexible pool and legacy controlled-pilot policy are active together"],
+                    },
+                    indent=2,
+                )
+            )
+            return 1
+        try:
+            release_root = args.release_root or default_release_root()
+        except RuntimeError as error:
+            print(json.dumps({"ok": False, "status": "BLOCKED", "errors": [str(error)]}, indent=2))
+            return 1
+        explicit_exe = args.exe if any(value == "--exe" or value.startswith("--exe=") for value in raw_args) else None
+        return certify_flexible_pool(data_dir, db_path, release_root, pool, explicit_exe=explicit_exe)
+
     evidence: dict[str, Any] = {
         "database": str(db_path.resolve()),
         "focus": str(focus_path.resolve()),
         "executable": str(args.exe.resolve()),
     }
 
-    if not db_path.is_file():
-        errors.append(f"database not found: {db_path}")
     if not focus_path.is_file():
         errors.append(f"focus not found: {focus_path}")
     if not args.exe.is_file():

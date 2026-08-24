@@ -21,7 +21,8 @@ So absence of warnings is only evidence when the warning could have been emitted
 that first, and refuses to return READY on an empty window:
 
   1. the binary under test actually CONTAINS the observe marker — otherwise silence is vacuous;
-  2. phone decisions were taken in the window, at least ``--min-decisions`` of them;
+  2. phone decisions in the active review namespace were taken in the window, at least
+     ``--min-decisions`` of them;
   3. more than one reviewer is represented, because `timeupdate` fires on a DEVICE, not on a policy:
      twenty clips from one phone say nothing about the other seven reviewers' browsers, and
      enforcement lands on all of them at once;
@@ -45,8 +46,10 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from check_spot_check_pool import PolicyBroken, active_flexible_pool
 from check_review_compensation_readiness import POLICY_VERSION as REVIEW_PAY_POLICY_VERSION
-from pilot_focus_contract import canonical_source_span, source_span_duration_issue
+from pilot_focus_contract import PLAYBACK_GUARD_VERSION, canonical_source_span, source_span_duration_issue
+from release_private_production import ReleaseError, active_pointer
 
 # Mirrors db::MIN_PLAYBACK_COVERAGE and db::PLAYBACK_POLICY_VERSION. Pinned by
 # test_playback_enforcement_readiness_policy.py so a change on either side cannot drift silently.
@@ -75,6 +78,13 @@ def default_db_path() -> str:
     appdata = os.environ.get("APPDATA")
     root = Path(appdata) / "cortex-speech" if appdata else Path.home() / ".local" / "share" / "cortex-speech"
     return str(root / "cortex-speech.db")
+
+
+def default_release_root() -> Path:
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        raise RuntimeError("LOCALAPPDATA is not set; pass --release-root explicitly")
+    return Path(localappdata) / "CortexSpeech" / "private-production-releases"
 
 
 def binary_can_warn(exe: Path) -> tuple[bool, str]:
@@ -131,6 +141,87 @@ def decisions_since(conn: sqlite3.Connection, since: str) -> list[tuple[int, str
         """,
         (since,),
     ).fetchall()
+
+
+def pool_decisions_since(
+    conn: sqlite3.Connection,
+    since: str,
+) -> list[tuple[object, ...]]:
+    """Effective non-skip schema-63 pool decisions in the exact deployed-binary window."""
+
+    return conn.execute(
+        """
+        SELECT id, segment_id, reviewer, datetime(created_at_ms / 1000, 'unixepoch'),
+               created_at_ms, served_revision, audio_content_hash, source_start_ms,
+               source_end_ms, duration_ms, playback_guard_version
+          FROM effective_review_pool_decisions_v62
+         WHERE action <> 'skip'
+           AND datetime(created_at_ms / 1000, 'unixepoch') >= datetime(?)
+         ORDER BY created_at_ms, id
+        """,
+        (since,),
+    ).fetchall()
+
+
+def pool_decision_identity_issue(conn: sqlite3.Connection, row: tuple[object, ...]) -> str | None:
+    """Bind a pool decision to the exact revision/audio/span that its playback receipt authorized."""
+
+    (
+        decision_id,
+        segment_id,
+        reviewer,
+        _created_at,
+        created_at_ms,
+        served_revision,
+        audio_content_hash,
+        source_start_ms,
+        source_end_ms,
+        duration_ms,
+        playback_guard_version,
+    ) = row
+    if type(decision_id) is not int or decision_id <= 0:
+        return "pool decision id is not a positive integer"
+    if not isinstance(segment_id, str) or not segment_id.strip():
+        return f"pool decision {decision_id} has an invalid segment identity"
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        return f"pool decision {decision_id} has an invalid reviewer identity"
+    if type(created_at_ms) is not int or created_at_ms <= 0:
+        return f"pool decision {decision_id} has an invalid timestamp"
+    if type(served_revision) is not int or served_revision < 0:
+        return f"pool decision {decision_id} has an invalid served revision"
+    if playback_guard_version != PLAYBACK_GUARD_VERSION:
+        return f"pool decision {decision_id} used playback guard {playback_guard_version!r}"
+    if not is_canonical_audio_content_hash(audio_content_hash):
+        return f"pool decision {decision_id} has no canonical decoded-PCM content hash"
+    if type(source_start_ms) is not int or type(source_end_ms) is not int:
+        return f"pool decision {decision_id} has non-integer source bounds"
+    if source_start_ms < 0 or source_end_ms <= source_start_ms:
+        return f"pool decision {decision_id} has an invalid source span"
+    if type(duration_ms) is not int or duration_ms <= 0:
+        return f"pool decision {decision_id} has an invalid duration"
+    current = conn.execute(
+        """SELECT review_revision, audio_content_hash, duration_ms, alignment_json
+             FROM speech_segments WHERE id=?""",
+        (segment_id,),
+    ).fetchone()
+    if current is None:
+        return f"pool decision {decision_id} points to a missing segment"
+    current_revision, current_hash, current_duration, alignment_json = current
+    expected_span, span_error = canonical_source_span(alignment_json)
+    if expected_span is None:
+        return f"pool decision {decision_id} current source span is invalid: {span_error}"
+    if (
+        current_revision != served_revision
+        or current_hash != audio_content_hash
+        or current_duration != duration_ms
+        or expected_span != (source_start_ms, source_end_ms)
+    ):
+        return f"pool decision {decision_id} disagrees with its immutable current clip identity"
+    return source_span_duration_issue(
+        duration_ms,
+        expected_span,
+        subject=f"pool decision {decision_id} duration",
+    )
 
 
 def canonical_receipt_coverage(
@@ -449,10 +540,50 @@ def main() -> int:
     )
     parser.add_argument("--min-decisions", type=int, default=20)
     parser.add_argument("--min-reviewers", type=int, default=2)
+    parser.add_argument(
+        "--active-release",
+        action="store_true",
+        help="in flexible mode, use and hash-verify the immutable active release executable",
+    )
+    parser.add_argument("--release-root", type=Path)
     args = parser.parse_args()
 
     print("PLAYBACK ENFORCEMENT READINESS")
     failures = 0
+
+    conn: sqlite3.Connection | None = None
+    mode_error: str | None = None
+    try:
+        conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+        flexible_pool = active_flexible_pool(conn)
+    except (sqlite3.Error, PolicyBroken) as error:
+        if conn is not None:
+            conn.close()
+            conn = None
+        flexible_pool = None
+        mode_error = str(error)
+    explicit_exe = any(value == "--exe" or value.startswith("--exe=") for value in sys.argv[1:])
+    if args.active_release and explicit_exe:
+        if conn is not None:
+            conn.close()
+        print("FAIL [binary]: --active-release and --exe are mutually exclusive")
+        print("PLAYBACK ENFORCEMENT READINESS: NOT READY — 1 check(s) failed")
+        return 1
+    if args.active_release and flexible_pool is not None:
+        try:
+            release_root = args.release_root or default_release_root()
+            manifest = active_pointer(Path(args.db).resolve().parent, release_root)
+            if manifest is None:
+                raise ReleaseError("the flexible pool has no active immutable release pointer")
+            args.exe = Path(str(manifest["appExe"]))
+        except (OSError, ReleaseError, RuntimeError) as error:
+            if conn is not None:
+                conn.close()
+            print(f"FAIL [binary]: active immutable release cannot be proved: {error}")
+            print("PLAYBACK ENFORCEMENT READINESS: NOT READY — 1 check(s) failed")
+            return 1
+    mode = "unavailable" if mode_error is not None else ("flexible-pool" if flexible_pool is not None else "legacy")
+    print(f"       review mode: {mode}")
 
     can_warn, why = binary_can_warn(args.exe)
     if can_warn:
@@ -476,7 +607,12 @@ def main() -> int:
             since = "9999-01-01 00:00:00"
     print(f"       window : decisions at or after {since}")
 
-    conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    if conn is None:
+        failures += 1
+        print(f"FAIL [database]: playback evidence cannot be audited read-only: {mode_error}")
+        print(f"PLAYBACK ENFORCEMENT READINESS: NOT READY — {failures} check(s) failed")
+        return 1
+
     try:
         receipt_count, semantic_errors = playback_receipt_semantic_issues(conn)
         print(f"       playback receipts audited: {receipt_count}")
@@ -496,7 +632,10 @@ def main() -> int:
                 "and policy-3 spans match server identity"
             )
 
-        rows = decisions_since(conn, since)
+        if flexible_pool is not None:
+            rows = pool_decisions_since(conn, since)
+        else:
+            rows = decisions_since(conn, since)
         print(f"       phone decisions in window: {len(rows)}")
         if len(rows) < args.min_decisions:
             failures += 1
@@ -507,7 +646,7 @@ def main() -> int:
         else:
             print(f"PASS [evidence]: {len(rows)} decision(s) is a real sample")
 
-        represented = sorted({who for _, _, who, _, _ in rows})
+        represented = sorted({str(row[2]) for row in rows})
         if rows:
             print(f"       reviewers represented: {len(represented)} ({', '.join(represented)})")
         if rows and len(represented) < args.min_reviewers:
@@ -520,11 +659,15 @@ def main() -> int:
             print(f"PASS [devices]: {len(represented)} distinct reviewer(s) exercised the guard")
 
         refused = []
-        for event_id, seg, who, at, timestamp_ms in rows:
-            required_revision, revision_error = corpus_receipt_revision_for_event(
-                conn, event_id, seg, who, "couch"
-            )
-            why = revision_error
+        for row in rows:
+            event_id, seg, who, at, timestamp_ms = row[:5]
+            if flexible_pool is not None:
+                required_revision = row[5] if type(row[5]) is int else None
+                why = pool_decision_identity_issue(conn, row)
+            else:
+                required_revision, why = corpus_receipt_revision_for_event(
+                    conn, event_id, seg, who, "couch"
+                )
             if why is None and required_revision is not None:
                 why = uncovered(conn, seg, at, who, required_revision, timestamp_ms)
             if why is not None:

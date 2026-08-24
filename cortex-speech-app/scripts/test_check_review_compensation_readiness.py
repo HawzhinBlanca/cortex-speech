@@ -247,6 +247,34 @@ class CompensationReadinessGateTests(unittest.TestCase):
         )
         return completed.returncode, json.loads(completed.stdout)
 
+    def activate_flexible_pool(self, *, created_at: str = "2026-08-24 08:00:00") -> None:
+        connection = sqlite3.connect(self.db)
+        connection.executescript(
+            """
+            INSERT INTO schema_migrations VALUES (63, 'flexible pool fixture');
+            CREATE TABLE review_pool_registry(
+                singleton_key INTEGER, pool_id TEXT, focus_segment_count INTEGER,
+                focus_sha256 TEXT, created_at TEXT
+            );
+            CREATE TABLE review_pool_members(pool_id TEXT, segment_id TEXT);
+            CREATE TABLE review_pool_decisions(id INTEGER, operation_id TEXT);
+            CREATE TABLE review_pool_reversals(id INTEGER);
+            INSERT INTO review_pool_members VALUES
+                ('123e4567-e89b-42d3-a456-426614174000', 's1');
+            """
+        )
+        connection.execute(
+            "INSERT INTO review_pool_registry VALUES (1, ?, 1, ?, ?)",
+            (
+                "123e4567-e89b-42d3-a456-426614174000",
+                "a" * 64,
+                created_at,
+            ),
+        )
+        connection.commit()
+        connection.close()
+        (self.root / "review_pilot_policy.json").unlink()
+
     def rewrite_all_durations(self, duration_ms: int) -> None:
         """Keep every pay artifact internally consistent while changing the server denominator."""
         connection = sqlite3.connect(self.db)
@@ -885,6 +913,23 @@ class CompensationReadinessGateTests(unittest.TestCase):
         code, report = self.run_gate()
         self.assertEqual(code, 1)
         self.assertTrue(any("duplicate canonical pay identities" in error for error in report["errors"]), report)
+
+    def test_flexible_pool_proves_deferred_compensation_without_legacy_pilot(self):
+        self.activate_flexible_pool()
+        code, report = self.run_gate()
+        self.assertEqual(code, 0, report)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["mode"], "flexible-pool")
+        self.assertEqual(report["compensationOperationalStatus"], "deferred")
+        self.assertEqual(report["postPoolLegacyReviewEvents"], 0)
+        self.assertEqual(report["postPoolLegacyLedgerEntries"], 0)
+
+    def test_flexible_pool_refuses_legacy_pay_events_after_activation(self):
+        self.activate_flexible_pool(created_at="2026-08-21 00:00:00")
+        code, report = self.run_gate()
+        self.assertEqual(code, 1)
+        self.assertTrue(any("legacy paid-review event" in error for error in report["errors"]), report)
+        self.assertTrue(any("legacy compensation" in error for error in report["errors"]), report)
 
     def test_verify_10_runs_live_compensation_readiness_without_a_skip_probe(self):
         """The master release verdict must not ignore a stale or corrupt live pay database."""

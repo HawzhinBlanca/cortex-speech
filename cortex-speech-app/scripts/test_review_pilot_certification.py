@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("check_review_pilot_certification.py")
@@ -28,6 +33,101 @@ PILOT_EVENT_IDS = {
 FOCUS_IDS = PILOT_EVENT_IDS | {f"focus-filler-{index}" for index in range(8254)}
 FOCUS = focus_evidence(FOCUS_IDS)
 CONTENT_HASH = "a" * 64
+
+
+def flexible_report() -> dict[str, object]:
+    return {
+        "reportSchema": 2,
+        "readOnly": True,
+        "generatedAtEpochSecs": 1_700_000_000,
+        "appGitSha": "b" * 40,
+        "databaseSchemaVersion": 63,
+        "pool": {
+            "poolId": "123e4567-e89b-42d3-a456-426614174000",
+            "focusSegmentCount": 2,
+            "focusSha256": "a" * 64,
+            "championModelVersionId": "omniasr-7b-test",
+            "championDeploymentSha256": "c" * 64,
+        },
+        "resolutionSummary": {
+            "totalClips": 2,
+            "resolvedClips": 0,
+            "needsFirstOrSecondReview": 2,
+            "needsThirdReview": 0,
+            "ownerConflicts": 0,
+        },
+        "resolutionAuthority": {
+            "consensusAgreements": 0,
+            "ownerAdjudications": 0,
+            "unresolvedConflicts": 0,
+        },
+        "coverageByVoice": [
+            {
+                "voiceName": "Lamo",
+                "totalClips": 2,
+                "zeroReviews": 2,
+                "oneReview": 0,
+                "twoReviews": 0,
+                "threeOrMoreReviews": 0,
+                "needsThirdReview": 0,
+                "ownerConflicts": 0,
+                "resolved": 0,
+            }
+        ],
+        "voiceOutcomes": {
+            "Lamo": {
+                "total": 2,
+                "retained": 0,
+                "rejected": 0,
+                "unresolved": 2,
+                "consensusAgreements": 0,
+                "ownerAdjudications": 0,
+                "unresolvedConflicts": 0,
+                "certificate": None,
+            }
+        },
+        "reviewerVoiceTotals": [],
+        "rights": {
+            "allExact": True,
+            "exactRows": 2,
+            "segmentRows": 2,
+            "conflictingRows": 0,
+            "revokedRows": 0,
+            "unstampedRows": 0,
+        },
+        "audio": {
+            "allAvailable": True,
+            "clips": 2,
+            "missingClips": 0,
+            "missingRecordings": 0,
+        },
+        "database": {
+            "quickCheck": ["ok"],
+            "fullIntegrityCheck": ["ok"],
+            "foreignKeyViolations": 0,
+            "healthy": True,
+        },
+        "disk": {"freeBytes": 50_000_000_000, "minimumFreeBytes": 20_000_000_000, "healthy": True},
+        "snapshots": {
+            "local": {"fresh": True, "verified": True, "ageSecs": 10, "targetRpoSecs": 600},
+            "offsite": {"fresh": True, "verified": True, "ageSecs": 11, "targetRpoSecs": 600},
+        },
+        "gates": {
+            "reviewReady": True,
+            "allClipsResolved": False,
+            "rightsComplete": True,
+            "everyVoiceCertified": False,
+            "finalDatasetReady": False,
+        },
+    }
+
+
+def flexible_manifest(root: Path) -> dict[str, object]:
+    return {
+        "appGitSha": "b" * 40,
+        "appExe": str(root / "app.exe"),
+        "poolAdminExe": str(root / "pool_admin.exe"),
+    }
 
 
 def policy() -> ReviewPilotPolicy:
@@ -649,19 +749,119 @@ def test_compensation_must_have_one_event_ledger_and_operation_receipt_per_actio
     assert any("durableOperationReceipts=23" in item for item in found)
 
 
-def test_verify_10_registers_the_final_gate_without_skip_or_backdating() -> None:
+def test_flexible_report_must_be_internally_consistent_and_review_ready() -> None:
+    report = flexible_report()
+    pool = (
+        "123e4567-e89b-42d3-a456-426614174000",
+        2,
+        "a" * 64,
+        "omniasr-7b-test",
+        "c" * 64,
+    )
+    manifest = flexible_manifest(Path("."))
+    assert gate.flexible_report_issues(report, pool, manifest) == []
+    report["resolutionSummary"]["needsFirstOrSecondReview"] = 1
+    report["snapshots"]["offsite"]["fresh"] = False
+    found = gate.flexible_report_issues(report, pool, manifest)
+    assert any("partition" in item for item in found)
+    assert any("offsite snapshot" in item for item in found)
+
+
+def test_flexible_mode_uses_the_hash_bound_admin_and_not_the_legacy_pilot() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        db_path = root / "cortex-speech.db"
+        connection = sqlite3.connect(db_path)
+        connection.executescript(
+            """
+            CREATE TABLE review_pool_registry(
+                singleton_key INTEGER, pool_id TEXT, focus_segment_count INTEGER, focus_sha256 TEXT,
+                champion_model_version_id TEXT, champion_deployment_sha256 TEXT
+            );
+            CREATE TABLE review_pool_members(pool_id TEXT, segment_id TEXT);
+            CREATE TABLE review_pool_decisions(id INTEGER);
+            CREATE TABLE review_pool_reversals(id INTEGER);
+            INSERT INTO review_pool_registry VALUES(
+                1, '123e4567-e89b-42d3-a456-426614174000', 2,
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'omniasr-7b-test',
+                'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+            );
+            INSERT INTO review_pool_members VALUES
+                ('123e4567-e89b-42d3-a456-426614174000', 'a'),
+                ('123e4567-e89b-42d3-a456-426614174000', 'b');
+            """
+        )
+        connection.commit()
+        connection.close()
+        manifest = flexible_manifest(root)
+        output = io.StringIO()
+        with (
+            mock.patch.object(gate, "active_pointer", return_value=manifest),
+            mock.patch.object(gate, "run_json", return_value=flexible_report()) as run,
+            contextlib.redirect_stdout(output),
+        ):
+            assert gate.main(["--data-dir", raw, "--release-root", raw]) == 0
+        payload = json.loads(output.getvalue())
+        assert payload["ok"] is True and payload["mode"] == "flexible-pool"
+        command = run.call_args.args[0]
+        assert command == [
+            str(root / "pool_admin.exe"),
+            "certify",
+            "--db",
+            str(db_path),
+            "--full-integrity",
+            "--require-review-ready",
+        ]
+
+
+def test_flexible_mode_refuses_a_simultaneous_legacy_pilot_policy() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        connection = sqlite3.connect(root / "cortex-speech.db")
+        connection.executescript(
+            """
+            CREATE TABLE review_pool_registry(
+                singleton_key INTEGER, pool_id TEXT, focus_segment_count INTEGER, focus_sha256 TEXT,
+                champion_model_version_id TEXT, champion_deployment_sha256 TEXT
+            );
+            CREATE TABLE review_pool_members(pool_id TEXT, segment_id TEXT);
+            CREATE TABLE review_pool_decisions(id INTEGER);
+            CREATE TABLE review_pool_reversals(id INTEGER);
+            INSERT INTO review_pool_registry VALUES(
+                1, '123e4567-e89b-42d3-a456-426614174000', 1,
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'omniasr-7b-test',
+                'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+            );
+            INSERT INTO review_pool_members VALUES
+                ('123e4567-e89b-42d3-a456-426614174000', 'a');
+            """
+        )
+        connection.commit()
+        connection.close()
+        (root / "review_pilot_policy.json").write_text("{}", encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert gate.main(["--data-dir", raw, "--release-root", raw]) == 1
+        payload = json.loads(output.getvalue())
+        assert payload["mode"] == "conflicting"
+
+
+def test_verify_10_registers_the_mode_selected_gate_without_skip_or_backdating() -> None:
     spec = importlib.util.spec_from_file_location("verify_10_final_pilot_policy", VERIFY_10)
     assert spec and spec.loader
     verify = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = verify
     spec.loader.exec_module(verify)
-    matches = [entry for entry in verify.GATES if entry[0] == "review-pilot-certification"]
+    matches = [entry for entry in verify.GATES if entry[0] == "review-mode-certification"]
     assert len(matches) == 1
     _name, tier, kind, payload, cwd, probe, _charter = matches[0]
     assert (tier, kind, cwd) == (2, "cmd", verify.APP)
     assert probe is None
-    assert str(SCRIPT) in payload and str(verify.EXE) in payload
+    assert str(SCRIPT) in payload and str(verify.EXE) not in payload
     assert "--since" not in payload and "--db" not in payload
+    assert "flexible pool" in _charter and "legacy" in _charter
 
 
 def main() -> int:

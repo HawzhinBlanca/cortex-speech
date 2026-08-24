@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Fail-closed production gate for Cortex reviewer compensation.
+"""Fail-closed production gate for Cortex reviewer compensation in the active review mode.
 
-This gate reads the migrated live database and active voice focus without modifying either.  It
-proves the authorized policy constants, one ledger consequence per effective post-cutoff event,
-append-only triggers, durable schema-v60 hidden-key grants, the 24-action pilot ceiling, signed
-re-decision/reversal arithmetic, and canonical audio identity for every focused clip.  A pre-v60
-database cannot be called ready merely because the source tree contains the new release code.
+In legacy controlled-pilot mode this gate reads the migrated live database and active voice focus
+without modifying either. It proves the authorized policy constants, one ledger consequence per
+effective post-cutoff event, append-only triggers, durable schema-v60 hidden-key grants, the
+24-action pilot ceiling, signed re-decision/reversal arithmetic, and canonical audio identity for
+every focused clip.
+
+Flexible schema-63 pool compensation is operationally deferred by owner canon. In that mode the gate
+does not invent pay: it proves the legacy pilot is absent, the immutable legacy policy/schema remain
+intact, and no flexible-pool decision has leaked into the legacy review-event or compensation ledger
+namespace. A source migration or a green boolean alone is never accepted as live evidence.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from check_spot_check_pool import PolicyBroken, active_flexible_pool
 from pilot_focus_contract import (
     CANONICAL_IDENTITY_KIND,
     canonical_audio_work_id,
@@ -84,6 +90,157 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA query_only = ON")
     connection.execute("BEGIN")
     return connection
+
+
+def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
+    """Return the flexible-mode deferred-pay audit, or None when legacy mode is active."""
+
+    if not db_path.is_file():
+        return None
+    try:
+        connection = _connect_read_only(db_path)
+    except sqlite3.Error as error:
+        return {
+            "database": str(db_path.resolve()),
+            "mode": "unknown",
+            "ok": False,
+            "errors": [f"cannot open database read-only: {error}"],
+        }
+    errors: list[str] = []
+    evidence: dict[str, Any] = {
+        "database": str(db_path.resolve()),
+        "mode": "flexible-pool",
+        "compensationOperationalStatus": "deferred",
+        "policyVersion": POLICY_VERSION,
+    }
+    try:
+        pool = active_flexible_pool(connection)
+        if pool is None:
+            return None
+        pool_id, member_count, focus_sha256 = pool
+        evidence.update(
+            {
+                "poolId": pool_id,
+                "poolMembers": member_count,
+                "poolFocusSha256": focus_sha256,
+            }
+        )
+        if (db_path.parent / REVIEW_PILOT_FILE).exists():
+            errors.append("flexible pool and legacy controlled-pilot policy are active together")
+
+        schema_version = int(
+            connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+        )
+        evidence["schemaVersion"] = schema_version
+        if schema_version != 63:
+            errors.append(f"flexible compensation audit requires exact schema 63, found {schema_version}")
+
+        policy_rows = connection.execute(
+            """SELECT effective_after_event_id, base_rate_micro_iqd_per_hour,
+                      edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points
+                 FROM review_compensation_policies WHERE policy_version = ?""",
+            (POLICY_VERSION,),
+        ).fetchall()
+        evidence["policyRows"] = len(policy_rows)
+        if len(policy_rows) != 1:
+            errors.append(f"expected one immutable {POLICY_VERSION} policy row, found {len(policy_rows)}")
+        else:
+            row = policy_rows[0]
+            observed = (
+                row["base_rate_micro_iqd_per_hour"],
+                row["edit_basis_points"],
+                row["accept_basis_points"],
+                row["reject_basis_points"],
+                row["skip_basis_points"],
+            )
+            expected = (BASE_RATE_MICRO_IQD_PER_HOUR, 10_000, 1_000, 1_000, 0)
+            if observed != expected:
+                errors.append(f"policy constants differ: observed={observed}, expected={expected}")
+
+        triggers = {
+            row["name"]: row["sql"] or ""
+            for row in connection.execute(
+                """SELECT name, sql FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND (name LIKE 'review_compensation_%'
+                           OR name LIKE 'review_event_operation_%'
+                           OR name LIKE 'review_events_v60_%'
+                           OR name LIKE 'review_effect_state_%'
+                           OR name LIKE 'human_decision_effect_%')"""
+            )
+        }
+        missing_triggers = sorted(REQUIRED_TRIGGERS - triggers.keys())
+        if missing_triggers:
+            errors.append(f"missing immutable triggers: {missing_triggers}")
+        non_aborting = sorted(
+            name for name in REQUIRED_TRIGGERS & triggers.keys() if "RAISE(ABORT" not in triggers[name].upper()
+        )
+        if non_aborting:
+            errors.append(f"immutable triggers do not abort writes: {non_aborting}")
+        evidence["immutableTriggers"] = sorted(triggers)
+
+        registry_rows = connection.execute(
+            "SELECT created_at FROM review_pool_registry WHERE pool_id=?", (pool_id,)
+        ).fetchall()
+        if len(registry_rows) != 1 or not isinstance(registry_rows[0]["created_at"], str):
+            errors.append("flexible pool activation time is not uniquely recorded")
+            activated_at = "9999-12-31 23:59:59"
+        else:
+            activated_at = registry_rows[0]["created_at"]
+            valid_time = connection.execute("SELECT datetime(?) IS NOT NULL", (activated_at,)).fetchone()[0]
+            if valid_time != 1:
+                errors.append("flexible pool activation time is invalid")
+        evidence["poolActivatedAt"] = activated_at
+
+        post_pool_legacy_events = int(
+            connection.execute(
+                """SELECT COUNT(*) FROM review_events
+                    WHERE source IN ('couch','couch_spot_check')
+                      AND datetime(created_at) >= datetime(?)""",
+                (activated_at,),
+            ).fetchone()[0]
+        )
+        post_pool_ledger = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM review_compensation_ledger WHERE datetime(created_at) >= datetime(?)",
+                (activated_at,),
+            ).fetchone()[0]
+        )
+        operation_collisions = int(
+            connection.execute(
+                """SELECT COUNT(*) FROM review_pool_decisions pool
+                    JOIN review_events event ON event.operation_id=pool.operation_id"""
+            ).fetchone()[0]
+        )
+        evidence.update(
+            {
+                "postPoolLegacyReviewEvents": post_pool_legacy_events,
+                "postPoolLegacyLedgerEntries": post_pool_ledger,
+                "crossNamespaceOperationCollisions": operation_collisions,
+            }
+        )
+        if post_pool_legacy_events:
+            errors.append(f"{post_pool_legacy_events} legacy paid-review event(s) landed after pool activation")
+        if post_pool_ledger:
+            errors.append(f"{post_pool_ledger} legacy compensation entry/entries landed after pool activation")
+        if operation_collisions:
+            errors.append(f"{operation_collisions} operation UUID(s) exist in both pool and legacy review namespaces")
+
+        fk_violations = 0
+        for table in (
+            "review_compensation_ledger",
+            "review_compensation_policies",
+            "review_compensation_settlements",
+        ):
+            fk_violations += len(list(connection.execute(f"PRAGMA foreign_key_check({table})")))
+        evidence["compensationForeignKeyViolations"] = fk_violations
+        if fk_violations:
+            errors.append(f"compensation tables have {fk_violations} foreign-key violation(s)")
+    except (sqlite3.Error, PolicyBroken, TypeError, ValueError) as error:
+        errors.append(f"flexible deferred-compensation authority cannot be proved: {error}")
+    finally:
+        connection.close()
+    return {**evidence, "ok": not errors, "errors": errors}
 
 
 def _exact_entitlement(duration_ms: int, basis_points: int) -> int:
@@ -629,7 +786,9 @@ def main(argv: list[str] | None = None) -> int:
     data_dir = args.data_dir or _default_data_dir()
     db_path = args.db or data_dir / "cortex-speech.db"
     focus_path = args.focus or data_dir / "voice_focus.json"
-    result = audit(db_path, focus_path)
+    result = audit_flexible_deferred(db_path)
+    if result is None:
+        result = audit(db_path, focus_path)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1
 

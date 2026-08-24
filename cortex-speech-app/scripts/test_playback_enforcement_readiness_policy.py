@@ -183,6 +183,57 @@ def _insert_receipt(
     )
 
 
+def _activate_pool_with_decision(db_path: Path, *, guard: str = gate.PLAYBACK_GUARD_VERSION) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE review_pool_registry(
+            singleton_key INTEGER, pool_id TEXT, focus_segment_count INTEGER, focus_sha256 TEXT
+        );
+        CREATE TABLE review_pool_members(pool_id TEXT, segment_id TEXT);
+        CREATE TABLE review_pool_decisions(
+            id INTEGER PRIMARY KEY, pool_id TEXT, segment_id TEXT, reviewer TEXT, action TEXT,
+            submitted_transcript TEXT, served_transcript TEXT, served_revision INTEGER,
+            audio_content_hash TEXT, source_start_ms INTEGER, source_end_ms INTEGER,
+            duration_ms INTEGER, requested_action TEXT, requested_transcript TEXT,
+            operation_id TEXT, operation_payload_hash TEXT, app_git_sha TEXT,
+            playback_guard_version TEXT, created_at_ms INTEGER
+        );
+        CREATE TABLE review_pool_reversals(id INTEGER);
+        CREATE VIEW effective_review_pool_decisions_v62 AS SELECT * FROM review_pool_decisions;
+        INSERT INTO review_pool_registry VALUES(
+            1, '123e4567-e89b-42d3-a456-426614174000', 1,
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        );
+        INSERT INTO review_pool_members VALUES
+            ('123e4567-e89b-42d3-a456-426614174000', 's1');
+        """
+    )
+    conn.execute(
+        """INSERT INTO review_pool_decisions VALUES(
+               1, '123e4567-e89b-42d3-a456-426614174000', 's1', 'Sara', 'accept',
+               'دەق', 'دەق', 1,
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               0, 1000, 1000, 'accept', 'دەق',
+               '11111111-1111-4111-8111-111111111111',
+               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+               'cccccccccccccccccccccccccccccccccccccccc', ?, ?)""",
+        (guard, EVENT_TIMESTAMP_MS),
+    )
+    _insert_receipt(
+        conn,
+        "s1",
+        1,
+        CONTENT_HASH,
+        0.9,
+        "2023-11-14 22:13:20",
+        "Sara",
+        started_at_ms=EVENT_TIMESTAMP_MS - 500,
+    )
+    conn.commit()
+    conn.close()
+
+
 def _insert_event(
     conn: sqlite3.Connection,
     segment_id: str,
@@ -269,6 +320,67 @@ def test_an_empty_window_is_refused_not_passed() -> None:
         assert "0 decision(s)" in result.stdout
 
 
+def test_flexible_pool_counts_its_own_decisions_and_exact_playback_identity() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        _activate_pool_with_decision(db_path)
+        exe = tmp / "cortex-speech-app.exe"
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(GATE),
+                "--db",
+                str(db_path),
+                "--exe",
+                str(exe),
+                "--since",
+                "2023-01-01 00:00:00",
+                "--min-decisions",
+                "1",
+                "--min-reviewers",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "review mode: flexible-pool" in result.stdout
+        assert "all 1 decision(s) carry a receipt" in result.stdout
+
+
+def test_flexible_pool_refuses_a_decision_from_another_playback_guard() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "t.db"
+        _seed(db_path)
+        _activate_pool_with_decision(db_path, guard="obsolete-guard")
+        exe = tmp / "cortex-speech-app.exe"
+        exe.write_bytes(b"\x00" + gate.ENFORCE_MARKER + b"\x00")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(GATE),
+                "--db",
+                str(db_path),
+                "--exe",
+                str(exe),
+                "--since",
+                "2023-01-01 00:00:00",
+                "--min-decisions",
+                "1",
+                "--min-reviewers",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        assert "obsolete-guard" in result.stdout
+
+
 def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
     """The real aggregator must run this proof, without a skip probe or a backdated window.
 
@@ -290,7 +402,8 @@ def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
     assert tier == 2 and kind == "cmd", "the canary belongs to the live/deployed-binary tier"
     assert cwd == verify.APP
     assert probe is None, "missing evidence is RED; an env probe must not skip the canary"
-    assert str(GATE) in payload and str(verify.EXE) in payload
+    assert str(GATE) in payload and "--active-release" in payload
+    assert str(verify.EXE) not in payload
     assert "--since" not in payload, "verify-10 must use the exact binary's own build-time cutoff"
     assert "--min-decisions" not in payload, "the gate's pinned 20-decision default must remain in force"
 
@@ -304,7 +417,7 @@ def test_verify_10_keeps_the_current_build_empty_canary_red() -> None:
         # Exercise the exact registered command through the aggregator, changing only the isolated
         # binary path and DB environment. The old event predates the just-written executable, so the
         # current-build window is genuinely 0/20 without manufacturing or backdating any evidence.
-        isolated_payload = payload.replace(str(verify.EXE), str(exe))
+        isolated_payload = payload.replace("--active-release", f'--exe "{exe}"')
         previous_db = os.environ.get("CORTEX_DB")
         previous_log_dir = verify.LOG_DIR
         try:
