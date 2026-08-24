@@ -215,6 +215,16 @@ def test_every_production_writer_loads_champion_canon_or_is_retired() -> None:
         assert forbidden not in retired, f"retired batch_processor still reaches {forbidden}"
 
 
+def test_production_importer_can_only_write_an_explicit_isolated_staging_profile() -> None:
+    importer = (APP / "src-tauri" / "src" / "bin" / "batch_importer.rs").read_text(encoding="utf-8")
+    assert "CORTEX_APP_DATA_DIR is required" in importer
+    assert "live review imports are forbidden" in importer
+    assert "selected.starts_with(&live)" in importer
+    assert "live.starts_with(&selected)" in importer
+    assert 'std::env::var_os("CORTEX_APP_DATA_DIR")' in importer
+    assert '.or_else(|| std::env::var_os("APPDATA")' not in importer
+
+
 def test_shipped_gold_eval_has_no_auxiliary_engine_selector() -> None:
     lib = (APP / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
     command = (APP / "src-tauri" / "src" / "commands" / "gold_eval.rs").read_text(encoding="utf-8")

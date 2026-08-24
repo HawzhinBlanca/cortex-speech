@@ -97,6 +97,21 @@ def test_the_backup_pacing_cannot_regress_to_the_doc_example() -> None:
     assert "run_to_completion(5," not in db, "the rusqlite doc-example pacing is banned by canon"
 
 
+def test_periodic_snapshots_have_a_real_ten_minute_rpo_margin_without_cadence_drift() -> None:
+    desktop = _read("src-tauri/src/lib.rs")
+    required = [
+        "const SNAPSHOT_TARGET_RPO_SECS: u64 = 10 * 60;",
+        "const SNAPSHOT_CAPTURE_JITTER_MARGIN_SECS: u64 = 60;",
+        "SNAPSHOT_TARGET_RPO_SECS - SNAPSHOT_CAPTURE_JITTER_MARGIN_SECS",
+        "next_snapshot_deadline(deadline, interval, Instant::now())",
+    ]
+    missing = [pin for pin in required if pin not in desktop]
+    assert not missing, f"periodic snapshot RPO/cadence safety regressed: {missing}"
+    assert "sleep(std::time::Duration::from_secs(SNAPSHOT_INTERVAL_SECS))" not in desktop, (
+        "snapshot cadence must advance from a monotonic deadline, not sleep after backup completion"
+    )
+
+
 def test_the_watchdog_grace_stays_sized_to_the_measured_startup() -> None:
     wd = _read("scripts/ops/cortex-watchdog.ps1")
     assert "else { 10 }" in wd, "grace is 10 min (startup measures 6.4s; 45 was sized to a fixed bug)"

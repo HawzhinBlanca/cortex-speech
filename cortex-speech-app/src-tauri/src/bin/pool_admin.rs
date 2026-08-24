@@ -11,6 +11,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+const CERTIFICATION_REPORT_SCHEMA: u32 = 2;
+
 #[derive(Debug, Clone)]
 struct VoiceSpec {
     name: String,
@@ -30,6 +32,30 @@ struct VoiceInventory {
     invalid_segments: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ResolutionAuthorityTotals {
+    consensus_agreements: usize,
+    owner_adjudications: usize,
+    unresolved_conflicts: usize,
+}
+
+fn resolution_authority_totals<'a>(
+    rows: impl IntoIterator<Item = &'a review_pool::SegmentResolution>,
+) -> ResolutionAuthorityTotals {
+    let mut totals =
+        ResolutionAuthorityTotals { consensus_agreements: 0, owner_adjudications: 0, unresolved_conflicts: 0 };
+    for row in rows {
+        match row.status.as_str() {
+            "resolved" => totals.consensus_agreements += 1,
+            "ownerResolved" => totals.owner_adjudications += 1,
+            "ownerConflict" => totals.unresolved_conflicts += 1,
+            _ => {}
+        }
+    }
+    totals
+}
+
 fn voice_inventory_ready(report: &VoiceInventory) -> bool {
     // A long prepared WAV is intentionally split into multiple bounded review clips. Completeness is
     // therefore every disk WAV matched at least once and every resulting segment exact/usable—not the
@@ -43,6 +69,25 @@ fn voice_inventory_ready(report: &VoiceInventory) -> bool {
 
 fn usage() -> &'static str {
     "Usage:\n  pool_admin migrate --db <cortex-speech.db>\n  pool_admin inventory --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...]\n  pool_admin activate --db <cortex-speech.db> --voice <Name=final-wavs-dir> [--voice ...] [--pool-id <uuid>]\n  pool_admin status --db <cortex-speech.db>\n  pool_admin certify --db <cortex-speech.db> [--full-integrity] [--require-review-ready | --require-final-ready]\n  pool_admin probe --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...]\n  pool_admin benchmark --db <cortex-speech.db> --reviewer <Name> [--dialect <Name> ...] [--iterations <1..100>]\n  pool_admin benchmark-commit --db <DISPOSABLE-clone.db> --iterations <1..500> --confirm-disposable\n  pool_admin stamp-rights --db <cortex-speech.db>\n  pool_admin adjudicate --db <cortex-speech.db> --segment <id> (--retain-text <text> | --reject) --operation-id <uuid>\n  pool_admin export --db <cortex-speech.db> --voice-name <Name> --output <directory>"
+}
+
+const READ_COMMANDS: &[&str] = &["inventory", "status", "certify", "probe", "benchmark"];
+const WRITE_COMMANDS: &[&str] = &["migrate", "activate", "benchmark-commit", "stamp-rights", "adjudicate", "export"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseAccess {
+    ReadOnly,
+    LockedWrite,
+}
+
+fn command_database_access(command: &str) -> Result<DatabaseAccess, String> {
+    if READ_COMMANDS.contains(&command) {
+        Ok(DatabaseAccess::ReadOnly)
+    } else if WRITE_COMMANDS.contains(&command) {
+        Ok(DatabaseAccess::LockedWrite)
+    } else {
+        Err(usage().to_string())
+    }
 }
 
 fn value_after(args: &[String], flag: &str) -> Result<String, String> {
@@ -512,23 +557,31 @@ fn inventory(db: &Database, specs: &[VoiceSpec]) -> Result<(Vec<VoiceInventory>,
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).ok_or_else(|| usage().to_string())?;
+    let database_access = command_database_access(command)?;
     let db_path = PathBuf::from(value_after(&args, "--db")?);
     if !db_path.is_file() {
         return Err(format!("database does not exist: {}", db_path.display()).into());
     }
-    let _instance_lock =
-        if matches!(command, "migrate" | "activate" | "benchmark-commit" | "stamp-rights" | "adjudicate" | "export") {
-            let data_dir = db_path
-                .parent()
-                .ok_or_else(|| format!("database has no parent data directory: {}", db_path.display()))?;
-            Some(
-                cortex_speech_app_lib::flock::InstanceLock::try_lock(data_dir)
-                    .map_err(|error| format!("{command} requires Cortex and every writer to be stopped: {error}"))?,
-            )
-        } else {
-            None
-        };
-    let db = Database::open_with_retry(&db_path.to_string_lossy())?;
+    let _instance_lock = if database_access == DatabaseAccess::LockedWrite {
+        let data_dir =
+            db_path.parent().ok_or_else(|| format!("database has no parent data directory: {}", db_path.display()))?;
+        Some(
+            cortex_speech_app_lib::flock::InstanceLock::try_lock(data_dir)
+                .map_err(|error| format!("{command} requires Cortex and every writer to be stopped: {error}"))?,
+        )
+    } else {
+        None
+    };
+    // Certification, status, inventory, probe, and queue benchmark are observational tools. Opening them
+    // through the normal startup path could change WAL pragmas or invoke corruption recovery on the
+    // live database. The source is opened with SQLite READ_ONLY + query_only inside one stable read
+    // transaction: accidental writes fail, not merely disappear into a disposable copy, and the
+    // five-minute certifier does not copy the entire production DB into RAM. Only instance-locked
+    // writer commands receive source write authority.
+    let db = match database_access {
+        DatabaseAccess::ReadOnly => Database::open_read_only(&db_path.to_string_lossy())?,
+        DatabaseAccess::LockedWrite => Database::open_with_retry(&db_path.to_string_lossy())?,
+    };
     if command == "migrate" {
         let before = cortex_speech_app_lib::migrations::get_current_version(&db)?;
         let data_dir =
@@ -595,6 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pool = review_pool::load(&db)?.ok_or("review pool is not active")?;
             let coverage = review_pool::coverage_by_voice(&db)?;
             let resolutions = review_pool::segment_resolutions(&db, None)?;
+            let resolution_authority = resolution_authority_totals(&resolutions);
             let resolution_summary = review_pool::resolution_summary(&db)?;
             let rights = review_pool::rights_coverage(&db)?;
             let audio = audio_coverage(&db)?;
@@ -634,6 +688,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let voice_rows: Vec<_> = resolutions.iter().filter(|row| row.voice_name == voice.voice_name).collect();
                 let retained = voice_rows.iter().filter(|row| row.final_action.as_deref() == Some("retain")).count();
                 let rejected = voice_rows.iter().filter(|row| row.final_action.as_deref() == Some("reject")).count();
+                let authority = resolution_authority_totals(voice_rows.iter().copied());
                 let certificate = review_pool::voice_certificate(&db, &voice.voice_name)?;
                 voice_outcomes.insert(
                     voice.voice_name.clone(),
@@ -642,6 +697,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "retained": retained,
                         "rejected": rejected,
                         "unresolved": voice_rows.len().saturating_sub(retained + rejected),
+                        "consensusAgreements": authority.consensus_agreements,
+                        "ownerAdjudications": authority.owner_adjudications,
+                        "unresolvedConflicts": authority.unresolved_conflicts,
                         "certificate": certificate,
                     }),
                 );
@@ -666,7 +724,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |row| row.get(0),
             )?;
             let report = serde_json::json!({
-                "reportSchema": 1,
+                "reportSchema": CERTIFICATION_REPORT_SCHEMA,
                 "readOnly": true,
                 "generatedAtEpochSecs": now,
                 "appGitSha": cortex_speech_app_lib::GIT_SHA,
@@ -679,6 +737,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "championDeploymentSha256": pool.champion_deployment_sha256,
                 },
                 "resolutionSummary": resolution_summary,
+                "resolutionAuthority": resolution_authority,
                 "coverageByVoice": coverage,
                 "voiceOutcomes": voice_outcomes,
                 "reviewerVoiceTotals": reviewer_voice_totals(&db)?,
@@ -979,6 +1038,43 @@ mod tests {
         ] {
             assert_eq!(snapshot_epoch(name, pinned), None);
         }
+    }
+
+    #[test]
+    fn every_admin_command_has_an_explicit_read_or_locked_write_boundary() {
+        for command in READ_COMMANDS {
+            assert_eq!(command_database_access(command), Ok(DatabaseAccess::ReadOnly), "{command}");
+        }
+        for command in WRITE_COMMANDS {
+            assert_eq!(command_database_access(command), Ok(DatabaseAccess::LockedWrite), "{command}");
+        }
+        assert!(command_database_access("unknown").is_err());
+        assert!(READ_COMMANDS.iter().all(|command| !WRITE_COMMANDS.contains(command)));
+    }
+
+    #[test]
+    fn certification_distinguishes_human_agreement_owner_adjudication_and_conflict() {
+        let row = |segment_id: &str, status: &str| review_pool::SegmentResolution {
+            segment_id: segment_id.to_string(),
+            voice_name: "Lamo".to_string(),
+            status: status.to_string(),
+            final_action: None,
+            final_transcript: None,
+            evidence_sha256: "0".repeat(64),
+            reviewer_count: 0,
+            agreeing_reviewers: Vec::new(),
+        };
+        let rows = vec![
+            row("agreement-a", "resolved"),
+            row("agreement-b", "resolved"),
+            row("owner", "ownerResolved"),
+            row("conflict", "ownerConflict"),
+            row("pending", "pending"),
+        ];
+        assert_eq!(
+            resolution_authority_totals(&rows),
+            ResolutionAuthorityTotals { consensus_agreements: 2, owner_adjudications: 1, unresolved_conflicts: 1 }
+        );
     }
 
     #[test]

@@ -34,6 +34,29 @@ fn detached_read_snapshot_cannot_mutate_its_source_database() {
     assert_eq!(persisted, 0, "writes to the certification snapshot must never reach its source file");
 }
 
+#[test]
+fn direct_read_only_connection_measures_the_source_but_cannot_write_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("query-only.db");
+    {
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+    }
+    let reader = Database::open_read_only(path.to_str().unwrap()).unwrap();
+    assert_eq!(crate::migrations::validate_applied_history(reader.connection()).unwrap(), 63);
+    let query_only: i64 = reader.connection().query_row("PRAGMA query_only", [], |row| row.get(0)).unwrap();
+    assert_eq!(query_only, 1);
+    assert!(reader.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).is_err());
+    drop(reader);
+
+    let source = Database::open(path.to_str().unwrap()).unwrap();
+    let persisted: i64 = source
+        .connection()
+        .query_row("SELECT COUNT(*) FROM settings WHERE key='must-not-write'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(persisted, 0);
+}
+
 fn make_segment(id: &str, audio_path: &str) -> SpeechSegment {
     SpeechSegment {
         id: id.to_string(),

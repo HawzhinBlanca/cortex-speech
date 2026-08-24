@@ -10,11 +10,37 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-fn app_data_dir() -> PathBuf {
-    std::env::var_os("CORTEX_APP_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("cortex-speech")))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("cortex-speech"))
+fn isolated_import_data_dir(
+    explicit: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let explicit = explicit.filter(|value| !value.is_empty()).ok_or_else(|| {
+        "CORTEX_APP_DATA_DIR is required and must point to an existing isolated staging profile; live review imports are forbidden"
+            .to_string()
+    })?;
+    let selected = std::fs::canonicalize(PathBuf::from(explicit)).map_err(|error| {
+        format!("CORTEX_APP_DATA_DIR must point to an existing isolated staging directory: {error}")
+    })?;
+    if !selected.is_dir() {
+        return Err("CORTEX_APP_DATA_DIR must point to an existing isolated staging directory".to_string());
+    }
+
+    // The importer is an offline staging tool. It must never infer or overlap the mutable profile
+    // served to reviewers, even if the GUI is currently closed. Canonical paths close case, `..`,
+    // symlink, and junction aliases; rejecting ancestor overlap also keeps staging databases out of
+    // the live snapshot tree and keeps the live profile out of a staging tree.
+    let appdata = appdata
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "APPDATA is required to identify and protect the live review profile".to_string())?;
+    let live = std::fs::canonicalize(PathBuf::from(appdata).join("cortex-speech"))
+        .map_err(|error| format!("cannot resolve the live review profile for import isolation: {error}"))?;
+    if selected == live || selected.starts_with(&live) || live.starts_with(&selected) {
+        return Err(format!(
+            "live review imports are forbidden: CORTEX_APP_DATA_DIR must be separate from {}",
+            live.display()
+        ));
+    }
+    Ok(selected)
 }
 
 fn collect_prepared_wavs(directory: &Path) -> Result<Vec<PathBuf>, String> {
@@ -195,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     println!("Starting Batch Importer...");
 
-    let app_data_dir = app_data_dir();
+    let app_data_dir = isolated_import_data_dir(std::env::var_os("CORTEX_APP_DATA_DIR"), std::env::var_os("APPDATA"))?;
 
     // Single-instance guard shared with the GUI (same cortex.lock): refuse to run against the live DB
     // while the app — or another importer — is open, so two writers never contend on the WAL DB or the
@@ -376,5 +402,40 @@ mod tests {
 
         let files = collect_prepared_wavs(root.path()).expect("collect prepared wavs");
         assert_eq!(files, vec![root.path().join("b.WAV"), nested.join("a.wav")]);
+    }
+
+    #[test]
+    fn production_import_requires_an_explicit_nonoverlapping_staging_profile() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let appdata = root.path().join("appdata");
+        let live = appdata.join("cortex-speech");
+        let live_child = live.join("staging");
+        let isolated = root.path().join("isolated-import");
+        std::fs::create_dir_all(&live_child).expect("live fixture");
+        std::fs::create_dir_all(&isolated).expect("isolated fixture");
+        let appdata_value = Some(appdata.as_os_str().to_owned());
+
+        let absent = isolated_import_data_dir(None, appdata_value.clone()).unwrap_err();
+        assert!(absent.contains("CORTEX_APP_DATA_DIR is required"));
+        let exact_live =
+            isolated_import_data_dir(Some(live.as_os_str().to_owned()), appdata_value.clone()).unwrap_err();
+        assert!(exact_live.contains("live review imports are forbidden"));
+        let live_descendant =
+            isolated_import_data_dir(Some(live_child.as_os_str().to_owned()), appdata_value.clone()).unwrap_err();
+        assert!(live_descendant.contains("live review imports are forbidden"));
+        let live_ancestor =
+            isolated_import_data_dir(Some(appdata.as_os_str().to_owned()), appdata_value.clone()).unwrap_err();
+        assert!(live_ancestor.contains("live review imports are forbidden"));
+        let missing = isolated_import_data_dir(
+            Some(root.path().join("typo-does-not-exist").as_os_str().to_owned()),
+            appdata_value.clone(),
+        )
+        .unwrap_err();
+        assert!(missing.contains("existing isolated staging directory"));
+
+        assert_eq!(
+            isolated_import_data_dir(Some(isolated.as_os_str().to_owned()), appdata_value).unwrap(),
+            std::fs::canonicalize(isolated).unwrap()
+        );
     }
 }

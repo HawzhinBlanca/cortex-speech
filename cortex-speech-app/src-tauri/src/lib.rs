@@ -104,6 +104,22 @@ use session::SessionManager;
 use settings::AppSettings;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+// A nine-minute monotonic schedule leaves one minute for capture and ordinary scheduler jitter while
+// preserving the private-production RPO <= 10 minutes. Advancing from the prior deadline (rather than
+// sleeping after each completed backup) prevents snapshot duration from accumulating as cadence drift.
+const SNAPSHOT_TARGET_RPO_SECS: u64 = 10 * 60;
+const SNAPSHOT_CAPTURE_JITTER_MARGIN_SECS: u64 = 60;
+const SNAPSHOT_INTERVAL_SECS: u64 = SNAPSHOT_TARGET_RPO_SECS - SNAPSHOT_CAPTURE_JITTER_MARGIN_SECS;
+
+fn next_snapshot_deadline(previous_deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    let mut next = previous_deadline + interval;
+    while next <= now {
+        next += interval;
+    }
+    next
+}
 
 /// Clonable access to the AppState database for blocking worker tasks.
 ///
@@ -556,10 +572,10 @@ pub fn run() {
     }
 
     // P3.1/M0.4b: rotating auto-snapshots of the DB + config state. One on startup (so a corruption is
-    // recoverable from the moment the app runs), then every 10 minutes — protecting the marathon's
-    // irreplaceable review labor without any user action. Skipped in headless test modes.
+    // recoverable from the moment the app runs), then on a fixed nine-minute monotonic cadence. The
+    // one-minute capture/jitter margin keeps the measured recovery point within the ten-minute target
+    // without cumulative drift. Skipped in headless test modes.
     const SNAPSHOT_KEEP: usize = 10;
-    const SNAPSHOT_INTERVAL_SECS: u64 = 600;
     if !smoke_test {
         match crate::snapshot::take_snapshot(&db, &data_dir, SNAPSHOT_KEEP) {
             Ok(Some(_)) => {}
@@ -568,47 +584,54 @@ pub fn run() {
         }
         let snap_db_path = db_path.clone();
         let snap_data_dir = data_dir.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
-            // catch_unwind (true-10 audit 2026-07-09): a panic in the loop body silently killed the
-            // safety-net thread for the rest of the session — the failure counter only saw Err, not
-            // panics. A panic now counts as a failure (health surfaces it) and the loop survives.
-            let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
-                match Database::open(snap_db_path.to_string_lossy().as_ref()) {
-                    Ok(snap_db) => {
-                        match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
-                        }
-                        // Second-directory backup (Week-2): re-read settings.json each interval so the
-                        // owner can point backups at another drive without a restart. Failure here is
-                        // warn-only — it must never break the primary snapshot safety net above.
-                        let second = AppSettings::load(&snap_data_dir.join("settings.json")).backup_second_dir;
-                        if !second.trim().is_empty() {
-                            // Quarantine files live in the PRIMARY data dir — thread it in so the
-                            // off-drive tree's prune-pin and accumulation cap see the corruption too
-                            // (its own parent never holds *.corrupt.* files).
-                            // take_offsite_snapshot (NOT ..._with_quarantine_source): the off-drive tree
-                            // must not touch the shared health counters, or its success masks a failing
-                            // primary snapshot tree and health_check reads a false green (round-25 hunt).
-                            match crate::snapshot::take_offsite_snapshot(
-                                &snap_db,
-                                std::path::Path::new(second.trim()),
-                                &snap_data_dir,
-                                SNAPSHOT_KEEP,
-                            ) {
+        std::thread::spawn(move || {
+            let interval = Duration::from_secs(SNAPSHOT_INTERVAL_SECS);
+            let mut deadline = Instant::now() + interval;
+            loop {
+                if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+                // catch_unwind (true-10 audit 2026-07-09): a panic in the loop body silently killed the
+                // safety-net thread for the rest of the session — the failure counter only saw Err, not
+                // panics. A panic now counts as a failure (health surfaces it) and the loop survives.
+                let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
+                    match Database::open(snap_db_path.to_string_lossy().as_ref()) {
+                        Ok(snap_db) => {
+                            match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
                                 Ok(_) => {}
-                                Err(e) => tracing::warn!("second-directory snapshot failed ({second}): {e}"),
+                                Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
+                            }
+                            // Second-directory backup (Week-2): re-read settings.json each interval so the
+                            // owner can point backups at another drive without a restart. Failure here is
+                            // warn-only — it must never break the primary snapshot safety net above.
+                            let second = AppSettings::load(&snap_data_dir.join("settings.json")).backup_second_dir;
+                            if !second.trim().is_empty() {
+                                // Quarantine files live in the PRIMARY data dir — thread it in so the
+                                // off-drive tree's prune-pin and accumulation cap see the corruption too
+                                // (its own parent never holds *.corrupt.* files).
+                                // take_offsite_snapshot (NOT ..._with_quarantine_source): the off-drive tree
+                                // must not touch the shared health counters, or its success masks a failing
+                                // primary snapshot tree and health_check reads a false green (round-25 hunt).
+                                match crate::snapshot::take_offsite_snapshot(
+                                    &snap_db,
+                                    std::path::Path::new(second.trim()),
+                                    &snap_data_dir,
+                                    SNAPSHOT_KEEP,
+                                ) {
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!("second-directory snapshot failed ({second}): {e}"),
+                                }
                             }
                         }
+                        Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
                     }
-                    Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
+                }));
+                if iteration.is_err() {
+                    crate::snapshot::record_snapshot_panic();
+                    tracing::error!("periodic snapshot iteration PANICKED — counted as a failure; loop continues");
                 }
-            }));
-            if iteration.is_err() {
-                crate::snapshot::record_snapshot_panic();
-                tracing::error!("periodic snapshot iteration PANICKED — counted as a failure; loop continues");
+                deadline = next_snapshot_deadline(deadline, interval, Instant::now());
             }
         });
     }
@@ -1116,6 +1139,28 @@ fn dirs_fallback(suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_snapshot_deadlines_do_not_accumulate_capture_time_or_missed_ticks() {
+        let interval = Duration::from_secs(SNAPSHOT_INTERVAL_SECS);
+        let first = Instant::now() + interval;
+
+        let after_fast_capture = first + Duration::from_secs(7);
+        assert_eq!(
+            next_snapshot_deadline(first, interval, after_fast_capture),
+            first + interval,
+            "a completed capture must advance from the scheduled deadline, not its completion time"
+        );
+
+        let after_two_missed_ticks = first + interval * 2 + Duration::from_secs(7);
+        assert_eq!(
+            next_snapshot_deadline(first, interval, after_two_missed_ticks),
+            first + interval * 3,
+            "a suspended or overrun process must skip expired ticks without introducing cadence drift"
+        );
+        assert_eq!(SNAPSHOT_INTERVAL_SECS, 9 * 60);
+        assert_eq!(SNAPSHOT_TARGET_RPO_SECS, 10 * 60);
+    }
 
     #[cfg(windows)]
     #[test]

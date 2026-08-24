@@ -1494,6 +1494,25 @@ impl Database {
         Ok(Self { conn, path: path.to_string() })
     }
 
+    /// Open the live SQLite/WAL path with query-only authority and one stable read transaction.
+    /// This preserves real disk/cache behavior without a full in-memory copy, but cannot change rows,
+    /// journal mode, or invoke startup corruption recovery. The first query establishes the WAL
+    /// snapshot and every later certification query sees that same point in time.
+    pub fn open_read_only(path: &str) -> AppResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA foreign_keys=ON;
+             PRAGMA cache_size=-64000;
+             PRAGMA busy_timeout=10000;
+             BEGIN DEFERRED;",
+        )?;
+        Ok(Self { conn, path: path.to_string() })
+    }
+
     /// Take a WAL-consistent, detached in-memory snapshot of an existing database without acquiring
     /// source write authority or changing its journal mode. Offline certification and production
     /// export use the private copy so they can never bootstrap, migrate, or mutate the live library.
