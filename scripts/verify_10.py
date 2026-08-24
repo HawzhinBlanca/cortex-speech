@@ -32,6 +32,7 @@ no honesty/privacy/reliability/correctness gate is waived.
 """
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,68 @@ APP = REPO_ROOT / "cortex-speech-app"
 SRC_TAURI = APP / "src-tauri"
 MANIFEST = SRC_TAURI / "Cargo.toml"
 EXE = SRC_TAURI / "target" / "release" / "cortex-speech-app.exe"
+ACTIVE_RELEASE_POINTER = "active-private-production-release.json"
+_RUNTIME_EXE_CONFIGURED = False
+_RUNTIME_EXE_ERROR = None
+
+
+def validate_active_release_runtime(manifest, release_root):
+    """Return the exact immutable app binary, or fail closed on pointer/hash/SHA drift."""
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+        raise ValueError("active release pointer is not a schema-1 object")
+    directory_value = manifest.get("directory")
+    exe_value = manifest.get("appExe")
+    expected_hash = manifest.get("appSha256")
+    expected_git_sha = manifest.get("appGitSha")
+    if not all(isinstance(value, str) and value for value in (directory_value, exe_value, expected_hash, expected_git_sha)):
+        raise ValueError("active release pointer lacks app path/hash/git authority")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        raise ValueError("active release app hash is not canonical SHA-256")
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_git_sha):
+        raise ValueError("active release app git SHA is not canonical")
+
+    root = Path(release_root).resolve(strict=True)
+    directory = Path(directory_value).resolve(strict=True)
+    exe = Path(exe_value).resolve(strict=True)
+    if directory.parent != root or exe.parent != directory or exe.name.casefold() != "cortex-speech-app.exe":
+        raise ValueError("active release app path escapes its immutable release directory")
+    blob = exe.read_bytes()
+    actual_hash = hashlib.sha256(blob).hexdigest()
+    if actual_hash != expected_hash:
+        raise ValueError(f"active release app hash drifted ({actual_hash[:12]}… != {expected_hash[:12]}…)")
+    marker = re.search(rb"CORTEX_BUILD_SHA:([0-9a-fA-F]{7,40}|unknown)", blob)
+    baked_sha = marker.group(1).decode("ascii").casefold() if marker else None
+    if baked_sha is None or not (expected_git_sha.startswith(baked_sha) or baked_sha.startswith(expected_git_sha)):
+        raise ValueError("active release app binary does not carry its manifest git SHA")
+    return exe
+
+
+def configure_runtime_exe():
+    """Prefer an explicit diagnostic exe, then the validated immutable production release."""
+    global _RUNTIME_EXE_CONFIGURED, _RUNTIME_EXE_ERROR
+    if _RUNTIME_EXE_CONFIGURED:
+        return
+    _RUNTIME_EXE_CONFIGURED = True
+    if os.environ.get("CORTEX_APP_EXE"):
+        return
+    appdata = os.environ.get("APPDATA")
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not appdata or not localappdata:
+        return
+    pointer = Path(appdata) / "cortex-speech" / ACTIVE_RELEASE_POINTER
+    if not pointer.is_file():
+        return
+    try:
+        manifest = json.loads(pointer.read_text(encoding="utf-8"))
+        release_root = Path(localappdata) / "CortexSpeech" / "private-production-releases"
+        os.environ["CORTEX_APP_EXE"] = str(validate_active_release_runtime(manifest, release_root))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        _RUNTIME_EXE_ERROR = f"active immutable release pointer is invalid: {error}"
+
+
+def runtime_exe():
+    configure_runtime_exe()
+    return Path(os.environ.get("CORTEX_APP_EXE", str(EXE)))
 
 # A SEPARATE cargo target dir for the fault-drill binaries, and it is not a preference.
 # `tauri_build`/`ort` copy `onnxruntime.dll` next to the built artifacts, and the RUNNING app holds
@@ -480,14 +543,18 @@ def _probe_deny():
 
 
 def _probe_exe():
-    if EXE.exists():
+    exe = runtime_exe()
+    if _RUNTIME_EXE_ERROR:
+        return _RUNTIME_EXE_ERROR
+    if exe.exists():
         return None
-    return "release exe missing - run `make build-app`"
+    return f"release exe missing at {exe} - build a candidate or activate a validated immutable release"
 
 
 def _probe_real_e2e():
-    if not EXE.exists():
-        return "release exe missing - run `make build-app`"
+    reason = _probe_exe()
+    if reason:
+        return reason
     # This used to skip whenever CORTEX_AUDIO was unset, which made the leg the registration below
     # calls "THE daily-use reliability gate" the easiest one in the suite to not run: a sweep came
     # back "22 PASS, 0 FAIL" with it reported SKIP-ENV. The harness now defaults to the committed
@@ -514,8 +581,9 @@ def _probe_ipc_harness():
     They now default to that fixture and run against a DISPOSABLE profile (e2e_profile.cjs), so the
     only generic reasons to skip are a missing binary or fixture — not a forgotten env var.
     """
-    if not EXE.exists():
-        return "release exe missing - run `make build-app`"
+    reason = _probe_exe()
+    if reason:
+        return reason
     if not (SRC_TAURI / "tests" / "fixtures" / "fleurs_ckb_sample.wav").exists():
         return "committed audio fixture missing"
     return None
@@ -581,8 +649,9 @@ def _probe_champion_7b():
 
 
 def _probe_egress():
-    if not EXE.exists():
-        return "release exe missing - run `make build-app`"
+    reason = _probe_exe()
+    if reason:
+        return reason
     if sys.platform != "win32":
         return "egress probe samples Windows TCP (Get-NetTCPConnection); runs on the owner Windows rig"
     return None
@@ -712,12 +781,12 @@ GATES = [
     ("test-e2e+a11y", 1, "cmd", "npm run test:e2e", APP, None, "A11y: axe WCAG 2.2 AA en+ckb/RTL (coverage assertion: WS2 follow-up)"),
     # Tier 2 — real binary on this machine (the personal-use core)
     ("database-integrity-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_database_integrity.py"}" --require-production-v58-repair', APP, None, "Whole LIVE SQLite truth, read-only and unskippable: quick_check and full integrity_check must each return exactly ok, foreign_key_check must return zero rows across every table, migration history must be exact, and the immutable v58 archives must prove the authorized 2,104+2,104 production repair by identity digest and provenance. Feature-specific gates cannot certify a database that is structurally healthy but missing its repair evidence."),
-    ("review-schema-contract-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_schema_contract.py"}"', APP, None, "Exact LIVE paid-review schema truth: every table, index, trigger, and view created by canonical compensation/effect migrations 57 and 60 must byte-semantically match this exact checkout; every ALTER-added column and foreign key must exist; same-name dummy safety triggers and unexpected triggers on protected tables are RED. A schema_migrations row alone is not proof that future writes remain protected."),
-    ("review-compensation-readiness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_compensation_readiness.py"}"', APP, None, "Mode-selected compensation truth on the LIVE database. Legacy pilot mode requires the exact review-iqd-v1-2026-08-21 policy (edit 100%, unchanged accept 10%, valid reject 10%, skip 0% at 18,000 IQD/full-equivalent hour), one durable ledger consequence per event, balanced revisions/settlements/operations, and canonical work identities. Flexible schema-63 mode follows the owner's operational deferral: the legacy policy/schema remain immutable, the pilot policy must be absent, and no pool decision may leak into the legacy payable event/ledger namespace. Missing or mixed authority is RED."),
-    ("review-mode-certification", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_pilot_certification.py"}"', APP, None, "Mode-selected final review authority. An active schema-63 flexible pool must bind to the exact hash-verified immutable release and pass a fresh detached full-integrity certification for its exact registry, membership, audio, rights, disk, local/offsite snapshots and internally consistent resolution totals; review readiness does not impersonate final dataset completion. Without a flexible pool, the strict legacy Rubar/Alle canary remains mandatory: 10+10 corpus and 2+2 hidden decisions, zero skips, exact playback and complete ledger/operation receipts. Conflicting modes or missing evidence are RED."),
+    ("review-schema-contract-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_schema_contract.py"}"', APP, None, "Exact LIVE review schema truth: every table, index, trigger, and view created by canonical compensation/effect and pool migrations 57, 60-65 must byte-semantically match this exact checkout; every ALTER-added column and foreign key must exist; same-name dummy safety triggers and unexpected triggers on protected tables are RED. A schema_migrations row alone is not proof that future writes remain protected."),
+    ("review-compensation-readiness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_compensation_readiness.py"}"', APP, None, "Mode-selected compensation truth on the LIVE database. Legacy pilot mode requires the exact review-iqd-v1-2026-08-21 policy (edit 100%, unchanged accept 10%, valid reject 10%, skip 0% at 18,000 IQD/full-equivalent hour), one durable ledger consequence per event, balanced revisions/settlements/operations, and canonical work identities. Flexible-pool mode (introduced at schema 63; current authority schema 65) follows the owner's operational deferral: the legacy policy/schema remain immutable, the pilot policy must be absent, and no pool decision may leak into the legacy payable event/ledger namespace. Missing or mixed authority is RED."),
+    ("review-mode-certification", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_review_pilot_certification.py"}"', APP, None, "Mode-selected final review authority. An active flexible pool (introduced at schema 63; current authority schema 65) must bind to the exact hash-verified immutable release and pass a fresh detached full-integrity certification for its exact registry, membership, audio, rights, disk, local/offsite snapshots and internally consistent resolution totals; review readiness does not impersonate final dataset completion. Without a flexible pool, the strict legacy Rubar/Alle canary remains mandatory: 10+10 corpus and 2+2 hidden decisions, zero skips, exact playback and complete ledger/operation receipts. Conflicting modes or missing evidence are RED."),
     ("reviewer-links-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_reviewer_links_live.py"}" --funnel --port 8737 --require-private-production', APP, None, "Every durable reviewer credential must authenticate through the advertised Tailscale Funnel and bind to its intended identity, exact live database, fixed production port, durable state, and active review mode. Flexible-pool mode requires its immutable pool registry and forbids a simultaneous legacy pilot; a pre-pool database still requires the exact controlled-pilot contract. The probe is read-only: it mints no cookie, evicts no phone session, leases no work and consumes no hidden-check key. Queue eligibility is independently proven by reviewer-queues-live. Public TLS verification remains enabled; missing Funnel/session/mode/links is RED, never skipped."),
     ("exe-freshness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_exe_freshness.py"}"', REPO_ROOT, _probe_exe, "Truth-in-advertising: exe compiled from HEAD"),
-    ("playback-enforcement-readiness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_playback_enforcement_readiness.py"}" --active-release', APP, None, "Mode-selected listening proof for the exact deployed binary. Flexible schema-63 mode hash-verifies the immutable active release and audits effective pool decisions using their immutable served revision, decoded-PCM BLAKE3 hash, exact source span, duration and playback-guard version; legacy mode retains compensation-ledger revision authority. At least 20 post-build phone decisions across two reviewer browsers must each carry >=85% canonical raw-counter playback evidence. No skip probe, --since override or empty-window pass is allowed."),
+    ("playback-enforcement-readiness", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_playback_enforcement_readiness.py"}" --active-release', APP, None, "Mode-selected listening proof for the exact deployed binary. Flexible-pool mode (introduced at schema 63; current authority schema 65) hash-verifies the immutable active release and audits effective pool decisions using their immutable served revision, decoded-PCM BLAKE3 hash, exact source span, duration and playback-guard version; legacy mode retains compensation-ledger revision authority. At least 20 post-build phone decisions across two reviewer browsers must each carry >=85% canonical raw-counter playback evidence. No skip probe, --since override or empty-window pass is allowed."),
     ("supervision-live", 2, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_supervision_live.py"}"', REPO_ROOT, None, "Fitness to SERVE, not just to compile: the watchdog is enabled, every live reviewer link answers on 8737, and the data drive has room to write. MEASURED 2026-08-15: all three were false at once — CortexWatchdog left `Disabled` by the rebuild procedure, the app exited so five sent links were dead, and C: at 0 bytes had already broken the 10-minute DB snapshot ('periodic DB snapshot failed'). Every source-level gate was still capable of GREEN, because none of them looks at the machine."),
     ("real-app-e2e", 2, "cmd", f'node "{APP / "e2e_real_app.cjs"}"', APP, _probe_real_e2e, "Daily-use proof on a disposable profile: real exe + real audio + the exact pinned WSL7B champion + real transcript. CORTEX_GATE forces WSL7B, so an inherited diagnostic-engine override cannot weaken this gate."),
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)

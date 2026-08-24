@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import difflib
 import random
+import sqlite3
 from unittest import mock
 from pathlib import Path
 
@@ -15,10 +16,68 @@ from check_dataset_duplicates import (  # noqa: E402
     audio_says_duplicate,
     confirm_groups_with_audio,
     duplicate_groups,
+    load_audit_rows,
 )
 
 TEXT = "ئەم ڕستەیە بەشێکی تەواوی گفتوگۆکەیە و درێژییەکەی بەسە"
 ALIGN = '{"source_start_ms": 132945, "source_end_ms": 140740}'
+
+
+def _pool_scope_database() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE speech_segments(
+            id TEXT PRIMARY KEY, audio_path TEXT, alignment_json TEXT,
+            raw_transcript TEXT, verified INTEGER
+        );
+        CREATE TABLE review_pool_registry(
+            singleton_key INTEGER PRIMARY KEY, pool_id TEXT, focus_segment_count INTEGER
+        );
+        CREATE TABLE review_pool_members(
+            pool_id TEXT, segment_id TEXT, raw_transcript TEXT,
+            source_start_ms INTEGER, source_end_ms INTEGER
+        );
+        CREATE TABLE review_pool_dedup_manifests(
+            pool_id TEXT, source_focus_segment_count INTEGER, canonical_count INTEGER,
+            excluded_count INTEGER, unconfirmed_risk_count INTEGER
+        );
+        CREATE TABLE review_pool_duplicate_exclusions(pool_id TEXT, segment_id TEXT);
+        INSERT INTO review_pool_registry VALUES(1, 'pool', 3);
+        INSERT INTO speech_segments VALUES
+            ('canonical', 'one.wav', '{}', 'same', 0),
+            ('excluded', 'two.wav', '{}', 'same', 0),
+            ('unique', 'three.wav', '{}', 'different', 0);
+        INSERT INTO review_pool_members VALUES
+            ('pool', 'canonical', 'same', 0, 1000),
+            ('pool', 'excluded', 'same', 0, 1000),
+            ('pool', 'unique', 'different', 1000, 2000);
+        INSERT INTO review_pool_dedup_manifests VALUES('pool', 3, 2, 1, 0);
+        INSERT INTO review_pool_duplicate_exclusions VALUES('pool', 'excluded');
+        """
+    )
+    return connection
+
+
+def test_active_pool_duplicate_audit_uses_only_verified_canonical_overlay() -> None:
+    connection = _pool_scope_database()
+    rows, scope = load_audit_rows(connection)
+    connection.close()
+    assert [row[0] for row in rows] == ["canonical", "unique"]
+    assert "canonical review pool" in scope and "2 clips" in scope
+
+
+def test_active_pool_duplicate_audit_fails_closed_on_exclusion_count_drift() -> None:
+    connection = _pool_scope_database()
+    connection.execute("DELETE FROM review_pool_duplicate_exclusions")
+    try:
+        load_audit_rows(connection)
+    except ValueError as error:
+        assert "inconsistent dedup authority" in str(error)
+    else:
+        raise AssertionError("dedup exclusion drift was accepted")
+    finally:
+        connection.close()
 
 
 def test_the_real_find_same_offset_and_text_in_two_files_is_one_group() -> None:

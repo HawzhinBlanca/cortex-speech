@@ -500,6 +500,109 @@ def confirm_groups_with_audio(groups, rows, *, include_proof: bool = False):
     return confirmed, unconfirmed, repeats
 
 
+def load_audit_rows(con: sqlite3.Connection) -> tuple[list[tuple[str, str, str, str, int]], str]:
+    """Load the exact corpus that may still be served or exported.
+
+    A v64+ pool retains excluded duplicates as immutable provenance rows. Auditing those rows as if
+    they were canonical work rejects the exclusion authority itself. Verify the manifest and its
+    exclusion counts first, then narrow to the canonical overlay. Missing or unapplied dedup
+    authority keeps the full source pool in scope and therefore remains fail-closed.
+    """
+    pool_registry_exists = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_pool_registry'"
+    ).fetchone()
+    pool_members_exist = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_pool_members'"
+    ).fetchone()
+    active_pool = None
+    if pool_registry_exists and pool_members_exist:
+        active_pool = con.execute(
+            "SELECT pool_id, focus_segment_count FROM review_pool_registry WHERE singleton_key = 1"
+        ).fetchone()
+    if not active_pool:
+        rows = con.execute(
+            "SELECT id, audio_path, alignment_json, raw_transcript, verified FROM speech_segments"
+        ).fetchall()
+        return rows, f"full live library ({len(rows)} clips)"
+
+    pool_id, expected_count = active_pool
+    expected_count = int(expected_count)
+    actual_count = int(
+        con.execute("SELECT COUNT(*) FROM review_pool_members WHERE pool_id = ?", (pool_id,)).fetchone()[0]
+    )
+    if actual_count != expected_count:
+        raise ValueError(
+            f"active pool {pool_id} is structurally incomplete: registry expects "
+            f"{expected_count}, found {actual_count}"
+        )
+
+    manifest_table = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_pool_dedup_manifests'"
+    ).fetchone()
+    exclusions_table = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_pool_duplicate_exclusions'"
+    ).fetchone()
+    if bool(manifest_table) != bool(exclusions_table):
+        raise ValueError("dedup authority tables are only partially present")
+
+    dedup = None
+    if manifest_table:
+        dedup = con.execute(
+            """SELECT source_focus_segment_count, canonical_count, excluded_count,
+                      unconfirmed_risk_count
+                 FROM review_pool_dedup_manifests
+                WHERE pool_id = ?""",
+            (pool_id,),
+        ).fetchone()
+    if dedup:
+        source_count, canonical_count, excluded_count, unconfirmed_risk_count = map(int, dedup)
+        actual_excluded = int(
+            con.execute(
+                "SELECT COUNT(*) FROM review_pool_duplicate_exclusions WHERE pool_id = ?", (pool_id,)
+            ).fetchone()[0]
+        )
+        if (
+            source_count != expected_count
+            or canonical_count + excluded_count != source_count
+            or actual_excluded != excluded_count
+            or unconfirmed_risk_count != 0
+        ):
+            raise ValueError(
+                f"active pool {pool_id} has inconsistent dedup authority: source={source_count}, "
+                f"canonical={canonical_count}, excluded={excluded_count}/{actual_excluded}, "
+                f"unconfirmedRisk={unconfirmed_risk_count}, registry={expected_count}"
+            )
+        rows = con.execute(
+            """SELECT s.id, s.audio_path,
+                      printf('{\"source_start_ms\":%d,\"source_end_ms\":%d}',
+                             p.source_start_ms, p.source_end_ms),
+                      p.raw_transcript, s.verified
+                 FROM review_pool_members p
+                 JOIN speech_segments s ON s.id = p.segment_id
+                 LEFT JOIN review_pool_duplicate_exclusions exclusion
+                   ON exclusion.pool_id = p.pool_id AND exclusion.segment_id = p.segment_id
+                WHERE p.pool_id = ? AND exclusion.segment_id IS NULL""",
+            (pool_id,),
+        ).fetchall()
+        if len(rows) != canonical_count:
+            raise ValueError(
+                f"active pool {pool_id} canonical overlay expects {canonical_count}, found {len(rows)}"
+            )
+        return rows, f"active immutable canonical review pool {pool_id} ({canonical_count} clips)"
+
+    rows = con.execute(
+        """SELECT s.id, s.audio_path,
+                  printf('{\"source_start_ms\":%d,\"source_end_ms\":%d}',
+                         p.source_start_ms, p.source_end_ms),
+                  p.raw_transcript, s.verified
+             FROM review_pool_members p
+             JOIN speech_segments s ON s.id = p.segment_id
+            WHERE p.pool_id = ?""",
+        (pool_id,),
+    ).fetchall()
+    return rows, f"active immutable source review pool {pool_id} ({actual_count} clips; dedup unapplied)"
+
+
 def main() -> int:
     db = _data_dir() / "cortex-speech.db"
     if not db.is_file():
@@ -507,45 +610,11 @@ def main() -> int:
         return 0
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        pool_registry_exists = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_pool_registry'"
-        ).fetchone()
-        pool_members_exist = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_pool_members'"
-        ).fetchone()
-        active_pool = None
-        if pool_registry_exists and pool_members_exist:
-            active_pool = con.execute(
-                "SELECT pool_id, focus_segment_count FROM review_pool_registry WHERE singleton_key = 1"
-            ).fetchone()
-        if active_pool:
-            pool_id, expected_count = active_pool
-            actual_count = con.execute(
-                "SELECT COUNT(*) FROM review_pool_members WHERE pool_id = ?", (pool_id,)
-            ).fetchone()[0]
-            if actual_count != expected_count:
-                print(
-                    "DATASET DUPLICATES: FAIL\n"
-                    f"  active pool {pool_id} is structurally incomplete: registry expects "
-                    f"{expected_count}, found {actual_count}",
-                    flush=True,
-                )
-                return 1
-            rows = con.execute(
-                """SELECT s.id, s.audio_path,
-                          printf('{\"source_start_ms\":%d,\"source_end_ms\":%d}',
-                                 p.source_start_ms, p.source_end_ms),
-                          p.raw_transcript, s.verified
-                     FROM review_pool_members p
-                     JOIN speech_segments s ON s.id = p.segment_id
-                    WHERE p.pool_id = ?""",
-                (pool_id,),
-            ).fetchall()
-            print(f"  scope: active immutable review pool {pool_id} ({actual_count} clips)", flush=True)
-        else:
-            rows = con.execute(
-                "SELECT id, audio_path, alignment_json, raw_transcript, verified FROM speech_segments"
-            ).fetchall()
+        rows, scope = load_audit_rows(con)
+        print(f"  scope: {scope}", flush=True)
+    except (sqlite3.Error, ValueError) as error:
+        print(f"DATASET DUPLICATES: FAIL\n  {error}", flush=True)
+        return 1
     finally:
         con.close()
 

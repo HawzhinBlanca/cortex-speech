@@ -54,10 +54,36 @@ def test_contract_is_extracted_from_the_canonical_migration_source():
         ("trigger", "segments_ad"),
         ("trigger", "segments_au"),
         ("trigger", "speech_segments_review_revision"),
+        ("table", "independent_review_decisions"),
+        ("view", "effective_independent_review_decisions_v61"),
+        ("table", "review_pool_registry"),
+        ("table", "review_pool_members"),
+        ("table", "review_pool_decisions"),
+        ("view", "effective_review_pool_decisions_v62"),
+        ("table", "review_pool_owner_adjudications"),
+        ("table", "review_pool_voice_certificates"),
+        ("table", "review_pool_dedup_manifests"),
+        ("table", "review_pool_duplicate_exclusions"),
+        ("trigger", "speech_segments_v64_excluded_review_guard"),
     }
-    assert len(objects) >= 70, f"contract unexpectedly shrank to {len(objects)} objects"
+    assert len(objects) >= 120, f"contract unexpectedly shrank to {len(objects)} objects"
     assert required <= objects.keys(), sorted(required - objects.keys())
     assert len(digest) == 64 and set(digest) <= set("0123456789abcdef")
+
+
+def test_contract_replays_the_schema_65_excluded_review_guard_replacement():
+    objects, _digest = GATE.load_contract_objects()
+    guard = objects[("trigger", "speech_segments_v64_excluded_review_guard")].sql
+    assert "review_revision" not in guard
+    for protected_column in (
+        "human_decision",
+        "verdict",
+        "verdict_transcript",
+        "annotated_transcript",
+        "verified",
+        "reviewed_by",
+    ):
+        assert protected_column in guard
 
 
 def test_contract_preserves_raw_phone_action_and_strict_integer_source_spans():

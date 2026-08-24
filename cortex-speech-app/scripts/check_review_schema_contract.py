@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Fail closed when the live paid-review SQLite schema differs from migrations 57/60.
+"""Fail closed when the live review SQLite schema differs from migrations 57/60-65.
 
 The migration number alone is not proof that the safety objects still have their intended
 definitions: SQLite permits a trigger or view to be dropped and recreated under the same name.
-This gate compares every table, index, trigger, and view created by the compensation/effect
-migrations with the canonical SQL compiled from this checkout.  It also checks every column those
-migrations add to an older table and rejects extra triggers attached to the protected tables.  The
-four canonical speech-segment triggers that predate v57 are included explicitly so ordinary FTS and
-revision maintenance is not misreported as hostile schema drift.
+This gate compares every table, index, trigger, and view created by the compensation/effect and
+private-production pool migrations with the canonical final SQL compiled from this checkout.  It
+also checks every column those migrations add to an older table and rejects extra triggers attached
+to the protected tables.  The four canonical speech-segment triggers that predate v57 are included
+explicitly so ordinary FTS and revision maintenance is not misreported as hostile schema drift.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Iterable
 
 
-REQUIRED_SCHEMA = 60
-CONTRACT_MIGRATIONS = (57, 60)
+REQUIRED_SCHEMA = 65
+CONTRACT_MIGRATIONS = (57, 60, 61, 62, 63, 64, 65)
 MIGRATIONS_SOURCE = Path(__file__).resolve().parents[1] / "src-tauri" / "src" / "migrations" / "mod.rs"
 
 BASE_SPEECH_SEGMENT_TRIGGER_SQL = """
@@ -186,17 +186,9 @@ def load_contract_objects(source_path: Path = MIGRATIONS_SOURCE) -> tuple[dict[t
     source = source_path.read_text(encoding="utf-8")
     objects: dict[tuple[str, str], SchemaObject] = {}
     contract_sql: list[str] = []
-    for version in CONTRACT_MIGRATIONS:
-        up_sql = migration_up_sql(source, version)
-        contract_sql.append(up_sql)
-        for item in created_schema_objects(up_sql):
-            key = (item.object_type, item.name)
-            if key in objects:
-                raise ValueError(f"duplicate schema-contract object {key}")
-            objects[key] = item
-    # v60 protects speech_segments, which legitimately already has two base FTS triggers and the
-    # v53 narrowed FTS-update + monotonic-revision triggers.  Bind their exact SQL as supporting
-    # context; otherwise the "no extra trigger" check rejects every honest production database.
+    # v60+ protects speech_segments, which legitimately already has two base FTS triggers and the
+    # v53 narrowed FTS-update + monotonic-revision triggers. Bind their exact SQL first, in migration
+    # order; otherwise the "no extra trigger" check rejects every honest production database.
     supporting_sql = [BASE_SPEECH_SEGMENT_TRIGGER_SQL, migration_up_sql(source, 53)]
     for sql in supporting_sql:
         contract_sql.append(sql)
@@ -212,6 +204,24 @@ def load_contract_objects(source_path: Path = MIGRATIONS_SOURCE) -> tuple[dict[t
             if key in objects:
                 raise ValueError(f"duplicate schema-contract object {key}")
             objects[key] = item
+
+    # Replay CREATE/DROP effects in version order so a later safety migration can deliberately
+    # replace an earlier object.  Schema 65 does exactly this for the v64 excluded-duplicate guard:
+    # comparing the first CREATE would certify stale SQL or reject the valid replacement.
+    drop_pattern = re.compile(
+        r"(?is)^DROP\s+(TABLE|INDEX|TRIGGER|VIEW)\s+(?:IF\s+EXISTS\s+)?"
+        r"([A-Za-z_][A-Za-z0-9_]*)\b"
+    )
+    for version in CONTRACT_MIGRATIONS:
+        up_sql = migration_up_sql(source, version)
+        contract_sql.append(up_sql)
+        for statement in split_sql_statements(up_sql):
+            drop = drop_pattern.match(statement)
+            if drop is not None:
+                objects.pop((drop.group(1).casefold(), drop.group(2)), None)
+                continue
+            for item in created_schema_objects(statement):
+                objects[(item.object_type, item.name)] = item
     digest = hashlib.sha256("\n".join(contract_sql).encode("utf-8")).hexdigest()
     return objects, digest
 

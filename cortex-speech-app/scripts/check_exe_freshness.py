@@ -17,6 +17,7 @@ Exit 0 = fresh and HEAD-matched. Exit 1 = stale, wrong-SHA, or exe missing.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -306,11 +307,10 @@ def _source_changed_since(app_root: Path, baked_sha: str, source_dirs: list[str]
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
-BUNDLE_DIR = EXE_PATH.parent / "bundle"
 INSTALLER_GLOBS = ("msi/*.msi", "nsis/*-setup.exe")
 
 
-def find_stale_installers(newest_src_mtime: float) -> list[tuple[str, float]]:
+def find_stale_installers(newest_src_mtime: float, exe_path: Path = EXE_PATH) -> list[tuple[str, float]]:
     """Bundled installers that would install an app built from OLDER SOURCES than this checkout.
 
     Measured against the newest SOURCE, not against the exe. Comparing installer-vs-exe asks the
@@ -326,8 +326,9 @@ def find_stale_installers(newest_src_mtime: float) -> list[tuple[str, float]]:
     same-build artifact 336 s "behind" its exe is still newer than every source and passes honestly.
     """
     stale: list[tuple[str, float]] = []
+    bundle_dir = exe_path.parent / "bundle"
     for pattern in INSTALLER_GLOBS:
-        for path in sorted(BUNDLE_DIR.glob(pattern)):
+        for path in sorted(bundle_dir.glob(pattern)):
             mtime = path.stat().st_mtime
             if mtime < newest_src_mtime:
                 stale.append((path.name, mtime))
@@ -335,9 +336,13 @@ def find_stale_installers(newest_src_mtime: float) -> list[tuple[str, float]]:
 
 
 def main() -> int:
-    exe_exists = EXE_PATH.is_file()
-    exe_mtime = EXE_PATH.stat().st_mtime if exe_exists else 0.0
-    baked_sha = extract_baked_sha(EXE_PATH.read_bytes()) if exe_exists else None
+    # The private-production controller deliberately builds outside the mutable repo target and
+    # activates a hash-pinned immutable release. verify_10 exports that validated path. Standalone
+    # developer use retains the historical repo target default.
+    exe_path = Path(os.environ.get("CORTEX_APP_EXE", str(EXE_PATH)))
+    exe_exists = exe_path.is_file()
+    exe_mtime = exe_path.stat().st_mtime if exe_exists else 0.0
+    baked_sha = extract_baked_sha(exe_path.read_bytes()) if exe_exists else None
     head_sha = _git_head(REPO_ROOT)
 
     # Narrow the SHA-equality check to what matters: if HEAD advanced past the baked commit but no
@@ -367,7 +372,7 @@ def main() -> int:
         head_sha=effective_head,
         newest_src_mtime=newest_src_mtime,
         newest_src_file=str(newest_src_file.relative_to(REPO_ROOT)) if newest_src_file else None,
-        stale_installers=find_stale_installers(newest_src_mtime) if exe_exists else [],
+        stale_installers=find_stale_installers(newest_src_mtime, exe_path) if exe_exists else [],
         dirty_source_paths=dirty_sources,
         source_status_available=current_status is not None,
     )
@@ -386,7 +391,11 @@ def main() -> int:
     for w in wt_warnings:
         print(f"  ! WARNING: {w}", flush=True)
 
-    print(f"EXE FRESHNESS GATE: OK (exe at HEAD {head_sha[:12]}…, newer than all sources)", flush=True)
+    print(
+        f"EXE FRESHNESS GATE: OK ({exe_path} at source-equivalent HEAD {head_sha[:12]}…, "
+        "newer than all compiled sources)",
+        flush=True,
+    )
     if wt_warnings:
         print(
             f"  (note: {len(wt_warnings)} sibling worktree(s) carry uncommitted source — commit + rebuild before shipping)",
