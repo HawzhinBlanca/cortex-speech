@@ -747,7 +747,7 @@ fn resolve_wsl_7b_client(configured: Option<String>) -> Option<String> {
         }
     }
     let exe_dir = std::env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf))?;
-    [
+    let installed = [
         "cortex_7b_client.py",
         "scripts/cortex_7b_client.py",
         "_up_/scripts/cortex_7b_client.py",
@@ -763,7 +763,26 @@ fn resolve_wsl_7b_client(configured: Option<String>) -> Option<String> {
             .ok()
             .filter(|path| path.is_file())
             .map(|path| path.to_string_lossy().into_owned())
-    })
+    });
+    if installed.is_some() {
+        return installed;
+    }
+
+    // An isolated Cargo target directory deliberately has no stable relationship to the checkout.
+    // Unit tests still need to exercise the same tracked client that Tauri packages as a resource;
+    // production binaries must only resolve their installed resource or an explicit override, never
+    // retain a build-machine source path as an undocumented fallback.
+    #[cfg(test)]
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/cortex_7b_client.py")
+            .canonicalize()
+            .ok()
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+    #[cfg(not(test))]
+    None
 }
 
 /// Spawn the configured external WSL ASR client for ONE segment and return its parsed transcript.

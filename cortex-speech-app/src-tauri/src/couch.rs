@@ -7951,6 +7951,70 @@ mod tests {
     }
 
     #[test]
+    fn one_thousand_lost_response_retries_across_database_restarts_are_exactly_once() {
+        const RESTARTS: usize = 20;
+        const RETRIES_PER_RESTART: usize = 50;
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        db.insert_segment(&seg("operation-1000", "دەقی خاو")).unwrap();
+        let operation_id = "33333333-3333-4333-8333-333333333333";
+        let body = serde_json::json!({
+            "operationId": operation_id,
+            "id": "operation-1000",
+            "action": "edit",
+            "text": "دەقی ڕاستکراوە",
+            "reviewer": "Sara",
+            "rowVersion": db.segment_row_stamp("operation-1000").unwrap().unwrap(),
+            "heardMs": 600_000,
+            "clipDurationMs": 1_500,
+        })
+        .to_string();
+        assert_eq!(api_decision(&db, body.as_bytes(), "Sara", &state()).0, 200);
+        drop(db);
+
+        let mut replay_count = 0usize;
+        for _ in 0..RESTARTS {
+            let reopened = Database::open(&db_path).unwrap();
+            reopened.initialize().unwrap();
+            let restarted_state = state();
+            for _ in 0..RETRIES_PER_RESTART {
+                let (code, _, response, ..) = api_decision(&reopened, body.as_bytes(), "Sara", &restarted_state);
+                assert_eq!(code, 200);
+                let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+                assert_eq!(response["duplicate"], true, "every lost-response replay must be an idempotent ACK");
+                replay_count += 1;
+            }
+            let guard = lock_state(&restarted_state);
+            assert_eq!(
+                guard.undo.get("Sara").map(Vec::len),
+                Some(1),
+                "retries in one restarted process must restore one undo token, never one per request"
+            );
+        }
+        assert_eq!(replay_count, 1_000);
+
+        let final_db = Database::open(&db_path).unwrap();
+        final_db.initialize().unwrap();
+        let receipt = final_db.review_operation(operation_id).unwrap().expect("the one durable operation receipt");
+        assert_eq!(receipt.segment_id, "operation-1000");
+        assert_eq!(receipt.reviewer, "Sara");
+        let counts: (i64, i64, i64) = final_db
+            .connection()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM review_events WHERE operation_id=?1),
+                     (SELECT COUNT(*) FROM review_compensation_ledger ledger
+                        JOIN review_events event ON event.id=ledger.review_event_id
+                       WHERE event.operation_id=?1),
+                     (SELECT COUNT(*) FROM agent_examples WHERE segment_id='operation-1000')",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1), "1,000 retries must leave exactly one event/pay/learning effect");
+    }
+
+    #[test]
     fn a_bound_operation_uuid_rejects_any_segment_action_text_or_reviewer_change() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());

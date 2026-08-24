@@ -17,11 +17,7 @@ pub fn replace_file(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
     fsync_path(tmp_path)?;
     fs::rename(tmp_path, final_path)?;
     // Make the rename itself durable by fsyncing the containing directory.
-    if let Some(parent) = final_path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    fsync_parent_dir(final_path);
     Ok(())
 }
 
@@ -89,11 +85,20 @@ pub fn replace_file(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
 /// `sync_all()` then maps to `FlushFileBuffers`. Failure is ignored: the replacement already
 /// succeeded, so a fsync error must not turn a good write into a hard error.
 #[cfg(target_os = "windows")]
-fn fsync_parent_dir(final_path: &Path) {
+pub(crate) fn fsync_parent_dir(final_path: &Path) {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if let Ok(dir) = fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn fsync_parent_dir(final_path: &Path) {
+    if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = fs::File::open(parent) {
             let _ = dir.sync_all();
         }
     }

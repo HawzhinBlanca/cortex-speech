@@ -13,11 +13,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const POOL_EXPORT_SCHEMA_VERSION: u32 = 1;
 const TTS_SAMPLE_RATE: u32 = 24_000;
 const ASR_SAMPLE_RATE: u32 = 16_000;
+
+#[cfg(test)]
+static FAIL_AFTER_CERTIFICATION_BEFORE_PUBLICATION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -607,7 +612,14 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             .map_err(|error| AppError::Other(error.to_string()))?,
         )?;
         sync_tree(&staging)?;
-        fs::rename(&staging, &output)?;
+        // Move the fully synced tree to a still-hidden commit name before touching database
+        // authority. Publishing the final name first left a process-crash window where a directory
+        // containing `_COMPLETE.json` was visible even though SQLite had no voice certificate. The
+        // hidden tree may survive a crash, but a final visible tree never can without a durable
+        // certificate. A retry deterministically rebuilds and publishes from the existing certificate.
+        let certifying = parent.join(format!(".{leaf}.certifying-{}", uuid::Uuid::new_v4().hyphenated()));
+        fs::rename(&staging, &certifying)?;
+        crate::atomic_file::fsync_parent_dir(&certifying);
 
         if existing.is_none() {
             let registration = review_pool::record_voice_certificate(
@@ -630,10 +642,10 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
             );
             if let Err(error) = registration {
                 let quarantine = parent.join(format!(".{leaf}.uncertified-{}", uuid::Uuid::new_v4().hyphenated()));
-                let quarantine_note = match fs::rename(&output, &quarantine) {
+                let quarantine_note = match fs::rename(&certifying, &quarantine) {
                     Ok(()) => format!("; unpublished artifact preserved at {}", quarantine.display()),
                     Err(rename_error) => {
-                        format!("; WARNING: could not quarantine {}: {rename_error}", output.display())
+                        format!("; WARNING: could not quarantine {}: {rename_error}", certifying.display())
                     }
                 };
                 return Err(AppError::Validation(format!(
@@ -641,6 +653,15 @@ pub fn export_voice(db: &Database, options: &PoolDatasetOptions) -> AppResult<Po
                 )));
             }
         }
+        #[cfg(test)]
+        if FAIL_AFTER_CERTIFICATION_BEFORE_PUBLICATION.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Validation(format!(
+                "injected crash window after durable certification; unpublished artifact preserved at {}",
+                certifying.display()
+            )));
+        }
+        fs::rename(&certifying, &output)?;
+        crate::atomic_file::fsync_parent_dir(&output);
         Ok(PoolDatasetResult {
             output_dir: output.to_string_lossy().to_string(),
             pool_id: pool.pool_id,
@@ -907,5 +928,41 @@ mod tests {
 
         assert!(error.contains("source WAV is missing"), "unexpected refusal: {error}");
         assert!(!output.exists(), "failed export must never publish an output directory");
+    }
+
+    #[test]
+    fn certificate_commit_precedes_atomic_publication_and_a_crash_window_is_retryable() {
+        let (directory, db) = fixture();
+        let output = directory.path().join("crash-window");
+        FAIL_AFTER_CERTIFICATION_BEFORE_PUBLICATION.store(true, Ordering::SeqCst);
+
+        let error = export_voice(
+            &db,
+            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("after durable certification"), "unexpected injected failure: {error}");
+        assert!(!output.exists(), "the final export name must remain absent until after certification");
+        assert!(review_pool::voice_certificate(&db, "Lamo").unwrap().is_some());
+        let hidden = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".crash-window.certifying-"))
+            .count();
+        assert_eq!(hidden, 1, "a complete hidden artifact must survive for crash diagnosis");
+
+        let retried = export_voice(
+            &db,
+            &PoolDatasetOptions { output_dir: output.to_string_lossy().to_string(), voice_name: "Lamo".to_string() },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::canonicalize(&retried.output_dir).unwrap(),
+            fs::canonicalize(&output).unwrap(),
+            "the retry must publish the requested directory even when Windows canonicalizes it with a device prefix"
+        );
+        assert!(output.join("_COMPLETE.json").is_file());
+        assert!(output.join("certificate.json").is_file());
     }
 }

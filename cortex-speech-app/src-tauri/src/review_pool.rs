@@ -2097,6 +2097,77 @@ mod tests {
     }
 
     #[test]
+    fn every_accept_edit_reject_skip_pair_has_the_exact_consensus_semantics() {
+        let actions = ["accept", "edit", "reject", "skip"];
+        for first in actions {
+            for second in actions {
+                let mut all = HashMap::new();
+                for (reviewer, action, evidence_id) in [("Rubar", first, "pair:first"), ("Alle", second, "pair:second")]
+                {
+                    let transcript = matches!(action, "accept" | "edit").then(|| "دەقی یەکسان".to_string());
+                    insert_judgement(
+                        &mut all,
+                        "clip".to_string(),
+                        reviewer.to_string(),
+                        evidence_id.to_string(),
+                        action.to_string(),
+                        transcript,
+                    )
+                    .unwrap();
+                }
+                let reviewers = all.get("clip").unwrap();
+                assert_eq!(reviewers.seen.len(), 2, "{first}+{second} must mark both reviewers seen");
+                let (resolution, _) = derive_resolution("clip", Some(reviewers), None);
+                let judgement_count = usize::from(first != "skip") + usize::from(second != "skip");
+                if judgement_count < 2 {
+                    assert!(
+                        matches!(resolution, DerivedResolution::Pending),
+                        "{first}+{second} must remain pending because skip contributes no judgement"
+                    );
+                    continue;
+                }
+                let both_retain = matches!(first, "accept" | "edit") && matches!(second, "accept" | "edit");
+                let both_reject = first == "reject" && second == "reject";
+                if both_retain || both_reject {
+                    assert!(
+                        matches!(resolution, DerivedResolution::Resolved { owner: false, .. }),
+                        "{first}+{second} must resolve as the same semantic outcome"
+                    );
+                } else {
+                    assert!(
+                        matches!(resolution, DerivedResolution::NeedsThird),
+                        "{first}+{second} must admit exactly one blinded third judgement"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reviewer_identity_is_distinct_and_case_trim_normalized() {
+        let mut all = HashMap::new();
+        insert_judgement(
+            &mut all,
+            "clip".to_string(),
+            " Rubar ".to_string(),
+            "first".to_string(),
+            "accept".to_string(),
+            Some("دەق".to_string()),
+        )
+        .unwrap();
+        let error = insert_judgement(
+            &mut all,
+            "clip".to_string(),
+            "RUBAR".to_string(),
+            "second".to_string(),
+            "edit".to_string(),
+            Some("دەق".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate effective evidence from one reviewer"), "unexpected refusal: {error}");
+    }
+
+    #[test]
     fn disagreement_gets_one_blinded_third_review_then_resolves_by_matching_pair() {
         let (_dir, db, pool) = one_clip_pool("دەقی یەکەم");
         decide(&db, &pool, "Alle", "دەقی دووەم", "123e4567-e89b-42d3-a456-426614174052", 1);
