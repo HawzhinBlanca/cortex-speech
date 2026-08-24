@@ -46,7 +46,7 @@ def activate(*args, **kwargs):
         return activator.activate(*args, **kwargs)
 
 
-def seed(root: Path, *, schema: int = 63) -> tuple[Path, dict[str, object]]:
+def seed(root: Path, *, schema: int = 65) -> tuple[Path, dict[str, object]]:
     db_path = root / "cortex-speech.db"
     conn = sqlite3.connect(db_path)
     conn.executescript(
@@ -380,7 +380,7 @@ def test_schema_56_is_refused_before_any_activation_file_changes() -> None:
         try:
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         except RuntimeError as error:
-            assert "schema 56/63" in str(error)
+            assert "schema 56/65" in str(error)
         else:
             raise AssertionError("pre-compensation database was accepted")
         assert not (root / POLICY_FILE).exists()
@@ -451,7 +451,7 @@ def test_non_restartable_or_duplicate_session_json_is_refused_before_revocation(
         assert not (root / REVOCATION_FILE).exists()
 
 
-def test_maintenance_revocation_precedes_schema_56_to_63_work_and_survives_refusal() -> None:
+def test_maintenance_revocation_precedes_schema_56_to_65_work_and_survives_refusal() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         db_path, original = seed(root, schema=56)
@@ -461,7 +461,7 @@ def test_maintenance_revocation_precedes_schema_56_to_63_work_and_survives_refus
         try:
             activate(root, db_path, expected_max_review_event_id=863, check_runtime=False)
         except RuntimeError as error:
-            assert "schema 56/63" in str(error)
+            assert "schema 56/65" in str(error)
         else:
             raise AssertionError("schema 56 unexpectedly activated")
         assert (root / REVOCATION_FILE).read_bytes() == marker_before

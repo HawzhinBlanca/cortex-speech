@@ -11198,3 +11198,23 @@ listening evidence gate is now truthfully reachable but remains externally incom
 post-release decisions across two reviewer browsers. Reviewers satisfy that through ordinary game
 play; engineering does not fabricate or backdate it. No live database, reviewer server, or GPU was
 changed, so the healthy immutable release was deliberately not restarted.
+
+## 2026-08-24 — schema-65 excluded-duplicate legal-lineage hardening
+
+An isolated schema-64 audit reproduced a fail-closed rights defect before deployment: the duplicate
+exclusion trigger guarded `review_revision`, while the schema-53 metadata trigger increments that
+revision after every segment update. A legitimate rights revocation or provenance correction on an
+excluded duplicate was therefore misclassified as human-review evidence and aborted. Schema 65 now
+guards only the actual review-authority columns; excluded rows still cannot become canonical review
+work, while rights revocation and metadata lineage remain writable and revision-bound. Regression
+tests prove both sides and prove an interrupted v65 migration is atomic and recoverable.
+
+Commit `93bbfd310919bdd7cedae34fde7fc892fb61e069` also advances snapshot, restore, certification,
+watchdog, and immutable-release boundaries to schema 65. Recovery now proves the pre-exposure
+schema-64 snapshot can be restored and its managed last-known-good release reactivated, while any
+post-exposure schema-65 judgment blocks destructive database rollback. Full isolated evidence before
+the release build: Rust library 1,541 passed / 0 failed / 8 intentional hardware or benchmark ignores;
+all binary tests, strict Clippy and formatting, snapshot 26/26, restore 21/21, release recovery 11/11,
+integrity 12/12, compensation 34/34, final-certification 24/24, and watchdog 13/13 passed. The live
+schema-64 reviewer service and GPUs remained untouched; exact-commit build, clone preflight, and
+protected handover remain pending.
