@@ -4349,7 +4349,11 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             .map(|operation_id| crate::review_pool::operation(db, operation_id))
             .transpose();
         let pool_replay = match pool_replay {
-            Ok(receipt) => receipt.is_some(),
+            // `transpose()` preserves both option layers: `Some(Ok(None))` is `Ok(Some(None))`.
+            // Testing only the outer option routes every brand-new UUID into the replay path, where
+            // an unreviewed clip is correctly rejected as not yet canonical. Flatten before testing
+            // so only an actually durable pool receipt is a replay.
+            Ok(receipt) => receipt.flatten().is_some(),
             Err(error) => return err_reply(500, &error),
         };
         let already_canonical = match db.get_segment_by_id(&parsed.id) {
@@ -6357,6 +6361,73 @@ mod tests {
         let canonical = db.get_segment_by_id("pool-reviewed").unwrap().unwrap();
         assert_eq!(canonical.reviewed_by.as_deref(), Some("Rubar"));
         assert_eq!(canonical.annotated_transcript.as_deref(), Some("Rubar first truth"));
+    }
+
+    #[test]
+    fn flexible_pool_accepts_the_first_review_after_activation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let champion_id = "omniasr-7b-test-champion";
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: champion_id.into(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.into(),
+                model_card_name: Some("pool first-review champion".into()),
+                checkpoint_sha256: "c".repeat(64),
+                checkpoint_path: "/test/pool-first-champion.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "owner-full-rights".into(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [champion_id]).unwrap();
+        let mut unreviewed = seg("pool-first-after-activation", "champion unreviewed draft");
+        unreviewed.model_version_id = Some(champion_id.into());
+        db.insert_segment(&unreviewed).unwrap();
+        let pool = crate::review_pool::activate(
+            &db,
+            "123e4567-e89b-42d3-a456-426614174002",
+            &[crate::review_pool::PoolMemberInput { segment_id: unreviewed.id.clone(), voice_name: "Lamo".into() }],
+        )
+        .unwrap();
+        let state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-rubar".into(), "Rubar".into())]),
+            session_store: Some((tmp.path().to_path_buf(), db_path)),
+            pool_policy: Some(pool),
+            ..CouchState::default()
+        });
+
+        let (queue_code, _, queue_body, ..) = api_queue(&db, "Rubar", &state);
+        assert_eq!(queue_code, 200, "pool queue failed: {}", String::from_utf8_lossy(&queue_body));
+        let queue: serde_json::Value = serde_json::from_slice(&queue_body).unwrap();
+        let item = &queue["items"][0];
+        assert_eq!(item["id"], unreviewed.id);
+        let body = serde_json::json!({
+            "operationId": "123e4567-e89b-42d3-a456-426614174098",
+            "id": unreviewed.id,
+            "action": "accept",
+            "text": "champion unreviewed draft",
+            "rowVersion": item["rowVersion"],
+            "heardMs": 1_500,
+            "clipDurationMs": 1_500,
+        });
+        let (decision_code, _, decision_body, ..) = api_decision(&db, body.to_string().as_bytes(), "Rubar", &state);
+        assert_eq!(
+            decision_code,
+            200,
+            "first post-activation review failed: {}",
+            String::from_utf8_lossy(&decision_body),
+        );
+        let events: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_events WHERE segment_id=?1 AND reviewer='Rubar'",
+                [&unreviewed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "the first review must be durably attributed");
     }
 
     #[test]
