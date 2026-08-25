@@ -5892,7 +5892,7 @@ impl Database {
     // ── P3.2: import journal (resume a directory import interrupted by a crash) ──────────────────
 
     /// Open a new import job (status 'running'). Also prunes old finished jobs so the journal stays
-    /// small. Journal writes are best-effort at the call sites — a failure here never fails an import.
+    /// small. Production callers fail closed if this durable recovery boundary cannot be written.
     pub fn begin_import_job(&self, dir: &str, total_files: usize) -> AppResult<String> {
         let id = uuid::Uuid::new_v4().to_string();
         // SAVEPOINT (write-path audit, Week 2): reap + INSERT + retention are one invariant — a failure

@@ -369,6 +369,36 @@ fn cancelled_directory_import_clears_running_status() {
 }
 
 #[test]
+fn import_refuses_before_audio_work_when_the_durable_journal_cannot_start() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_import_journal
+             BEFORE INSERT ON import_jobs
+             BEGIN
+               SELECT RAISE(ABORT, 'injected import journal failure');
+             END;",
+        )
+        .unwrap();
+    let import_dir = dir.path().join("journal_fault");
+    std::fs::create_dir_all(&import_dir).unwrap();
+    std::fs::write(import_dir.join("would_decode.wav"), b"not-real-audio").unwrap();
+
+    let error = pipeline.import_directory(&import_dir, None, |_| {}).unwrap_err().to_string();
+
+    assert!(
+        error.contains("Could not create the durable import recovery journal"),
+        "the journal failure must be the terminal cause before decode: {error}"
+    );
+    assert!(!pipeline.import_status().running, "journal refusal must release the visible import state");
+    assert_eq!(db.segment_count().unwrap(), 0, "no segment may publish without a durable recovery journal");
+    let jobs: i64 = db.connection().query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0)).unwrap();
+    assert_eq!(jobs, 0, "the failed journal transaction must not leave a partial generation");
+}
+
+#[test]
 fn fire_loop0_if_enabled_method_uses_the_pipelines_own_db() {
     // The method (used by the cached / non-WSL transcribe paths) opens its own DB connection.
     let settings = AppSettings { loop0_firing_enabled: true, ..AppSettings::default() };

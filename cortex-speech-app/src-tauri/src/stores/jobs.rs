@@ -37,6 +37,21 @@ impl JobStore {
         self.lock("discard_interrupted_import").discard_import_job(job_id)
     }
 
+    pub(crate) fn begin_import(&self, directory: &str, total_files: usize) -> AppResult<String> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("begin_import").begin_import_job(directory, total_files)
+    }
+
+    pub(crate) fn mark_import_file_done(&self, job_id: &str, path: &str) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("mark_import_file_done").mark_import_file_done(job_id, path)
+    }
+
+    pub(crate) fn complete_import(&self, job_id: &str) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("complete_import").complete_import_job(job_id)
+    }
+
     pub(crate) fn list_recent(&self, limit: i64) -> AppResult<Vec<Job>> {
         self.runtime.open_read()?.list_recent_jobs(limit)
     }
@@ -155,6 +170,63 @@ mod tests {
 
         store.discard_interrupted_import(&interrupted.id).unwrap();
         assert!(store.find_interrupted_import().unwrap().is_none());
+    }
+
+    #[test]
+    fn import_journal_lifecycle_is_serialized_and_exact_through_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        let store = JobStore::new(DatabaseRuntime::new(database));
+
+        let job_id = store.begin_import("C:/recordings", 2).unwrap();
+        store.mark_import_file_done(&job_id, "C:/recordings/a.wav").unwrap();
+        store.mark_import_file_done(&job_id, "C:/recordings/a.wav").unwrap();
+        let running = store.find_interrupted_import().unwrap().expect("running import remains resumable");
+        assert_eq!(running.id, job_id);
+        assert_eq!(running.total_files, 2);
+        assert_eq!(running.completed_paths, vec!["C:/recordings/a.wav"]);
+
+        store.complete_import(&job_id).unwrap();
+        assert!(store.find_interrupted_import().unwrap().is_none());
+    }
+
+    #[test]
+    fn import_journal_progress_and_completion_failures_remain_visible_as_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal-fault.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        database
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_import_progress
+                 BEFORE INSERT ON import_job_files
+                 WHEN NEW.path LIKE '%blocked.wav'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected progress failure');
+                 END;
+                 CREATE TRIGGER fail_import_completion
+                 BEFORE UPDATE OF status ON import_jobs
+                 WHEN NEW.status = 'completed'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected completion failure');
+                 END;",
+            )
+            .unwrap();
+        let store = JobStore::new(DatabaseRuntime::new(database));
+
+        let job_id = store.begin_import("C:/recordings", 1).unwrap();
+        assert!(store.mark_import_file_done(&job_id, "C:/recordings/blocked.wav").is_err());
+        let after_progress = store.find_interrupted_import().unwrap().expect("failed progress remains resumable");
+        assert_eq!(after_progress.id, job_id);
+        assert!(after_progress.completed_paths.is_empty());
+
+        assert!(store.complete_import(&job_id).is_err());
+        let after_completion = store.find_interrupted_import().unwrap().expect("failed completion remains resumable");
+        assert_eq!(after_completion.id, job_id);
+        assert!(after_completion.completed_paths.is_empty());
     }
 
     #[test]

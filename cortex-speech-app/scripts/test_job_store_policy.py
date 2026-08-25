@@ -29,6 +29,9 @@ def test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies
         "begin_mutation().map_err(AppError::Other)?",
         "self.runtime.open_read()?.find_interrupted_import_job()",
         'self.lock("discard_interrupted_import").discard_import_job(job_id)',
+        'self.lock("begin_import").begin_import_job(directory, total_files)',
+        'self.lock("mark_import_file_done").mark_import_file_done(job_id, path)',
+        'self.lock("complete_import").complete_import_job(job_id)',
         "self.runtime.open_read()?.list_recent_jobs(limit)",
         'self.run_tracked(job_id, "export_dataset", "EXPORT_FAILED"',
         'self.run_tracked(job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED"',
@@ -90,9 +93,45 @@ def test_commands_delegate_without_raw_database_authority() -> None:
             raise AssertionError(f"{name} lost rate or output-path validation")
 
 
+def test_pipeline_import_journal_is_store_owned_and_fail_closed() -> None:
+    pipeline = read("pipeline.rs")
+    for forbidden in (
+        "db.begin_import_job(",
+        "db.mark_import_file_done(",
+        "db.complete_import_job(",
+        ".begin_import_job(&dir_path",
+    ):
+        if forbidden in pipeline:
+            raise AssertionError(f"pipeline regained direct import-journal authority: {forbidden}")
+    for required in (
+        "job_store: Option<crate::stores::JobStore>",
+        "pub(crate) fn new_with_runtime(",
+        "let import_jobs = self.import_job_store()?;",
+        "let job_id = import_jobs.begin_import(",
+        "import_jobs.mark_import_file_done(&job_id, &file_path_str)",
+        "import_jobs.complete_import(&job_id)",
+        "Could not create the durable import recovery journal",
+        "Could not durably journal completed file",
+        "Could not durably complete the import recovery journal",
+    ):
+        if required not in pipeline:
+            raise AssertionError(f"pipeline lost fail-closed JobStore journaling: {required}")
+
+    startup = read("lib.rs")
+    for required in (
+        "let database_runtime = DatabaseRuntime::new(db);",
+        "let pipeline = ProcessingPipeline::new_with_runtime(",
+        "database_runtime.clone(),",
+        "db: database_runtime,",
+    ):
+        if required not in startup:
+            raise AssertionError(f"desktop startup lost shared runtime injection: {required}")
+
+
 def main() -> None:
     test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies()
     test_commands_delegate_without_raw_database_authority()
+    test_pipeline_import_journal_is_store_owned_and_fail_closed()
     print("job-store architecture policy passed")
 
 

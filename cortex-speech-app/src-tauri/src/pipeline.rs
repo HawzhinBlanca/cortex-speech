@@ -1099,6 +1099,10 @@ impl LiveConsent {
 #[derive(Clone)]
 pub struct ProcessingPipeline {
     db_path: String,
+    /// Desktop production injects the exact `AppState` runtime so import-journal rows have one
+    /// serialized writer and the same restore admission as every other durable job. Standalone
+    /// library consumers retain the public path-based constructor during the strangler migration.
+    job_store: Option<crate::stores::JobStore>,
     _normalizer: Arc<SoraniNormalizer>,
     cache: Arc<TranscriptCache>,
     fingerprint: Arc<AudioFingerprint>,
@@ -1127,8 +1131,41 @@ impl ProcessingPipeline {
         settings: Arc<AppSettings>,
         model_manager: Arc<ModelManager>,
     ) -> Self {
+        Self::build(db_path, normalizer, cache, fingerprint, settings, model_manager, None)
+    }
+
+    pub(crate) fn new_with_runtime(
+        db_path: String,
+        normalizer: Arc<SoraniNormalizer>,
+        cache: Arc<TranscriptCache>,
+        fingerprint: Arc<AudioFingerprint>,
+        settings: Arc<AppSettings>,
+        model_manager: Arc<ModelManager>,
+        runtime: crate::database_runtime::DatabaseRuntime,
+    ) -> Self {
+        Self::build(
+            db_path,
+            normalizer,
+            cache,
+            fingerprint,
+            settings,
+            model_manager,
+            Some(crate::stores::JobStore::new(runtime)),
+        )
+    }
+
+    fn build(
+        db_path: String,
+        normalizer: Arc<SoraniNormalizer>,
+        cache: Arc<TranscriptCache>,
+        fingerprint: Arc<AudioFingerprint>,
+        settings: Arc<AppSettings>,
+        model_manager: Arc<ModelManager>,
+        job_store: Option<crate::stores::JobStore>,
+    ) -> Self {
         Self {
             db_path,
+            job_store,
             _normalizer: normalizer,
             consent: Arc::new(LiveConsent::from_settings(&settings)),
             cache,
@@ -1142,6 +1179,17 @@ impl ProcessingPipeline {
             finetuned_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             finetuned_fallbacks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    fn import_job_store(&self) -> AppResult<crate::stores::JobStore> {
+        if let Some(store) = &self.job_store {
+            return Ok(store.clone());
+        }
+        // Compatibility path for public library consumers and standalone binaries that construct a
+        // pipeline from a database path. Desktop production never takes this path: lib.rs injects
+        // the exact AppState runtime. This connection owns only import-journal rows in this slice.
+        let database = Database::open(&self.db_path)?;
+        Ok(crate::stores::JobStore::new(crate::database_runtime::DatabaseRuntime::new(database)))
     }
 
     /// Apply only the WITHDRAWALS in `next` to the shared live consent, right now.
@@ -1738,12 +1786,10 @@ impl ProcessingPipeline {
             self.finish_import_status();
             return Ok(());
         }
-        // P3.2: open a resume journal for this import (best-effort — a journal failure never fails the
-        // import). A crash leaves this job 'running'; the next launch can offer to resume it.
-        let job_id: Option<String> = db.begin_import_job(&dir_path.to_string_lossy(), total).ok();
         // RAII: clear import_status.running on EVERY exit path. The per-file `token.check()?` cancel
-        // below early-returns before the manual finish_import_status() calls, which used to leave
-        // get_import_status() reporting running:true forever after a cancelled directory import.
+        // below and every durable-journal failure can early-return before the manual
+        // finish_import_status() calls. Without this guard, either path leaves get_import_status()
+        // reporting running:true forever.
         struct ImportStatusGuard<'a>(&'a ProcessingPipeline);
         impl Drop for ImportStatusGuard<'_> {
             fn drop(&mut self) {
@@ -1751,6 +1797,13 @@ impl ProcessingPipeline {
             }
         }
         let _status_guard = ImportStatusGuard(self);
+        // P3.2: open the durable resume journal before any file can publish segment rows. A journal
+        // failure is fatal: reporting a successful import without recovery evidence would make a
+        // crash window silently non-resumable.
+        let import_jobs = self.import_job_store()?;
+        let job_id = import_jobs.begin_import(&dir_path.to_string_lossy(), total).map_err(|error| {
+            AppError::Other(format!("Could not create the durable import recovery journal: {error}"))
+        })?;
         let mut succeeded = 0;
         let failed = 0; // halt-on-first-failure (2026-08-20): a COMPLETED import has zero failures by definition
         let mut imported_ids = Vec::new();
@@ -1802,10 +1855,12 @@ impl ProcessingPipeline {
                 journaled,
                 !resume_existing_ids.is_empty() && !staged_incomplete,
             ) {
+                import_jobs.mark_import_file_done(&job_id, &file_path_str).map_err(|error| {
+                    AppError::Other(format!(
+                        "Could not durably journal resumed file {file_path_str}; import halted: {error}"
+                    ))
+                })?;
                 succeeded += 1;
-                if let Some(ref jid) = job_id {
-                    let _ = db.mark_import_file_done(jid, &file_path_str);
-                }
                 // Fold the already-imported file's segments back into the jury batch. The post-import
                 // jury (below) runs once at the end keyed on `imported_ids`; a crash interrupts BEFORE
                 // that jury ever runs, so segments persisted pre-crash were never adjudicated. Skipping
@@ -1893,11 +1948,15 @@ impl ProcessingPipeline {
                         segment_count.max(1),
                     ));
                     callback(multi_model_hypothesis_stage(&db, &self.settings, fname.clone(), &segments));
+                    // Journal publication is part of declaring the file complete. Segment rows may
+                    // already be durable if this write fails; the resume gap guard above adopts those
+                    // exact rows on the next attempt instead of duplicating them.
+                    import_jobs.mark_import_file_done(&job_id, &file_path_str).map_err(|error| {
+                        AppError::Other(format!(
+                            "Could not durably journal completed file {file_path_str}; import halted: {error}"
+                        ))
+                    })?;
                     succeeded += 1;
-                    // P3.2: record this file as done in the resume journal (best-effort).
-                    if let Some(ref jid) = job_id {
-                        let _ = db.mark_import_file_done(jid, &file_path_str);
-                    }
                     imported_ids.extend(segments.iter().map(|s| s.id.clone()));
                     if segments.len() > 1 {
                         tracing::info!("Imported {} annotatable segments from {}", segments.len(), file.display());
@@ -2007,10 +2066,11 @@ impl ProcessingPipeline {
             }
         }
 
-        // P3.2: a clean finish — the job is no longer an interruption to resume (best-effort).
-        if let Some(ref jid) = job_id {
-            let _ = db.complete_import_job(jid);
-        }
+        // P3.2: completion is durable evidence, not a best-effort decoration. If terminal stamping
+        // fails, leave the running journal visible so recovery never mistakes the import for clean.
+        import_jobs.complete_import(&job_id).map_err(|error| {
+            AppError::Other(format!("Could not durably complete the import recovery journal: {error}"))
+        })?;
         // F2: a fine-tuned→stock downgrade during this import must end LOUD, not log-only.
         {
             let attempts = self.finetuned_attempts.load(std::sync::atomic::Ordering::Relaxed);

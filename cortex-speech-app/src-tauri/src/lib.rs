@@ -739,13 +739,15 @@ pub fn run() {
         }
     }
 
-    let pipeline = ProcessingPipeline::new(
+    let database_runtime = DatabaseRuntime::new(db);
+    let pipeline = ProcessingPipeline::new_with_runtime(
         db_path.to_string_lossy().to_string(),
         Arc::clone(&normalizer),
         Arc::clone(&cache),
         Arc::clone(&fingerprint),
         Arc::new(settings.clone()),
         Arc::new(ModelManager::new(data_dir.join("models"))),
+        database_runtime.clone(),
     );
 
     let history = HistoryManager::new(500);
@@ -779,7 +781,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            db: DatabaseRuntime::new(db),
+            db: database_runtime,
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,
