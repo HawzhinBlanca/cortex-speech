@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `20148bb`
+**Current evidence commit:** `a0fb4df`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -53,10 +53,11 @@ requires the immutable profile manifest and the external evidence listed under O
 | Interrupted-import discovery/discard and Job Center recent-job reads cross a Tauri-free `JobStore`. Discovery and history use bounded restore-gated snapshots; discard remains serialized through `DatabaseRuntime`; all four startup/resume/job handlers retain rate and identifier validation without raw database authority. | `6e72bcc` | 2 store regressions prove bounded newest-first history and read/discard of interrupted import state; architecture policy covers `get_interrupted_import`, `discard_interrupted_import`, `resume_interrupted_import` and `get_jobs`; full Rust 1,594/0; all 119 Python policies; generated-binding drift, strict Clippy and rustfmt passed | Pipeline/background job writers and import orchestration still use the compatibility façade; segment mutations, Couch decomposition, connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Segment deletion, batch deletion and speaker rename cross a Tauri-free `SegmentWriteStore`. Deletes read the authoritative server rows before removal, push exact undo history only after successful deletion, and return an admission token that keeps restore fenced through command-side session autosave. The retired whole-row command now refuses before acquiring database authority. | `d21f241` | 2 store regressions prove exact raw-transcript/speaker restoration and shared serialized batch-delete/rename behavior; architecture policy covers all 3 migrated commands plus the retired endpoint; runtime-panic policy follows the new boundary and requires batch-read/delete error propagation; full Rust 1,596/0; all 120 Python policies; strict Clippy and rustfmt passed | Field-level segment mutations, pipeline/background job writers, import orchestration and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Field-level segment updates cross `SegmentWriteStore`: the store owns the curation whitelist, structural alignment validation, schema-60 human-truth guard and exact history persistence. The command validates and delegates without raw database authority, and the returned mutation token keeps restore fenced through session autosave. | `20148bb` | 4 focused store regressions include whitelist-only mutation, mixed-payload atomic refusal at schema 60, exact deletion undo and serialized batch-delete/rename; the architecture policy now covers all 4 active segment mutation commands and the retired whole-row endpoint; full Rust 1,596/0; all 120 Python policies; strict Clippy and rustfmt passed | Pipeline/background job writers, import orchestration and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
+| Plain and Hugging Face dataset exports cross the Tauri-free `JobStore`: IPC retains rate/path validation and off-main-thread dispatch but cannot acquire the raw writer or drive job transitions. The store holds restore admission across queued/running work, output publication and terminal stamping. | `a0fb4df` | 4 JobStore regressions include a real disposable JSON export with a succeeded durable job plus injected failure/error-code propagation; job-store and main-thread policies forbid raw DB/job authority in both commands; full Rust 1,598/0; all 120 Python policies passed sequentially with generated bindings current; strict Clippy and rustfmt passed | Other export services, pipeline import journaling/background writers and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,596 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --all-targets --all-features`: 1,598 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Frontend: 58 files / 310 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
@@ -98,4 +99,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `20148bb` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `a0fb4df` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
