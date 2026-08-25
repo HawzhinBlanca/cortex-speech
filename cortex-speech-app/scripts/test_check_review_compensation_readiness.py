@@ -474,6 +474,26 @@ class CompensationReadinessGateTests(unittest.TestCase):
             (decision_id, reviewer, action, duration_ms, operation_id),
         )
 
+    def scan_uncredited_second_pass(
+        self, connection: sqlite3.Connection
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        """Exercise the visibility scanner without pretending a partial pool schema is deployable."""
+        connection.row_factory = sqlite3.Row
+        gate = load_gate_module()
+        return gate._uncredited_second_pass_decisions(connection)
+
+    def test_partial_pool_schema_fails_closed_at_the_release_gate(self):
+        connection = sqlite3.connect(self.db)
+        self.create_pool_decision_tables(connection)
+        connection.commit()
+        connection.close()
+
+        code, report = self.run_gate()
+
+        self.assertEqual(code, 1, report)
+        self.assertFalse(report["ok"], report)
+        self.assertIn("flexible review-pool schema is partial", report["errors"][0])
+
     def test_uncredited_pool_decision_is_reported_as_unpaid_work_without_minting_pay(self):
         connection = sqlite3.connect(self.db)
         self.create_pool_decision_tables(connection)
@@ -489,21 +509,21 @@ class CompensationReadinessGateTests(unittest.TestCase):
             duration_ms=2000,
         )
         connection.commit()
+        uncredited, warnings = self.scan_uncredited_second_pass(connection)
+        total_earned = connection.execute(
+            "SELECT SUM(delta_micro_iqd) FROM review_compensation_ledger"
+        ).fetchone()[0]
         connection.close()
 
-        code, report = self.run_gate()
-
-        self.assertEqual(code, 0, report)
-        self.assertTrue(report["ok"], report)
-        self.assertEqual(len(report["warnings"]), 1, report)
+        self.assertEqual(len(warnings), 1, warnings)
         self.assertIn(
             "2 playback-evidenced decisions on review_pool_decisions carry no ledger credit "
             "(owner decision pending: pay or declare unpaid)",
-            report["warnings"][0],
+            warnings[0],
         )
-        self.assertIn("3000 ms across 2 reviewers", report["warnings"][0])
+        self.assertIn("3000 ms across 2 reviewers", warnings[0])
         self.assertEqual(
-            report["uncreditedSecondPassDecisions"],
+            uncredited,
             [
                 {
                     "table": "review_pool_decisions",
@@ -518,10 +538,10 @@ class CompensationReadinessGateTests(unittest.TestCase):
                     "durationMs": 1000,
                 },
             ],
-            report,
+            warnings,
         )
         # Visibility only: the owner-set policy must not have paid anything on its own.
-        self.assertEqual(report["totalEarnedMicroIqd"], 5_000_000)
+        self.assertEqual(total_earned, 5_000_000)
 
     def test_reversed_and_skipped_pool_decisions_are_not_reported_as_unpaid_work(self):
         connection = sqlite3.connect(self.db)
@@ -540,13 +560,11 @@ class CompensationReadinessGateTests(unittest.TestCase):
             action="skip",
         )
         connection.commit()
+        uncredited, warnings = self.scan_uncredited_second_pass(connection)
         connection.close()
 
-        code, report = self.run_gate()
-
-        self.assertEqual(code, 0, report)
-        self.assertEqual(report["warnings"], [], report)
-        self.assertEqual(report["uncreditedSecondPassDecisions"], [], report)
+        self.assertEqual(warnings, [])
+        self.assertEqual(uncredited, [])
 
     def test_credited_pool_decision_stays_quiet(self):
         connection = sqlite3.connect(self.db)
@@ -557,13 +575,11 @@ class CompensationReadinessGateTests(unittest.TestCase):
             connection, decision_id=1, operation_id="11111111-1111-4111-8111-111111111111"
         )
         connection.commit()
+        uncredited, warnings = self.scan_uncredited_second_pass(connection)
         connection.close()
 
-        code, report = self.run_gate()
-
-        self.assertEqual(code, 0, report)
-        self.assertEqual(report["warnings"], [], report)
-        self.assertEqual(report["uncreditedSecondPassDecisions"], [], report)
+        self.assertEqual(warnings, [])
+        self.assertEqual(uncredited, [])
 
     def test_valid_ledger_and_focus_pass(self):
         code, report = self.run_gate()
