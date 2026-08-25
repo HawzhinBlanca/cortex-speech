@@ -32,9 +32,11 @@ no honesty/privacy/reliability/correctness gate is waived.
 """
 import argparse
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -42,7 +44,45 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterator, Sequence
+
+_VERIFY_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _VERIFY_SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _VERIFY_SCRIPT_DIR)
+
+try:
+    from verify10_supervisor import (
+        EvidenceError,
+        EvidenceJournal,
+        LeaseError,
+        LeaseManager,
+        acquired_lease,
+        atomic_write_bytes,
+        atomic_write_json,
+        sha256_file,
+        spawn_isolated,
+        terminate_isolated,
+        utc_now,
+        wait_isolated,
+    )
+except ModuleNotFoundError:  # Imported as ``scripts.verify_10`` by policy tests.
+    from scripts.verify10_supervisor import (
+        EvidenceError,
+        EvidenceJournal,
+        LeaseError,
+        LeaseManager,
+        acquired_lease,
+        atomic_write_bytes,
+        atomic_write_json,
+        sha256_file,
+        spawn_isolated,
+        terminate_isolated,
+        utc_now,
+        wait_isolated,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APP = REPO_ROOT / "cortex-speech-app"
@@ -278,6 +318,30 @@ def check_repo_integrity():
     else:
         print(f"  [OK]  Cargo.toml repository set ({declared}); git remote unavailable to cross-check.")
     return ok
+
+
+def check_clean_source_tree():
+    """Certification is about one committed tree, never an unrecorded working-copy variant."""
+
+    completed = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        print("  [ERR] git status could not prove a clean source tree")
+        return False
+    dirty = [line for line in completed.stdout.splitlines() if line.strip()]
+    if dirty:
+        print(f"  [ERR] source tree has {len(dirty)} tracked/untracked change(s)")
+        for line in dirty[:20]:
+            print(f"    {line}")
+        return False
+    print("  [OK] source tree is clean and exactly represented by HEAD")
+    return True
 
 
 def check_branch_protection():
@@ -535,7 +599,13 @@ def static_main():
 # Aggregator framework
 # ---------------------------------------------------------------------------
 
-PASS, FAIL, SKIP_ENV, NOT_BUILT = "PASS", "FAIL", "SKIP-ENV", "NOT-BUILT"
+PASS, PASS_AFTER_RETRY, FAIL, SKIP_ENV, NOT_BUILT = (
+    "PASS",
+    "PASS-AFTER-RETRY",
+    "FAIL",
+    "SKIP-ENV",
+    "NOT-BUILT",
+)
 # --quick deliberately does not run tier-2/3 kept gates; they are counted with this status so the
 # verdict is at best INCOMPLETE. Quick mode must never print the ship-ready GREEN line — that
 # verdict was previously reachable ONLY in the least-verified mode (true-10 sweep 2026-07-11).
@@ -850,6 +920,173 @@ def _fn_fuzz_smoke():
     return True
 
 
+PROFILE_OWNER = "owner-product"
+PROFILE_WINDOWS = "windows-product"
+PROFILE_MODEL = "model-evidence"
+PROFILE_FULL = "full-charter"
+PROFILES = frozenset({PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_MODEL, PROFILE_FULL})
+
+
+@dataclass(frozen=True)
+class GateStep:
+    argv: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GateSpec:
+    """The complete, hashable execution contract for one verifier gate.
+
+    ``__iter__`` and ``__getitem__`` retain the old seven-field read-only policy-test API while the
+    runtime uses typed steps, explicit timeouts, artifacts, profiles and retry semantics.
+    """
+
+    id: str
+    tier: int
+    profiles: frozenset[str]
+    kind: str
+    payload: object
+    steps: tuple[GateStep, ...]
+    cwd: Path
+    environment_probe: Callable[[], object] | None
+    timeout_seconds: int
+    artifact_requirements: tuple[str, ...]
+    retry_policy: str
+    charter_ref: str
+
+    def legacy_tuple(self) -> tuple[object, ...]:
+        legacy_cwd: Path | None = self.cwd if self.kind == "cmd" else None
+        return (
+            self.id,
+            self.tier,
+            self.kind,
+            self.payload,
+            legacy_cwd,
+            self.environment_probe,
+            self.charter_ref,
+        )
+
+    def __iter__(self) -> Iterator[object]:
+        return iter(self.legacy_tuple())
+
+    def __getitem__(self, index: int) -> object:
+        return self.legacy_tuple()[index]
+
+
+def _command_argv(command: str) -> tuple[str, ...]:
+    """Parse one command line with Windows' own quoting rules; never invoke a shell implicitly."""
+
+    if os.name != "nt":
+        parsed = shlex.split(command)
+    else:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        argc = ctypes.c_int()
+        shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        pointer = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+        if not pointer:
+            raise ValueError(f"cannot parse gate command: {command!r}")
+        try:
+            parsed = [pointer[index] for index in range(argc.value)]
+        finally:
+            ctypes.WinDLL("kernel32", use_last_error=True).LocalFree(pointer)
+    if not parsed:
+        raise ValueError("gate command has no executable")
+    resolved = shutil.which(parsed[0]) or parsed[0]
+    parsed[0] = resolved
+    if os.name == "nt" and Path(resolved).suffix.casefold() in {".cmd", ".bat"}:
+        # Batch files are an explicit interpreter substep. Popen still receives an argument array
+        # and ``shell=False``; metacharacters can never join otherwise independent gate steps.
+        command_processor = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        return (command_processor, "/d", "/s", "/c", subprocess.list2cmdline(parsed))
+    return tuple(parsed)
+
+
+def _command_steps(command: str) -> tuple[GateStep, ...]:
+    parts = command.split(" && ")
+    if any(not part.strip() for part in parts):
+        raise ValueError(f"gate command has an empty compound substep: {command!r}")
+    return tuple(GateStep(_command_argv(part.strip())) for part in parts)
+
+
+def _profiles_for_gate(name: str, tier: int) -> frozenset[str]:
+    profiles = {PROFILE_FULL}
+    model_gates = {
+        "license-compat",
+        "dataset-duplicates",
+        "snapshot-immutability",
+        "challenger-loop",
+        "review-serving-provenance",
+        "fuzz-smoke",
+        "fairness-gender-age",
+        "refinery-lift",
+    }
+    windows_specific = {
+        "test-e2e+a11y",
+        "audit",
+        "deny",
+        "egress-runtime",
+        "heartbeat-runtime",
+        "bench-budget",
+    }
+    if name in model_gates:
+        profiles.add(PROFILE_MODEL)
+    if tier <= 1 or name in windows_specific:
+        profiles.add(PROFILE_WINDOWS)
+    if name not in model_gates or name in {
+        "dataset-duplicates",
+        "review-serving-provenance",
+        "fuzz-smoke",
+    }:
+        profiles.add(PROFILE_OWNER)
+    return frozenset(profiles)
+
+
+def _timeout_for_gate(name: str, kind: str) -> int:
+    """Explicit provisional budgets; certification remains blocked until three baselines calibrate them."""
+
+    if kind == "fn":
+        return 120
+    return {
+        "python-policies": 1_500,
+        "test-rust": 1_800,
+        "clippy": 900,
+        "test-e2e+a11y": 900,
+        "real-app-e2e": 900,
+        "fuzz-smoke": 1_200,
+        "pipeline-ipc-e2e": 900,
+        "durability-drill": 1_200,
+        "export-kill-drill": 900,
+    }.get(name, 240)
+
+
+def _typed_gate(row: Sequence[object]) -> GateSpec:
+    name, tier, kind, payload, cwd, probe, charter = row
+    if not isinstance(name, str) or not isinstance(tier, int) or not isinstance(kind, str):
+        raise TypeError(f"invalid gate registry row: {row!r}")
+    if kind == "cmd":
+        if not isinstance(payload, str):
+            raise TypeError(f"command gate {name} has non-string payload")
+        steps = _command_steps(payload)
+    elif kind in {"fn", "not-built"}:
+        steps = ()
+    else:
+        raise ValueError(f"gate {name} has unknown kind {kind}")
+    resolved_cwd = Path(cwd or REPO_ROOT).resolve()
+    return GateSpec(
+        id=name,
+        tier=tier,
+        profiles=_profiles_for_gate(name, tier),
+        kind=kind,
+        payload=payload,
+        steps=steps,
+        cwd=resolved_cwd,
+        environment_probe=probe if callable(probe) else None,
+        timeout_seconds=_timeout_for_gate(name, kind),
+        artifact_requirements=("attempt-log", "worker-result"),
+        retry_policy="diagnostic-once",
+        charter_ref=str(charter),
+    )
+
+
 # (name, tier, kind, payload, cwd, env_probe, charter_ref)
 #   kind "fn"  -> payload is a callable returning bool
 #   kind "cmd" -> payload is a shell command string
@@ -857,6 +1094,7 @@ GATES = [
     # Tier 0 — static governance (seconds)
     ("manifest-alignment", 0, "fn", check_manifests, None, None, "Git+integrity: versions byte-equal CHANGELOG"),
     ("repo-integrity", 0, "fn", check_repo_integrity, None, None, "Git+integrity: LICENSE/NOTICE/repo URL"),
+    ("clean-source-tree", 0, "fn", check_clean_source_tree, None, None, "Git+integrity: no tracked or untracked release inputs outside HEAD"),
     ("required-files", 0, "fn", check_required_files, None, None, "Engineering rigor: SECURITY.md/CODEOWNERS present"),
     ("ledger-schema", 0, "fn", check_provenance_ledger, None, None, "Data governance: ledger schema-valid"),
     ("license-compat", 0, "fn", check_license_compatibility, None, None, "Data governance: contamination gate"),
@@ -906,6 +1144,35 @@ GATES = [
     ("durability-drill", 3, "cmd", _drill_cmd("durability_writer", "durability_drill.py", "--cycles 25"), APP, None, "Crash durability PROVEN, not asserted: 25 hard kills of the real writer (production Database::open_with_retry + insert_segment) across write-phase and boot-phase, verifying integrity_check ok, zero LOST journaled edits, a contiguous id space and a row count that never decreases. The single reliability property daily review depends on - the app dying must never cost work that was saved. It existed and NOTHING ran it (found 2026-08-02 by asking which scripts no gate references); an unrun drill is a claim."),
     ("export-kill-drill", 3, "cmd", _drill_cmd("export_writer", "export_kill_drill.py", "--cycles 15"), APP, None, "Atomic-write design under real kills: 15 mid-export TerminateProcess cycles proving every JOURNALED export parses complete with the full row count, and that NO final .json is ever torn (atomic temp+fsync+rename in atomic_file.rs is the design under test). Scope honesty: process kill, not power loss. Same find as the durability drill - written, never run."),
 ]
+GATES = [_typed_gate(row) for row in GATES]
+
+
+def gate_registry_document() -> dict[str, object]:
+    return {
+        "schema": 1,
+        "gates": [
+            {
+                "id": gate.id,
+                "tier": gate.tier,
+                "profiles": sorted(gate.profiles),
+                "kind": gate.kind,
+                "steps": [list(step.argv) for step in gate.steps],
+                "cwd": str(gate.cwd),
+                "timeoutSeconds": gate.timeout_seconds,
+                "artifactRequirements": list(gate.artifact_requirements),
+                "retryPolicy": gate.retry_policy,
+                "charterRef": gate.charter_ref,
+            }
+            for gate in GATES
+        ],
+    }
+
+
+def gate_registry_hash() -> str:
+    canonical = json.dumps(
+        gate_registry_document(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 # Charter DoD legs descoped by the owner amendment (2026-07-10) — always printed.
 DESCOPED = [
@@ -929,6 +1196,9 @@ OWNER_GATED = [
 
 
 LOG_DIR = Path(tempfile.gettempdir()) / "cortex-verify10"
+PROOF_ROOT = LOG_DIR / "proof-runs"
+LATEST_PROOF = LOG_DIR / "latest-proof.json"
+RUN_LOCK = LOG_DIR / "verify10.lease.json"
 
 # Append-only per-gate run record (external review 2026-08-06, P0.1): "a result that ran but cannot be
 # retrieved is operationally indistinguishable from no result."
@@ -939,17 +1209,12 @@ LOG_DIR = Path(tempfile.gettempdir()) / "cortex-verify10"
 # a durable, ordered record of exactly how far it got and what each leg cost.
 #
 # JSONL and append-only on purpose: a partial last line is the only damage a kill can do, and every line
-# before it stays parseable. Best-effort — evidence bookkeeping must never be the thing that fails a
-# sweep, so a write error is reported once and the run continues.
+# before it stays parseable. Evidence is part of the verdict: a write/fsync failure fails the verifier.
 RUN_LOG = LOG_DIR / "runs.jsonl"
-_run_log_broken = False
 
 
 def record_run_event(**fields):
-    """Append one JSON line to RUN_LOG. Never raises."""
-    global _run_log_broken
-    if _run_log_broken:
-        return
+    """Append one JSON line to the legacy aggregate log and fail closed on evidence loss."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with RUN_LOG.open("a", encoding="utf-8") as fh:
@@ -957,8 +1222,7 @@ def record_run_event(**fields):
             fh.flush()
             os.fsync(fh.fileno())  # a record that is still in a buffer when the process is killed is not a record
     except OSError as exc:
-        _run_log_broken = True
-        print(f"  (run-log unavailable: {exc} — the sweep continues; only its durable record is lost)")
+        raise EvidenceError(f"run-log unavailable: {exc}") from exc
 
 # Everything this script runs is THE GATE, and a gate must never quietly reuse a resource it did not
 # create. Set for the whole run (subprocesses inherit it) rather than per leg, because that is exactly
@@ -1006,7 +1270,7 @@ _node_report_opts = f"--report-on-fatalerror --report-directory={LOG_DIR}"
 os.environ["NODE_OPTIONS"] = (os.environ.get("NODE_OPTIONS", "") + " " + _node_report_opts).strip()
 
 
-def run_gate(name, kind, payload, cwd, probe, timeout=3600):
+def _retired_captured_run_gate(name, kind, payload, cwd, probe, timeout=3600):
     """Run one gate; returns (status, seconds, detail). Full cmd output -> LOG_DIR/<gate>.log.
 
     A probe returns None (runnable), a reason string (SKIP-ENV: the environment cannot run this leg),
@@ -1035,7 +1299,7 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
     first_attempt = ""
     try:
         r = subprocess.run(
-            payload, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout
+            _command_argv(payload), shell=False, cwd=cwd, capture_output=True, text=True, timeout=timeout
         )
         # LNK1104 on system libs is a Windows file-lock (AV scan) flake, not a code failure:
         # retry exactly once, and say so — both attempts land in the log. Keeping the first one is
@@ -1048,7 +1312,7 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
                 f"{r.stdout or ''}\n{r.stderr or ''}\n\n"
             )
             r = subprocess.run(
-                payload, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout
+                _command_argv(payload), shell=False, cwd=cwd, capture_output=True, text=True, timeout=timeout
             )
     except subprocess.TimeoutExpired:
         return FAIL, time.perf_counter() - t0, f"timed out after {timeout}s"
@@ -1094,7 +1358,7 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
         retried = f" [OS-terminated (exit {r.returncode}) with no verdict; re-ran once — see {crash_log}]"
         try:
             r = subprocess.run(
-                payload, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout
+                _command_argv(payload), shell=False, cwd=cwd, capture_output=True, text=True, timeout=timeout
             )
         except subprocess.TimeoutExpired:
             return FAIL, time.perf_counter() - t0, f"timed out after {timeout}s (on the post-crash re-run)"
@@ -1128,7 +1392,151 @@ def run_gate(name, kind, payload, cwd, probe, timeout=3600):
     return FAIL, secs, f"exit {r.returncode}{retried} - full log: {log_path}{kept}\n{tail}"
 
 
-def write_status_md(path, head, quick, results, verdict):
+def _attempt_log_path(name: str, attempt: int) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return LOG_DIR / f"{name}.attempt-{attempt}.{stamp}.{uuid.uuid4().hex[:8]}.log"
+
+
+def _run_command_attempt(
+    name: str,
+    steps: tuple[GateStep, ...],
+    cwd: Path,
+    timeout: int,
+    attempt: int,
+) -> tuple[int | None, float, Path, bool]:
+    """Run explicit substeps into one durable attempt log and kill every descendant on timeout."""
+
+    if timeout <= 0:
+        raise ValueError(f"gate {name} has no positive timeout")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _attempt_log_path(name, attempt)
+    started = time.perf_counter()
+    deadline = started + timeout
+    return_code: int | None = 0
+    timed_out = False
+    try:
+        with log_path.open("x", encoding="utf-8", errors="replace", buffering=1) as log:
+            for index, step in enumerate(steps, start=1):
+                log.write(
+                    f"--- substep {index}/{len(steps)} ---\n"
+                    f"argv={json.dumps(list(step.argv), ensure_ascii=False)}\n"
+                    f"cwd={cwd}\n\n"
+                )
+                log.flush()
+                os.fsync(log.fileno())
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    timed_out = True
+                    return_code = None
+                    break
+                process, job = spawn_isolated(list(step.argv), cwd=cwd, log=log, env=dict(os.environ))
+                return_code, step_timeout = wait_isolated(
+                    process,
+                    job,
+                    timeout=remaining,
+                    heartbeat=lambda: None,
+                )
+                log.write(f"\n--- substep exit {return_code} ---\n")
+                log.flush()
+                os.fsync(log.fileno())
+                if step_timeout:
+                    timed_out = True
+                    break
+                if return_code != 0:
+                    break
+    except OSError as error:
+        raise EvidenceError(f"cannot stream gate {name} attempt {attempt} evidence: {error}") from error
+    return return_code, time.perf_counter() - started, log_path, timed_out
+
+
+def _publish_latest_gate_log(name: str, attempt_logs: list[Path]) -> Path:
+    chunks: list[bytes] = []
+    for index, path in enumerate(attempt_logs, start=1):
+        chunks.append(f"===== ATTEMPT {index}: {path.name} =====\n".encode("utf-8"))
+        chunks.append(path.read_bytes())
+        chunks.append(b"\n")
+    latest = LOG_DIR / f"{name}.log"
+    atomic_write_bytes(latest, b"".join(chunks))
+    return latest
+
+
+def run_gate(name, kind, payload, cwd, probe, timeout=3600):
+    """Compatibility entrypoint backed by explicit argv, durable logs and process-tree cleanup."""
+
+    if probe:
+        try:
+            verdict = probe()
+        except Exception as error:  # noqa: BLE001 - a broken probe is this gate's failure
+            return FAIL, 0.0, f"probe crashed: {error}"
+        if verdict:
+            status, reason = verdict if isinstance(verdict, tuple) else (SKIP_ENV, verdict)
+            return status, 0.0, reason
+    if kind == "not-built":
+        return NOT_BUILT, 0.0, payload
+    started = time.perf_counter()
+    if kind == "fn":
+        try:
+            ok = payload()
+        except Exception as error:  # noqa: BLE001 - a crashing worker is a red gate
+            return FAIL, time.perf_counter() - started, f"gate crashed: {error}"
+        return (PASS if ok else FAIL), time.perf_counter() - started, ""
+    if kind != "cmd" or not isinstance(payload, str):
+        return FAIL, 0.0, f"invalid gate kind/payload: {kind!r}"
+
+    try:
+        steps = _command_steps(payload)
+        return_code, seconds, first_log, timed_out = _run_command_attempt(
+            name, steps, Path(cwd or REPO_ROOT), timeout, 1
+        )
+    except (OSError, ValueError, EvidenceError) as error:
+        return FAIL, time.perf_counter() - started, f"gate supervisor failed: {error}"
+    attempt_logs = [first_log]
+    if timed_out:
+        latest = _publish_latest_gate_log(name, attempt_logs)
+        return FAIL, seconds, f"timed out after {timeout}s; full log: {latest}"
+
+    first_output = first_log.read_text(encoding="utf-8", errors="replace")
+    retry_reason: str | None = None
+    if return_code != 0 and "LNK1104" in first_output:
+        retry_reason = "LNK1104 linker file-lock flake"
+    elif return_code in ABNORMAL_EXIT_CODES:
+        retry_reason = f"OS-terminated before verdict (exit {return_code})"
+
+    if retry_reason is not None:
+        try:
+            retry_code, retry_seconds, retry_log, retry_timed_out = _run_command_attempt(
+                name, steps, Path(cwd or REPO_ROOT), timeout, 2
+            )
+            attempt_logs.append(retry_log)
+            seconds += retry_seconds
+        except (OSError, ValueError, EvidenceError) as error:
+            latest = _publish_latest_gate_log(name, attempt_logs)
+            return FAIL, time.perf_counter() - started, (
+                f"{retry_reason}; diagnostic re-run could not start: {error}; full log: {latest}"
+            )
+        latest = _publish_latest_gate_log(name, attempt_logs)
+        if retry_timed_out:
+            return FAIL, seconds, f"{retry_reason}; re-run timed out; full log: {latest}"
+        if retry_code == 0:
+            return PASS_AFTER_RETRY, seconds, f"{retry_reason}; re-ran once; full log: {latest}"
+        return FAIL, seconds, (
+            f"{retry_reason}; re-run exit {retry_code}; full log: {latest}\n"
+            + "\n".join(retry_log.read_text(encoding="utf-8", errors="replace").splitlines()[-12:])
+        )
+
+    latest = _publish_latest_gate_log(name, attempt_logs)
+    if return_code == 0:
+        return PASS, seconds, ""
+    stamped = LOG_DIR / f"{name}.FAIL.{time.strftime('%Y%m%d-%H%M%S')}.{uuid.uuid4().hex[:8]}.log"
+    atomic_write_bytes(stamped, latest.read_bytes())
+    tail = "\n".join(first_output.strip().splitlines()[-12:])
+    return FAIL, seconds, (
+        f"exit {return_code}; full log: {latest}\n"
+        f"     kept for post-mortem: {stamped}\n{tail}"
+    )
+
+
+def write_status_md(path, head, quick, results, verdict, profile=PROFILE_FULL):
     """Emit the single generated source of truth for gate status.
 
     Hand-written docs that restate which gates pass go stale silently — OWNER_HANDOFF.md
@@ -1150,7 +1558,7 @@ def write_status_md(path, head, quick, results, verdict):
 
 # Gate status — generated
 
-**Commit:** `{head}` · **Mode:** {'quick (tiers 0-1)' if quick else 'full'}
+**Commit:** `{head}` · **Profile:** `{profile}` · **Mode:** {'quick (tiers 0-1)' if quick else 'full'}
 
 **Verdict:** {verdict}
 
@@ -1172,11 +1580,11 @@ def write_status_md(path, head, quick, results, verdict):
 |---|---|
 {gated}
 """
-    Path(path).write_text(body, encoding="utf-8")
+    atomic_write_bytes(Path(path), body.encode("utf-8"))
     print(f"\n[status-md] wrote {path}")
 
 
-def aggregate_main(quick, status_md=None):
+def _retired_aggregate_main(quick, status_md=None):
     head = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True
     ).stdout.strip() or "?"
@@ -1295,7 +1703,452 @@ def aggregate_main(quick, status_md=None):
     sys.exit(code)
 
 
-RUN_LOCK = LOG_DIR / "verify10.lock"
+PROFILE_REQUIRED_EVIDENCE = {
+    PROFILE_OWNER: (
+        "three clean timeout-calibration baselines",
+        "three consecutive verifier fault campaigns",
+        "real owner workflow plus two-hour/1,000-decision soak",
+        "three exact-commit verifier runs around deployment and cold reboot",
+        "thirty incident-free owner daily-use sessions",
+    ),
+    PROFILE_WINDOWS: (
+        "signed and timestamped Windows installer/update artifacts",
+        "clean-VM install, update, rollback, uninstall and signature campaign",
+        "manual NVDA, keyboard, zoom, high-contrast and reduced-motion evidence",
+        "paired eight-participant comparator study meeting Gate B",
+        "seven-day five-user Windows pilot",
+    ),
+    PROFILE_MODEL: (
+        "current hash-bound model attestation",
+        "Gold Marathon and independent-annotator IAA evidence",
+        "CORDI dialect/domain evidence",
+    ),
+}
+PROFILE_REQUIRED_EVIDENCE[PROFILE_FULL] = tuple(
+    dict.fromkeys(
+        item
+        for profile in (PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_MODEL)
+        for item in PROFILE_REQUIRED_EVIDENCE[profile]
+    )
+)
+
+
+def _full_git_sha() -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    sha = completed.stdout.strip().casefold()
+    if completed.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise EvidenceError("cannot bind verifier run to a full Git SHA")
+    return sha
+
+
+def _source_tree_digest() -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    digest = completed.stdout.strip().casefold()
+    if completed.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", digest):
+        raise EvidenceError("cannot bind verifier run to the source tree digest")
+    return digest
+
+
+def _environment_document() -> dict[str, object]:
+    return {
+        "schema": 1,
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "python": sys.version,
+        "pythonExecutable": sys.executable,
+        "processor": platform.processor(),
+    }
+
+
+def _gate_by_id(gate_id: str) -> GateSpec:
+    matches = [gate for gate in GATES if gate.id == gate_id]
+    if len(matches) != 1:
+        raise ValueError(f"unknown or duplicate gate id {gate_id!r}")
+    return matches[0]
+
+
+def gate_worker_main(gate_id: str, result_path: Path, run_token: str) -> int:
+    """Execute a probe and gate body in an isolated worker, then atomically publish its result."""
+
+    global LOG_DIR
+    gate = _gate_by_id(gate_id)
+    LOG_DIR = result_path.parent
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    started = utc_now()
+    status, seconds, detail = run_gate(
+        gate.id,
+        gate.kind,
+        gate.payload,
+        gate.cwd,
+        gate.environment_probe,
+        timeout=gate.timeout_seconds,
+    )
+    artifacts = []
+    for path in sorted(candidate for candidate in LOG_DIR.glob("*.log") if candidate.name != "worker.log"):
+        artifacts.append(
+            {
+                "path": path.name,
+                "sha256": sha256_file(path),
+                "bytes": path.stat().st_size,
+            }
+        )
+    result = {
+        "schema": 1,
+        "runToken": run_token,
+        "gateId": gate.id,
+        "startedAt": started,
+        "endedAt": utc_now(),
+        "status": status,
+        "seconds": round(seconds, 3),
+        "detail": str(detail),
+        "artifacts": artifacts,
+    }
+    atomic_write_json(result_path, result)
+    return 0
+
+
+def _validate_worker_result(
+    path: Path, gate: GateSpec, run_token: str
+) -> tuple[str, float, str, list[dict[str, object]]]:
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"gate {gate.id} has no readable worker result: {error}") from error
+    if not isinstance(result, dict) or result.get("schema") != 1:
+        raise EvidenceError(f"gate {gate.id} worker result has the wrong schema")
+    if result.get("runToken") != run_token or result.get("gateId") != gate.id:
+        raise EvidenceError(f"gate {gate.id} worker result is bound to another run/gate")
+    status = result.get("status")
+    allowed = {PASS, PASS_AFTER_RETRY, FAIL, SKIP_ENV, NOT_BUILT}
+    if status not in allowed:
+        raise EvidenceError(f"gate {gate.id} worker returned unknown status {status!r}")
+    seconds = result.get("seconds")
+    detail = result.get("detail")
+    artifacts = result.get("artifacts")
+    if not isinstance(seconds, (int, float)) or seconds < 0 or not isinstance(detail, str):
+        raise EvidenceError(f"gate {gate.id} worker result has invalid timing/detail")
+    if not isinstance(artifacts, list):
+        raise EvidenceError(f"gate {gate.id} worker result has no artifact list")
+    checked: list[dict[str, object]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+            raise EvidenceError(f"gate {gate.id} worker artifact is malformed")
+        artifact_path = path.parent / str(artifact["path"])
+        if not artifact_path.is_file() or sha256_file(artifact_path) != artifact.get("sha256"):
+            raise EvidenceError(f"gate {gate.id} worker artifact hash mismatch: {artifact_path}")
+        checked.append(artifact)
+    return str(status), float(seconds), detail, checked
+
+
+def _run_gate_worker(
+    gate: GateSpec,
+    run_dir: Path,
+    run_token: str,
+    lease: LeaseManager,
+    journal: EvidenceJournal,
+) -> tuple[str, float, str, list[dict[str, object]]]:
+    gate_dir = run_dir / "gates" / gate.id
+    gate_dir.mkdir(parents=True, exist_ok=False)
+    result_path = gate_dir / "worker-result.json"
+    worker_log = gate_dir / "worker.log"
+    journal.append(
+        "gate_start",
+        gate=gate.id,
+        timeoutSeconds=gate.timeout_seconds,
+        profiles=sorted(gate.profiles),
+    )
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--gate-worker",
+        gate.id,
+        "--worker-result",
+        str(result_path),
+        "--run-token",
+        run_token,
+    ]
+    process = None
+    job = None
+    last_journal_heartbeat = 0.0
+    try:
+        with worker_log.open("x", encoding="utf-8", errors="replace", buffering=1) as log:
+            process, job = spawn_isolated(command, cwd=REPO_ROOT, log=log, env=dict(os.environ))
+            lease.update_gate(gate.id, process.pid)
+
+            def heartbeat() -> None:
+                nonlocal last_journal_heartbeat
+                lease.heartbeat()
+                now = time.monotonic()
+                if now - last_journal_heartbeat >= 5.0:
+                    journal.append("heartbeat", gate=gate.id, childPid=process.pid)
+                    last_journal_heartbeat = now
+
+            return_code, timed_out = wait_isolated(
+                process,
+                job,
+                timeout=gate.timeout_seconds + 45,
+                heartbeat=heartbeat,
+            )
+            log.flush()
+            os.fsync(log.fileno())
+        lease.update_gate(None, None)
+    except KeyboardInterrupt:
+        if process is not None and job is not None:
+            terminate_isolated(process, job)
+        lease.update_gate(None, None)
+        journal.append("gate_end", gate=gate.id, status="ABORTED", reason="KeyboardInterrupt")
+        raise
+    except (OSError, EvidenceError) as error:
+        if process is not None and job is not None:
+            terminate_isolated(process, job)
+        lease.update_gate(None, None)
+        detail = f"worker supervision failed: {error}"
+        journal.append("gate_end", gate=gate.id, status=FAIL, detail=detail)
+        return FAIL, 0.0, detail, []
+
+    worker_artifact = {
+        "path": str(worker_log.relative_to(run_dir)),
+        "sha256": sha256_file(worker_log),
+        "bytes": worker_log.stat().st_size,
+    }
+    if timed_out:
+        detail = f"worker exceeded hard timeout {gate.timeout_seconds + 45}s"
+        journal.append("gate_end", gate=gate.id, status=FAIL, detail=detail)
+        return FAIL, float(gate.timeout_seconds + 45), detail, [worker_artifact]
+    if return_code != 0:
+        detail = f"worker exited {return_code} without a trustworthy verdict"
+        journal.append("gate_end", gate=gate.id, status=FAIL, detail=detail)
+        return FAIL, 0.0, detail, [worker_artifact]
+    try:
+        status, seconds, detail, artifacts = _validate_worker_result(result_path, gate, run_token)
+    except EvidenceError as error:
+        status, seconds, detail, artifacts = FAIL, 0.0, str(error), []
+    normalized = [worker_artifact]
+    normalized.extend(
+        {
+            **artifact,
+            "path": str((gate_dir / str(artifact["path"])).relative_to(run_dir)),
+        }
+        for artifact in artifacts
+    )
+    normalized.append(
+        {
+            "path": str(result_path.relative_to(run_dir)),
+            "sha256": sha256_file(result_path),
+            "bytes": result_path.stat().st_size,
+        }
+    )
+    journal.append("gate_end", gate=gate.id, status=status, seconds=round(seconds, 3), detail=detail)
+    return status, seconds, detail, normalized
+
+
+def _manifest_artifacts(run_dir: Path) -> list[dict[str, object]]:
+    artifacts = []
+    for path in sorted(candidate for candidate in run_dir.rglob("*") if candidate.is_file()):
+        if path.name == "manifest.json":
+            continue
+        artifacts.append(
+            {
+                "path": str(path.relative_to(run_dir)),
+                "sha256": sha256_file(path),
+                "bytes": path.stat().st_size,
+            }
+        )
+    return artifacts
+
+
+def _validate_completed_manifest(path: Path, expected_sha: str, expected_token: str) -> dict[str, object]:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"completed proof manifest cannot be read: {error}") from error
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+        raise EvidenceError("completed proof manifest has the wrong schema")
+    if manifest.get("fullGitSha") != expected_sha or manifest.get("runToken") != expected_token:
+        raise EvidenceError("completed proof manifest is bound to another source/run")
+    if manifest.get("complete") is not True or not isinstance(manifest.get("results"), list):
+        raise EvidenceError("proof manifest is not complete")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise EvidenceError("proof manifest has no artifact inventory")
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+            raise EvidenceError("proof manifest contains a malformed artifact")
+        candidate = path.parent / str(artifact["path"])
+        if not candidate.is_file() or sha256_file(candidate) != artifact.get("sha256"):
+            raise EvidenceError(f"proof artifact is missing or changed: {candidate}")
+    event_log = path.parent / "events.jsonl"
+    last = json.loads(event_log.read_text(encoding="utf-8").splitlines()[-1])
+    if last.get("event") != "run_end" or last.get("runToken") != expected_token:
+        raise EvidenceError("proof journal has no matching terminal run_end")
+    return manifest
+
+
+def _profile_verdict(
+    profile: str,
+    quick: bool,
+    results: list[tuple[str, str, float, str]],
+) -> tuple[int, str]:
+    failures = [name for name, status, _, _ in results if status == FAIL]
+    incomplete = [
+        name
+        for name, status, _, _ in results
+        if status in {SKIP_ENV, NOT_BUILT, NOT_RUN_QUICK, PASS_AFTER_RETRY}
+    ]
+    if failures:
+        return 1, f"RED — {len(failures)} gate(s) failed: {', '.join(failures)}"
+    blockers = list(PROFILE_REQUIRED_EVIDENCE[profile])
+    if quick or incomplete or blockers:
+        reasons = []
+        if incomplete:
+            reasons.append(f"non-certifying gates: {', '.join(incomplete)}")
+        if blockers:
+            reasons.append(f"required evidence pending: {'; '.join(blockers)}")
+        if quick:
+            reasons.append("quick mode omitted required tiers")
+        return 2, "INCOMPLETE — " + " | ".join(reasons)
+    final = {
+        PROFILE_OWNER: "CORTEX PRODUCT 10/10 — OWNER WORKSTATION",
+        PROFILE_WINDOWS: "CORTEX PRODUCT 10/10 — WINDOWS 11",
+        PROFILE_MODEL: "CORTEX MODEL EVIDENCE — VERIFIED",
+        PROFILE_FULL: "CORTEX 10/10: ALL GATES GREEN",
+    }
+    return 0, final[profile]
+
+
+def aggregate_main(quick: bool, status_md: str | None, profile: str) -> int:
+    full_sha = _full_git_sha()
+    run_token = uuid.uuid4().hex
+    run_dir = PROOF_ROOT / run_token
+    run_dir.mkdir(parents=True, exist_ok=False)
+    journal = EvidenceJournal(run_dir / "events.jsonl", run_token)
+    lease = LeaseManager(RUN_LOCK, full_sha, profile, run_token)
+    registry = gate_registry_document()
+    registry_hash = gate_registry_hash()
+    environment = _environment_document()
+    atomic_write_json(run_dir / "gate-registry.json", registry)
+    atomic_write_json(run_dir / "environment.json", environment)
+    results: list[tuple[str, str, float, str]] = []
+    result_documents: list[dict[str, object]] = []
+    try:
+        if LEGACY_RUN_LOCK.exists():
+            try:
+                legacy_pid = int(LEGACY_RUN_LOCK.read_text(encoding="utf-8").strip().split()[0])
+            except (OSError, UnicodeError, ValueError, IndexError) as error:
+                raise LeaseError(f"unknown legacy verifier lock identity: {error}") from error
+            if _pid_alive(legacy_pid):
+                raise LeaseError(
+                    f"legacy verifier pid {legacy_pid} is live but has no creation-time/token identity; "
+                    "takeover fails closed"
+                )
+            LEGACY_RUN_LOCK.unlink()
+        with acquired_lease(lease) as abandoned_token:
+            journal.append(
+                "run_start",
+                fullGitSha=full_sha,
+                sourceTreeDigest=_source_tree_digest(),
+                profile=profile,
+                quick=quick,
+                gateRegistryHash=registry_hash,
+            )
+            if abandoned_token is not None:
+                journal.append("abandonment", abandonedRunToken=abandoned_token, reason="stale lease takeover")
+            selected = [gate for gate in GATES if profile in gate.profiles]
+            for gate in selected:
+                if quick and gate.tier > 1:
+                    result = (gate.id, NOT_RUN_QUICK, 0.0, "quick mode")
+                    results.append(result)
+                    result_documents.append(
+                        {"gateId": gate.id, "status": NOT_RUN_QUICK, "seconds": 0.0, "detail": "quick mode"}
+                    )
+                    continue
+                print(f"\n----- [tier {gate.tier}] {gate.id} :: {gate.charter_ref}", flush=True)
+                status, seconds, detail, artifacts = _run_gate_worker(
+                    gate, run_dir, run_token, lease, journal
+                )
+                results.append((gate.id, status, seconds, detail))
+                result_documents.append(
+                    {
+                        "gateId": gate.id,
+                        "status": status,
+                        "seconds": round(seconds, 3),
+                        "detail": detail,
+                        "artifacts": artifacts,
+                    }
+                )
+                print(f"  => {status} {gate.id} {seconds:.1f}s", flush=True)
+                if detail:
+                    print(f"     {detail}", flush=True)
+
+            code, verdict = _profile_verdict(profile, quick, results)
+            journal.append(
+                "run_end",
+                fullGitSha=full_sha,
+                profile=profile,
+                exitCode=code,
+                verdict=verdict,
+                results=len(results),
+            )
+            manifest_path = run_dir / "manifest.json"
+            manifest = {
+                "schema": 1,
+                "complete": True,
+                "runToken": run_token,
+                "fullGitSha": full_sha,
+                "sourceTreeDigest": _source_tree_digest(),
+                "profile": profile,
+                "quick": quick,
+                "environment": environment,
+                "gateRegistryHash": registry_hash,
+                "results": result_documents,
+                "verdict": verdict,
+                "exitCode": code,
+                "requiredEvidencePending": list(PROFILE_REQUIRED_EVIDENCE[profile]),
+                "artifacts": _manifest_artifacts(run_dir),
+            }
+            atomic_write_json(manifest_path, manifest)
+            _validate_completed_manifest(manifest_path, full_sha, run_token)
+            pointer = {
+                "schema": 1,
+                "runToken": run_token,
+                "fullGitSha": full_sha,
+                "profile": profile,
+                "manifest": str(manifest_path),
+                "manifestSha256": sha256_file(manifest_path),
+            }
+            atomic_write_json(LATEST_PROOF, pointer)
+            if status_md:
+                write_status_md(status_md, full_sha, quick, results, verdict, profile)
+            print(f"\nVERDICT: {verdict}", flush=True)
+            print(f"proof: {manifest_path}", flush=True)
+            return code
+    except KeyboardInterrupt:
+        with contextlib.suppress(EvidenceError):
+            journal.append("run_end", fullGitSha=full_sha, profile=profile, exitCode=130, verdict="ABORTED")
+        print("\nVERDICT: ABORTED — no proof pointer published", flush=True)
+        return 130
+    except (EvidenceError, LeaseError, OSError, ValueError) as error:
+        with contextlib.suppress(EvidenceError):
+            journal.append("run_end", fullGitSha=full_sha, profile=profile, exitCode=1, verdict="VERIFIER FAILURE", detail=str(error))
+        print(f"\nVERDICT: VERIFIER FAILURE — {error}", flush=True)
+        return 1
+
+
+LEGACY_RUN_LOCK = LOG_DIR / "verify10.lock"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1313,7 +2166,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 @contextlib.contextmanager
-def single_instance():
+def _retired_single_instance():
     """Refuse to start while another sweep is already running.
 
     WHY. Two sweeps in flight corrupt each other and the record, and it happened TWICE on 2026-08-03:
@@ -1331,9 +2184,9 @@ def single_instance():
     outage.
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    if RUN_LOCK.exists():
+    if LEGACY_RUN_LOCK.exists():
         try:
-            holder = int(RUN_LOCK.read_text(encoding="utf-8").strip().split()[0])
+            holder = int(LEGACY_RUN_LOCK.read_text(encoding="utf-8").strip().split()[0])
         except (ValueError, OSError, IndexError):
             holder = -1
         ours = holder == os.getpid()
@@ -1345,7 +2198,7 @@ def single_instance():
                 # refusal message somebody reads mid-run must not be mojibake.
                 f"  stamped with HEAD at write time (not run start), so the earlier one would label its\n"
                 f"  verdict with a commit it never tested. Wait for it, or stop it, then re-run.\n"
-                f"  Lock: {RUN_LOCK}",
+                f"  Lock: {LEGACY_RUN_LOCK}",
                 flush=True,
             )
             sys.exit(2)
@@ -1354,14 +2207,14 @@ def single_instance():
         # gate behaves oddly.
         if not ours:
             print(f"(taking over a stale verify-10 lock from dead pid {holder})", flush=True)
-    RUN_LOCK.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    LEGACY_RUN_LOCK.write_text(f"{os.getpid()}\n", encoding="utf-8")
     try:
         yield
     finally:
         # Only remove OUR lock: a takeover race must not delete the winner's.
         try:
-            if RUN_LOCK.exists() and RUN_LOCK.read_text(encoding="utf-8").strip().split()[0] == str(os.getpid()):
-                RUN_LOCK.unlink()
+            if LEGACY_RUN_LOCK.exists() and LEGACY_RUN_LOCK.read_text(encoding="utf-8").strip().split()[0] == str(os.getpid()):
+                LEGACY_RUN_LOCK.unlink()
         except OSError:
             pass
 
@@ -1370,21 +2223,29 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--static", action="store_true", help="historical 4-gate governance check (CI contract)")
     ap.add_argument("--quick", action="store_true", help="tiers 0-1 only")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default=PROFILE_OWNER)
     ap.add_argument(
         "--status-md",
         metavar="PATH",
+        default=str(REPO_ROOT / "docs" / "STATUS.md"),
         help="also write the generated gate-status file (docs/STATUS.md) — the single "
         "source of truth docs link to instead of restating gate state by hand",
     )
+    ap.add_argument("--gate-worker", help=argparse.SUPPRESS)
+    ap.add_argument("--worker-result", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--run-token", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.gate_worker:
+        if args.worker_result is None or not args.run_token:
+            ap.error("--gate-worker requires --worker-result and --run-token")
+        return gate_worker_main(args.gate_worker, args.worker_result, args.run_token)
     if args.static:
         # The static governance check runs no legs, opens no ports and writes no STATUS.md, so it is
         # not what the lock protects against and must stay runnable alongside a sweep.
         static_main()
-    else:
-        with single_instance():
-            aggregate_main(quick=args.quick, status_md=args.status_md)
+        return 0
+    return aggregate_main(quick=args.quick, status_md=args.status_md, profile=args.profile)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -181,8 +181,10 @@ def test_the_lnk1104_retry_keeps_both_attempts_in_the_log() -> None:
         status, _secs, _detail = v.run_gate("probe-status-lnk", "cmd", cmd, str(REPO_ROOT), None, timeout=60)
     finally:
         marker.unlink(missing_ok=True)
-    if status != v.PASS:
-        raise AssertionError(f"the LNK1104 retry leg reported {status!r}, expected PASS on the clean re-run")
+    if status != v.PASS_AFTER_RETRY:
+        raise AssertionError(
+            f"the LNK1104 retry leg reported {status!r}, expected non-certifying PASS-AFTER-RETRY"
+        )
     log = (v.LOG_DIR / "probe-status-lnk.log").read_text(encoding="utf-8", errors="replace")
     if "ATTEMPT1" not in log or "ATTEMPT2" not in log:
         raise AssertionError(
