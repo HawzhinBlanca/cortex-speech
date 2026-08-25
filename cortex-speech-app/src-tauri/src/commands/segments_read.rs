@@ -14,6 +14,142 @@ use crate::{audio, quality, AppState};
 use std::time::Duration;
 use tauri::State;
 
+fn public_review_read_error(error: &str) -> crate::ipc_contract::CommandErrorV1 {
+    if error.to_ascii_lowercase().contains("database is locked")
+        || error.to_ascii_lowercase().contains("database is busy")
+    {
+        crate::ipc_contract::CommandErrorV1::new(
+            "DATABASE_BUSY",
+            "The workspace is busy. Retry loading the review queue.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    } else {
+        crate::ipc_contract::CommandErrorV1::new("REVIEW_PAGE_FAILED", "The review queue could not be loaded.", false)
+            .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+    }
+}
+
+/// Versioned review queue read. Each rendered row and `baseRevision` originate in one SQLite result
+/// row, so a concurrent writer cannot pair old text with a newer compare-and-swap token. The read and
+/// DTO hydration stay off the desktop main thread even for a live-sized library.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_review_page_v1(
+    scope: crate::ipc_contract::ReviewScope,
+    limit: Option<usize>,
+    cursor: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::ipc_contract::ReviewPageV1, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_review_page_v1").map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "RATE_LIMITED",
+            "Too many review queue requests. Retry in a moment.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?;
+    let (query, scope_label) = match scope {
+        crate::ipc_contract::ReviewScope::Pending => (None, "pending".to_string()),
+        crate::ipc_contract::ReviewScope::Search { query } => {
+            validate::validate_text(&query, 1000, "Search query").map_err(|_| {
+                crate::ipc_contract::CommandErrorV1::new(
+                    "INVALID_REVIEW_SCOPE",
+                    "The review search is invalid or too long.",
+                    false,
+                )
+            })?;
+            (Some(query), "search".to_string())
+        }
+        crate::ipc_contract::ReviewScope::Escalation => {
+            return Err(crate::ipc_contract::CommandErrorV1::new(
+                "SCOPE_NOT_IMPLEMENTED",
+                "The versioned escalation queue is not available in this release.",
+                false,
+            ));
+        }
+        crate::ipc_contract::ReviewScope::VoiceFocus { .. } => {
+            return Err(crate::ipc_contract::CommandErrorV1::new(
+                "SCOPE_NOT_IMPLEMENTED",
+                "Named voice-focus selection is not available in this release.",
+                false,
+            ));
+        }
+    };
+    if let Some(cursor) = cursor.as_deref() {
+        validate::validate_text(cursor, 2048, "Review page cursor").map_err(|_| {
+            crate::ipc_contract::CommandErrorV1::new(
+                "INVALID_REVIEW_CURSOR",
+                "The review cursor is invalid. Reload the queue.",
+                false,
+            )
+            .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip)
+        })?;
+        if !cursor.chars().all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_') {
+            return Err(crate::ipc_contract::CommandErrorV1::new(
+                "INVALID_REVIEW_CURSOR",
+                "The review cursor is invalid. Reload the queue.",
+                false,
+            )
+            .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+        }
+    }
+    let focus = crate::voice_focus::resolve(state.lock_data_dir().as_deref())
+        .map_err(|error| public_review_read_error(&error))?;
+    let db = state.db_arc();
+    tokio::task::spawn_blocking(move || {
+        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let page = db
+            .get_segments_page_focused(
+                Some(false),
+                query.as_deref(),
+                "oldest",
+                limit.unwrap_or(100).clamp(1, 200),
+                cursor.as_deref(),
+                focus.as_deref(),
+            )
+            .map_err(|error| public_review_read_error(&error.to_string()))?;
+        let total = i64::try_from(page.total).map_err(|_| {
+            crate::ipc_contract::CommandErrorV1::new(
+                "REVIEW_PAGE_FAILED",
+                "The review queue count is out of range.",
+                false,
+            )
+        })?;
+        let items = page
+            .items
+            .into_iter()
+            .map(|segment| {
+                let base_revision = page.revisions.get(&segment.id).copied().unwrap_or(-1);
+                let eligible =
+                    base_revision >= 0 && !crate::quality::is_placeholder_transcript(&segment.raw_transcript);
+                crate::ipc_contract::ReviewItemV1 {
+                    segment,
+                    base_revision,
+                    eligible,
+                    disabled_reason: (!eligible).then(|| "TRANSCRIPT_NOT_READY".to_string()),
+                }
+            })
+            .collect();
+        Ok(crate::ipc_contract::ReviewPageV1 {
+            items,
+            total,
+            next_cursor: page.next_cursor,
+            scope_label,
+            focus_narrowed: page.focus_narrowed,
+        })
+    })
+    .await
+    .map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "REVIEW_PAGE_FAILED",
+            "The review queue worker stopped unexpectedly.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?
+}
+
 #[tauri::command]
 pub async fn get_segments(verified: Option<bool>, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_segments")?;

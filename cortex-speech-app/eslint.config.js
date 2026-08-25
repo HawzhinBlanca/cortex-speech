@@ -49,7 +49,7 @@ export default [
     },
   },
   {
-    ignores: ['dist/', 'node_modules/', '*.config.*', '*.config.js', '*.config.cjs'],
+    ignores: ['dist/', 'node_modules/', 'src/lib/generated/', '*.config.*', '*.config.js', '*.config.cjs'],
   },
   prettier,
 ];

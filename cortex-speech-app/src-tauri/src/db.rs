@@ -39,7 +39,7 @@ fn map_segment_delete_error(error: rusqlite::Error) -> AppError {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeechSegment {
     pub id: String,
@@ -491,6 +491,39 @@ pub(crate) fn desktop_decision_payload_hash(
     hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Idempotency digest for the versioned desktop review IPC.
+///
+/// Unlike the legacy desktop command, `CommitReviewRequestV1` intentionally has no client clock.
+/// Its immutable compare-and-swap revision is a better request identity: it binds the operation to
+/// the exact row the reviewer saw without trusting a renderer timestamp. The database still records
+/// its own positive audit time, but that time is not part of the caller's replay payload.
+pub(crate) fn desktop_review_v1_payload_hash(
+    segment_id: &str,
+    base_revision: i64,
+    decision: &str,
+    corrected_transcript: Option<&str>,
+) -> String {
+    fn framed(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+
+    let corrected = corrected_transcript.map(|text| to_nfc(text.trim())).filter(|text| !text.is_empty());
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-desktop-review-ipc-v1\0");
+    framed(&mut hash, segment_id.as_bytes());
+    hash.update(base_revision.to_be_bytes());
+    framed(&mut hash, decision.as_bytes());
+    match corrected.as_deref() {
+        Some(text) => {
+            hash.update([1]);
+            framed(&mut hash, text.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Canonical phone/Couch operation payload. This is shared with the HTTP boundary and persisted
 /// request snapshots so restore validation can rederive every post-v60 operation digest exactly.
 pub(crate) fn review_operation_payload_hash(
@@ -614,6 +647,10 @@ pub struct SegmentsPage {
     pub items: Vec<SpeechSegment>,
     pub total: usize,
     pub next_cursor: Option<String>,
+    /// Database-owned revision paired with each list row by the same SQLite result row. Typed review
+    /// IPC consumes this map; legacy list callers safely ignore the additive field.
+    #[serde(default)]
+    pub revisions: std::collections::BTreeMap<String, i64>,
     /// True when a voice focus narrowed this page — i.e. `total` counts a SUBSET of the library.
     ///
     /// The page needs this to tell the truth. Review mode measures progress against the corpus and
@@ -3460,15 +3497,22 @@ impl Database {
         let Some(effect) = existing else {
             return Ok(None);
         };
-        let rederived_payload_hash = desktop_decision_payload_hash(
+        let legacy_payload_hash = desktop_decision_payload_hash(
             &effect.segment_id,
             &effect.requested_action,
             effect.requested_transcript.as_deref(),
             Some(effect.requested_timestamp_ms),
         );
+        let typed_payload_hash = desktop_review_v1_payload_hash(
+            &effect.segment_id,
+            effect.prior_revision,
+            &effect.requested_action,
+            effect.requested_transcript.as_deref(),
+        );
         if effect.segment_id != segment_id
             || effect.operation_payload_hash != operation_payload_hash
-            || rederived_payload_hash != effect.operation_payload_hash
+            || (legacy_payload_hash != effect.operation_payload_hash
+                && typed_payload_hash != effect.operation_payload_hash)
         {
             return Err(AppError::Validation(
                 "desktop decision operation UUID was already used for a different canonical payload".into(),
@@ -3553,6 +3597,26 @@ impl Database {
         }
         let operation_payload_hash =
             desktop_decision_payload_hash(segment_id, decision, corrected_transcript, timestamp_ms);
+        Self::desktop_human_decision_replay_on(&self.conn, operation_id, &operation_payload_hash, segment_id)
+    }
+
+    /// Lost-response preflight for the typed review IPC. The base revision, rather than a client
+    /// clock, is part of the immutable request identity.
+    pub(crate) fn replay_desktop_review_v1(
+        &self,
+        segment_id: &str,
+        base_revision: i64,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        operation_id: &str,
+    ) -> AppResult<Option<HumanDecisionCommit>> {
+        validate_operation_uuid(operation_id)?;
+        if base_revision < 0 {
+            return Err(AppError::Validation("human decision revision must be non-negative".into()));
+        }
+        human_verdict_for_decision(decision)?;
+        let operation_payload_hash =
+            desktop_review_v1_payload_hash(segment_id, base_revision, decision, corrected_transcript);
         Self::desktop_human_decision_replay_on(&self.conn, operation_id, &operation_payload_hash, segment_id)
     }
 
@@ -5201,6 +5265,7 @@ impl Database {
                     items: Vec::new(),
                     total: 0,
                     next_cursor: None,
+                    revisions: std::collections::BTreeMap::new(),
                     focus_narrowed: focus.is_some(),
                 });
             }
@@ -5316,13 +5381,18 @@ impl Database {
         bind_values.push(Value::Integer(limit as i64));
         let limit_idx = bind_values.len();
         let page_sql = format!(
-            "SELECT {SEGMENT_LIST_SELECT_COLUMNS} FROM speech_segments{where_sql} ORDER BY {order_sql} LIMIT ?{limit_idx}"
+            "SELECT {SEGMENT_LIST_SELECT_COLUMNS}, review_revision FROM speech_segments{where_sql} ORDER BY {order_sql} LIMIT ?{limit_idx}"
         );
         let mut stmt = self.conn.prepare(&page_sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(bind_values.iter()), Self::map_row)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
+            Ok((Self::map_row(row)?, row.get::<_, i64>(37)?))
+        })?;
         let mut items = Vec::new();
+        let mut revisions = std::collections::BTreeMap::new();
         for row in rows {
-            items.push(row?);
+            let (segment, revision) = row?;
+            revisions.insert(segment.id.clone(), revision);
+            items.push(segment);
         }
         let emitted = decoded_cursor.as_ref().map_or(0, |cursor| cursor.emitted) + items.len();
         let next_cursor = if emitted < total && !items.is_empty() {
@@ -5353,7 +5423,7 @@ impl Database {
         } else {
             None
         };
-        Ok(SegmentsPage { items, total, next_cursor, focus_narrowed: focus.is_some() })
+        Ok(SegmentsPage { items, total, next_cursor, revisions, focus_narrowed: focus.is_some() })
     }
 
     /// Lightweight batch scope: return only ids plus the transcript needed for the optional content
@@ -8100,6 +8170,41 @@ impl Database {
         }
     }
 
+    /// Typed desktop review commit. The supplied revision is checked again inside the same
+    /// `BEGIN IMMEDIATE` transaction as playback proof, human truth, effect identity and undo state.
+    pub(crate) fn finalize_desktop_review_v1_with_playback(
+        &self,
+        segment_id: &str,
+        base_revision: i64,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        playback: &PlaybackDecisionProof,
+        operation_id: &str,
+    ) -> AppResult<HumanDecisionCommit> {
+        validate_operation_uuid(operation_id)?;
+        let operation_payload_hash =
+            desktop_review_v1_payload_hash(segment_id, base_revision, decision, corrected_transcript);
+        match self.record_human_decision_by_with_finalize(
+            segment_id,
+            decision,
+            corrected_transcript,
+            None,
+            None,
+            Some(base_revision),
+            true,
+            None,
+            Some((operation_id, &operation_payload_hash)),
+            None,
+            None,
+            Some(playback),
+        )? {
+            Some(commit) => Ok(commit),
+            None => Err(AppError::Validation(format!(
+                "{PLAYBACK_EVIDENCE_CHANGED}: clip identity, revision, or playback proof changed while the desktop decision was being saved"
+            ))),
+        }
+    }
+
     /// Finish a row written by an older release that committed the decision but not phone
     /// finalization. This intentionally does not replay learning/audit side effects.
     pub fn finalize_phone_human_decision(&self, segment_id: &str, corrected_transcript: Option<&str>) -> AppResult<()> {
@@ -8637,9 +8742,17 @@ impl Database {
             return Err(AppError::Validation("human decision timestamp must be positive".into()));
         }
         if audit_source.is_none() && audit_operation.is_some() && timestamp_ms.is_none() {
-            return Err(AppError::Validation(
-                "replayable desktop decisions require a positive request timestamp".into(),
-            ));
+            let typed_payload_is_exact =
+                expected_revision.zip(audit_operation).is_some_and(|(revision, (_, supplied_hash))| {
+                    supplied_hash
+                        == desktop_review_v1_payload_hash(segment_id, revision, decision, corrected_transcript)
+                });
+            if !typed_payload_is_exact {
+                return Err(AppError::Validation(
+                    "replayable desktop decisions without a client timestamp require the exact typed review payload"
+                        .into(),
+                ));
+            }
         }
         human_verdict_for_decision(decision)?;
         let corrected_owned: Option<String> =

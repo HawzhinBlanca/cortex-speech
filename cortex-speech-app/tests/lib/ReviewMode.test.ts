@@ -8,6 +8,7 @@ import { ckb } from '../../src/lib/i18n/ckb';
 
 const mocks = vi.hoisted(() => ({
   getSegmentsPage: vi.fn(),
+  getReviewPageV1: vi.fn(),
   getSegment: vi.fn(),
   getSegmentConsensus: vi.fn(),
   getDatasetStats: vi.fn(),
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   alignSegment: vi.fn(),
   recordPlaybackReceipt: vi.fn(),
   recordHumanDecision: vi.fn(),
+  commitReviewV1: vi.fn(),
   undoHumanDecision: vi.fn(),
   updateSegmentFields: vi.fn(),
   registerMediaAsset: vi.fn(),
@@ -24,6 +26,17 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../src/lib/commands', () => ({
   ...mocks,
   is7bUnavailableError: vi.fn(() => false),
+  isCommandErrorV1: vi.fn(
+    (error: unknown, code?: string) =>
+      !!error &&
+      typeof error === 'object' &&
+      (error as { schema?: number }).schema === 1 &&
+      (code === undefined || (error as { code?: string }).code === code),
+  ),
+  reviewEffectId: vi.fn((decisionId: string) => {
+    const match = /^effect:([1-9][0-9]*)$/.exec(decisionId);
+    return match ? Number(match[1]) : null;
+  }),
   engineLabel: vi.fn((id: string) => id),
 }));
 
@@ -82,6 +95,49 @@ describe('ReviewMode windowed queue', () => {
     mocks.recordHumanDecision.mockImplementation(
       async (id: string, action: 'accept' | 'edit' | 'reject', text?: string | null) =>
         decisionCommit({ ...segment(), id }, action, text),
+    );
+    mocks.getReviewPageV1.mockImplementation(
+      async (scope: { kind: string; query?: string }, cursor: string | null, limit: number) => {
+        const page = await mocks.getSegmentsPage({
+          verified: false,
+          query: scope.kind === 'search' ? scope.query : null,
+          sort: 'oldest',
+          limit,
+          cursor,
+          focused: true,
+        });
+        return {
+          items: page.items.map((item: SpeechSegment) => ({
+            segment: item,
+            baseRevision: page.revisions?.[item.id] ?? 0,
+            eligible: true,
+            disabledReason: null,
+          })),
+          total: page.total,
+          nextCursor: page.nextCursor,
+          scopeLabel: scope.kind,
+          focusNarrowed: page.focusNarrowed === true,
+        };
+      },
+    );
+    mocks.commitReviewV1.mockImplementation(
+      async (request: {
+        segmentId: string;
+        decision: 'accept' | 'edit' | 'reject';
+        transcript: string | null;
+      }) => {
+        const legacy = await mocks.recordHumanDecision(
+          request.segmentId,
+          request.decision,
+          request.transcript,
+        );
+        return {
+          segmentId: legacy.segmentId,
+          committedRevision: legacy.decidedRevision,
+          authoritativeTranscript: legacy.segment.verdictTranscript ?? legacy.segment.rawTranscript,
+          decisionId: `effect:${legacy.effectEventId}`,
+        };
+      },
     );
     mocks.undoHumanDecision.mockResolvedValue({
       status: 'applied',

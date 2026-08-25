@@ -42,18 +42,19 @@ describe('schema-v60 frontend review-write boundary', () => {
       expect(e, `missing ${next} after ${fn}`).toBeGreaterThan(s);
       return src.slice(s, e);
     };
-    // Human decisions are now one backend-owned atomic commit. ReviewMode consumes the authoritative
-    // returned row and must not issue a second revision-bumping field write or a stale whole-row upsert.
+    // Human decisions are now one versioned backend-owned atomic commit. ReviewMode reloads the
+    // authoritative row and must not issue a second revision-bumping field write or stale upsert.
     const submit = region('async function submit(', 'function advance(');
-    expect(submit).toContain('const commit = await api.recordHumanDecision(');
-    expect(submit).toContain('commit.segment');
+    expect(submit).toContain('const commit = await api.commitReviewV1({');
+    expect(submit).toContain('baseRevision');
+    expect(submit).toContain('commit.authoritativeTranscript');
     expect(submit).not.toContain('updateSegmentFields(seg.id');
     expect(submit).not.toMatch(/api\.updateSegment\(/);
     const markBad = region('async function markBad(', 'async function submit(');
-    expect(markBad).toContain(
-      "const commit = await api.recordHumanDecision(seg.id, 'reject', null)",
-    );
-    expect(markBad).toContain('commit.segment');
+    expect(markBad).toContain('const commit = await api.commitReviewV1({');
+    expect(markBad).toContain("decision: 'reject'");
+    expect(markBad).toContain('baseRevision');
+    expect(markBad).toContain('commit.authoritativeTranscript');
     expect(markBad).not.toContain('updateSegmentFields(seg.id');
     expect(markBad).not.toMatch(/api\.updateSegment\(/);
     const go = region('async function go(', 'function resetToOriginal(');

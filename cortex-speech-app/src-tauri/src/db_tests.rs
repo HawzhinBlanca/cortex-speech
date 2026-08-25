@@ -6392,6 +6392,14 @@ fn segment_pages_use_stable_keysets_and_lightweight_rows() {
     let first = db.get_segments_page(None, None, "newest", 2, None).unwrap();
     assert_eq!(first.items.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     assert_eq!(first.total, 5);
+    assert_eq!(first.revisions.len(), first.items.len());
+    for item in &first.items {
+        assert_eq!(
+            first.revisions.get(&item.id).copied(),
+            db.segment_review_revision(&item.id).unwrap(),
+            "each lightweight row carries its database-owned compare-and-swap revision"
+        );
+    }
     assert!(first.items.iter().all(|s| s.alignment_json.is_none() && s.evidence_json.is_none()));
 
     // This id would sort ahead of the continuation point, but was inserted after the frozen anchor.

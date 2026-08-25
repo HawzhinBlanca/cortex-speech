@@ -98,7 +98,7 @@ def test_retranscribe_uses_authoritative_champion_row_and_guards_editor_writes()
 
 
 def test_submit_guards_editor_writes_against_navigation() -> None:
-    """ReviewMode.submit() (accept/edit): after the atomic recordHumanDecision await, the authoritative
+    """ReviewMode.submit() (accept/edit): after the typed atomic commitReviewV1 await, the authoritative
     returned row is applied to seg by id (correct even if the reviewer navigated away,
     hundreds of ms), but editText/lastLoadedOriginal/editedChips belong to the CURRENT clip. Without a
     current-vs-seg recheck, navigating mid-await puts seg's text into another clip's editor (and submit never
@@ -113,21 +113,33 @@ def test_submit_guards_editor_writes_against_navigation() -> None:
     # v60 removes the second renderer-owned write completely: decision, verification and transcript
     # commit together, and the UI consumes only the server-returned authoritative row.  The navigation
     # invariant remains: that id-targeted store update must precede the guarded editor write.
-    decision_commit = body.find("const commit = await api.recordHumanDecision(")
-    store_write = body.find("segments.update((list) => list.map((s) => (s.id === seg.id ? commit.segment : s)))")
+    base_revision = body.find("const baseRevision = reviewRevisions[seg.id];")
+    decision_commit = body.find("const commit = await api.commitReviewV1(")
+    store_write = body.find("segments.update((list)", decision_commit)
+    authoritative_text = body.find("commit.authoritativeTranscript", store_write)
     visible_capture = body.find("const visibleId = current?.id ?? null;")
     editor_guard = body.find("if (visibleId === seg.id)", visible_capture)
     guard_open = body.find("{", editor_guard)
     guard_close = _matching_brace(body, guard_open)
     editor_write = body.find("editText = text;", editor_guard)
-    if decision_commit == -1 or store_write == -1 or editor_write == -1:
+    if -1 in (base_revision, decision_commit, store_write, authoritative_text, editor_write):
         raise AssertionError("submit atomic-commit/store/editor markers are missing — gate vacuous")
     if (
         visible_capture == -1
         or editor_guard == -1
         or guard_open == -1
         or guard_close == -1
-        or not (decision_commit < store_write < visible_capture < editor_guard < guard_open < editor_write < guard_close)
+        or not (
+            base_revision
+            < decision_commit
+            < store_write
+            < authoritative_text
+            < visible_capture
+            < editor_guard
+            < guard_open
+            < editor_write
+            < guard_close
+        )
     ):
         raise AssertionError(
             "submit() writes editText without capturing the post-await visible id and guarding the editor "
@@ -157,7 +169,7 @@ def test_review_mode_drafts_are_session_local_until_atomic_decision() -> None:
         raise AssertionError(
             "ReviewMode navigation no longer proves that dirty drafts remain in its per-segment session cache"
         )
-    if "await api.recordHumanDecision(" not in src:
+    if "await api.commitReviewV1(" not in src:
         raise AssertionError("ReviewMode lost its only durable human-review commit path")
 
 
@@ -307,7 +319,7 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
                     )
             cursor = closing + 1
 
-    if "await api.recordHumanDecision(" not in review_mode:
+    if "await api.commitReviewV1(" not in review_mode:
         raise AssertionError("ReviewMode no longer owns the atomic human-decision path")
 
 
@@ -545,9 +557,9 @@ def test_batch_verify_controls_are_not_reachable_and_review_mode_owns_approval()
         )
 
     review_mode = _read("src/lib/ReviewMode.svelte")
-    if "await api.recordHumanDecision(" not in review_mode:
+    if "await api.commitReviewV1(" not in review_mode:
         raise AssertionError(
-            "ReviewMode must retain the atomic recordHumanDecision approval path after removing legacy batch verify"
+            "ReviewMode must retain the revision-bound commitReviewV1 approval path after removing legacy batch verify"
         )
 
 

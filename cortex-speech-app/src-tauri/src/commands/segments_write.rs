@@ -12,6 +12,9 @@
 use super::{apply_curation_fields, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
 use crate::history::{Command, HistoryManager};
+use crate::ipc_contract::{
+    CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, ReviewDecisionV1, SuggestedActionV1,
+};
 use crate::validation::input as validate;
 use crate::AppState;
 use tauri::State;
@@ -318,6 +321,181 @@ pub fn record_human_decision(
     Ok(commit)
 }
 
+fn public_review_error(error: &str, operation_id: &str) -> CommandErrorV1 {
+    if error.contains("E_NO_PLAYBACK_EVIDENCE") {
+        CommandErrorV1::new("NO_PLAYBACK_EVIDENCE", "Listen to this clip before committing a decision.", true)
+            .operation(operation_id)
+            .suggested(SuggestedActionV1::ReloadClip)
+    } else if error.contains("E_PLAYBACK_EVIDENCE_CHANGED") {
+        CommandErrorV1::new(
+            "PLAYBACK_EVIDENCE_CHANGED",
+            "The clip changed while it was being saved. Reload it and listen again.",
+            true,
+        )
+        .operation(operation_id)
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else if error.contains("operation UUID was already used") {
+        CommandErrorV1::new(
+            "OPERATION_ID_CONFLICT",
+            "This save identity is already bound to a different review request.",
+            false,
+        )
+        .operation(operation_id)
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else if error.to_ascii_lowercase().contains("database is locked")
+        || error.to_ascii_lowercase().contains("database is busy")
+    {
+        CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry this save.", true)
+            .operation(operation_id)
+            .suggested(SuggestedActionV1::Retry)
+    } else {
+        CommandErrorV1::new("REVIEW_COMMIT_FAILED", "The decision was not committed. Your draft is unchanged.", false)
+            .operation(operation_id)
+            .suggested(SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn committed_review_v1(commit: crate::db::HumanDecisionCommit) -> CommittedReviewV1 {
+    let authoritative_transcript = commit
+        .segment
+        .verdict_transcript
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| commit.segment.annotated_transcript.as_deref().filter(|text| !text.trim().is_empty()))
+        .unwrap_or(&commit.segment.raw_transcript)
+        .to_string();
+    CommittedReviewV1 {
+        segment_id: commit.segment_id,
+        committed_revision: commit.decided_revision,
+        authoritative_transcript,
+        decision_id: format!("effect:{}", commit.effect_event_id),
+    }
+}
+
+fn commit_review_v1_on(
+    db: &crate::db::Database,
+    request: &CommitReviewRequestV1,
+) -> Result<CommittedReviewV1, CommandErrorV1> {
+    let invalid =
+        |message: &str| CommandErrorV1::new("INVALID_REVIEW_REQUEST", message, false).operation(&request.operation_id);
+    validate::validate_identifier(&request.segment_id).map_err(|_| invalid("The clip identity is invalid."))?;
+    validate::validate_identifier(&request.operation_id).map_err(|_| invalid("The operation identity is invalid."))?;
+    if request.base_revision < 0 {
+        return Err(invalid("The clip revision must be non-negative."));
+    }
+    if let Some(transcript) = request.transcript.as_deref() {
+        validate::validate_text(transcript, 100_000, "Transcript")
+            .map_err(|_| invalid("The transcript is invalid or too long."))?;
+    }
+    if request.reason_code.is_some() {
+        return Err(CommandErrorV1::new(
+            "REASON_CODE_NOT_SUPPORTED",
+            "This release cannot yet persist a structured unusable-audio reason.",
+            false,
+        )
+        .operation(&request.operation_id));
+    }
+    if request.playback_receipt_id.is_some() {
+        return Err(CommandErrorV1::new(
+            "PLAYBACK_RECEIPT_ID_NOT_SUPPORTED",
+            "This release verifies the current server-owned playback proof instead of accepting a receipt identity.",
+            false,
+        )
+        .operation(&request.operation_id)
+        .suggested(SuggestedActionV1::ReloadClip));
+    }
+
+    let (decision, transcript) = match request.decision {
+        ReviewDecisionV1::Accept => ("accept", request.transcript.as_deref()),
+        ReviewDecisionV1::Edit => {
+            let transcript = request
+                .transcript
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| invalid("A correction must contain a non-blank transcript."))?;
+            ("edit", Some(transcript))
+        }
+        ReviewDecisionV1::Reject => {
+            if request.transcript.as_deref().is_some_and(|text| !text.trim().is_empty()) {
+                return Err(invalid("A rejection cannot silently discard a submitted transcript."));
+            }
+            ("reject", None)
+        }
+        ReviewDecisionV1::Skip => {
+            return Err(CommandErrorV1::new(
+                "SKIP_NOT_A_COMMIT",
+                "Skip changes navigation only and cannot create review truth.",
+                false,
+            )
+            .operation(&request.operation_id));
+        }
+    };
+
+    if let Some(commit) = db
+        .replay_desktop_review_v1(
+            &request.segment_id,
+            request.base_revision,
+            decision,
+            transcript,
+            &request.operation_id,
+        )
+        .map_err(|error| public_review_error(&error.to_string(), &request.operation_id))?
+    {
+        return Ok(committed_review_v1(commit));
+    }
+
+    let Some((_segment, current_revision)) = db
+        .get_segment_by_id_with_revision(&request.segment_id)
+        .map_err(|error| public_review_error(&error.to_string(), &request.operation_id))?
+    else {
+        return Err(CommandErrorV1::new("SEGMENT_NOT_FOUND", "This clip no longer exists.", false)
+            .operation(&request.operation_id)
+            .suggested(SuggestedActionV1::ReloadClip));
+    };
+    if current_revision != request.base_revision {
+        return Err(CommandErrorV1::new("STALE_REVISION", "This clip changed; reload it before saving.", false)
+            .operation(&request.operation_id)
+            .suggested(SuggestedActionV1::ReloadClip)
+            .detail("expectedRevision", request.base_revision)
+            .detail("currentRevision", current_revision));
+    }
+
+    let playback = require_listened(db, &request.segment_id)
+        .map_err(|error| public_review_error(&error, &request.operation_id))?;
+    let commit = db
+        .finalize_desktop_review_v1_with_playback(
+            &request.segment_id,
+            request.base_revision,
+            decision,
+            transcript,
+            &playback,
+            &request.operation_id,
+        )
+        .map_err(|error| public_review_error(&error.to_string(), &request.operation_id))?;
+    Ok(committed_review_v1(commit))
+}
+
+/// Versioned, compare-and-swap desktop review boundary. Legacy callers remain registered while the
+/// renderer migrates one review domain at a time.
+#[tauri::command]
+#[specta::specta]
+pub fn commit_review_v1(
+    state: State<'_, AppState>,
+    request: CommitReviewRequestV1,
+) -> Result<CommittedReviewV1, CommandErrorV1> {
+    RATE_LIMITER.check("commit_review_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many review saves. Retry in a moment.", true)
+            .operation(&request.operation_id)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    let db = state.lock_db();
+    let commit = commit_review_v1_on(&db, &request)?;
+    let mut session = state.lock_session();
+    session.set_current_segment(&request.segment_id);
+    let _ = session.save(&db);
+    Ok(commit)
+}
+
 fn record_human_decision_on(
     db: &crate::db::Database,
     segment_id: &str,
@@ -478,11 +656,12 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        persist_segment_fields_on, persist_whole_segment_update_on, record_human_decision_on, record_review_flag_on,
-        require_listened, validate_playback_receipt_identity,
+        commit_review_v1_on, persist_segment_fields_on, persist_whole_segment_update_on, record_human_decision_on,
+        record_review_flag_on, require_listened, validate_playback_receipt_identity,
     };
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
     use crate::history::HistoryManager;
+    use crate::ipc_contract::{CommitReviewRequestV1, ReviewDecisionV1};
 
     fn db_with_clip(dir: &std::path::Path, id: &str) -> Database {
         let db = Database::open(dir.join("t.db").to_str().unwrap()).unwrap();
@@ -762,6 +941,36 @@ mod tests {
         .expect("a response-loss retry must resolve before require_listened sees the stale revision");
         assert_eq!(replay.effect_event_id, first.effect_event_id);
         assert_eq!(replay.decided_revision, first.decided_revision);
+    }
+
+    #[test]
+    fn typed_review_commit_is_revision_bound_idempotent_and_returns_server_truth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "typed-review");
+        receipt(&db, "typed-review", 9_000);
+        let base_revision = db.segment_review_revision("typed-review").unwrap().unwrap();
+        let request = CommitReviewRequestV1 {
+            operation_id: "44444444-4444-4444-8444-444444444444".into(),
+            segment_id: "typed-review".into(),
+            base_revision,
+            decision: ReviewDecisionV1::Accept,
+            transcript: Some("دەق".into()),
+            reason_code: None,
+            playback_receipt_id: None,
+        };
+        let first = commit_review_v1_on(&db, &request).expect("typed commit");
+        assert_eq!(first.segment_id, "typed-review");
+        assert_eq!(first.authoritative_transcript, "دەق");
+        assert!(first.decision_id.starts_with("effect:"));
+
+        let replay = commit_review_v1_on(&db, &request).expect("lost-response replay");
+        assert_eq!(replay, first, "an exact typed retry returns the original effect");
+
+        let stale = CommitReviewRequestV1 { operation_id: "55555555-5555-4555-8555-555555555555".into(), ..request };
+        let error = commit_review_v1_on(&db, &stale).expect_err("a new operation cannot reuse the old revision");
+        assert_eq!(error.code, "STALE_REVISION");
+        assert!(!error.retryable);
+        assert_eq!(error.details.get("expectedRevision"), Some(&base_revision.into()));
     }
 
     #[test]

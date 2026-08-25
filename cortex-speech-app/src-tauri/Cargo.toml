@@ -30,6 +30,11 @@ tauri-build = { version = "2", features = [] }
 # Tauri ecosystem
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+# Exact RC trio per the tauri-specta v2 release contract. Keep all three pins in lockstep: the RC
+# APIs have breaking changes between releases and generated IPC is a checked-in release artifact.
+tauri-specta = { version = "=2.0.0-rc.24", features = ["derive", "typescript"] }
+specta = { version = "=2.0.0-rc.24", features = ["derive"] }
+specta-typescript = "=0.0.11"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

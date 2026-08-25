@@ -42,6 +42,7 @@
   // lands on the riskiest clips first. Off by default — the plain pending-first order is unchanged.
   let suspectFirst = $state(false);
   let reviewRows = $state<SpeechSegment[]>([]);
+  let reviewRevisions = $state<Record<string, number>>({});
   let reviewCursor = $state<string | null>(null);
   let reviewTotal = $state(0);
   let reviewInitialTotal = $state(0);
@@ -85,6 +86,7 @@
       // replacement loads can record a decision against a clip the reviewer can no longer see in
       // context, and a failed reset must never masquerade as the successful all-done state.
       reviewRows = [];
+      reviewRevisions = {};
       reviewCursor = null;
       reviewTotal = 0;
       reviewInitialTotal = 0;
@@ -98,26 +100,49 @@
     try {
       const statsPromise =
         reset && !query ? api.getDatasetStats().catch(() => null) : Promise.resolve(null);
-      const page = await api.getSegmentsPage({
-        verified: false,
-        query,
-        sort: suspectFirst ? 'suspectFirst' : 'oldest',
-        limit: 100,
-        cursor,
-        // The desktop review queue obeys the voice focus like every phone queue does (owner report
-        // 2026-08-20: guests still played here while the couch was narrowed). Curate stays unfocused.
-        focused: true,
-      });
+      let pageRows: SpeechSegment[];
+      let pageRevisions: Record<string, number>;
+      let pageNextCursor: string | null;
+      let pageTotal: number;
+      let pageFocusNarrowed: boolean;
+      if (suspectFirst) {
+        // The legacy suspect ranking remains during domain-by-domain migration, but its additive
+        // revision map comes from the SAME SQLite rows and therefore still authorizes typed commits.
+        const page = await api.getSegmentsPage({
+          verified: false,
+          query,
+          sort: 'suspectFirst',
+          limit: 100,
+          cursor,
+          focused: true,
+        });
+        pageRows = page.items;
+        pageRevisions = page.revisions ?? {};
+        pageNextCursor = page.nextCursor;
+        pageTotal = page.total;
+        pageFocusNarrowed = page.focusNarrowed === true;
+      } else {
+        const scope = query ? ({ kind: 'search', query } as const) : ({ kind: 'pending' } as const);
+        const page = await api.getReviewPageV1(scope, cursor, 100);
+        pageRows = page.items.map((item) => item.segment);
+        pageRevisions = Object.fromEntries(
+          page.items.map((item) => [item.segment.id, item.baseRevision]),
+        );
+        pageNextCursor = page.nextCursor;
+        pageTotal = page.total;
+        pageFocusNarrowed = page.focusNarrowed;
+      }
       const stats = await statsPromise;
       if (generation !== reviewGeneration) return;
       reviewLoadError = null;
-      reviewRows = reset ? page.items : [...reviewRows, ...page.items];
-      reviewCursor = page.nextCursor;
-      focusNarrowed = page.focusNarrowed === true;
+      reviewRows = reset ? pageRows : [...reviewRows, ...pageRows];
+      reviewRevisions = reset ? pageRevisions : { ...reviewRevisions, ...pageRevisions };
+      reviewCursor = pageNextCursor;
+      focusNarrowed = pageFocusNarrowed;
       if (reset) {
-        reviewTotal = page.total;
-        reviewInitialTotal = page.total;
-        reviewCorpusTotal = stats?.totalSegments ?? page.total;
+        reviewTotal = pageTotal;
+        reviewInitialTotal = pageTotal;
+        reviewCorpusTotal = stats?.totalSegments ?? pageTotal;
         reviewInitiallyVerified = stats?.verifiedCount ?? 0;
         index = 0;
       }
@@ -126,6 +151,7 @@
       reviewLoadError = formatUnknownError(error, $t('notifications.loadSegmentsFailed'));
       if (reset) {
         reviewRows = [];
+        reviewRevisions = {};
         reviewCursor = null;
         reviewTotal = 0;
         reviewInitialTotal = 0;
@@ -361,6 +387,12 @@
       notifications.error($t('review.cannotDecideWithoutAudio'));
       return;
     }
+    const baseRevision = reviewRevisions[seg.id];
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      notifications.error($t('notifications.loadSegmentsFailed'));
+      void loadReviewPage(true);
+      return;
+    }
     // No blocking confirm (true-10 audit): 'x' is undoable via Backspace now, so a native
     // window.confirm per press only broke the keyboard flow.
     saving = true;
@@ -376,16 +408,45 @@
       } catch (e) {
         console.error('playback receipt failed', e);
       }
-      const commit = await api.recordHumanDecision(seg.id, 'reject', null);
+      const commit = await api.commitReviewV1({
+        operationId: crypto.randomUUID(),
+        segmentId: seg.id,
+        baseRevision,
+        decision: 'reject',
+        transcript: null,
+        reasonCode: null,
+        playbackReceiptId: null,
+      });
+      const effectEventId = api.reviewEffectId(commit.decisionId);
+      if (effectEventId === null) {
+        notifications.error($t('notifications.loadSegmentsFailed'));
+        await loadReviewPage(true);
+        return;
+      }
       // Undo authority is the immutable database effect id, never this renderer's pre-save row.
       // Push only after the atomic decision commits, so a failed decision cannot create a phantom undo.
       undoHistory = [
         ...undoHistory,
-        { id: seg.id, effectEventId: commit.effectEventId, operationId: crypto.randomUUID() },
+        { id: seg.id, effectEventId, operationId: crypto.randomUUID() },
       ];
-      segments.update((list) => list.map((s) => (s.id === seg.id ? commit.segment : s)));
+      segments.update((list) =>
+        list.map((stored) =>
+          stored.id === seg.id
+            ? {
+                ...stored,
+                verified: true,
+                verdict: 'human_reject',
+                humanDecision: 'reject',
+                verdictTranscript: commit.authoritativeTranscript,
+              }
+            : stored,
+        ),
+      );
       const visibleId = current?.id ?? null;
       reviewRows = reviewRows.filter((s) => s.id !== seg.id);
+      const remainingRevisions = { ...reviewRevisions };
+      delete remainingRevisions[seg.id];
+      reviewRevisions = remainingRevisions;
       reviewTotal = Math.max(0, reviewTotal - 1);
       void refreshSegmentStats();
       notifications.success($t('review.markedBad'));
@@ -395,9 +456,12 @@
         if (visibleIndex >= 0) index = visibleIndex;
       }
     } catch (e) {
-      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
+      if (api.isCommandErrorV1(e, 'NO_PLAYBACK_EVIDENCE'))
         notifications.error($t('review.mustListen'));
-      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      else {
+        notifications.error($t('notifications.saveFailed'));
+        if (api.isCommandErrorV1(e, 'STALE_REVISION')) void loadReviewPage(true);
+      }
     } finally {
       saving = false;
     }
@@ -644,6 +708,13 @@
     // Map to a real human decision: an actual change is an "edit" (the typed text becomes gold), a
     // no-change save is an "accept".
     const isEdit = !acceptAsIs && text !== original;
+    const baseRevision = reviewRevisions[seg.id];
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      saving = false;
+      notifications.error($t('notifications.loadSegmentsFailed'));
+      void loadReviewPage(true);
+      return;
+    }
     try {
       // Accept-what-you-SEE: pass the displayed text even on accept so verdict_transcript (the
       // COALESCE-preferred gold source) becomes exactly what the human approved. Passing null let an
@@ -663,12 +734,39 @@
       } catch (e) {
         console.error('playback receipt failed', e);
       }
-      const commit = await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', text);
+      const commit = await api.commitReviewV1({
+        operationId: crypto.randomUUID(),
+        segmentId: seg.id,
+        baseRevision,
+        decision: isEdit ? 'edit' : 'accept',
+        transcript: text,
+        reasonCode: null,
+        playbackReceiptId: null,
+      });
+      const effectEventId = api.reviewEffectId(commit.decisionId);
+      if (effectEventId === null) {
+        notifications.error($t('notifications.loadSegmentsFailed'));
+        await loadReviewPage(true);
+        return;
+      }
       undoHistory = [
         ...undoHistory,
-        { id: seg.id, effectEventId: commit.effectEventId, operationId: crypto.randomUUID() },
+        { id: seg.id, effectEventId, operationId: crypto.randomUUID() },
       ];
-      segments.update((list) => list.map((s) => (s.id === seg.id ? commit.segment : s)));
+      segments.update((list) =>
+        list.map((stored) =>
+          stored.id === seg.id
+            ? {
+                ...stored,
+                verified: true,
+                verdictTranscript: commit.authoritativeTranscript,
+                annotatedTranscript: isEdit
+                  ? commit.authoritativeTranscript
+                  : stored.annotatedTranscript,
+              }
+            : stored,
+        ),
+      );
       // Capture navigation state BEFORE removing the saved row. Once it is filtered out, `current`
       // necessarily changes (or becomes null while the next lightweight row hydrates), which cannot
       // distinguish an ordinary successful advance from a real mid-flight user navigation.
@@ -679,6 +777,9 @@
         editedChips = {};
       }
       reviewRows = reviewRows.filter((s) => s.id !== seg.id);
+      const remainingRevisions = { ...reviewRevisions };
+      delete remainingRevisions[seg.id];
+      reviewRevisions = remainingRevisions;
       reviewTotal = Math.max(0, reviewTotal - 1);
       void refreshSegmentStats();
       editCache.delete(seg.id); // persisted — drop the in-progress copy
@@ -692,9 +793,12 @@
       }
       advance();
     } catch (e) {
-      if (String(e).includes('E_NO_PLAYBACK_EVIDENCE'))
+      if (api.isCommandErrorV1(e, 'NO_PLAYBACK_EVIDENCE'))
         notifications.error($t('review.mustListen'));
-      else notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      else {
+        notifications.error($t('notifications.saveFailed'));
+        if (api.isCommandErrorV1(e, 'STALE_REVISION')) void loadReviewPage(true);
+      }
     } finally {
       saving = false;
     }

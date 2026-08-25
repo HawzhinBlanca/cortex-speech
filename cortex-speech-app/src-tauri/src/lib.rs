@@ -48,6 +48,7 @@ pub mod history;
 pub mod http;
 pub mod inference;
 pub mod integration_runner;
+pub mod ipc_contract;
 pub mod jobs;
 pub mod jury;
 pub mod llm_refiner;
@@ -854,7 +855,9 @@ pub fn run() {
             // Phase 2 — T0 Gate + Jury
             commands::run_t0_gate,
             commands::get_escalation_queue,
+            commands::get_review_page_v1,
             commands::record_human_decision,
+            commands::commit_review_v1,
             commands::undo_human_decision,
             commands::record_review_flag,
             commands::undo_review_flag,

@@ -1,4 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
+import { commands as generatedCommands } from './generated/ipc';
+import type {
+  CommandErrorV1,
+  CommitReviewRequestV1,
+  CommittedReviewV1,
+  ReviewPageV1,
+  ReviewScope,
+} from './generated/ipc';
 import type {
   SpeechSegment,
   SegmentsPage,
@@ -183,6 +191,57 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
     );
   }
   return data;
+}
+
+export function isCommandErrorV1(error: unknown, code?: string): error is CommandErrorV1 {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as Partial<CommandErrorV1>;
+  return (
+    candidate.schema === 1 &&
+    typeof candidate.code === 'string' &&
+    typeof candidate.message === 'string' &&
+    typeof candidate.retryable === 'boolean' &&
+    (code === undefined || candidate.code === code)
+  );
+}
+
+export function reviewErrorMessage(error: unknown, fallback: string): string {
+  return isCommandErrorV1(error) ? error.message : fallback;
+}
+
+/** Revision-paired queue read generated from the Rust contract. */
+export async function getReviewPageV1(
+  scope: ReviewScope,
+  cursor: string | null = null,
+  limit = 100,
+): Promise<ReviewPageV1> {
+  const result = await generatedCommands.getReviewPageV1(scope, limit, cursor);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/**
+ * Commit an exact versioned review request. A transport-level lost response gets one replay with the
+ * SAME operation id and payload; a structured backend refusal is never retried blindly.
+ */
+export async function commitReviewV1(request: CommitReviewRequestV1): Promise<CommittedReviewV1> {
+  const invokeExact = async (): Promise<CommittedReviewV1> => {
+    const result = await generatedCommands.commitReviewV1(request);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+export function reviewEffectId(decisionId: string): number | null {
+  const match = /^effect:([1-9][0-9]*)$/.exec(decisionId);
+  const value = match ? Number(match[1]) : Number.NaN;
+  return Number.isSafeInteger(value) ? value : null;
 }
 
 export async function getSegmentIdsForView(

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AudioExportFormat,
   ASR_7B_UNAVAILABLE_TAG,
+  commitReviewV1,
   is7bUnavailableError,
   listAgentImportReports,
   listAgentStageEvents,
@@ -95,6 +96,56 @@ describe('desktop review decision idempotency', () => {
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
       ),
     });
+  });
+});
+
+describe('typed desktop review decision idempotency', () => {
+  const request = {
+    operationId: '44444444-4444-4444-8444-444444444444',
+    segmentId: 'segment-typed',
+    baseRevision: 7,
+    decision: 'edit' as const,
+    transcript: 'دەقی ڕاست',
+    reasonCode: null,
+    playbackReceiptId: null,
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('replays only a transport-level uncertainty with the exact generated payload', async () => {
+    const commit = {
+      segmentId: request.segmentId,
+      committedRevision: 8,
+      authoritativeTranscript: request.transcript,
+      decisionId: 'effect:41',
+    };
+    invokeMock
+      .mockRejectedValueOnce(new Error('transport response lost'))
+      .mockResolvedValueOnce(commit);
+
+    await expect(commitReviewV1(request)).resolves.toEqual(commit);
+
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock.mock.calls[0]).toEqual(['commit_review_v1', { request }]);
+    expect(invokeMock.mock.calls[1]).toEqual(invokeMock.mock.calls[0]);
+  });
+
+  it('never retries a structured backend refusal', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'STALE_REVISION',
+      message: 'stale',
+      retryable: false,
+      suggestedAction: 'reloadClip',
+      operationId: request.operationId,
+      details: { expectedRevision: 7, currentRevision: 8 },
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(commitReviewV1(request)).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 });
 
