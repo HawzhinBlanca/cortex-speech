@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `7116887`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
-> 58 files, browser E2E/accessibility **97/97** with zero retries, all **120** reachable Python policy scripts, compensation readiness **38/38**, strict
+> Measured checkpoint at `1c443d9`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,602 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,605 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -106,9 +106,17 @@
 > any clip can publish; progress or completion failure halts the import and leaves a visible running
 > journal for exact resume instead of reporting false success. Three focused regressions prove the
 > exact lifecycle, idempotent file stamps, progress/completion fault visibility and pre-decode refusal.
-> Segment persistence and other background writers still use the compatibility façade; connection
-> reopening, import kill/resume/performance proof, Couch decomposition, export-kill/disk-full campaigns
-> and the 50,000-segment hammer remain open.
+> `1c443d9` adds a Tauri/HTTP-free `ImportWriteStore` for atomic segment-batch publication, exact
+> rollback and revision-CAS background alignment. Desktop imports reuse the exact `AppState` runtime;
+> standalone and cloned headless workers lazily converge on one shared runtime and fail closed if a
+> caller supplies a different database identity. The pipeline no longer directly calls the three
+> migrated database writers. Store regressions prove all-or-nothing publication and rollback plus
+> stale alignment preservation, and a cloned-worker regression proves runtime sharing and mismatch
+> refusal. Source transcript/provenance, audio identity, LOOP-0/hypothesis and champion transcript
+> writers still use compatibility paths. Champion placeholders are still published before inference
+> and catastrophic rollback failure remains unresolved; import journals and segment publication are
+> not one transaction. Connection reopening, import kill/resume/performance proof, Couch decomposition,
+> export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
