@@ -146,7 +146,15 @@ QUERY_STORE_COMMANDS = {
 
 # Durable export commands whose blocking body is owned by the Tauri-free JobStore. They must not
 # regain either the raw writer handle or direct job-lifecycle authority at the IPC boundary.
-JOB_STORE_COMMANDS = {"export_dataset", "export_huggingface_dataset"}
+JOB_STORE_COMMANDS = {
+    "export_dataset",
+    "export_transcript",
+    "export_huggingface_dataset",
+    "export_dataset_bundle",
+    "export_audio",
+    "export_gold_eval_set",
+    "export_finetune_pack",
+}
 
 
 def source() -> str:

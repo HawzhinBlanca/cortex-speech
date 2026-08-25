@@ -3,7 +3,11 @@
 use crate::database_runtime::{begin_mutation, DatabaseRuntime};
 use crate::db::ImportJob;
 use crate::error::{AppError, AppResult};
+use crate::eval::{FinetunePackResult, GoldEvalExport};
+use crate::export_audio::{AudioExportOptions, AudioExportResult};
+use crate::export_bundle::BundleExportResult;
 use crate::jobs::Job;
+use crate::models::ModelManager;
 use crate::settings::{AppSettings, ExportFormat};
 use std::path::Path;
 
@@ -62,6 +66,66 @@ impl JobStore {
     ) -> AppResult<()> {
         self.run_tracked(job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED", |database| {
             crate::export::export_huggingface_dataset(database, path, settings)
+        })
+    }
+
+    pub(crate) fn export_transcript(
+        &self,
+        job_id: &str,
+        path: &Path,
+        format: crate::transcript_export::TranscriptFormat,
+    ) -> AppResult<()> {
+        self.run_tracked(job_id, "export_transcript", "TRANSCRIPT_EXPORT_FAILED", |database| {
+            crate::transcript_export::export_transcript(database, path, format)
+        })
+    }
+
+    pub(crate) fn export_dataset_bundle(
+        &self,
+        job_id: &str,
+        model_manager: &ModelManager,
+        output_dir: &Path,
+        settings: &AppSettings,
+        production: bool,
+        warning_threshold: usize,
+    ) -> AppResult<BundleExportResult> {
+        self.run_tracked(job_id, "export_dataset_bundle", "BUNDLE_EXPORT_FAILED", |database| {
+            crate::export_bundle::export_dataset_bundle(
+                database,
+                model_manager,
+                output_dir,
+                settings,
+                production,
+                warning_threshold,
+            )
+        })
+    }
+
+    pub(crate) fn export_audio(
+        &self,
+        job_id: &str,
+        segment_ids: &[String],
+        options: &AudioExportOptions,
+    ) -> AppResult<AudioExportResult> {
+        self.run_tracked(job_id, "export_audio", "AUDIO_EXPORT_FAILED", |database| {
+            crate::export_audio::export_audio_segments(database, segment_ids, options)
+        })
+    }
+
+    pub(crate) fn export_gold_eval_set(&self, job_id: &str, output_dir: &Path) -> AppResult<GoldEvalExport> {
+        self.run_tracked(job_id, "export_gold_eval_set", "GOLD_EVAL_EXPORT_FAILED", |database| {
+            crate::eval::export_gold_eval_set(database, output_dir)
+        })
+    }
+
+    pub(crate) fn export_finetune_pack(
+        &self,
+        job_id: &str,
+        output_dir: &Path,
+        corpus_ledger_path: Option<&Path>,
+    ) -> AppResult<FinetunePackResult> {
+        self.run_tracked(job_id, "export_finetune_pack", "FINETUNE_PACK_EXPORT_FAILED", |database| {
+            crate::eval::export_finetune_pack(database, output_dir, corpus_ledger_path)
         })
     }
 }
@@ -135,5 +199,20 @@ mod tests {
         let job = store.runtime.open_read().unwrap().get_job("tracked-export").unwrap().unwrap();
         assert_eq!(job.state, crate::jobs::JobState::Succeeded);
         assert_eq!(job.kind, "export_dataset");
+    }
+
+    #[test]
+    fn transcript_export_publishes_output_and_terminal_job_through_the_store() {
+        let (directory, store) = store_with_jobs();
+        let output = directory.path().join("transcript.txt");
+
+        store
+            .export_transcript("tracked-transcript", &output, crate::transcript_export::TranscriptFormat::Txt)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "");
+        let job = store.runtime.open_read().unwrap().get_job("tracked-transcript").unwrap().unwrap();
+        assert_eq!(job.state, crate::jobs::JobState::Succeeded);
+        assert_eq!(job.kind, "export_transcript");
     }
 }

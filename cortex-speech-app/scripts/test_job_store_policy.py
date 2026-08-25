@@ -32,8 +32,17 @@ def test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies
         "self.runtime.open_read()?.list_recent_jobs(limit)",
         'self.run_tracked(job_id, "export_dataset", "EXPORT_FAILED"',
         'self.run_tracked(job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED"',
+        'self.run_tracked(job_id, "export_transcript", "TRANSCRIPT_EXPORT_FAILED"',
+        'self.run_tracked(job_id, "export_dataset_bundle", "BUNDLE_EXPORT_FAILED"',
+        'self.run_tracked(job_id, "export_audio", "AUDIO_EXPORT_FAILED"',
+        'self.run_tracked(job_id, "export_gold_eval_set", "GOLD_EVAL_EXPORT_FAILED"',
+        'self.run_tracked(job_id, "export_finetune_pack", "FINETUNE_PACK_EXPORT_FAILED"',
         "crate::export::export_dataset(database, path, format)",
         "crate::export::export_huggingface_dataset(database, path, settings)",
+        "crate::transcript_export::export_transcript(database, path, format)",
+        "crate::export_audio::export_audio_segments(database, segment_ids, options)",
+        "crate::eval::export_gold_eval_set(database, output_dir)",
+        "crate::eval::export_finetune_pack(database, output_dir, corpus_ledger_path)",
     ):
         if required not in store:
             raise AssertionError(f"JobStore lost required database boundary: {required}")
@@ -63,11 +72,16 @@ def test_commands_delegate_without_raw_database_authority() -> None:
     exports = read("commands/export.rs")
     export_signatures = {
         "export_dataset": "pub async fn export_dataset(",
+        "export_transcript": "pub async fn export_transcript(",
         "export_huggingface_dataset": "pub async fn export_huggingface_dataset(",
+        "export_dataset_bundle": "pub async fn export_dataset_bundle(",
+        "export_audio": "pub async fn export_audio(",
+        "export_gold_eval_set": "pub async fn export_gold_eval_set(",
+        "export_finetune_pack": "pub async fn export_finetune_pack(",
     }
     for name, signature in export_signatures.items():
         body = command(exports, signature)
-        if ".job_store()" not in body or f"store.{name}" not in body:
+        if ".job_store()" not in body or f".{name}(" not in body:
             raise AssertionError(f"{name} bypasses the tracked JobStore boundary")
         for forbidden in ("state.lock_db()", "state.db_arc()", ".run_tracked(", "crate::db::Database"):
             if forbidden in body:
