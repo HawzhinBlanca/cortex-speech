@@ -4,6 +4,15 @@
   import { onDestroy } from 'svelte';
   import { notifications } from './stores/notificationStore';
   import { t } from './i18n';
+  import {
+    audioAttemptBinding,
+    audioTransition,
+    createAudioMachine,
+    isCurrentAudioAttempt,
+    type AudioAttemptBinding,
+    type AudioMachineEvent,
+    type AudioPhase,
+  } from './audioMachine';
 
   interface Props {
     audioPath: string;
@@ -71,7 +80,16 @@
     lastMediaPos = null;
   }
   let audioEl: HTMLAudioElement | undefined = $state();
-  let loading = $state(true);
+  let audioMachine = createAudioMachine();
+  let audioPhase = $state<AudioPhase>('idle');
+  const loading = $derived(
+    audioPhase === 'idle' || audioPhase === 'resolving' || audioPhase === 'loading',
+  );
+  function transitionAudio(event: AudioMachineEvent): AudioAttemptBinding | null {
+    audioMachine = audioTransition(audioMachine, event);
+    audioPhase = audioMachine.phase;
+    return audioAttemptBinding(audioMachine);
+  }
   let playbackRate = $state(1.0);
   let loop = $state(false);
   const RATES = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
@@ -97,76 +115,95 @@
   }
 
   let resolveController: AbortController | null = null;
+  let mediaLoadBinding: AudioAttemptBinding | null = null;
+  let activePlayBinding: AudioAttemptBinding | null = null;
 
-  async function resolveAudioUrl(path: string) {
-    // 1. Stop any existing playback immediately so there's no ghost audio. Cancel the clip-stop timer
-    //    too — otherwise a pending timer from the PREVIOUS clip could fire after the source switched and
-    //    (with Loop on) auto-play the newly-selected clip the user never pressed Play on.
+  function stopPhysicalPlayback() {
     clearClipStop();
-    supersedePlay();
-    if (audioEl && !audioEl.paused) {
-      audioEl.pause();
-      playing = false;
-    }
-    // 2. Cancel any in-flight resolution for the previous path.
+    if (audioEl && !audioEl.paused) audioEl.pause();
+    playing = false;
+    lastMediaPos = null;
+  }
+
+  async function resolveAudioUrl(path: string, binding: AudioAttemptBinding) {
+    // Cancel any in-flight resolution for the previous path. Its promise also carries `binding`, so
+    // even a dependency that ignores AbortSignal cannot publish into the newly selected clip.
     resolveController?.abort();
     const ctrl = new AbortController();
     resolveController = ctrl;
 
     try {
       const grant = await registerMediaAsset(path);
-      if (ctrl.signal.aborted) return;
+      if (ctrl.signal.aborted || !isCurrentAudioAttempt(audioMachine, binding)) return;
       // Guard: the asset grant can be null/denied (missing file, permission,
       // or no backend) — never deref blindly or we surface a raw TypeError.
       const grantedPath = grant?.id ? await getMediaAssetUrl(grant.id) : null;
-      if (ctrl.signal.aborted) return;
+      if (ctrl.signal.aborted || !isCurrentAudioAttempt(audioMachine, binding)) return;
       if (!grantedPath) throw new Error('audio asset unavailable');
       let cleanPath = grantedPath.replaceAll('\\', '/');
       if (cleanPath.startsWith('//?/')) {
         cleanPath = cleanPath.substring(4);
       }
-      // 3. Set src directly; the onloadedmetadata handler will clear loading.
+      transitionAudio({ type: 'resolved', binding });
+      // Set src directly; the metadata/error handlers retain the attempt that owns this load.
       const url = convertFileSrc(cleanPath);
-      if (audioEl) {
-        resetHeardTime(); // new source => new evidence; a previous clip's listen never carries
-        audioEl.src = url;
-        audioEl.playbackRate = playbackRate;
-        audioEl.load();
-      }
+      if (!audioEl) throw new Error('audio element unavailable');
+      mediaLoadBinding = binding;
+      resetHeardTime(); // new source => new evidence; a previous clip's listen never carries
+      audioEl.src = url;
+      audioEl.playbackRate = playbackRate;
+      audioEl.load();
     } catch (e) {
-      if (!ctrl.signal.aborted) {
+      if (!ctrl.signal.aborted && isCurrentAudioAttempt(audioMachine, binding)) {
         // Keep the technical detail in the console; show the user a clean,
         // consistent message instead of a raw "TypeError: …".
         console.error('[AudioPlayer] could not resolve audio:', e);
+        transitionAudio({ type: 'failed', binding, errorCode: 'AUDIO_RESOLUTION_FAILED' });
         audioError = $t('audio.loadFailed');
-        loading = false;
       }
     }
   }
 
+  function retryAudio() {
+    stopPhysicalPlayback();
+    resolveController?.abort();
+    const binding = transitionAudio({ type: 'retry' });
+    audioError = null;
+    if (binding && audioPath) void resolveAudioUrl(audioPath, binding);
+  }
+
   // Abort any pending resolution when the component is torn down.
   onDestroy(() => {
-    clearClipStop();
     resolveController?.abort();
-    audioEl?.pause();
+    stopPhysicalPlayback();
+    transitionAudio({ type: 'reset' });
   });
 
+  let selectedClipMarker: string | null = null;
+  let selectedSourceMarker: string | null = null;
   $effect(() => {
-    if (audioPath) {
-      loading = true;
-      audioError = null;
-      currentTime = 0;
-      resolveAudioUrl(audioPath);
-    }
+    const sourceId = audioPath;
+    const clipId = String(clipKey ?? sourceId);
+    if (!sourceId || (clipId === selectedClipMarker && sourceId === selectedSourceMarker)) return;
+
+    const sourceChanged = sourceId !== selectedSourceMarker;
+    selectedClipMarker = clipId;
+    selectedSourceMarker = sourceId;
+    stopPhysicalPlayback();
+    resolveController?.abort();
+    const binding = transitionAudio({ type: 'select', clipId, sourceId });
+    audioError = null;
+    if (sourceChanged) currentTime = 0;
+    if (binding && audioMachine.phase === 'resolving') void resolveAudioUrl(sourceId, binding);
   });
 
   // Autoplay each newly-selected CLIP. handleLoaded covers a fresh SOURCE load (onloadedmetadata), but
   // consecutive review segments from the SAME recording share audioPath, so the element never reloads and
   // onloadedmetadata never re-fires — without this, autoplay dies after the first clip. Key on clipKey (the
   // segment identity), not startTime, so a tap-a-word (which only narrows startTime) never re-autoplays.
-  // Guarded on !loading: a DIFFERENT-source advance sets loading=true in the audioPath effect above (which
-  // runs first), so this skips and handleLoaded owns that autoplay — no double play. `autoplayedClip` is a
-  // plain (non-reactive) marker so setting it here never re-triggers the effect.
+  // Guarded on !loading: a different-source selection enters resolving/loading first, so this skips
+  // and handleLoaded owns that autoplay — no double play. `autoplayedClip` is a plain (non-reactive)
+  // marker so setting it here never re-triggers the effect.
   let autoplayedClip: string | number | undefined = undefined;
   $effect(() => {
     if (autoplay && audioEl && !loading && clipKey !== undefined && clipKey !== autoplayedClip) {
@@ -222,9 +259,16 @@
     if (playing) scheduleClipStop();
   });
 
-  function reportPlaybackFailure(message: string, cause: unknown) {
+  function reportPlaybackFailure(message: string, cause: unknown, binding: AudioAttemptBinding) {
+    if (!isCurrentAudioAttempt(audioMachine, binding)) return;
+    if ((cause as { name?: string } | null)?.name === 'NotAllowedError') {
+      transitionAudio({ type: 'blocked', binding, errorCode: 'AUDIO_PLAYBACK_BLOCKED' });
+    } else {
+      transitionAudio({ type: 'failed', binding, errorCode: 'AUDIO_PLAYBACK_FAILED' });
+    }
     audioError = message;
     playing = false;
+    lastMediaPos = null;
     notifications.error(message, { detail: String(cause) });
   }
 
@@ -246,6 +290,8 @@
     // the still-starting element and reject play() with a spurious error. Every paused→playing
     // transition re-arms this via attemptPlay's .then once playback has actually begun.
     if (!audioEl || audioEl.paused || endTime <= startTime) return;
+    const binding = activePlayBinding;
+    if (!binding || !isCurrentAudioAttempt(audioMachine, binding)) return;
     const remainingSec = (endTime - audioEl.currentTime) / (playbackRate || 1);
     if (remainingSec <= 0) return;
     clipStopTimer = setTimeout(
@@ -253,13 +299,15 @@
         clipStopTimer = null;
         // Only act if still actively playing — a timer that survived a pause or a source switch must
         // not resurrect playback (e.g. loop-restart the newly-selected clip).
-        if (!audioEl || !playing) return;
+        if (!audioEl || !playing || !isCurrentAudioAttempt(audioMachine, binding)) return;
         if (loop) {
           audioEl.currentTime = startTime;
           attemptPlay($t('audio.loopFailed'));
         } else {
           audioEl.pause();
           playing = false;
+          lastMediaPos = null;
+          transitionAudio({ type: 'ended', binding });
         }
       },
       Math.max(0, remainingSec * 1000),
@@ -276,39 +324,38 @@
   // review queue's 412 `.mov`/`.mp4` clips are spread over 140 distinct FILES (~3 clips each), so
   // advancing switches source every few clips, often while the previous play() is still starting.
   //
-  // `playAttempt` is the generation counter — a rejection from a superseded attempt is discarded
-  // rather than reported, and only the newest attempt may set `playing`.
-  let playAttempt = 0;
-  function supersedePlay() {
-    playAttempt += 1;
-  }
-
   function attemptPlay(failureMessage: string) {
     if (!audioEl) return;
-    const attempt = ++playAttempt;
+    const priorAttempt = audioMachine.attemptId;
+    const binding = transitionAudio({ type: 'playRequested' });
+    if (!binding || audioMachine.attemptId === priorAttempt) return;
+    activePlayBinding = binding;
     audioEl
       .play()
       .then(() => {
-        if (attempt !== playAttempt) return; // a newer attempt owns the element now
+        if (!isCurrentAudioAttempt(audioMachine, binding)) return;
         // Playback STARTED, so the audio is audible — clear any earlier failure. Without this the
         // error is sticky: `audioError` otherwise only clears when `audioPath` changes or the user
         // notices the Retry link, and consecutive review clips from one recording SHARE an audioPath.
         // The dominant recording holds 403 of the 414 exportable clips, so one transient failure kept
         // the reviewer's Accept/Save/Mark-bad refused for the rest of that recording.
+        transitionAudio({ type: 'playStarted', binding });
         audioError = null;
         playing = true;
         scheduleClipStop();
       })
       .catch((e: unknown) => {
-        if (attempt !== playAttempt) return;
-        // Belt and braces for an abort the element raised without going through supersedePlay (a
+        if (!isCurrentAudioAttempt(audioMachine, binding)) return;
+        // Belt and braces for an abort the element raised without a newer selection/pause attempt (a
         // `load()` from elsewhere). AbortError never means undecodable (NotSupportedError) or blocked
         // (NotAllowedError), so discarding it hides no real failure.
         if ((e as { name?: string } | null)?.name === 'AbortError') {
+          transitionAudio({ type: 'pause' });
           playing = false;
+          lastMediaPos = null;
           return;
         }
-        reportPlaybackFailure(failureMessage, e);
+        reportPlaybackFailure(failureMessage, e, binding);
       });
   }
 
@@ -328,9 +375,10 @@
 
   function pause() {
     clearClipStop();
-    supersedePlay();
     audioEl?.pause();
     playing = false;
+    lastMediaPos = null;
+    transitionAudio({ type: 'pause' });
   }
 
   $effect(() => {
@@ -345,6 +393,7 @@
 
   function handleTimeUpdate() {
     if (!audioEl) return;
+    if (activePlayBinding && !isCurrentAudioAttempt(audioMachine, activePlayBinding)) return;
     currentTime = audioEl.currentTime;
     if (!audioEl.paused) accrueHeardTime(audioEl.currentTime);
     else lastMediaPos = null;
@@ -359,26 +408,48 @@
       } else {
         audioEl.pause();
         playing = false;
+        lastMediaPos = null;
+        if (activePlayBinding) transitionAudio({ type: 'ended', binding: activePlayBinding });
       }
     }
   }
 
   function handleLoaded() {
-    if (audioEl) {
-      duration = audioEl.duration;
-      loading = false;
-      if (autoplay) {
-        // Mark this clip as autoplayed so the clip-identity effect (which re-runs when loading flips
-        // false) doesn't fire a second play() for the same clip.
-        autoplayedClip = clipKey;
-        play();
-      }
+    const binding = mediaLoadBinding;
+    if (!audioEl || !binding || !isCurrentAudioAttempt(audioMachine, binding)) return;
+    duration = audioEl.duration;
+    transitionAudio({ type: 'loaded', binding });
+    if (autoplay) {
+      // Mark this clip as autoplayed so the clip-identity effect (which re-runs when loading flips
+      // false) doesn't fire a second play() for the same clip.
+      autoplayedClip = clipKey;
+      play();
     }
   }
 
   function handleError() {
-    loading = false;
+    const binding =
+      activePlayBinding && isCurrentAudioAttempt(audioMachine, activePlayBinding)
+        ? activePlayBinding
+        : mediaLoadBinding;
+    if (!binding || !isCurrentAudioAttempt(audioMachine, binding)) return;
+    transitionAudio({ type: 'failed', binding, errorCode: 'AUDIO_DECODE_FAILED' });
     audioError = $t('audio.loadFailed');
+  }
+
+  function handleEnded() {
+    const binding = activePlayBinding;
+    if (!binding || !isCurrentAudioAttempt(audioMachine, binding)) return;
+    transitionAudio({ type: 'ended', binding });
+    if (loop) {
+      if (audioEl) {
+        audioEl.currentTime = startTime;
+        attemptPlay($t('audio.loopFailed'));
+      }
+    } else {
+      playing = false;
+      lastMediaPos = null;
+    }
   }
 
   function seek(e: Event) {
@@ -429,11 +500,7 @@
       <button
         type="button"
         class="ms-auto shrink-0 text-xs text-cortex-400 hover:text-cortex-200"
-        onclick={() => {
-          audioError = null;
-          loading = true;
-          resolveAudioUrl(audioPath);
-        }}>{$t('retry')}</button
+        onclick={retryAudio}>{$t('retry')}</button
       >
     </div>
   {:else}
@@ -501,16 +568,7 @@
     bind:this={audioEl}
     ontimeupdate={handleTimeUpdate}
     onloadedmetadata={handleLoaded}
-    onended={() => {
-      if (loop) {
-        if (audioEl) {
-          audioEl.currentTime = startTime;
-          attemptPlay($t('audio.loopFailed'));
-        }
-      } else {
-        playing = false;
-      }
-    }}
+    onended={handleEnded}
     onkeydown={handleKeydown}
     onerror={handleError}
   ></audio>
