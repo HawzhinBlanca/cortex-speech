@@ -1,9 +1,71 @@
 //! Durable segment deletion, undo-history capture and speaker rename boundaries.
 
 use crate::database_runtime::{begin_mutation, DatabaseRuntime, MutationGuard};
+use crate::db::SpeechSegment;
 use crate::error::{AppError, AppResult};
 use crate::history::{Command, HistoryManager};
+use crate::validation::input as validate;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+const UNBOUND_REVIEW_FIELD_MUTATION_DISABLED: &str =
+    "generic review-owned field mutation is disabled at schema v60; use the evidence-bound review decision/flag flow";
+
+fn schema_uses_effect_bound_human_truth(database: &crate::db::Database) -> AppResult<bool> {
+    crate::migrations::get_current_version(database).map(|version| version >= 60)
+}
+
+/// Apply only the fields owned by curation autosave. Unknown keys and wrong value types are loud
+/// errors, and the caller persists only after the complete payload has validated.
+fn apply_curation_fields(
+    segment: &mut SpeechSegment,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    fn optional_string(key: &str, value: &serde_json::Value) -> Result<Option<String>, String> {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value.as_str().map(str::to_string).map(Some).ok_or_else(|| format!("{key} must be a string or null"))
+        }
+    }
+
+    for (key, value) in fields {
+        match key.as_str() {
+            "annotatedTranscript" => {
+                let value = optional_string(key, value)?;
+                if let Some(ref transcript) = value {
+                    validate::validate_text(transcript, 100_000, "Annotated transcript")?;
+                }
+                segment.annotated_transcript = value;
+            }
+            "speakerId" => {
+                let value = optional_string(key, value)?;
+                if let Some(ref speaker) = value {
+                    if !speaker.is_empty() {
+                        validate::validate_text(speaker, 256, "Speaker ID")?;
+                    }
+                }
+                segment.speaker_id = value;
+            }
+            "alignmentJson" => {
+                let value = optional_string(key, value)?;
+                if let Some(ref alignment) = value {
+                    validate::validate_alignment_json(alignment)?;
+                }
+                segment.alignment_json = value;
+            }
+            "verified" => {
+                segment.verified = value.as_bool().ok_or_else(|| format!("{key} must be a boolean"))?;
+            }
+            other => {
+                return Err(format!(
+                    "update_segment_fields: unsupported field '{other}' — only curation fields \
+                     (annotatedTranscript, speakerId, alignmentJson, verified) may be partially updated"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub(crate) struct SegmentWriteStore {
@@ -33,6 +95,29 @@ impl SegmentWriteStore {
             tracing::warn!(operation, "Recovering poisoned history lock during a segment write");
             poisoned.into_inner()
         })
+    }
+
+    pub(crate) fn update_fields(
+        &self,
+        segment_id: &str,
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> AppResult<(bool, SegmentMutation)> {
+        let admission = begin_mutation().map_err(AppError::Other)?;
+        let database = self.lock_database("update_segment_fields");
+        if schema_uses_effect_bound_human_truth(&database)?
+            && fields.keys().any(|key| matches!(key.as_str(), "verified" | "annotatedTranscript"))
+        {
+            return Err(AppError::Other(UNBOUND_REVIEW_FIELD_MUTATION_DISABLED.into()));
+        }
+        let Some(mut segment) = database.get_segment_by_id(segment_id)? else {
+            return Ok((false, SegmentMutation { _admission: admission }));
+        };
+        apply_curation_fields(&mut segment, fields)?;
+        let history = self.lock_history("update_segment_fields");
+        HistoryManager::persist_segment_update(&database, &history, &segment)?;
+        drop(history);
+        drop(database);
+        Ok((true, SegmentMutation { _admission: admission }))
     }
 
     pub(crate) fn delete_one(&self, id: &str) -> AppResult<SegmentMutation> {
@@ -69,7 +154,7 @@ impl SegmentWriteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, SpeechSegment};
+    use crate::db::Database;
 
     fn store_with_segments() -> (tempfile::TempDir, SegmentWriteStore, DatabaseRuntime, Arc<Mutex<HistoryManager>>) {
         let directory = tempfile::tempdir().unwrap();
@@ -120,5 +205,77 @@ mod tests {
             runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "two");
+    }
+
+    #[test]
+    fn apply_curation_fields_touches_only_whitelisted_fields_and_rejects_unknown_keys() {
+        let mut segment = SpeechSegment {
+            id: "curation".into(),
+            audio_path: "curation.wav".into(),
+            raw_transcript: "raw text".into(),
+            verified: true,
+            confidence: Some(0.42),
+            ..SpeechSegment::default()
+        };
+        let before = segment.clone();
+        let fields = serde_json::json!({ "annotatedTranscript": "دەق", "speakerId": "SPEAKER_01" });
+        apply_curation_fields(&mut segment, fields.as_object().unwrap()).unwrap();
+        assert_eq!(segment.annotated_transcript.as_deref(), Some("دەق"));
+        assert_eq!(segment.speaker_id.as_deref(), Some("SPEAKER_01"));
+        assert_eq!(segment.verified, before.verified);
+        assert_eq!(segment.confidence, before.confidence);
+        assert_eq!(segment.raw_transcript, before.raw_transcript);
+        assert_eq!(segment.audio_path, before.audio_path);
+        assert_eq!(segment.alignment_json, before.alignment_json);
+
+        let clear = serde_json::json!({ "speakerId": null });
+        apply_curation_fields(&mut segment, clear.as_object().unwrap()).unwrap();
+        assert_eq!(segment.speaker_id, None);
+
+        let verified = serde_json::json!({ "verified": false });
+        apply_curation_fields(&mut segment, verified.as_object().unwrap()).unwrap();
+        assert!(!segment.verified);
+        assert_eq!(segment.raw_transcript, before.raw_transcript);
+        let bad_verified = serde_json::json!({ "verified": "yes" });
+        assert!(apply_curation_fields(&mut segment, bad_verified.as_object().unwrap()).is_err());
+
+        let unsupported = serde_json::json!({ "confidence": 0.9 });
+        let error = apply_curation_fields(&mut segment, unsupported.as_object().unwrap()).unwrap_err();
+        assert!(error.contains("unsupported field 'confidence'"), "{error}");
+        assert_eq!(segment.confidence, before.confidence);
+        let wrong_type = serde_json::json!({ "annotatedTranscript": 7 });
+        assert!(apply_curation_fields(&mut segment, wrong_type.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn schema_v60_field_writer_refuses_unbound_review_fields_atomically() {
+        let (_directory, store, runtime, _history) = store_with_segments();
+        let allowed = serde_json::json!({
+            "speakerId": "speaker-z",
+            "alignmentJson": r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#
+        });
+        let (changed, admission) = store.update_fields("one", allowed.as_object().unwrap()).unwrap();
+        assert!(changed);
+        drop(admission);
+        assert_eq!(
+            runtime.open_read().unwrap().get_segment_by_id("one").unwrap().unwrap().speaker_id.as_deref(),
+            Some("speaker-z")
+        );
+
+        for restricted in [
+            serde_json::json!({ "verified": true }),
+            serde_json::json!({ "annotatedTranscript": "unbound human truth" }),
+        ] {
+            let error =
+                store.update_fields("one", restricted.as_object().unwrap()).err().expect("restricted field refused");
+            assert!(error.to_string().contains("disabled at schema v60"), "{error}");
+        }
+
+        let mixed = serde_json::json!({ "speakerId": "must-not-commit", "verified": true });
+        let error = store.update_fields("one", mixed.as_object().unwrap()).err().expect("mixed field payload refused");
+        assert!(error.to_string().contains("disabled at schema v60"), "{error}");
+        let retained = runtime.open_read().unwrap().get_segment_by_id("one").unwrap().unwrap();
+        assert_eq!(retained.speaker_id.as_deref(), Some("speaker-z"));
+        assert!(!retained.verified && retained.annotated_transcript.is_none());
     }
 }

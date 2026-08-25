@@ -30,6 +30,10 @@ def test_store_owns_serialized_deletes_history_and_rename_without_ui_dependencie
         "struct SegmentMutation",
         "_admission: MutationGuard<'static>",
         "begin_mutation().map_err(AppError::Other)?",
+        "fn apply_curation_fields(",
+        "schema_uses_effect_bound_human_truth(&database)?",
+        "HistoryManager::persist_segment_update(&database, &history, &segment)?",
+        "UNBOUND_REVIEW_FIELD_MUTATION_DISABLED",
         "database.get_segment_by_id(id)?",
         "database.get_segments_by_ids(ids)?",
         "database.delete_segment(id)?",
@@ -44,6 +48,7 @@ def test_store_owns_serialized_deletes_history_and_rename_without_ui_dependencie
 def test_migrated_commands_validate_then_delegate_without_raw_database_authority() -> None:
     source = read("commands/segments_write.rs")
     signatures = {
+        "update_segment_fields": "pub fn update_segment_fields(",
         "delete_segment": "pub fn delete_segment(",
         "delete_segments_batch": "pub fn delete_segments_batch(",
         "rename_speaker": "pub fn rename_speaker(",
@@ -56,11 +61,13 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
             if forbidden in body:
                 raise AssertionError(f"{name} regained raw database authority: {forbidden}")
 
-    for name in ("delete_segment", "delete_segments_batch"):
+    for name in ("update_segment_fields", "delete_segment", "delete_segments_batch"):
         body = command(source, signatures[name])
         if "validate::validate_identifier" not in body:
             raise AssertionError(f"{name} lost identifier validation")
-        if "let _mutation = state.segment_writes()" not in body or "state.session_auto_save()" not in body:
+        if "_mutation" not in body:
+            raise AssertionError(f"{name} no longer retains the restore-admission token")
+        if "state.session_auto_save()" not in body:
             raise AssertionError(f"{name} no longer keeps restore admission alive through session save")
     if "validate::validate_identifier(&new_id)" not in command(source, signatures["rename_speaker"]):
         raise AssertionError("rename_speaker lost new identity validation")

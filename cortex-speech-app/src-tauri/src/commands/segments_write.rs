@@ -9,7 +9,7 @@
 //! bounds) — they run on the caller thread (no run_blocking) exactly as before, since a single indexed
 //! write is not a UI-freeze risk.
 
-use super::{apply_curation_fields, RATE_LIMITER, STRICT_RATE_LIMITER};
+use super::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
 use crate::history::HistoryManager;
 use crate::ipc_contract::{
@@ -20,15 +20,8 @@ use crate::validation::input as validate;
 use crate::AppState;
 use tauri::State;
 
-const UNBOUND_REVIEW_FIELD_MUTATION_DISABLED: &str =
-    "generic review-owned field mutation is disabled at schema v60; use the evidence-bound review decision/flag flow";
-
 const WHOLE_ROW_SEGMENT_WRITE_RETIRED: &str =
     "the whole-row segment writer is retired; use update_segment_fields or the review decision/flag flow";
-
-fn schema_uses_effect_bound_human_truth(db: &crate::db::Database) -> Result<bool, String> {
-    crate::migrations::get_current_version(db).map(|version| version >= 60).map_err(|error| error.to_string())
-}
 
 /// RETIRED (deep audit 2026-08-25) — the legacy whole-row segment write.
 ///
@@ -47,25 +40,6 @@ fn persist_whole_segment_update_on(
 ) -> Result<(), String> {
     let _ = (db, history, segment);
     Err(WHOLE_ROW_SEGMENT_WRITE_RETIRED.into())
-}
-
-fn persist_segment_fields_on(
-    db: &crate::db::Database,
-    history: &HistoryManager,
-    segment_id: &str,
-    fields: &serde_json::Map<String, serde_json::Value>,
-) -> Result<bool, String> {
-    if schema_uses_effect_bound_human_truth(db)?
-        && fields.keys().any(|key| matches!(key.as_str(), "verified" | "annotatedTranscript"))
-    {
-        return Err(UNBOUND_REVIEW_FIELD_MUTATION_DISABLED.into());
-    }
-    let Some(mut segment) = db.get_segment_by_id(segment_id).map_err(|error| error.to_string())? else {
-        return Ok(false);
-    };
-    apply_curation_fields(&mut segment, fields)?;
-    HistoryManager::persist_segment_update(db, history, &segment).map_err(|error| error.to_string())?;
-    Ok(true)
 }
 
 /// Declare rights for one source RECORDING — every segment cut from it (migration v49, audit #6).
@@ -179,11 +153,8 @@ pub fn update_segment_fields(
         return Ok(false); // nothing to apply
     }
 
-    let db = state.lock_db();
-    let history = state.lock_history();
-    let changed = persist_segment_fields_on(&db, &history, &segment_id, obj)?;
-    drop(history);
-    drop(db);
+    let (changed, _mutation) =
+        state.segment_writes().update_fields(&segment_id, obj).map_err(|error| error.to_string())?;
 
     if changed {
         state.session_auto_save();
@@ -618,7 +589,7 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_review_v1_on, persist_segment_fields_on, persist_whole_segment_update_on, record_human_decision_on,
+        commit_review_v1_on, persist_whole_segment_update_on, record_human_decision_on,
         validate_playback_receipt_identity,
     };
     use crate::database_runtime::DatabaseRuntime;
@@ -671,108 +642,6 @@ mod tests {
             source_end_ms: None,
         })
         .unwrap();
-    }
-
-    #[test]
-    fn schema_v60_registered_segment_writers_refuse_unbound_review_fields_atomically() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = db_with_clip(tmp.path(), "curation-v60");
-        let history = HistoryManager::new(20);
-
-        let allowed = serde_json::json!({
-            "speakerId": "speaker-a",
-            "alignmentJson": r#"{"source_start_ms":0,"source_end_ms":10000,"chunk_index":0,"chunk_count":1}"#
-        });
-        assert!(persist_segment_fields_on(&db, &history, "curation-v60", allowed.as_object().unwrap()).unwrap());
-        let allowed_row = db.get_segment_by_id("curation-v60").unwrap().unwrap();
-        assert_eq!(allowed_row.speaker_id.as_deref(), Some("speaker-a"));
-
-        for restricted in [
-            serde_json::json!({ "verified": true }),
-            serde_json::json!({ "annotatedTranscript": "unbound human truth" }),
-        ] {
-            let error =
-                persist_segment_fields_on(&db, &history, "curation-v60", restricted.as_object().unwrap()).unwrap_err();
-            assert!(error.contains("disabled at schema v60"), "{error}");
-        }
-
-        let mixed = serde_json::json!({ "speakerId": "must-not-commit", "verified": true });
-        let error = persist_segment_fields_on(&db, &history, "curation-v60", mixed.as_object().unwrap()).unwrap_err();
-        assert!(error.contains("disabled at schema v60"), "{error}");
-        let after_mixed = db.get_segment_by_id("curation-v60").unwrap().unwrap();
-        assert_eq!(after_mixed.speaker_id.as_deref(), Some("speaker-a"), "mixed refusal must be atomic");
-        assert!(!after_mixed.verified && after_mixed.annotated_transcript.is_none());
-
-        // The whole-row writer is RETIRED (deep audit 2026-08-25), so it now refuses EVERY request —
-        // including one that only touches an allowed curation field, which it used to commit.
-        let mut whole_curation_only = after_mixed.clone();
-        whole_curation_only.speaker_id = Some("must-not-commit".into());
-        let error = persist_whole_segment_update_on(&db, &history, &whole_curation_only).unwrap_err();
-        assert!(error.contains("retired"), "{error}");
-        assert_eq!(
-            db.get_segment_by_id("curation-v60").unwrap().unwrap().speaker_id.as_deref(),
-            Some("speaker-a"),
-            "a retired writer must not commit even an allowed field"
-        );
-
-        let mut whole_verified = db.get_segment_by_id("curation-v60").unwrap().unwrap();
-        whole_verified.verified = true;
-        whole_verified.speaker_id = Some("must-not-commit".into());
-        let error = persist_whole_segment_update_on(&db, &history, &whole_verified).unwrap_err();
-        assert!(error.contains("retired"), "{error}");
-        let after_whole_verified = db.get_segment_by_id("curation-v60").unwrap().unwrap();
-        assert!(!after_whole_verified.verified);
-        assert_eq!(after_whole_verified.speaker_id.as_deref(), Some("speaker-a"));
-
-        let mut whole_annotated = after_whole_verified.clone();
-        whole_annotated.annotated_transcript = Some("unbound annotation".into());
-        let error = persist_whole_segment_update_on(&db, &history, &whole_annotated).unwrap_err();
-        assert!(error.contains("retired"), "{error}");
-        assert!(db.get_segment_by_id("curation-v60").unwrap().unwrap().annotated_transcript.is_none());
-
-        for (field, mutate) in [
-            ("human_decision", 0_u8),
-            ("verdict", 1),
-            ("reviewed_by", 2),
-            ("corrected_at", 3),
-            ("escalated", 4),
-            ("rationale", 5),
-            ("is_gold", 6),
-        ] {
-            let mut forged = db.get_segment_by_id("curation-v60").unwrap().unwrap();
-            forged.speaker_id = Some("must-not-commit".into());
-            match mutate {
-                0 => forged.human_decision = Some("accept".into()),
-                1 => forged.verdict = Some("human_accept".into()),
-                2 => forged.reviewed_by = Some("forged reviewer".into()),
-                3 => forged.corrected_at = Some("2026-08-22 00:00:00".into()),
-                4 => forged.escalated = true,
-                5 => forged.rationale = Some("forged flag rationale".into()),
-                6 => forged.is_gold = true,
-                _ => unreachable!(),
-            }
-            let error = persist_whole_segment_update_on(&db, &history, &forged).unwrap_err();
-            assert!(error.contains("retired"), "{field}: {error}");
-            let retained = db.get_segment_by_id("curation-v60").unwrap().unwrap();
-            assert_eq!(retained.speaker_id.as_deref(), Some("speaker-a"), "{field} mixed refusal must be atomic");
-            assert!(retained.human_decision.is_none() && retained.verdict.is_none());
-            assert!(retained.reviewed_by.is_none() && retained.corrected_at.is_none());
-            assert!(!retained.escalated && retained.rationale.is_none() && !retained.is_gold);
-        }
-
-        let mut new_unbound = SpeechSegment {
-            id: "curation-new-unbound".into(),
-            audio_path: tmp.path().join("new.wav").to_string_lossy().into_owned(),
-            raw_transcript: "machine".into(),
-            duration_ms: 1_000,
-            ..SpeechSegment::default()
-        };
-        new_unbound.human_decision = Some("accept".into());
-        new_unbound.verdict = Some("human_accept".into());
-        new_unbound.reviewed_by = Some("forged reviewer".into());
-        let error = persist_whole_segment_update_on(&db, &history, &new_unbound).unwrap_err();
-        assert!(error.contains("retired"), "{error}");
-        assert!(db.get_segment_by_id("curation-new-unbound").unwrap().is_none());
     }
 
     /// The three hazards the caller-less whole-row IPC still carried, proved dead on a real row.

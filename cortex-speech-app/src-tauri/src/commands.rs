@@ -1772,67 +1772,6 @@ pub fn get_signal_anomaly_segments(
     state.segment_queries().get_signal_anomaly_segments(limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
-/// Apply the whitelisted curation fields from an autosave `fields` object onto a segment row. Pure and
-/// unit-tested. Only the three fields the debounced curation autosave edits are accepted; an unknown
-/// key is a LOUD error (never silently dropped — a typo'd field must not look saved). Each value may
-/// be a string or `null` (all three columns are nullable).
-pub(crate) fn apply_curation_fields(
-    segment: &mut SpeechSegment,
-    fields: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    fn opt_string(key: &str, v: &serde_json::Value) -> Result<Option<String>, String> {
-        if v.is_null() {
-            Ok(None)
-        } else {
-            v.as_str().map(str::to_string).map(Some).ok_or_else(|| format!("{key} must be a string or null"))
-        }
-    }
-    for (key, value) in fields {
-        match key.as_str() {
-            "annotatedTranscript" => {
-                let v = opt_string(key, value)?;
-                if let Some(ref t) = v {
-                    validate::validate_text(t, 100000, "Annotated transcript")?;
-                }
-                segment.annotated_transcript = v;
-            }
-            "speakerId" => {
-                let v = opt_string(key, value)?;
-                if let Some(ref s) = v {
-                    if !s.is_empty() {
-                        validate::validate_text(s, 256, "Speaker ID")?;
-                    }
-                }
-                segment.speaker_id = v;
-            }
-            "alignmentJson" => {
-                let v = opt_string(key, value)?;
-                if let Some(ref aj) = v {
-                    validate::validate_alignment_json(aj)?;
-                }
-                segment.alignment_json = v;
-            }
-            "verified" => {
-                // Verifying is a single-field curation action. Routing it through this field-level path
-                // (update_segment_fields reads the FRESH row by id, applies only this field, persists) —
-                // instead of the whole-row api.updateSegment upsert handleToggleVerify used to send — means a
-                // concurrent writer that holds NO $isProcessing lock, notably the WSL-7B refinement loop
-                // (it emits wsl-log events, not batch-progress, so the Verify button stays live), cannot have
-                // its raw_transcript write reverted by a stale whole-row spread. Matches the sibling
-                // handleSaveAnnotation / handleSaveSpeaker conversions to field-level updates.
-                segment.verified = value.as_bool().ok_or_else(|| format!("{key} must be a boolean"))?;
-            }
-            other => {
-                return Err(format!(
-                    "update_segment_fields: unsupported field '{other}' — only curation fields \
-                     (annotatedTranscript, speakerId, alignmentJson, verified) may be partially updated"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn merge_dataset_json(json_content: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     STRICT_RATE_LIMITER.check("merge_dataset_json")?;
@@ -11379,57 +11318,6 @@ mod tests {
         s.jury_model = "example/future-approved-judge".into();
         let (_, _, model) = resolve_t2_endpoint_from_keys(&s, "gkey", Some("orkey"));
         assert_eq!(model, "example/future-approved-judge");
-    }
-
-    #[test]
-    fn apply_curation_fields_touches_only_whitelisted_fields_and_rejects_unknown_keys() {
-        // F10 root fix: the partial autosave path must be able to change ONLY the whitelisted curation
-        // fields (annotatedTranscript, speakerId, alignmentJson, verified); everything else in the row must
-        // be bit-identical after the apply, and an unknown key must be a loud error (a typo'd field must
-        // never look saved).
-        let mut seg = test_segment("s1", "/audio/a.wav", "raw text");
-        seg.verified = true;
-        seg.confidence = Some(0.42);
-        let before = seg.clone();
-
-        let fields: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"annotatedTranscript": "دەق", "speakerId": "SPEAKER_01"}"#).unwrap();
-        apply_curation_fields(&mut seg, &fields).unwrap();
-        assert_eq!(seg.annotated_transcript.as_deref(), Some("دەق"));
-        assert_eq!(seg.speaker_id.as_deref(), Some("SPEAKER_01"));
-        // Every non-curation column is untouched — the stale-store clobber class is closed by construction.
-        assert_eq!(seg.verified, before.verified);
-        assert_eq!(seg.confidence, before.confidence);
-        assert_eq!(seg.raw_transcript, before.raw_transcript);
-        assert_eq!(seg.audio_path, before.audio_path);
-        assert_eq!(seg.alignment_json, before.alignment_json, "unprovided field stays untouched");
-
-        // null clears a nullable field.
-        let clear: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"speakerId": null}"#).unwrap();
-        apply_curation_fields(&mut seg, &clear).unwrap();
-        assert_eq!(seg.speaker_id, None);
-
-        // `verified` IS a whitelisted curation field now — handleToggleVerify routes through this field-level
-        // path (not a whole-row upsert) so a concurrent WSL-7B refinement write is never reverted. It applies
-        // as a bool, and a non-bool is a loud error.
-        let ver: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"verified": false}"#).unwrap();
-        apply_curation_fields(&mut seg, &ver).unwrap();
-        assert!(!seg.verified, "verified applies as a bool");
-        assert_eq!(seg.raw_transcript, before.raw_transcript, "verifying must not touch raw_transcript");
-        let ver_bad: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"verified": "yes"}"#).unwrap();
-        assert!(apply_curation_fields(&mut seg, &ver_bad).is_err(), "a non-bool verified must be a loud error");
-
-        // A genuinely non-whitelisted key -> loud error, row unchanged.
-        let bad: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"confidence": 0.9}"#).unwrap();
-        let err = apply_curation_fields(&mut seg, &bad).unwrap_err();
-        assert!(err.contains("unsupported field 'confidence'"), "{err}");
-        assert_eq!(seg.confidence, before.confidence, "non-whitelisted field must not change");
-
-        // Wrong value type -> loud error.
-        let wrong: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"annotatedTranscript": 7}"#).unwrap();
-        assert!(apply_curation_fields(&mut seg, &wrong).is_err());
     }
 
     #[test]
