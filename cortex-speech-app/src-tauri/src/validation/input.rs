@@ -97,6 +97,13 @@ pub fn validate_identifier(s: &str) -> Result<(), String> {
     if s.len() > 256 {
         return Err("Identifier too long (max 256 chars)".to_string());
     }
+    // The dot is allowed so ids may carry a file-like suffix, which also admits `.`, `..` and `....`
+    // — every one of them a path component, not an identifier. This gate is the app-wide id boundary
+    // (segment ids, operation ids, speaker ids), so a dot-only id is refused here rather than left as
+    // a traversal primitive for whichever caller eventually joins it onto a path.
+    if s.chars().all(|c| c == '.') {
+        return Err("Identifier must not consist only of dots".to_string());
+    }
     if !s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
         return Err("Identifier must be alphanumeric (underscore, hyphen, dot allowed)".to_string());
     }
@@ -272,6 +279,17 @@ mod tests {
         assert!(validate_identifier("a".repeat(257).as_str()).is_err());
         assert!(validate_identifier("../evil").is_err());
         assert!(validate_identifier("good.name").is_ok());
+    }
+
+    #[test]
+    fn dot_only_identifiers_are_rejected() {
+        // `.` and `..` passed the alphanumeric-plus-dot rule and are path components, not identifiers.
+        for evil in [".", "..", "....", "..."] {
+            assert!(validate_identifier(evil).is_err(), "a dot-only identifier must be rejected: {evil:?}");
+        }
+        // A dot inside a real id is still legal — that is what the dot was allowed for.
+        assert!(validate_identifier("clip.01.wav").is_ok());
+        assert!(validate_identifier(".hidden").is_ok());
     }
 
     #[test]

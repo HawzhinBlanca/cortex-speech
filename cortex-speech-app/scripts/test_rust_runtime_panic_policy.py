@@ -572,16 +572,23 @@ def test_instance_lock_cleanup_reports_failures() -> None:
     forbidden = [
         "let _ = std::fs::remove_file(&lock_path);",
         "let _ = std::fs::remove_file(&self.path);",
+        # ONLY THE HOLDER MAY UNLINK. The Unix refusal branch used to delete the file it had just
+        # failed to flock — the LIVE holder's own lockfile — so the next launch created a fresh inode,
+        # locked that instead, and two processes ran on one SQLite database. Deleting on refusal is
+        # the defect; this pin used to REQUIRE the very call it now forbids.
+        'remove_lock_file(&lock_path, "failed Unix instance lock acquisition");',
     ]
     present = [pattern for pattern in forbidden if pattern in flock]
     if present:
         formatted = "\n".join(f"- {entry}" for entry in present)
-        raise AssertionError(f"flock.rs silently discards instance lock cleanup failures:\n{formatted}")
+        raise AssertionError(
+            "flock.rs mishandles the instance lockfile — a silently discarded cleanup failure, or a "
+            f"REFUSED instance deleting the live holder's lockfile:\n{formatted}"
+        )
 
     required = [
         "fn remove_lock_file(path: &Path, context: &str)",
         'remove_lock_file(&lock_path, "stale Windows instance lock");',
-        'remove_lock_file(&lock_path, "failed Unix instance lock acquisition");',
         'remove_lock_file(&PathBuf::from(&self.path), "released instance lock");',
         "Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}",
         'tracing::warn!("Failed to remove {context} file {}: {error}", path.display()),',

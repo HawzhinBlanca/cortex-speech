@@ -19,26 +19,29 @@ use tauri::State;
 const UNBOUND_REVIEW_FIELD_MUTATION_DISABLED: &str =
     "generic review-owned field mutation is disabled at schema v60; use the evidence-bound review decision/flag flow";
 
+const WHOLE_ROW_SEGMENT_WRITE_RETIRED: &str =
+    "the whole-row segment writer is retired; use update_segment_fields or the review decision/flag flow";
+
 fn schema_uses_effect_bound_human_truth(db: &crate::db::Database) -> Result<bool, String> {
     crate::migrations::get_current_version(db).map(|version| version >= 60).map_err(|error| error.to_string())
 }
 
+/// RETIRED (deep audit 2026-08-25) — the legacy whole-row segment write.
+///
+/// It had no callers left: curation autosave moved to `update_segment_fields` and human truth moved to
+/// the evidence-bound decision/flag flow. What it still carried was every retired write hazard on one
+/// endpoint — a BLANK `raw_transcript` overwriting a good champion draft, renderer-supplied STALE
+/// machine fields, and resurrection of a row deleted mid-edit through `insert_segment`'s ON CONFLICT
+/// upsert. Hardening a caller-less endpoint only preserves the surface, so the write is gone; the
+/// refusal stays here (rather than inline in the command) so a test can prove it without a Tauri
+/// `State`. Same shape as `restore_segment_snapshot` above it.
 fn persist_whole_segment_update_on(
     db: &crate::db::Database,
     history: &HistoryManager,
     segment: &SpeechSegment,
 ) -> Result<(), String> {
-    let existing = db.get_segment_by_id(&segment.id).map_err(|error| error.to_string())?;
-    if schema_uses_effect_bound_human_truth(db)? {
-        let mutates_review_truth = existing.as_ref().map_or_else(
-            || !crate::db::review_owned_projection_matches(segment, &SpeechSegment::default()),
-            |current| !crate::db::review_owned_projection_matches(current, segment),
-        );
-        if mutates_review_truth {
-            return Err(UNBOUND_REVIEW_FIELD_MUTATION_DISABLED.into());
-        }
-    }
-    HistoryManager::persist_segment_update(db, history, segment).map_err(|error| error.to_string())
+    let _ = (db, history, segment);
+    Err(WHOLE_ROW_SEGMENT_WRITE_RETIRED.into())
 }
 
 fn persist_segment_fields_on(
@@ -128,44 +131,15 @@ pub fn list_recording_rights(state: State<'_, AppState>) -> Result<Vec<serde_jso
         .collect())
 }
 
+/// RETIRED. The IPC name stays registered so `lib.rs`'s invoke_handler keeps compiling and any stray
+/// caller gets a legible refusal instead of a silent whole-row write — see
+/// `persist_whole_segment_update_on` above for what this endpoint used to be able to do.
 #[tauri::command]
 pub fn update_segment(segment: SpeechSegment, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("update_segment")?;
-    validate::validate_identifier(&segment.id)?;
-    if let Some(ref aj) = segment.alignment_json {
-        validate::validate_alignment_json(aj)?;
-    }
-    let _mutation = super::begin_mutation()?;
-    let db = state.lock_db();
-    let path_changed = match db.get_segment_by_id(&segment.id) {
-        Ok(Some(existing)) => existing.audio_path != segment.audio_path,
-        Ok(None) => true,
-        Err(e) => return Err(e.to_string()),
-    };
-    drop(db);
-    if path_changed {
-        validate::validate_file_path(&segment.audio_path)?;
-    }
-    validate::validate_text(&segment.raw_transcript, 100000, "Raw transcript")?;
-    if let Some(ref t) = segment.normalized_transcript {
-        validate::validate_text(t, 100000, "Normalized transcript")?;
-    }
-    if let Some(ref t) = segment.annotated_transcript {
-        validate::validate_text(t, 100000, "Annotated transcript")?;
-    }
-    if let Some(ref s) = segment.speaker_id {
-        if !s.is_empty() {
-            validate::validate_text(s, 256, "Speaker ID")?;
-        }
-    }
     let db = state.lock_db();
     let history = state.lock_history();
-    persist_whole_segment_update_on(&db, &history, &segment)?;
-    drop(history);
-    drop(db);
-
-    state.session_auto_save();
-    Ok(())
+    persist_whole_segment_update_on(&db, &history, &segment)
 }
 
 /// Lossless snapshot restore — the review-undo IPC. `update_segment` deliberately omits the
@@ -423,6 +397,20 @@ pub fn undo_review_flag(
     db.undo_review_flag(effect_event_id, &operation_id).map_err(|error| error.to_string())
 }
 
+/// Bound BOTH renderer-supplied identity strings on a playback receipt. `session_id` is stored on the
+/// receipt exactly like `reviewer` is, but was the one string in this module that arrived unbounded —
+/// every other write command bounds its free text. Extracted so the gate can prove the bound without a
+/// Tauri `State`.
+fn validate_playback_receipt_identity(reviewer: Option<&str>, session_id: Option<&str>) -> Result<(), String> {
+    if let Some(name) = reviewer {
+        validate::validate_text(name, 128, "Reviewer")?;
+    }
+    if let Some(session) = session_id {
+        validate::validate_text(session, 128, "Session")?;
+    }
+    Ok(())
+}
+
 /// Record that a reviewer actually HEARD a clip, so a verdict on it can be more than a guess.
 ///
 /// The renderer reports how much MEDIA time it advanced; the backend derives coverage and stamps the
@@ -446,9 +434,7 @@ pub fn record_playback_receipt(
 ) -> Result<(), String> {
     RATE_LIMITER.check("record_playback_receipt")?;
     validate::validate_identifier(&segment_id)?;
-    if let Some(name) = reviewer.as_deref() {
-        validate::validate_text(name, 128, "Reviewer")?;
-    }
+    validate_playback_receipt_identity(reviewer.as_deref(), session_id.as_deref())?;
     if played_ms < 0 || clip_duration_ms < 0 {
         return Err("playback receipt durations must not be negative".to_string());
     }
@@ -493,7 +479,7 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 mod tests {
     use super::{
         persist_segment_fields_on, persist_whole_segment_update_on, record_human_decision_on, record_review_flag_on,
-        require_listened,
+        require_listened, validate_playback_receipt_identity,
     };
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
     use crate::history::HistoryManager;
@@ -569,24 +555,31 @@ mod tests {
         assert_eq!(after_mixed.speaker_id.as_deref(), Some("speaker-a"), "mixed refusal must be atomic");
         assert!(!after_mixed.verified && after_mixed.annotated_transcript.is_none());
 
-        let mut whole_allowed = after_mixed.clone();
-        whole_allowed.speaker_id = Some("speaker-b".into());
-        persist_whole_segment_update_on(&db, &history, &whole_allowed).unwrap();
-        assert_eq!(db.get_segment_by_id("curation-v60").unwrap().unwrap().speaker_id.as_deref(), Some("speaker-b"));
+        // The whole-row writer is RETIRED (deep audit 2026-08-25), so it now refuses EVERY request —
+        // including one that only touches an allowed curation field, which it used to commit.
+        let mut whole_curation_only = after_mixed.clone();
+        whole_curation_only.speaker_id = Some("must-not-commit".into());
+        let error = persist_whole_segment_update_on(&db, &history, &whole_curation_only).unwrap_err();
+        assert!(error.contains("retired"), "{error}");
+        assert_eq!(
+            db.get_segment_by_id("curation-v60").unwrap().unwrap().speaker_id.as_deref(),
+            Some("speaker-a"),
+            "a retired writer must not commit even an allowed field"
+        );
 
         let mut whole_verified = db.get_segment_by_id("curation-v60").unwrap().unwrap();
         whole_verified.verified = true;
         whole_verified.speaker_id = Some("must-not-commit".into());
         let error = persist_whole_segment_update_on(&db, &history, &whole_verified).unwrap_err();
-        assert!(error.contains("disabled at schema v60"), "{error}");
+        assert!(error.contains("retired"), "{error}");
         let after_whole_verified = db.get_segment_by_id("curation-v60").unwrap().unwrap();
         assert!(!after_whole_verified.verified);
-        assert_eq!(after_whole_verified.speaker_id.as_deref(), Some("speaker-b"));
+        assert_eq!(after_whole_verified.speaker_id.as_deref(), Some("speaker-a"));
 
         let mut whole_annotated = after_whole_verified.clone();
         whole_annotated.annotated_transcript = Some("unbound annotation".into());
         let error = persist_whole_segment_update_on(&db, &history, &whole_annotated).unwrap_err();
-        assert!(error.contains("disabled at schema v60"), "{error}");
+        assert!(error.contains("retired"), "{error}");
         assert!(db.get_segment_by_id("curation-v60").unwrap().unwrap().annotated_transcript.is_none());
 
         for (field, mutate) in [
@@ -611,9 +604,9 @@ mod tests {
                 _ => unreachable!(),
             }
             let error = persist_whole_segment_update_on(&db, &history, &forged).unwrap_err();
-            assert!(error.contains("disabled at schema v60"), "{field}: {error}");
+            assert!(error.contains("retired"), "{field}: {error}");
             let retained = db.get_segment_by_id("curation-v60").unwrap().unwrap();
-            assert_eq!(retained.speaker_id.as_deref(), Some("speaker-b"), "{field} mixed refusal must be atomic");
+            assert_eq!(retained.speaker_id.as_deref(), Some("speaker-a"), "{field} mixed refusal must be atomic");
             assert!(retained.human_decision.is_none() && retained.verdict.is_none());
             assert!(retained.reviewed_by.is_none() && retained.corrected_at.is_none());
             assert!(!retained.escalated && retained.rationale.is_none() && !retained.is_gold);
@@ -630,8 +623,56 @@ mod tests {
         new_unbound.verdict = Some("human_accept".into());
         new_unbound.reviewed_by = Some("forged reviewer".into());
         let error = persist_whole_segment_update_on(&db, &history, &new_unbound).unwrap_err();
-        assert!(error.contains("disabled at schema v60"), "{error}");
+        assert!(error.contains("retired"), "{error}");
         assert!(db.get_segment_by_id("curation-new-unbound").unwrap().is_none());
+    }
+
+    /// The three hazards the caller-less whole-row IPC still carried, proved dead on a real row.
+    ///
+    /// It could blank a good champion draft (the recurring "blank transcript overwrites good" class),
+    /// write renderer-supplied STALE machine fields over fresher ones, and RESURRECT a row deleted
+    /// mid-edit through `insert_segment`'s ON CONFLICT upsert. Retirement kills all three at once, so
+    /// this pins that none of them can write anything.
+    #[test]
+    fn the_retired_whole_row_writer_cannot_blank_a_draft_write_stale_machine_text_or_resurrect_a_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "retired-whole-row");
+        let history = HistoryManager::new(20);
+        let row = db.get_segment_by_id("retired-whole-row").unwrap().unwrap();
+
+        let mut blanked = row.clone();
+        blanked.raw_transcript = String::new();
+        assert!(persist_whole_segment_update_on(&db, &history, &blanked).is_err());
+        assert_eq!(
+            db.get_segment_by_id("retired-whole-row").unwrap().unwrap().raw_transcript,
+            row.raw_transcript,
+            "a blank draft must never reach the row"
+        );
+
+        let mut stale = row.clone();
+        stale.raw_transcript = "stale renderer copy".into();
+        stale.normalized_transcript = Some("stale normalized".into());
+        assert!(persist_whole_segment_update_on(&db, &history, &stale).is_err());
+        assert_eq!(db.get_segment_by_id("retired-whole-row").unwrap().unwrap().raw_transcript, row.raw_transcript);
+
+        db.delete_segment("retired-whole-row").unwrap();
+        assert!(persist_whole_segment_update_on(&db, &history, &row).is_err());
+        assert!(
+            db.get_segment_by_id("retired-whole-row").unwrap().is_none(),
+            "a deleted row must not be resurrected by a whole-row upsert"
+        );
+    }
+
+    #[test]
+    fn a_playback_receipt_bounds_both_renderer_supplied_identity_strings() {
+        // `session_id` is persisted on the receipt exactly like `reviewer`, but arrived unbounded —
+        // the one free-text field in this module that skipped the command's own bounding convention.
+        assert!(validate_playback_receipt_identity(Some("Sara"), Some("session-1")).is_ok());
+        assert!(validate_playback_receipt_identity(None, None).is_ok());
+        assert!(validate_playback_receipt_identity(Some(&"r".repeat(129)), None).is_err());
+        let long_session = "s".repeat(129);
+        let error = validate_playback_receipt_identity(None, Some(&long_session)).expect_err("must be bounded");
+        assert!(error.contains("Session"), "{error}");
     }
 
     /// The desktop must hold the same bar as the phone, or it is simply the easier way in.

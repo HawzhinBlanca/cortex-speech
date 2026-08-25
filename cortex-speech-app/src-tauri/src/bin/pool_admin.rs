@@ -19,6 +19,19 @@ struct VoiceSpec {
     directory: PathBuf,
 }
 
+/// One library row matched to a prepared WAV: its draft, the model that produced it, and the exact
+/// audio identity `review_pool::activate` binds. Named rather than a wide tuple so adding the
+/// identity columns did not have to widen every destructuring site.
+#[derive(Debug, Clone)]
+struct LibrarySegment {
+    id: String,
+    raw_transcript: String,
+    model_id: String,
+    audio_content_hash: String,
+    source_start_ms: Option<i64>,
+    source_end_ms: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VoiceInventory {
@@ -59,12 +72,29 @@ fn resolution_authority_totals<'a>(
 fn voice_inventory_ready(report: &VoiceInventory) -> bool {
     // A long prepared WAV is intentionally split into multiple bounded review clips. Completeness is
     // therefore every disk WAV matched at least once and every resulting segment exact/usable—not the
-    // false assumption that WAV count must equal segment count.
+    // false assumption that WAV count must equal segment count. The doubled-generation check that the
+    // old equality used to provide incidentally now lives in `inventory` as an explicit refusal
+    // (`first_overlapping_window`), so relaxing this predicate no longer costs it.
     report.disk_wavs == report.matched_files
         && report.matched_segments >= report.disk_wavs
         && report.matched_segments == report.usable_7b_segments
         && report.missing_files.is_empty()
         && report.invalid_segments.is_empty()
+}
+
+/// The first pair of canonical source windows of ONE recording that OVERLAP, as `(earlier, later)`
+/// segment ids. Sorts `windows` in place.
+///
+/// `review_pool::activate` refuses two members that share the exact (content hash, start, end)
+/// activation triple, so an identical-settings double import already collides there. A SPAN-DIVERGENT
+/// double — the same recording re-imported under a different `max_segment_duration` or VAD threshold —
+/// produces different windows over the same audio, clears that triple, and would bind BOTH generations
+/// into the pool: the same audio servable and PAYABLE twice. Overlap within one content hash is the
+/// only check that sees it, and it does NOT re-break the bounded-span case: contiguous clips cut from
+/// one long prepared WAV never overlap.
+fn first_overlapping_window(spans: &mut [(i64, i64, String)]) -> Option<(String, String)> {
+    spans.sort_unstable();
+    spans.windows(2).find(|pair| pair[1].0 < pair[0].1).map(|pair| (pair[0].2.clone(), pair[1].2.clone()))
 }
 
 fn usage() -> &'static str {
@@ -499,25 +529,45 @@ fn submission_idempotency_authority(db: &Database) -> Result<bool, String> {
 
 fn inventory(db: &Database, specs: &[VoiceSpec]) -> Result<(Vec<VoiceInventory>, Vec<PoolMemberInput>), String> {
     let champion_model_id = review_pool::current_champion_7b_model_id(db)?;
-    let mut by_path: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    let mut by_path: HashMap<String, Vec<LibrarySegment>> = HashMap::new();
     let mut statement = db
         .connection()
-        .prepare("SELECT id, audio_path, raw_transcript, COALESCE(model_version_id, '') FROM speech_segments")
+        .prepare(
+            "SELECT id, audio_path, raw_transcript, COALESCE(model_version_id, ''),
+                    COALESCE(audio_content_hash, ''),
+                    json_extract(alignment_json, '$.source_start_ms'),
+                    json_extract(alignment_json, '$.source_end_ms')
+               FROM speech_segments",
+        )
         .map_err(|error| format!("library inventory cannot be prepared: {error}"))?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            Ok((
+                row.get::<_, String>(1)?,
+                LibrarySegment {
+                    id: row.get(0)?,
+                    raw_transcript: row.get(2)?,
+                    model_id: row.get(3)?,
+                    audio_content_hash: row.get(4)?,
+                    source_start_ms: row.get(5)?,
+                    source_end_ms: row.get(6)?,
+                },
+            ))
         })
         .map_err(|error| format!("library inventory cannot be read: {error}"))?;
     for row in rows {
-        let (id, audio_path, raw_transcript, model_id) =
-            row.map_err(|error| format!("library inventory row is unreadable: {error}"))?;
-        by_path.entry(normalized_path(Path::new(&audio_path))).or_default().push((id, raw_transcript, model_id));
+        let (audio_path, segment) = row.map_err(|error| format!("library inventory row is unreadable: {error}"))?;
+        by_path.entry(normalized_path(Path::new(&audio_path))).or_default().push(segment);
     }
 
     let mut reports = Vec::new();
     let mut members = Vec::new();
     let mut assigned_segments: HashMap<String, String> = HashMap::new();
+    // Every canonical audio window this activation would bind, keyed by RECORDING identity. All clips
+    // cut from one source share its `audio_content_hash` (blake3 over the decoded PCM), so this groups
+    // the two generations of a doubled import together even when they were imported under different
+    // file names — which is where the money leak hides.
+    let mut windows_by_recording: HashMap<String, Vec<(i64, i64, String)>> = HashMap::new();
     for spec in specs {
         let wavs = collect_wavs(&spec.directory)?;
         if wavs.is_empty() {
@@ -536,22 +586,43 @@ fn inventory(db: &Database, specs: &[VoiceSpec]) -> Result<(Vec<VoiceInventory>,
             };
             matched_files += 1;
             matched_segments += segments.len();
-            for (segment_id, raw_transcript, model_id) in segments {
-                let draft = raw_transcript.trim();
-                let usable = !(draft.is_empty() || draft.starts_with('[') && draft.ends_with(']'))
-                    && model_id == &champion_model_id;
+            for segment in segments {
+                let segment_id = &segment.id;
+                let model_id = &segment.model_id;
+                let draft = segment.raw_transcript.trim();
+                // The shared authority, not a re-implementation: an inventory that called 'n/a' usable
+                // while the serving queue did not is exactly the drift this pool gate exists to catch.
+                let usable =
+                    !cortex_speech_app_lib::quality::is_placeholder_transcript(draft) && model_id == &champion_model_id;
                 if !usable {
                     invalid_segments.push(format!("{segment_id}:{model_id}"));
                     continue;
                 }
                 usable_7b_segments += 1;
-                if let Some(existing) = assigned_segments.insert(segment_id.clone(), spec.name.clone()) {
-                    if !existing.eq_ignore_ascii_case(&spec.name) {
+                // Activation binds (content hash, start, end); a clip missing either half of that
+                // identity is refused there, so refuse it HERE too rather than let `inventory` report
+                // an activation that cannot happen.
+                if segment.audio_content_hash.is_empty() {
+                    return Err(format!("segment {segment_id} has no canonical audio-content hash"));
+                }
+                let (Some(start_ms), Some(end_ms)) = (segment.source_start_ms, segment.source_end_ms) else {
+                    return Err(format!("segment {segment_id} has no canonical source span"));
+                };
+                match assigned_segments.insert(segment_id.clone(), spec.name.clone()) {
+                    Some(existing) if !existing.eq_ignore_ascii_case(&spec.name) => {
                         return Err(format!(
                             "segment {segment_id} appears in both voice {existing} and voice {}",
                             spec.name
-                        ));
+                        ))
                     }
+                    // Already counted from a nested/overlapping prepared directory: one segment is one
+                    // window, and re-adding it would look like an overlap with itself.
+                    Some(_) => {}
+                    None => windows_by_recording.entry(segment.audio_content_hash.clone()).or_default().push((
+                        start_ms,
+                        end_ms,
+                        segment_id.clone(),
+                    )),
                 }
                 members.push(PoolMemberInput { segment_id: segment_id.clone(), voice_name: spec.name.clone() });
             }
@@ -569,6 +640,14 @@ fn inventory(db: &Database, specs: &[VoiceSpec]) -> Result<(Vec<VoiceInventory>,
             missing_files,
             invalid_segments,
         });
+    }
+    for (content_hash, mut windows) in windows_by_recording {
+        if let Some((earlier, later)) = first_overlapping_window(&mut windows) {
+            return Err(format!(
+                "segments {earlier} and {later} cover overlapping audio of recording {content_hash}: \
+                 a doubled import generation would be servable and payable twice"
+            ));
+        }
     }
     members.sort_unstable_by(|left, right| left.segment_id.cmp(&right.segment_id));
     members.dedup_by(|left, right| left.segment_id == right.segment_id);
@@ -1062,6 +1141,35 @@ mod tests {
     #[test]
     fn long_wavs_may_expand_to_multiple_exact_review_segments() {
         assert!(voice_inventory_ready(&report()));
+    }
+
+    #[test]
+    fn a_span_divergent_double_import_generation_is_refused() {
+        // The hole e021ffe opened: relaxing `matched_segments == disk_wavs` to `>=` was correct for
+        // bounded spans, but it was also the only thing that could notice a DOUBLED import generation.
+        // Two generations of one recording cut at different `max_segment_duration` / VAD settings share
+        // no (content hash, start, end) triple, so `review_pool::activate`'s identical-window check waves
+        // them through — and every second of that audio becomes servable and PAYABLE twice.
+        let mut doubled = vec![
+            (0, 5_000, "gen-a-1".to_string()),
+            (5_000, 10_000, "gen-a-2".to_string()),
+            (0, 3_000, "gen-b-1".to_string()),
+            (3_000, 10_000, "gen-b-2".to_string()),
+        ];
+        assert!(first_overlapping_window(&mut doubled).is_some(), "a span-divergent double must be refused");
+
+        // The identical-settings double, which activation also refuses on the activation triple.
+        let mut identical = vec![(0, 5_000, "first".to_string()), (0, 5_000, "second".to_string())];
+        assert!(first_overlapping_window(&mut identical).is_some());
+
+        // And the case e021ffe fixed must still pass: one long prepared WAV cut into contiguous
+        // bounded review clips is NOT a duplicate generation.
+        let mut bounded = vec![
+            (0, 5_000, "clip-1".to_string()),
+            (5_000, 10_000, "clip-2".to_string()),
+            (10_000, 12_500, "clip-3".to_string()),
+        ];
+        assert_eq!(first_overlapping_window(&mut bounded), None, "contiguous bounded spans must still activate");
     }
 
     #[test]

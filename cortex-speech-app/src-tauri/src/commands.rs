@@ -1182,6 +1182,15 @@ where
 }
 
 /// Record the FIRST failure only, so the reported cause is the one that actually stopped the run.
+/// The terminal cause of a batch run, or `None` — the ONLY shape that may be reported as `completed`.
+///
+/// A per-clip failure comes first because it is the harder stop (clips were left undrafted). A
+/// post-batch jury failure keeps its own wording: every clip WAS drafted, so borrowing the per-clip
+/// "remaining clips were not transcribed" phrasing would be its own small lie.
+fn batch_terminal_halt_cause(clip_failure: Option<String>, jury_failure: Option<String>) -> Option<String> {
+    clip_failure.or_else(|| jury_failure.map(|error| format!("post-batch jury adjudication failed: {error}")))
+}
+
 fn record_first_failure(slot: &std::sync::Mutex<Option<String>>, message: String) {
     if let Ok(mut guard) = slot.lock() {
         if guard.is_none() {
@@ -1477,6 +1486,11 @@ pub fn batch_transcribe(
             }
         }
 
+        // A post-batch jury failure is NOT a clean run. The drafts landed, but the adjudication that
+        // decides what the review queue and the escalation path see did not — and this was log-only
+        // while the terminal event below still said `completed`. That is the same flattering-finish
+        // shape the hard stop above exists to kill: nobody reads the log, everybody reads the event.
+        let mut jury_failure: Option<String> = None;
         if !transcribed_ids.is_empty() {
             if let Some(app_state) = app_clone.try_state::<AppState>() {
                 let settings = app_state.lock_settings().clone();
@@ -1490,6 +1504,7 @@ pub fn batch_transcribe(
                     run_jury_pipeline_core_via(db, &settings, transcribed_ids, jury_data_dir.as_deref())
                 }) {
                     log_jury_pipeline_failure("batch transcription", &error);
+                    jury_failure = Some(error);
                 }
             }
         }
@@ -1497,13 +1512,14 @@ pub fn batch_transcribe(
         // A run that stopped on a failure is reported as HALTED, with the first cause named. It must
         // never arrive at the UI as an ordinary "completed" — that is precisely how a half-drafted
         // dataset gets mistaken for a finished one.
-        let halted_by = first_failure.into_inner().ok().flatten();
-        if let Some(reason) = &halted_by {
+        let clip_failure = first_failure.into_inner().ok().flatten();
+        if let Some(reason) = &clip_failure {
             tracing::error!(
                 "Batch transcribe HARD-STOPPED after {succeeded} succeeded, {skipped} skipped: {reason}. \
                  Remaining clips were NOT transcribed; the dataset is incomplete, not finished."
             );
         }
+        let halted_by = batch_terminal_halt_cause(clip_failure, jury_failure);
         emit_or_log(
             &app_clone,
             "batch-progress",
@@ -8786,6 +8802,25 @@ pub fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_post_batch_jury_failure_is_never_reported_as_a_completed_batch() {
+        // The failure was log-only while the terminal `batch-progress` event still said
+        // type:"completed" — the adjudication that decides what the review queue sees had failed and
+        // nothing above the log said so.
+        let jury = batch_terminal_halt_cause(None, Some("jury db unavailable".into()))
+            .expect("a jury failure must produce a halt cause, not a clean completion");
+        assert!(jury.contains("jury"), "{jury}");
+
+        // A per-clip hard stop still wins and keeps its own cause.
+        assert_eq!(
+            batch_terminal_halt_cause(Some("segment x: decode failed".into()), Some("jury db unavailable".into())),
+            Some("segment x: decode failed".to_string())
+        );
+
+        // And a genuinely clean run is still allowed to report completion.
+        assert_eq!(batch_terminal_halt_cause(None, None), None);
+    }
 
     fn test_segment(id: &str, audio_path: &str, raw_transcript: &str) -> crate::db::SpeechSegment {
         crate::db::SpeechSegment {

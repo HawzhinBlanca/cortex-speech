@@ -328,6 +328,10 @@ pub fn classify_memory_outcome(
 /// phonetic match clearing the structural gates), mirroring `apply_memories`'s selection exactly. The
 /// eligibility gates are disabled (via `cfg`) so a not-yet-confident memory is still counted. Deduped:
 /// a memory that wins several slots appears once.
+///
+/// "Mirroring `apply_memories` exactly" includes `cfg.context`: this used to hard-code the Exact slot
+/// rule, so under `Either`/`Ignore` a memory could rewrite a word while `fired_memories_summary`
+/// reported no provenance for it and `classify_memory_outcomes` credited the change to nobody.
 fn firing_winner_indices(text: &str, memories: &[MemoryEntry], cfg: &FiringConfig) -> Vec<usize> {
     let normalizer = char_only_normalizer();
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -343,7 +347,11 @@ fn firing_winner_indices(text: &str, memories: &[MemoryEntry], cfg: &FiringConfi
         let best = memories
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.slot_key == slot_key && m.confidence > cfg.tau_conf && m.hit_count >= cfg.min_hits)
+            .filter(|(_, m)| {
+                cfg.context.matches(&m.slot_key, left, right, &slot_key)
+                    && m.confidence > cfg.tau_conf
+                    && m.hit_count >= cfg.min_hits
+            })
             .map(|(idx, m)| (idx, crate::diff::phonetic::normalized_phonetic_word_distance(word_norm, &m.phonetic_key)))
             .filter(|(_, dist)| *dist <= cfg.phon_tau)
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -464,6 +472,30 @@ mod tests {
             apply_memories(elsewhere, &[mem], &gated(ContextMode::Ignore)) != elsewhere,
             "Ignore drops the context requirement entirely — this is the harmful mode, kept only for measurement"
         );
+    }
+
+    #[test]
+    fn the_firing_provenance_winner_set_honours_the_configured_context_mode() {
+        // `firing_winner_indices` hard-coded the Exact slot rule while `apply_memories` consulted
+        // `cfg.context`. Under a looser mode the rewrite happened but nothing explained it: the LOOP-0
+        // provenance line was empty and `classify_memory_outcomes` credited no memory for a change it
+        // had made — evidence silently diverging from the text it is supposed to score.
+        let memories = [captured_entry("ئەو ساڵە باش بوو", "ئەو ساڵە خراپ بوو", 1.0, 5)];
+        let gated = |context| FiringConfig { phon_tau: 0.2, tau_conf: 0.0, min_hits: 0, context };
+        let elsewhere = "ژنێکی زۆر باش دیتم"; // neither recorded neighbour is present
+
+        let ignore = gated(ContextMode::Ignore);
+        assert_ne!(apply_memories(elsewhere, &memories, &ignore), elsewhere, "precondition: Ignore rewrites this");
+        assert_eq!(
+            fired_memories_summary(elsewhere, &memories, &ignore).len(),
+            1,
+            "a rewrite must name the memory that made it under EVERY context mode"
+        );
+
+        // The shipped Exact rule is unchanged: nothing fires, so nothing is claimed.
+        let exact = gated(ContextMode::Exact);
+        assert_eq!(apply_memories(elsewhere, &memories, &exact), elsewhere);
+        assert!(fired_memories_summary(elsewhere, &memories, &exact).is_empty());
     }
 
     #[test]
