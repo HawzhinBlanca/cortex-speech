@@ -1,8 +1,20 @@
 //! Serialized human-review effect writes that already expose a stable database-domain contract.
 
 use crate::database_runtime::DatabaseRuntime;
-use crate::db::{HumanDecisionUndoOutcome, HumanFlagCommit, HumanFlagUndoOutcome};
-use crate::error::AppResult;
+use crate::db::{
+    HumanDecisionCommit, HumanDecisionUndoOutcome, HumanFlagCommit, HumanFlagUndoOutcome, PlaybackDecisionProof,
+};
+use crate::error::{AppError, AppResult};
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReviewCommitError {
+    #[error("the review segment no longer exists")]
+    SegmentNotFound,
+    #[error("the review revision is stale; current revision is {current_revision}")]
+    StaleRevision { current_revision: i64 },
+    #[error(transparent)]
+    Backend(#[from] AppError),
+}
 
 #[derive(Clone)]
 pub(crate) struct ReviewWriteStore {
@@ -19,6 +31,78 @@ impl ReviewWriteStore {
             tracing::warn!(operation, "Recovering poisoned database lock during a review write");
             poisoned.into_inner()
         })
+    }
+
+    /// Legacy desktop compatibility boundary. Exact operation replay is resolved before current
+    /// playback preflight because the first successful decision advances the review revision.
+    pub(crate) fn commit_legacy_decision(
+        &self,
+        segment_id: &str,
+        decision: &str,
+        corrected_transcript: Option<&str>,
+        timestamp_ms: Option<i64>,
+        operation_id: &str,
+    ) -> AppResult<HumanDecisionCommit> {
+        let database = self.lock("record_human_decision");
+        if let Some(commit) = database.replay_desktop_human_decision(
+            segment_id,
+            decision,
+            corrected_transcript,
+            timestamp_ms,
+            operation_id,
+        )? {
+            return Ok(commit);
+        }
+        let playback = require_listened(&database, segment_id)?;
+        database.finalize_human_review_with_playback(
+            segment_id,
+            decision,
+            corrected_transcript,
+            timestamp_ms,
+            &playback,
+            operation_id,
+        )
+    }
+
+    /// Revision-bound typed desktop commit. Draft clearing remains inside the database transaction;
+    /// a replay may clear only the draft for the original base revision.
+    pub(crate) fn commit_typed_decision(
+        &self,
+        segment_id: &str,
+        base_revision: i64,
+        decision: &str,
+        transcript: Option<&str>,
+        operation_id: &str,
+    ) -> Result<HumanDecisionCommit, ReviewCommitError> {
+        let database = self.lock("commit_review_v1");
+        if let Some(commit) = database.replay_desktop_review_v1_and_clear_draft(
+            segment_id,
+            base_revision,
+            decision,
+            transcript,
+            operation_id,
+        )? {
+            return Ok(commit);
+        }
+
+        let Some((_segment, current_revision)) = database.get_segment_by_id_with_revision(segment_id)? else {
+            return Err(ReviewCommitError::SegmentNotFound);
+        };
+        if current_revision != base_revision {
+            return Err(ReviewCommitError::StaleRevision { current_revision });
+        }
+
+        let playback = require_listened(&database, segment_id)?;
+        database
+            .finalize_desktop_review_v1_with_playback(
+                segment_id,
+                base_revision,
+                decision,
+                transcript,
+                &playback,
+                operation_id,
+            )
+            .map_err(ReviewCommitError::from)
     }
 
     pub(crate) fn undo_human_decision(
@@ -45,6 +129,47 @@ impl ReviewWriteStore {
 
     pub(crate) fn clear_legacy_decision(&self, segment_id: &str) -> AppResult<()> {
         self.lock("clear_human_decision").clear_human_decision(segment_id)
+    }
+}
+
+/// Server-authoritative playback preflight shared by both desktop review contracts. The caller can
+/// supply only a segment identity; revision, decoded-audio hash, canonical source span and the
+/// evidence verdict are all resolved from the database under the serialized writer lock.
+pub(crate) fn require_listened(database: &crate::db::Database, segment_id: &str) -> AppResult<PlaybackDecisionProof> {
+    let audio_content_hash = database
+        .segment_audio_content_hash(segment_id)
+        .map_err(|error| AppError::Other(format!("playback identity lookup failed: {error}")))?
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "E_NO_AUDIO_CONTENT_HASH: segment {segment_id} has no server-derived audio content hash"
+            ))
+        })?;
+    let segment_revision = database
+        .segment_review_revision(segment_id)
+        .map_err(|error| AppError::Other(format!("playback revision lookup failed: {error}")))?
+        .unwrap_or(0);
+    let (source_start_ms, source_end_ms) = database
+        .segment_source_span(segment_id)
+        .map_err(|error| AppError::Other(format!("playback source-span lookup failed: {error}")))?
+        .ok_or_else(|| {
+            AppError::Other(format!("E_NO_AUDIO_SOURCE_SPAN: segment {segment_id} has no canonical server source span"))
+        })?;
+    match database.has_sufficient_playback_evidence(segment_id, segment_revision, &audio_content_hash, None) {
+        Ok(true) => Ok(PlaybackDecisionProof { segment_revision, audio_content_hash, source_start_ms, source_end_ms }),
+        Ok(false) => {
+            tracing::warn!(
+                "PLAYBACK_EVIDENCE_V3_CONTENT_HASH_RAW_COUNTER_REFUSED: {segment_id} on the desktop at revision {segment_revision}"
+            );
+            Err(AppError::Other(
+                database
+                    .require_playback_evidence(segment_id, segment_revision, &audio_content_hash, None)
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
+            ))
+        }
+        // A database fault is not evidence that the reviewer failed to listen.
+        Err(error) => Err(AppError::Other(format!("playback evidence check failed: {error}"))),
     }
 }
 

@@ -9,5 +9,7 @@ mod segment_query;
 
 pub(crate) use playback::{PlaybackObservation, PlaybackWriteStore};
 pub(crate) use review_draft::{ReviewDraftRecord, ReviewDraftStore};
-pub(crate) use review_write::ReviewWriteStore;
+#[cfg(test)]
+pub(crate) use review_write::require_listened;
+pub(crate) use review_write::{ReviewCommitError, ReviewWriteStore};
 pub(crate) use segment_query::SegmentQueryStore;

@@ -1,4 +1,4 @@
-"""Architecture policy for the human-review effect write-store slice."""
+"""Architecture policy for the serialized desktop human-review write boundary."""
 
 from pathlib import Path
 
@@ -28,6 +28,13 @@ def test_store_is_backend_only_and_serializes_each_effect_write() -> None:
         "struct ReviewWriteStore",
         "runtime: DatabaseRuntime",
         "self.runtime.lock()",
+        "commit_legacy_decision",
+        "commit_typed_decision",
+        "replay_desktop_human_decision",
+        "replay_desktop_review_v1_and_clear_draft",
+        "finalize_human_review_with_playback",
+        "finalize_desktop_review_v1_with_playback",
+        "has_sufficient_playback_evidence",
         "undo_human_decision",
         "record_review_flag",
         "undo_review_flag",
@@ -40,6 +47,8 @@ def test_store_is_backend_only_and_serializes_each_effect_write() -> None:
 def test_migrated_commands_validate_then_delegate_without_raw_database_authority() -> None:
     commands = read("commands/segments_write.rs").split("#[cfg(test)]", 1)[0]
     expectations = {
+        "record_human_decision": "record_human_decision_on(",
+        "commit_review_v1": "commit_review_v1_on(",
         "undo_human_decision": ".undo_human_decision(",
         "record_review_flag": ".record_flag(",
         "undo_review_flag": ".undo_flag(",
@@ -57,6 +66,14 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
     for required in ("validate::validate_identifier(&segment_id)", "validate::validate_text(&rationale"):
         if required not in flag:
             raise AssertionError(f"record_review_flag lost command-layer validation: {required}")
+
+    for helper in ("fn record_human_decision_on(", "fn commit_review_v1_on("):
+        start = commands.find(helper)
+        if start < 0:
+            raise AssertionError(f"missing review command adapter: {helper}")
+        body = commands[start : commands.find("\n}", start) + 2]
+        if "ReviewWriteStore" not in body or "crate::db::Database" in body:
+            raise AssertionError(f"{helper} does not stay on the review-store boundary")
 
 
 def test_identity_free_clear_stays_retired_and_undo_stays_effect_bound() -> None:

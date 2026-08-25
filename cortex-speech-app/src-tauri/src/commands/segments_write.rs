@@ -243,51 +243,6 @@ pub fn rename_speaker(old_id: String, new_id: String, state: State<'_, AppState>
     db.rename_speaker(&old_id, &new_id).map_err(|e| e.to_string())
 }
 
-/// The desktop half of the listening bar, extracted so it can be tested without a Tauri `State`.
-///
-/// The desktop was the last way to write a verdict on a clip nobody heard: `ReviewMode` posted a
-/// receipt on accept/edit but not on reject, `ReviewInbox` posted none at all, and the command never
-/// asked for one — so the comment in ReviewMode claiming "the backend refuses a verdict without
-/// sufficient evidence" described an intent that was never implemented. Both surfaces post now, and
-/// this is the check that makes it mean something.
-fn require_listened(db: &crate::db::Database, segment_id: &str) -> Result<crate::db::PlaybackDecisionProof, String> {
-    let content_hash = db
-        .segment_audio_content_hash(segment_id)
-        .map_err(|error| format!("playback identity lookup failed: {error}"))?
-        .ok_or_else(|| {
-            format!("E_NO_AUDIO_CONTENT_HASH: segment {segment_id} has no server-derived audio content hash")
-        })?;
-    let revision = db
-        .segment_review_revision(segment_id)
-        .map_err(|error| format!("playback revision lookup failed: {error}"))?
-        .unwrap_or(0);
-    let (source_start_ms, source_end_ms) = db
-        .segment_source_span(segment_id)
-        .map_err(|error| format!("playback source-span lookup failed: {error}"))?
-        .ok_or_else(|| format!("E_NO_AUDIO_SOURCE_SPAN: segment {segment_id} has no canonical server source span"))?;
-    match db.has_sufficient_playback_evidence(segment_id, revision, &content_hash, None) {
-        Ok(true) => Ok(crate::db::PlaybackDecisionProof {
-            segment_revision: revision,
-            audio_content_hash: content_hash,
-            source_start_ms,
-            source_end_ms,
-        }),
-        Ok(false) => {
-            tracing::warn!(
-                "PLAYBACK_EVIDENCE_V3_CONTENT_HASH_RAW_COUNTER_REFUSED: {segment_id} on the desktop at revision {revision}"
-            );
-            Err(db
-                .require_playback_evidence(segment_id, revision, &content_hash, None)
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()))
-        }
-        // Not a verdict about the reviewer: an unwell database cannot answer the question, and
-        // telling someone who listened that they did not is both false and unactionable.
-        Err(e) => Err(format!("playback evidence check failed: {e}")),
-    }
-}
-
 #[tauri::command]
 pub fn record_human_decision(
     state: State<'_, AppState>,
@@ -304,9 +259,8 @@ pub fn record_human_decision(
     if let Some(t) = corrected_transcript.as_deref() {
         validate::validate_text(t, 100_000, "Corrected transcript")?;
     }
-    let db = state.lock_db();
     let commit = record_human_decision_on(
-        &db,
+        &state.review_writes(),
         &segment_id,
         &decision,
         corrected_transcript.as_deref(),
@@ -314,11 +268,7 @@ pub fn record_human_decision(
         &operation_id,
     )?;
 
-    // M2.6: Update session with current review segment for cursor persistence on restart.
-    let mut session = state.lock_session();
-    session.set_current_segment(&segment_id);
-    let _ = session.save(&db);
-
+    state.persist_review_cursor(&segment_id);
     Ok(commit)
 }
 
@@ -483,7 +433,7 @@ fn committed_review_v1(commit: crate::db::HumanDecisionCommit) -> CommittedRevie
 }
 
 fn commit_review_v1_on(
-    db: &crate::db::Database,
+    store: &crate::stores::ReviewWriteStore,
     request: &CommitReviewRequestV1,
 ) -> Result<CommittedReviewV1, CommandErrorV1> {
     let invalid =
@@ -541,47 +491,25 @@ fn commit_review_v1_on(
         }
     };
 
-    if let Some(commit) = db
-        .replay_desktop_review_v1_and_clear_draft(
-            &request.segment_id,
-            request.base_revision,
-            decision,
-            transcript,
-            &request.operation_id,
-        )
-        .map_err(|error| public_review_error(&error.to_string(), &request.operation_id))?
-    {
-        return Ok(committed_review_v1(commit));
-    }
-
-    let Some((_segment, current_revision)) = db
-        .get_segment_by_id_with_revision(&request.segment_id)
-        .map_err(|error| public_review_error(&error.to_string(), &request.operation_id))?
-    else {
-        return Err(CommandErrorV1::new("SEGMENT_NOT_FOUND", "This clip no longer exists.", false)
-            .operation(&request.operation_id)
-            .suggested(SuggestedActionV1::ReloadClip));
-    };
-    if current_revision != request.base_revision {
-        return Err(CommandErrorV1::new("STALE_REVISION", "This clip changed; reload it before saving.", false)
-            .operation(&request.operation_id)
-            .suggested(SuggestedActionV1::ReloadClip)
-            .detail("expectedRevision", request.base_revision)
-            .detail("currentRevision", current_revision));
-    }
-
-    let playback = require_listened(db, &request.segment_id)
-        .map_err(|error| public_review_error(&error, &request.operation_id))?;
-    let commit = db
-        .finalize_desktop_review_v1_with_playback(
-            &request.segment_id,
-            request.base_revision,
-            decision,
-            transcript,
-            &playback,
-            &request.operation_id,
-        )
-        .map_err(|error| public_review_error(&error.to_string(), &request.operation_id))?;
+    let commit = store
+        .commit_typed_decision(&request.segment_id, request.base_revision, decision, transcript, &request.operation_id)
+        .map_err(|error| match error {
+            crate::stores::ReviewCommitError::SegmentNotFound => {
+                CommandErrorV1::new("SEGMENT_NOT_FOUND", "This clip no longer exists.", false)
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::ReloadClip)
+            }
+            crate::stores::ReviewCommitError::StaleRevision { current_revision } => {
+                CommandErrorV1::new("STALE_REVISION", "This clip changed; reload it before saving.", false)
+                    .operation(&request.operation_id)
+                    .suggested(SuggestedActionV1::ReloadClip)
+                    .detail("expectedRevision", request.base_revision)
+                    .detail("currentRevision", current_revision)
+            }
+            crate::stores::ReviewCommitError::Backend(source) => {
+                public_review_error(&source.to_string(), &request.operation_id)
+            }
+        })?;
     Ok(committed_review_v1(commit))
 }
 
@@ -598,46 +526,22 @@ pub fn commit_review_v1(
             .operation(&request.operation_id)
             .suggested(SuggestedActionV1::Retry)
     })?;
-    let db = state.lock_db();
-    let commit = commit_review_v1_on(&db, &request)?;
-    let mut session = state.lock_session();
-    session.set_current_segment(&request.segment_id);
-    let _ = session.save(&db);
+    let commit = commit_review_v1_on(&state.review_writes(), &request)?;
+    state.persist_review_cursor(&request.segment_id);
     Ok(commit)
 }
 
 fn record_human_decision_on(
-    db: &crate::db::Database,
+    store: &crate::stores::ReviewWriteStore,
     segment_id: &str,
     decision: &str,
     corrected_transcript: Option<&str>,
     timestamp_ms: Option<i64>,
     operation_id: &str,
 ) -> Result<crate::db::HumanDecisionCommit, String> {
-    // A successful first attempt advanced the revision, so its old playback receipt is correctly no
-    // longer current. Resolve an exact lost-response replay by immutable operation identity before
-    // asking for fresh evidence; the writer repeats this check under BEGIN IMMEDIATE for races.
-    if let Some(commit) = db
-        .replay_desktop_human_decision(segment_id, decision, corrected_transcript, timestamp_ms, operation_id)
-        .map_err(|error| error.to_string())?
-    {
-        return Ok(commit);
-    }
-
-    let playback = require_listened(db, segment_id)?;
-
-    // ONE commit: decision, transcript, attribution and `verified` together. Two writes left nine
-    // rows decided-but-pending on the live library — ReviewMode's second `update_segment_fields`
-    // covered it, ReviewInbox never made that call, so its decisions never reached the corpus.
-    db.finalize_human_review_with_playback(
-        segment_id,
-        decision,
-        corrected_transcript,
-        timestamp_ms,
-        &playback,
-        operation_id,
-    )
-    .map_err(|e| e.to_string())
+    store
+        .commit_legacy_decision(segment_id, decision, corrected_transcript, timestamp_ms, operation_id)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -740,11 +644,13 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 mod tests {
     use super::{
         commit_review_v1_on, persist_segment_fields_on, persist_whole_segment_update_on, record_human_decision_on,
-        require_listened, validate_playback_receipt_identity,
+        validate_playback_receipt_identity,
     };
+    use crate::database_runtime::DatabaseRuntime;
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
     use crate::history::HistoryManager;
     use crate::ipc_contract::{CommitReviewRequestV1, ReviewDecisionV1};
+    use crate::stores::{require_listened, ReviewWriteStore};
 
     fn db_with_clip(dir: &std::path::Path, id: &str) -> Database {
         let db = Database::open(dir.join("t.db").to_str().unwrap()).unwrap();
@@ -767,6 +673,11 @@ mod tests {
             )
             .unwrap();
         db
+    }
+
+    fn review_store(database: &Database) -> ReviewWriteStore {
+        let writer = Database::open(database.path()).expect("open independent serialized review writer");
+        ReviewWriteStore::new(DatabaseRuntime::new(writer))
     }
 
     fn receipt(db: &Database, id: &str, played: i64) {
@@ -948,11 +859,11 @@ mod tests {
         let db = db_with_clip(tmp.path(), "d1");
 
         let refused = require_listened(&db, "d1").expect_err("no receipt at all must be refused");
-        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "the reason must be legible: {refused}");
+        assert!(refused.to_string().contains("E_NO_PLAYBACK_EVIDENCE"), "the reason must be legible: {refused}");
 
         receipt(&db, "d1", 3_000); // 30% of a 10s clip
         let refused = require_listened(&db, "d1").expect_err("a third of a clip is not a listen");
-        assert!(refused.contains("E_NO_PLAYBACK_EVIDENCE"), "{refused}");
+        assert!(refused.to_string().contains("E_NO_PLAYBACK_EVIDENCE"), "{refused}");
 
         receipt(&db, "d1", 9_000); // 90%, clear of the 0.85 bar
         require_listened(&db, "d1").expect("a clip heard to the bar must be decidable");
@@ -996,8 +907,9 @@ mod tests {
         let db = db_with_clip(tmp.path(), "desktop-command-replay");
         receipt(&db, "desktop-command-replay", 9_000);
         let operation_id = "22222222-2222-4222-8222-222222222222";
+        let store = review_store(&db);
         let first = record_human_decision_on(
-            &db,
+            &store,
             "desktop-command-replay",
             "accept",
             Some("دەق"),
@@ -1014,7 +926,7 @@ mod tests {
             "the original receipt is correctly stale after the decision advanced the revision"
         );
         let replay = record_human_decision_on(
-            &db,
+            &store,
             "desktop-command-replay",
             "accept",
             Some("دەق"),
@@ -1048,7 +960,8 @@ mod tests {
             reason_code: None,
             playback_receipt_id: None,
         };
-        let first = commit_review_v1_on(&db, &request).expect("typed commit");
+        let store = review_store(&db);
+        let first = commit_review_v1_on(&store, &request).expect("typed commit");
         assert_eq!(first.segment_id, "typed-review");
         assert_eq!(first.authoritative_transcript, "دەق");
         assert!(first.decision_id.starts_with("effect:"));
@@ -1066,7 +979,7 @@ mod tests {
             )
             .unwrap();
 
-        let replay = commit_review_v1_on(&db, &request).expect("lost-response replay");
+        let replay = commit_review_v1_on(&store, &request).expect("lost-response replay");
         assert_eq!(replay, first, "an exact typed retry returns the original effect");
         let draft_count: i64 = db
             .connection()
@@ -1081,7 +994,7 @@ mod tests {
                 rusqlite::params!["typed-review", first.committed_revision],
             )
             .unwrap();
-        let replay = commit_review_v1_on(&db, &request).expect("repeat lost-response replay");
+        let replay = commit_review_v1_on(&store, &request).expect("repeat lost-response replay");
         assert_eq!(replay, first);
         let retained_revision: i64 = db
             .connection()
@@ -1092,7 +1005,7 @@ mod tests {
         assert_eq!(retained_revision, first.committed_revision, "old replay must preserve newer work");
 
         let stale = CommitReviewRequestV1 { operation_id: "55555555-5555-4555-8555-555555555555".into(), ..request };
-        let error = commit_review_v1_on(&db, &stale).expect_err("a new operation cannot reuse the old revision");
+        let error = commit_review_v1_on(&store, &stale).expect_err("a new operation cannot reuse the old revision");
         assert_eq!(error.code, "STALE_REVISION");
         assert!(!error.retryable);
         assert_eq!(error.details.get("expectedRevision"), Some(&base_revision.into()));
@@ -1126,7 +1039,8 @@ mod tests {
             reason_code: None,
             playback_receipt_id: None,
         };
-        let error = commit_review_v1_on(&db, &request).expect_err("draft-clear failure must abort review truth");
+        let store = review_store(&db);
+        let error = commit_review_v1_on(&store, &request).expect_err("draft-clear failure must abort review truth");
         assert_eq!(error.code, "REVIEW_COMMIT_FAILED");
         let row = db.get_segment_by_id("draft-atomicity").unwrap().unwrap();
         assert!(row.human_decision.is_none() && !row.verified, "human truth must roll back with draft clear");
@@ -1182,7 +1096,7 @@ mod tests {
 
         let refused =
             require_listened(&db, "blank-fingerprint").expect_err("an identifier fallback is not exact audio identity");
-        assert!(refused.contains("E_NO_AUDIO_CONTENT_HASH"), "{refused}");
+        assert!(refused.to_string().contains("E_NO_AUDIO_CONTENT_HASH"), "{refused}");
 
         let error = db
             .record_playback_receipt(&PlaybackReceipt {

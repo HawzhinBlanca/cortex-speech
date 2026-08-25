@@ -317,6 +317,17 @@ impl AppState {
         }
     }
 
+    /// Best-effort navigation breadcrumb after durable review truth commits. Commands do not need
+    /// raw database authority merely to keep restart position current.
+    pub(crate) fn persist_review_cursor(&self, segment_id: &str) {
+        let db = self.lock_db();
+        let mut session = self.lock_session();
+        session.set_current_segment(segment_id);
+        if let Err(error) = session.save(&db) {
+            tracing::warn!("Review cursor save failed after durable commit: {error}");
+        }
+    }
+
     pub fn session_auto_save(&self) {
         let db = self.lock_db();
         if let Err(error) = self.lock_session().auto_save(&db) {
