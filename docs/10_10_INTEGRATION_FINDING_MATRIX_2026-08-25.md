@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `78f2a1c`
+**Current evidence commit:** `7370068`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -48,6 +48,7 @@ requires the immutable profile manifest and the external evidence listed under O
 | The production build enforces the initial 125 KB JavaScript and 15 KB CSS ceilings over the complete transitive static manifest; secondary workspaces load in explicit chunks with localized pending/failure states, retry, stale-load isolation and raw-error scrubbing. Preview/E2E typed review mocks are explicit and unknown commands fail loudly. | `deddfd3` | Executable oversized-transitive-dependency fault test; 2 lazy-boundary tests; frontend 310/310; Playwright 97/97 with zero retries; standalone preview traversed Insights → Settings → Review with zero console/page errors; all 115 Python policies | Cold-shell/review-usable timing, search/audio latency, long tasks, FPS and 1,000-decision heap proof remain open |
 | Desktop playback evidence writes cross a Tauri-free `PlaybackWriteStore`; its observation-only database DTO cannot express review revision, audio hash, source span or authoritative duration. The database resolves all identity and coverage fields while holding the serialized writer. | `08ae275` | 3 adversarial store tests prove client duration cannot shrink coverage, missing server audio identity creates no receipt, and invalid timing creates no partial write; 16 focused playback regressions; architecture policy; full Rust 1,587/0; all 116 Python policies; strict Clippy/rustfmt | Remaining review/payment writes still use the compatibility façade; the 50,000-segment concurrent review/import/backup and restore-reopen proofs remain open |
 | Desktop review-effect mutations cross a Tauri-free `ReviewWriteStore`: exact decision undo, review-flag creation, exact flag undo and the retired identity-free clear endpoint all serialize through `DatabaseRuntime`, while input/rate validation remains at the command boundary. | `78f2a1c` | 3 store regressions prove exact flag replay plus idempotent effect-bound undo, immutable-effect decision undo plus replay, and fail-closed identity-free clearing; architecture policy prevents migrated commands from regaining raw database authority; full Rust 1,590/0; all 117 Python policies; strict Clippy/rustfmt | Typed review commit and other review/payment write domains still use the compatibility façade; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
+| Both desktop human-decision contracts cross `ReviewWriteStore`: the legacy operation-ID boundary and typed revision-CAS boundary resolve exact replay before playback preflight, derive playback identity under the serialized writer, and commit review truth plus matching draft clear transactionally. Commands retain validation and typed DTO/error mapping but cannot acquire raw database authority. | `7370068` | Existing 11 command regressions now execute through an independently opened store writer and cover exact lost-response replay, stale-revision refusal, playback enforcement and injected draft-clear rollback; 3 store regressions; architecture policy; full Rust 1,590/0; all 117 Python policies; strict Clippy/rustfmt | Other review/payment writes and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 
 ## Integrated checkpoint evidence
 
@@ -93,4 +94,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `78f2a1c` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `7370068` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.

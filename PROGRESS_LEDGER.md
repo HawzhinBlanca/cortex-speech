@@ -16,7 +16,7 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `78f2a1c`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `7370068`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **117** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
 > **1,590 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
@@ -60,8 +60,14 @@
 > clear endpoint now delegate through a Tauri-free `ReviewWriteStore`. Three focused regressions pin
 > exact response-loss replay, payload-conflict refusal, one immutable reversal per effect, idempotent
 > undo, and continued refusal of authority-free clearing; the architecture policy prevents those
-> four migrated commands from regaining raw database access. Typed decision commit and other
-> review/payment writes remain open strangler work.
+> four migrated commands from regaining raw database access. `7370068` expands that same serialized
+> boundary to both desktop decision contracts. Legacy operation-ID replay and typed revision-CAS
+> replay are resolved before current playback preflight; playback identity is derived under the
+> writer lock; typed draft clearing remains in the human-truth transaction; stale revisions retain
+> structured public error details; and navigation cursor persistence no longer gives either command
+> raw database authority. The existing 11 command regressions now execute through the store and pin
+> lost-response replay, playback enforcement, stale-revision refusal and injected draft-clear
+> rollback. Other review/payment writes remain open strangler work.
 > This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
