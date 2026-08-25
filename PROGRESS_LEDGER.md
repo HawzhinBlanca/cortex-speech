@@ -11465,3 +11465,92 @@ at schema 65 with all 162 contract objects exact, quick/full integrity `ok`, zer
 `F:` snapshots, Alle/Rubar authenticating, and supervision green with 424.8 GB free. Human progress stayed
 two Rubar judgments, zero resolutions, and 0/20 post-release playback decisions. No reviewer restart,
 live database write, GPU, model server, ASR inference, or synthetic judgment occurred.
+## 2026-08-25 — deep adversarial audit, and the remediation of 53 of its 55 findings
+
+A 43-agent adversarial audit ran over the whole Rust/Python/Svelte surface at `1282578`
+(13 subsystem hunters, one skeptic per finding instructed to REFUTE by reading the code, then a
+completeness critic over the subsystems nobody owned; 855 tool uses). **51 defects survived
+verification — 6 high, 15 medium, 30 low — and 3 claims were refuted and recorded as refuted.**
+The report is `audit-2026-08-25/DEEP_BRUTAL_AUDIT.md`; what was done about it is
+`audit-2026-08-25/REMEDIATION.md`. Auditor's grade, explicitly a judgment and not harness output:
+**8.4/10**.
+
+Three gates were RED on the machine at the time, from real runs, not review opinion: the
+**CortexWatchdog scheduled task was registered but DISABLED** (healthy until 08-24 05:12, then
+disabled and never re-enabled — with the app restarting 4-9x/day this is the dead-phone-link
+incident re-armed); `PROGRESS_LEDGER.md` was **7 commits stale**; and `spot-check-pool` reported
+**0 of 1,107 required answer keys for each of 4 reviewers**. The watchdog is re-enabled and its gate
+now prints `WATCHDOG GATE: OK (CortexWatchdog state=Ready)`. This entry closes the second.
+
+The third is NOT fixed, deliberately: the gate's own contract says fixing it is an owner action,
+and fabricating answer keys is forbidden. The live database says 53 candidate keys exist
+(`verified = 1`, `reviewed_by IS NULL`) and **0 of them are inside the active focus** — the only
+honest remedies are owner adjudication at the desktop inside the focus, or narrowing the campaign.
+
+Fourteen fix commits landed (`86719e3`..`d759515`, plus `e69198c`), each carrying a regression gate.
+The six high findings: the champion's hard-stop event was emitted by the backend and silently
+dropped by the only frontend listener, so a halt wedged the UI at "transcribing" and never named its
+cause; `batch_importer` — the owner's primary import lane — built an empty `AudioFingerprint` and
+never rehydrated it, leaving the headless path with zero cross-run duplicate protection while
+printing a false "Resuming" line; `check_dataset_duplicates.py` divided sample counts by a hard-coded
+16 kHz and promised a resample step that did not exist anywhere in the file, so a 48k/16k pair of the
+same audio cleared as a legitimate repeat; pool and blinded-second-pass decisions passed the full
+playback-evidence gate and appended nothing to the ledger; and `run_gold_eval_with_transcriber`
+tallied per-clip failures into a `tracing::warn!` and published a headline CER over the survivors.
+
+**Correction on live evidence:** `review_pool_decisions` and `independent_review_decisions` are both
+**0 rows**. The unpaid-work defect is real and the wiring genuinely absent, but no reviewer has been
+shorted — the exposure is prospective. The readiness gate now counts and loudly reports uncredited
+playback-evidenced decisions per reviewer with duration, and **mints nothing**: whether a
+non-canonical second pass is payable under `review-iqd-v1-2026-08-21` is an owner decision requiring
+`change canon:`, not an agent's.
+
+Three defects were found while fixing, none of them in the audit. `review_pool.rs` carried two
+clippy errors and had **never been linted** — it is absent at `21c639d`, the last fully-swept commit,
+and arrived in `e2b256c`, one of the seven unledgered commits (verified with `git cat-file`), so the
+unledgered-commit problem was never mere bookkeeping. `test_rust_runtime_panic_policy.py` listed
+`remove_lock_file(&lock_path, "failed Unix instance lock acquisition")` as **required** — the very
+call by which a refused second instance deletes the live holder's lockfile; it is now forbidden. And
+two agent fixes overreached and were caught by existing tests: excluding placeholders (not just
+rejects) from the quality counters would have hidden clips the champion has not drafted, and a
+reviewed-baseline guard on the generic upserts made a conflicting upsert a silent no-op against the
+pinned v60 contract. Both narrowed/removed; `merge_dataset_json`'s own pre-existing guard was briefly
+removed with them and restored verbatim.
+
+One methodology error of mine, recorded because the honesty law applies to the auditor too: five
+`pipeline` tests were first reported as pre-existing failures. They were not. Running with
+`CARGO_TARGET_DIR=scratch-target` (to dodge the running app's DLL lock) put
+`scripts/cortex_7b_client.py` out of reach of `resolve_wsl_7b_client`, which walks up from
+`current_exe()`; the baseline comparison used the same flag, so the artifact reproduced and looked
+like proof. Against the normal target dir all five pass. **There are no pre-existing test failures.**
+
+Phase 4 went further than expected and hit a structural wall worth recording. Both scorecards are
+real measured runs over a byte-identical frozen manifest (`ed713075…`): champion
+`omniasr-7b-legacy-c348ade8a816` at **micro CER 7.913%** and challenger
+`omniasr-7b-challenger-eb0105fdb6a5` at **7.556%**, N=348 each. The champion's provenance sidecar —
+the missing piece that made a verdict impossible — was emitted with the repo's own
+`emit_scorecard_provenance.py`, which re-hashes every component from disk and fails closed against
+the manifest's pinned hashes; the adapter hashes to `c348ade8a816…`, matching `champion.json`'s
+`deploymentSha256` pin. But `promotion_gate.py` requires `--slices` and `build_eval_slices.py`
+refuses: `none of the 348 manifest row(s) name a clip in this library`. Protected slices derive from
+library metadata (speaker, dialect, SNR); the frozen FLEURS eval lives in `gold_segments`, which
+carries only id/path/reference/holdout/hash. **The challenger loop is structurally unclosable on the
+corpus canon designates as the frozen eval set** — that, not an unrun cycle, is why `runs/` holds
+zero verdicts. Closing it needs enriched gold metadata or an owner-authorized in-library holdout eval
+set. Weakening the slice requirement was not considered.
+
+Evidence, from real runs on this machine: `cargo test --lib` **1,542 passed, 0 failed, 8 ignored**
+(429.86s), and the db suite 209/209 after the final lint cleanup; `cargo clippy --all-targets --
+-D warnings` **clean** (it had 4 errors, two of them the never-linted `review_pool.rs` pair);
+`cargo fmt --check` clean; `npm run typecheck` **0 errors across 449 files**; `npm test` **297 passed
+across 56 files**; `npm run test:python-policies` **105 of 105 policy test scripts passed** (the
+ledger-staleness gate goes green with this entry). The policy suite grew 101 -> 105 scripts, and each new file
+was checked for a working `__main__` block — without one it is counted as passed while asserting
+nothing. Live gates: watchdog OK, and `check_review_serving_provenance.py` passes on the live
+database **under the tightened invariants** (skip-bearing rows are no longer exempt), which also
+proves no violation was hiding among them.
+
+Not ship-green, and this entry does not claim otherwise. `spot-check-pool` and `challenger-loop`
+remain RED for the reasons above; `iaa-kappa-ceiling`, `cordi-dialect-fairness` and
+`refinery-lift-in-product` remain owner-gated. Only a full `verify_10.py` run at the release commit
+can print `GREEN - PERSONAL-USE SHIP-READY`.
