@@ -293,6 +293,12 @@ impl AppState {
         crate::stores::ReviewDraftStore::new(self.db.clone())
     }
 
+    /// Serialized playback-evidence writer. Renderer claims stop at the observation DTO; the store
+    /// and database resolve the current revision and canonical audio identity under the writer lock.
+    pub(crate) fn playback_writes(&self) -> crate::stores::PlaybackWriteStore {
+        crate::stores::PlaybackWriteStore::new(self.db.clone())
+    }
+
     /// Raw DB access for the restore implementation only. The caller must already own the exclusive
     /// RestoreReservation; ordinary commands must use `lock_db` / `db_arc` so they cannot pass it.
     pub(crate) fn db_arc_for_restore(&self) -> Arc<Mutex<Database>> {

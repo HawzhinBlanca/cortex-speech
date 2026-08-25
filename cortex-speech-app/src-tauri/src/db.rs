@@ -1017,6 +1017,18 @@ pub struct PlaybackReceipt {
     pub source_end_ms: Option<i64>,
 }
 
+/// Untrusted playback timing reported by a client. Review revision, audio identity, canonical source
+/// span and coverage denominator are deliberately absent; only the database may resolve them.
+#[derive(Debug, Clone)]
+pub(crate) struct PlaybackReceiptObservation {
+    pub(crate) segment_id: String,
+    pub(crate) reviewer: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) started_at_ms: i64,
+    pub(crate) played_ms: i64,
+    pub(crate) claimed_clip_duration_ms: i64,
+}
+
 /// Server-owned playback identity that must still be valid at the instant a paid review write
 /// commits. The HTTP layer checks once for a useful error before entering the write path; this
 /// second copy is deliberately carried into the SQLite transaction so a concurrent audio/revision
@@ -8485,6 +8497,22 @@ impl Database {
             "E_NO_PLAYBACK_EVIDENCE: no receipt shows this reviewer heard at least {:.0}% of segment              {segment_id} at revision {revision}. A verdict on an unheard clip is a guess, not a label.",
             MIN_PLAYBACK_COVERAGE * 100.0
         )))
+    }
+
+    /// Record an untrusted client observation without making the caller invent server-owned identity.
+    pub(crate) fn record_playback_observation(&self, observation: PlaybackReceiptObservation) -> AppResult<()> {
+        self.record_playback_receipt(&PlaybackReceipt {
+            segment_id: observation.segment_id,
+            segment_revision: 0,
+            audio_content_hash: String::new(),
+            reviewer: observation.reviewer,
+            session_id: observation.session_id,
+            started_at_ms: observation.started_at_ms,
+            played_ms: observation.played_ms,
+            clip_duration_ms: observation.claimed_clip_duration_ms,
+            source_start_ms: None,
+            source_end_ms: None,
+        })
     }
 
     /// A reviewer's own record that they HEARD this exact clip at this exact revision.

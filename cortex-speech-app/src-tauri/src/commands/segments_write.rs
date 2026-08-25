@@ -15,6 +15,7 @@ use crate::history::{Command, HistoryManager};
 use crate::ipc_contract::{
     CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, ReviewDecisionV1, ReviewDraftV1, SuggestedActionV1,
 };
+use crate::stores::PlaybackObservation;
 use crate::validation::input as validate;
 use crate::AppState;
 use tauri::State;
@@ -725,31 +726,17 @@ pub fn record_playback_receipt(
     if played_ms < 0 || clip_duration_ms < 0 {
         return Err("playback receipt durations must not be negative".to_string());
     }
-    let db = state.lock_db();
-
-    // The REVISION and CONTENT HASH are resolved here, from the row itself — never accepted from the
-    // renderer. A client that could name them could mint a receipt for a revision it never heard, or
-    // for audio that has since been replaced; then the guard would be comparing the client's claim
-    // with the client's claim. Resolved server-side, the only thing a caller can assert is how much
-    // time it played, and that assertion is still bound to the clip actually on file.
-    let content_hash = db.segment_audio_content_hash(&segment_id).map_err(|e| e.to_string())?.ok_or_else(|| {
-        format!("cannot mint playback evidence for segment {segment_id} without a server-derived audio content hash")
-    })?;
-    let revision = db.segment_review_revision(&segment_id).map_err(|e| e.to_string())?.unwrap_or(0);
-
-    db.record_playback_receipt(&crate::db::PlaybackReceipt {
-        segment_id,
-        segment_revision: revision,
-        audio_content_hash: content_hash,
-        reviewer,
-        session_id,
-        started_at_ms,
-        played_ms,
-        clip_duration_ms,
-        source_start_ms: None,
-        source_end_ms: None,
-    })
-    .map_err(|e| e.to_string())
+    state
+        .playback_writes()
+        .record_observation(PlaybackObservation {
+            segment_id,
+            reviewer,
+            session_id,
+            started_at_ms,
+            played_ms,
+            claimed_clip_duration_ms: clip_duration_ms,
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// P3-3: Revert a segment back to unreviewed state (NULL human_decision).
