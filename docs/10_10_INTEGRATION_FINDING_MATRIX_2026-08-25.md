@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `6e72bcc`
+**Current evidence commit:** `d21f241`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -51,15 +51,16 @@ requires the immutable profile manifest and the external evidence listed under O
 | Both desktop human-decision contracts cross `ReviewWriteStore`: the legacy operation-ID boundary and typed revision-CAS boundary resolve exact replay before playback preflight, derive playback identity under the serialized writer, and commit review truth plus matching draft clear transactionally. Commands retain validation and typed DTO/error mapping but cannot acquire raw database authority. | `7370068` | Existing 11 command regressions now execute through an independently opened store writer and cover exact lost-response replay, stale-revision refusal, playback enforcement and injected draft-clear rollback; 3 store regressions; architecture policy; full Rust 1,590/0; all 117 Python policies; strict Clippy/rustfmt | Other review/payment writes and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Recording-scoped rights declaration, irreversible consent withdrawal and rights/provenance listing cross a Tauri-free `RightsStore`. Writes serialize through `DatabaseRuntime`; listing uses a bounded restore-gated read snapshot; commands retain validation and DTO mapping without raw database authority. | `9a43316` | 2 focused store regressions prove one declaration covers exactly the intended recording and that withdrawal survives a later metadata declaration; architecture policy covers all 3 commands; full Rust 1,592/0; all 118 Python policies; generated-binding drift, strict Clippy and rustfmt passed | Remaining segment/job/import stores and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Interrupted-import discovery/discard and Job Center recent-job reads cross a Tauri-free `JobStore`. Discovery and history use bounded restore-gated snapshots; discard remains serialized through `DatabaseRuntime`; all four startup/resume/job handlers retain rate and identifier validation without raw database authority. | `6e72bcc` | 2 store regressions prove bounded newest-first history and read/discard of interrupted import state; architecture policy covers `get_interrupted_import`, `discard_interrupted_import`, `resume_interrupted_import` and `get_jobs`; full Rust 1,594/0; all 119 Python policies; generated-binding drift, strict Clippy and rustfmt passed | Pipeline/background job writers and import orchestration still use the compatibility façade; segment mutations, Couch decomposition, connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
+| Segment deletion, batch deletion and speaker rename cross a Tauri-free `SegmentWriteStore`. Deletes read the authoritative server rows before removal, push exact undo history only after successful deletion, and return an admission token that keeps restore fenced through command-side session autosave. The retired whole-row command now refuses before acquiring database authority. | `d21f241` | 2 store regressions prove exact raw-transcript/speaker restoration and shared serialized batch-delete/rename behavior; architecture policy covers all 3 migrated commands plus the retired endpoint; runtime-panic policy follows the new boundary and requires batch-read/delete error propagation; full Rust 1,596/0; all 120 Python policies; strict Clippy and rustfmt passed | Field-level segment mutations, pipeline/background job writers, import orchestration and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,594 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --all-targets --all-features`: 1,596 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Frontend: 58 files / 310 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
 - Browser E2E/accessibility: 97/97 passed with zero retries against a gate-owned Vite server.
-- Python policies: all 119 reachable policy scripts passed sequentially, including generated-binding drift.
+- Python policies: all 120 reachable policy scripts passed sequentially, including generated-binding drift.
 - Production build and its fail-closed manifest budget passed. Initial JavaScript is **111.19 KB gzip**
   against the 125 KB ceiling; initial CSS is **11.20 KB gzip** against the 15 KB ceiling. The gate
   recursively counts the entry and all static imports, excludes on-demand chunks, and was proven to
@@ -96,4 +97,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `6e72bcc` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `d21f241` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
