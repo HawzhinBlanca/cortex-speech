@@ -144,6 +144,10 @@ QUERY_STORE_COMMANDS = {
     "get_active_learning_queue",
 }
 
+# Durable export commands whose blocking body is owned by the Tauri-free JobStore. They must not
+# regain either the raw writer handle or direct job-lifecycle authority at the IPC boundary.
+JOB_STORE_COMMANDS = {"export_dataset", "export_huggingface_dataset"}
+
 
 def source() -> str:
     """The whole command surface: commands.rs + every extracted slice under src/commands/."""
@@ -201,6 +205,11 @@ def test_migrated_exports_do_not_hold_lock_db_across_the_await() -> None:
                 raise AssertionError(f"`{name}` must obtain its bounded SegmentQueryStore before the blocking task")
             if "state.db_arc()" in body:
                 raise AssertionError(f"`{name}` query path regained the raw serialized-writer handle")
+        elif name in JOB_STORE_COMMANDS:
+            if "state.job_store()" not in body:
+                raise AssertionError(f"`{name}` must obtain its tracked JobStore before the blocking task")
+            if "state.db_arc()" in body or ".run_tracked(" in body:
+                raise AssertionError(f"`{name}` regained raw database or job-lifecycle authority")
         elif "state.db_arc()" not in body:
             raise AssertionError(f"`{name}` must obtain the DB via state.db_arc() for the blocking task")
 

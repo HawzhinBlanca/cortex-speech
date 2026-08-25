@@ -26,9 +26,14 @@ def test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies
     for required in (
         "struct JobStore",
         "runtime: DatabaseRuntime",
+        "begin_mutation().map_err(AppError::Other)?",
         "self.runtime.open_read()?.find_interrupted_import_job()",
         'self.lock("discard_interrupted_import").discard_import_job(job_id)',
         "self.runtime.open_read()?.list_recent_jobs(limit)",
+        'self.run_tracked(job_id, "export_dataset", "EXPORT_FAILED"',
+        'self.run_tracked(job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED"',
+        "crate::export::export_dataset(database, path, format)",
+        "crate::export::export_huggingface_dataset(database, path, settings)",
     ):
         if required not in store:
             raise AssertionError(f"JobStore lost required database boundary: {required}")
@@ -54,6 +59,21 @@ def test_commands_delegate_without_raw_database_authority() -> None:
     for required in ('STRICT_RATE_LIMITER.check("discard_interrupted_import")', "validate::validate_identifier(&job_id)"):
         if required not in discard:
             raise AssertionError(f"discard_interrupted_import lost validation: {required}")
+
+    exports = read("commands/export.rs")
+    export_signatures = {
+        "export_dataset": "pub async fn export_dataset(",
+        "export_huggingface_dataset": "pub async fn export_huggingface_dataset(",
+    }
+    for name, signature in export_signatures.items():
+        body = command(exports, signature)
+        if ".job_store()" not in body or f"store.{name}" not in body:
+            raise AssertionError(f"{name} bypasses the tracked JobStore boundary")
+        for forbidden in ("state.lock_db()", "state.db_arc()", ".run_tracked(", "crate::db::Database"):
+            if forbidden in body:
+                raise AssertionError(f"{name} regained raw database or job-lifecycle authority: {forbidden}")
+        if 'STRICT_RATE_LIMITER.check("' + name + '")' not in body or "validate::validate_output_path" not in body:
+            raise AssertionError(f"{name} lost rate or output-path validation")
 
 
 def main() -> None:
