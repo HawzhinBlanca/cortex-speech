@@ -1,8 +1,9 @@
-//! Durable import publication, rollback and background-metadata write boundaries.
+//! Durable import and processing write boundaries for publication, evidence, metadata and rollback.
 
 use crate::database_runtime::{begin_mutation, DatabaseRuntime};
-use crate::db::SpeechSegment;
+use crate::db::{SegmentHypothesis, SourceAudioProvenance, SourceTranscriptRecord, SpeechSegment};
 use crate::error::{AppError, AppResult};
+use crate::fingerprint::AudioIdentity;
 use std::sync::MutexGuard;
 
 #[derive(Clone)]
@@ -45,6 +46,54 @@ impl ImportWriteStore {
             expected_alignment,
             alignment_json,
             quality,
+        )
+    }
+
+    pub(crate) fn upsert_source_transcript(&self, record: &SourceTranscriptRecord) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("upsert_import_source_transcript").upsert_source_transcript(record)
+    }
+
+    pub(crate) fn upsert_source_audio_provenance(&self, record: &SourceAudioProvenance) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("upsert_import_source_provenance").upsert_source_audio_provenance(record)
+    }
+
+    pub(crate) fn set_audio_identity(&self, audio_path: &str, identity: &AudioIdentity) -> AppResult<usize> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("set_import_audio_identity").set_audio_identity(audio_path, identity)
+    }
+
+    pub(crate) fn record_loop0_shadow(&self, segment_id: &str, memory_fired: bool) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("record_import_loop0_shadow").record_loop0_shadow(segment_id, memory_fired)
+    }
+
+    pub(crate) fn update_machine_speaker(&self, segment_id: &str, speaker_id: &str) -> AppResult<bool> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("update_machine_speaker").update_speaker_id(segment_id, Some(speaker_id))
+    }
+
+    pub(crate) fn insert_hypothesis(&self, hypothesis: &SegmentHypothesis) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("insert_import_hypothesis").insert_hypothesis(hypothesis)
+    }
+
+    pub(crate) fn commit_champion_transcript_if_unreviewed(
+        &self,
+        champion: &SegmentHypothesis,
+        expected_deployment_sha256: Option<&str>,
+        normalized_transcript: Option<&str>,
+        confidence_source: Option<&str>,
+        cloud_call: bool,
+    ) -> AppResult<bool> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("commit_import_champion_transcript").commit_champion_transcript_if_unreviewed(
+            champion,
+            expected_deployment_sha256,
+            normalized_transcript,
+            confidence_source,
+            cloud_call,
         )
     }
 }
@@ -105,5 +154,89 @@ mod tests {
         let retained = runtime.open_read().unwrap().get_segment_by_id("aligned").unwrap().unwrap();
         assert_eq!(retained.alignment_json.as_deref(), Some(newer));
         assert_eq!(retained.alignment_quality.as_deref(), Some("energy_heuristic"));
+    }
+
+    #[test]
+    fn import_metadata_and_machine_evidence_share_the_serialized_runtime() {
+        let (_directory, store, runtime) = store();
+        let audio_path = "C:/recordings/evidence.wav";
+        let mut speech = segment("evidence", None);
+        speech.audio_path = audio_path.into();
+        store.publish_segments(&[speech]).unwrap();
+
+        store
+            .set_audio_identity(audio_path, &AudioIdentity { spectral: 42, content: "recording-content-sha256".into() })
+            .unwrap();
+        store
+            .upsert_source_audio_provenance(&SourceAudioProvenance {
+                audio_path: audio_path.into(),
+                processing: "voice-separation".into(),
+                separator_model: Some("separator-v1".into()),
+                timeline_preserved: true,
+                manifest_path: Some("C:/recordings/manifest.json".into()),
+            })
+            .unwrap();
+        store
+            .upsert_source_transcript(&SourceTranscriptRecord {
+                audio_path: audio_path.into(),
+                model_id: "reference-v1".into(),
+                audio_content_hash: Some("recording-content-sha256".into()),
+                audio_size_bytes: Some(123),
+                transcript_path: "C:/recordings/reference.txt".into(),
+                transcript_text: "reference transcript".into(),
+                created_at: None,
+            })
+            .unwrap();
+        store
+            .insert_hypothesis(&SegmentHypothesis {
+                segment_id: "evidence".into(),
+                model_id: "draft-v1".into(),
+                transcript: "machine draft".into(),
+                confidence: Some(0.75),
+            })
+            .unwrap();
+        store.record_loop0_shadow("evidence", true).unwrap();
+        assert!(store.update_machine_speaker("evidence", "SPEAKER_07").unwrap());
+
+        let read = runtime.open_read().unwrap();
+        assert_eq!(read.load_audio_identities().unwrap().len(), 1);
+        assert_eq!(read.source_audio_provenance(audio_path).unwrap().unwrap().processing, "voice-separation");
+        assert_eq!(
+            read.get_source_transcript(audio_path, "reference-v1").unwrap().unwrap().transcript_text,
+            "reference transcript"
+        );
+        assert_eq!(read.get_hypotheses_for_segment("evidence").unwrap().len(), 1);
+        assert_eq!(read.get_segment_by_id("evidence").unwrap().unwrap().speaker_id.as_deref(), Some("SPEAKER_07"));
+        assert_eq!(read.intelligence_report().unwrap()["loop0Shadow"]["wouldFire"], 1);
+    }
+
+    #[test]
+    fn champion_commit_through_store_preserves_human_owned_truth_and_prior_votes() {
+        let (_directory, store, runtime) = store();
+        store.publish_segments(&[segment("reviewed", None)]).unwrap();
+        let prior = SegmentHypothesis {
+            segment_id: "reviewed".into(),
+            model_id: "prior-v1".into(),
+            transcript: "prior vote".into(),
+            confidence: None,
+        };
+        store.insert_hypothesis(&prior).unwrap();
+        runtime.lock().unwrap().update_verified_for_test("reviewed", true).unwrap();
+
+        let champion = SegmentHypothesis {
+            segment_id: "reviewed".into(),
+            model_id: "champion-v1".into(),
+            transcript: "must not overwrite".into(),
+            confidence: Some(0.99),
+        };
+        assert!(!store
+            .commit_champion_transcript_if_unreviewed(&champion, None, None, Some("external_provider"), false)
+            .unwrap());
+
+        let read = runtime.open_read().unwrap();
+        assert_eq!(read.get_segment_by_id("reviewed").unwrap().unwrap().raw_transcript, "draft-reviewed");
+        let hypotheses = read.get_hypotheses_for_segment("reviewed").unwrap();
+        assert_eq!(hypotheses.len(), 1);
+        assert_eq!(hypotheses[0].model_id, "prior-v1");
     }
 }

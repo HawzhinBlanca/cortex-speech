@@ -50,8 +50,8 @@ def test_the_import_records_it_without_being_asked() -> None:
             "the import must detect processed source audio itself — a declaration that depends on "
             "someone remembering to run a command is not a guarantee"
         )
-    if "upsert_source_audio_provenance" not in pipeline:
-        raise AssertionError("the import must persist what it detected")
+    if "import_writes.upsert_source_audio_provenance(&provenance)" not in pipeline:
+        raise AssertionError("the import must persist what it detected through the serialized import store")
 
     detector = _read("src-tauri/src/source_provenance.rs")
     if "audio_is_processed" not in detector:

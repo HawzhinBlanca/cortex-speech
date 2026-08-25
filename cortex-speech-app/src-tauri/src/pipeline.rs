@@ -286,19 +286,20 @@ fn resolve_segment_id_by_alignment(
 }
 
 fn insert_hypothesis_checked(
-    db: &Database,
+    import_writes: &crate::stores::ImportWriteStore,
     segment_id: &str,
     model_id: &str,
     transcript: String,
     confidence: Option<f64>,
 ) -> AppResult<()> {
-    db.insert_hypothesis(&SegmentHypothesis {
-        segment_id: segment_id.to_string(),
-        model_id: model_id.to_string(),
-        transcript,
-        confidence,
-    })
-    .map_err(|error| AppError::Other(format!("Failed to insert {model_id} hypothesis for {segment_id}: {error}")))
+    import_writes
+        .insert_hypothesis(&SegmentHypothesis {
+            segment_id: segment_id.to_string(),
+            model_id: model_id.to_string(),
+            transcript,
+            confidence,
+        })
+        .map_err(|error| AppError::Other(format!("Failed to insert {model_id} hypothesis for {segment_id}: {error}")))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1561,7 +1562,7 @@ impl ProcessingPipeline {
 
     fn reusable_source_reference_record(
         &self,
-        db: &Database,
+        import_writes: &crate::stores::ImportWriteStore,
         existing: &SourceTranscriptRecord,
         current_identity: Option<&SourceAudioIdentity>,
     ) -> AppResult<Option<SourceTranscriptRecord>> {
@@ -1627,7 +1628,7 @@ impl ProcessingPipeline {
             created_at: existing.created_at.clone(),
             ..existing.clone()
         };
-        db.upsert_source_transcript(&synced)?;
+        import_writes.upsert_source_transcript(&synced)?;
         tracing::info!(
             "Synced cached whole-file reference transcript for {} with {} from edited text file '{}'",
             existing.audio_path,
@@ -1646,6 +1647,7 @@ impl ProcessingPipeline {
         if !self.source_reference_enabled() {
             return Ok(Vec::new());
         }
+        let import_writes = self.import_write_store(db.path())?;
         let Some(api_key) = self.jury_cloud_api_key() else {
             return Err(AppError::Other(
                 "Gemini API key is required for whole-file reference transcript when jury cloud opt-in \
@@ -1676,7 +1678,7 @@ impl ProcessingPipeline {
         for model in self.settings.source_reference_models() {
             if let Some(existing) = db.get_source_transcript(&audio_path, &model)? {
                 if let Some(existing) =
-                    self.reusable_source_reference_record(db, &existing, current_identity.as_ref())?
+                    self.reusable_source_reference_record(&import_writes, &existing, current_identity.as_ref())?
                 {
                     tracing::info!(
                         "Reusing whole-file reference transcript for {} from {}",
@@ -1708,7 +1710,7 @@ impl ProcessingPipeline {
                         transcript_text: artifact.transcript_text,
                         created_at: None,
                     };
-                    db.upsert_source_transcript(&record)?;
+                    import_writes.upsert_source_transcript(&record)?;
                     records.push(record);
                 }
                 Err(error) => {
@@ -2117,6 +2119,7 @@ impl ProcessingPipeline {
         if duration_ms == 0 {
             return Err(AppError::Validation("Empty audio file".into()));
         }
+        let import_writes = self.import_write_store(db.path())?;
 
         // Before anything is decoded: if this recording was PROCESSED before it reached the app (the
         // pre-import cleaner separates voice from music, cuts the non-speech out, and normalises the
@@ -2126,7 +2129,7 @@ impl ProcessingPipeline {
         // audio is fine — but it WARNs, because what is lost is a provenance claim, not audio.
         if let Some(provenance) = crate::source_provenance::detect(path) {
             tracing::info!("source audio declared as processed before import: {}", provenance.processing);
-            if let Err(e) = db.upsert_source_audio_provenance(&provenance) {
+            if let Err(e) = import_writes.upsert_source_audio_provenance(&provenance) {
                 tracing::warn!("could not record source audio provenance for {}: {e}", path.display());
             }
         }
@@ -2155,7 +2158,6 @@ impl ProcessingPipeline {
         if chunking::should_stream_decode(duration_ms, self.settings.max_segment_duration_ms) {
             return self.process_single_file_streaming(path, db, decode_timeout, duration_ms, cancel, on_chunk);
         }
-        let import_writes = self.import_write_store(db.path())?;
 
         let (sample_rate, pcm) = audio::decode_to_pcm_with_timeout(path, decode_timeout)?;
 
@@ -2268,14 +2270,14 @@ impl ProcessingPipeline {
         // stamp must not fail an import whose audio and transcripts are already committed — it only costs
         // this recording its place in cross-session dedup, and a WARN says so.
         if identity.spectral != 0 {
-            if let Err(e) = db.set_audio_identity(&path.to_string_lossy(), &identity) {
+            if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
                 tracing::warn!("audio identity not persisted for {}: {e}", path.display());
             }
         }
         self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?;
         // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
-        self.shadow_log_loop0(db, &persisted);
+        self.shadow_log_loop0(db, &import_writes, &persisted);
         self.enqueue_background_alignments(&persisted, import_writes);
         {
             let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
@@ -2307,7 +2309,6 @@ impl ProcessingPipeline {
             ((duration_ms as f64 / self.settings.max_segment_duration_ms.max(1) as f64).ceil() as usize).max(1);
         let mut global_chunk = 0usize;
         let import_writes = self.import_write_store(db.path())?;
-
         let mut segments = Vec::new();
         let mut all_pcm_cache = Vec::new();
         let mut windows_seen = 0usize;
@@ -2552,13 +2553,13 @@ impl ProcessingPipeline {
         // must not fail an import whose audio and transcripts are already committed; it only costs this
         // recording its place in cross-session dedup.
         if identity.spectral != 0 {
-            if let Err(e) = db.set_audio_identity(&path.to_string_lossy(), &identity) {
+            if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
                 tracing::warn!("audio identity not persisted for {}: {e}", path.display());
             }
         }
         self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?;
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
-        self.shadow_log_loop0(db, &persisted);
+        self.shadow_log_loop0(db, &import_writes, &persisted);
         self.enqueue_background_alignments(&persisted, import_writes);
         {
             let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
@@ -2934,7 +2935,12 @@ impl ProcessingPipeline {
     /// M2.3 / P1.3: for each freshly persisted segment, record whether LOOP-0 WOULD have fired on its
     /// finalized transcript (annotated ▸ normalized ▸ raw), WITHOUT mutating anything. Memories are
     /// loaded once. Best-effort: a load or write failure logs and never fails the import.
-    fn shadow_log_loop0(&self, db: &Database, segments: &[SpeechSegment]) {
+    fn shadow_log_loop0(
+        &self,
+        db: &Database,
+        import_writes: &crate::stores::ImportWriteStore,
+        segments: &[SpeechSegment],
+    ) {
         let memories = match db.load_correction_memories() {
             Ok(memories) => memories,
             Err(error) => {
@@ -2945,7 +2951,7 @@ impl ProcessingPipeline {
         for seg in segments {
             let text = crate::corrections::loop0_draft_text(seg.annotated_transcript.as_deref(), &seg.raw_transcript);
             let would_fire = loop0_would_fire(&memories, text);
-            if let Err(error) = db.record_loop0_shadow(&seg.id, would_fire) {
+            if let Err(error) = import_writes.record_loop0_shadow(&seg.id, would_fire) {
                 tracing::warn!("LOOP-0 shadow log write failed for {}: {error}", seg.id);
             }
         }
@@ -3476,7 +3482,9 @@ impl ProcessingPipeline {
         // with the CLIP, not the source. Only the fine-tuned override still needs PCM before the
         // engine choice, and it keeps its precedence below.
         if self.should_use_wsl_primary_asr() && !self.finetuned_override_active() {
-            let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
+            let runtime = self.shared_database_runtime(&self.db_path)?;
+            let import_writes = crate::stores::ImportWriteStore::new(runtime.clone());
+            let db = runtime.open_read()?;
             let audio_path_str = path.to_string_lossy().to_string();
 
             let segment_id: Option<String> = if let Some(id) = segment_id {
@@ -3532,7 +3540,7 @@ impl ProcessingPipeline {
                     ))));
                 }
 
-                let db = crate::db::Database::open(&self.db_path).map_err(|e| AppError::Other(e.to_string()))?;
+                let db = runtime.open_read()?;
 
                 // Stage 2: Dual-Pass LLM Refinement (OpenRouter when configured + key present)
                 let final_text = if let Some(refiner) = self.build_refiner() {
@@ -3608,7 +3616,8 @@ impl ProcessingPipeline {
                     transcript: raw_transcript.clone(),
                     confidence,
                 };
-                let updated = db
+                drop(db);
+                let updated = import_writes
                     .commit_champion_transcript_if_unreviewed(
                         &champion,
                         Some(&wsl_result.deployment_sha256),
@@ -4023,6 +4032,7 @@ impl ProcessingPipeline {
         if !auxiliary_hypotheses_enabled(&self.settings) {
             return Ok(());
         }
+        let import_writes = self.import_write_store(db.path())?;
         // 1. OmniASR 300M
         let model_id_300m = "omniasr-ctc-300m";
         let config_300m = asr::AsrLoadConfig {
@@ -4044,7 +4054,9 @@ impl ProcessingPipeline {
             })
         });
         match res_300m {
-            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_300m, text, conf)?,
+            Some(Ok((text, conf))) => {
+                insert_hypothesis_checked(&import_writes, segment_id, model_id_300m, text, conf)?;
+            }
             Some(Err(error)) => {
                 tracing::warn!("{model_id_300m} hypothesis transcription failed for {segment_id}: {error}");
             }
@@ -4072,7 +4084,9 @@ impl ProcessingPipeline {
             })
         });
         match res_1b {
-            Some(Ok((text, conf))) => insert_hypothesis_checked(db, segment_id, model_id_1b, text, conf)?,
+            Some(Ok((text, conf))) => {
+                insert_hypothesis_checked(&import_writes, segment_id, model_id_1b, text, conf)?;
+            }
             Some(Err(error)) => {
                 tracing::warn!("{model_id_1b} hypothesis transcription failed for {segment_id}: {error}");
             }
@@ -4092,7 +4106,7 @@ impl ProcessingPipeline {
         });
         match res_finetuned {
             Some(Ok((text, _))) if !text.trim().is_empty() => {
-                insert_hypothesis_checked(db, segment_id, model_id_finetuned, text, None)?;
+                insert_hypothesis_checked(&import_writes, segment_id, model_id_finetuned, text, None)?;
             }
             Some(Ok(_)) => tracing::debug!("{model_id_finetuned} hypothesis empty for {segment_id}"),
             Some(Err(error)) => {
@@ -4101,12 +4115,17 @@ impl ProcessingPipeline {
             None => tracing::debug!("{model_id_finetuned} hypothesis model unavailable for {segment_id}"),
         }
 
-        self.populate_wsl_hypothesis_if_configured(db, segment_id)?;
+        self.populate_wsl_hypothesis_if_configured(db, &import_writes, segment_id)?;
 
         Ok(())
     }
 
-    fn populate_wsl_hypothesis_if_configured(&self, db: &Database, segment_id: &str) -> AppResult<()> {
+    fn populate_wsl_hypothesis_if_configured(
+        &self,
+        db: &Database,
+        import_writes: &crate::stores::ImportWriteStore,
+        segment_id: &str,
+    ) -> AppResult<()> {
         if self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
             return Ok(());
         }
@@ -4138,7 +4157,7 @@ impl ProcessingPipeline {
                     ));
                 }
                 insert_hypothesis_checked(
-                    db,
+                    import_writes,
                     segment_id,
                     &result.model_version_id,
                     result.raw_transcript,
@@ -4260,6 +4279,7 @@ impl ProcessingPipeline {
         // Own DB connection so no AppState lock is held across the per-file decode + ONNX diarization
         // loop (which previously froze every other db-touching command for the decode duration).
         let db = self.open_db()?;
+        let import_writes = self.import_write_store(db.path())?;
         let all = db.get_segments_by_ids(ids)?;
         let targets: Vec<_> = all.into_iter().collect();
         if targets.is_empty() {
@@ -4353,7 +4373,7 @@ impl ProcessingPipeline {
                 // multi-minute rediarize. This is the same anti-clobber discipline the batch speaker
                 // command already follows via update_speaker_id. It also stops a segment DELETED during
                 // the pass from being resurrected by the upsert: that is now a no-op, not a revival.
-                match db.update_speaker_id(seg_id, Some(label.as_str())) {
+                match import_writes.update_machine_speaker(seg_id, label.as_str()) {
                     Ok(true) => updated += 1,
                     Ok(false) => {
                         tracing::warn!("Rediarize speaker update skipped: segment {seg_id} no longer exists");

@@ -30,6 +30,13 @@ def test_store_owns_import_publication_rollback_and_revision_guarded_alignment()
         'self.lock("publish_import_segments").insert_segments_batch(segments)',
         'self.lock("rollback_import_segments").delete_segments_batch(segment_ids)',
         'self.lock("update_import_alignment").update_segment_alignment_if_unchanged(',
+        'self.lock("upsert_import_source_transcript").upsert_source_transcript(record)',
+        'self.lock("upsert_import_source_provenance").upsert_source_audio_provenance(record)',
+        'self.lock("set_import_audio_identity").set_audio_identity(audio_path, identity)',
+        'self.lock("record_import_loop0_shadow").record_loop0_shadow(segment_id, memory_fired)',
+        'self.lock("update_machine_speaker").update_speaker_id(segment_id, Some(speaker_id))',
+        'self.lock("insert_import_hypothesis").insert_hypothesis(hypothesis)',
+        'self.lock("commit_import_champion_transcript").commit_champion_transcript_if_unreviewed(',
     ):
         if required not in store:
             raise AssertionError(f"ImportWriteStore lost required authority: {required}")
@@ -41,6 +48,13 @@ def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> 
         "db.insert_segments_batch(",
         "db.delete_segments_batch(",
         "db.update_segment_alignment(",
+        "db.upsert_source_transcript(",
+        "db.upsert_source_audio_provenance(",
+        "db.set_audio_identity(",
+        "db.record_loop0_shadow(",
+        "db.update_speaker_id(",
+        "db.insert_hypothesis(",
+        "db.commit_champion_transcript_if_unreviewed(",
     ):
         if forbidden in pipeline:
             raise AssertionError(f"pipeline regained a raw migrated import writer: {forbidden}")
@@ -58,6 +72,18 @@ def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> 
         raise AssertionError("background alignment lost revision-CAS store delegation")
     if "source_alignment.as_deref()" not in background:
         raise AssertionError("background alignment no longer compares the exact pre-inference metadata")
+
+    champion = method(pipeline, "pub fn transcribe(")
+    for required in (
+        "let runtime = self.shared_database_runtime(&self.db_path)?;",
+        "let db = runtime.open_read()?;",
+        "let updated = import_writes",
+        ".commit_champion_transcript_if_unreviewed(",
+    ):
+        if required not in champion:
+            raise AssertionError(f"champion transcription lost serialized store authority: {required}")
+    if "Database::open(&self.db_path)" in champion:
+        raise AssertionError("champion transcription regained an independent raw database connection")
 
     for required in (
         "database_runtime: Arc<Mutex<Option<crate::database_runtime::DatabaseRuntime>>>",
