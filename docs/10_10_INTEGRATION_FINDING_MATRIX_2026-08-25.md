@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `7370068`
+**Current evidence commit:** `9a43316`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -49,15 +49,16 @@ requires the immutable profile manifest and the external evidence listed under O
 | Desktop playback evidence writes cross a Tauri-free `PlaybackWriteStore`; its observation-only database DTO cannot express review revision, audio hash, source span or authoritative duration. The database resolves all identity and coverage fields while holding the serialized writer. | `08ae275` | 3 adversarial store tests prove client duration cannot shrink coverage, missing server audio identity creates no receipt, and invalid timing creates no partial write; 16 focused playback regressions; architecture policy; full Rust 1,587/0; all 116 Python policies; strict Clippy/rustfmt | Remaining review/payment writes still use the compatibility façade; the 50,000-segment concurrent review/import/backup and restore-reopen proofs remain open |
 | Desktop review-effect mutations cross a Tauri-free `ReviewWriteStore`: exact decision undo, review-flag creation, exact flag undo and the retired identity-free clear endpoint all serialize through `DatabaseRuntime`, while input/rate validation remains at the command boundary. | `78f2a1c` | 3 store regressions prove exact flag replay plus idempotent effect-bound undo, immutable-effect decision undo plus replay, and fail-closed identity-free clearing; architecture policy prevents migrated commands from regaining raw database authority; full Rust 1,590/0; all 117 Python policies; strict Clippy/rustfmt | Typed review commit and other review/payment write domains still use the compatibility façade; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Both desktop human-decision contracts cross `ReviewWriteStore`: the legacy operation-ID boundary and typed revision-CAS boundary resolve exact replay before playback preflight, derive playback identity under the serialized writer, and commit review truth plus matching draft clear transactionally. Commands retain validation and typed DTO/error mapping but cannot acquire raw database authority. | `7370068` | Existing 11 command regressions now execute through an independently opened store writer and cover exact lost-response replay, stale-revision refusal, playback enforcement and injected draft-clear rollback; 3 store regressions; architecture policy; full Rust 1,590/0; all 117 Python policies; strict Clippy/rustfmt | Other review/payment writes and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
+| Recording-scoped rights declaration, irreversible consent withdrawal and rights/provenance listing cross a Tauri-free `RightsStore`. Writes serialize through `DatabaseRuntime`; listing uses a bounded restore-gated read snapshot; commands retain validation and DTO mapping without raw database authority. | `9a43316` | 2 focused store regressions prove one declaration covers exactly the intended recording and that withdrawal survives a later metadata declaration; architecture policy covers all 3 commands; full Rust 1,592/0; all 118 Python policies; generated-binding drift, strict Clippy and rustfmt passed | Remaining segment/job/import stores and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,590 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --all-targets --all-features`: 1,592 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Frontend: 58 files / 310 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
 - Browser E2E/accessibility: 97/97 passed with zero retries against a gate-owned Vite server.
-- Python policies: all 117 reachable policy scripts passed.
+- Python policies: all 118 reachable policy scripts passed sequentially, including generated-binding drift.
 - Production build and its fail-closed manifest budget passed. Initial JavaScript is **111.19 KB gzip**
   against the 125 KB ceiling; initial CSS is **11.20 KB gzip** against the 15 KB ceiling. The gate
   recursively counts the entry and all static imports, excludes on-demand chunks, and was proven to
@@ -94,4 +95,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `7370068` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `9a43316` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
