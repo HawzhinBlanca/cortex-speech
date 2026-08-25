@@ -29,6 +29,7 @@ export const ckb: Record<string, string> = {
   cancel: 'هەڵوەشاندنەوە',
   confirm: 'دڵنیاکردنەوە',
   loading: 'بارکردن...',
+  'workspace.loadFailed': 'بارکردنی ئەم شوێنەی کار سەرکەوتوو نەبوو.',
   noData: 'هیچ داتایەک نییە',
   error: 'هەڵە',
   processing: 'پرۆسێسکردن',

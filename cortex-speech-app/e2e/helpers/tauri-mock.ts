@@ -121,6 +121,31 @@ export async function installTauriMock(page: Page): Promise<void> {
             return emptyLibrary()
               ? { items: [], total: 0, nextCursor: null }
               : { items: [mockSegment], total: 1, nextCursor: null };
+          case 'get_review_page_v1':
+            return emptyLibrary()
+              ? {
+                  items: [],
+                  total: 0,
+                  nextCursor: null,
+                  scopeLabel: 'pending',
+                  focusNarrowed: false,
+                }
+              : {
+                  items: [
+                    {
+                      segment: mockSegment,
+                      baseRevision: 0,
+                      eligible: true,
+                      disabledReason: null,
+                    },
+                  ],
+                  total: 1,
+                  nextCursor: null,
+                  scopeLabel: 'pending',
+                  focusNarrowed: false,
+                };
+          case 'get_review_draft_v1':
+            return null;
           case 'get_segment':
             if (emptyLibrary()) throw new Error('Segment no longer exists');
             return mockSegment;
@@ -159,6 +184,10 @@ export async function installTauriMock(page: Page): Promise<void> {
             return [0.1, 0.35, 0.8, 0.4, 0.15];
           case 'get_audio_duration':
             return 1.5;
+          case 'get_audio_health':
+            return { totalFiles: 1, missingFiles: 0, missingPaths: [] };
+          case 'take_last_crash':
+            return null;
           case 'get_training_grade_breakdown':
             // Match the fail-closed readiness contract. Falling through to null/object stubs makes
             // the Insights panel log an error on every E2E page load and leaves the accessibility
@@ -431,7 +460,7 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'plugin:event|unlisten':
             return null;
           default:
-            return null;
+            throw new Error(`Unknown E2E Tauri mock command: ${cmd}`);
         }
       },
       // @tauri-apps/api/window reads these labels before registering the close-request handler.

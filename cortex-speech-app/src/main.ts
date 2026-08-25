@@ -14,15 +14,26 @@ installGlobalErrorTrap();
 // where window.__TAURI_INTERNALS__ already exists.
 // ---------------------------------------------------------------------------
 if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
-  // `_trend$` added 2026-08-05: `get_escalation_rate_trend` matched NOTHING here, so it fell through
-  // to the final `null` and RefineryPanel's `trend.length === 0` threw "Cannot read properties of null
-  // (reading 'length')" on every Insights load in dev preview. An ErrorBoundary caught it, which is
-  // why it never surfaced as a page error and was easy to miss — the panel just rendered a retry
-  // button. Commands that return a Vec must default to [], not null.
-  const listKinds =
-    /(^get_segments$|^list_|_reports$|_events$|_runs$|_history$|_trend$|^search_|_queue$|^get_speakers$)/;
-  const objKinds =
-    /(^get_settings$|^app_health$|^db_info$|^import_status$|readiness$|^models_status$|_info$|^get_stats$|^compute_stats$)/;
+  // These are deliberate preview fixtures, not regex catch-alls. A newly introduced command must
+  // choose and implement an explicit preview contract or fail loudly at the final branch below.
+  const emptyListCommands = new Set([
+    'get_active_learning_queue',
+    'get_escalation_queue',
+    'get_escalation_rate_trend',
+    'list_agent_import_reports',
+    'list_agent_stage_events',
+    'list_db_snapshots',
+    'list_eval_runs',
+    'list_model_versions',
+  ]);
+  const emptyObjectCommands = new Set([
+    'app_health',
+    'check_agentic_readiness',
+    'db_info',
+    'get_settings',
+    'import_status',
+    'models_status',
+  ]);
 
   // Sample Sorani dataset so the populated curate UI renders without a backend.
   const SAMPLE: Array<[string, number, string | null, boolean, number]> = [
@@ -82,6 +93,20 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     isGold: i === 0,
     alignmentQuality: ver ? 'ctc_forced' : null,
   }));
+  const demoReviewRevisions = new Map(demoSegments.map((segment) => [segment.id, 0]));
+  const demoReviewDrafts = new Map<
+    string,
+    { segmentId: string; baseRevision: number; text: string; updatedAt: string }
+  >();
+  const demoReviewOperations = new Map<
+    string,
+    {
+      segmentId: string;
+      committedRevision: number;
+      authoritativeTranscript: string;
+      decisionId: string;
+    }
+  >();
   // Return detached rows just like IPC serialization does. The backing collection remains mutable so
   // review decisions survive subsequent reads during a browser-preview session.
   const sampleSegments = () => demoSegments.map((segment) => ({ ...segment }));
@@ -120,6 +145,130 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     // throwing while the app is already handling another update.
     if (cmd === 'plugin:event|listen') return args?.handler ?? 0;
     if (cmd.startsWith('plugin:')) return null;
+    if (cmd === 'get_review_page_v1') {
+      const scope = args?.scope as { kind?: string; query?: string; focusId?: string } | undefined;
+      const query =
+        scope?.kind === 'search'
+          ? String(scope.query ?? '')
+              .trim()
+              .toLowerCase()
+          : '';
+      const items = sampleSegments()
+        .filter((segment) => {
+          if (scope?.kind === 'pending' && segment.verified) return false;
+          if (scope?.kind === 'escalation' && !segment.escalated) return false;
+          return (
+            !query ||
+            segment.rawTranscript.toLowerCase().includes(query) ||
+            segment.audioPath.toLowerCase().includes(query) ||
+            (segment.speakerId ?? '').toLowerCase().includes(query)
+          );
+        })
+        .map((segment) => ({
+          segment,
+          baseRevision: demoReviewRevisions.get(segment.id) ?? 0,
+          eligible: segment.rawTranscript.trim().length > 0,
+          disabledReason: segment.rawTranscript.trim().length > 0 ? null : 'TRANSCRIPT_NOT_READY',
+        }));
+      return {
+        items,
+        total: items.length,
+        nextCursor: null,
+        scopeLabel: scope?.kind ?? 'pending',
+        focusNarrowed: scope?.kind === 'voiceFocus',
+      };
+    }
+    if (cmd === 'get_review_draft_v1') {
+      return demoReviewDrafts.get(String(args?.segmentId ?? '')) ?? null;
+    }
+    if (cmd === 'save_review_draft_v1') {
+      const segmentId = String(args?.segmentId ?? '');
+      const baseRevision = Number(args?.baseRevision);
+      if (!demoReviewRevisions.has(segmentId)) {
+        throw new Error(`Unknown preview segment: ${segmentId}`);
+      }
+      if (demoReviewRevisions.get(segmentId) !== baseRevision) {
+        throw {
+          schema: 1,
+          code: 'STALE_REVIEW_DRAFT',
+          message: 'The preview segment changed. Reload it before saving this draft.',
+          retryable: false,
+          suggestedAction: 'reloadClip',
+          operationId: null,
+        };
+      }
+      const draft = {
+        segmentId,
+        baseRevision,
+        text: String(args?.text ?? ''),
+        updatedAt: new Date().toISOString(),
+      };
+      demoReviewDrafts.set(segmentId, draft);
+      return draft;
+    }
+    if (cmd === 'delete_review_draft_v1') {
+      const segmentId = String(args?.segmentId ?? '');
+      const baseRevision = Number(args?.baseRevision);
+      const draft = demoReviewDrafts.get(segmentId);
+      if (!draft || draft.baseRevision !== baseRevision) return false;
+      demoReviewDrafts.delete(segmentId);
+      return true;
+    }
+    if (cmd === 'commit_review_v1') {
+      const request = args?.request as
+        | {
+            operationId?: string;
+            segmentId?: string;
+            baseRevision?: number;
+            decision?: string;
+            transcript?: string | null;
+          }
+        | undefined;
+      const operationId = String(request?.operationId ?? '');
+      const replay = demoReviewOperations.get(operationId);
+      if (replay) return replay;
+      const segmentId = String(request?.segmentId ?? '');
+      const index = demoSegments.findIndex((segment) => segment.id === segmentId);
+      const currentRevision = demoReviewRevisions.get(segmentId);
+      if (index < 0 || currentRevision === undefined) {
+        throw new Error(`Unknown preview segment: ${segmentId}`);
+      }
+      if (request?.baseRevision !== currentRevision) {
+        throw {
+          schema: 1,
+          code: 'STALE_REVIEW_REVISION',
+          message: 'The preview segment changed. Reload it before committing.',
+          retryable: false,
+          suggestedAction: 'reloadClip',
+          operationId,
+        };
+      }
+      const authoritativeTranscript =
+        request.decision === 'edit'
+          ? String(request.transcript ?? '')
+          : demoSegments[index].rawTranscript;
+      const committedRevision = currentRevision + 1;
+      demoSegments[index] = {
+        ...demoSegments[index],
+        rawTranscript: authoritativeTranscript,
+        annotatedTranscript:
+          request.decision === 'accept' || request.decision === 'edit'
+            ? authoritativeTranscript
+            : null,
+        verified: request.decision === 'accept' || request.decision === 'edit',
+      };
+      demoReviewRevisions.set(segmentId, committedRevision);
+      const draft = demoReviewDrafts.get(segmentId);
+      if (draft?.baseRevision === currentRevision) demoReviewDrafts.delete(segmentId);
+      const committed = {
+        segmentId,
+        committedRevision,
+        authoritativeTranscript,
+        decisionId: `preview-${operationId}`,
+      };
+      demoReviewOperations.set(operationId, committed);
+      return committed;
+    }
     if (cmd === 'get_segments_page') {
       const q = String(args?.query ?? '')
         .trim()
@@ -175,8 +324,62 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     }
     if (cmd === 'get_waveform') return sampleWaveform();
     if (cmd === 'get_audio_duration') return 6.2;
+    if (cmd === 'get_audio_health') {
+      return { totalFiles: sampleSegments().length, missingFiles: 0, missingPaths: [] };
+    }
+    if (cmd === 'register_media_asset') {
+      const audioPath = String(args?.audioPath ?? '');
+      return {
+        id: `preview-${audioPath}`,
+        path: audioPath,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      };
+    }
+    if (cmd === 'get_media_asset_url') {
+      return 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    }
     if (cmd === 'get_stats' || cmd === 'compute_stats' || cmd === 'get_dataset_stats')
       return sampleStats();
+    if (cmd === 'get_dataset_quality') {
+      const segs = sampleSegments();
+      return {
+        totalSegments: segs.length,
+        emptyTranscriptCount: segs.filter((segment) => !segment.rawTranscript.trim()).length,
+        lowConfidenceCount: segs.filter((segment) => segment.confidence < 0.5).length,
+        duplicateTranscriptGroups: 0,
+        duplicateTranscriptSegments: 0,
+        durationOutlierCount: 0,
+        medianDurationMs: 5600,
+        q1DurationMs: 4200,
+        q3DurationMs: 7200,
+        duplicateGroups: [],
+        durationOutliers: [],
+        annotatedSegmentCount: segs.filter((segment) => segment.annotatedTranscript).length,
+        meanWer: 0,
+        meanCer: 0,
+        segmentsAboveWerThreshold: 0,
+        segmentsAboveCerThreshold: 0,
+        qualityGatePassed: true,
+        werOutliers: [],
+      };
+    }
+    if (cmd === 'get_label_quality_lift') return null;
+    if (cmd === 'get_dataset_certificate') {
+      return {
+        targetError: 0.05,
+        confidenceLevel: 0.95,
+        threshold: 0.35,
+        totalCertified: 0,
+        certifiedSegmentIds: [],
+        expectedErrorBound: 0.05,
+        isCalibrated: false,
+      };
+    }
+    if (cmd === 'restore_session' || cmd === 'take_last_crash') return null;
+    if (cmd === 'save_session' || cmd === 'update_settings') return null;
+    if (cmd === 'get_configured_providers') return [];
+    if (cmd === 'couch_review_status') return { running: false, reviewers: [] };
+    if (cmd === 'spot_check_report' || cmd === 'reviewer_throughput') return [];
     if (cmd === 'count_segments' || cmd === 'get_segment_count') return SAMPLE.length;
     if (cmd === 'get_speakers') return ['SPEAKER_00', 'SPEAKER_01', 'SPEAKER_02'];
     if (cmd === 'validate_dataset_cmd') {
@@ -210,12 +413,13 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
         summary: `${segs.length} segments checked · ${errors.length} error(s) · ${warnings.length} warning(s)`,
       };
     }
-    if (listKinds.test(cmd)) return [];
-    if (objKinds.test(cmd)) return {};
-    return null;
+    if (emptyListCommands.has(cmd)) return [];
+    if (emptyObjectCommands.has(cmd)) return {};
+    throw new Error(`Unknown development mock command: ${cmd}`);
   };
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: (cmd: string, args?: Record<string, unknown>) => mockInvoke(cmd, args),
+    convertFileSrc: (path: string) => path,
     transformCallback: (cb: unknown) => {
       const id = Math.floor(Math.random() * 1e9);
       const w = window as unknown as Record<string, Record<number, unknown>>;

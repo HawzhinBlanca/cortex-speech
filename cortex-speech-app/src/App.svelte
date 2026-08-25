@@ -68,26 +68,17 @@
   import JobsActivityPill from './lib/JobsActivityPill.svelte';
   import Waveform from './lib/Waveform.svelte';
   import ErrorBoundary from './lib/ErrorBoundary.svelte';
+  import LazyComponent from './lib/LazyComponent.svelte';
   import Toast from './lib/Toast.svelte';
-  import SettingsPanel from './lib/SettingsPanel.svelte';
   import StatsDashboard from './lib/StatsDashboard.svelte';
-  import RefineryPanel from './lib/RefineryPanel.svelte';
   import AgentReportPanel from './lib/AgentReportPanel.svelte';
   import SearchBar from './lib/SearchBar.svelte';
   import VirtualList from './lib/VirtualList.svelte';
-  import KeyboardShortcuts from './lib/KeyboardShortcuts.svelte';
   import ConfirmDialog from './lib/ConfirmDialog.svelte';
-  import ValidationPanel from './lib/ValidationPanel.svelte';
-  import SpeakerPanel from './lib/SpeakerPanel.svelte';
-  import DatasetMerge from './lib/DatasetMerge.svelte';
-  import WslConsolePanel from './lib/WslConsolePanel.svelte';
-  import ReviewInbox from './lib/ReviewInbox.svelte';
   import DiffView from './lib/DiffView.svelte';
-  import CommandPalette from './lib/CommandPalette.svelte';
   import EmptyState from './lib/EmptyState.svelte';
   import ActivityRail from './lib/ActivityRail.svelte';
   import ProcessingProgress from './lib/ProcessingProgress.svelte';
-  import ReviewMode from './lib/ReviewMode.svelte';
   import PanelSplitter from './lib/PanelSplitter.svelte';
   import HistoryPanel from './lib/HistoryPanel.svelte';
   import {
@@ -103,6 +94,19 @@
   type HistoryPanelApi = {
     recordAction: (description: string, type: 'edit' | 'verify' | 'delete' | 'import') => void;
   };
+
+  // Secondary workspaces are isolated chunks. These stable loader functions are intentionally
+  // declared outside reactive work so a parent update cannot restart an in-flight import.
+  const loadSettingsPanel = () => import('./lib/SettingsPanel.svelte');
+  const loadRefineryPanel = () => import('./lib/RefineryPanel.svelte');
+  const loadReviewMode = () => import('./lib/ReviewMode.svelte');
+  const loadKeyboardShortcuts = () => import('./lib/KeyboardShortcuts.svelte');
+  const loadValidationPanel = () => import('./lib/ValidationPanel.svelte');
+  const loadReviewInbox = () => import('./lib/ReviewInbox.svelte');
+  const loadSpeakerPanel = () => import('./lib/SpeakerPanel.svelte');
+  const loadDatasetMerge = () => import('./lib/DatasetMerge.svelte');
+  const loadWslConsolePanel = () => import('./lib/WslConsolePanel.svelte');
+  const loadCommandPalette = () => import('./lib/CommandPalette.svelte');
 
   let waveformData = $state<number[]>([]);
   // Non-null ONLY when the decode failed — an empty array alone cannot distinguish "unreadable" from
@@ -2501,9 +2505,23 @@
           <!-- P2.3: the readiness card's "N clips still awaiting review" blocker becomes a button that
                actually goes there, instead of naming a problem and leaving the reviewer to find it. -->
           <StatsDashboard onOpenReview={enterReviewMode} />
-          <RefineryPanel />
+          <LazyComponent
+            load={loadRefineryPanel}
+            loadingLabel={$t('loading')}
+            failedLabel={$t('workspace.loadFailed')}
+            retryLabel={$t('retry')}
+            closeLabel={$t('close')}
+          />
         {:else if viewMode === 'review'}
-          <ReviewMode onExport={handleExport} onDone={leaveReviewMode} />
+          <LazyComponent
+            load={loadReviewMode}
+            componentProps={{ onExport: handleExport, onDone: leaveReviewMode }}
+            loadingLabel={$t('loading')}
+            failedLabel={$t('workspace.loadFailed')}
+            retryLabel={$t('retry')}
+            closeLabel={$t('close')}
+            onClose={() => leaveReviewMode()}
+          />
         {:else if $selectedSegment}
           <div class="card overflow-hidden">
             {#if waveformError}
@@ -3083,25 +3101,62 @@
 <!-- Modals -->
 {#if $showSettings}
   <ErrorBoundary>
-    <SettingsPanel />
+    <LazyComponent
+      load={loadSettingsPanel}
+      loadingLabel={$t('loading')}
+      failedLabel={$t('workspace.loadFailed')}
+      retryLabel={$t('retry')}
+      closeLabel={$t('close')}
+      onClose={() => showSettings.set(false)}
+      overlay
+    />
   </ErrorBoundary>
 {/if}
 
-<KeyboardShortcuts />
+{#if $showKeyboardHelp}
+  <LazyComponent
+    load={loadKeyboardShortcuts}
+    loadingLabel={$t('loading')}
+    failedLabel={$t('workspace.loadFailed')}
+    retryLabel={$t('retry')}
+    closeLabel={$t('close')}
+    onClose={() => showKeyboardHelp.set(false)}
+    overlay
+  />
+{/if}
 
 <!-- reviewActive keeps background-library commands unreachable while either dedicated review surface
      owns the keyboard and visible selection. -->
-<CommandPalette
-  open={showCommandPalette}
-  reviewActive={viewMode === 'review' || $showReviewInbox}
-  onClose={() => (showCommandPalette = false)}
-/>
+{#if showCommandPalette}
+  <LazyComponent
+    load={loadCommandPalette}
+    componentProps={{
+      open: true,
+      reviewActive: viewMode === 'review' || $showReviewInbox,
+      onClose: () => (showCommandPalette = false),
+    }}
+    loadingLabel={$t('loading')}
+    failedLabel={$t('workspace.loadFailed')}
+    retryLabel={$t('retry')}
+    closeLabel={$t('close')}
+    onClose={() => (showCommandPalette = false)}
+    overlay
+  />
+{/if}
 
 <ConfirmDialog />
 
 {#if $showValidationPanel}
   <ErrorBoundary>
-    <ValidationPanel />
+    <LazyComponent
+      load={loadValidationPanel}
+      loadingLabel={$t('loading')}
+      failedLabel={$t('workspace.loadFailed')}
+      retryLabel={$t('retry')}
+      closeLabel={$t('close')}
+      onClose={() => showValidationPanel.set(false)}
+      overlay
+    />
   </ErrorBoundary>
 {/if}
 
@@ -3115,11 +3170,19 @@
            Correct queue keep pre-decision data, and a reviewer could unknowingly overwrite a
            just-recorded reject with an accept. loadSegments routes through the loadSeq-guarded
            segments.load(), so the refresh is race-safe. -->
-      <ReviewInbox
-        onClose={() => {
-          showReviewInbox.set(false);
-          void loadSegments();
+      <LazyComponent
+        load={loadReviewInbox}
+        componentProps={{
+          onClose: () => {
+            showReviewInbox.set(false);
+            void loadSegments();
+          },
         }}
+        loadingLabel={$t('loading')}
+        failedLabel={$t('workspace.loadFailed')}
+        retryLabel={$t('retry')}
+        closeLabel={$t('close')}
+        onClose={() => showReviewInbox.set(false)}
       />
     </ErrorBoundary>
   </div>
@@ -3127,19 +3190,43 @@
 
 {#if $showSpeakerPanel}
   <ErrorBoundary>
-    <SpeakerPanel />
+    <LazyComponent
+      load={loadSpeakerPanel}
+      loadingLabel={$t('loading')}
+      failedLabel={$t('workspace.loadFailed')}
+      retryLabel={$t('retry')}
+      closeLabel={$t('close')}
+      onClose={() => showSpeakerPanel.set(false)}
+      overlay
+    />
   </ErrorBoundary>
 {/if}
 
 {#if $showDatasetMerge}
   <ErrorBoundary>
-    <DatasetMerge />
+    <LazyComponent
+      load={loadDatasetMerge}
+      loadingLabel={$t('loading')}
+      failedLabel={$t('workspace.loadFailed')}
+      retryLabel={$t('retry')}
+      closeLabel={$t('close')}
+      onClose={() => showDatasetMerge.set(false)}
+      overlay
+    />
   </ErrorBoundary>
 {/if}
 
 {#if $showWslConsole}
   <ErrorBoundary>
-    <WslConsolePanel />
+    <LazyComponent
+      load={loadWslConsolePanel}
+      loadingLabel={$t('loading')}
+      failedLabel={$t('workspace.loadFailed')}
+      retryLabel={$t('retry')}
+      closeLabel={$t('close')}
+      onClose={() => showWslConsole.set(false)}
+      overlay
+    />
   </ErrorBoundary>
 {/if}
 

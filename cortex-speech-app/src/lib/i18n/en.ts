@@ -25,6 +25,7 @@ export const en: Record<string, string> = {
   cancel: 'Cancel',
   confirm: 'Confirm',
   loading: 'Loading...',
+  'workspace.loadFailed': 'This workspace could not be loaded.',
   noData: 'No data',
   error: 'Error',
   processing: 'Processing',

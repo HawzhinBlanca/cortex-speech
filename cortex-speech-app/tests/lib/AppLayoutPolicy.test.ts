@@ -31,7 +31,8 @@ describe('App layout integrity', () => {
     expect(app).toContain("else if (id === 'review') enterReviewMode();");
     expect(app).toContain("else if (viewMode === 'review') leaveReviewMode");
     expect(app).toContain('<StatsDashboard onOpenReview={enterReviewMode} />');
-    expect(app).toContain('<ReviewMode onExport={handleExport} onDone={leaveReviewMode} />');
+    expect(app).toContain("const loadReviewMode = () => import('./lib/ReviewMode.svelte')");
+    expect(app).toContain('componentProps={{ onExport: handleExport, onDone: leaveReviewMode }}');
     expect(app).toContain(
       'snapshot?.sidebarWide === sidebarWide ? snapshot.sidebarOpen : sidebarWide',
     );

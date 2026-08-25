@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && node scripts/check_bundle_budget.mjs",
+    "build:vite": "vite build",
+    "check:bundle-budget": "node scripts/check_bundle_budget.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
