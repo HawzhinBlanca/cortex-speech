@@ -486,7 +486,7 @@ pub(crate) fn validate_offsite_dir(target: &Path, primary_data_dir: &Path) -> Ap
 /// BEFORE a restore overwrites the live DB — a mis-restore of the wrong snapshot was otherwise
 /// recoverable only from a ≤10-min-old rolling snapshot that itself rotates out.
 pub fn take_pinned_snapshot(db: &Database, data_dir: &Path, label: &str, keep_pinned: usize) -> AppResult<PathBuf> {
-    let _capture = crate::commands::begin_snapshot_capture(data_dir).map_err(AppError::Other)?;
+    let _capture = crate::database_runtime::begin_snapshot_capture(data_dir).map_err(AppError::Other)?;
     take_pinned_snapshot_at(db, data_dir, label, keep_pinned, now_secs())
 }
 
@@ -495,7 +495,7 @@ pub fn take_pinned_snapshot(db: &Database, data_dir: &Path, label: &str, keep_pi
 /// The explicit reservation capability binds this bypass to the caller's live ownership lifetime;
 /// ambient process-global state is not sufficient proof.
 pub(crate) fn take_pinned_snapshot_during_restore(
-    reservation: &crate::commands::RestoreReservation<'_>,
+    reservation: &crate::database_runtime::RestoreReservation<'_>,
     db: &Database,
     data_dir: &Path,
     label: &str,
@@ -653,7 +653,7 @@ pub(crate) fn take_snapshot_at_from(
     // Serialize the complete DB+config capture against named restores. The guard is held until the
     // staging tree is either promoted or removed, so no restore generation can be mixed with config
     // from another generation. It also refuses a durable marker left by an interrupted restore.
-    let _capture = crate::commands::begin_snapshot_capture(primary_data_dir).map_err(AppError::Other)?;
+    let _capture = crate::database_runtime::begin_snapshot_capture(primary_data_dir).map_err(AppError::Other)?;
     let root = dest_dir.join("snapshots");
 
     // THE EMPTY-DB GUARD (B2, true-10 audit blocker): after a corruption quarantine the app opens a

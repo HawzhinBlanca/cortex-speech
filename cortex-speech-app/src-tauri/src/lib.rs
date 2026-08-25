@@ -20,6 +20,7 @@ pub mod constrained_decode;
 pub mod corrections;
 pub mod couch;
 pub mod crash;
+mod database_runtime;
 pub mod db;
 pub mod denoiser;
 pub mod deployment;
@@ -94,6 +95,7 @@ static GIT_SHA_MARKER: &str = concat!("CORTEX_BUILD_SHA:", env!("GIT_SHA"));
 
 use cache::TranscriptCache;
 use cancel::CancellationToken;
+use database_runtime::DatabaseRuntime;
 use db::Database;
 use fingerprint::AudioFingerprint;
 use history::HistoryManager;
@@ -130,12 +132,12 @@ fn next_snapshot_deadline(previous_deadline: Instant, interval: Duration, now: I
 /// configuration + history updates.
 #[derive(Clone)]
 pub(crate) struct AppDatabaseHandle {
-    inner: Arc<Mutex<Database>>,
+    inner: DatabaseRuntime,
 }
 
 impl AppDatabaseHandle {
     pub(crate) fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, Database>> {
-        crate::commands::lock_app_db(&self.inner)
+        self.inner.lock()
     }
 }
 
@@ -154,7 +156,7 @@ pub enum BatchState {
 pub struct AppState {
     // Arc so a slow command can clone the handle and move DB work into `spawn_blocking` (off the
     // main/UI thread) without borrowing `State` across an await. lock_db() still returns a guard.
-    pub db: Arc<Mutex<Database>>,
+    pub(crate) db: DatabaseRuntime,
     pub pipeline: Mutex<ProcessingPipeline>,
     pub normalizer: Arc<SoraniNormalizer>,
     pub cache: Arc<TranscriptCache>,
@@ -264,7 +266,7 @@ impl AppState {
     }
 
     pub(crate) fn lock_db(&self) -> MutexGuard<'_, Database> {
-        crate::commands::lock_app_db(&self.db).unwrap_or_else(|poisoned| {
+        self.db.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned database lock");
             poisoned.into_inner()
         })
@@ -272,13 +274,18 @@ impl AppState {
 
     /// A clonable, restore-gated DB handle for moving blocking work into `spawn_blocking`.
     pub(crate) fn db_arc(&self) -> AppDatabaseHandle {
-        AppDatabaseHandle { inner: Arc::clone(&self.db) }
+        AppDatabaseHandle { inner: self.db.clone() }
+    }
+
+    /// Bounded query-only connection authority for read-heavy blocking work.
+    pub(crate) fn db_runtime(&self) -> DatabaseRuntime {
+        self.db.clone()
     }
 
     /// Raw DB access for the restore implementation only. The caller must already own the exclusive
     /// RestoreReservation; ordinary commands must use `lock_db` / `db_arc` so they cannot pass it.
     pub(crate) fn db_arc_for_restore(&self) -> Arc<Mutex<Database>> {
-        Arc::clone(&self.db)
+        self.db.writer_arc_for_restore()
     }
 
     pub fn session_save(&self) {
@@ -345,8 +352,8 @@ impl AppState {
         let mut import = self.lock_import_state();
         // P1.3b: refuse to start while a DB restore is reserved. Checked UNDER the import_state lock (and
         // set-Running is under the same lock) so it can't race prepare_restore's writers_active() read.
-        if crate::commands::restore_pending() {
-            return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.into());
+        if crate::database_runtime::restore_pending() {
+            return Err(crate::database_runtime::RESTORE_IN_PROGRESS_MSG.into());
         }
         if *import == ImportState::Running {
             return Err("Import already in progress".into());
@@ -370,8 +377,8 @@ impl AppState {
     pub fn try_start_batch(&self) -> Result<(), String> {
         let mut batch = self.lock_batch_state();
         // P1.3b: refuse to start a batch while a DB restore is reserved (checked under the batch_state lock).
-        if crate::commands::restore_pending() {
-            return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.into());
+        if crate::database_runtime::restore_pending() {
+            return Err(crate::database_runtime::RESTORE_IN_PROGRESS_MSG.into());
         }
         if *batch == BatchState::Running {
             return Err("Batch operation already in progress".into());
@@ -724,7 +731,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            db: Arc::new(Mutex::new(db)),
+            db: DatabaseRuntime::new(db),
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,
@@ -922,7 +929,7 @@ pub fn run() {
                         // every engine start until the background recovery and final pointer sync pass.
                         crate::engine_runtime::set_promotion_recovery_blocked(true);
                         let recovery_app = app.handle().clone();
-                        match crate::commands::begin_mutation() {
+                        match crate::database_runtime::begin_mutation() {
                             Ok(mutation) => {
                                 std::thread::spawn(move || {
                                     let _mutation = mutation;
@@ -1225,7 +1232,7 @@ mod tests {
         );
 
         AppState {
-            db: Arc::new(Mutex::new(Database::open(":memory:").unwrap())),
+            db: DatabaseRuntime::new(Database::open(":memory:").unwrap()),
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,

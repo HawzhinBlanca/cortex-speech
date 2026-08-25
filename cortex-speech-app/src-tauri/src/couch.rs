@@ -1076,8 +1076,8 @@ where
     // are mutex-serialized (airtight, like try_start_import): a restore reserved concurrently either sees
     // the server registered (fence refuses) or is seen here (this refuses). An already-running server is
     // also caught by the fence.
-    if crate::commands::restore_pending() {
-        return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.to_string());
+    if crate::database_runtime::restore_pending() {
+        return Err(crate::database_runtime::RESTORE_IN_PROGRESS_MSG.to_string());
     }
     if let Some(h) = guard.as_ref() {
         return Ok(status_of(h));

@@ -96,9 +96,9 @@ pub async fn get_review_page_v1(
     }
     let focus = crate::voice_focus::resolve(state.lock_data_dir().as_deref())
         .map_err(|error| public_review_read_error(&error))?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     tokio::task::spawn_blocking(move || {
-        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = database.open_read().map_err(|error| public_review_read_error(&error.to_string()))?;
         let page = db
             .get_segments_page_focused(
                 Some(false),

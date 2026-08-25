@@ -67,17 +67,18 @@ def test_both_restore_callers_hold_the_reservation() -> None:
 
 def test_restore_admission_is_exclusive_and_all_appstate_handles_delegate() -> None:
     commands = _read("commands.rs")
+    runtime = _read("database_runtime.rs")
     for phase in ("Idle", "ActiveNew", "ActiveArmed", "Parked"):
-        if phase not in _fn_body(commands, "enum RestorePhase", span=700):
+        if phase not in _fn_body(runtime, "enum RestorePhase", span=700):
             raise AssertionError(f"restore state machine lost phase {phase}")
-    reserve = _fn_body(commands, "fn reserve(", span=4300)
+    reserve = _fn_body(runtime, "fn reserve(", span=4300)
     for needle in (".compare_exchange(", "admission.generation", "RestorePhase::Parked if recovery_required"):
         if needle not in reserve:
             raise AssertionError(f"restore reservation lost ownership/recovery primitive: {needle}")
-    drop = _fn_body(commands, "impl Drop for RestoreReservation", span=1700)
+    drop = _fn_body(runtime, "impl Drop for RestoreReservation", span=1700)
     if "RestorePhase::ActiveArmed" not in drop or "state.phase = RestorePhase::Parked" not in drop:
         raise AssertionError("dropping an armed named restore must park admission, never reopen writers")
-    commit = _fn_body(commands, "fn commit_named_restore", span=1200)
+    commit = _fn_body(runtime, "fn commit_named_restore", span=1200)
     for needle in ("state.phase = RestorePhase::Idle", "pending.store(false", "complete.notify_all()"):
         if needle not in commit:
             raise AssertionError(f"coherent restore commit lost release step: {needle}")
@@ -87,15 +88,20 @@ def test_restore_admission_is_exclusive_and_all_appstate_handles_delegate() -> N
     ):
         if regression not in commands:
             raise AssertionError(f"missing deterministic restore-admission regression: {regression}")
-    if "while self.is_pending()" not in _fn_body(commands, "fn lock<'a, T>(", span=1400):
+    if "while self.is_pending()" not in _fn_body(runtime, "fn lock<'a, T>(", span=1400):
         raise AssertionError("ordinary AppState DB locks must wait behind the restore admission barrier")
 
     lib = _read("lib.rs")
-    if "crate::commands::lock_app_db(&self.db)" not in _fn_body(lib, "pub(crate) fn lock_db(", span=500):
+    if "mod database_runtime;" not in lib or "db: DatabaseRuntime" not in lib:
+        raise AssertionError("AppState must delegate process-level database ownership to DatabaseRuntime")
+    if "self.db.lock()" not in _fn_body(lib, "pub(crate) fn lock_db(", span=500):
         raise AssertionError("AppState::lock_db bypasses the restore admission barrier")
     handle = _fn_body(lib, "impl AppDatabaseHandle", span=700)
-    if "crate::commands::lock_app_db(&self.inner)" not in handle:
+    if "self.inner.lock()" not in handle:
         raise AssertionError("the clonable AppState DB handle bypasses the restore admission barrier")
+    for needle in ("writer: Arc<Mutex<Database>>", "reads: Arc<ReadConnectionPool>", "admission: Arc<RestoreAdmission>"):
+        if needle not in runtime:
+            raise AssertionError(f"DatabaseRuntime lost process-level ownership boundary: {needle}")
 
 
 def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
@@ -203,7 +209,7 @@ def test_long_prework_publishers_hold_full_operation_mutation_guards() -> None:
 
     integration = _read("integration_runner.rs")
     body = _fn_body(integration, "pub fn run(", span=3500)
-    mutation = body.find("crate::commands::begin_mutation()?")
+    mutation = body.find("crate::database_runtime::begin_mutation()?")
     first_import = body.find("pipeline.import_directory(")
     if mutation == -1 or first_import == -1 or mutation >= first_import:
         raise AssertionError("registered integration/audiobook lifecycle must fence its complete write lifetime")
@@ -286,7 +292,7 @@ def test_every_writer_start_checks_restore_pending() -> None:
     # would reopen the race between the reservation and the background writer becoming visible.
     lifecycle = _fn_body(couch, "fn start_on_port_with_session_lifecycle", span=30_000)
     lock = lifecycle.find("let mut guard = COUCH.lock().unwrap_or_else(|p| p.into_inner());")
-    pending = lifecycle.find("if crate::commands::restore_pending()")
+    pending = lifecycle.find("if crate::database_runtime::restore_pending()")
     register = lifecycle.find("*guard = Some(handle);")
     if -1 in (lock, pending, register) or not (lock < pending < register):
         raise AssertionError(
