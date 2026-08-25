@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `dff94a4`
+**Current evidence commit:** `deddfd3`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -45,16 +45,21 @@ requires the immutable profile manifest and the external evidence listed under O
 | `DatabaseRuntime` owns serialized writes, a bounded four-connection read pool and restore admission; typed review reads and online backup use restore-gated query snapshots. | `44222f6` | 3/3 runtime regressions; focused restore-admission 2/2, named-restore 4/4 and snapshot-restore 1/1; full Rust and policy suites passed | Connection reopening, domain stores, remaining command SQL removal and the 50,000-segment concurrency/restore proof remain open |
 | Segment/library/review queries are routed through a Tauri-free `SegmentQueryStore`; bounded readers use the runtime-owned live path without contending on the serialized writer mutex. | `d554d4a` | 4/4 runtime regressions, 1/1 store regression, new architecture policy, all 113 policy scripts, full Rust 1,578/0 and frontend 303/303 | Only the first query domain is migrated; write stores, remaining raw command access, connection reopening and the 50,000-segment proof remain open |
 | Desktop review drafts survive navigation/restart without becoming review truth: schema v66 is additive, writes use FULL-sync revision-CAS storage, stale saves cannot resurrect cleared text, and typed commit/replay clears only the matching revision in the human-truth transaction. | `dff94a4` | 4/4 draft-store tests including injected failure; typed commit/rollback/replay tests; 3 frontend recovery/conflict/debounce tests; generated bindings and non-authority policy; full Rust 1,584/0, frontend 308/308 and all 114 Python policy scripts | Process-kill timing, power-loss behavior, long-session draft churn and full `ReviewWorkspace` decomposition remain certification gates |
+| The production build enforces the initial 125 KB JavaScript and 15 KB CSS ceilings over the complete transitive static manifest; secondary workspaces load in explicit chunks with localized pending/failure states, retry, stale-load isolation and raw-error scrubbing. Preview/E2E typed review mocks are explicit and unknown commands fail loudly. | `deddfd3` | Executable oversized-transitive-dependency fault test; 2 lazy-boundary tests; frontend 310/310; Playwright 97/97 with zero retries; standalone preview traversed Insights → Settings → Review with zero console/page errors; all 115 Python policies | Cold-shell/review-usable timing, search/audio latency, long tasks, FPS and 1,000-decision heap proof remain open |
 
 ## Integrated checkpoint evidence
 
 - `cargo test --all-targets --all-features`: 1,584 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
-- Frontend: 57 files / 308 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
-- Python policies: all 114 reachable policy scripts passed.
-- Production build passed. Initial CSS is 13.75 KB gzip (within the 15 KB target); initial JavaScript is
-  146.14 KB gzip and therefore **fails** the 125 KB target by 21.14 KB. No performance pass is claimed.
+- Frontend: 58 files / 310 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
+- Browser E2E/accessibility: 97/97 passed with zero retries against a gate-owned Vite server.
+- Python policies: all 115 reachable policy scripts passed.
+- Production build and its fail-closed manifest budget passed. Initial JavaScript is **111.19 KB gzip**
+  against the 125 KB ceiling; initial CSS is **11.20 KB gzip** against the 15 KB ceiling. The gate
+  recursively counts the entry and all static imports, excludes on-demand chunks, and was proven to
+  reject an oversized transitive dependency. This closes only the declared bundle-size slice, not the
+  remaining startup, latency, interaction, scrolling or memory budgets.
 - Migrations 1–65 are byte-identical to production base `bd581ef` (normalized catalog SHA-256
   `c47d4be689871b8191c13d96a59dd502a9de4d8868788f8cd9cfa4efca7cc2e3`).
 - Work used disposable databases only. The active database and immutable release pointer were not modified.
@@ -75,8 +80,9 @@ evidence, lock recovery, or manual status changes.
 ## Open gates preventing any 10/10 verdict
 
 - Backend store/runtime decomposition and the 50,000-segment concurrency/restore proof are incomplete.
-- Frontend workstation decomposition, complete typed IPC migration, i18n parity, responsive,
-  WCAG 2.2 AA manual evidence, and performance/memory budgets are incomplete.
+- Frontend workstation decomposition, complete typed IPC migration, typed i18n keys, responsive and
+  WCAG 2.2 AA manual evidence, plus runtime performance/memory budgets are incomplete. Initial bundle
+  size is now green and build-enforced.
 - Three clean calibrated verifier runs and three complete verifier fault campaigns are incomplete.
 - Owner workflow, crash/recovery, two-hour/1,000-decision soak, cold-reboot proof, and 30 daily-use
   sessions have not been completed on the release candidate.
@@ -85,4 +91,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `dff94a4` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `deddfd3` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.

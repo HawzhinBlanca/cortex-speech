@@ -16,8 +16,8 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `dff94a4`: duplicate policies **6/6 + 17/17**, frontend **308/308** across
-> 57 files, all **114** reachable Python policy scripts, compensation readiness **38/38**, strict
+> Measured checkpoint at `deddfd3`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> 58 files, browser E2E/accessibility **97/97** with zero retries, all **115** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
 > **1,584 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
@@ -41,8 +41,14 @@
 > appends schema 66 for FULL-sync, revision-bound, non-authoritative desktop drafts; stale writes
 > cannot resurrect cleared work, matching drafts clear atomically with typed human decisions and
 > lost-response replays, stale drafts are shown beside server truth without automatic merge, and
-> exports/evaluation/payment/serving cannot query the draft table. The production build is honest-red
-> on the initial JavaScript budget: **146.14 KB gzip versus 125 KB required**; CSS is green at 13.75 KB.
+> exports/evaluation/payment/serving cannot query the draft table. `deddfd3` isolates Review,
+> Settings, Refinery, validation, review inbox, keyboard help, command palette, speaker, merge and WSL
+> workspaces behind literal dynamic imports with localized loading/failure, retry, stale-load isolation
+> and raw-error scrubbing. Both standalone preview and E2E mocks implement the typed review page/draft
+> contract and reject unknown commands instead of returning deceptive `null`. The production build now
+> walks Vite's complete transitive static manifest and fails over **125 KB JavaScript / 15 KB CSS**;
+> its exact result is **111.19 KB JS gzip and 11.20 KB CSS gzip**. A synthetic oversized transitive
+> dependency is rejected, so this is an enforced bundle gate rather than a copied measurement.
 > This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
