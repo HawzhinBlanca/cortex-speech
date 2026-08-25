@@ -576,8 +576,7 @@ pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value
 #[tauri::command]
 pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<crate::db::ImportJob>, String> {
     RATE_LIMITER.check("get_interrupted_import")?;
-    let db = state.lock_db();
-    db.find_interrupted_import_job().map_err(|e| e.to_string())
+    state.job_store().find_interrupted_import().map_err(|error| error.to_string())
 }
 
 /// P3.2: discard an interrupted import job (the user chose not to resume).
@@ -585,8 +584,7 @@ pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<crate
 pub fn discard_interrupted_import(job_id: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("discard_interrupted_import")?;
     validate::validate_identifier(&job_id)?;
-    let db = state.lock_db();
-    db.discard_import_job(&job_id).map_err(|e| e.to_string())
+    state.job_store().discard_interrupted_import(&job_id).map_err(|error| error.to_string())
 }
 
 /// P3.2: resume the interrupted directory import — re-run its folder, skipping files already imported
@@ -598,10 +596,7 @@ pub fn resume_interrupted_import(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("resume_interrupted_import")?;
-    let job = {
-        let db = state.lock_db();
-        db.find_interrupted_import_job().map_err(|e| e.to_string())?
-    };
+    let job = state.job_store().find_interrupted_import().map_err(|error| error.to_string())?;
     let Some(job) = job else { return Err("No interrupted import to resume".into()) };
     let dir_path = std::path::PathBuf::from(&job.dir);
     if !dir_path.is_dir() {
@@ -612,8 +607,7 @@ pub fn resume_interrupted_import(
     state.try_start_import()?;
     {
         // Retire the crashed job now that we are resuming it; the fresh import job supersedes it.
-        let db = state.lock_db();
-        let _ = db.discard_import_job(&job.id);
+        let _ = state.job_store().discard_interrupted_import(&job.id);
     }
     let cancel = Some(state.start_cancel_token());
     let pipeline = state.lock_pipeline().clone();
@@ -1864,12 +1858,8 @@ pub async fn merge_dataset_json(json_content: String, state: State<'_, AppState>
 #[tauri::command]
 pub async fn get_jobs(state: State<'_, AppState>) -> Result<Vec<crate::jobs::Job>, String> {
     RATE_LIMITER.check("get_jobs")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.list_recent_jobs(50).map_err(|e| e.to_string())
-    })
-    .await
+    let store = state.job_store();
+    run_blocking(move || store.list_recent(50).map_err(|error| error.to_string())).await
 }
 
 #[derive(serde::Serialize)]
