@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `d21f241`
+**Current evidence commit:** `20148bb`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -52,6 +52,7 @@ requires the immutable profile manifest and the external evidence listed under O
 | Recording-scoped rights declaration, irreversible consent withdrawal and rights/provenance listing cross a Tauri-free `RightsStore`. Writes serialize through `DatabaseRuntime`; listing uses a bounded restore-gated read snapshot; commands retain validation and DTO mapping without raw database authority. | `9a43316` | 2 focused store regressions prove one declaration covers exactly the intended recording and that withdrawal survives a later metadata declaration; architecture policy covers all 3 commands; full Rust 1,592/0; all 118 Python policies; generated-binding drift, strict Clippy and rustfmt passed | Remaining segment/job/import stores and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Interrupted-import discovery/discard and Job Center recent-job reads cross a Tauri-free `JobStore`. Discovery and history use bounded restore-gated snapshots; discard remains serialized through `DatabaseRuntime`; all four startup/resume/job handlers retain rate and identifier validation without raw database authority. | `6e72bcc` | 2 store regressions prove bounded newest-first history and read/discard of interrupted import state; architecture policy covers `get_interrupted_import`, `discard_interrupted_import`, `resume_interrupted_import` and `get_jobs`; full Rust 1,594/0; all 119 Python policies; generated-binding drift, strict Clippy and rustfmt passed | Pipeline/background job writers and import orchestration still use the compatibility façade; segment mutations, Couch decomposition, connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Segment deletion, batch deletion and speaker rename cross a Tauri-free `SegmentWriteStore`. Deletes read the authoritative server rows before removal, push exact undo history only after successful deletion, and return an admission token that keeps restore fenced through command-side session autosave. The retired whole-row command now refuses before acquiring database authority. | `d21f241` | 2 store regressions prove exact raw-transcript/speaker restoration and shared serialized batch-delete/rename behavior; architecture policy covers all 3 migrated commands plus the retired endpoint; runtime-panic policy follows the new boundary and requires batch-read/delete error propagation; full Rust 1,596/0; all 120 Python policies; strict Clippy and rustfmt passed | Field-level segment mutations, pipeline/background job writers, import orchestration and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
+| Field-level segment updates cross `SegmentWriteStore`: the store owns the curation whitelist, structural alignment validation, schema-60 human-truth guard and exact history persistence. The command validates and delegates without raw database authority, and the returned mutation token keeps restore fenced through session autosave. | `20148bb` | 4 focused store regressions include whitelist-only mutation, mixed-payload atomic refusal at schema 60, exact deletion undo and serialized batch-delete/rename; the architecture policy now covers all 4 active segment mutation commands and the retired whole-row endpoint; full Rust 1,596/0; all 120 Python policies; strict Clippy and rustfmt passed | Pipeline/background job writers, import orchestration and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 
 ## Integrated checkpoint evidence
 
@@ -97,4 +98,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `d21f241` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `20148bb` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.

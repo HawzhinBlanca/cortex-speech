@@ -16,7 +16,7 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `d21f241`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `20148bb`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **120** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
 > **1,596 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
@@ -83,8 +83,13 @@
 > restore cannot split the database mutation from matching session persistence. Two store regressions
 > prove exact raw-transcript/speaker restoration and shared batch-delete/rename serialization; the
 > architecture and runtime-panic policies require delegation and explicit database error propagation.
-> The retired whole-row endpoint now refuses before acquiring database authority. Field-level segment
-> mutations, pipeline/background job writers, import orchestration and Couch decomposition remain open.
+> The retired whole-row endpoint now refuses before acquiring database authority. `20148bb` completes
+> the active desktop segment-mutation slice by routing field-level updates through the same store. The
+> store now owns the curation whitelist, structural alignment validation, schema-60 human-truth guard and
+> exact history persistence; mixed restricted payloads refuse before mutation, and the command keeps
+> the restore-admission token alive through session autosave. Four focused store regressions plus the
+> expanded architecture policy passed on the same tree. Pipeline/background job writers, import
+> orchestration, Couch decomposition, connection reopening and the 50,000-segment hammer remain open.
 > This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
