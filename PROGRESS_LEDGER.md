@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `a0fb4df`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `888a2bd`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **120** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,598 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,599 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -94,8 +94,14 @@
 > raw database handle or drive queued/running/terminal transitions. Restore admission now spans the
 > durable job and output publication. Four store regressions include a real disposable JSON export
 > ending in `succeeded` and an injected failure preserving its exact error plus stable failure code;
-> both architecture policies forbid regression. Other export services, pipeline import journaling,
-> background writers, Couch decomposition, connection reopening and the 50,000-segment hammer remain open.
+> both architecture policies forbid regression. `888a2bd` completes the shipped export-command slice:
+> transcript, production bundle, reviewed-audio, gold-eval and fine-tune-pack exports now use the same
+> store-owned serialized database and durable job lifecycle. IPC retains rate/identifier/path checks
+> plus immutable settings, model-manager and ledger-path capture; every export receives a stable
+> domain-specific terminal failure code, and `commands/export.rs` contains no raw database or
+> job-transition authority. A fifth store regression publishes a real disposable transcript artifact
+> and proves its durable succeeded state. Pipeline import journaling, background writers, Couch
+> decomposition, connection reopening, export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,

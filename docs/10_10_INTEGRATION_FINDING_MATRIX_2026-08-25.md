@@ -1,12 +1,12 @@
 # Cortex Speech 10/10 Integration Finding Matrix
 
-**Date:** 2026-08-25
+**Date:** 2026-08-25 (updated 2026-08-26)
 
 **Branch:** `codex/10-10-integration`
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `a0fb4df`
+**Current evidence commit:** `888a2bd`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -54,10 +54,11 @@ requires the immutable profile manifest and the external evidence listed under O
 | Segment deletion, batch deletion and speaker rename cross a Tauri-free `SegmentWriteStore`. Deletes read the authoritative server rows before removal, push exact undo history only after successful deletion, and return an admission token that keeps restore fenced through command-side session autosave. The retired whole-row command now refuses before acquiring database authority. | `d21f241` | 2 store regressions prove exact raw-transcript/speaker restoration and shared serialized batch-delete/rename behavior; architecture policy covers all 3 migrated commands plus the retired endpoint; runtime-panic policy follows the new boundary and requires batch-read/delete error propagation; full Rust 1,596/0; all 120 Python policies; strict Clippy and rustfmt passed | Field-level segment mutations, pipeline/background job writers, import orchestration and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Field-level segment updates cross `SegmentWriteStore`: the store owns the curation whitelist, structural alignment validation, schema-60 human-truth guard and exact history persistence. The command validates and delegates without raw database authority, and the returned mutation token keeps restore fenced through session autosave. | `20148bb` | 4 focused store regressions include whitelist-only mutation, mixed-payload atomic refusal at schema 60, exact deletion undo and serialized batch-delete/rename; the architecture policy now covers all 4 active segment mutation commands and the retired whole-row endpoint; full Rust 1,596/0; all 120 Python policies; strict Clippy and rustfmt passed | Pipeline/background job writers, import orchestration and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 | Plain and Hugging Face dataset exports cross the Tauri-free `JobStore`: IPC retains rate/path validation and off-main-thread dispatch but cannot acquire the raw writer or drive job transitions. The store holds restore admission across queued/running work, output publication and terminal stamping. | `a0fb4df` | 4 JobStore regressions include a real disposable JSON export with a succeeded durable job plus injected failure/error-code propagation; job-store and main-thread policies forbid raw DB/job authority in both commands; full Rust 1,598/0; all 120 Python policies passed sequentially with generated bindings current; strict Clippy and rustfmt passed | Other export services, pipeline import journaling/background writers and Couch decomposition remain open; connection reopening, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
+| Transcript, production bundle, reviewed-audio, gold-eval and fine-tune-pack exports also cross the Tauri-free `JobStore`, completing the shipped export command slice. IPC owns rate/identifier/path validation and immutable settings/model/ledger inputs; the store exclusively owns serialized database access, restore admission and durable queued/running/terminal state with stable per-domain failure codes. | `888a2bd` | 5 JobStore regressions include real disposable JSON and transcript artifacts with succeeded durable jobs plus exact injected failure propagation; policies cover all 7 exports and prove `commands/export.rs` has no raw database or job-lifecycle authority; full Rust 1,599/0 with all integration, soak, binary and benchmark targets green; all 120 Python policies passed sequentially with generated bindings current; strict Clippy and rustfmt passed | Pipeline import journaling/background writers and Couch decomposition remain open; connection reopening, export-kill/disk-full certification campaigns, the 50,000-segment concurrent review/import/backup proof and restore-reopen proof remain open |
 
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,598 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --all-targets --all-features`: 1,599 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Frontend: 58 files / 310 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
