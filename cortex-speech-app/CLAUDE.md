@@ -93,6 +93,31 @@ This project's entire credibility rests on real, never fabricated, results.
   law** — machine code never writes it; `scripts/check_review_serving_provenance.py` (verify-10 gate
   `review-serving-provenance`) enforces both invariants on the live database every sweep.
 
+### Auditor discipline — measure before you assert (added 2026-08-25, after a real failure)
+
+The honesty law above governs numbers. This governs CLAIMS, and it was written because an audit
+session reported four things as fact that measurement then contradicted.
+
+- **A claim about LIVE impact requires a live query FIRST.** "Reviewers are unpaid" needs its
+  `SELECT COUNT(*)` before the sentence exists. That session published "playback-evidenced review
+  work mints zero pay" as an active loss; the two decision tables held **0 rows**. The defect was
+  real, the harm was not.
+- **A failure observed under non-canonical flags is NOT a finding.** Use the repo's exact gate
+  commands (`scripts/verify_10.py`, the Makefile targets). Deviating for speed is fine —
+  `CARGO_TARGET_DIR=<scratch>` dodges the running app's DLL lock — but any failure that deviation
+  produces is void until reproduced canonically. Measured: a scratch target dir hides
+  `scripts/cortex_7b_client.py` from `resolve_wsl_7b_client`, which walks up from `current_exe()`,
+  manufacturing 5 `pipeline::tests` failures that look pre-existing. `cargo test` in the NORMAL
+  `target/` works even with the app running; the DLL lock only bites release artifacts.
+- **A baseline must vary the SUSPECTED CAUSE, not just the code.** Stashing the diff while keeping
+  the same flag is a fake control: it reproduces the artifact and reads as proof. This is the
+  write-path/serving-path law pointed at the auditor — checking your own reasoning is not verification.
+- **Report the defect, not a culprit.** Findings name the file, the commit and the fix. They do not
+  name the person, and never the owner: he ordered the audit and reviews everyone's work.
+- **A pin can enforce the bug.** Before fixing a defect, grep `scripts/test_*.py` for the symbol or
+  string you are changing — `test_rust_runtime_panic_policy.py` once listed the lockfile-deleting
+  call as REQUIRED. Invert the pin in the same commit; never weaken it.
+
 ## Environment realities (read before acting)
 
 The app targets **Windows**; the Cowork sandbox is **Linux with node/npm/python3 only — no Rust toolchain**.
