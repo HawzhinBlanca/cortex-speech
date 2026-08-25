@@ -541,7 +541,8 @@ mod tests {
     fn library_identities_rehydrate_before_any_import() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open_with_retry(&dir.path().join("cortex-speech.db").to_string_lossy()).expect("open db");
-        db.initialize().expect("initialize schema");
+        cortex_speech_app_lib::snapshot::initialize_with_required_pre_migration_pin(&db, dir.path())
+            .expect("initialize schema through the production admission guard");
         let segment = cortex_speech_app_lib::db::SpeechSegment {
             id: "seg-1".into(),
             audio_path: "d:/voice/lamo_000056.wav".into(),
