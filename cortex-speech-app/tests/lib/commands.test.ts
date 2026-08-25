@@ -5,11 +5,14 @@ import {
   AudioExportFormat,
   ASR_7B_UNAVAILABLE_TAG,
   commitReviewV1,
+  deleteReviewDraftV1,
+  getReviewDraftV1,
   is7bUnavailableError,
   listAgentImportReports,
   listAgentStageEvents,
   recordHumanDecision,
   recordReviewFlag,
+  saveReviewDraftV1,
 } from '../../src/lib/commands';
 
 const invokeMock = vi.mocked(invoke);
@@ -145,6 +148,53 @@ describe('typed desktop review decision idempotency', () => {
     invokeMock.mockRejectedValueOnce(refusal);
 
     await expect(commitReviewV1(request)).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('revision-bound desktop review drafts', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('uses only generated typed commands for load, save, and guarded delete', async () => {
+    const draft = {
+      segmentId: 'segment-draft',
+      baseRevision: 9,
+      text: 'دەقی ناتەواو',
+      updatedAt: '2026-08-25T12:00:00.000Z',
+    };
+    invokeMock.mockResolvedValueOnce(draft).mockResolvedValueOnce(draft).mockResolvedValueOnce(true);
+
+    await expect(getReviewDraftV1(draft.segmentId)).resolves.toEqual(draft);
+    await expect(saveReviewDraftV1(draft.segmentId, draft.baseRevision, draft.text)).resolves.toEqual(draft);
+    await expect(deleteReviewDraftV1(draft.segmentId, draft.baseRevision)).resolves.toBe(true);
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['get_review_draft_v1', { segmentId: draft.segmentId }],
+      [
+        'save_review_draft_v1',
+        { segmentId: draft.segmentId, baseRevision: draft.baseRevision, text: draft.text },
+      ],
+      [
+        'delete_review_draft_v1',
+        { segmentId: draft.segmentId, baseRevision: draft.baseRevision },
+      ],
+    ]);
+  });
+
+  it('does not retry or stringify a stale-revision draft refusal', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'STALE_DRAFT_REVISION',
+      message: 'reload',
+      retryable: false,
+      suggestedAction: 'reloadClip',
+      operationId: null,
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(saveReviewDraftV1('segment-draft', 9, 'text')).rejects.toBe(refusal);
     expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -289,6 +289,10 @@ impl AppState {
         crate::stores::SegmentQueryStore::new(self.db.clone())
     }
 
+    pub(crate) fn review_drafts(&self) -> crate::stores::ReviewDraftStore {
+        crate::stores::ReviewDraftStore::new(self.db.clone())
+    }
+
     /// Raw DB access for the restore implementation only. The caller must already own the exclusive
     /// RestoreReservation; ordinary commands must use `lock_db` / `db_arc` so they cannot pass it.
     pub(crate) fn db_arc_for_restore(&self) -> Arc<Mutex<Database>> {
@@ -872,6 +876,9 @@ pub fn run() {
             commands::get_review_page_v1,
             commands::record_human_decision,
             commands::commit_review_v1,
+            commands::get_review_draft_v1,
+            commands::save_review_draft_v1,
+            commands::delete_review_draft_v1,
             commands::undo_human_decision,
             commands::record_review_flag,
             commands::undo_review_flag,

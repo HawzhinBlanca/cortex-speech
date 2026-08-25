@@ -15,6 +15,26 @@ export const commands = {
 	 *  renderer migrates one review domain at a time.
 	 */
 	commitReviewV1: (request: CommitReviewRequestV1) => typedError<CommittedReviewV1, CommandErrorV1>(__TAURI_INVOKE("commit_review_v1", { request })),
+	/**
+	 *  Load the non-authoritative desktop draft for one clip. Draft text never participates in review
+	 *  truth, exports, evaluation, readiness, compensation, or serving queries.
+	 */
+	getReviewDraftV1: (segmentId: string) => typedError<{
+	segmentId: string,
+	baseRevision: number,
+	text: string,
+	updatedAt: string,
+} | null, CommandErrorV1>(__TAURI_INVOKE("get_review_draft_v1", { segmentId })),
+	/**
+	 *  Durably replace one clip's desktop draft. The server owns the timestamp; the renderer supplies
+	 *  the exact review revision so a later decision cannot erase a draft for a newer clip state.
+	 */
+	saveReviewDraftV1: (segmentId: string, baseRevision: number, text: string) => typedError<ReviewDraftV1, CommandErrorV1>(__TAURI_INVOKE("save_review_draft_v1", { segmentId, baseRevision, text })),
+	/**
+	 *  Delete only a draft bound to the supplied review revision. A stale renderer cannot erase work
+	 *  saved against a newer server state.
+	 */
+	deleteReviewDraftV1: (segmentId: string, baseRevision: number) => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("delete_review_draft_v1", { segmentId, baseRevision })),
 };
 
 /* Types */

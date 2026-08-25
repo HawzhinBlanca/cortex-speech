@@ -4,6 +4,7 @@ import type {
   CommandErrorV1,
   CommitReviewRequestV1,
   CommittedReviewV1,
+  ReviewDraftV1,
   ReviewPageV1,
   ReviewScope,
 } from './generated/ipc';
@@ -236,6 +237,34 @@ export async function commitReviewV1(request: CommitReviewRequestV1): Promise<Co
     if (error instanceof Error) return invokeExact();
     throw error;
   }
+}
+
+/** Load one crash-safe draft. Drafts are non-authoritative and never enter corpus truth. */
+export async function getReviewDraftV1(segmentId: string): Promise<ReviewDraftV1 | null> {
+  const result = await generatedCommands.getReviewDraftV1(segmentId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Persist the exact clip/revision draft with a server-owned timestamp. */
+export async function saveReviewDraftV1(
+  segmentId: string,
+  baseRevision: number,
+  text: string,
+): Promise<ReviewDraftV1> {
+  const result = await generatedCommands.saveReviewDraftV1(segmentId, baseRevision, text);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Revision-guarded explicit discard; returns false when no matching draft exists. */
+export async function deleteReviewDraftV1(
+  segmentId: string,
+  baseRevision: number,
+): Promise<boolean> {
+  const result = await generatedCommands.deleteReviewDraftV1(segmentId, baseRevision);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export function reviewEffectId(decisionId: string): number | null {
@@ -1322,7 +1351,7 @@ export interface HumanDecisionCommit {
 
 export type HumanDecisionUndoOutcome =
   | { status: 'applied'; restoredRevision: number; segment: SpeechSegment }
-  | { status: 'alreadyApplied'; segment: SpeechSegment }
+  | { status: 'alreadyApplied'; restoredRevision: number; segment: SpeechSegment }
   | { status: 'conflict'; segment: SpeechSegment };
 
 export async function recordHumanDecision(

@@ -2694,9 +2694,9 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
         db.insert_segment_full(&reviewed_segment("clip", &audio, "Rubar", first_text)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='clip'", ["a".repeat(64)])
             .unwrap();
@@ -2714,7 +2714,7 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
         for id in ["a", "b"] {
             let audio = dir.path().join(format!("{id}.wav"));
             std::fs::write(&audio, b"wav").unwrap();
@@ -2725,7 +2725,7 @@ mod tests {
             };
             db.insert_segment_full(&row).unwrap();
         }
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
         db.connection()
             .execute("UPDATE speech_segments SET audio_content_hash=?1 WHERE id='a'", ["a".repeat(64)])
             .unwrap();
@@ -2928,7 +2928,7 @@ mod tests {
         )
         .unwrap_err()
         .contains("outside the active review pool"));
-        assert!(crate::migrations::rollback(&db, 2).unwrap_err().to_string().contains("CHECK constraint failed"));
+        assert!(crate::migrations::rollback(&db, 3).unwrap_err().to_string().contains("CHECK constraint failed"));
     }
 
     #[test]
@@ -3050,10 +3050,10 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         seed_champion(&db);
-        assert_eq!(crate::migrations::rollback(&db, 6).unwrap(), vec![65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
         db.insert_segment_full(&segment("first", &first_audio, Some("Rubar"))).unwrap();
         db.insert_segment_full(&segment("second", &second_audio, None)).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
         db.connection()
             .execute(
                 "UPDATE speech_segments

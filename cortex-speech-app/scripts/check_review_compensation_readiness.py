@@ -148,8 +148,8 @@ def audit_flexible_deferred(db_path: Path) -> dict[str, Any] | None:
             connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
         )
         evidence["schemaVersion"] = schema_version
-        if schema_version != 65:
-            errors.append(f"flexible compensation audit requires exact schema 65, found {schema_version}")
+        if schema_version not in (65, 66):
+            errors.append(f"flexible compensation audit requires supported schema 65 or 66, found {schema_version}")
 
         policy_rows = connection.execute(
             """SELECT effective_after_event_id, base_rate_micro_iqd_per_hour,

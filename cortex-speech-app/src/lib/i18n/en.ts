@@ -185,6 +185,22 @@ export const en: Record<string, string> = {
   'review.saveNext': 'Save & next',
   'review.prev': 'Back',
   'review.reset': 'Original',
+  'review.draftSaving': 'Saving recovery draft…',
+  'review.draftRecovered': 'Recovered your unsaved draft from this workstation.',
+  'review.draftSaveFailed': 'Recovery draft not saved',
+  'review.draftSaveFailedHint':
+    'Your text remains open, but it is not yet crash-safe. Retry before closing.',
+  'review.draftLoadFailed': 'Recovery draft not loaded',
+  'review.draftLoadFailedHint':
+    'The current server transcript is shown. Reload the clip to retry draft recovery.',
+  'review.draftConflictTitle': 'Saved draft needs your decision',
+  'review.draftConflictHint':
+    'The clip changed after this local draft was saved. Nothing was merged automatically. Compare both versions and choose explicitly.',
+  'review.serverTruth': 'Current server transcript',
+  'review.localDraft': 'Saved local draft',
+  'review.useLocalDraft': 'Use saved draft',
+  'review.discardLocalDraft': 'Discard saved draft',
+  'review.draftDiscardFailed': 'The saved draft could not be discarded.',
   'review.kbdHint':
     'Keys: A accept · E edit · X mark bad · Space play/pause · R replay · N/P next/prev · Backspace undo · Ctrl+Enter save & next',
   'review.actionsLabel': 'Review actions',

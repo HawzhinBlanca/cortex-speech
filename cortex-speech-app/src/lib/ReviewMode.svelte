@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import { get } from 'svelte/store';
   import {
     segments,
@@ -29,6 +29,7 @@
   import { parseEscalationEvidence, reasonLabelKey, reasonTone } from './reasonCodes';
   import { formatUnknownError } from './errorText';
   import type { SpeechSegment, WordTimestamp } from './types';
+  import type { ReviewDraftV1 } from './generated/ipc';
 
   interface Props {
     // Pro next-steps surfaced when the whole queue is reviewed (wired by App to its export / exit).
@@ -449,6 +450,8 @@
       reviewRevisions = remainingRevisions;
       reviewTotal = Math.max(0, reviewTotal - 1);
       void refreshSegmentStats();
+      editCache.delete(seg.id);
+      syncedDrafts.set(seg.id, `deleted:${baseRevision}`);
       notifications.success($t('review.markedBad'));
       if (visibleId === seg.id) advance();
       else {
@@ -486,6 +489,7 @@
         return;
       }
       const restored = outcome.segment;
+      reviewRevisions = { ...reviewRevisions, [last.id]: outcome.restoredRevision };
       // The same segment id may re-enter the queue immediately. Force the load effect to consume the
       // authoritative restored fields instead of treating that id as the already-loaded decided row.
       editCache.delete(last.id);
@@ -626,6 +630,92 @@
   // correction. Cleared per id on a successful save.
   const editCache = new Map<string, string>();
   let lastLoadedOriginal = '';
+  let lastLoadedRevision: number | null = null;
+  let draftReadyId = $state<string | null>(null);
+  let draftConflict = $state<ReviewDraftV1 | null>(null);
+  let draftRecovered = $state(false);
+  let draftSaving = $state(false);
+  let draftSaveFailed = $state(false);
+  let draftLoadSeq = 0;
+  let draftWriteSeq = 0;
+  const syncedDrafts = new Map<string, string>();
+  const draftWriteChains = new Map<string, Promise<void>>();
+
+  function draftStateKey(baseRevision: number, text: string, original: string): string {
+    return text.trim() === original.trim()
+      ? `deleted:${baseRevision}`
+      : `saved:${baseRevision}:${text}`;
+  }
+
+  function queueDraftWrite(
+    segmentId: string,
+    baseRevision: number,
+    text: string,
+    original: string,
+  ): Promise<void> {
+    const desired = draftStateKey(baseRevision, text, original);
+    if (syncedDrafts.get(segmentId) === desired) return Promise.resolve();
+    const writeSeq = ++draftWriteSeq;
+    const prior = draftWriteChains.get(segmentId) ?? Promise.resolve();
+    const write = prior
+      .catch(() => undefined)
+      .then(async () => {
+        if (desired.startsWith('deleted:')) {
+          await api.deleteReviewDraftV1(segmentId, baseRevision);
+        } else {
+          await api.saveReviewDraftV1(segmentId, baseRevision, text);
+        }
+        syncedDrafts.set(segmentId, desired);
+        if (current?.id === segmentId && writeSeq === draftWriteSeq) draftSaveFailed = false;
+      })
+      .catch((error) => {
+        if (current?.id === segmentId) {
+          draftSaveFailed = true;
+          notifications.error($t('review.draftSaveFailed'), {
+            detail: api.reviewErrorMessage(error, $t('review.draftSaveFailedHint')),
+          });
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (draftWriteChains.get(segmentId) === write) draftWriteChains.delete(segmentId);
+        if (current?.id === segmentId && writeSeq === draftWriteSeq) draftSaving = false;
+      });
+    draftWriteChains.set(segmentId, write);
+    if (current?.id === segmentId) draftSaving = true;
+    return write;
+  }
+
+  async function loadReviewDraft(seg: SpeechSegment, baseRevision: number, baseline: string) {
+    const seq = ++draftLoadSeq;
+    try {
+      const draft = await api.getReviewDraftV1(seg.id);
+      if (seq !== draftLoadSeq || current?.id !== seg.id) return;
+      draftConflict = null;
+      draftRecovered = false;
+      draftSaveFailed = false;
+      if (!draft) {
+        syncedDrafts.set(seg.id, `deleted:${baseRevision}`);
+      } else if (draft.baseRevision === baseRevision && editText === baseline) {
+        editCache.set(seg.id, draft.text);
+        syncedDrafts.set(seg.id, draftStateKey(baseRevision, draft.text, baseline));
+        editText = draft.text;
+        draftRecovered = draft.text.trim() !== baseline.trim();
+      } else {
+        // Never merge human text automatically. Server truth remains in the editor and the persisted
+        // local draft is shown beside it for an explicit reviewer choice.
+        draftConflict = draft;
+      }
+    } catch (error) {
+      if (seq !== draftLoadSeq || current?.id !== seg.id) return;
+      draftSaveFailed = true;
+      notifications.error($t('review.draftLoadFailed'), {
+        detail: api.reviewErrorMessage(error, $t('review.draftLoadFailedHint')),
+      });
+    } finally {
+      if (seq === draftLoadSeq && current?.id === seg.id) draftReadyId = seg.id;
+    }
+  }
 
   // Load the editable text + waveform whenever the current clip changes.
   $effect(() => {
@@ -639,9 +729,19 @@
       } else {
         editCache.delete(lastLoadedId);
       }
+      if (lastLoadedRevision !== null) {
+        void queueDraftWrite(lastLoadedId, lastLoadedRevision, editText, lastLoadedOriginal).catch(
+          () => undefined,
+        );
+      }
     }
+    draftReadyId = null;
+    draftConflict = null;
+    draftRecovered = false;
+    draftSaveFailed = false;
     lastLoadedId = seg.id;
     lastLoadedOriginal = originalText(seg);
+    lastLoadedRevision = reviewRevisions[seg.id] ?? null;
     editText = editCache.get(seg.id) ?? lastLoadedOriginal;
     currentTime = 0;
     playing = false;
@@ -650,7 +750,55 @@
     loadWaveform(seg);
     void ensureWordTimings(seg);
     void loadConsensus(seg);
+    if (lastLoadedRevision !== null) void loadReviewDraft(seg, lastLoadedRevision, editText);
   });
+
+  // Persist active edits after a short quiet period. Clip changes flush immediately above; the
+  // backend revision-checks each write so a late autosave cannot resurrect a cleared old draft.
+  $effect(() => {
+    const seg = current;
+    const text = editText;
+    const original = lastLoadedOriginal;
+    const baseRevision = lastLoadedRevision;
+    if (!seg || draftReadyId !== seg.id || baseRevision === null) return;
+    if (syncedDrafts.get(seg.id) === draftStateKey(baseRevision, text, original)) return;
+    const timer = window.setTimeout(() => {
+      void queueDraftWrite(seg.id, baseRevision, text, original).catch(() => undefined);
+    }, 500);
+    return () => window.clearTimeout(timer);
+  });
+
+  onDestroy(() => {
+    if (lastLoadedId && lastLoadedRevision !== null) {
+      void queueDraftWrite(lastLoadedId, lastLoadedRevision, editText, lastLoadedOriginal).catch(
+        () => undefined,
+      );
+    }
+  });
+
+  function useConflictingDraft() {
+    if (!current || !draftConflict) return;
+    editText = draftConflict.text;
+    editCache.set(current.id, draftConflict.text);
+    draftConflict = null;
+    draftRecovered = true;
+  }
+
+  async function discardConflictingDraft() {
+    const conflict = draftConflict;
+    if (!current || !conflict) return;
+    try {
+      await api.deleteReviewDraftV1(current.id, conflict.baseRevision);
+      if (current?.id === conflict.segmentId) {
+        draftConflict = null;
+        draftRecovered = false;
+      }
+    } catch (error) {
+      notifications.error($t('review.draftDiscardFailed'), {
+        detail: api.reviewErrorMessage(error, $t('review.draftDiscardFailed')),
+      });
+    }
+  }
 
   // Drop a stale getWaveform response: switching clips A -> B while A's decode (up to ~30 s for a large
   // source) is still in flight must NOT let A's later-resolving waveform overwrite B's. Last-call-wins via
@@ -783,6 +931,7 @@
       reviewTotal = Math.max(0, reviewTotal - 1);
       void refreshSegmentStats();
       editCache.delete(seg.id); // persisted — drop the in-progress copy
+      syncedDrafts.set(seg.id, `deleted:${baseRevision}`);
       notifications.success($t('saved'));
       // If the reviewer really navigated during the slow decision call, keep that clip selected after
       // the removal shifted array indices and never copy seg's editor state into it.
@@ -1349,6 +1498,50 @@
             >
               {$t('review.reset')}
             </button>
+          {/if}
+        </div>
+        {#if draftConflict}
+          <div class="mt-3 rounded-token border border-warning/40 bg-warning/10 p-3" role="alert">
+            <div class="text-sm font-semibold text-default">{$t('review.draftConflictTitle')}</div>
+            <p class="mt-1 text-xs text-muted">{$t('review.draftConflictHint')}</p>
+            <div class="mt-3 grid gap-3 md:grid-cols-2">
+              <section class="rounded-token bg-surface-raised p-3">
+                <div class="text-xs font-semibold text-muted">{$t('review.serverTruth')}</div>
+                <p class="font-kurdish mt-1 whitespace-pre-wrap text-base" dir="rtl">
+                  {originalText(current)}
+                </p>
+              </section>
+              <section class="rounded-token bg-surface-raised p-3">
+                <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+                  <span class="font-semibold">{$t('review.localDraft')}</span>
+                  <time dir="ltr">{draftConflict.updatedAt}</time>
+                </div>
+                <p class="font-kurdish mt-1 whitespace-pre-wrap text-base" dir="rtl">
+                  {draftConflict.text}
+                </p>
+              </section>
+            </div>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button type="button" class="btn btn-primary !text-xs" onclick={useConflictingDraft}>
+                {$t('review.useLocalDraft')}
+              </button>
+              <button
+                type="button"
+                class="btn btn-secondary !text-xs"
+                onclick={() => void discardConflictingDraft()}
+              >
+                {$t('review.discardLocalDraft')}
+              </button>
+            </div>
+          </div>
+        {/if}
+        <div class="mt-2 min-h-5 text-xs text-muted" aria-live="polite">
+          {#if draftSaving}
+            {$t('review.draftSaving')}
+          {:else if draftSaveFailed}
+            <span class="text-danger">{$t('review.draftSaveFailedHint')}</span>
+          {:else if draftRecovered}
+            {$t('review.draftRecovered')}
           {/if}
         </div>
         <textarea

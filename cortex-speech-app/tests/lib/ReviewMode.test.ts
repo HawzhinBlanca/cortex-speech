@@ -17,6 +17,9 @@ const mocks = vi.hoisted(() => ({
   recordPlaybackReceipt: vi.fn(),
   recordHumanDecision: vi.fn(),
   commitReviewV1: vi.fn(),
+  getReviewDraftV1: vi.fn(),
+  saveReviewDraftV1: vi.fn(),
+  deleteReviewDraftV1: vi.fn(),
   undoHumanDecision: vi.fn(),
   updateSegmentFields: vi.fn(),
   registerMediaAsset: vi.fn(),
@@ -37,6 +40,13 @@ vi.mock('../../src/lib/commands', () => ({
     const match = /^effect:([1-9][0-9]*)$/.exec(decisionId);
     return match ? Number(match[1]) : null;
   }),
+  reviewErrorMessage: vi.fn((error: unknown, fallback: string) =>
+    error &&
+    typeof error === 'object' &&
+    typeof (error as { message?: unknown }).message === 'string'
+      ? (error as { message: string }).message
+      : fallback,
+  ),
   engineLabel: vi.fn((id: string) => id),
 }));
 
@@ -139,6 +149,16 @@ describe('ReviewMode windowed queue', () => {
         };
       },
     );
+    mocks.getReviewDraftV1.mockResolvedValue(null);
+    mocks.saveReviewDraftV1.mockImplementation(
+      async (segmentId: string, baseRevision: number, text: string) => ({
+        segmentId,
+        baseRevision,
+        text,
+        updatedAt: '2026-08-25T12:00:00.000Z',
+      }),
+    );
+    mocks.deleteReviewDraftV1.mockResolvedValue(true);
     mocks.undoHumanDecision.mockResolvedValue({
       status: 'applied',
       restoredRevision: 2,
@@ -265,6 +285,75 @@ describe('ReviewMode windowed queue', () => {
     resolveHydration(full);
     expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
     expect(mocks.alignSegment).not.toHaveBeenCalled();
+  });
+
+  it('restores a matching crash-safe draft without making it server truth', async () => {
+    const full = segment();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 0 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.getReviewDraftV1.mockResolvedValue({
+      segmentId: full.id,
+      baseRevision: 0,
+      text: 'ڕەشنووسی نەخوازراو',
+      updatedAt: '2026-08-25T12:00:00.000Z',
+    });
+
+    render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    await waitFor(() => expect(editor).toHaveValue('ڕەشنووسی نەخوازراو'));
+    expect(screen.getByText(ckb['review.draftRecovered'])).toBeInTheDocument();
+    expect(mocks.commitReviewV1).not.toHaveBeenCalled();
+  });
+
+  it('shows stale local text beside server truth and never merges it automatically', async () => {
+    const full = segment();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 3 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+    mocks.getReviewDraftV1.mockResolvedValue({
+      segmentId: full.id,
+      baseRevision: 2,
+      text: 'ڕەشنووسی کۆن',
+      updatedAt: '2026-08-25T12:00:00.000Z',
+    });
+
+    render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    expect(await screen.findByText(ckb['review.draftConflictTitle'])).toBeInTheDocument();
+    expect(screen.getByText('ڕەشنووسی کۆن')).toBeInTheDocument();
+    expect(screen.getAllByText(full.rawTranscript).length).toBeGreaterThan(0);
+    expect(editor).toHaveValue(full.rawTranscript);
+    expect(mocks.saveReviewDraftV1).not.toHaveBeenCalled();
+  });
+
+  it('debounces an edited transcript into the revision-bound draft command', async () => {
+    const full = segment();
+    mocks.getSegmentsPage.mockResolvedValue({
+      items: [{ ...full, alignmentJson: null, evidenceJson: null }],
+      total: 1,
+      nextCursor: null,
+      revisions: { [full.id]: 7 },
+    });
+    mocks.getSegment.mockResolvedValue(full);
+
+    render(ReviewMode);
+    const editor = await screen.findByRole('textbox');
+    await waitFor(() => expect(mocks.getReviewDraftV1).toHaveBeenCalledWith(full.id));
+    await fireEvent.input(editor, { target: { value: 'دەقی ڕاستکراوە' } });
+    await waitFor(
+      () => expect(mocks.saveReviewDraftV1).toHaveBeenCalledWith(full.id, 7, 'دەقی ڕاستکراوە'),
+      { timeout: 1_500 },
+    );
+    expect(mocks.commitReviewV1).not.toHaveBeenCalled();
   });
 
   it('keeps the next row non-actionable after a decision until that row is fully hydrated', async () => {

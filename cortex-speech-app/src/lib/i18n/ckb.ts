@@ -187,6 +187,22 @@ export const ckb: Record<string, string> = {
   'review.saveNext': 'پاشەکەوت و دواتر',
   'review.prev': 'گەڕانەوە',
   'review.reset': 'بنەڕەت',
+  'review.draftSaving': 'ڕەشنووسی گەڕاندنەوە پاشەکەوت دەکرێت…',
+  'review.draftRecovered': 'ڕەشنووسە پاشەکەوتنەکراوەکەت لەم ئامێرەوە گەڕێندرایەوە.',
+  'review.draftSaveFailed': 'ڕەشنووسی گەڕاندنەوە پاشەکەوت نەکرا',
+  'review.draftSaveFailedHint':
+    'دەقەکەت هێشتا کراوەیە، بەڵام بۆ تێکچوون پارێزراو نییە. پێش داخستن دووبارە هەوڵبدە.',
+  'review.draftLoadFailed': 'ڕەشنووسی گەڕاندنەوە بارنەکرا',
+  'review.draftLoadFailedHint':
+    'دەقی ئێستای ڕاژە پیشان دراوە. بۆ دووبارە هەوڵدان کلیپەکە نوێ بکەرەوە.',
+  'review.draftConflictTitle': 'ڕەشنووسی پاشەکەوتکراو پێویستی بە بڕیاری تۆیە',
+  'review.draftConflictHint':
+    'کلیپەکە دوای پاشەکەوتکردنی ئەم ڕەشنووسە گۆڕاوە. هیچ شتێک خۆکارانە تێکەڵ نەکرا. هەردوو وەشانەکە بەراورد بکە و خۆت هەڵبژێرە.',
+  'review.serverTruth': 'دەقی ئێستای ڕاژە',
+  'review.localDraft': 'ڕەشنووسی ناوخۆیی پاشەکەوتکراو',
+  'review.useLocalDraft': 'ڕەشنووسی پاشەکەوتکراو بەکاربهێنە',
+  'review.discardLocalDraft': 'ڕەشنووسی پاشەکەوتکراو فڕێبدە',
+  'review.draftDiscardFailed': 'ڕەشنووسی پاشەکەوتکراو فڕێنەدرا.',
   'review.kbdHint':
     'کلیلەکان: A پەسەندکردن · E دەستکاری · X خراپ · Space لێدان/وەستان · R دووبارە · N/P دواتر/پێشتر · Backspace گەڕاندنەوە · Ctrl+Enter پاشەکەوت و دواتر',
   'review.actionsLabel': 'کردارەکانی پێداچوونەوە',

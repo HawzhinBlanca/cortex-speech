@@ -139,7 +139,11 @@ pub enum HumanDecisionUndoOutcome {
         segment: SpeechSegment,
     },
     #[serde(rename = "alreadyApplied")]
-    AlreadyApplied { segment: SpeechSegment },
+    AlreadyApplied {
+        #[serde(rename = "restoredRevision")]
+        restored_revision: i64,
+        segment: SpeechSegment,
+    },
     #[serde(rename = "conflict")]
     Conflict { segment: SpeechSegment },
 }
@@ -3602,7 +3606,7 @@ impl Database {
 
     /// Lost-response preflight for the typed review IPC. The base revision, rather than a client
     /// clock, is part of the immutable request identity.
-    pub(crate) fn replay_desktop_review_v1(
+    pub(crate) fn replay_desktop_review_v1_and_clear_draft(
         &self,
         segment_id: &str,
         base_revision: i64,
@@ -3617,7 +3621,25 @@ impl Database {
         human_verdict_for_decision(decision)?;
         let operation_payload_hash =
             desktop_review_v1_payload_hash(segment_id, base_revision, decision, corrected_transcript);
-        Self::desktop_human_decision_replay_on(&self.conn, operation_id, &operation_payload_hash, segment_id)
+        let (commit, cleared_draft) = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let Some(commit) =
+                Self::desktop_human_decision_replay_on(&tx, operation_id, &operation_payload_hash, segment_id)?
+            else {
+                tx.rollback()?;
+                return Ok((None, false));
+            };
+            let cleared_draft = tx.execute(
+                "DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2",
+                params![segment_id, base_revision],
+            )? > 0;
+            tx.commit()?;
+            Ok((Some(commit), cleared_draft))
+        })?;
+        if cleared_draft {
+            self.track_write()?;
+        }
+        Ok(commit)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7462,7 +7484,7 @@ impl Database {
             if let Some(prior_operation) = prior_reversal {
                 tx.rollback()?;
                 return Ok(if prior_operation == operation_id {
-                    HumanDecisionUndoOutcome::AlreadyApplied { segment: current.0 }
+                    HumanDecisionUndoOutcome::AlreadyApplied { restored_revision: current.1, segment: current.0 }
                 } else {
                     HumanDecisionUndoOutcome::Conflict { segment: current.0 }
                 });
@@ -7969,6 +7991,7 @@ impl Database {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -8027,6 +8050,7 @@ impl Database {
             None,
             None,
             None,
+            None,
         )
         .map(|commit| commit.map(|value| value.decided_revision))
     }
@@ -8057,6 +8081,7 @@ impl Database {
             Some("couch"),
             Some((operation_id, operation_payload_hash)),
             Some((decision, corrected_transcript.unwrap_or_default())),
+            None,
             None,
             None,
         )
@@ -8099,6 +8124,7 @@ impl Database {
             Some((requested_action, requested_transcript)),
             decision_limit,
             Some(playback),
+            None,
         )
     }
 
@@ -8125,6 +8151,7 @@ impl Database {
             annotator,
             None,
             true,
+            None,
             None,
             None,
             None,
@@ -8162,6 +8189,7 @@ impl Database {
             None,
             None,
             Some(playback),
+            None,
         )? {
             Some(commit) => Ok(commit),
             None => Err(AppError::Validation(format!(
@@ -8197,6 +8225,7 @@ impl Database {
             None,
             None,
             Some(playback),
+            Some(base_revision),
         )? {
             Some(commit) => Ok(commit),
             None => Err(AppError::Validation(format!(
@@ -8691,7 +8720,7 @@ impl Database {
         )
     }
 
-    // Eleven parameters, deliberately: each is a distinct fact about ONE adjudication (which clip,
+    // The parameters are deliberately explicit: each is a distinct fact about ONE adjudication (which clip,
     // what verdict, whose text, when, who, at which revision, whether this call finalizes, and which
     // surface audits it). Bundling them into a struct would move the width rather than remove it,
     // and this is a private helper with three call sites — all in this file.
@@ -8716,6 +8745,7 @@ impl Database {
         audit_request: Option<(&str, &str)>,
         decision_limit: Option<&ReviewDecisionLimit>,
         required_playback: Option<&PlaybackDecisionProof>,
+        review_draft_revision: Option<i64>,
     ) -> AppResult<Option<HumanDecisionCommit>> {
         if audit_source.is_none() && annotator.is_some() {
             return Err(AppError::Validation(
@@ -8740,6 +8770,17 @@ impl Database {
         }
         if timestamp_ms.is_some_and(|timestamp| timestamp <= 0) {
             return Err(AppError::Validation("human decision timestamp must be positive".into()));
+        }
+        if review_draft_revision.is_some()
+            && !(audit_source.is_none()
+                && annotator.is_none()
+                && timestamp_ms.is_none()
+                && audit_operation.is_some()
+                && expected_revision == review_draft_revision)
+        {
+            return Err(AppError::Validation(
+                "review drafts may be cleared only by their exact typed desktop decision revision".into(),
+            ));
         }
         if audit_source.is_none() && audit_operation.is_some() && timestamp_ms.is_none() {
             let typed_payload_is_exact =
@@ -8820,8 +8861,20 @@ impl Database {
                 if let Some(commit) =
                     Self::desktop_human_decision_replay_on(&tx, operation_id, operation_payload_hash, segment_id)?
                 {
-                    tx.rollback()?;
-                    return Ok((Some(commit), false));
+                    let cleared_draft = if let Some(draft_revision) = review_draft_revision {
+                        tx.execute(
+                            "DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2",
+                            params![segment_id, draft_revision],
+                        )? > 0
+                    } else {
+                        false
+                    };
+                    if cleared_draft {
+                        tx.commit()?;
+                    } else {
+                        tx.rollback()?;
+                    }
+                    return Ok((Some(commit), cleared_draft));
                 }
             }
             let Some((prior, prior_revision, stored_content_hash)) = Self::decision_snapshot_on(&tx, segment_id)?
@@ -9232,6 +9285,13 @@ impl Database {
             };
             if authoritative_revision != decided_revision {
                 return Err(AppError::Other("human decision authoritative row revision drifted before commit".into()));
+            }
+
+            if let Some(draft_revision) = review_draft_revision {
+                tx.execute(
+                    "DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2",
+                    params![segment_id, draft_revision],
+                )?;
             }
 
             tx.commit()?;

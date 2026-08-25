@@ -221,7 +221,10 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     tauri_specta::Builder::<tauri::Wry>::new()
         .commands(tauri_specta::collect_commands![
             crate::commands::get_review_page_v1,
-            crate::commands::commit_review_v1
+            crate::commands::commit_review_v1,
+            crate::commands::get_review_draft_v1,
+            crate::commands::save_review_draft_v1,
+            crate::commands::delete_review_draft_v1
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

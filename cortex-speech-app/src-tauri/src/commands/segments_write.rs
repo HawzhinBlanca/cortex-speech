@@ -13,7 +13,7 @@ use super::{apply_curation_fields, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
 use crate::history::{Command, HistoryManager};
 use crate::ipc_contract::{
-    CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, ReviewDecisionV1, SuggestedActionV1,
+    CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, ReviewDecisionV1, ReviewDraftV1, SuggestedActionV1,
 };
 use crate::validation::input as validate;
 use crate::AppState;
@@ -355,6 +355,115 @@ fn public_review_error(error: &str, operation_id: &str) -> CommandErrorV1 {
     }
 }
 
+fn public_draft_error(error: &str, action: &str) -> CommandErrorV1 {
+    if error.contains("E_STALE_REVIEW_DRAFT") {
+        CommandErrorV1::new(
+            "STALE_DRAFT_REVISION",
+            "The clip changed while this draft was being saved. Reload it before continuing.",
+            false,
+        )
+        .suggested(SuggestedActionV1::ReloadClip)
+    } else if error.contains("E_REVIEW_DRAFT_SEGMENT_NOT_FOUND") {
+        CommandErrorV1::new("SEGMENT_NOT_FOUND", "This clip no longer exists.", false)
+            .suggested(SuggestedActionV1::ReloadClip)
+    } else if error.to_ascii_lowercase().contains("database is locked")
+        || error.to_ascii_lowercase().contains("database is busy")
+    {
+        CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry this draft action.", true)
+            .suggested(SuggestedActionV1::Retry)
+    } else {
+        let message = match action {
+            "loaded" => "The review draft could not be loaded.",
+            "saved" => "The review draft could not be saved.",
+            "deleted" => "The review draft could not be deleted.",
+            _ => "The review draft operation failed.",
+        };
+        CommandErrorV1::new("REVIEW_DRAFT_FAILED", message, false).suggested(SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn review_draft_v1(record: crate::stores::ReviewDraftRecord) -> ReviewDraftV1 {
+    ReviewDraftV1 {
+        segment_id: record.segment_id,
+        base_revision: record.base_revision,
+        text: record.text,
+        updated_at: record.updated_at,
+    }
+}
+
+/// Load the non-authoritative desktop draft for one clip. Draft text never participates in review
+/// truth, exports, evaluation, readiness, compensation, or serving queries.
+#[tauri::command]
+#[specta::specta]
+pub fn get_review_draft_v1(
+    state: State<'_, AppState>,
+    segment_id: String,
+) -> Result<Option<ReviewDraftV1>, CommandErrorV1> {
+    RATE_LIMITER.check("get_review_draft_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many draft reads. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    validate::validate_identifier(&segment_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    state
+        .review_drafts()
+        .get(&segment_id)
+        .map(|draft| draft.map(review_draft_v1))
+        .map_err(|error| public_draft_error(&error.to_string(), "loaded"))
+}
+
+/// Durably replace one clip's desktop draft. The server owns the timestamp; the renderer supplies
+/// the exact review revision so a later decision cannot erase a draft for a newer clip state.
+#[tauri::command]
+#[specta::specta]
+pub fn save_review_draft_v1(
+    state: State<'_, AppState>,
+    segment_id: String,
+    base_revision: i64,
+    text: String,
+) -> Result<ReviewDraftV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("save_review_draft_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many draft saves. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    validate::validate_identifier(&segment_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    if base_revision < 0 {
+        return Err(CommandErrorV1::new("INVALID_REVIEW_REVISION", "The clip revision must be non-negative.", false));
+    }
+    validate::validate_text(&text, 100_000, "Review draft")
+        .map_err(|_| CommandErrorV1::new("INVALID_REVIEW_DRAFT", "The draft is invalid or too long.", false))?;
+    state
+        .review_drafts()
+        .save(&segment_id, base_revision, &text)
+        .map(review_draft_v1)
+        .map_err(|error| public_draft_error(&error.to_string(), "saved"))
+}
+
+/// Delete only a draft bound to the supplied review revision. A stale renderer cannot erase work
+/// saved against a newer server state.
+#[tauri::command]
+#[specta::specta]
+pub fn delete_review_draft_v1(
+    state: State<'_, AppState>,
+    segment_id: String,
+    base_revision: i64,
+) -> Result<bool, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("delete_review_draft_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many draft deletes. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    validate::validate_identifier(&segment_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The clip identity is invalid.", false))?;
+    if base_revision < 0 {
+        return Err(CommandErrorV1::new("INVALID_REVIEW_REVISION", "The clip revision must be non-negative.", false));
+    }
+    state
+        .review_drafts()
+        .delete_if_revision(&segment_id, base_revision)
+        .map_err(|error| public_draft_error(&error.to_string(), "deleted"))
+}
+
 fn committed_review_v1(commit: crate::db::HumanDecisionCommit) -> CommittedReviewV1 {
     let authoritative_transcript = commit
         .segment
@@ -432,7 +541,7 @@ fn commit_review_v1_on(
     };
 
     if let Some(commit) = db
-        .replay_desktop_review_v1(
+        .replay_desktop_review_v1_and_clear_draft(
             &request.segment_id,
             request.base_revision,
             decision,
@@ -949,6 +1058,13 @@ mod tests {
         let db = db_with_clip(tmp.path(), "typed-review");
         receipt(&db, "typed-review", 9_000);
         let base_revision = db.segment_review_revision("typed-review").unwrap().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_drafts (segment_id, base_revision, text, updated_at)
+                 VALUES (?1, ?2, 'unfinished', datetime('now'))",
+                rusqlite::params!["typed-review", base_revision],
+            )
+            .unwrap();
         let request = CommitReviewRequestV1 {
             operation_id: "44444444-4444-4444-8444-444444444444".into(),
             segment_id: "typed-review".into(),
@@ -962,15 +1078,89 @@ mod tests {
         assert_eq!(first.segment_id, "typed-review");
         assert_eq!(first.authoritative_transcript, "دەق");
         assert!(first.decision_id.starts_with("effect:"));
+        let draft_count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_drafts WHERE segment_id = 'typed-review'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(draft_count, 0, "the matching draft clears with the durable decision");
+
+        db.connection()
+            .execute(
+                "INSERT INTO review_drafts (segment_id, base_revision, text, updated_at)
+                 VALUES (?1, ?2, 'response-loss copy', datetime('now'))",
+                rusqlite::params!["typed-review", base_revision],
+            )
+            .unwrap();
 
         let replay = commit_review_v1_on(&db, &request).expect("lost-response replay");
         assert_eq!(replay, first, "an exact typed retry returns the original effect");
+        let draft_count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_drafts WHERE segment_id = 'typed-review'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(draft_count, 0, "an exact replay clears only its old-revision draft");
+
+        db.connection()
+            .execute(
+                "INSERT INTO review_drafts (segment_id, base_revision, text, updated_at)
+                 VALUES (?1, ?2, 'newer work', datetime('now'))",
+                rusqlite::params!["typed-review", first.committed_revision],
+            )
+            .unwrap();
+        let replay = commit_review_v1_on(&db, &request).expect("repeat lost-response replay");
+        assert_eq!(replay, first);
+        let retained_revision: i64 = db
+            .connection()
+            .query_row("SELECT base_revision FROM review_drafts WHERE segment_id = 'typed-review'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained_revision, first.committed_revision, "old replay must preserve newer work");
 
         let stale = CommitReviewRequestV1 { operation_id: "55555555-5555-4555-8555-555555555555".into(), ..request };
         let error = commit_review_v1_on(&db, &stale).expect_err("a new operation cannot reuse the old revision");
         assert_eq!(error.code, "STALE_REVISION");
         assert!(!error.retryable);
         assert_eq!(error.details.get("expectedRevision"), Some(&base_revision.into()));
+    }
+
+    #[test]
+    fn typed_review_truth_rolls_back_if_matching_draft_cannot_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = db_with_clip(tmp.path(), "draft-atomicity");
+        receipt(&db, "draft-atomicity", 9_000);
+        let base_revision = db.segment_review_revision("draft-atomicity").unwrap().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_drafts (segment_id, base_revision, text, updated_at)
+                 VALUES (?1, ?2, 'must remain', datetime('now'))",
+                rusqlite::params!["draft-atomicity", base_revision],
+            )
+            .unwrap();
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER test_refuse_draft_clear BEFORE DELETE ON review_drafts
+                 BEGIN SELECT RAISE(ABORT, 'injected draft clear failure'); END;",
+            )
+            .unwrap();
+        let request = CommitReviewRequestV1 {
+            operation_id: "66666666-6666-4666-8666-666666666666".into(),
+            segment_id: "draft-atomicity".into(),
+            base_revision,
+            decision: ReviewDecisionV1::Accept,
+            transcript: Some("دەق".into()),
+            reason_code: None,
+            playback_receipt_id: None,
+        };
+        let error = commit_review_v1_on(&db, &request).expect_err("draft-clear failure must abort review truth");
+        assert_eq!(error.code, "REVIEW_COMMIT_FAILED");
+        let row = db.get_segment_by_id("draft-atomicity").unwrap().unwrap();
+        assert!(row.human_decision.is_none() && !row.verified, "human truth must roll back with draft clear");
+        let draft_count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_drafts WHERE segment_id = 'draft-atomicity'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(draft_count, 1);
     }
 
     #[test]
