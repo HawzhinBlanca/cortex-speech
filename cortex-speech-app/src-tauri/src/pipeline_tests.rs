@@ -399,6 +399,25 @@ fn import_refuses_before_audio_work_when_the_durable_journal_cannot_start() {
 }
 
 #[test]
+fn cloned_pipeline_workers_share_one_lazy_runtime_and_refuse_database_identity_drift() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let worker = pipeline.clone();
+    assert!(
+        Arc::ptr_eq(&pipeline.database_runtime, &worker.database_runtime),
+        "cloned batch workers must share one runtime slot"
+    );
+
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    pipeline.import_write_store(db.path()).unwrap();
+    assert!(worker.database_runtime.lock().unwrap().is_some(), "one worker must initialize the shared slot");
+
+    let other_path = dir.path().join("other.db").to_string_lossy().into_owned();
+    let error = worker.import_write_store(&other_path).err().expect("database identity drift must refuse");
+    assert!(error.to_string().contains("does not match"), "unexpected mismatch error: {error}");
+}
+
+#[test]
 fn fire_loop0_if_enabled_method_uses_the_pipelines_own_db() {
     // The method (used by the cached / non-WSL transcribe paths) opens its own DB connection.
     let settings = AppSettings { loop0_firing_enabled: true, ..AppSettings::default() };
@@ -732,8 +751,9 @@ fn wsl_primary_import_pass_never_silently_skips_the_bundled_champion() {
     db.insert_segment(&segment).unwrap();
 
     let mut segments = vec![segment];
+    let import_writes = pipeline.import_write_store(db.path()).unwrap();
     let error = pipeline
-        .run_primary_wsl_pass_for_import(&db, &mut segments, None)
+        .run_primary_wsl_pass_for_import(&db, &import_writes, &mut segments, None)
         .expect_err("a clean default must run the bundled champion path and fail hard on infrastructure errors");
     assert!(error.to_string().contains("rolled back"));
     assert!(db.get_segment_by_id("preflight-refused").unwrap().is_none());
@@ -777,7 +797,8 @@ fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
     insert_hypothesis(&db, "import-0", "omniasr-wsl-7b", "stale draft");
 
     let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
-    let result = pipeline.run_primary_wsl_pass_for_import(&db, &mut segments, None);
+    let import_writes = pipeline.import_write_store(db.path()).unwrap();
+    let result = pipeline.run_primary_wsl_pass_for_import(&db, &import_writes, &mut segments, None);
 
     // The import is cancelled (fail-hard), not silently downgraded to a weaker engine.
     let msg = result.expect_err("a 7B infrastructure failure must cancel the import").to_string();

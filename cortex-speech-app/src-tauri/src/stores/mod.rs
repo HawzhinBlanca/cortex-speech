@@ -2,6 +2,7 @@
 //!
 //! Stores own database interaction for one domain and deliberately have no Tauri or HTTP surface.
 
+mod import_write;
 mod jobs;
 mod playback;
 mod review_draft;
@@ -10,6 +11,7 @@ mod rights;
 mod segment_query;
 mod segment_write;
 
+pub(crate) use import_write::ImportWriteStore;
 pub(crate) use jobs::JobStore;
 pub(crate) use playback::{PlaybackObservation, PlaybackWriteStore};
 pub(crate) use review_draft::{ReviewDraftRecord, ReviewDraftStore};

@@ -104,7 +104,7 @@ def test_pipeline_import_journal_is_store_owned_and_fail_closed() -> None:
         if forbidden in pipeline:
             raise AssertionError(f"pipeline regained direct import-journal authority: {forbidden}")
     for required in (
-        "job_store: Option<crate::stores::JobStore>",
+        "database_runtime: Arc<Mutex<Option<crate::database_runtime::DatabaseRuntime>>>",
         "pub(crate) fn new_with_runtime(",
         "let import_jobs = self.import_job_store()?;",
         "let job_id = import_jobs.begin_import(",

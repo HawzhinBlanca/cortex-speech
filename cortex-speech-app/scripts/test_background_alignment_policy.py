@@ -70,6 +70,21 @@ def test_background_alignment_persists_the_reported_quality() -> None:
     print("[OK]  background alignment persists the quality the aligner reported")
 
 
+def test_background_alignment_is_serialized_and_revision_guarded() -> None:
+    block = _background_block(PIPELINE.read_text(encoding="utf-8"))
+    if "import_writes.update_alignment_if_unchanged(" not in block:
+        raise AssertionError(
+            "background alignment must persist through ImportWriteStore with the source alignment "
+            "as a compare-and-swap guard"
+        )
+    for forbidden in ("Database::open(", "db.update_segment_alignment("):
+        if forbidden in block:
+            raise AssertionError(f"background alignment regained an unguarded raw writer: {forbidden}")
+    if "canonical alignment changed during inference" not in block:
+        raise AssertionError("a stale background alignment must be reported rather than silently clobbered")
+    print("[OK]  background alignment uses serialized revision-CAS persistence")
+
+
 def test_no_fallback_only_free_aligner_helpers() -> None:
     """A free helper that silently ignores the model is a trap, not a convenience — it sprang once."""
     text = ALIGNER.read_text(encoding="utf-8")
@@ -87,6 +102,7 @@ def test_no_fallback_only_free_aligner_helpers() -> None:
 def main() -> None:
     test_background_alignment_uses_the_real_aligner()
     test_background_alignment_persists_the_reported_quality()
+    test_background_alignment_is_serialized_and_revision_guarded()
     test_no_fallback_only_free_aligner_helpers()
     print("background alignment policy regression passed")
 

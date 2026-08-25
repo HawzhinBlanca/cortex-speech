@@ -1099,10 +1099,10 @@ impl LiveConsent {
 #[derive(Clone)]
 pub struct ProcessingPipeline {
     db_path: String,
-    /// Desktop production injects the exact `AppState` runtime so import-journal rows have one
-    /// serialized writer and the same restore admission as every other durable job. Standalone
+    /// Desktop production injects the exact `AppState` runtime so migrated import writes have one
+    /// serialized writer and the same restore admission as every other durable domain. Standalone
     /// library consumers retain the public path-based constructor during the strangler migration.
-    job_store: Option<crate::stores::JobStore>,
+    database_runtime: Arc<Mutex<Option<crate::database_runtime::DatabaseRuntime>>>,
     _normalizer: Arc<SoraniNormalizer>,
     cache: Arc<TranscriptCache>,
     fingerprint: Arc<AudioFingerprint>,
@@ -1143,15 +1143,7 @@ impl ProcessingPipeline {
         model_manager: Arc<ModelManager>,
         runtime: crate::database_runtime::DatabaseRuntime,
     ) -> Self {
-        Self::build(
-            db_path,
-            normalizer,
-            cache,
-            fingerprint,
-            settings,
-            model_manager,
-            Some(crate::stores::JobStore::new(runtime)),
-        )
+        Self::build(db_path, normalizer, cache, fingerprint, settings, model_manager, Some(runtime))
     }
 
     fn build(
@@ -1161,11 +1153,11 @@ impl ProcessingPipeline {
         fingerprint: Arc<AudioFingerprint>,
         settings: Arc<AppSettings>,
         model_manager: Arc<ModelManager>,
-        job_store: Option<crate::stores::JobStore>,
+        database_runtime: Option<crate::database_runtime::DatabaseRuntime>,
     ) -> Self {
         Self {
             db_path,
-            job_store,
+            database_runtime: Arc::new(Mutex::new(database_runtime)),
             _normalizer: normalizer,
             consent: Arc::new(LiveConsent::from_settings(&settings)),
             cache,
@@ -1181,15 +1173,34 @@ impl ProcessingPipeline {
         }
     }
 
-    fn import_job_store(&self) -> AppResult<crate::stores::JobStore> {
-        if let Some(store) = &self.job_store {
-            return Ok(store.clone());
+    fn shared_database_runtime(&self, database_path: &str) -> AppResult<crate::database_runtime::DatabaseRuntime> {
+        if database_path != self.db_path {
+            return Err(AppError::Other(
+                "pipeline database capability does not match the supplied database".to_string(),
+            ));
         }
-        // Compatibility path for public library consumers and standalone binaries that construct a
-        // pipeline from a database path. Desktop production never takes this path: lib.rs injects
-        // the exact AppState runtime. This connection owns only import-journal rows in this slice.
-        let database = Database::open(&self.db_path)?;
-        Ok(crate::stores::JobStore::new(crate::database_runtime::DatabaseRuntime::new(database)))
+        let mut slot = self.database_runtime.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned pipeline runtime slot");
+            poisoned.into_inner()
+        });
+        if let Some(runtime) = slot.as_ref() {
+            return Ok(runtime.clone());
+        }
+        // Compatibility path for public library consumers and standalone binaries. The slot is Arc
+        // backed, so every cloned worker pipeline converges on this one runtime. Desktop production
+        // never opens here: lib.rs injects the exact AppState runtime before the pipeline is cloned.
+        let database = Database::open(database_path)?;
+        let runtime = crate::database_runtime::DatabaseRuntime::new(database);
+        *slot = Some(runtime.clone());
+        Ok(runtime)
+    }
+
+    fn import_job_store(&self) -> AppResult<crate::stores::JobStore> {
+        Ok(crate::stores::JobStore::new(self.shared_database_runtime(&self.db_path)?))
+    }
+
+    fn import_write_store(&self, database_path: &str) -> AppResult<crate::stores::ImportWriteStore> {
+        Ok(crate::stores::ImportWriteStore::new(self.shared_database_runtime(database_path)?))
     }
 
     /// Apply only the WITHDRAWALS in `next` to the shared live consent, right now.
@@ -1801,6 +1812,7 @@ impl ProcessingPipeline {
         // failure is fatal: reporting a successful import without recovery evidence would make a
         // crash window silently non-resumable.
         let import_jobs = self.import_job_store()?;
+        let import_writes = self.import_write_store(db.path())?;
         let job_id = import_jobs.begin_import(&dir_path.to_string_lossy(), total).map_err(|error| {
             AppError::Other(format!("Could not create the durable import recovery journal: {error}"))
         })?;
@@ -1848,7 +1860,7 @@ impl ProcessingPipeline {
                     file_path_str,
                     resume_existing_ids.len()
                 );
-                db.delete_segments_batch(&resume_existing_ids)?;
+                import_writes.rollback_segments(&resume_existing_ids)?;
             }
             if resume_should_skip_file(
                 resume_completed.is_some(),
@@ -2143,6 +2155,7 @@ impl ProcessingPipeline {
         if chunking::should_stream_decode(duration_ms, self.settings.max_segment_duration_ms) {
             return self.process_single_file_streaming(path, db, decode_timeout, duration_ms, cancel, on_chunk);
         }
+        let import_writes = self.import_write_store(db.path())?;
 
         let (sample_rate, pcm) = audio::decode_to_pcm_with_timeout(path, decode_timeout)?;
 
@@ -2249,7 +2262,7 @@ impl ProcessingPipeline {
             None, // non-streaming: the whole file is one call, so diarization clusters in-place
             file_hash.as_deref(),
         )?;
-        let mut persisted = self.persist_segments(db, segments)?;
+        let mut persisted = self.persist_segments(&import_writes, segments)?;
         // v50: persist the fingerprint now that the rows exist, so the NEXT session rehydrates it and
         // re-importing this recording under a different path is rejected then too. Best-effort: a failed
         // stamp must not fail an import whose audio and transcripts are already committed — it only costs
@@ -2259,11 +2272,11 @@ impl ProcessingPipeline {
                 tracing::warn!("audio identity not persisted for {}: {e}", path.display());
             }
         }
-        self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
+        self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?;
         // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
         self.shadow_log_loop0(db, &persisted);
-        self.enqueue_background_alignments(&persisted);
+        self.enqueue_background_alignments(&persisted, import_writes);
         {
             let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
                 .iter()
@@ -2293,6 +2306,7 @@ impl ProcessingPipeline {
         let estimated_total =
             ((duration_ms as f64 / self.settings.max_segment_duration_ms.max(1) as f64).ceil() as usize).max(1);
         let mut global_chunk = 0usize;
+        let import_writes = self.import_write_store(db.path())?;
 
         let mut segments = Vec::new();
         let mut all_pcm_cache = Vec::new();
@@ -2532,7 +2546,7 @@ impl ProcessingPipeline {
             }
         }
 
-        let mut persisted = self.persist_segments(db, segments)?;
+        let mut persisted = self.persist_segments(&import_writes, segments)?;
         // v51: stamp the whole-recording identity now that the rows exist, exactly as the non-streaming
         // sibling does. Already checked and registered in memory above. Best-effort — a failed stamp
         // must not fail an import whose audio and transcripts are already committed; it only costs this
@@ -2542,10 +2556,10 @@ impl ProcessingPipeline {
                 tracing::warn!("audio identity not persisted for {}: {e}", path.display());
             }
         }
-        self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?;
+        self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?;
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
         self.shadow_log_loop0(db, &persisted);
-        self.enqueue_background_alignments(&persisted);
+        self.enqueue_background_alignments(&persisted, import_writes);
         {
             let primary_by_segment: HashMap<&str, PrimaryHypothesis<'_>> = persisted
                 .iter()
@@ -2894,13 +2908,17 @@ impl ProcessingPipeline {
         Ok((segments, pcm_cache))
     }
 
-    fn persist_segments(&self, db: &Database, segments: Vec<SpeechSegment>) -> AppResult<Vec<SpeechSegment>> {
+    fn persist_segments(
+        &self,
+        import_writes: &crate::stores::ImportWriteStore,
+        segments: Vec<SpeechSegment>,
+    ) -> AppResult<Vec<SpeechSegment>> {
         if segments.is_empty() {
             return Err(AppError::Validation("No speech chunks produced".into()));
         }
 
         // insert_segments_batch wraps inserts in its own transaction; do not nest SAVEPOINTs.
-        db.insert_segments_batch(&segments)?;
+        import_writes.publish_segments(&segments)?;
 
         // NOTE: neither LOOP-0 shadow logging NOR background word-alignment runs here. Both must see
         // the REAL transcript, which under the forced WSL-7B engine does not exist yet (segments carry
@@ -2945,7 +2963,11 @@ impl ProcessingPipeline {
     /// with a bare word array, which would destroy the offsets and silently degrade every reader to
     /// the whole file. (This ran inside `persist_segments` and clobbered offsets; it is now deferred to
     /// after the 7B pass and repaired to slice+merge.)
-    fn enqueue_background_alignments(&self, segments: &[SpeechSegment]) {
+    fn enqueue_background_alignments(
+        &self,
+        segments: &[SpeechSegment],
+        import_writes: crate::stores::ImportWriteStore,
+    ) {
         if !self.settings.auto_align {
             return;
         }
@@ -2960,7 +2982,6 @@ impl ProcessingPipeline {
                 crate::corrections::loop0_draft_text(s.annotated_transcript.as_deref(), &s.raw_transcript).to_string();
             by_path.entry(s.audio_path.clone()).or_default().push((s.id.clone(), s.alignment_json.clone(), text));
         }
-        let db_path = self.db_path.clone();
         // Resolved HERE because the thread below is `move` and never captures `self`. That is exactly how
         // this path ended up on `aligner::align` — the free fallback-only stub — instead of the real
         // aligner the foreground path uses: the model root simply was not reachable inside the closure.
@@ -2971,21 +2992,15 @@ impl ProcessingPipeline {
         let enable_gpu = self.settings.enable_gpu;
 
         // R3: this DETACHED thread is spawned during import (ImportState::Running) but OUTLIVES the
-        // ImportGuard, then writes segment alignments (update_segment_alignment) on its OWN connection —
-        // so in the post-import window it escapes the import fence AND the db-Mutex serialization the
-        // restore relies on. Register it as a background DB writer for its whole lifetime. Acquire the
-        // guard HERE (still on the import worker thread, so there is no unfenced gap between enqueue and
-        // the thread starting) and move it into the closure; it drops when the thread ends, incl. panic.
+        // ImportGuard. Keep the legacy background-writer fence for the thread's whole lifetime so a
+        // restore cannot replace the database while inference is reading source metadata. The actual
+        // write below additionally crosses the shared DatabaseRuntime and compares the exact alignment
+        // read before inference, so it is serialized and cannot clobber a newer edit. Acquire the guard
+        // HERE so there is no unfenced gap between enqueue and thread start; Drop covers exit and panic.
         let align_writer_guard = crate::commands::BgDbWriterGuard::new();
         std::thread::spawn(move || {
-            let _align_writer_guard = align_writer_guard; // held for the whole alignment thread
-            let db = match crate::db::Database::open(&db_path) {
-                Ok(db) => db,
-                Err(error) => {
-                    tracing::warn!("background alignment skipped: could not open db: {error}");
-                    return;
-                }
-            };
+            // Held for the whole alignment thread.
+            let _align_writer_guard = align_writer_guard;
             // ONCE for the whole import, not per segment: `ForcedAligner::new` loads a ~365 MB ONNX
             // session. `Pipeline::align` can afford to build one per call because it aligns a single
             // clip; doing that here — across every segment of every file in an import — would not be.
@@ -3031,8 +3046,9 @@ impl ProcessingPipeline {
                             // word timings unmarked, and quality.rs only raises the review-risk
                             // reason when the marker is present.
                             let merged = crate::chunking::merge_word_timestamps(source_alignment.as_deref(), &words);
-                            if let Err(error) = db.update_segment_alignment(
+                            match import_writes.update_alignment_if_unchanged(
                                 &seg_id,
+                                source_alignment.as_deref(),
                                 &merged,
                                 // The quality the aligner ACTUALLY achieved. This was hardcoded to
                                 // EnergyHeuristic, which was true of the stub but is a provenance lie the
@@ -3041,11 +3057,18 @@ impl ProcessingPipeline {
                                 // clip a false risk flag.
                                 quality.as_db_str(),
                             ) {
-                                tracing::warn!("background alignment: persist failed for {seg_id}: {error}");
-                                failed += 1;
-                                continue;
+                                Ok(true) => aligned += 1,
+                                Ok(false) => {
+                                    tracing::warn!(
+                                        "background alignment: skipped stale metadata for {seg_id}; canonical alignment changed during inference"
+                                    );
+                                    failed += 1;
+                                }
+                                Err(error) => {
+                                    tracing::warn!("background alignment: persist failed for {seg_id}: {error}");
+                                    failed += 1;
+                                }
                             }
-                            aligned += 1;
                         }
                         // Empty word list or error: leave the source offsets INTACT (never overwrite).
                         Ok(_) => failed += 1,
@@ -3069,6 +3092,7 @@ impl ProcessingPipeline {
     fn run_primary_wsl_pass_for_import(
         &self,
         db: &Database,
+        import_writes: &crate::stores::ImportWriteStore,
         segments: &mut [SpeechSegment],
         cancel: Option<&CancellationToken>,
     ) -> AppResult<usize> {
@@ -3108,7 +3132,7 @@ impl ProcessingPipeline {
             if let Some(token) = cancel {
                 if let Err(cancel_err) = token.check() {
                     tracing::info!("WSL 7B import cancelled; rolling back {} segment(s)", import_ids.len());
-                    if let Err(e) = db.delete_segments_batch(&import_ids) {
+                    if let Err(e) = import_writes.rollback_segments(&import_ids) {
                         tracing::error!("failed to roll back {} segment(s) after cancel: {e}", import_ids.len());
                     }
                     return Err(cancel_err);
@@ -3145,7 +3169,7 @@ impl ProcessingPipeline {
                             "WSL 7B import cancelled (server unavailable: {reason}); rolling back {} segment(s)",
                             import_ids.len()
                         );
-                        if let Err(e) = db.delete_segments_batch(&import_ids) {
+                        if let Err(e) = import_writes.rollback_segments(&import_ids) {
                             tracing::error!(
                                 "failed to roll back {} placeholder segment(s) after 7B cancel: {e}",
                                 import_ids.len()
@@ -3164,7 +3188,7 @@ impl ProcessingPipeline {
                                 "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
                                 import_ids.len()
                             );
-                            if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                            if let Err(rollback_err) = import_writes.rollback_segments(&import_ids) {
                                 tracing::error!(
                                     "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
                                     import_ids.len()
@@ -3202,7 +3226,7 @@ impl ProcessingPipeline {
                         seg.id,
                         import_ids.len()
                     );
-                    if let Err(rollback_err) = db.delete_segments_batch(&import_ids) {
+                    if let Err(rollback_err) = import_writes.rollback_segments(&import_ids) {
                         tracing::error!(
                             "failed to roll back {} segment(s) after champion halt: {rollback_err}",
                             import_ids.len()

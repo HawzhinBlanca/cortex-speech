@@ -828,13 +828,19 @@ def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> Non
         raise AssertionError(f"commands.rs must keep observable CAS-protected atomic alignment persistence:\n{formatted}")
 
     required_pipeline = [
-        "if let Err(error) = db.update_segment_alignment(",
+        "match import_writes.update_alignment_if_unchanged(",
+        "source_alignment.as_deref(),",
+        "Ok(false) => {",
+        "canonical alignment changed during inference",
         'tracing::warn!("background alignment: persist failed for {seg_id}: {error}");',
     ]
     missing = [pattern for pattern in required_pipeline if pattern not in pipeline]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"pipeline.rs background aligner must report atomic alignment persist failures:\n{formatted}")
+        raise AssertionError(
+            "pipeline.rs background aligner must keep observable, serialized CAS-protected "
+            f"alignment persistence:\n{formatted}"
+        )
 
 
 def test_media_cache_cleanup_reports_failures() -> None:

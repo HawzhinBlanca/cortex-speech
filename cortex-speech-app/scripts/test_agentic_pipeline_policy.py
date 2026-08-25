@@ -134,8 +134,10 @@ def main() -> None:
         "configured source-reference failures must not be logged and ignored"
     )
     assert "run_primary_wsl_pass_for_import" in pipeline, "WSL 7B imports must attempt the primary ASR pass before jury"
-    assert "self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?" in pipeline, (
-        "import must run the WSL 7B primary pass immediately after segment persistence"
+    champion_import_call = "self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?"
+    assert pipeline.count(champion_import_call) == 2, (
+        "streaming and non-streaming imports must run the WSL 7B primary pass immediately after "
+        "store-owned segment persistence and carry the same rollback capability"
     )
     assert "if !self.should_use_wsl_primary_asr() || segments.is_empty()" in pipeline, (
         "the WSL pass must be inert after an unconfigured champion has already been refused by preflight"
