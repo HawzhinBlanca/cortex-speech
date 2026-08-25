@@ -299,9 +299,14 @@ impl AppState {
         crate::stores::PlaybackWriteStore::new(self.db.clone())
     }
 
-    /// Serialized human-review effect writer for migrated undo and flag command domains.
+    /// Serialized human-review writer for desktop decisions, exact undo and review flags.
     pub(crate) fn review_writes(&self) -> crate::stores::ReviewWriteStore {
         crate::stores::ReviewWriteStore::new(self.db.clone())
+    }
+
+    /// Recording-scoped rights, consent withdrawal and provenance query boundary.
+    pub(crate) fn rights_store(&self) -> crate::stores::RightsStore {
+        crate::stores::RightsStore::new(self.db.clone())
     }
 
     /// Raw DB access for the restore implementation only. The caller must already own the exclusive

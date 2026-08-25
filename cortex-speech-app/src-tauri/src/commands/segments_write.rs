@@ -98,8 +98,7 @@ pub fn set_recording_rights(
     }
     // `revoked_at` is deliberately NOT settable here: withdrawal has its own command, so a rights
     // edit can never quietly un-revoke a recording by omitting the field.
-    let db = state.lock_db();
-    db.set_recording_rights(&validated, &rights).map_err(|e| e.to_string())
+    state.rights_store().declare_recording(&validated, &rights).map_err(|error| error.to_string())
 }
 
 /// Record a withdrawal of consent for a recording. Irreversible from this API by design.
@@ -110,8 +109,7 @@ pub fn set_recording_rights(
 pub fn revoke_recording_consent(audio_path: String, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("revoke_recording_consent")?;
     let validated = validate::validate_file_path(&audio_path)?;
-    let db = state.lock_db();
-    let n = db.revoke_recording(&validated).map_err(|e| e.to_string())?;
+    let n = state.rights_store().revoke_recording(&validated).map_err(|error| error.to_string())?;
     tracing::warn!("consent withdrawn for {validated}: {n} segment(s) excluded from every export");
     Ok(n)
 }
@@ -120,8 +118,7 @@ pub fn revoke_recording_consent(audio_path: String, state: State<'_, AppState>) 
 #[tauri::command]
 pub fn list_recording_rights(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     RATE_LIMITER.check("list_recording_rights")?;
-    let db = state.lock_db();
-    let rows = db.list_recording_rights().map_err(|e| e.to_string())?;
+    let rows = state.rights_store().list_recordings().map_err(|error| error.to_string())?;
     Ok(rows
         .into_iter()
         .map(|(path, count, rights)| {
