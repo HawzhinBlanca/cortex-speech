@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `08ae275`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
-> 58 files, browser E2E/accessibility **97/97** with zero retries, all **116** reachable Python policy scripts, compensation readiness **38/38**, strict
+> Measured checkpoint at `78f2a1c`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> 58 files, browser E2E/accessibility **97/97** with zero retries, all **117** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,587 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,590 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -55,7 +55,13 @@
 > those values and coverage under the writer lock. Three adversarial store tests prove a one-millisecond
 > claimed duration cannot inflate coverage, missing server identity writes no receipt, and invalid
 > timing leaves no partial row; the full playback selection passed 16/16 and the architecture policy
-> prevents the command from regaining raw database authority.
+> prevents the command from regaining raw database authority. `78f2a1c` adds a second serialized
+> write boundary: decision undo, review-flag creation, exact flag undo and the retired identity-free
+> clear endpoint now delegate through a Tauri-free `ReviewWriteStore`. Three focused regressions pin
+> exact response-loss replay, payload-conflict refusal, one immutable reversal per effect, idempotent
+> undo, and continued refusal of authority-free clearing; the architecture policy prevents those
+> four migrated commands from regaining raw database access. Typed decision commit and other
+> review/payment writes remain open strangler work.
 > This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
