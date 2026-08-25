@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `44222f6`
+**Current evidence commit:** `d554d4a`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -43,14 +43,15 @@ requires the immutable profile manifest and the external evidence listed under O
 | Generated, versioned IPC plus revision-bound review commit and exact operation-ID replay. | `df861d7` | Binding drift gate passed; full Rust, frontend and Python suites passed; strict Clippy passed | Remaining command domains still require typed migration; zero dynamic/untyped invokes is not yet reached |
 | Playback is bound to clip ID and attempt ID through explicit state transitions; stale resolver, play, timer, error and ended callbacks are ignored. | `dd43844` | 10,000 deterministic randomized transitions, every declared phase visited; 19 focused audio tests; full frontend 303/303 | `AudioPlayer.svelte` still requires presentational decomposition and real-device timing/accessibility evidence |
 | `DatabaseRuntime` owns serialized writes, a bounded four-connection read pool and restore admission; typed review reads and online backup use restore-gated query snapshots. | `44222f6` | 3/3 runtime regressions; focused restore-admission 2/2, named-restore 4/4 and snapshot-restore 1/1; full Rust and policy suites passed | Connection reopening, domain stores, remaining command SQL removal and the 50,000-segment concurrency/restore proof remain open |
+| Segment/library/review queries are routed through a Tauri-free `SegmentQueryStore`; bounded readers use the runtime-owned live path without contending on the serialized writer mutex. | `d554d4a` | 4/4 runtime regressions, 1/1 store regression, new architecture policy, all 113 policy scripts, full Rust 1,578/0 and frontend 303/303 | Only the first query domain is migrated; write stores, remaining raw command access, connection reopening and the 50,000-segment proof remain open |
 
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,576 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --all-targets --all-features`: 1,578 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Frontend: 57 files / 303 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
-- Python policies: all 112 reachable policy scripts passed.
+- Python policies: all 113 reachable policy scripts passed.
 - Migrations 1–65 are byte-identical to production base `bd581ef`.
 - Work used disposable databases only. The active database and immutable release pointer were not modified.
 
@@ -80,4 +81,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `44222f6` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `d554d4a` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
