@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `deddfd3`
+**Current evidence commit:** `08ae275`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -46,15 +46,16 @@ requires the immutable profile manifest and the external evidence listed under O
 | Segment/library/review queries are routed through a Tauri-free `SegmentQueryStore`; bounded readers use the runtime-owned live path without contending on the serialized writer mutex. | `d554d4a` | 4/4 runtime regressions, 1/1 store regression, new architecture policy, all 113 policy scripts, full Rust 1,578/0 and frontend 303/303 | Only the first query domain is migrated; write stores, remaining raw command access, connection reopening and the 50,000-segment proof remain open |
 | Desktop review drafts survive navigation/restart without becoming review truth: schema v66 is additive, writes use FULL-sync revision-CAS storage, stale saves cannot resurrect cleared text, and typed commit/replay clears only the matching revision in the human-truth transaction. | `dff94a4` | 4/4 draft-store tests including injected failure; typed commit/rollback/replay tests; 3 frontend recovery/conflict/debounce tests; generated bindings and non-authority policy; full Rust 1,584/0, frontend 308/308 and all 114 Python policy scripts | Process-kill timing, power-loss behavior, long-session draft churn and full `ReviewWorkspace` decomposition remain certification gates |
 | The production build enforces the initial 125 KB JavaScript and 15 KB CSS ceilings over the complete transitive static manifest; secondary workspaces load in explicit chunks with localized pending/failure states, retry, stale-load isolation and raw-error scrubbing. Preview/E2E typed review mocks are explicit and unknown commands fail loudly. | `deddfd3` | Executable oversized-transitive-dependency fault test; 2 lazy-boundary tests; frontend 310/310; Playwright 97/97 with zero retries; standalone preview traversed Insights → Settings → Review with zero console/page errors; all 115 Python policies | Cold-shell/review-usable timing, search/audio latency, long tasks, FPS and 1,000-decision heap proof remain open |
+| Desktop playback evidence writes cross a Tauri-free `PlaybackWriteStore`; its observation-only database DTO cannot express review revision, audio hash, source span or authoritative duration. The database resolves all identity and coverage fields while holding the serialized writer. | `08ae275` | 3 adversarial store tests prove client duration cannot shrink coverage, missing server audio identity creates no receipt, and invalid timing creates no partial write; 16 focused playback regressions; architecture policy; full Rust 1,587/0; all 116 Python policies; strict Clippy/rustfmt | Remaining review/payment writes still use the compatibility façade; the 50,000-segment concurrent review/import/backup and restore-reopen proofs remain open |
 
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,584 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --all-targets --all-features`: 1,587 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Frontend: 58 files / 310 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
 - Browser E2E/accessibility: 97/97 passed with zero retries against a gate-owned Vite server.
-- Python policies: all 115 reachable policy scripts passed.
+- Python policies: all 116 reachable policy scripts passed.
 - Production build and its fail-closed manifest budget passed. Initial JavaScript is **111.19 KB gzip**
   against the 125 KB ceiling; initial CSS is **11.20 KB gzip** against the 15 KB ceiling. The gate
   recursively counts the entry and all static imports, excludes on-demand chunks, and was proven to
@@ -91,4 +92,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `deddfd3` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `08ae275` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
