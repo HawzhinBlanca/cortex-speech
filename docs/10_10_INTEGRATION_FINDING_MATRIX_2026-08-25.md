@@ -6,7 +6,7 @@
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `d554d4a`
+**Current evidence commit:** `dff94a4`
 
 **Status:** integrated source checkpoint; **not a product or model certification**
 
@@ -44,15 +44,19 @@ requires the immutable profile manifest and the external evidence listed under O
 | Playback is bound to clip ID and attempt ID through explicit state transitions; stale resolver, play, timer, error and ended callbacks are ignored. | `dd43844` | 10,000 deterministic randomized transitions, every declared phase visited; 19 focused audio tests; full frontend 303/303 | `AudioPlayer.svelte` still requires presentational decomposition and real-device timing/accessibility evidence |
 | `DatabaseRuntime` owns serialized writes, a bounded four-connection read pool and restore admission; typed review reads and online backup use restore-gated query snapshots. | `44222f6` | 3/3 runtime regressions; focused restore-admission 2/2, named-restore 4/4 and snapshot-restore 1/1; full Rust and policy suites passed | Connection reopening, domain stores, remaining command SQL removal and the 50,000-segment concurrency/restore proof remain open |
 | Segment/library/review queries are routed through a Tauri-free `SegmentQueryStore`; bounded readers use the runtime-owned live path without contending on the serialized writer mutex. | `d554d4a` | 4/4 runtime regressions, 1/1 store regression, new architecture policy, all 113 policy scripts, full Rust 1,578/0 and frontend 303/303 | Only the first query domain is migrated; write stores, remaining raw command access, connection reopening and the 50,000-segment proof remain open |
+| Desktop review drafts survive navigation/restart without becoming review truth: schema v66 is additive, writes use FULL-sync revision-CAS storage, stale saves cannot resurrect cleared text, and typed commit/replay clears only the matching revision in the human-truth transaction. | `dff94a4` | 4/4 draft-store tests including injected failure; typed commit/rollback/replay tests; 3 frontend recovery/conflict/debounce tests; generated bindings and non-authority policy; full Rust 1,584/0, frontend 308/308 and all 114 Python policy scripts | Process-kill timing, power-loss behavior, long-session draft churn and full `ReviewWorkspace` decomposition remain certification gates |
 
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,578 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --all-targets --all-features`: 1,584 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
-- Frontend: 57 files / 303 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
-- Python policies: all 113 reachable policy scripts passed.
-- Migrations 1–65 are byte-identical to production base `bd581ef`.
+- Frontend: 57 files / 308 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
+- Python policies: all 114 reachable policy scripts passed.
+- Production build passed. Initial CSS is 13.75 KB gzip (within the 15 KB target); initial JavaScript is
+  146.14 KB gzip and therefore **fails** the 125 KB target by 21.14 KB. No performance pass is claimed.
+- Migrations 1–65 are byte-identical to production base `bd581ef` (normalized catalog SHA-256
+  `c47d4be689871b8191c13d96a59dd502a9de4d8868788f8cd9cfa4efca7cc2e3`).
 - Work used disposable databases only. The active database and immutable release pointer were not modified.
 
 The eight ignored Rust diagnostics include live/model-dependent evidence and are not counted as
@@ -81,4 +85,4 @@ evidence, lock recovery, or manual status changes.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `d554d4a` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict at `dff94a4` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.

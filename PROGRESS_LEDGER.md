@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `d554d4a`: duplicate policies **6/6 + 17/17**, frontend **303/303** across
-> 57 files, all **113** reachable Python policy scripts, compensation readiness **38/38**, strict
+> Measured checkpoint at `dff94a4`: duplicate policies **6/6 + 17/17**, frontend **308/308** across
+> 57 files, all **114** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,578 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,584 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -37,7 +37,13 @@
 > reads and exact online backup migration history. `d554d4a` adds the first Tauri-free domain store: ten
 > segment/library/review read handlers now use bounded `SegmentQueryStore` snapshots, readers no
 > longer take the serialized-writer mutex just to discover the live database path, and a new
-> architecture policy forbids those handlers from regaining raw database authority. This entry is
+> architecture policy forbids those handlers from regaining raw database authority. `dff94a4`
+> appends schema 66 for FULL-sync, revision-bound, non-authoritative desktop drafts; stale writes
+> cannot resurrect cleared work, matching drafts clear atomically with typed human decisions and
+> lost-response replays, stale drafts are shown beside server truth without automatic merge, and
+> exports/evaluation/payment/serving cannot query the draft table. The production build is honest-red
+> on the initial JavaScript budget: **146.14 KB gzip versus 125 KB required**; CSS is green at 13.75 KB.
+> This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
 > certification-grade soak/field sessions, Windows signing/VM/a11y/usability/pilot evidence and the
