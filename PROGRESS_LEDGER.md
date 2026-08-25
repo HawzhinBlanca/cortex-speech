@@ -9,6 +9,34 @@
 > human-reviewed dataset is correctly not final. Never use an older score, machine-state paragraph,
 > hidden-check requirement, model route, focus, or roster below as current production instruction.
 
+> **2026-08-25 — EVIDENCE-BACKED 10/10 INTEGRATION IN PROGRESS (NOT CERTIFIED):** Branch
+> `codex/10-10-integration` was created from schema-65 production commit `bd581ef`; the intent of the
+> 15 audit-remediation commits from `ea2ec3d` through `889672c` was replayed individually, preserving
+> migrations 1–65 and the flexible-pool authority. Conflict integrations retain the production
+> vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
+> retain every audit regression. The commit-to-regression map is
+> [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
+> Measured checkpoint at `dd43844`: duplicate policies **6/6 + 17/17**, frontend **303/303** across
+> 57 files, all **112** reachable Python policy scripts, compensation readiness **38/38**, strict
+> Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
+> **1,573 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
+> fixture now executes the production `Database::initialize` boot step and its binary suite is
+> **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
+> per-gate timeouts, streamed
+> immutable attempt logs, Windows kill-on-close Job Objects, PID-creation/token/SHA leases with 5 s
+> heartbeat and 30 s stale threshold, fsynced event sequencing, non-certifying
+> `PASS-AFTER-RETRY`, hash-validated manifests and post-validation latest/status publication. Its
+> current fault regressions are **9/9** (concurrency, dead/PID-reused/wedged leases, child+grandchild
+> timeout, evidence-write failure, isolated worker and manifest binding). Generated versioned IPC and
+> revision-bound review commits landed at `df861d7`; attempt-bound audio with a 10,000-transition
+> randomized state-machine proof landed at `dd43844`. This entry is deliberately **not a green
+> claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
+> certification-grade soak/field sessions, Windows signing/VM/a11y/usability/pilot evidence and the
+> separate model attestation remain pending. The requested `PAY_POLICY_REQUIRED` external-pool shutdown conflicts
+> with active owner-FINAL schema-65 pool canon and is not implemented without literal
+> `change canon: <item>` authorization; no pay was minted, backfilled or altered.
+
 ## 1. Overall 10/10 Gate Status
 
 * **Stop Condition (`verify-10` checker)**: **GREEN — narrow M0/M1 gate only** (`make verify-10` exits 0: manifest sync, asset presence, ledger schema, license-compatibility). This is **NOT** the full-charter 10/10. **Honest grade as of 2026-07-09: ≈7/10** (36-agent adversarially-verified audit, [docs/TRUE_RATING_2026-07-09.md](docs/TRUE_RATING_2026-07-09.md)); lineage 6.5 (07-02) → 6.5 (07-06 deep-check) → ~7.0 (07-09). The scorecard table below is the ORIGINAL Wave-0 blueprint scorecard, retained for history; the current per-dimension grades live in the 07-09 rating doc. The remaining gap to a declared 10/10 is owner-gated measurement (P2.2 benchmark → marathon → retrain cycle → P7 re-audit).
