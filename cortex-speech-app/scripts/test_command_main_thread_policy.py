@@ -134,6 +134,16 @@ RUN_BLOCKING_COMMANDS = [
     "get_active_learning_queue",
 ]
 
+# Query-only segment commands migrated behind the bounded SegmentQueryStore. They still run their
+# work on the blocking pool, but must no longer regain the raw serialized-writer handle.
+QUERY_STORE_COMMANDS = {
+    "get_segments",
+    "get_segments_suspect_first",
+    "search_segments",
+    "get_audio_health",
+    "get_active_learning_queue",
+}
+
 
 def source() -> str:
     """The whole command surface: commands.rs + every extracted slice under src/commands/."""
@@ -147,6 +157,12 @@ def source() -> str:
     if "#[tauri::command]" not in text:
         raise AssertionError("no #[tauri::command] found in the command surface — this gate would pass vacuously")
     return text
+
+
+def command_body(src: str, name: str) -> str:
+    start = src.index(f"pub async fn {name}(")
+    end = src.find("\n#[tauri::command]", start + len(name))
+    return src[start:] if end < 0 else src[start:end]
 
 
 def test_listed_slow_commands_are_async() -> None:
@@ -173,14 +189,19 @@ def test_off_main_thread_helper_exists_and_is_used() -> None:
 
 
 def test_migrated_exports_do_not_hold_lock_db_across_the_await() -> None:
-    # The blocking body must clone the Arc handle (db_arc) and lock INSIDE the task — never take a
-    # `lock_db()` guard and carry it across the await (a non-Send guard across await won't compile,
-    # but this pins the intended pattern so a future edit doesn't reintroduce a main-thread lock).
+    # Write-capable commands clone the restore-gated Arc handle and lock INSIDE the task. Migrated
+    # query commands clone SegmentQueryStore instead. Neither may carry a lock_db() guard across await.
     src = source()
     for name in RUN_BLOCKING_COMMANDS:
-        start = src.index(f"pub async fn {name}(")
-        body = src[start : start + 1200]
-        if "state.db_arc()" not in body:
+        body = command_body(src, name)
+        if "state.lock_db()" in body:
+            raise AssertionError(f"`{name}` must not carry state.lock_db() into a blocking task")
+        if name in QUERY_STORE_COMMANDS:
+            if "state.segment_queries()" not in body:
+                raise AssertionError(f"`{name}` must obtain its bounded SegmentQueryStore before the blocking task")
+            if "state.db_arc()" in body:
+                raise AssertionError(f"`{name}` query path regained the raw serialized-writer handle")
+        elif "state.db_arc()" not in body:
             raise AssertionError(f"`{name}` must obtain the DB via state.db_arc() for the blocking task")
 
 

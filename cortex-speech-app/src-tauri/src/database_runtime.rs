@@ -17,6 +17,7 @@ const DEFAULT_READ_WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub(crate) struct DatabaseRuntime {
     writer: Arc<Mutex<Database>>,
+    database_path: Arc<str>,
     reads: Arc<ReadConnectionPool>,
     admission: Arc<RestoreAdmission>,
 }
@@ -32,8 +33,10 @@ impl DatabaseRuntime {
         read_wait: Duration,
         admission: Arc<RestoreAdmission>,
     ) -> Self {
+        let database_path: Arc<str> = Arc::from(database.path());
         Self {
             writer: Arc::new(Mutex::new(database)),
+            database_path,
             reads: Arc::new(ReadConnectionPool::new(max_reads, read_wait)),
             admission,
         }
@@ -47,15 +50,7 @@ impl DatabaseRuntime {
     /// Open one stable, query-only WAL snapshot under a bounded permit. Restore admission spans the
     /// complete reader lifetime so a command cannot observe two database generations.
     pub(crate) fn open_read(&self) -> AppResult<ReadDatabase<'_>> {
-        let path = self
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                tracing::warn!("Recovering poisoned database lock while opening a read snapshot");
-                poisoned.into_inner()
-            })
-            .path()
-            .to_string();
-        if path == ":memory:" {
+        if self.database_path.as_ref() == ":memory:" {
             return Err(AppError::Other("bounded read snapshots require a file-backed database".to_string()));
         }
 
@@ -63,7 +58,7 @@ impl DatabaseRuntime {
         // reader would deadlock a restore that has already published `pending` and is draining readers.
         let permit = self.reads.acquire()?;
         let admission = self.admission.begin_capture().map_err(AppError::Other)?;
-        let database = Database::open_read_only(&path)?;
+        let database = Database::open_read_only(self.database_path.as_ref())?;
         Ok(ReadDatabase { database, _admission: admission, _permit: permit })
     }
 
@@ -435,5 +430,14 @@ mod tests {
             crate::migrations::validate_applied_history(backup.connection()).unwrap(),
             crate::migrations::max_supported_version()
         );
+    }
+
+    #[test]
+    fn bounded_read_does_not_wait_for_the_serialized_writer_mutex() {
+        let (_directory, runtime) = file_runtime(1, Duration::from_millis(10));
+        let _writer = runtime.lock().unwrap();
+
+        let reader = runtime.open_read().expect("cached live path must let readers bypass the writer mutex");
+        assert_eq!(reader.segment_count().unwrap(), 0);
     }
 }

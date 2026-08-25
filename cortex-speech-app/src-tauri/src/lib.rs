@@ -74,6 +74,7 @@ pub mod significance;
 pub mod snapshot;
 pub mod source_provenance;
 pub mod stats;
+mod stores;
 pub mod telemetry;
 pub mod throttle;
 pub mod transcript_export;
@@ -280,6 +281,12 @@ impl AppState {
     /// Bounded query-only connection authority for read-heavy blocking work.
     pub(crate) fn db_runtime(&self) -> DatabaseRuntime {
         self.db.clone()
+    }
+
+    /// Query-domain store for segment/library/review reads. Command handlers retain validation and
+    /// DTO mapping but do not receive a raw connection for this migrated domain.
+    pub(crate) fn segment_queries(&self) -> crate::stores::SegmentQueryStore {
+        crate::stores::SegmentQueryStore::new(self.db.clone())
     }
 
     /// Raw DB access for the restore implementation only. The caller must already own the exclusive

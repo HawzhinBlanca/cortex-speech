@@ -10,7 +10,7 @@
 use super::{run_blocking, send_audio_duration_probe_result, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
 use crate::validation::input as validate;
-use crate::{audio, quality, AppState};
+use crate::{audio, AppState};
 use std::time::Duration;
 use tauri::State;
 
@@ -96,11 +96,10 @@ pub async fn get_review_page_v1(
     }
     let focus = crate::voice_focus::resolve(state.lock_data_dir().as_deref())
         .map_err(|error| public_review_read_error(&error))?;
-    let database = state.db_runtime();
+    let segment_queries = state.segment_queries();
     tokio::task::spawn_blocking(move || {
-        let db = database.open_read().map_err(|error| public_review_read_error(&error.to_string()))?;
-        let page = db
-            .get_segments_page_focused(
+        let page = segment_queries
+            .get_segments_page(
                 Some(false),
                 query.as_deref(),
                 "oldest",
@@ -153,12 +152,8 @@ pub async fn get_review_page_v1(
 #[tauri::command]
 pub async fn get_segments(verified: Option<bool>, state: State<'_, AppState>) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_segments")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.get_segments(verified).map_err(|e| e.to_string())
-    })
-    .await
+    let segment_queries = state.segment_queries();
+    run_blocking(move || segment_queries.get_segments(verified).map_err(|e| e.to_string())).await
 }
 
 /// M2.5: Return segments ordered by suspect-first priority: escalated + low confidence first.
@@ -169,12 +164,8 @@ pub async fn get_segments_suspect_first(
     state: State<'_, AppState>,
 ) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_segments_suspect_first")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.get_segments_suspect_first(verified).map_err(|e| e.to_string())
-    })
-    .await
+    let segment_queries = state.segment_queries();
+    run_blocking(move || segment_queries.get_segments_suspect_first(verified).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
@@ -185,14 +176,10 @@ pub async fn search_segments(query: String, state: State<'_, AppState>) -> Resul
     validate::validate_text(&query, 1000, "Search query")?;
     // Off the main thread: the FTS5 MATCH has no LIMIT, so a common token materializes + serializes a
     // large slice of the library. Run it on the blocking pool exactly like the get_segments siblings so
-    // a keystroke in the search box can't freeze the UI. db_arc + lock INSIDE the task — never hold a
-    // lock_db() guard across the await.
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.search_segments(&query).map_err(|e| e.to_string())
-    })
-    .await
+    // a keystroke in the search box can't freeze the UI. The bounded query store is moved into the task;
+    // no database guard is held across the await.
+    let segment_queries = state.segment_queries();
+    run_blocking(move || segment_queries.search_segments(&query).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
@@ -249,12 +236,8 @@ pub async fn get_waveform(
 #[tauri::command]
 pub async fn get_audio_health(state: State<'_, AppState>) -> Result<crate::db::AudioHealth, String> {
     RATE_LIMITER.check("get_audio_health")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.audio_health().map_err(|e| e.to_string())
-    })
-    .await
+    let segment_queries = state.segment_queries();
+    run_blocking(move || segment_queries.audio_health().map_err(|e| e.to_string())).await
 }
 
 /// P3.3: relink missing source audio by basename against a folder the owner picks.
@@ -282,58 +265,9 @@ pub async fn get_active_learning_queue(
     limit: usize,
 ) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_active_learning_queue")?;
-    let db = state.db_arc();
+    let segment_queries = state.segment_queries();
     run_blocking(move || {
-        // P1.3, last site. This read the WHOLE library as full records — transcripts, alignment JSON,
-        // evidence JSON — to compute one threshold and then return at most `limit` clips.
-        //
-        // The audit filed this under "compute the conformal threshold in SQL", but that conflates two
-        // separable problems. The SELECTION RULE here really is naive (rank by distance to one
-        // threshold) and fixing it needs the frozen human-labelled calibration split that does not exist
-        // until the Gold Marathon — that is P1.4 and it stays open. The MEMORY SHAPE is independent of
-        // that and fixable now, so it is fixed now, and the ranking below is byte-for-byte what it was.
-        //
-        // ONE streaming pass does both jobs: the tally accumulates the certificate, and every unverified
-        // row's nonconformity is captured as it goes by. `q_hat` is not known until the pass ends, but it
-        // is a GLOBAL constant applied afterwards, so the per-segment score is all that must be carried.
-        //
-        // What survives the pass is `(id, score)` per unverified row — tens of bytes — instead of the
-        // full record. Only the `limit` clips actually returned are hydrated, exactly as couch.rs does.
-        let (q_hat, mut scored) = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            let mut tally = quality::conformal::ConformalTally::default();
-            let mut scored: Vec<(String, f64)> = Vec::new();
-            db.for_each_segment(None, |seg| {
-                if !seg.verified {
-                    scored.push((seg.id.clone(), quality::conformal::compute_nonconformity_score(&seg)));
-                }
-                tally.push(&seg);
-            })
-            .map_err(|e| e.to_string())?;
-            (tally.finish(target_error, confidence_level).threshold, scored)
-        };
-
-        // Identical ordering to the Vec<(SpeechSegment, f64)> sort this replaces: uncertainty is
-        // `-(score - q_hat).abs()` sorted DESCENDING, and `sort_by` is STABLE, so ties keep corpus
-        // order. Both properties are preserved deliberately — this change is about memory, not ranking.
-        scored.sort_by(|a, b| {
-            let (ua, ub) = (-(a.1 - q_hat).abs(), -(b.1 - q_hat).abs());
-            ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(limit);
-
-        // Hydrate only what is returned, then re-impose the ranked order: get_segments_by_ids applies its
-        // own global ordering, and handing back a differently-ordered queue would silently change which
-        // clip a reviewer is asked to judge first — the whole point of an active-learning queue.
-        let ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
-        let rows = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?
-        };
-        let by_id: std::collections::HashMap<&str, &SpeechSegment> = rows.iter().map(|s| (s.id.as_str(), s)).collect();
-        // filter_map, not unwrap: a clip can be deleted between the scan and the fetch. Returning one
-        // fewer is correct; panicking on a race in a read command is not.
-        Ok(ids.iter().filter_map(|id| by_id.get(id.as_str()).map(|s| (*s).clone())).collect())
+        segment_queries.active_learning_queue(target_error, confidence_level, limit).map_err(Into::into)
     })
     .await
 }

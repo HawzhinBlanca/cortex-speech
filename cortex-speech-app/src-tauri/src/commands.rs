@@ -1694,8 +1694,9 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
 pub fn get_segment(segment_id: String, state: State<'_, AppState>) -> Result<SpeechSegment, String> {
     RATE_LIMITER.check("get_segment")?;
     validate::validate_identifier(&segment_id)?;
-    let db = state.lock_db();
-    db.get_segment_by_id(&segment_id)
+    state
+        .segment_queries()
+        .get_segment(&segment_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))
 }
@@ -1740,8 +1741,9 @@ pub fn get_segments_page(
     } else {
         None
     };
-    let db = state.lock_db();
-    db.get_segments_page_focused(verified, query.as_deref(), &sort, limit, cursor.as_deref(), focus.as_deref())
+    state
+        .segment_queries()
+        .get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref(), focus.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -1761,8 +1763,10 @@ pub fn get_segment_ids_for_view(
         "any" | "real" | "missing" => {}
         _ => return Err("Invalid transcript state".into()),
     }
-    let db = state.lock_db();
-    db.get_segment_ids_for_view(verified, query.as_deref(), &transcript_state).map_err(|e| e.to_string())
+    state
+        .segment_queries()
+        .get_segment_ids_for_view(verified, query.as_deref(), &transcript_state)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1771,8 +1775,7 @@ pub fn get_signal_anomaly_segments(
     state: State<'_, AppState>,
 ) -> Result<Vec<SpeechSegment>, String> {
     RATE_LIMITER.check("get_signal_anomaly_segments")?;
-    let db = state.lock_db();
-    db.get_signal_anomaly_segments(limit.unwrap_or(100)).map_err(|e| e.to_string())
+    state.segment_queries().get_signal_anomaly_segments(limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
 /// Apply the whitelisted curation fields from an autosave `fields` object onto a segment row. Pure and
