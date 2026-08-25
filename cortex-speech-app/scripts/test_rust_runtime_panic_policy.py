@@ -603,7 +603,6 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
     commands = command_surface()
     required = [
         'tracing::error!("Batch transcribe DB prefetch failed: {error}")',
-        'let segments = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;',
         'tracing::error!("Batch speaker assignment DB update failed for {id}: {error}")',
         '.get_segments_by_ids(&segment_ids)\n        .map_err(|e| e.to_string())?',
         'let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',
@@ -615,6 +614,18 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"commands.rs is missing explicit DB failure handling:\n{formatted}")
+
+    segment_store = (REPO_ROOT / "src-tauri" / "src" / "stores" / "segment_write.rs").read_text(encoding="utf-8")
+    store_required = [
+        "let segments = database.get_segments_by_ids(ids)?;",
+        "database.delete_segments_batch(ids)?;",
+    ]
+    store_missing = [pattern for pattern in store_required if pattern not in segment_store]
+    if store_missing:
+        formatted = "\n".join(f"- {entry}" for entry in store_missing)
+        raise AssertionError(f"segment_write.rs is missing explicit batch-delete DB failure propagation:\n{formatted}")
+    if "unwrap_or_default" in segment_store:
+        raise AssertionError("segment_write.rs must not silently default batch-delete DB failures")
 
 
 def test_commands_batch_transcribe_reports_insert_failures() -> None:

@@ -11,7 +11,7 @@
 
 use super::{apply_curation_fields, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
-use crate::history::{Command, HistoryManager};
+use crate::history::HistoryManager;
 use crate::ipc_contract::{
     CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, ReviewDecisionV1, ReviewDraftV1, SuggestedActionV1,
 };
@@ -39,6 +39,7 @@ fn schema_uses_effect_bound_human_truth(db: &crate::db::Database) -> Result<bool
 /// upsert. Hardening a caller-less endpoint only preserves the surface, so the write is gone; the
 /// refusal stays here (rather than inline in the command) so a test can prove it without a Tauri
 /// `State`. Same shape as `restore_segment_snapshot` above it.
+#[allow(dead_code)]
 fn persist_whole_segment_update_on(
     db: &crate::db::Database,
     history: &HistoryManager,
@@ -138,9 +139,8 @@ pub fn list_recording_rights(state: State<'_, AppState>) -> Result<Vec<serde_jso
 #[tauri::command]
 pub fn update_segment(segment: SpeechSegment, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("update_segment")?;
-    let db = state.lock_db();
-    let history = state.lock_history();
-    persist_whole_segment_update_on(&db, &history, &segment)
+    let _ = (segment, state);
+    Err(WHOLE_ROW_SEGMENT_WRITE_RETIRED.into())
 }
 
 /// Lossless snapshot restore — the review-undo IPC. `update_segment` deliberately omits the
@@ -195,17 +195,7 @@ pub fn update_segment_fields(
 pub fn delete_segment(id: String, state: State<'_, AppState>) -> Result<(), String> {
     STRICT_RATE_LIMITER.check("delete_segment")?;
     validate::validate_identifier(&id)?;
-    let _mutation = super::begin_mutation()?;
-    let db = state.lock_db();
-    let previous = db.get_segment_by_id(&id).map_err(|e| e.to_string())?;
-    db.delete_segment(&id).map_err(|e| e.to_string())?;
-    drop(db);
-
-    if let Some(seg) = previous {
-        let history = state.lock_history();
-        history.push(Command::DeleteSegments { segments: vec![seg] });
-    }
-
+    let _mutation = state.segment_writes().delete_one(&id).map_err(|error| error.to_string())?;
     state.session_auto_save();
     Ok(())
 }
@@ -216,18 +206,7 @@ pub fn delete_segments_batch(ids: Vec<String>, state: State<'_, AppState>) -> Re
     for id in &ids {
         validate::validate_identifier(id)?;
     }
-    let _mutation = super::begin_mutation()?;
-    let db = state.lock_db();
-    // Single batch-SELECT instead of N individual get_segment_by_id calls (O(1) SQL round trip).
-    let segments = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;
-    db.delete_segments_batch(&ids).map_err(|e| e.to_string())?;
-    drop(db);
-
-    if !segments.is_empty() {
-        let history = state.lock_history();
-        history.push(Command::DeleteSegments { segments });
-    }
-
+    let _mutation = state.segment_writes().delete_batch(&ids).map_err(|error| error.to_string())?;
     state.session_auto_save();
     Ok(())
 }
@@ -236,8 +215,7 @@ pub fn delete_segments_batch(ids: Vec<String>, state: State<'_, AppState>) -> Re
 pub fn rename_speaker(old_id: String, new_id: String, state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("rename_speaker")?;
     validate::validate_identifier(&new_id)?;
-    let db = state.lock_db();
-    db.rename_speaker(&old_id, &new_id).map_err(|e| e.to_string())
+    state.segment_writes().rename_speaker(&old_id, &new_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

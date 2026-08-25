@@ -314,6 +314,11 @@ impl AppState {
         crate::stores::JobStore::new(self.db.clone())
     }
 
+    /// Segment deletion/history and speaker-rename mutation boundary.
+    pub(crate) fn segment_writes(&self) -> crate::stores::SegmentWriteStore {
+        crate::stores::SegmentWriteStore::new(self.db.clone(), Arc::clone(&self.history))
+    }
+
     /// Raw DB access for the restore implementation only. The caller must already own the exclusive
     /// RestoreReservation; ordinary commands must use `lock_db` / `db_arc` so they cannot pass it.
     pub(crate) fn db_arc_for_restore(&self) -> Arc<Mutex<Database>> {

@@ -8,6 +8,7 @@ mod review_draft;
 mod review_write;
 mod rights;
 mod segment_query;
+mod segment_write;
 
 pub(crate) use jobs::JobStore;
 pub(crate) use playback::{PlaybackObservation, PlaybackWriteStore};
@@ -17,3 +18,4 @@ pub(crate) use review_write::require_listened;
 pub(crate) use review_write::{ReviewCommitError, ReviewWriteStore};
 pub(crate) use rights::RightsStore;
 pub(crate) use segment_query::SegmentQueryStore;
+pub(crate) use segment_write::SegmentWriteStore;
