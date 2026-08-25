@@ -2376,7 +2376,7 @@ impl Database {
                 .transpose()?;
             let mut machine_stmt = schema_v60
                 .then(|| {
-                    self.conn.prepare(&format!(
+                    self.conn.prepare(
                         "INSERT INTO speech_segments
                             (id, created_at, audio_path, raw_transcript, normalized_transcript,
                              alignment_json, duration_ms, speaker_id, confidence, ctc_score,
@@ -2415,8 +2415,8 @@ impl Database {
                                  excluded.speaker_change_score,
                                  speech_segments.speaker_change_score
                              ),
-                             updated_at=datetime('now')"
-                    ))
+                             updated_at=datetime('now')",
+                    )
                 })
                 .transpose()?;
             for seg in segments {
