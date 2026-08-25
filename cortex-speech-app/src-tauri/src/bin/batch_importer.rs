@@ -73,10 +73,79 @@ fn collect_prepared_wavs(directory: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(wavs)
 }
 
+/// A BLANK draft is not champion evidence: `is_placeholder_transcript` only recognises the marker
+/// strings, so an empty `raw_transcript` passed this gate and was reused (or accepted on the way out)
+/// as finished champion work. That is the twice-fixed blank-transcript class — a transcribe path that
+/// returns "" as success — and here it would silently publish an untranscribed clip.
 fn is_exact_champion_segment(segment: &cortex_speech_app_lib::db::SpeechSegment, champion_model_id: &str) -> bool {
     segment.model_version_id.as_deref() == Some(champion_model_id)
         && !segment.cloud_call
+        && !segment.raw_transcript.trim().is_empty()
         && !quality::is_placeholder_transcript(&segment.raw_transcript)
+}
+
+/// Re-base one library path onto the directory text THIS run walks; `None` when it is not a file
+/// under that directory.
+///
+/// `Database::audio_paths_with_segments_under` matches case- and separator-insensitively, but every
+/// per-file resume check downstream is an EXACT string compare against the path the walker builds
+/// (`segment_ids_for_audio_path` in SQL, `resume_completed.contains` in the pipeline). So a re-run
+/// typed `D:\Voice` against a library holding `d:/voice/...` printed "Resuming: N file(s) ... already
+/// in the library" and then imported all N a SECOND time. Canon puts the duplicate-content baseline
+/// at 0, and any duplicate from now on is a RED sweep.
+fn rebase_onto_import_dir(stored: &str, target_dir: &str) -> Option<String> {
+    let key = |c: u8| if c == b'/' { b'\\' } else { c.to_ascii_lowercase() };
+    let head = stored.get(..target_dir.len())?;
+    if !head.bytes().zip(target_dir.bytes()).all(|(a, b)| key(a) == key(b)) {
+        return None;
+    }
+    let rest = &stored[target_dir.len()..];
+    let tail = match rest.strip_prefix(['/', '\\']) {
+        Some(tail) => tail,
+        // No separator at the split point means a SIBLING like `voice2\a.wav`, not a file under
+        // `voice` — the same over-match the prefix query makes. Adopting it would skip a real import.
+        None if target_dir.ends_with(['/', '\\']) => rest,
+        None => return None,
+    };
+    if tail.is_empty() {
+        return None;
+    }
+    // Joined the way the directory walkers build their paths, so the result is byte-identical to the
+    // string this run will produce for that file.
+    Some(
+        Path::new(target_dir)
+            .join(tail.replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR))
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+/// Rehydrate the cross-run content-dedup map from the library, exactly as the desktop does at startup
+/// (`lib.rs`). `AudioFingerprint::new()` starts EMPTY, so without this the headless importer — the
+/// owner's primary import lane — had NO cross-run duplicate detection at all: a recording already in
+/// the library, offered again under another name, was admitted silently.
+///
+/// Best-effort like the desktop's: a failed read costs this run cross-run dedup and says so loudly
+/// rather than blocking the import. Rows predating v51 have no content hash and can never reject an
+/// import, so their count is reported separately instead of implied by silence.
+fn rehydrate_dedup_from_library(db: &Database, fingerprint: &AudioFingerprint) -> usize {
+    match db.load_audio_identities() {
+        Ok(known) => {
+            let unhashed = known.iter().filter(|row| row.content.is_none()).count();
+            let rehydrated = fingerprint.rehydrate(known);
+            println!("Audio dedup: rehydrated {rehydrated} recording identity/identities from the library.");
+            if unhashed > 0 {
+                println!(
+                    "Audio dedup: {unhashed} recording(s) have no content hash and can never reject an import — run `backfill_fingerprints --apply`."
+                );
+            }
+            rehydrated
+        }
+        Err(error) => {
+            println!("Audio dedup: could not rehydrate identities ({error}) — within-run dedup only.");
+            0
+        }
+    }
 }
 
 /// Import final, one-character WAVs two files at a time so the two warm 7B workers receive genuinely
@@ -93,22 +162,46 @@ fn import_prepared_voice_parallel(
     let files = collect_prepared_wavs(target_dir)?;
     let total = files.len();
     let champion_model_id = review_pool::current_champion_7b_model_id(db)?;
+    let target_text = target_dir.to_string_lossy().to_string();
     let job_id = db
-        .begin_import_job(&target_dir.to_string_lossy(), total)
+        .begin_import_job(&target_text, total)
         .map_err(|error| format!("cannot create prepared import journal: {error}"))?;
+
+    // The library may hold this directory under a different case or separator than the one typed on
+    // this run's command line, and `segment_ids_for_audio_path` matches EXACTLY. Without this map the
+    // re-run finds nothing for every file and imports the whole directory a second time.
+    let mut stored_by_walked: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for stored in db
+        .audio_paths_with_segments_under(&target_text)
+        .map_err(|error| format!("cannot read what is already imported from {}: {error}", target_dir.display()))?
+    {
+        if let Some(walked) = rebase_onto_import_dir(&stored, &target_text) {
+            stored_by_walked.insert(walked, stored);
+        }
+    }
+
+    // ONE number for two readers. The process-wide champion gate re-reads CORTEX_7B_CONCURRENCY on
+    // every acquire and defaults to a SINGLE permit, so with the variable unset the second prepared
+    // worker just blocked on the gate while this line claimed both warm GPU workers were busy. Pin the
+    // variable to the number this mode actually runs, before any champion call, so the gate admits
+    // exactly as many requests as there are workers and the printed limit is the real one.
     let file_concurrency = std::env::var("CORTEX_7B_CONCURRENCY")
         .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| (1..=2).contains(value))
         .unwrap_or(2);
-    println!("Prepared-file concurrency: {file_concurrency} (one file per warm GPU worker).");
+    std::env::set_var("CORTEX_7B_CONCURRENCY", file_concurrency.to_string());
+    println!(
+        "Prepared-file concurrency: {file_concurrency} (one file per warm GPU worker; champion gate pinned to {file_concurrency} permit(s))."
+    );
 
     let mut succeeded = 0usize;
     let mut pending = Vec::new();
     for file in files {
         let path_text = file.to_string_lossy().to_string();
+        let stored_path = stored_by_walked.get(&path_text).unwrap_or(&path_text);
         let existing_ids = db
-            .segment_ids_for_audio_path(&path_text)
+            .segment_ids_for_audio_path(stored_path)
             .map_err(|error| format!("cannot inspect existing rows for {}: {error}", file.display()))?;
         if existing_ids.is_empty() {
             pending.push(file);
@@ -284,6 +377,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let normalizer = Arc::new(SoraniNormalizer::new());
     let cache = Arc::new(TranscriptCache::new(1000));
     let fingerprint = Arc::new(AudioFingerprint::new());
+    // Before ANY import work, in BOTH modes — the map must already know every recording the library
+    // holds by the time the first file is offered to it.
+    rehydrate_dedup_from_library(&db, &fingerprint);
     let model_manager = Arc::new(ModelManager::new(app_data_dir.join("models")));
 
     let pipeline = ProcessingPipeline::new(
@@ -329,10 +425,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handing the importer the set of paths it already holds turns that into the resume the
     // machinery was written for: finished files are adopted (never re-persisted), and a file left
     // mid-stage — placeholder or empty drafts from an interrupted run — is discarded and redone.
+    //
+    // The prefix query matches case/separator-insensitively, but the pipeline consults this set with
+    // an EXACT compare against the path it walks, so a re-run typed in another case printed
+    // "Resuming: N" and then re-imported all N anyway. Re-base each stored path to the string the
+    // walker will build for it this run.
+    let target_text = target_dir.to_string_lossy().to_string();
     let already_imported: std::collections::HashSet<String> = db
-        .audio_paths_with_segments_under(&target_dir.to_string_lossy())
+        .audio_paths_with_segments_under(&target_text)
         .map_err(|e| format!("could not read what is already imported from this directory: {e}"))?
         .into_iter()
+        .map(|stored| rebase_onto_import_dir(&stored, &target_text).unwrap_or(stored))
         .collect();
     if already_imported.is_empty() {
         println!("Fresh import: this directory has no clips in the library yet.");
@@ -391,6 +494,76 @@ mod tests {
         assert!(!is_exact_champion_segment(&segment, "different-deployment"));
     }
 
+    /// A blank draft is not evidence of champion work. `is_placeholder_transcript` only knows the
+    /// marker strings, so "" used to pass and publish an untranscribed clip as finished.
+    #[test]
+    fn prepared_reuse_rejects_a_blank_transcript_as_champion_evidence() {
+        let mut segment = cortex_speech_app_lib::db::SpeechSegment {
+            raw_transcript: String::new(),
+            model_version_id: Some("champion-v1".into()),
+            ..Default::default()
+        };
+        assert!(!is_exact_champion_segment(&segment, "champion-v1"), "an empty transcript is not champion work");
+        segment.raw_transcript = "   \n\t ".into();
+        assert!(!is_exact_champion_segment(&segment, "champion-v1"), "whitespace-only is still empty");
+    }
+
+    /// A re-run typed with a different case or separator must resolve to the SAME per-file key the
+    /// prefix query already matched, or the importer prints "Resuming: N" and re-imports all N —
+    /// duplicate content, whose canon baseline is 0.
+    #[test]
+    fn resume_keys_survive_a_differently_typed_directory() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let typed = format!("D:{sep}Voice");
+        let walked = format!("{typed}{sep}lamo_000056.wav");
+
+        assert_eq!(rebase_onto_import_dir("d:/voice/lamo_000056.wav", &typed).as_deref(), Some(walked.as_str()));
+        // Idempotent: a path already in this run's spelling rebases to itself.
+        assert_eq!(rebase_onto_import_dir(&walked, &typed).as_deref(), Some(walked.as_str()));
+        // A trailing separator on the typed directory is not an off-by-one.
+        assert_eq!(
+            rebase_onto_import_dir("d:/voice/lamo_000056.wav", &format!("{typed}{sep}")).as_deref(),
+            Some(walked.as_str())
+        );
+        // Nested files keep their sub-path, spelled with this platform's separator.
+        assert_eq!(rebase_onto_import_dir("d:/voice/ep01/a.wav", &typed), Some(format!("{typed}{sep}ep01{sep}a.wav")));
+        // A SIBLING directory sharing the prefix is not under it: adopting it would skip a real import.
+        assert_eq!(rebase_onto_import_dir("d:/voice2/lamo_000056.wav", &typed), None);
+        assert_eq!(rebase_onto_import_dir("e:/elsewhere/lamo_000056.wav", &typed), None);
+        // The directory itself is not a file under itself.
+        assert_eq!(rebase_onto_import_dir("d:/voice", &typed), None);
+        assert_eq!(rebase_onto_import_dir("d:/voice/", &typed), None);
+    }
+
+    /// The headless importer is the owner's primary import lane; it must start knowing every
+    /// recording the library already holds, exactly like the desktop does at startup.
+    #[test]
+    fn library_identities_rehydrate_before_any_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open_with_retry(&dir.path().join("cortex-speech.db").to_string_lossy()).expect("open db");
+        let segment = cortex_speech_app_lib::db::SpeechSegment {
+            id: "seg-1".into(),
+            audio_path: "d:/voice/lamo_000056.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        };
+        db.insert_segment(&segment).expect("insert segment");
+        let identity =
+            cortex_speech_app_lib::fingerprint::AudioIdentity { spectral: 0xDEAD_BEEF, content: "abc123".into() };
+        db.set_audio_identity(&segment.audio_path, &identity).expect("store identity");
+
+        // A fresh importer process starts with an EMPTY map — that is the whole defect.
+        let fingerprint = AudioFingerprint::new();
+        assert_eq!(fingerprint.count(), 0);
+        assert_eq!(rehydrate_dedup_from_library(&db, &fingerprint), 1);
+        // Offered again under a different file name — the cross-run duplicate this lane could not see.
+        assert!(
+            fingerprint
+                .check_and_register_identity(&identity, Some(Path::new("d:/voice/copy_of_lamo_000056.wav")))
+                .is_err(),
+            "a recording already in the library must be refused on a later run"
+        );
+    }
     #[test]
     fn prepared_inventory_accepts_only_wavs_and_is_deterministic() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -403,7 +576,6 @@ mod tests {
         let files = collect_prepared_wavs(root.path()).expect("collect prepared wavs");
         assert_eq!(files, vec![root.path().join("b.WAV"), nested.join("a.wav")]);
     }
-
     #[test]
     fn production_import_requires_an_explicit_nonoverlapping_staging_profile() {
         let root = tempfile::tempdir().expect("tempdir");
