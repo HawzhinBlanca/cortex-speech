@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `9a43316`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
-> 58 files, browser E2E/accessibility **97/97** with zero retries, all **118** reachable Python policy scripts, compensation readiness **38/38**, strict
+> Measured checkpoint at `6e72bcc`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> 58 files, browser E2E/accessibility **97/97** with zero retries, all **119** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,592 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,594 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -72,7 +72,12 @@
 > bounded restore-gated read snapshot. Commands retain path/text validation and public DTO mapping
 > without raw database access. Two store regressions prove declaration scope and that a later metadata
 > declaration cannot resurrect withdrawn consent; a new architecture policy covers all three commands.
-> Other segment/job/import stores and Couch decomposition remain open strangler work.
+> `6e72bcc` adds a Tauri-free `JobStore`: interrupted-import discovery and recent Job Center history
+> use bounded restore-gated snapshots, while interrupted-import discard stays serialized behind
+> `DatabaseRuntime`. Startup, resume and recent-job commands retain their rate/identifier validation
+> but no longer acquire raw database authority. Two store regressions and a four-command architecture
+> policy pin bounded newest-first reads and durable read/discard behavior. Pipeline/background job
+> writers, import orchestration, segment mutations and Couch decomposition remain open strangler work.
 > This entry is
 > deliberately **not a green
 > claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
