@@ -647,8 +647,7 @@ pub fn undo_human_decision(
     operation_id: String,
 ) -> Result<crate::db::HumanDecisionUndoOutcome, String> {
     STRICT_RATE_LIMITER.check("undo_human_decision")?;
-    let db = state.lock_db();
-    db.undo_human_decision(effect_event_id, None, &operation_id).map_err(|error| error.to_string())
+    state.review_writes().undo_human_decision(effect_event_id, None, &operation_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -661,17 +660,7 @@ pub fn record_review_flag(
     RATE_LIMITER.check("record_review_flag")?;
     validate::validate_identifier(&segment_id)?;
     validate::validate_text(&rationale, 10_000, "Review flag rationale")?;
-    let db = state.lock_db();
-    record_review_flag_on(&db, &segment_id, &rationale, &operation_id)
-}
-
-fn record_review_flag_on(
-    db: &crate::db::Database,
-    segment_id: &str,
-    rationale: &str,
-    operation_id: &str,
-) -> Result<crate::db::HumanFlagCommit, String> {
-    db.record_review_flag(segment_id, rationale, operation_id).map_err(|error| error.to_string())
+    state.review_writes().record_flag(&segment_id, &rationale, &operation_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -681,8 +670,7 @@ pub fn undo_review_flag(
     operation_id: String,
 ) -> Result<crate::db::HumanFlagUndoOutcome, String> {
     STRICT_RATE_LIMITER.check("undo_review_flag")?;
-    let db = state.lock_db();
-    db.undo_review_flag(effect_event_id, &operation_id).map_err(|error| error.to_string())
+    state.review_writes().undo_flag(effect_event_id, &operation_id).map_err(|error| error.to_string())
 }
 
 /// Bound BOTH renderer-supplied identity strings on a playback receipt. `session_id` is stored on the
@@ -745,15 +733,14 @@ pub fn record_playback_receipt(
 pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> Result<(), String> {
     RATE_LIMITER.check("clear_human_decision")?;
     validate::validate_identifier(&segment_id)?; // round-22 #4
-    let db = state.lock_db();
-    db.clear_human_decision(&segment_id).map_err(|e| e.to_string())
+    state.review_writes().clear_legacy_decision(&segment_id).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         commit_review_v1_on, persist_segment_fields_on, persist_whole_segment_update_on, record_human_decision_on,
-        record_review_flag_on, require_listened, validate_playback_receipt_identity,
+        require_listened, validate_playback_receipt_identity,
     };
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
     use crate::history::HistoryManager;
@@ -1155,15 +1142,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = db_with_clip(tmp.path(), "desktop-flag-replay");
         let operation_id = "33333333-3333-4333-8333-333333333333";
-        let first = record_review_flag_on(&db, "desktop-flag-replay", "Needs a second listen", operation_id).unwrap();
-        let replay = record_review_flag_on(&db, "desktop-flag-replay", "Needs a second listen", operation_id)
+        let first = db.record_review_flag("desktop-flag-replay", "Needs a second listen", operation_id).unwrap();
+        let replay = db
+            .record_review_flag("desktop-flag-replay", "Needs a second listen", operation_id)
             .expect("an exact retry must return the original flag commit");
         assert_eq!(replay.effect_event_id, first.effect_event_id);
         assert_eq!(replay.flag_revision, first.flag_revision);
 
-        let conflict = record_review_flag_on(&db, "desktop-flag-replay", "Different request", operation_id)
+        let conflict = db
+            .record_review_flag("desktop-flag-replay", "Different request", operation_id)
             .expect_err("one operation UUID cannot authorize a different flag request");
-        assert!(conflict.contains("different request"), "{conflict}");
+        assert!(conflict.to_string().contains("different request"), "{conflict}");
         let effect_count: i64 = db
             .connection()
             .query_row(
