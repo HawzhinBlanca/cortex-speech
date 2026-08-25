@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `1c443d9`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `93ec2db`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,605 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,607 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -112,8 +112,13 @@
 > caller supplies a different database identity. The pipeline no longer directly calls the three
 > migrated database writers. Store regressions prove all-or-nothing publication and rollback plus
 > stale alignment preservation, and a cloned-worker regression proves runtime sharing and mismatch
-> refusal. Source transcript/provenance, audio identity, LOOP-0/hypothesis and champion transcript
-> writers still use compatibility paths. Champion placeholders are still published before inference
+> refusal. `93ec2db` expands that boundary to source transcripts/provenance, persisted recording
+> identity, LOOP-0 evidence, auxiliary/champion hypotheses and targeted rediarization speaker updates.
+> Champion transcription now reads through a bounded restore-gated connection and commits through
+> the shared serialized runtime; verified human truth and existing votes remain protected. Four store
+> regressions cover the complete boundary, and architecture policies ban all ten migrated raw pipeline
+> writers. Compatibility reads and one raw read-connection lookup remain. Champion placeholders are
+> still published before inference
 > and catastrophic rollback failure remains unresolved; import journals and segment publication are
 > not one transaction. Connection reopening, import kill/resume/performance proof, Couch decomposition,
 > export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
