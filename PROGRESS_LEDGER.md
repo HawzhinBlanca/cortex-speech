@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `8d18260`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `c5e3748`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,611 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,612 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -152,6 +152,17 @@
 > restore selection **54/54**, recovery module **2/2**, all **121** policies sequentially, strict
 > Clippy and rustfmt. Semantic database validation, snapshot-plan inspection, settings publication and
 > startup/named restore orchestration remain in `commands.rs` and are not claimed extracted.
+> `c5e3748` moves typed snapshot plans, atomic cross-file routing-state installation, controlled-pilot
+> policy publication and strict settings restoration into the same Tauri-free `recovery` module.
+> Dataset-coupled settings are restored while current cloud consent, champion/ASR routing and GPU/runtime
+> controls are preserved and durably saved before runtime publication or barrier completion. The command
+> layer retains AppState publication but no longer owns state-file writes. Three recovery regressions now
+> include a cloud-enabled historical snapshot restored under revoked live consent, and source policies
+> follow the extracted helpers without becoming vacuous. Exact proof is **1,612/0/8** library tests plus
+> every all-target integration, soak, binary and benchmark target, recovery module **3/3**, all **121**
+> policies sequentially, strict all-target/all-feature Clippy and rustfmt. Semantic snapshot/pilot
+> inspection, durable database validation and startup/named/bare orchestration remain in `commands.rs`;
+> process-kill restore drills and the 50,000-segment hammer remain open.
 > Import process-kill/resume and performance proof, Couch decomposition,
 > export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
