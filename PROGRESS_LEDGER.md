@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `56e98d0`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `00f49f8`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,607 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,608 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -120,10 +120,20 @@
 > writers. `56e98d0` moves champion target selection into `SegmentQueryStore`, closing the pipeline's
 > last raw read-connection escape. Exact alignment resolution, no-row behavior, multi-segment path
 > ambiguity and missing-schema propagation are regression-covered under a bounded restore-gated
-> snapshot. Other compatibility reads remain. Champion placeholders are
-> still published before inference
-> and catastrophic rollback failure remains unresolved; import journals and segment publication are
-> not one transaction. Connection reopening, import kill/resume/performance proof, Couch decomposition,
+> snapshot. Other compatibility reads remain. `00f49f8` closes the new-import
+> placeholder-before-champion crash window: every champion and enabled-refiner result is completed in
+> memory before canonical publication, and one serialized savepoint publishes the file's finalized
+> segments, sole champion hypotheses and recording identity together. The boundary rejects blank or
+> placeholder transcripts, noncanonical deployment digests, mixed-source batches and any model that is
+> no longer the exact registry champion. An injected failure on the second hypothesis proves zero
+> segments and zero audio identity survive; infrastructure failure and worker panic leave the entire
+> file unpublished rather than depending on compensating deletion. The exact post-format tree passed
+> the complete **121-script** Python policy sweep, strict all-target/all-feature Clippy, rustfmt and the
+> all-target/all-feature Rust command with **1,608/0/8** library results plus every integration, soak,
+> binary and benchmark target green. Legacy interrupted-placeholder cleanup remains for old databases;
+> catastrophic cleanup failure in that legacy path and the separation between import-journal progress
+> and file publication are not claimed closed. Connection reopening, import process-kill/resume and
+> performance proof, Couch decomposition,
 > export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
 > deliberately **not a green
