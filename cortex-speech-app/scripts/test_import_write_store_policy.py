@@ -84,6 +84,10 @@ def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> 
             raise AssertionError(f"champion transcription lost serialized store authority: {required}")
     if "Database::open(&self.db_path)" in champion:
         raise AssertionError("champion transcription regained an independent raw database connection")
+    if ".connection()" in champion:
+        raise AssertionError("champion transcription regained a raw database connection escape")
+    if "segment_queries.resolve_transcription_segment(&audio_path_str, alignment_json)?" not in champion:
+        raise AssertionError("champion transcription bypasses the bounded segment query store")
 
     for required in (
         "database_runtime: Arc<Mutex<Option<crate::database_runtime::DatabaseRuntime>>>",

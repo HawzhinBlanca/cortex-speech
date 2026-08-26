@@ -3201,6 +3201,22 @@ impl Database {
         }
     }
 
+    /// Resolve one exact source/audio-alignment pair without exposing the raw connection to callers.
+    pub(crate) fn get_segment_id_by_audio_alignment(
+        &self,
+        audio_path: &str,
+        alignment_json: &str,
+    ) -> AppResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM speech_segments WHERE audio_path = ?1 AND alignment_json = ?2",
+                params![audio_path, alignment_json],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Segments usable as SPOT CHECKS: a trusted human answer already exists, and the raw ASR draft
     /// DIFFERS from it (Migration v44, docs/REMOTE_REVIEW_PLAN.md §2.1).
     ///

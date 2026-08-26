@@ -20,6 +20,32 @@ impl SegmentQueryStore {
         self.runtime.open_read()?.get_segment_by_id(segment_id)
     }
 
+    /// Resolve the target for one-off transcription without permitting an arbitrary first row when
+    /// multiple segments share the same source recording.
+    pub(crate) fn resolve_transcription_segment(
+        &self,
+        audio_path: &str,
+        alignment_json: Option<&str>,
+    ) -> AppResult<Option<String>> {
+        let database = self.runtime.open_read()?;
+        if let Some(alignment_json) = alignment_json {
+            return database.get_segment_id_by_audio_alignment(audio_path, alignment_json).map_err(|error| {
+                crate::error::AppError::Other(format!("transcribe: segment lookup by alignment failed: {error}"))
+            });
+        }
+
+        let ids = database.segment_ids_for_audio_path(audio_path).map_err(|error| {
+            crate::error::AppError::Other(format!("transcribe: segment lookup by audio path failed: {error}"))
+        })?;
+        if ids.len() > 1 {
+            return Err(crate::error::AppError::Validation(format!(
+                "transcribe: {} segments share this audio file; pass an explicit segment_id (or alignment_json) to choose which one to transcribe",
+                ids.len()
+            )));
+        }
+        Ok(ids.into_iter().next())
+    }
+
     pub(crate) fn get_segments(&self, verified: Option<bool>) -> AppResult<Vec<SpeechSegment>> {
         self.runtime.open_read()?.get_segments(verified)
     }
@@ -114,8 +140,50 @@ mod tests {
         assert!(store.get_segment_ids_for_view(None, None, "any").unwrap().is_empty());
         assert!(store.get_signal_anomaly_segments(10).unwrap().is_empty());
         assert!(store.active_learning_queue(0.1, 0.95, 10).unwrap().is_empty());
+        assert_eq!(store.resolve_transcription_segment("missing.wav", None).unwrap(), None);
         let page = store.get_segments_page(Some(false), None, "oldest", 10, None, None).unwrap();
         assert_eq!(page.total, 0);
         assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn transcription_lookup_is_exact_ambiguity_safe_and_error_preserving() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lookup.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        for (id, alignment) in [
+            ("first", r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":2}"#),
+            ("second", r#"{"source_start_ms":1000,"source_end_ms":2000,"chunk_index":1,"chunk_count":2}"#),
+        ] {
+            database
+                .insert_segment(&SpeechSegment {
+                    id: id.into(),
+                    audio_path: "shared.wav".into(),
+                    alignment_json: Some(alignment.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let store = SegmentQueryStore::new(DatabaseRuntime::new(database));
+        assert_eq!(
+            store
+                .resolve_transcription_segment(
+                    "shared.wav",
+                    Some(r#"{"source_start_ms":1000,"source_end_ms":2000,"chunk_index":1,"chunk_count":2}"#),
+                )
+                .unwrap(),
+            Some("second".into())
+        );
+        assert_eq!(store.resolve_transcription_segment("shared.wav", Some(r#"{"missing":1}"#)).unwrap(), None);
+        assert!(store.resolve_transcription_segment("shared.wav", None).is_err());
+
+        let bare_path = directory.path().join("bare.db");
+        let bare = Database::open(bare_path.to_str().unwrap()).unwrap();
+        let bare_store = SegmentQueryStore::new(DatabaseRuntime::new(bare));
+        let error = bare_store
+            .resolve_transcription_segment("shared.wav", Some("{}"))
+            .expect_err("a missing schema must not masquerade as an absent segment");
+        assert!(error.to_string().contains("segment lookup by alignment failed"), "{error}");
     }
 }

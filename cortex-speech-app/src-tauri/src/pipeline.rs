@@ -262,29 +262,6 @@ fn resume_should_skip_file(resuming: bool, journaled: bool, has_persisted_segmen
     journaled || (resuming && has_persisted_segments)
 }
 
-/// Resolve the segment id for a `(audio_path, alignment_json)` pair when `transcribe` was called
-/// without an explicit `segment_id`. A missing row is a legitimate `Ok(None)` — the caller falls
-/// through to the "segment not found, import first" error. A REAL DB error (locked / IO / corrupt /
-/// no-such-table) PROPAGATES as `Err` instead of masquerading as "no such row": the old `.ok()`
-/// collapsed both into `None`, so a transient read failure wrongly told the user to re-import an
-/// already-imported file and hid the real fault. Matches the sibling bare-`audio_path` branch, which
-/// already propagates DB errors.
-fn resolve_segment_id_by_alignment(
-    conn: &rusqlite::Connection,
-    audio_path: &str,
-    alignment_json: &str,
-) -> AppResult<Option<String>> {
-    match conn.query_row(
-        "SELECT id FROM speech_segments WHERE audio_path = ? AND alignment_json = ?",
-        [audio_path, alignment_json],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(id) => Ok(Some(id)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(AppError::Other(format!("transcribe: segment lookup by alignment failed: {e}"))),
-    }
-}
-
 fn insert_hypothesis_checked(
     import_writes: &crate::stores::ImportWriteStore,
     segment_id: &str,
@@ -3484,41 +3461,17 @@ impl ProcessingPipeline {
         if self.should_use_wsl_primary_asr() && !self.finetuned_override_active() {
             let runtime = self.shared_database_runtime(&self.db_path)?;
             let import_writes = crate::stores::ImportWriteStore::new(runtime.clone());
-            let db = runtime.open_read()?;
+            let segment_queries = crate::stores::SegmentQueryStore::new(runtime.clone());
             let audio_path_str = path.to_string_lossy().to_string();
 
             let segment_id: Option<String> = if let Some(id) = segment_id {
                 Some(id.to_string())
-            } else if let Some(aj) = alignment_json {
-                resolve_segment_id_by_alignment(db.connection(), &audio_path_str, aj)?
             } else {
-                // Round-22 #10: with neither an explicit segment_id NOR an alignment_json to
-                // disambiguate, a bare `WHERE audio_path = ?` returns an ARBITRARY row when a file was
-                // chunked into multiple segments (every chunk shares the source audio_path) — writing
-                // the WSL ASR and its hypothesis to the WRONG segment. Only accept the bare lookup when
-                // EXACTLY ONE segment matches; otherwise refuse and require an explicit segment_id.
-                let conn = db.connection();
-                let mut stmt = conn
-                    .prepare("SELECT id FROM speech_segments WHERE audio_path = ?")
-                    .map_err(|e| AppError::Other(e.to_string()))?;
-                let ids: Vec<String> = stmt
-                    .query_map([&audio_path_str], |row| row.get::<_, String>(0))
-                    .map_err(|e| AppError::Other(e.to_string()))?
-                    .filter_map(Result::ok)
-                    .collect();
-                if ids.len() > 1 {
-                    return Err(AppError::Validation(format!(
-                        "transcribe: {} segments share this audio file; pass an explicit segment_id (or alignment_json) to choose which one to transcribe",
-                        ids.len()
-                    )));
-                }
-                ids.into_iter().next()
+                segment_queries.resolve_transcription_segment(&audio_path_str, alignment_json)?
             };
 
             if let Some(id) = segment_id {
                 tracing::info!("Running WSL 7B ASR for segment ID: {}", id);
-
-                drop(db);
 
                 // Tag a 7B failure (server down / timeout / empty) so the UI can offer a champion retry
                 // — and NEVER silently fall through to a smaller model here.

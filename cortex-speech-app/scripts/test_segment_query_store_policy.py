@@ -35,6 +35,7 @@ def test_store_is_backend_only_and_connection_bounded() -> None:
         "self.runtime.open_read()?",
         "get_segments_page",
         "active_learning_queue",
+        "resolve_transcription_segment",
     )
     for needle in required:
         if needle not in store:
