@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `00f49f8`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `9a2a0c5`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,608 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,609 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -132,8 +132,17 @@
 > all-target/all-feature Rust command with **1,608/0/8** library results plus every integration, soak,
 > binary and benchmark target green. Legacy interrupted-placeholder cleanup remains for old databases;
 > catastrophic cleanup failure in that legacy path and the separation between import-journal progress
-> and file publication are not claimed closed. Connection reopening, import process-kill/resume and
-> performance proof, Couch decomposition,
+> and file publication are not claimed closed. `9a2a0c5` removes the restore-only raw writer escapes
+> from `AppState` and `DatabaseRuntime`: both restore commands now publish through one runtime-owned
+> boundary that requires the exact active reservation, pre-opens the replacement connection before
+> the live commit point, and replaces the sole writer before admission can reopen. A deterministic
+> generation test dirties connection-local SQLite state, restores a different database, and proves
+> the reopened writer resets its pragmas while both writer and bounded reader see only the restored
+> generation. Restore-focused Rust tests passed **54/54**; the exact post-format all-target/all-feature
+> command passed **1,609/0/8**, every other target exited zero, strict Clippy and rustfmt passed, and
+> all **121** policy scripts passed sequentially. Restore orchestration and validation still reside in
+> `commands.rs`; process-kill restore drills are not closed.
+> Import process-kill/resume and performance proof, Couch decomposition,
 > export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
 > deliberately **not a green
