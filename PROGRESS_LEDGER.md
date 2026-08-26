@@ -16,7 +16,7 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `93ec2db`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `56e98d0`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
 > **1,607 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
@@ -117,7 +117,10 @@
 > Champion transcription now reads through a bounded restore-gated connection and commits through
 > the shared serialized runtime; verified human truth and existing votes remain protected. Four store
 > regressions cover the complete boundary, and architecture policies ban all ten migrated raw pipeline
-> writers. Compatibility reads and one raw read-connection lookup remain. Champion placeholders are
+> writers. `56e98d0` moves champion target selection into `SegmentQueryStore`, closing the pipeline's
+> last raw read-connection escape. Exact alignment resolution, no-row behavior, multi-segment path
+> ambiguity and missing-schema propagation are regression-covered under a bounded restore-gated
+> snapshot. Other compatibility reads remain. Champion placeholders are
 > still published before inference
 > and catastrophic rollback failure remains unresolved; import journals and segment publication are
 > not one transaction. Connection reopening, import kill/resume/performance proof, Couch decomposition,
