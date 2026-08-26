@@ -46,6 +46,9 @@ pub struct TranscriptionDraft {
     pub confidence: Option<f64>,
     pub confidence_source: Option<String>,
     pub model_version_id: Option<String>,
+    /// Exact immutable deployment digest returned by the out-of-process champion. Internal import
+    /// publication uses it to bind every drafted row to the still-current registry identity.
+    pub(crate) deployment_sha256: Option<String>,
     pub cloud_call: bool,
     /// TRUE when `transcribe` itself already committed this draft to the segment row (the WSL-7B
     /// champion branch commits transcript + sole hypothesis + provenance atomically). Callers must
@@ -583,15 +586,12 @@ fn parse_wsl_segment_result(stdout: &str) -> AppResult<Wsl7bResult> {
 /// cumulative-timeout failure this gate exists to prevent.
 static WSL_7B_GATE: Wsl7bGate = Wsl7bGate::new();
 
-/// What one segment's champion attempts concluded — decided WITHOUT the shared `Database`, so a
-/// whole wave of them can run at once. `transcribe` opens its OWN connection per call, which is
-/// what makes this safe: each thread writes through its own SQLite handle rather than sharing the
-/// caller's.
+/// What one segment's champion attempts concluded. Inference and refinement complete in memory;
+/// canonical segment rows are published only after every segment in the file has a usable draft.
 enum ChampionAttempt {
-    /// A usable transcript came back and `transcribe` stored it.
-    Drafted,
-    /// Reachable server, no words after every retry — a silent/music chunk. Escalate THIS segment
-    /// only; never roll the file back, or the good transcripts for its other chunks are discarded.
+    /// A usable, fully refined transcript came back but has not been published.
+    Drafted(TranscriptionDraft),
+    /// Reachable server, no words after every retry. The whole file remains unpublished.
     Empty(String),
     /// The client exited non-zero: server down, hung, or errored. Fatal for a force-7B import.
     Infra(String),
@@ -2241,17 +2241,23 @@ impl ProcessingPipeline {
             None, // non-streaming: the whole file is one call, so diarization clusters in-place
             file_hash.as_deref(),
         )?;
-        let mut persisted = self.persist_segments(&import_writes, segments)?;
-        // v50: persist the fingerprint now that the rows exist, so the NEXT session rehydrates it and
-        // re-importing this recording under a different path is rejected then too. Best-effort: a failed
-        // stamp must not fail an import whose audio and transcripts are already committed — it only costs
-        // this recording its place in cross-session dedup, and a WARN says so.
-        if identity.spectral != 0 {
-            if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
-                tracing::warn!("audio identity not persisted for {}: {e}", path.display());
+        let mut prepared = segments;
+        let champion_deployment = self.run_primary_wsl_pass_for_import(&mut prepared, cancel)?;
+        let persisted = if let Some(deployment_sha256) = champion_deployment.as_deref() {
+            // Canonical publication happens only after every champion/refiner call succeeded. Segment
+            // rows, sole champion hypotheses and cross-session audio identity share one savepoint.
+            import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?;
+            prepared
+        } else {
+            let persisted = self.persist_segments(&import_writes, prepared)?;
+            // Non-champion compatibility path: retain the historical best-effort fingerprint stamp.
+            if identity.spectral != 0 {
+                if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
+                    tracing::warn!("audio identity not persisted for {}: {e}", path.display());
+                }
             }
-        }
-        self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?;
+            persisted
+        };
         // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
         self.shadow_log_loop0(db, &import_writes, &persisted);
@@ -2524,17 +2530,21 @@ impl ProcessingPipeline {
             }
         }
 
-        let mut persisted = self.persist_segments(&import_writes, segments)?;
-        // v51: stamp the whole-recording identity now that the rows exist, exactly as the non-streaming
-        // sibling does. Already checked and registered in memory above. Best-effort — a failed stamp
-        // must not fail an import whose audio and transcripts are already committed; it only costs this
-        // recording its place in cross-session dedup.
-        if identity.spectral != 0 {
-            if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
-                tracing::warn!("audio identity not persisted for {}: {e}", path.display());
+        let mut prepared = segments;
+        let champion_deployment = self.run_primary_wsl_pass_for_import(&mut prepared, cancel)?;
+        let persisted = if let Some(deployment_sha256) = champion_deployment.as_deref() {
+            import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?;
+            prepared
+        } else {
+            let persisted = self.persist_segments(&import_writes, prepared)?;
+            // Non-champion compatibility path retains the historical best-effort identity stamp.
+            if identity.spectral != 0 {
+                if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
+                    tracing::warn!("audio identity not persisted for {}: {e}", path.display());
+                }
             }
-        }
-        self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?;
+            persisted
+        };
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
         self.shadow_log_loop0(db, &import_writes, &persisted);
         self.enqueue_background_alignments(&persisted, import_writes);
@@ -2898,13 +2908,9 @@ impl ProcessingPipeline {
         // insert_segments_batch wraps inserts in its own transaction; do not nest SAVEPOINTs.
         import_writes.publish_segments(&segments)?;
 
-        // NOTE: neither LOOP-0 shadow logging NOR background word-alignment runs here. Both must see
-        // the REAL transcript, which under the forced WSL-7B engine does not exist yet (segments carry
-        // the "[Pending WSL 7B ASR]" placeholder until run_primary_wsl_pass_for_import fills them in).
-        // Shadowing the placeholder made the C5 over-trigger gate vacuous (always would_fire=false);
-        // aligning before the 7B pass clobbered the slice offsets the 7B client needs. So the caller
-        // runs BOTH only after the primary pass — see the shadow_log_loop0 + enqueue_background_alignments
-        // calls right after run_primary_wsl_pass_for_import.
+        // NOTE: neither LOOP-0 shadow logging nor background word-alignment runs here. Champion imports
+        // bypass this compatibility publisher and use publish_champion_segments only after in-memory
+        // drafting. Both follow-up passes therefore always see a real, durably published transcript.
 
         Ok(segments)
     }
@@ -3074,23 +3080,18 @@ impl ProcessingPipeline {
 
     fn run_primary_wsl_pass_for_import(
         &self,
-        db: &Database,
-        import_writes: &crate::stores::ImportWriteStore,
         segments: &mut [SpeechSegment],
         cancel: Option<&CancellationToken>,
-    ) -> AppResult<usize> {
+    ) -> AppResult<Option<String>> {
         if !self.should_use_wsl_primary_asr() || segments.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
-        // FORCE-USE the Champion (fail-hard): if the 7B server is unreachable/hung/errored — an
-        // INFRASTRUCTURE failure, i.e. the client process exits non-zero (its honest failure contract),
-        // as opposed to a REACHABLE server legitimately returning an empty transcript for a silent clip —
-        // this import is CANCELLED and every segment it just created is rolled back. The user then starts
-        // the 7B server and re-imports cleanly, instead of being left with a library of
-        // "[Pending WSL 7B ASR]" placeholders or silently-downgraded output the owner never asked for.
-        let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
-        let mut updated = 0usize;
+        // FORCE-USE the champion (fail hard), but do not publish staging rows. Every inference and
+        // enabled refinement completes in memory first. A cancellation, process kill, empty draft,
+        // worker panic, or identity rotation therefore leaves zero canonical rows for this file.
+        let segment_count = segments.len();
+        let mut deployment_identity: Option<(String, String)> = None;
 
         // Run the champion calls a WAVE at a time instead of one clip at a time.
         //
@@ -3101,10 +3102,8 @@ impl ProcessingPipeline {
         // existed and the second card never received work. Setting CORTEX_7B_CONCURRENCY=2 changed the
         // rate by nothing, which is what proved the loop was the bottleneck.
         //
-        // Only the CALL is parallel. Every database touch — refresh, provenance, escalation, rollback —
-        // stays on this thread, in the original order, so the rollback contract and the "escalate this
-        // segment only" rule behave exactly as before. `transcribe` opens its own connection per call,
-        // so the concurrent phase never shares `db`.
+        // Inference/refinement is parallel. The sequential phase only validates returned identity and
+        // copies finalized machine-owned fields into the in-memory segments.
         let wave_size = wsl_7b_concurrency().max(1);
         let mut start = 0usize;
         while start < segments.len() {
@@ -3113,13 +3112,7 @@ impl ProcessingPipeline {
             // Cancellation is checked once per WAVE rather than per segment; `transcribe` also polls
             // the flag inside each in-flight call, so a cancel still lands within ~50 ms.
             if let Some(token) = cancel {
-                if let Err(cancel_err) = token.check() {
-                    tracing::info!("WSL 7B import cancelled; rolling back {} segment(s)", import_ids.len());
-                    if let Err(e) = import_writes.rollback_segments(&import_ids) {
-                        tracing::error!("failed to roll back {} segment(s) after cancel: {e}", import_ids.len());
-                    }
-                    return Err(cancel_err);
-                }
+                token.check()?;
             }
 
             // PHASE A — concurrent, no shared DB.
@@ -3146,96 +3139,82 @@ impl ProcessingPipeline {
             // PHASE B — sequential, in the original segment order.
             for (offset, outcome) in outcomes.into_iter().enumerate() {
                 let seg = &mut segments[start + offset];
-                let problem: Option<String> = match outcome {
+                match outcome {
                     ChampionAttempt::Infra(reason) => {
                         tracing::error!(
-                            "WSL 7B import cancelled (server unavailable: {reason}); rolling back {} segment(s)",
-                            import_ids.len()
+                            "WSL 7B import halted before publication (server unavailable: {reason}); {} segment(s) remain unpublished",
+                            segment_count
                         );
-                        if let Err(e) = import_writes.rollback_segments(&import_ids) {
-                            tracing::error!(
-                                "failed to roll back {} placeholder segment(s) after 7B cancel: {e}",
-                                import_ids.len()
-                            );
-                        }
                         return Err(AppError::Validation(format!(
                             "OmniASR 7B server is not running — start it (e.g. wsl python cortex_7b_server.py from scripts/) and re-import. \
-                             The import was cancelled and its {} segment(s) were rolled back. ({reason})",
-                            import_ids.len()
+                             The import was halted before any of this file's {segment_count} segment(s) were published. ({reason})"
                         )));
                     }
-                    ChampionAttempt::Empty(reason) => Some(reason),
-                    ChampionAttempt::Drafted => {
-                        if let Err(e) = self.refresh_segment_from_db(db, seg) {
-                            tracing::error!(
-                                "WSL 7B import: DB error mid-pass ({e}); rolling back {} segment(s)",
-                                import_ids.len()
-                            );
-                            if let Err(rollback_err) = import_writes.rollback_segments(&import_ids) {
-                                tracing::error!(
-                                    "failed to roll back {} segment(s) after mid-pass DB error: {rollback_err}",
-                                    import_ids.len()
-                                );
-                            }
-                            return Err(e);
-                        }
-                        // Re-verify against the STORED row. The concurrent phase judged usability from
-                        // the returned draft (it cannot read the DB); if the row disagrees, believe the
-                        // row and escalate rather than count a clip that has no text.
-                        let stored_ok =
-                            !seg.raw_transcript.trim().is_empty() && !seg.raw_transcript.contains("[Pending");
-                        if stored_ok {
-                            // `attempt_champion` routes through `transcribe`, whose DB helper commits
-                            // transcript + sole champion hypothesis atomically. Replacing hypotheses
-                            // again here used to create a second, fallible write after success.
-                            updated += 1;
-                            None
-                        } else {
-                            Some("7B reported a draft but the stored row is still empty".to_string())
-                        }
-                    }
-                };
-
-                if let Some(reason) = problem {
-                    // HALT, do not escalate-and-continue (owner rule 2026-08-11, wired 2026-08-20).
-                    // These are VAD speech chunks — silence was already filtered out — so a champion
-                    // that returns nothing for one after three retries is an anomaly, not a
-                    // classification. The old path wrote an "escalated" verdict and let the import
-                    // finish "successfully" with unresolved rows inside it: exactly the tally the
-                    // law forbids. Roll the whole file back and stop; re-import resumes cleanly.
-                    tracing::error!(
-                        "WSL 7B primary ASR unavailable before jury: segment {} failed after retries ({reason}); \
-                         rolling back {} segment(s) and HALTING the import",
-                        seg.id,
-                        import_ids.len()
-                    );
-                    if let Err(rollback_err) = import_writes.rollback_segments(&import_ids) {
+                    ChampionAttempt::Empty(reason) => {
                         tracing::error!(
-                            "failed to roll back {} segment(s) after champion halt: {rollback_err}",
-                            import_ids.len()
+                            "WSL 7B primary ASR unavailable before publication: segment {} failed after retries ({reason}); all {segment_count} segment(s) remain unpublished",
+                            seg.id
                         );
+                        return Err(AppError::Other(format!(
+                            "champion produced no usable draft for segment {} after retries ({reason}). \
+                             The import was halted before this file's {segment_count} segment(s) were published. \
+                             Check the 7B server load and re-import.",
+                            seg.id
+                        )));
                     }
-                    return Err(AppError::Other(format!(
-                        "champion produced no usable draft for segment {} after retries ({reason}). \
-                         The import was HALTED and this file's {} segment(s) rolled back — nothing was stored unresolved. \
-                         Check the 7B server load and re-import.",
-                        seg.id,
-                        import_ids.len()
-                    )));
+                    ChampionAttempt::Drafted(draft) => {
+                        let model_id = draft.model_version_id.clone().ok_or_else(|| {
+                            AppError::Validation(format!(
+                                "Champion draft for segment {} omitted its model identity",
+                                seg.id
+                            ))
+                        })?;
+                        let deployment_sha256 = draft.deployment_sha256.clone().ok_or_else(|| {
+                            AppError::Validation(format!(
+                                "Champion draft for segment {} omitted its deployment digest",
+                                seg.id
+                            ))
+                        })?;
+                        match deployment_identity.as_ref() {
+                            Some((expected_model, expected_sha))
+                                if expected_model != &model_id || expected_sha != &deployment_sha256 =>
+                            {
+                                return Err(AppError::Validation(format!(
+                                    "MODEL_IDENTITY_CHANGED: champion deployment rotated while drafting this file (expected {expected_model}@{expected_sha}, received {model_id}@{deployment_sha256}); no segments were published"
+                                )));
+                            }
+                            None => deployment_identity = Some((model_id.clone(), deployment_sha256)),
+                            _ => {}
+                        }
+                        seg.raw_transcript = draft.raw_text;
+                        seg.normalized_transcript = if self.settings.auto_normalize && !draft.final_text.is_empty() {
+                            let norm_config = crate::normalizer::NormalizationConfig {
+                                normalize_numbers: self.settings.auto_normalize,
+                                verbalize_numbers: self.settings.verbalize_numbers,
+                                normalize_hamza: true,
+                                remove_diacritics: false,
+                            };
+                            Some(SoraniNormalizer::with_config(norm_config).normalize(&draft.final_text))
+                        } else {
+                            None
+                        };
+                        seg.normalizer_version =
+                            seg.normalized_transcript.as_ref().map(|_| NORMALIZER_VERSION.to_string());
+                        seg.confidence = draft.confidence;
+                        seg.confidence_source = draft.confidence_source;
+                        seg.model_version_id = Some(model_id);
+                        seg.cloud_call = draft.cloud_call;
+                    }
                 }
             }
 
             start = end;
         }
-        Ok(updated)
+        Ok(deployment_identity.map(|(_, sha)| sha))
     }
 
-    /// The retry loop for ONE segment, with no shared-DB access anywhere in it.
-    ///
-    /// Usability is judged from the returned draft rather than by re-reading the row, because the
-    /// re-read needs the shared connection. The caller re-verifies against the DB in its sequential
-    /// phase and downgrades to `Empty` if the stored row disagrees — so this cannot report success
-    /// for a row that did not actually get text.
+    /// Retry and fully refine one segment without publishing it. The resulting draft is copied into
+    /// the in-memory file batch; only the later atomic publication boundary can create canonical rows.
     fn attempt_champion(
         &self,
         segment_id: &str,
@@ -3252,11 +3231,11 @@ impl ProcessingPipeline {
         let mut last_problem = String::from("7B produced no result");
         let mut infra = false;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.transcribe(Some(segment_id), audio_path, alignment_json, cancel) {
+            match self.transcribe_with_champion_commit(Some(segment_id), audio_path, alignment_json, cancel, false) {
                 Ok(draft) => {
                     let usable = !draft.raw_text.trim().is_empty() && !draft.raw_text.contains("[Pending");
                     if usable {
-                        return ChampionAttempt::Drafted;
+                        return ChampionAttempt::Drafted(draft);
                     }
                     last_problem = "7B returned an empty transcript".to_string();
                     infra = false;
@@ -3290,16 +3269,6 @@ impl ProcessingPipeline {
             ChampionAttempt::Infra(last_problem)
         } else {
             ChampionAttempt::Empty(last_problem)
-        }
-    }
-
-    fn refresh_segment_from_db(&self, db: &Database, seg: &mut SpeechSegment) -> AppResult<bool> {
-        let ids = vec![seg.id.clone()];
-        if let Some(fresh) = db.get_segments_by_ids(&ids)?.into_iter().next() {
-            *seg = fresh;
-            Ok(true)
-        } else {
-            Ok(false)
         }
     }
 
@@ -3446,6 +3415,20 @@ impl ProcessingPipeline {
         // token; one-off callers pass None).
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> AppResult<TranscriptionDraft> {
+        self.transcribe_with_champion_commit(segment_id, audio_path, alignment_json, cancel, true)
+    }
+
+    /// Shared transcription implementation. Normal re-transcription commits the champion result
+    /// immediately; file import passes `commit_champion = false` so every chunk is completed in
+    /// memory before the file is atomically published.
+    fn transcribe_with_champion_commit(
+        &self,
+        segment_id: Option<&str>,
+        audio_path: &str,
+        alignment_json: Option<&str>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        commit_champion: bool,
+    ) -> AppResult<TranscriptionDraft> {
         let path = Path::new(audio_path);
         let duration_ms = audio::get_duration_ms(path)?;
         if duration_ms == 0 {
@@ -3570,19 +3553,21 @@ impl ProcessingPipeline {
                     confidence,
                 };
                 drop(db);
-                let updated = import_writes
-                    .commit_champion_transcript_if_unreviewed(
-                        &champion,
-                        Some(&wsl_result.deployment_sha256),
-                        normalized_transcript.as_deref(),
-                        Some("external_provider"),
-                        cloud_call,
-                    )
-                    .map_err(|e| AppError::Other(format!("Failed to commit champion transcript: {e}")))?;
-                if !updated {
-                    return Err(AppError::Validation(format!(
-                        "Segment {id} gained a human decision while the champion was running; its reviewed transcript was not overwritten"
-                    )));
+                if commit_champion {
+                    let updated = import_writes
+                        .commit_champion_transcript_if_unreviewed(
+                            &champion,
+                            Some(&wsl_result.deployment_sha256),
+                            normalized_transcript.as_deref(),
+                            Some("external_provider"),
+                            cloud_call,
+                        )
+                        .map_err(|e| AppError::Other(format!("Failed to commit champion transcript: {e}")))?;
+                    if !updated {
+                        return Err(AppError::Validation(format!(
+                            "Segment {id} gained a human decision while the champion was running; its reviewed transcript was not overwritten"
+                        )));
+                    }
                 }
 
                 return Ok(TranscriptionDraft {
@@ -3591,8 +3576,9 @@ impl ProcessingPipeline {
                     confidence,
                     confidence_source: Some("external_provider".to_string()),
                     model_version_id: Some(wsl_result.model_version_id),
+                    deployment_sha256: Some(wsl_result.deployment_sha256),
                     cloud_call,
-                    committed_by_pipeline: true, // commit_champion_transcript_if_unreviewed above was THE write
+                    committed_by_pipeline: commit_champion,
                 });
             } else {
                 return Err(AppError::Other(
@@ -3649,6 +3635,7 @@ impl ProcessingPipeline {
                             confidence: None,
                             confidence_source: Some("fine_tuned_no_posterior".to_string()),
                             model_version_id: Some("finetuned-mms-ckb".to_string()),
+                            deployment_sha256: None,
                             cloud_call,
                             committed_by_pipeline: false,
                         });
@@ -3694,6 +3681,7 @@ impl ProcessingPipeline {
                 confidence: None,
                 confidence_source: Some("cache_replay".to_string()),
                 model_version_id: Some(model_id.clone()),
+                deployment_sha256: None,
                 cloud_call: self.llm_refinement_uses_cloud(),
                 committed_by_pipeline: false,
             });
@@ -3764,6 +3752,7 @@ impl ProcessingPipeline {
             confidence,
             confidence_source: Some(confidence_source.as_db_value().to_string()),
             model_version_id: Some(model_id),
+            deployment_sha256: None,
             cloud_call: self.llm_refinement_uses_cloud(),
             committed_by_pipeline: false,
         })

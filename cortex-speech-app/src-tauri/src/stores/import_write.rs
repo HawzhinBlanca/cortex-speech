@@ -28,6 +28,20 @@ impl ImportWriteStore {
         self.lock("publish_import_segments").insert_segments_batch(segments)
     }
 
+    pub(crate) fn publish_champion_segments(
+        &self,
+        segments: &[SpeechSegment],
+        deployment_sha256: &str,
+        identity: Option<&AudioIdentity>,
+    ) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("publish_champion_import_segments").insert_champion_segments_batch(
+            segments,
+            deployment_sha256,
+            identity,
+        )
+    }
+
     pub(crate) fn rollback_segments(&self, segment_ids: &[String]) -> AppResult<()> {
         let _mutation = begin_mutation().map_err(AppError::Other)?;
         self.lock("rollback_import_segments").delete_segments_batch(segment_ids)
@@ -238,5 +252,80 @@ mod tests {
         let hypotheses = read.get_hypotheses_for_segment("reviewed").unwrap();
         assert_eq!(hypotheses.len(), 1);
         assert_eq!(hypotheses[0].model_id, "prior-v1");
+    }
+
+    #[test]
+    fn champion_file_publication_is_atomic_and_never_exposes_placeholders() {
+        let (_directory, store, runtime) = store();
+        let deployment_sha256 = "a".repeat(64);
+        {
+            let database = runtime.lock().unwrap();
+            crate::registry::register_candidate(
+                &database,
+                &crate::registry::NewModelVersion {
+                    id: "champion-import-v1".into(),
+                    family: "omniasr-7b".into(),
+                    model_card_name: Some("test/champion".into()),
+                    checkpoint_sha256: deployment_sha256.clone(),
+                    checkpoint_path: "C:/models/champion-import-v1.json".into(),
+                    source: "cortex-finetuned".into(),
+                    license: "test-only".into(),
+                },
+            )
+            .unwrap();
+            crate::registry::set_champion_for_test(&database, "champion-import-v1").unwrap();
+        }
+
+        let audio_path = "C:/recordings/champion.wav";
+        let ready = ["one", "two"].map(|id| {
+            let mut value = segment(id, None);
+            value.audio_path = audio_path.into();
+            value.raw_transcript = format!("champion draft {id}");
+            value.model_version_id = Some("champion-import-v1".into());
+            value.confidence_source = Some("external_provider".into());
+            value
+        });
+        runtime
+            .lock()
+            .unwrap()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_second_champion_hypothesis
+                 BEFORE INSERT ON segment_hypotheses
+                 WHEN NEW.segment_id = 'two'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected champion hypothesis failure');
+                 END;",
+            )
+            .unwrap();
+
+        let identity = AudioIdentity { spectral: 42, content: "whole-recording-content".into() };
+        assert!(store.publish_champion_segments(&ready, &deployment_sha256, Some(&identity)).is_err());
+        let after_failure = runtime.open_read().unwrap();
+        assert_eq!(after_failure.segment_count().unwrap(), 0);
+        assert!(after_failure.load_audio_identities().unwrap().is_empty());
+        drop(after_failure);
+
+        runtime.lock().unwrap().connection().execute_batch("DROP TRIGGER fail_second_champion_hypothesis").unwrap();
+        store.publish_champion_segments(&ready, &deployment_sha256, Some(&identity)).unwrap();
+        let published = runtime.open_read().unwrap();
+        assert_eq!(published.segment_count().unwrap(), 2);
+        assert_eq!(published.load_audio_identities().unwrap().len(), 1);
+        for segment in &ready {
+            let stored = published.get_segment_by_id(&segment.id).unwrap().unwrap();
+            assert!(!crate::quality::is_placeholder_transcript(&stored.raw_transcript));
+            let hypotheses = published.get_hypotheses_for_segment(&segment.id).unwrap();
+            assert_eq!(hypotheses.len(), 1);
+            assert_eq!(hypotheses[0].model_id, "champion-import-v1");
+            assert_eq!(hypotheses[0].transcript, segment.raw_transcript);
+        }
+        drop(published);
+
+        let mut placeholder = segment("placeholder", None);
+        placeholder.audio_path = audio_path.into();
+        placeholder.raw_transcript = "[Pending WSL 7B ASR]".into();
+        placeholder.model_version_id = Some("champion-import-v1".into());
+        assert!(store.publish_champion_segments(&[placeholder], &deployment_sha256, None).is_err());
+        assert_eq!(runtime.open_read().unwrap().segment_count().unwrap(), 2);
     }
 }

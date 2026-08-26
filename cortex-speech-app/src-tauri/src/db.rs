@@ -2547,6 +2547,102 @@ impl Database {
         }
     }
 
+    /// Publish one fully champion-drafted import file as a single durable unit.
+    ///
+    /// Import inference happens before this boundary. Consequently no placeholder or partially
+    /// drafted segment may enter the canonical table, and the segment rows, their sole champion
+    /// hypotheses, and the recording identity either all commit or all roll back together.
+    pub(crate) fn insert_champion_segments_batch(
+        &self,
+        segments: &[SpeechSegment],
+        deployment_sha256: &str,
+        identity: Option<&AudioIdentity>,
+    ) -> AppResult<()> {
+        if segments.is_empty() {
+            return Err(AppError::Validation("No champion-drafted segments to publish".into()));
+        }
+        if deployment_sha256.len() != 64
+            || !deployment_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AppError::Validation(
+                "Champion deployment identity must be a canonical lowercase SHA-256".into(),
+            ));
+        }
+
+        let audio_path = segments[0].audio_path.as_str();
+        for segment in segments {
+            if segment.audio_path != audio_path {
+                return Err(AppError::Validation(
+                    "One champion import publication may contain segments from only one source file".into(),
+                ));
+            }
+            if segment.raw_transcript.trim().is_empty()
+                || crate::quality::is_placeholder_transcript(&segment.raw_transcript)
+            {
+                return Err(AppError::Validation(format!(
+                    "Champion import segment '{}' has no usable finalized transcript",
+                    segment.id
+                )));
+            }
+            let model_id = segment.model_version_id.as_deref().ok_or_else(|| {
+                AppError::Validation(format!("Champion import segment '{}' is missing its model identity", segment.id))
+            })?;
+            let identity_is_current: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM model_versions
+                    WHERE id = ?1 AND family = 'omniasr-7b' AND status = 'champion'
+                      AND checkpoint_sha256 = ?2
+                )",
+                params![model_id, deployment_sha256],
+                |row| row.get(0),
+            )?;
+            if !identity_is_current {
+                return Err(AppError::Validation(format!(
+                    "MODEL_IDENTITY_CHANGED: refusing import transcript from model '{model_id}' deployment '{deployment_sha256}' because it is not the current registry champion"
+                )));
+            }
+        }
+
+        self.conn.execute("SAVEPOINT champion_import_publish", [])?;
+        let result = (|| -> AppResult<()> {
+            self.insert_segments_batch(segments)?;
+            let mut delete = self.conn.prepare("DELETE FROM segment_hypotheses WHERE segment_id = ?1")?;
+            let mut insert = self.conn.prepare(
+                "INSERT INTO segment_hypotheses
+                    (segment_id, model_id, transcript, confidence, model_version_id)
+                 VALUES (?1, ?2, ?3, ?4, ?2)",
+            )?;
+            for segment in segments {
+                let model_id = segment.model_version_id.as_deref().ok_or_else(|| {
+                    AppError::Validation(format!(
+                        "Champion import segment '{}' lost its model identity before publication",
+                        segment.id
+                    ))
+                })?;
+                delete.execute([segment.id.as_str()])?;
+                insert.execute(params![segment.id, model_id, to_nfc(&segment.raw_transcript), segment.confidence])?;
+            }
+            drop(insert);
+            drop(delete);
+            if let Some(identity) = identity.filter(|identity| identity.spectral != 0) {
+                self.set_audio_identity(audio_path, identity)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.release_savepoint("champion_import_publish")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("champion_import_publish");
+                Err(error)
+            }
+        }
+    }
+
     pub fn merge_dataset_json(&self, json_content: &str) -> AppResult<(usize, usize)> {
         let external_segments: Vec<SpeechSegment> = serde_json::from_str(json_content)?;
         let schema_v60 = crate::migrations::get_current_version(self)? >= 60;

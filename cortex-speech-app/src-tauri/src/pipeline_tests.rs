@@ -710,24 +710,20 @@ fn wsl_primary_import_pass_never_silently_skips_the_bundled_champion() {
         duration_ms: 1000,
         ..SpeechSegment::default()
     };
-    db.insert_segment(&segment).unwrap();
-
     let mut segments = vec![segment];
-    let import_writes = pipeline.import_write_store(db.path()).unwrap();
     let error = pipeline
-        .run_primary_wsl_pass_for_import(&db, &import_writes, &mut segments, None)
+        .run_primary_wsl_pass_for_import(&mut segments, None)
         .expect_err("a clean default must run the bundled champion path and fail hard on infrastructure errors");
-    assert!(error.to_string().contains("rolled back"));
+    assert!(error.to_string().contains("before any"));
     assert!(db.get_segment_by_id("preflight-refused").unwrap().is_none());
 }
 
 #[test]
-fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
+fn wsl_primary_import_pass_leaves_no_rows_on_infrastructure_failure() {
     // The owner forces the 7B Champion: if the 7B path errors (server down / unreachable / hung —
     // here simulated by a missing audio file so transcribe() fails BEFORE spawning any subprocess),
-    // the WHOLE import is cancelled and every segment it just created is rolled back, rather than
-    // leaving a library of "[Pending WSL 7B ASR]" placeholders or silently downgrading. This locks
-    // in that fail-hard contract AND the cascade cleanup that leaves no orphaned hypothesis rows.
+    // the WHOLE file remains unpublished rather than depending on compensating deletion of partially
+    // drafted placeholder rows. This locks in the stronger fail-hard contract.
     let settings = AppSettings {
         asr_model_size: AsrModelSize::WSL7B,
         // Non-empty => should_use_wsl_primary_asr() is true so the pass actually runs (it Ok(0)-skips
@@ -739,7 +735,18 @@ fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
     let db = Database::open(dir.path().join("db.sqlite").to_str().unwrap()).unwrap();
     db.initialize().unwrap();
 
-    // Two freshly-imported segments whose audio file does not exist => transcribe() fails hard
+    // One unrelated canonical row proves the failure does not delete pre-existing data.
+    let unrelated = SpeechSegment {
+        id: "unrelated".into(),
+        audio_path: "unrelated.wav".into(),
+        raw_transcript: "durable prior draft".into(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    };
+    db.insert_segment(&unrelated).unwrap();
+    insert_hypothesis(&db, "unrelated", "prior-model", "durable prior vote");
+
+    // Two in-memory segments whose audio file does not exist => transcribe() fails hard
     // (get_duration_ms on a missing path) on every attempt = an infrastructure failure, not a
     // reachable-but-silent clip.
     let missing_audio = dir.path().join("does-not-exist.wav").to_string_lossy().to_string();
@@ -752,30 +759,24 @@ fn wsl_primary_import_pass_cancels_and_rolls_back_on_infrastructure_failure() {
             duration_ms: 1000,
             ..SpeechSegment::default()
         };
-        db.insert_segment(&seg).unwrap();
         segments.push(seg);
     }
-    // A stale hypothesis on the first segment must be cascade-deleted with it (no orphan rows).
-    insert_hypothesis(&db, "import-0", "omniasr-wsl-7b", "stale draft");
 
     let import_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
-    let import_writes = pipeline.import_write_store(db.path()).unwrap();
-    let result = pipeline.run_primary_wsl_pass_for_import(&db, &import_writes, &mut segments, None);
+    let result = pipeline.run_primary_wsl_pass_for_import(&mut segments, None);
 
     // The import is cancelled (fail-hard), not silently downgraded to a weaker engine.
     let msg = result.expect_err("a 7B infrastructure failure must cancel the import").to_string();
-    assert!(msg.contains("rolled back"), "error must state the rollback: {msg}");
+    assert!(msg.contains("before any"), "error must state that publication never occurred: {msg}");
     assert!(msg.contains("7B server"), "error must name the 7B server: {msg}");
 
-    // Every segment the import created is gone, and the cascade removed the hypothesis with it.
+    // No staged segment ever entered the canonical tables; unrelated durable truth is untouched.
     assert!(
         db.get_segments_by_ids(&import_ids).unwrap().is_empty(),
-        "all import segments must be deleted after a fail-hard cancel"
+        "all failed-file segments must remain unpublished"
     );
-    assert!(
-        db.get_hypotheses_for_segment("import-0").unwrap().is_empty(),
-        "segment_hypotheses must cascade-delete with the rolled-back segment (no orphans)"
-    );
+    assert_eq!(db.get_segment_by_id("unrelated").unwrap().unwrap().raw_transcript, "durable prior draft");
+    assert_eq!(db.get_hypotheses_for_segment("unrelated").unwrap().len(), 1);
 }
 
 #[test]

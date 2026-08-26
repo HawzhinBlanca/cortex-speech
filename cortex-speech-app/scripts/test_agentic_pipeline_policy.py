@@ -134,10 +134,18 @@ def main() -> None:
         "configured source-reference failures must not be logged and ignored"
     )
     assert "run_primary_wsl_pass_for_import" in pipeline, "WSL 7B imports must attempt the primary ASR pass before jury"
-    champion_import_call = "self.run_primary_wsl_pass_for_import(db, &import_writes, &mut persisted, cancel)?"
+    champion_import_call = "self.run_primary_wsl_pass_for_import(&mut prepared, cancel)?"
     assert pipeline.count(champion_import_call) == 2, (
-        "streaming and non-streaming imports must run the WSL 7B primary pass immediately after "
-        "store-owned segment persistence and carry the same rollback capability"
+        "streaming and non-streaming imports must finish the WSL 7B primary pass in memory before publication"
+    )
+    champion_publish_call = (
+        "import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?"
+    )
+    assert pipeline.count(champion_publish_call) == 2, (
+        "streaming and non-streaming imports must atomically publish only fully champion-drafted segments"
+    )
+    assert pipeline.index(champion_import_call) < pipeline.index(champion_publish_call), (
+        "champion inference must precede the first canonical file publication"
     )
     assert "if !self.should_use_wsl_primary_asr() || segments.is_empty()" in pipeline, (
         "the WSL pass must be inert after an unconfigured champion has already been refused by preflight"
@@ -194,21 +202,27 @@ def main() -> None:
     assert "parse_wsl_segment_result" in pipeline, (
         "WSL 7B stdout parsing must be centralized and regression-tested"
     )
-    assert "WSL 7B primary ASR unavailable before jury" in pipeline, (
-        "WSL 7B failures must be explicit before jury adjudication"
+    assert "WSL 7B primary ASR unavailable before publication" in pipeline, (
+        "WSL 7B failures must be explicit before canonical publication or jury adjudication"
     )
     # 2026-08-20 external review — the champion pipeline's crash/consistency contract:
     assert "import HALTED at" in pipeline, (
         "directory import must HALT on the first real failure (owner rule 2026-08-11), never tally and continue"
     )
-    assert "rolled back — nothing was stored unresolved" in pipeline, (
-        "an exhausted-empty champion result must roll the file back and halt, never store unresolved rows in a 'successful' import"
+    assert "halted before this file's {segment_count} segment(s) were published" in pipeline, (
+        "an exhausted-empty champion result must halt before publication, never store unresolved rows in a 'successful' import"
     )
     assert "audio_path_has_placeholder_rows" in pipeline, (
         "resume must discriminate an interrupted stage (placeholder rows) from a completed file — rows-exist is not done"
     )
-    assert pipeline.count("committed_by_pipeline: true") == 1, (
-        "exactly ONE transcribe path commits its own draft (the champion branch); a second committing path is a second owner"
+    assert pipeline.count("committed_by_pipeline: commit_champion") == 1, (
+        "the champion result must report the exact conditional commit owner"
+    )
+    assert "self.transcribe_with_champion_commit(segment_id, audio_path, alignment_json, cancel, true)" in pipeline, (
+        "normal re-transcription must retain the single immediate champion commit owner"
+    )
+    assert "self.transcribe_with_champion_commit(Some(segment_id), audio_path, alignment_json, cancel, false)" in pipeline, (
+        "import drafting must explicitly disable per-segment publication"
     )
     assert "Ok(draft) if draft.committed_by_pipeline =>" in commands, (
         "batch_transcribe must not re-write a draft the pipeline already committed (one inference, one commit, one owner)"

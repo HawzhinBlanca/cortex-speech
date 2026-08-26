@@ -141,6 +141,11 @@ pub(crate) fn promote_to_champion(db: &Database, id: &str) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn set_champion_for_test(db: &Database, id: &str) -> AppResult<()> {
+    promote_to_champion(db, id)
+}
+
 /// P5.2 (true-10 audit): mirror the registry's champions to `<data_dir>/champion.json` so external
 /// consumers — the WSL 7B server, whose adapter path was previously HARDCODED, making promotion a
 /// no-op at its final step — can resolve the current champion without reading the app database.
