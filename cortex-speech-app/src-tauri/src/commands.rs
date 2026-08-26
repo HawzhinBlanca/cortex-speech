@@ -17,6 +17,12 @@ use crate::history::Command;
 use crate::models;
 use crate::pipeline::PipelineEvent;
 use crate::quality;
+use crate::recovery::{
+    atomic_write_restore_state, clear_review_pilot_restore_pending, load_named_restore_pending,
+    mark_named_restore_completed, named_restore_barrier_may_exist, prepare_restore_admission,
+    refuse_bare_restore_during_controlled_pilot, remove_live_restore_state, write_named_restore_pending,
+    NamedRestorePending, NAMED_RESTORE_PENDING_SCHEMA,
+};
 use crate::settings::{AppSettings, AsrModelSize};
 use crate::stats;
 use crate::throttle::{RATE_LIMITER, STRICT_RATE_LIMITER};
@@ -5397,37 +5403,11 @@ fn prepare_and_restore_named_transaction(
 /// rotated out within ~100 minutes). Returns a RestoreReservation the caller MUST hold across the
 /// restore so no new writer can start mid-restore (P1.3b).
 fn prepare_restore(state: &State<'_, AppState>) -> Result<(RestoreReservation<'static>, std::path::PathBuf), String> {
-    // Reserve FIRST: set RESTORE_PENDING before checking writers_active, so a writer racing this check
-    // observes the reservation and refuses. THEN verify none is already running (the fence). The
-    // reservation is closed by ONE OF TWO airtight mechanisms per writer, NOT a single shared lock:
-    //   • import/batch and couch::start check restore_pending() UNDER the same mutex writers_active()
-    //     reads (import_state / batch_state / COUCH), so their check+register is totally ordered against
-    //     the fence read — a concurrent restore either sees them registered or is seen by them.
-    //   • the atomic/counter writers (WSL refine and jury via BG_DB_WRITERS) use publish-then-
-    //     recheck: they SET their flag, then RE-READ the reservation and roll back if set. Under SeqCst
-    //     the fence's {store RESTORE_PENDING; load flag} and the writer's {store flag; load RESTORE_PENDING}
-    //     can't both read stale, so one side always refuses.
-    // Resolve only immutable process state before reserving. The race is closed by publishing the
-    // reservation BEFORE writers_active(), not by reading data_dir first.
     let data_dir = state
         .lock_data_dir()
         .clone()
         .ok_or_else(|| "Database restore refused: the app data directory is unavailable, so a mandatory pre-restore safety snapshot cannot be created.".to_string())?;
-    // An earlier post-swap failure parks admission with the durable marker still present. Exact retry
-    // reclaims that state; an ordinary restore can only reserve from Idle.
-    let reservation = if named_restore_barrier_may_exist(&data_dir) {
-        RESTORE_ADMISSION.claim_recovery()?
-    } else {
-        RESTORE_ADMISSION.try_reserve()?
-    };
-    if state.writers_active() {
-        return Err("A background write is in progress (import, batch, 7B refinement, jury, or the \
-                    Couch Review server) — cancel it, let it finish, or stop Couch \
-                    Review before restoring. Restoring mid-write would mix pre-restore rows into the \
-                    restored library and re-arm stale undo history."
-            .to_string());
-    }
-    Ok((reservation, data_dir))
+    prepare_restore_admission(data_dir, || state.writers_active())
 }
 
 #[tauri::command]
@@ -5533,81 +5513,6 @@ enum SnapshotPilotPolicyRestore {
     /// historical DB recovery possible without ever interpreting missing legacy state as permission
     /// to delete/relax a live paid-review cap.
     PreserveLegacy,
-}
-
-fn refuse_bare_restore_during_controlled_pilot(data_dir: &Path) -> Result<(), String> {
-    match crate::review_pilot::load(data_dir) {
-        Ok(None) => match crate::couch::durable_controlled_pilot_state(data_dir) {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(
-                "Bare database restore is refused because the durable Couch session retains a controlled paid-review baseline. Use a policy-bearing named snapshot restore instead."
-                    .to_string(),
-            ),
-            Err(error) => Err(format!(
-                "Bare database restore is refused because durable Couch pilot state is not provably safe: {error}"
-            )),
-        },
-        Ok(Some(_)) => Err(
-            "Bare database restore is refused while a controlled paid-review pilot is active: its external baseline/policy would no longer match review_events. Use a policy-bearing named snapshot restore instead."
-                .to_string(),
-        ),
-        Err(error) => Err(format!(
-            "Bare database restore is refused because controlled paid-review state is not provably safe: {error}"
-        )),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NamedRestorePending {
-    schema: u32,
-    source_selector: String,
-    pre_restore_pin_selector: String,
-    /// Written only after DB + every required config/settings file has committed. If marker cleanup
-    /// then fails or the process crashes, startup clears the barrier without replaying or rolling
-    /// back an already-coherent generation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completed_selector: Option<String>,
-}
-
-const NAMED_RESTORE_PENDING_SCHEMA: u32 = 2;
-
-fn atomic_write_restore_state(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
-            return Err(format!("restore destination {} must be a regular file or absent", path.display()));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("could not inspect restore destination {}: {error}", path.display())),
-    }
-    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("restore-state");
-    let temp = path.with_file_name(format!(".{file_name}.restore-{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&temp);
-    if let Err(error) = std::fs::write(&temp, bytes) {
-        return Err(format!("could not stage {}: {error}", path.display()));
-    }
-    if let Err(error) = crate::atomic_file::replace_file(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(format!("could not atomically install {}: {error}", path.display()));
-    }
-    Ok(())
-}
-
-fn remove_live_restore_state(destination: &Path) -> Result<(), String> {
-    crate::atomic_file::recover_interrupted_replace(destination)
-        .map_err(|error| format!("could not recover {} before explicit removal: {error}", destination.display()))?;
-    // Remove recoverable backups FIRST while the canonical file still exists. If cleanup is blocked
-    // by an antivirus/indexer lock, returning here leaves the old committed state intact; deleting
-    // canonical first could let a leftover backup resurrect it after we had reported absence.
-    crate::atomic_file::remove_replacement_backups(destination)
-        .map_err(|error| format!("could not remove stale backups for {}: {error}", destination.display()))?;
-    match std::fs::remove_file(destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("could not remove {}: {error}", destination.display())),
-    }
-    Ok(())
 }
 
 fn restore_required_snapshot_state_atomic(
@@ -6353,80 +6258,6 @@ fn inspect_snapshot_restore_plan(
     Ok(SnapshotRestorePlan { pilot, optional })
 }
 
-fn load_named_restore_pending(data_dir: &Path) -> Result<Option<NamedRestorePending>, String> {
-    let pending = data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE);
-    crate::atomic_file::recover_interrupted_replace(&pending)
-        .map_err(|error| format!("could not recover the paid-review restore barrier: {error}"))?;
-    let bytes = match std::fs::read(&pending) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not read restore transaction {}: {error}", pending.display())),
-    };
-    let state: NamedRestorePending = serde_json::from_slice(&bytes).map_err(|error| {
-        format!("restore transaction {} is invalid and paid review remains blocked: {error}", pending.display())
-    })?;
-    if !matches!(state.schema, 1 | NAMED_RESTORE_PENDING_SCHEMA) {
-        return Err(format!("unsupported restore transaction schema {}", state.schema));
-    }
-    if state.schema == 1 && state.completed_selector.is_some() {
-        return Err("legacy restore transaction cannot claim a completed generation".to_string());
-    }
-    if let Some(completed) = state.completed_selector.as_deref() {
-        if completed != state.source_selector && completed != state.pre_restore_pin_selector {
-            return Err("restore transaction completion selector is not its target or original pin".to_string());
-        }
-    }
-    Ok(Some(state))
-}
-
-/// Conservatively decide whether dropping a restore command must keep the process-wide admission
-/// fence parked. Invalid/unreadable marker state is recovery-required too: uncertainty can never be
-/// interpreted as permission to resume writes.
-fn named_restore_barrier_may_exist(data_dir: &Path) -> bool {
-    match load_named_restore_pending(data_dir) {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(error) => {
-            tracing::error!("restore barrier is invalid or unreadable; keeping database fenced: {error}");
-            true
-        }
-    }
-}
-
-fn write_named_restore_pending(data_dir: &Path, state: &NamedRestorePending) -> Result<(), String> {
-    if let Some(existing) = load_named_restore_pending(data_dir)? {
-        return (existing == *state).then_some(()).ok_or_else(|| {
-            format!(
-                "another interrupted restore transaction is pending for '{}'; retry that exact snapshot before selecting '{}'",
-                existing.source_selector, state.source_selector
-            )
-        });
-    }
-    let mut bytes = serde_json::to_vec_pretty(state)
-        .map_err(|error| format!("could not serialize restore transaction: {error}"))?;
-    bytes.push(b'\n');
-    atomic_write_restore_state(&data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), &bytes)
-}
-
-fn mark_named_restore_completed(data_dir: &Path, completed_selector: &str) -> Result<(), String> {
-    let mut pending = load_named_restore_pending(data_dir)?
-        .ok_or_else(|| "restore completion cannot be recorded because its durable marker is missing".to_string())?;
-    if completed_selector != pending.source_selector && completed_selector != pending.pre_restore_pin_selector {
-        return Err("restore completion selector is not the recorded target or original pin".to_string());
-    }
-    if let Some(existing) = pending.completed_selector.as_deref() {
-        return (existing == completed_selector)
-            .then_some(())
-            .ok_or_else(|| format!("restore was already completed with a different generation '{existing}'"));
-    }
-    pending.schema = NAMED_RESTORE_PENDING_SCHEMA;
-    pending.completed_selector = Some(completed_selector.to_string());
-    let mut bytes = serde_json::to_vec_pretty(&pending)
-        .map_err(|error| format!("could not serialize completed restore transaction: {error}"))?;
-    bytes.push(b'\n');
-    atomic_write_restore_state(&data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), &bytes)
-}
-
 fn apply_snapshot_pilot_policy(plan: &SnapshotPilotPolicyRestore, data_dir: &Path) -> Result<(), String> {
     let live = data_dir.join(crate::review_pilot::REVIEW_PILOT_FILE);
     match plan {
@@ -6435,23 +6266,6 @@ fn apply_snapshot_pilot_policy(plan: &SnapshotPilotPolicyRestore, data_dir: &Pat
             .map_err(|error| format!("could not apply explicit no-pilot snapshot state: {error}")),
         SnapshotPilotPolicyRestore::PreserveLegacy => Ok(()),
     }
-}
-
-fn clear_review_pilot_restore_pending(data_dir: &Path) -> Result<(), String> {
-    let pending = data_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE);
-    // Canonical marker removal is the FINAL commit point. Backups must disappear first; otherwise a
-    // cleanup failure after canonical removal could let load-time atomic recovery resurrect a barrier
-    // after the in-process admission guard had already been released.
-    crate::atomic_file::remove_replacement_backups(&pending).map_err(|error| {
-        format!("restore completed, but a stale paid-review restore-barrier backup could not be removed: {error}")
-    })?;
-    std::fs::remove_file(&pending).map_err(|error| {
-        format!(
-            "restore completed, but paid review remains fail-closed because {} could not be removed: {error}",
-            pending.display()
-        )
-    })?;
-    Ok(())
 }
 
 fn strict_live_settings_for_restore(path: &Path) -> Result<AppSettings, String> {

@@ -60,6 +60,7 @@ pub mod normalizer;
 pub mod pipeline;
 pub mod production_dataset;
 pub mod quality;
+mod recovery;
 pub mod registry;
 pub mod review_campaign;
 pub mod review_pilot;

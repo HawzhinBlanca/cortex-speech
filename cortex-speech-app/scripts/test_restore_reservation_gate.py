@@ -23,18 +23,35 @@ def _fn_body(src: str, signature_start: str, span: int = 1400) -> str:
 
 
 def test_prepare_restore_reserves_before_the_fence_and_returns_the_guard() -> None:
-    body = _fn_body(_read("commands.rs"), "fn prepare_restore(", span=5000)
-    if "RestoreReservation<'static>" not in body:
-        raise AssertionError("prepare_restore must return a RestoreReservation the caller holds across the restore")
+    commands = _read("commands.rs")
+    adapter = _fn_body(commands, "fn prepare_restore(", span=1200)
+    if "prepare_restore_admission(data_dir, || state.writers_active())" not in adapter:
+        raise AssertionError("the Tauri command adapter must delegate admission and its writer fence")
+    recovery = _read("recovery.rs")
+    if "use tauri" in recovery or "crate::AppState" in recovery or "crate::commands" in recovery:
+        raise AssertionError("restore admission/marker authority must remain Tauri- and command-free")
+    public = _fn_body(recovery, "pub(crate) fn prepare_restore_admission(", span=700)
+    if "RestoreReservation<'static>" not in public or "prepare_restore_admission_with(" not in public:
+        raise AssertionError("recovery admission must return a RestoreReservation held across restore")
+    body = _fn_body(recovery, "fn prepare_restore_admission_with<'a>(", span=1800)
     durable = body.find("named_restore_barrier_may_exist(&data_dir)")
-    recover = body.find("RESTORE_ADMISSION.claim_recovery()")
-    reserve = body.find("RESTORE_ADMISSION.try_reserve()")
-    fence = body.find("state.writers_active()")
+    recover = body.find("admission.claim_recovery()")
+    reserve = body.find("admission.try_reserve()")
+    fence = body.find("writers_active()")
     if -1 in (durable, recover, reserve, fence) or not (durable < recover < fence and reserve < fence):
         raise AssertionError(
-            "prepare_restore must reclaim a durable recovery marker or reserve a new generation BEFORE "
+            "recovery admission must reclaim a durable marker or reserve a new generation BEFORE "
             "checking writers_active(), so a racing writer cannot cross the boundary"
         )
+    for moved in (
+        "fn load_named_restore_pending(",
+        "fn named_restore_barrier_may_exist(",
+        "fn write_named_restore_pending(",
+        "fn mark_named_restore_completed(",
+        "fn clear_review_pilot_restore_pending(",
+    ):
+        if moved in commands or moved not in recovery:
+            raise AssertionError(f"durable restore marker authority was not isolated: {moved}")
 
 
 def test_both_restore_callers_hold_the_reservation() -> None:
