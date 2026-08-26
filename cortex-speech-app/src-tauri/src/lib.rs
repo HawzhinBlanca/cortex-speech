@@ -319,12 +319,6 @@ impl AppState {
         crate::stores::SegmentWriteStore::new(self.db.clone(), Arc::clone(&self.history))
     }
 
-    /// Raw DB access for the restore implementation only. The caller must already own the exclusive
-    /// RestoreReservation; ordinary commands must use `lock_db` / `db_arc` so they cannot pass it.
-    pub(crate) fn db_arc_for_restore(&self) -> Arc<Mutex<Database>> {
-        self.db.writer_arc_for_restore()
-    }
-
     pub fn session_save(&self) {
         let db = self.lock_db();
         if let Err(error) = self.lock_session().save(&db) {

@@ -5440,13 +5440,15 @@ pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), S
     // (after the page swap + history clear), so no new writer can start mid-restore (P1.3b).
     let (restore_reservation, data_dir) = prepare_restore(&state)?;
     refuse_bare_restore_during_controlled_pilot(&data_dir)?;
-    // Heavy snapshot + DB file-copy + reopen run off the main thread under ONE uninterrupted raw DB
-    // mutex guard. Ordinary raw access is not exposed; every other AppState handle is restore-gated.
-    let db = state.db_arc_for_restore();
+    // Heavy snapshot + DB publication + connection reopening run off the main thread through the
+    // runtime-owned exclusive restore boundary. Commands never receive the raw writer Arc.
+    let database = state.db_runtime();
     let history = state.history_arc_for_restore();
     let restore_reservation = run_blocking(move || {
-        let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-        restore_with_mandatory_snapshot(&restore_reservation, &mut guard, &data_dir, Path::new(&validated))?;
+        database.with_restore_writer(&restore_reservation, |writer| {
+            restore_with_mandatory_snapshot(&restore_reservation, writer, &data_dir, Path::new(&validated))?;
+            Ok(())
+        })?;
         // Clear old-row undo commands in the same worker, before its reservation can be dropped. A
         // cancelled Tauri future detaches spawn_blocking; cleanup after `.await` would then be lost
         // even though the page publication completed successfully.
@@ -6694,20 +6696,21 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
     // under ONE uninterrupted DB guard. Bad source staging happens before the pin/marker; retries of a
     // post-swap config failure reuse the original pin instead of evicting it.
     let (restore_plan, restore_reservation) = {
-        let db = state.db_arc_for_restore();
+        let database = state.db_runtime();
         let restore_src = src.clone();
         let restore_snapshot_dir = snap_dir.clone();
         let restore_selector = name.clone();
         run_blocking(move || {
-            let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-            let restore_plan = prepare_and_restore_named_transaction(
-                &restore_reservation,
-                &mut guard,
-                &restore_data_dir,
-                &restore_snapshot_dir,
-                &restore_src,
-                &restore_selector,
-            )?;
+            let restore_plan = database.with_restore_writer(&restore_reservation, |writer| {
+                prepare_and_restore_named_transaction(
+                    &restore_reservation,
+                    writer,
+                    &restore_data_dir,
+                    &restore_snapshot_dir,
+                    &restore_src,
+                    &restore_selector,
+                )
+            })?;
             Ok((restore_plan, restore_reservation))
         })
         .await

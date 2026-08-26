@@ -106,6 +106,7 @@ def test_restore_admission_is_exclusive_and_all_appstate_handles_delegate() -> N
 
 def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
     commands = _read("commands.rs")
+    runtime = _read("database_runtime.rs")
     production = commands.split("#[cfg(test)]\nmod tests", 1)[0]
     # Restore validation now includes the complete durable-history and semantic gates before the
     # pin. Keep the scan wide enough to include the final publish call as that safety work grows.
@@ -122,12 +123,27 @@ def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
         raise AssertionError("named restore must bind verified artifacts to its reusable safety-pin transaction")
     if "db.commit_staged_restore(&staged)" not in named:
         raise AssertionError("named restore no longer publishes only the isolated, verified staged database")
-    if production.count("restore_with_mandatory_snapshot(&restore_reservation, &mut guard") != 1:
+    if production.count("restore_with_mandatory_snapshot(&restore_reservation, writer") != 1:
         raise AssertionError("db_restore must call the one-guard bare snapshot+restore helper exactly once")
     if production.count("prepare_and_restore_named_transaction(") < 2:
         raise AssertionError("restore_db_from_snapshot must call the named one-guard transaction helper")
-    if production.count("state.db_arc_for_restore()") != 2:
-        raise AssertionError("only the two restore commands may use the reservation-protected raw DB handle")
+    if "db_arc_for_restore" in production or "writer_arc_for_restore" in runtime:
+        raise AssertionError("restore commands must not escape DatabaseRuntime through a raw writer Arc")
+    restore_boundary = _fn_body(runtime, "pub(crate) fn with_restore_writer", span=3100)
+    for required in (
+        "std::ptr::eq(self.admission.as_ref(), reservation.admission)",
+        "let reopened = Database::open(self.database_path.as_ref())",
+        "let value = operation(&mut writer)?;",
+        "*writer = reopened;",
+    ):
+        if required not in restore_boundary:
+            raise AssertionError(f"runtime-owned restore/reopen boundary lost invariant: {required}")
+    if restore_boundary.find("let reopened =") > restore_boundary.find("operation(&mut writer)"):
+        raise AssertionError("post-restore connection creation must be proven before live-page publication")
+    if production.count("database.with_restore_writer(&restore_reservation") != 2:
+        raise AssertionError("both restore commands must publish and reopen through DatabaseRuntime")
+    if "successful_restore_reopens_the_writer_before_admission_releases" not in runtime:
+        raise AssertionError("restore/reopen generation behavior needs a deterministic runtime regression")
     db = _read("db.rs")
     stage = _fn_body(db, "pub(crate) fn stage_restore_source", span=3000)
     if "open_immutable_connection" not in stage:

@@ -62,9 +62,36 @@ impl DatabaseRuntime {
         Ok(ReadDatabase { database, _admission: admission, _permit: permit })
     }
 
-    /// Restore publication only. Ordinary code must use `lock` or `open_read`.
-    pub(crate) fn writer_arc_for_restore(&self) -> Arc<Mutex<Database>> {
-        Arc::clone(&self.writer)
+    /// Execute one restore publication under this runtime's exact reservation and reopen the sole
+    /// writer before admission can be released.
+    ///
+    /// The replacement connection is opened while the old writer is locked but before `operation`
+    /// may mutate live pages. An inability to reopen therefore fails before the restore commit
+    /// point. On success SQLite observes the page-generation change on the already-open replacement
+    /// connection, then dropping the old `Database` clears all pre-restore connection-local state.
+    pub(crate) fn with_restore_writer<T>(
+        &self,
+        reservation: &RestoreReservation<'_>,
+        operation: impl FnOnce(&mut Database) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if !std::ptr::eq(self.admission.as_ref(), reservation.admission) || !reservation.is_active() {
+            return Err("restore writer access requires this DatabaseRuntime's active reservation".to_string());
+        }
+        if self.database_path.as_ref() == ":memory:" {
+            return Err("restore publication requires a file-backed DatabaseRuntime".to_string());
+        }
+
+        let mut writer = self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !reservation.is_active() {
+            return Err("restore reservation lost ownership before writer acquisition".to_string());
+        }
+        // Open first: after `operation` succeeds there is no fallible connection-creation step that
+        // can report failure after the live generation already changed.
+        let reopened = Database::open(self.database_path.as_ref())
+            .map_err(|error| format!("could not prepare the post-restore database connection: {error}"))?;
+        let value = operation(&mut writer)?;
+        *writer = reopened;
+        Ok(value)
     }
 }
 
@@ -439,5 +466,54 @@ mod tests {
 
         let reader = runtime.open_read().expect("cached live path must let readers bypass the writer mutex");
         assert_eq!(reader.segment_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn successful_restore_reopens_the_writer_before_admission_releases() {
+        let (_directory, runtime) = file_runtime(1, Duration::from_millis(20));
+        {
+            let writer = runtime.lock().unwrap();
+            writer
+                .insert_segment(&crate::db::SpeechSegment {
+                    id: "old-generation".into(),
+                    audio_path: "old.wav".into(),
+                    raw_transcript: "old".into(),
+                    duration_ms: 1_000,
+                    ..crate::db::SpeechSegment::default()
+                })
+                .unwrap();
+            writer.connection().execute_batch("PRAGMA synchronous=OFF;").unwrap();
+        }
+
+        let replacement = Database::open(":memory:").unwrap();
+        replacement.initialize().unwrap();
+        replacement
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "restored-generation".into(),
+                audio_path: "restored.wav".into(),
+                raw_transcript: "restored".into(),
+                duration_ms: 1_000,
+                ..crate::db::SpeechSegment::default()
+            })
+            .unwrap();
+
+        let reservation = runtime.admission.try_reserve().unwrap();
+        runtime
+            .with_restore_writer(&reservation, |writer| {
+                writer.commit_staged_restore(&replacement).map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert!(reservation.is_active(), "runtime must not release the caller-owned restore reservation");
+        drop(reservation);
+
+        let writer = runtime.lock().unwrap();
+        let synchronous: i64 = writer.connection().query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(synchronous, 1, "reopened writer must restore Database::open connection pragmas");
+        assert!(writer.get_segment_by_id("old-generation").unwrap().is_none());
+        assert!(writer.get_segment_by_id("restored-generation").unwrap().is_some());
+        drop(writer);
+
+        let reader = runtime.open_read().unwrap();
+        assert!(reader.get_segment_by_id("restored-generation").unwrap().is_some());
     }
 }
