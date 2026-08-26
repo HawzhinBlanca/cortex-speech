@@ -16,7 +16,7 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `c5e3748`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `ad3085d`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
 > **1,612 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
@@ -163,6 +163,15 @@
 > policies sequentially, strict all-target/all-feature Clippy and rustfmt. Semantic snapshot/pilot
 > inspection, durable database validation and startup/named/bare orchestration remain in `commands.rs`;
 > process-kill restore drills and the 50,000-segment hammer remain open.
+> `ad3085d` moves policy/absence artifact parsing, manifest-bound pilot-to-database inspection and the
+> composite optional-state restore-plan builder into `recovery`. Policy-bearing snapshots still require
+> a verified manifest, exact controlled focus, schema support for durable hidden keys and a baseline no
+> later than their own review-event maximum; legacy manifestless snapshots preserve rather than relax
+> live policy. The source policy prevents all three inspectors from returning to commands. The exact
+> tree passed **1,612/0/8** library tests plus every target, all **121** policies sequentially, strict
+> all-target/all-feature Clippy and rustfmt. Durable review-history/pilot semantic validation,
+> authoritative-floor comparison and top-level startup/named/bare restore transactions remain in
+> `commands.rs`; process-kill restore drills and the 50,000-segment hammer remain open.
 > Import process-kill/resume and performance proof, Couch decomposition,
 > export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
