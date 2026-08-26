@@ -16,7 +16,7 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `ad3085d`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `7f173fa`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
 > **1,612 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
@@ -172,6 +172,17 @@
 > all-target/all-feature Clippy and rustfmt. Durable review-history/pilot semantic validation,
 > authoritative-floor comparison and top-level startup/named/bare restore transactions remain in
 > `commands.rs`; process-kill restore drills and the 50,000-segment hammer remain open.
+> `7f173fa` moves named-restore artifact staging and final manifest rehash, the mandatory pre-restore
+> safety snapshot, exact safety-pin selector/reuse and the durable transaction-begin boundary into
+> `recovery`. A new transaction still refuses selector drift or a completed generation, verifies an
+> interrupted restore's original pin before reuse, and arms fail-closed restore parking immediately
+> before writing the durable pending marker. The source policy requires all four boundaries in
+> `recovery`, absent from production commands, and pins arm-before-marker ordering. The exact tree
+> passed **1,612/0/8** library tests plus every all-target/all-feature integration, soak, binary and
+> benchmark target, all **121** policies sequentially, strict all-target/all-feature Clippy and
+> rustfmt. Durable review-history/pilot semantic validation, authoritative-floor comparison,
+> database target semantics, the full named transaction and startup/named/bare restore orchestration
+> remain in `commands.rs`; process-kill restore drills and the 50,000-segment hammer remain open.
 > Import process-kill/resume and performance proof, Couch decomposition,
 > export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
