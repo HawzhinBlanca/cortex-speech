@@ -54,6 +54,9 @@ def test_prepare_restore_reserves_before_the_fence_and_returns_the_guard() -> No
         "fn apply_snapshot_pilot_policy(",
         "fn strict_live_settings_for_restore(",
         "fn install_snapshot_restore_plan(",
+        "fn inspect_snapshot_pilot_policy(",
+        "fn explicit_snapshot_pilot_policy(",
+        "fn inspect_snapshot_restore_plan(",
     ):
         if moved in commands or moved not in recovery:
             raise AssertionError(f"durable restore marker authority was not isolated: {moved}")

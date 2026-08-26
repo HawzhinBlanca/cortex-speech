@@ -24,6 +24,128 @@ pub(crate) struct SnapshotRestorePlan {
     pub(crate) optional: Vec<(crate::snapshot::OptionalSnapshotState, crate::snapshot::OptionalSnapshotRestore)>,
 }
 
+pub(crate) fn inspect_snapshot_pilot_policy(
+    snapshot_dir: &Path,
+    snapshot_db: &Path,
+    manifest_verified: bool,
+) -> Result<SnapshotPilotPolicyRestore, String> {
+    let policy_path = snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE);
+    let absent_path = snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE);
+    let read_optional = |path: &Path| -> Result<Option<Vec<u8>>, String> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("snapshot state {} is unreadable: {error}", path.display())),
+        }
+    };
+    match (read_optional(&policy_path)?, read_optional(&absent_path)?) {
+        (Some(_), Some(_)) => Err(format!(
+            "snapshot is ambiguous: it contains both {} and {}",
+            crate::review_pilot::REVIEW_PILOT_FILE,
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+        )),
+        (Some(bytes), None) => {
+            if !manifest_verified {
+                return Err(
+                    "policy-bearing named snapshot restore requires a verified manifest that cryptographically binds its database, policy, and exact voice focus"
+                        .to_string(),
+                );
+            }
+            let raw = std::str::from_utf8(&bytes).map_err(|error| {
+                format!("snapshot {} is not UTF-8: {error}", crate::review_pilot::REVIEW_PILOT_FILE)
+            })?;
+            let policy = crate::review_pilot::parse(raw)?;
+            // A policy-bearing artifact is one indivisible DB + policy + exact-focus generation.
+            // This applies equally to manifestless legacy snapshots: preserving or inferring a
+            // missing focus would turn a bounded campaign into a different paid workload.
+            crate::review_pilot::validate_controlled_focus(snapshot_dir)
+                .map_err(|error| format!("snapshot controlled-pilot focus is invalid: {error}"))?;
+            let source = crate::db::Database::open_immutable_connection(snapshot_db)
+                .map_err(|error| format!("snapshot pilot policy could not bind to its database: {error}"))?;
+            let snapshot_schema: i64 = source
+                .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))
+                .map_err(|error| format!("snapshot pilot schema could not be verified: {error}"))?;
+            if snapshot_schema < crate::review_pilot::REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION {
+                return Err(format!(
+                    "policy-bearing snapshot schema {snapshot_schema} predates durable hidden-key authority v{}; restoring it could forget already-served paid QC keys",
+                    crate::review_pilot::REVIEW_PILOT_HIDDEN_KEYS_SCHEMA_VERSION
+                ));
+            }
+            let max_event_id: i64 = source
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
+                .map_err(|error| format!("snapshot pilot baseline could not be verified: {error}"))?;
+            if policy.after_review_event_id > max_event_id {
+                return Err(format!(
+                    "snapshot pilot baseline {} is ahead of its database review-event maximum {max_event_id}",
+                    policy.after_review_event_id
+                ));
+            }
+            let mut canonical = serde_json::to_vec_pretty(&policy)
+                .map_err(|error| format!("snapshot pilot policy could not be canonicalized: {error}"))?;
+            canonical.push(b'\n');
+            Ok(SnapshotPilotPolicyRestore::Install(canonical))
+        }
+        (None, Some(marker)) => {
+            if marker != crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES {
+                return Err(format!(
+                    "snapshot {} has invalid contents",
+                    crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+                ));
+            }
+            Ok(SnapshotPilotPolicyRestore::ExplicitlyAbsent)
+        }
+        (None, None) => {
+            if manifest_verified {
+                return Err(format!(
+                    "manifest-bearing snapshot is missing both {} and {}",
+                    crate::review_pilot::REVIEW_PILOT_FILE,
+                    crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+                ));
+            }
+            tracing::warn!(
+                "LEGACY MANIFEST-LESS SNAPSHOT: neither {} nor {} is present; preserving the current live paid-review policy exactly",
+                crate::review_pilot::REVIEW_PILOT_FILE,
+                crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE
+            );
+            Ok(SnapshotPilotPolicyRestore::PreserveLegacy)
+        }
+    }
+}
+
+pub(crate) fn explicit_snapshot_pilot_policy(
+    action: &SnapshotPilotPolicyRestore,
+    context: &str,
+) -> Result<Option<crate::review_pilot::ReviewPilotPolicy>, String> {
+    match action {
+        SnapshotPilotPolicyRestore::Install(bytes) => {
+            let raw =
+                std::str::from_utf8(bytes).map_err(|error| format!("{context} pilot policy is not UTF-8: {error}"))?;
+            crate::review_pilot::parse(raw).map(Some)
+        }
+        SnapshotPilotPolicyRestore::ExplicitlyAbsent => Ok(None),
+        SnapshotPilotPolicyRestore::PreserveLegacy => {
+            Err(format!("{context} does not explicitly bind paid-review policy presence or absence"))
+        }
+    }
+}
+
+pub(crate) fn inspect_snapshot_restore_plan(
+    snapshot_dir: &Path,
+    snapshot_db: &Path,
+    manifest_verified: bool,
+) -> Result<SnapshotRestorePlan, String> {
+    let pilot = inspect_snapshot_pilot_policy(snapshot_dir, snapshot_db, manifest_verified)?;
+    let optional = crate::snapshot::OPTIONAL_SNAPSHOT_STATE
+        .iter()
+        .copied()
+        .map(|state| {
+            crate::snapshot::inspect_optional_state_for_restore(snapshot_dir, state, manifest_verified)
+                .map(|action| (state, action))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SnapshotRestorePlan { pilot, optional })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NamedRestorePending {
