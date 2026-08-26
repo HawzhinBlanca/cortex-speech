@@ -49,6 +49,11 @@ def test_prepare_restore_reserves_before_the_fence_and_returns_the_guard() -> No
         "fn write_named_restore_pending(",
         "fn mark_named_restore_completed(",
         "fn clear_review_pilot_restore_pending(",
+        "fn preserve_live_asr_runtime_controls(",
+        "fn restore_required_snapshot_state_atomic(",
+        "fn apply_snapshot_pilot_policy(",
+        "fn strict_live_settings_for_restore(",
+        "fn install_snapshot_restore_plan(",
     ):
         if moved in commands or moved not in recovery:
             raise AssertionError(f"durable restore marker authority was not isolated: {moved}")
@@ -209,7 +214,8 @@ def test_named_snapshot_restore_commits_config_only_after_atomic_required_state_
             "named restore must install all config/runtime state, durably mark the completed generation, "
             "then clear the marker and release admission in that exact order"
         )
-    install_helper = _fn_body(commands, "fn install_snapshot_restore_plan(", span=4200)
+    recovery = _read("recovery.rs")
+    install_helper = _fn_body(recovery, "pub(crate) fn install_snapshot_restore_plan(", span=4200)
     routing = install_helper.find("restore_required_snapshot_state_atomic")
     pilot = install_helper.find("apply_snapshot_pilot_policy")
     settings = install_helper.find("restored.save(&live_settings_path)")

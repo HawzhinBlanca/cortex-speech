@@ -17,11 +17,15 @@ use crate::history::Command;
 use crate::models;
 use crate::pipeline::PipelineEvent;
 use crate::quality;
+#[cfg(test)]
 use crate::recovery::{
-    atomic_write_restore_state, clear_review_pilot_restore_pending, load_named_restore_pending,
+    apply_snapshot_pilot_policy, preserve_live_asr_runtime_controls, restore_required_snapshot_state_atomic,
+};
+use crate::recovery::{
+    clear_review_pilot_restore_pending, install_snapshot_restore_plan, load_named_restore_pending,
     mark_named_restore_completed, named_restore_barrier_may_exist, prepare_restore_admission,
-    refuse_bare_restore_during_controlled_pilot, remove_live_restore_state, write_named_restore_pending,
-    NamedRestorePending, NAMED_RESTORE_PENDING_SCHEMA,
+    refuse_bare_restore_during_controlled_pilot, strict_live_settings_for_restore, write_named_restore_pending,
+    NamedRestorePending, SnapshotPilotPolicyRestore, SnapshotRestorePlan, NAMED_RESTORE_PENDING_SCHEMA,
 };
 use crate::settings::{AppSettings, AsrModelSize};
 use crate::stats;
@@ -5494,53 +5498,6 @@ pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<crate::snapsh
     Ok(crate::snapshot::list_snapshots(&data_dir))
 }
 
-/// A dataset snapshot may restore dataset-coupled thresholds, but it must never change which ASR
-/// engine the operator is currently running or re-enable heavyweight background inference. Those
-/// are live machine/runtime decisions, not historical dataset state.
-fn preserve_live_asr_runtime_controls(restored: &mut AppSettings, live: &AppSettings) {
-    restored.asr_model_size = live.asr_model_size.clone();
-    restored.use_finetuned_asr = live.use_finetuned_asr;
-    restored.multi_engine_hypotheses = live.multi_engine_hypotheses;
-    restored.external_asr_script_path = live.external_asr_script_path.clone();
-    restored.champion_supervision_enabled = live.champion_supervision_enabled;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SnapshotPilotPolicyRestore {
-    Install(Vec<u8>),
-    ExplicitlyAbsent,
-    /// Snapshots made before explicit absence markers preserve the current live policy. This keeps
-    /// historical DB recovery possible without ever interpreting missing legacy state as permission
-    /// to delete/relax a live paid-review cap.
-    PreserveLegacy,
-}
-
-fn restore_required_snapshot_state_atomic(
-    plan: &[(crate::snapshot::OptionalSnapshotState, crate::snapshot::OptionalSnapshotRestore)],
-    data_dir: &Path,
-) -> Result<(), String> {
-    for (state, action) in plan {
-        if state.live_file == "settings.json" {
-            continue;
-        }
-        let destination = data_dir.join(state.live_file);
-        match action {
-            crate::snapshot::OptionalSnapshotRestore::Install(bytes) => {
-                atomic_write_restore_state(&destination, bytes).map_err(|error| {
-                    format!("required snapshot state {} could not be installed atomically: {error}", state.live_file)
-                })?;
-            }
-            crate::snapshot::OptionalSnapshotRestore::ExplicitlyAbsent => {
-                remove_live_restore_state(&destination).map_err(|error| {
-                    format!("required snapshot state {} could not be made explicitly absent: {error}", state.live_file)
-                })?;
-            }
-            crate::snapshot::OptionalSnapshotRestore::PreserveLegacy => {}
-        }
-    }
-    Ok(())
-}
-
 fn inspect_snapshot_pilot_policy(
     snapshot_dir: &Path,
     snapshot_db: &Path,
@@ -5627,12 +5584,6 @@ fn inspect_snapshot_pilot_policy(
             Ok(SnapshotPilotPolicyRestore::PreserveLegacy)
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct SnapshotRestorePlan {
-    pilot: SnapshotPilotPolicyRestore,
-    optional: Vec<(crate::snapshot::OptionalSnapshotState, crate::snapshot::OptionalSnapshotRestore)>,
 }
 
 fn explicit_snapshot_pilot_policy(
@@ -6256,67 +6207,6 @@ fn inspect_snapshot_restore_plan(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SnapshotRestorePlan { pilot, optional })
-}
-
-fn apply_snapshot_pilot_policy(plan: &SnapshotPilotPolicyRestore, data_dir: &Path) -> Result<(), String> {
-    let live = data_dir.join(crate::review_pilot::REVIEW_PILOT_FILE);
-    match plan {
-        SnapshotPilotPolicyRestore::Install(bytes) => atomic_write_restore_state(&live, bytes),
-        SnapshotPilotPolicyRestore::ExplicitlyAbsent => remove_live_restore_state(&live)
-            .map_err(|error| format!("could not apply explicit no-pilot snapshot state: {error}")),
-        SnapshotPilotPolicyRestore::PreserveLegacy => Ok(()),
-    }
-}
-
-fn strict_live_settings_for_restore(path: &Path) -> Result<AppSettings, String> {
-    crate::atomic_file::recover_interrupted_replace(path)
-        .map_err(|error| format!("could not recover live settings before restore: {error}"))?;
-    let mut settings = match std::fs::read(path) {
-        Ok(bytes) => crate::settings::AppSettings::parse_recovery_bytes(&bytes)
-            .map_err(|error| format!("live settings are invalid; restore remains blocked: {error}"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AppSettings::default(),
-        Err(error) => return Err(format!("live settings are unreadable; restore remains blocked: {error}")),
-    };
-    settings.enforce_production_canon();
-    Ok(settings)
-}
-
-fn install_snapshot_restore_plan(
-    restore_plan: &SnapshotRestorePlan,
-    data_dir: &Path,
-    live_controls: &AppSettings,
-) -> Result<AppSettings, String> {
-    // Dataset-routing state must agree with the restored DB before paid review can resume. Install
-    // every required file atomically; settings is typed and handled separately so historical cloud
-    // consent and machine routing never touch live disk.
-    restore_required_snapshot_state_atomic(&restore_plan.optional, data_dir)?;
-    apply_snapshot_pilot_policy(&restore_plan.pilot, data_dir)?;
-
-    let settings_action = restore_plan
-        .optional
-        .iter()
-        .find(|(state, _)| state.live_file == "settings.json")
-        .map(|(_, action)| action)
-        .ok_or_else(|| "snapshot restore plan omitted settings state".to_string())?;
-    let mut restored = match settings_action {
-        crate::snapshot::OptionalSnapshotRestore::Install(bytes) => {
-            crate::settings::AppSettings::parse_recovery_bytes(bytes)?
-        }
-        crate::snapshot::OptionalSnapshotRestore::ExplicitlyAbsent => crate::settings::AppSettings::default(),
-        crate::snapshot::OptionalSnapshotRestore::PreserveLegacy => live_controls.clone(),
-    };
-    // Consent and ASR/GPU controls are live operator decisions, never historical dataset state.
-    restored.cloud_llm_opt_in = live_controls.cloud_llm_opt_in;
-    restored.jury_cloud_opt_in = live_controls.jury_cloud_opt_in;
-    preserve_live_asr_runtime_controls(&mut restored, live_controls);
-    restored.enforce_production_canon();
-    let live_settings_path = data_dir.join("settings.json");
-    restored.save(&live_settings_path).map_err(|error| {
-        format!(
-            "snapshot database was restored, but live-control-preserving settings could not be installed; paid review remains blocked: {error}"
-        )
-    })?;
-    Ok(restored)
 }
 
 fn publish_prepared_snapshot_generation_offline(

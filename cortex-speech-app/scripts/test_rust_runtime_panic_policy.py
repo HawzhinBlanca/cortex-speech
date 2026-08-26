@@ -20,6 +20,17 @@ def command_surface() -> str:
     return text
 
 
+def recovery_surface() -> str:
+    """The Tauri-free recovery module owns restore admission and typed state publication."""
+    path = REPO_ROOT / "src-tauri" / "src" / "recovery.rs"
+    text = path.read_text(encoding="utf-8")
+    if "install_snapshot_restore_plan" not in text:
+        raise AssertionError(
+            "recovery.rs missing typed snapshot restore-plan installation — this gate would pass vacuously"
+        )
+    return text
+
+
 from _policy_util import strip_comments  # noqa: E402
 
 
@@ -2042,8 +2053,10 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
     """A snapshot captured while the cloud opt-ins were ON must never silently re-grant consent the user has
     since revoked. Consent is a LIVE per-session privacy decision, not dataset state a rollback should change,
     so restore must carry the CURRENT opt-ins across and atomically persist the narrowed typed settings before
-    publishing them to the running pipeline. Needs AppState + DB + files, so this remains source-pinned."""
+    publishing them to the running pipeline. The command owns runtime publication while the Tauri-free
+    recovery module owns typed state-file publication, so both surfaces remain source-pinned."""
     surface = command_surface()
+    recovery = recovery_surface()
     start = surface.find("fn restore_db_from_snapshot(")
     if start == -1:
         raise AssertionError("restore_db_from_snapshot not found — this gate would pass vacuously")
@@ -2056,10 +2069,10 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
     body = rest[:end]
     # Strip comment-only lines so commented-out calls cannot satisfy the executable ordering checks.
     code_body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("//"))
-    helper_start = surface.find("fn install_snapshot_restore_plan(")
+    helper_start = recovery.find("fn install_snapshot_restore_plan(")
     if helper_start == -1:
         raise AssertionError("typed snapshot restore-plan installer not found — consent gate would pass vacuously")
-    helper_rest = surface[helper_start:]
+    helper_rest = recovery[helper_start:]
     helper_end = helper_rest.find("\nfn ", 1)
     helper = helper_rest if helper_end == -1 else helper_rest[:helper_end]
     helper_code = "\n".join(ln for ln in helper.splitlines() if not ln.lstrip().startswith("//"))
@@ -2093,8 +2106,8 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
     # The typed consent-narrowing save must be the first and only settings.json write. Routing-state install
     # therefore explicitly excludes settings, while the restore plan supplies its strictly parsed value to the
     # typed settings path (hunt-9 / iter 165).
-    routing_start = surface.find("fn restore_required_snapshot_state_atomic(")
-    routing_helper = surface[routing_start : routing_start + 2400] if routing_start != -1 else ""
+    routing_start = recovery.find("fn restore_required_snapshot_state_atomic(")
+    routing_helper = recovery[routing_start : routing_start + 2400] if routing_start != -1 else ""
     atomic_routing = (
         "restore_required_snapshot_state_atomic(&restore_plan.optional, data_dir)?;" in helper_code
         and 'state.live_file == "settings.json"' in routing_helper
