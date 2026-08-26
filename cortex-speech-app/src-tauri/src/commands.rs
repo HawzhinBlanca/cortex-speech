@@ -20,14 +20,15 @@ use crate::quality;
 #[cfg(test)]
 use crate::recovery::{
     apply_snapshot_pilot_policy, inspect_snapshot_pilot_policy, preserve_live_asr_runtime_controls,
-    restore_required_snapshot_state_atomic,
+    restore_required_snapshot_state_atomic, write_named_restore_pending, NamedRestorePending,
+    NAMED_RESTORE_PENDING_SCHEMA,
 };
 use crate::recovery::{
-    clear_review_pilot_restore_pending, explicit_snapshot_pilot_policy, inspect_snapshot_restore_plan,
+    begin_named_restore_transaction, clear_review_pilot_restore_pending, explicit_snapshot_pilot_policy,
     install_snapshot_restore_plan, load_named_restore_pending, mark_named_restore_completed,
-    named_restore_barrier_may_exist, prepare_restore_admission, refuse_bare_restore_during_controlled_pilot,
-    strict_live_settings_for_restore, write_named_restore_pending, NamedRestorePending, SnapshotPilotPolicyRestore,
-    SnapshotRestorePlan, NAMED_RESTORE_PENDING_SCHEMA,
+    prepare_named_restore_artifacts, prepare_restore_admission, refuse_bare_restore_during_controlled_pilot,
+    strict_live_settings_for_restore, take_mandatory_pre_restore_snapshot, SnapshotPilotPolicyRestore,
+    SnapshotRestorePlan,
 };
 use crate::settings::{AppSettings, AsrModelSize};
 use crate::stats;
@@ -2117,21 +2118,6 @@ pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde
 pub(crate) use crate::database_runtime::{
     begin_mutation, restore_pending, RestoreAdmission, RestoreReservation, RESTORE_ADMISSION, RESTORE_IN_PROGRESS_MSG,
 };
-
-fn take_mandatory_pre_restore_snapshot(
-    reservation: &RestoreReservation<'_>,
-    db: &crate::db::Database,
-    data_dir: &Path,
-) -> Result<std::path::PathBuf, String> {
-    crate::snapshot::take_pinned_snapshot_during_restore(reservation, db, data_dir, "prerestore", 3).map_err(
-        |e| {
-            format!(
-                "Database restore refused because the mandatory pre-restore safety snapshot failed: {e}. \
-                 The current library has not been overwritten. Free disk space or fix the destination permissions, then retry."
-            )
-        },
-    )
-}
 
 /// These rows are irreversible review/payment evidence, not ordinary dataset state. A restore may
 /// add rows, but it may never make any exact pre-restore row disappear or change one of its values.
@@ -5273,91 +5259,6 @@ fn restore_with_mandatory_snapshot(
     tracing::info!("pre-restore snapshot pinned at {}", pinned.display());
     db.commit_staged_restore(&staged).map_err(|error| error.to_string())?;
     Ok(pinned)
-}
-
-fn pin_selector(data_dir: &Path, pin: &Path) -> Result<String, String> {
-    let relative = pin
-        .strip_prefix(data_dir.join("snapshots"))
-        .map_err(|_| format!("pre-restore pin {} is outside the snapshot tree", pin.display()))?;
-    let parts = relative
-        .components()
-        .map(|component| component.as_os_str().to_str().map(str::to_string))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| "pre-restore pin path is not UTF-8".to_string())?;
-    if parts.len() != 2 || parts[0] != "pinned" {
-        return Err(format!("pre-restore pin {} has an unexpected path", pin.display()));
-    }
-    Ok(format!("pinned/{}", parts[1]))
-}
-
-/// Reuse the original safety pin for every retry of an interrupted named restore. Creating a new
-/// `keep=3` pin per retry could evict the only copy of the true pre-restore generation.
-fn begin_named_restore_transaction(
-    reservation: &RestoreReservation<'_>,
-    db: &crate::db::Database,
-    data_dir: &Path,
-    source_selector: &str,
-) -> Result<std::path::PathBuf, String> {
-    if let Some(pending) = load_named_restore_pending(data_dir)? {
-        if let Some(completed) = pending.completed_selector.as_deref() {
-            return Err(format!(
-                "restore generation '{completed}' is already complete; only durable barrier cleanup may run"
-            ));
-        }
-        if pending.source_selector != source_selector {
-            return Err(format!(
-                "an interrupted restore of '{}' is pending; retry that exact snapshot before selecting '{}'",
-                pending.source_selector, source_selector
-            ));
-        }
-        let pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector)?;
-        if !crate::snapshot::verify_snapshot_manifest_for_restore(&pin)? {
-            return Err(
-                "the pending restore's original safety pin is legacy/unverifiable; refusing to continue".to_string()
-            );
-        }
-        tracing::info!("reusing interrupted restore safety pin at {}", pin.display());
-        return Ok(pin);
-    }
-    let pin = take_mandatory_pre_restore_snapshot(reservation, db, data_dir)?;
-    let pending = NamedRestorePending {
-        schema: NAMED_RESTORE_PENDING_SCHEMA,
-        source_selector: source_selector.to_string(),
-        pre_restore_pin_selector: pin_selector(data_dir, &pin)?,
-        completed_selector: None,
-    };
-    // This is the commit boundary: source/config preflight and the safety pin already succeeded;
-    // the durable fail-closed marker lands immediately before the live SQLite page transaction.
-    reservation.arm_named_restore()?;
-    if let Err(error) = write_named_restore_pending(data_dir, &pending) {
-        if !named_restore_barrier_may_exist(data_dir) {
-            reservation.disarm_named_restore_if_safe();
-        }
-        return Err(error);
-    }
-    Ok(pin)
-}
-
-fn prepare_named_restore_artifacts<F>(
-    snapshot_dir: &Path,
-    source: &Path,
-    before_final_verify: F,
-) -> Result<(SnapshotRestorePlan, crate::db::Database), String>
-where
-    F: FnOnce(),
-{
-    let manifest_verified = crate::snapshot::verify_snapshot_manifest_for_restore(snapshot_dir)?;
-    let plan = inspect_snapshot_restore_plan(snapshot_dir, source, manifest_verified)?;
-    let staged = crate::db::Database::stage_restore_source(source).map_err(|error| error.to_string())?;
-    before_final_verify();
-    // Re-hash after BOTH config-plan capture and DB staging. From this point onward commit uses only
-    // owned plan bytes + the staged in-memory DB, so a promoted-source mutation cannot cross the
-    // manifest boundary or create a mixed DB/config generation.
-    let reverified = crate::snapshot::verify_snapshot_manifest_for_restore(snapshot_dir)?;
-    if reverified != manifest_verified {
-        return Err("snapshot manifest presence changed during restore preflight".to_string());
-    }
-    Ok((plan, staged))
 }
 
 fn prepare_and_restore_named_transaction(

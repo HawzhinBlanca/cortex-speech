@@ -57,6 +57,10 @@ def test_prepare_restore_reserves_before_the_fence_and_returns_the_guard() -> No
         "fn inspect_snapshot_pilot_policy(",
         "fn explicit_snapshot_pilot_policy(",
         "fn inspect_snapshot_restore_plan(",
+        "fn prepare_named_restore_artifacts",
+        "fn take_mandatory_pre_restore_snapshot(",
+        "fn pin_selector(",
+        "fn begin_named_restore_transaction(",
     ):
         if moved in commands or moved not in recovery:
             raise AssertionError(f"durable restore marker authority was not isolated: {moved}")
@@ -224,7 +228,7 @@ def test_named_snapshot_restore_commits_config_only_after_atomic_required_state_
     settings = install_helper.find("restored.save(&live_settings_path)")
     if -1 in (routing, pilot, settings) or not (routing < pilot < settings):
         raise AssertionError("restore-plan installation must atomically bind routing, pilot policy, then typed settings")
-    marker = _fn_body(commands, "fn begin_named_restore_transaction(", span=3800)
+    marker = _fn_body(recovery, "pub(crate) fn begin_named_restore_transaction(", span=3800)
     if not (0 <= marker.find("reservation.arm_named_restore()?") < marker.find("write_named_restore_pending")):
         raise AssertionError("named admission must arm fail-closed parking before writing its durable marker")
 
