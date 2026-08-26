@@ -16,10 +16,10 @@
 > vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
 > retain every audit regression. The commit-to-regression map is
 > [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
-> Measured checkpoint at `9a2a0c5`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> Measured checkpoint at `8d18260`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
 > 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
 > Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
-> **1,609 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> **1,611 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
 > binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
 > fixture now executes the production `Database::initialize` boot step and its binary suite is
 > **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
@@ -141,7 +141,17 @@
 > generation. Restore-focused Rust tests passed **54/54**; the exact post-format all-target/all-feature
 > command passed **1,609/0/8**, every other target exited zero, strict Clippy and rustfmt passed, and
 > all **121** policy scripts passed sequentially. Restore orchestration and validation still reside in
-> `commands.rs`; process-kill restore drills are not closed.
+> `commands.rs`; process-kill restore drills are not closed. `8d18260` then extracts process-wide
+> restore admission, fail-closed durable marker load/write/complete/clear, atomic restore-state I/O and
+> bare-restore pilot refusal into a 254-line Tauri-free `recovery` module. The command layer now only
+> resolves its data directory and supplies a writer-activity callback; the recovery module publishes
+> or reclaims admission before invoking that fence. Two module regressions prove reservation-before-
+> fence ordering with release on refusal and exact one-target/one-completion durable marker behavior.
+> The source policy forbids a Tauri, AppState or commands dependency and prevents marker authority
+> from returning to `commands.rs`. Exact proof is **1,611/0/8** library tests plus every target,
+> restore selection **54/54**, recovery module **2/2**, all **121** policies sequentially, strict
+> Clippy and rustfmt. Semantic database validation, snapshot-plan inspection, settings publication and
+> startup/named restore orchestration remain in `commands.rs` and are not claimed extracted.
 > Import process-kill/resume and performance proof, Couch decomposition,
 > export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
 > This entry is
