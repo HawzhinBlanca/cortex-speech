@@ -45,7 +45,8 @@ def main() -> None:
     migrations = read("src-tauri/src/migrations/mod.rs")
     lib_rs = read("src-tauri/src/lib.rs")
     commands_ts = read("src/lib/commands.ts")
-    app = read("src/App.svelte")
+    app = read("src/Workstation.svelte")
+    status_bar = read("src/lib/StatusBar.svelte")
     agent_report_panel = read("src/lib/AgentReportPanel.svelte")
     settings_store = read("src/lib/stores/settingsStore.ts")
     events = read("src/lib/events.ts")
@@ -212,17 +213,56 @@ def main() -> None:
     assert "halted before this file's {segment_count} segment(s) were published" in pipeline, (
         "an exhausted-empty champion result must halt before publication, never store unresolved rows in a 'successful' import"
     )
-    assert "audio_path_has_placeholder_rows" in pipeline, (
-        "resume must discriminate an interrupted stage (placeholder rows) from a completed file — rows-exist is not done"
+    assert "resume_segment_has_authoritative_transcript" in pipeline, (
+        "resume must prove complete human/current-champion transcript authority from the rows; rows-exist is not done"
+    )
+    assert "resume_should_skip_file(resume_completed.is_some(), has_authoritative_segments)" in pipeline, (
+        "the resume journal must remain a hint and may skip only rows that independently prove transcript authority"
+    )
+    assert "resume_authority_rejects_placeholder_wrong_model_cloud_and_blank_drafts" in pipeline, (
+        "placeholder, wrong-model, cloud, and blank drafts need an adversarial resume-authority regression"
     )
     assert pipeline.count("committed_by_pipeline: commit_champion") == 1, (
         "the champion result must report the exact conditional commit owner"
     )
-    assert "self.transcribe_with_champion_commit(segment_id, audio_path, alignment_json, cancel, true)" in pipeline, (
-        "normal re-transcription must retain the single immediate champion commit owner"
+    compact_pipeline = " ".join(pipeline.split())
+    bound_commit_call = (
+        "self.transcribe_with_champion_commit( Some(&source.snapshot.segment.id), "
+        "&source.snapshot.segment.audio_path, source.snapshot.segment.alignment_json.as_deref(), "
+        "cancel, true, Some(&source.snapshot), )"
     )
-    assert "self.transcribe_with_champion_commit(Some(segment_id), audio_path, alignment_json, cancel, false)" in pipeline, (
-        "import drafting must explicitly disable per-segment publication"
+    assert bound_commit_call in compact_pipeline, (
+        "normal re-transcription must commit only through the immutable id/path/span/content source snapshot"
+    )
+    import_draft_call = (
+        "self.transcribe_with_champion_commit( Some(segment_id), audio_path, alignment_json, cancel, false, None, )"
+    )
+    assert import_draft_call in compact_pipeline, (
+        "import drafting must explicitly disable per-segment publication and carry no false source authority"
+    )
+    assert "if commit_champion && expected_source.is_none()" in pipeline, (
+        "the shared transcription primitive must reject every commit that lacks immutable source authority"
+    )
+    assert "E_TRANSCRIPTION_SOURCE_UNBOUND" in pipeline, (
+        "an unbound transcription commit needs a stable fail-closed error"
+    )
+    assert ".commit_bound_champion_transcript_if_unreviewed(" in pipeline, (
+        "the immediate champion writer must revalidate the bound source snapshot inside its transaction"
+    )
+    assert "expected_source.ok_or_else" in pipeline, (
+        "the final commit call must not synthesize or omit source authority"
+    )
+    assert "pipeline.bind_existing_transcription_source_cached(" in commands, (
+        "batch transcription must bind each segment to the current database/audio snapshot before inference"
+    )
+    assert "pipeline.transcribe_bound(&source, Some(cancel.as_atomic()))" in commands, (
+        "batch transcription must pass only the bound source into the committing pipeline path"
+    )
+    assert ".bind_existing_transcription_source(id, Some(&audio_path), alignment_json.as_deref())" in commands, (
+        "single transcription must refuse caller id/path substitution by binding server source truth"
+    )
+    assert "pipeline.transcribe_bound(&source, None)" in commands, (
+        "single transcription must use the same bound commit path as batch transcription"
     )
     assert "Ok(draft) if draft.committed_by_pipeline =>" in commands, (
         "batch_transcribe must not re-write a draft the pipeline already committed (one inference, one commit, one owner)"
@@ -321,8 +361,8 @@ def main() -> None:
     assert "AgentStageEvent" in commands_ts, "frontend must type persisted agent stage events"
     assert "agentRunId" in commands_ts, "frontend must type the report-to-stage run id"
     assert "AgentReportPanel" in app, "app must render the latest agent import report"
-    assert "agentPipelineStages" in app, "app must render live agent pipeline stages"
-    assert "data-testid=\"agent-pipeline-timeline\"" in app, "live agent timeline needs a stable UI hook"
+    assert "agentPipelineStages" in status_bar, "status bar must render live agent pipeline stages"
+    assert "data-testid=\"agent-pipeline-timeline\"" in status_bar, "live agent timeline needs a stable UI hook"
     assert "loadLatestAgentReport" in app, "app must refresh the latest agent import report"
     assert "loadLatestAgentStageEvents" in app, "app must refresh persisted agent stage events"
     assert "latestAgentReport?.agentRunId" in app, "app must load the stage log for the latest report run id"

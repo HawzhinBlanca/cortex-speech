@@ -1,12 +1,12 @@
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type DesktopEvent, type DesktopUnlisten as UnlistenFn } from './adapters/desktop';
 import { get } from 'svelte/store';
 import { notifications } from './stores/notificationStore';
-import { t } from './i18n';
+import { t, type Translate, type TranslationKey } from './i18n';
 
 // True-10 audit: every notification here was hardcoded English, so in the CKB locale the app went
 // mixed-language exactly where pipeline status/errors need to be clearest. Module-scope translator
 // (evaluated per call, so a locale switch applies immediately).
-const tr = (key: string, params?: Record<string, string>) => get(t)(key, params);
+const tr: Translate = (key, params) => get(t)(key, params);
 import {
   isProcessing,
   pipelinePhase,
@@ -76,6 +76,16 @@ export type ImportCompleteHandler = (payload: ImportComplete) => void | Promise<
 export type BatchCompleteHandler = (payload: BatchProgressEvent) => void | Promise<void>;
 
 const unlisteners: UnlistenFn[] = [];
+
+/** Subscribe to a typed desktop event without exposing the Tauri event API to components. */
+export function subscribeDesktopEvent<T>(
+  event: string,
+  handler: (event: DesktopEvent<T>) => void,
+): Promise<UnlistenFn> {
+  return listen<T>(event, handler);
+}
+
+export type { DesktopEvent } from './adapters/desktop';
 let onImportComplete: ImportCompleteHandler | null = null;
 let onBatchComplete: BatchCompleteHandler | null = null;
 
@@ -101,7 +111,9 @@ async function refreshAfterImport(payload: ImportComplete): Promise<void> {
       notifications.success(tr('events.importSuccess', { n: String(payload.total) }));
     }
   } else if (payload.failed > 0) {
-    notifications.error(tr('events.importFailed'), { detail: tr('events.importFailedDetail') });
+    notifications.error(tr('events.importFailed'), {
+      publicDetail: tr('events.importFailedDetail'),
+    });
   }
 
   isProcessing.set(false);
@@ -116,7 +128,7 @@ async function refreshAfterImport(payload: ImportComplete): Promise<void> {
     try {
       await onImportComplete(payload);
     } catch (e) {
-      notifications.error(tr('events.refreshFailed'), { detail: String(e) });
+      notifications.error(tr('events.refreshFailed'), { cause: e });
     }
   }
 }
@@ -127,7 +139,7 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
   pipelinePhase.set('idle');
   agentPipelineStages.set([]);
 
-  const batchOps: Record<string, { partial: string; success: string }> = {
+  const batchOps: Readonly<Record<string, { partial: TranslationKey; success: TranslationKey }>> = {
     transcribe: { partial: 'events.batchTranscribePartial', success: 'events.transcribed' },
     verify: { partial: 'events.batchVerifyPartial', success: 'events.verified' },
     assign_speaker: { partial: 'events.batchSpeakerPartial', success: 'events.speakerAssigned' },
@@ -138,7 +150,7 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
   // partly-drafted dataset that looks finished is worse than a run that stopped, so the cause the
   // backend named in haltedBy is the one thing the user has to see.
   if (payload.type === 'halted') {
-    notifications.error(tr('errors.transcriptionFailed'), { detail: payload.haltedBy });
+    notifications.error(tr('errors.transcriptionFailed'), { cause: payload.haltedBy });
   } else if (payload.cancelled) {
     notifications.warning(tr('events.batchCancelled'));
   } else if (payload.operation && batchOps[payload.operation]) {
@@ -159,7 +171,7 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
     try {
       await onBatchComplete(payload);
     } catch (e) {
-      notifications.error(tr('events.batchRefreshFailed'), { detail: String(e) });
+      notifications.error(tr('events.batchRefreshFailed'), { cause: e });
     }
   }
 }
@@ -190,7 +202,8 @@ export async function startEventListeners() {
 
   const unlistenError = await listen<PipelineError>('pipeline-error', (event) => {
     const { file, error } = event.payload;
-    notifications.error(tr('events.processingError', { file }), { detail: error });
+    const fileName = file.split(/[/\\]/).pop()?.slice(0, 160) || tr('events.unknownFile');
+    notifications.error(tr('events.processingError', { file: fileName }), { cause: error });
   });
   unlisteners.push(unlistenError);
 

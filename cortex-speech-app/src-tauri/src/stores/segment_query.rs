@@ -70,6 +70,15 @@ impl SegmentQueryStore {
         self.runtime.open_read()?.get_segments_page_focused(verified, query, sort, limit, cursor, focus)
     }
 
+    pub(crate) fn get_escalation_review_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        focus: Option<&HashSet<String>>,
+    ) -> AppResult<SegmentsPage> {
+        self.runtime.open_read()?.get_escalation_review_page(limit, cursor, focus)
+    }
+
     pub(crate) fn get_segment_ids_for_view(
         &self,
         verified: Option<bool>,

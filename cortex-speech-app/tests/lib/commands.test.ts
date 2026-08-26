@@ -4,18 +4,74 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AudioExportFormat,
   ASR_7B_UNAVAILABLE_TAG,
+  cancelDesktopPlaybackSessionV1,
   commitReviewV1,
   deleteReviewDraftV1,
+  getSettings,
+  getActiveVoiceFocusV1,
   getReviewDraftV1,
+  getVoiceFocusReviewPageV1,
+  authoritativeSettingsFromWriteError,
   is7bUnavailableError,
   listAgentImportReports,
   listAgentStageEvents,
+  markSegmentUnusableV1,
   recordHumanDecision,
   recordReviewFlag,
   saveReviewDraftV1,
+  updateSettings,
 } from '../../src/lib/commands';
+import { defaultSettings } from '../../src/lib/stores/settingsStore';
+import type { RendererSettingsV1 } from '../../src/lib/generated/ipc';
 
 const invokeMock = vi.mocked(invoke);
+
+function rendererSettings(overrides: Partial<RendererSettingsV1> = {}): RendererSettingsV1 {
+  return {
+    asr_model_size: 'WSL7B',
+    use_finetuned_asr: false,
+    vad_threshold: 0.5,
+    min_segment_duration_ms: 3000,
+    max_segment_duration_ms: 15000,
+    num_asr_threads: 4,
+    enable_gpu: true,
+    language: 'ckb',
+    export_format: 'Json',
+    auto_normalize: true,
+    verbalize_numbers: true,
+    auto_align: false,
+    assign_speaker_from_filename: true,
+    enable_diarization: true,
+    enable_denoising: false,
+    autoplay_segments: false,
+    max_speakers: 8,
+    max_wer_threshold: 0.35,
+    max_cer_threshold: 0.2,
+    enforce_quality_gates: false,
+    theme: 'Dark',
+    llm_mode: 'None',
+    llm_endpoint: 'http://127.0.0.1:11434/v1/chat/completions',
+    llm_api_key_configured: false,
+    cloud_llm_opt_in: false,
+    llm_system_prompt: defaultSettings.llmSystemPrompt,
+    llm_model: 'heretic-final:latest',
+    external_asr_script_path: '',
+    hf_train_ratio: 0.8,
+    hf_val_ratio: 0.1,
+    hf_test_ratio: 0.1,
+    hf_split_seed: 42,
+    hf_speaker_disjoint: true,
+    hf_license: 'mit',
+    jury_cloud_opt_in: false,
+    jury_model: 'gemini-2.5-pro',
+    jury_provider: 'gemini',
+    source_reference_models: ['gemini-2.5-pro'],
+    jury_self_consistency_n: 3,
+    jury_autonomy_level: 'propose',
+    jury_t1_threshold: 0.75,
+    ...overrides,
+  };
+}
 
 describe('7B-champion-unavailable detection (never silently downgrade)', () => {
   it('matches the sentinel whether the error is a bare string or an Error object', () => {
@@ -29,6 +85,148 @@ describe('7B-champion-unavailable detection (never silently downgrade)', () => {
     expect(is7bUnavailableError(new Error('ONNX inference failed'))).toBe(false);
     expect(is7bUnavailableError(null)).toBe(false);
     expect(is7bUnavailableError(undefined)).toBe(false);
+  });
+});
+
+describe('revision-guarded generated settings contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('loads settings and their opaque revision in one generated snapshot', async () => {
+    invokeMock.mockResolvedValueOnce({ settingsRevision: 101, settings: rendererSettings() });
+
+    await expect(getSettings()).resolves.toMatchObject(defaultSettings);
+    expect(invokeMock).toHaveBeenCalledWith('get_settings_v1');
+  });
+
+  it('writes only changed non-secret preference fields against the loaded revision', async () => {
+    const initial = rendererSettings();
+    const committed = rendererSettings({ autoplay_segments: true });
+    invokeMock
+      .mockResolvedValueOnce({ settingsRevision: 201, settings: initial })
+      .mockResolvedValueOnce({
+        settingsRevision: 202,
+        settings: committed,
+        alreadyApplied: false,
+      });
+
+    const loaded = await getSettings();
+    await updateSettings({
+      ...loaded,
+      autoplaySegments: true,
+      llmApiKey: 'must-use-the-secret-command',
+    });
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['get_settings_v1'],
+      [
+        'patch_settings_v1',
+        {
+          patch: {
+            expectedSettingsRevision: 201,
+            changedFields: { autoplay_segments: true },
+          },
+        },
+      ],
+    ]);
+  });
+
+  it('keeps consent out of the generic patch and grants only after preferences persist', async () => {
+    const initial = rendererSettings();
+    const preferences = rendererSettings({ autoplay_segments: true });
+    const granted = rendererSettings({
+      autoplay_segments: true,
+      cloud_llm_opt_in: true,
+    });
+    invokeMock
+      .mockResolvedValueOnce({ settingsRevision: 301, settings: initial })
+      .mockResolvedValueOnce({
+        settingsRevision: 302,
+        settings: preferences,
+        alreadyApplied: false,
+      })
+      .mockResolvedValueOnce({
+        settingsRevision: 303,
+        settings: granted,
+        alreadyApplied: false,
+      });
+
+    const loaded = await getSettings();
+    await updateSettings({ ...loaded, autoplaySegments: true, cloudLlmOptIn: true });
+
+    expect(invokeMock.mock.calls.slice(1)).toEqual([
+      [
+        'patch_settings_v1',
+        {
+          patch: {
+            expectedSettingsRevision: 301,
+            changedFields: { autoplay_segments: true },
+          },
+        },
+      ],
+      [
+        'set_cloud_consent_v1',
+        {
+          request: { expectedSettingsRevision: 302, consent: 'llm', granted: true },
+        },
+      ],
+    ]);
+  });
+
+  it('replays a transport-uncertain patch once with the byte-identical CAS payload', async () => {
+    const initial = rendererSettings();
+    const committed = rendererSettings({ autoplay_segments: true });
+    invokeMock
+      .mockResolvedValueOnce({ settingsRevision: 401, settings: initial })
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValueOnce({
+        settingsRevision: 402,
+        settings: committed,
+        alreadyApplied: true,
+      });
+
+    const loaded = await getSettings();
+    await updateSettings({ ...loaded, autoplaySegments: true });
+
+    expect(invokeMock).toHaveBeenCalledTimes(3);
+    expect(invokeMock.mock.calls[2]).toEqual(invokeMock.mock.calls[1]);
+  });
+
+  it('never retries a structured stale refusal and attaches fresh server truth for rollback', async () => {
+    const initial = rendererSettings();
+    const authoritative = rendererSettings({ jury_autonomy_level: 'act_confirm' });
+    const stale = {
+      schema: 1,
+      code: 'STALE_SETTINGS_REVISION',
+      message: 'reload',
+      retryable: false,
+      suggestedAction: null,
+      operationId: null,
+      details: { expectedSettingsRevision: 501, currentSettingsRevision: 502 },
+    };
+    invokeMock
+      .mockResolvedValueOnce({ settingsRevision: 501, settings: initial })
+      .mockRejectedValueOnce(stale)
+      .mockResolvedValueOnce({ settingsRevision: 502, settings: authoritative });
+
+    const loaded = await getSettings();
+    let failure: unknown;
+    try {
+      await updateSettings({ ...loaded, autoplaySegments: true });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+      'get_settings_v1',
+      'patch_settings_v1',
+      'get_settings_v1',
+    ]);
+    expect(authoritativeSettingsFromWriteError(failure)).toMatchObject({
+      juryAutonomyLevel: 'act_confirm',
+      autoplaySegments: false,
+    });
   });
 });
 
@@ -62,43 +260,90 @@ describe('commands audio export contract', () => {
   });
 });
 
+describe('opaque voice-focus review contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('discovers only the renderer-safe focus identity and cardinality', async () => {
+    const active = { focusId: `vf1_${'a'.repeat(64)}`, segmentCount: 2 };
+    invokeMock.mockResolvedValueOnce(active);
+
+    await expect(getActiveVoiceFocusV1()).resolves.toEqual(active);
+    expect(invokeMock).toHaveBeenCalledWith('get_active_voice_focus_v1');
+  });
+
+  it('binds review paging to the exact discovered identity without a legacy invoke path', async () => {
+    const focusId = `vf1_${'b'.repeat(64)}`;
+    const page = {
+      items: [],
+      total: 0,
+      nextCursor: null,
+      scopeLabel: 'voiceFocus',
+      focusNarrowed: true,
+    };
+    invokeMock.mockResolvedValueOnce(page);
+
+    await expect(getVoiceFocusReviewPageV1(focusId, 'cursor_1', 25)).resolves.toEqual(page);
+    expect(invokeMock).toHaveBeenCalledWith('get_review_page_v1', {
+      scope: { kind: 'voiceFocus', focusId },
+      limit: 25,
+      cursor: 'cursor_1',
+    });
+  });
+
+  it('preserves the structured stale-policy refusal without retry or string fallback', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'STALE_VOICE_FOCUS',
+      message: 'reload',
+      retryable: false,
+      suggestedAction: 'reloadClip',
+      operationId: null,
+      details: {},
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(getVoiceFocusReviewPageV1(`vf1_${'c'.repeat(64)}`)).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('desktop playback cancellation contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('sends the exact receipt and client-attempt identities and preserves the idempotent result', async () => {
+    invokeMock.mockResolvedValueOnce(false);
+
+    await expect(
+      cancelDesktopPlaybackSessionV1(
+        '11111111-1111-4111-8111-111111111111',
+        '22222222-2222-4222-8222-222222222222',
+      ),
+    ).resolves.toBe(false);
+    expect(invokeMock).toHaveBeenCalledWith('cancel_desktop_playback_session_v1', {
+      playbackReceiptId: '11111111-1111-4111-8111-111111111111',
+      clientAttemptId: '22222222-2222-4222-8222-222222222222',
+    });
+  });
+});
+
 describe('desktop review decision idempotency', () => {
   beforeEach(() => {
     invokeMock.mockReset();
   });
 
-  it('replays one uncertain invoke with the exact same operation identity and payload', async () => {
-    const commit = {
-      effectEventId: 41,
-      segmentId: 'segment-1',
-      effectiveAction: 'edit',
-      priorRevision: 3,
-      decidedRevision: 4,
-      segment: { id: 'segment-1' },
-    };
-    invokeMock
-      .mockRejectedValueOnce(new Error('transport response lost'))
-      .mockResolvedValueOnce(commit);
-
-    await expect(recordHumanDecision('segment-1', 'edit', 'دەقی ڕاست', 1_777_000)).resolves.toBe(
-      commit,
-    );
-
-    expect(invokeMock).toHaveBeenCalledTimes(2);
-    const first = invokeMock.mock.calls[0];
-    const second = invokeMock.mock.calls[1];
-    expect(first[0]).toBe('record_human_decision');
-    expect(second[0]).toBe('record_human_decision');
-    expect(second[1]).toEqual(first[1]);
-    expect(first[1]).toMatchObject({
-      segmentId: 'segment-1',
-      decision: 'edit',
-      correctedTranscript: 'دەقی ڕاست',
-      timestampMs: 1_777_000,
-      operationId: expect.stringMatching(
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-      ),
+  it('fails closed locally instead of invoking the retired ambient-receipt writer', async () => {
+    await expect(
+      recordHumanDecision('segment-1', 'edit', 'دەقی ڕاست', 1_777_000),
+    ).rejects.toMatchObject({
+      schema: 1,
+      code: 'TYPED_REVIEW_REQUIRED',
+      retryable: false,
     });
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
 
@@ -110,7 +355,7 @@ describe('typed desktop review decision idempotency', () => {
     decision: 'edit' as const,
     transcript: 'دەقی ڕاست',
     reasonCode: null,
-    playbackReceiptId: null,
+    playbackReceiptId: '77777777-7777-4777-8777-777777777777',
   };
 
   beforeEach(() => {
@@ -164,10 +409,15 @@ describe('revision-bound desktop review drafts', () => {
       text: 'دەقی ناتەواو',
       updatedAt: '2026-08-25T12:00:00.000Z',
     };
-    invokeMock.mockResolvedValueOnce(draft).mockResolvedValueOnce(draft).mockResolvedValueOnce(true);
+    invokeMock
+      .mockResolvedValueOnce(draft)
+      .mockResolvedValueOnce(draft)
+      .mockResolvedValueOnce(true);
 
     await expect(getReviewDraftV1(draft.segmentId)).resolves.toEqual(draft);
-    await expect(saveReviewDraftV1(draft.segmentId, draft.baseRevision, draft.text)).resolves.toEqual(draft);
+    await expect(
+      saveReviewDraftV1(draft.segmentId, draft.baseRevision, draft.text),
+    ).resolves.toEqual(draft);
     await expect(deleteReviewDraftV1(draft.segmentId, draft.baseRevision)).resolves.toBe(true);
 
     expect(invokeMock.mock.calls).toEqual([
@@ -176,10 +426,7 @@ describe('revision-bound desktop review drafts', () => {
         'save_review_draft_v1',
         { segmentId: draft.segmentId, baseRevision: draft.baseRevision, text: draft.text },
       ],
-      [
-        'delete_review_draft_v1',
-        { segmentId: draft.segmentId, baseRevision: draft.baseRevision },
-      ],
+      ['delete_review_draft_v1', { segmentId: draft.segmentId, baseRevision: draft.baseRevision }],
     ]);
   });
 
@@ -195,6 +442,52 @@ describe('revision-bound desktop review drafts', () => {
     invokeMock.mockRejectedValueOnce(refusal);
 
     await expect(saveReviewDraftV1('segment-draft', 9, 'text')).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('typed technical-unusable idempotency', () => {
+  const request = {
+    operationId: '55555555-5555-4555-8555-555555555555',
+    segmentId: 'segment-unusable',
+    baseRevision: 12,
+    reason: 'corruptContainer' as const,
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('replays one transport uncertainty with the exact same closed reason and operation id', async () => {
+    const committed = {
+      segmentId: request.segmentId,
+      committedRevision: 13,
+      reason: request.reason,
+      effectId: 'flag-effect:72',
+    };
+    invokeMock
+      .mockRejectedValueOnce(new Error('transport response lost'))
+      .mockResolvedValueOnce(committed);
+
+    await expect(markSegmentUnusableV1(request)).resolves.toEqual(committed);
+
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock.mock.calls[0]).toEqual(['mark_segment_unusable_v1', { request }]);
+    expect(invokeMock.mock.calls[1]).toEqual(invokeMock.mock.calls[0]);
+  });
+
+  it('never retries a structured revision refusal', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'STALE_REVISION',
+      message: 'reload this clip',
+      retryable: false,
+      suggestedAction: 'reloadClip',
+      operationId: request.operationId,
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(markSegmentUnusableV1(request)).rejects.toBe(refusal);
     expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 });

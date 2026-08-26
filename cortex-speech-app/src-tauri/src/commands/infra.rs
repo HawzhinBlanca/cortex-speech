@@ -8,10 +8,11 @@
 //! cache info + clear, fingerprint count, session save/restore, couch-review start/stop, transcript
 //! diff, and the telemetry span/stat readers.
 
-use super::{RATE_LIMITER, STRICT_RATE_LIMITER};
+use super::{run_blocking, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::diff::TextDiff;
 use crate::validation::input as validate;
 use crate::AppState;
+use std::sync::Arc;
 use tauri::State;
 
 /// Return a one-line summary of the most recent crash report (if the last session panicked), surfaced
@@ -24,39 +25,58 @@ pub fn take_last_crash(state: State<'_, AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-// ponytail: `async fn` moves the whole body (incl. the multi-GB cache copy in grant_source) OFF the
-// main/UI thread, which fixes the freeze. It runs on an async worker rather than a spawn_blocking
-// pool because grant_source holds the media-registry MutexGuard across the copy (not Send-movable);
-// a full spawn_blocking offload needs MediaRegistry restructured into check→copy→record phases (or an
-// Arc handle) — deferred. There is no `.await` in the body, so the guard never crosses a suspend
-// point and the future stays Send.
-#[allow(clippy::unused_async)]
 pub async fn register_media_asset(
     audio_path: String,
     state: State<'_, AppState>,
 ) -> Result<crate::media::MediaGrant, String> {
     RATE_LIMITER.check("register_media_asset")?;
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let mut registry = state.lock_media_registry();
-    // Round-25 #7: validate the source (membership check) under a SHORT-LIVED global db lock (fast),
-    // then DROP that lock before the potentially multi-GB cache copy in grant_source — holding the
-    // global db mutex across std::fs::copy froze every other DB-touching IPC (notably the UI's
-    // get_segments) for the length of the copy the first time a large clip was played. The
-    // media-registry lock is held throughout (only media commands take it), so this never deadlocks
-    // with the db lock.
+    // Ordinary Library/curation playback needs only imported-file membership. Legacy schema-65 rows
+    // with a missing identity remain playable here because this grant can never authorize a review
+    // decision: playback_binding rejects unverified grants. Keep the stronger proof path separate.
     let canonical = {
         let db = state.lock_db();
-        registry.validate_source(&db, &audio_path)?
+        crate::media::MediaRegistry::ensure_imported(&db, &audio_path)?
     };
-    registry.grant_source(&data_dir, canonical)
+    let registry = Arc::clone(&state.media_registry);
+    let materializer = Arc::clone(&state.media_materializer);
+    run_blocking(move || materializer.register_unverified(&registry, &data_dir, std::path::PathBuf::from(canonical)))
+        .await
+}
+
+/// Mint the immutable, decoded-PCM-verified grant required by the policy-4 review boundary. This is
+/// intentionally separate from ordinary media playback so a legacy/null fingerprint cannot break
+/// Library listening, while it still fails closed before any human-truth write is possible.
+#[tauri::command]
+pub async fn register_review_media_asset(
+    audio_path: String,
+    state: State<'_, AppState>,
+) -> Result<crate::media::MediaGrant, String> {
+    STRICT_RATE_LIMITER.check("register_review_media_asset")?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    // Capture authority under a short DB lock, then release it before the potentially multi-GB copy
+    // and PCM decode. Never acquire registry -> DB: session commands deliberately lease registry
+    // state first and release it before entering the database transaction.
+    let source = {
+        let db = state.lock_db();
+        crate::media::MediaRegistry::validate_playback_source(&db, &audio_path)?
+    };
+    let registry = Arc::clone(&state.media_registry);
+    let materializer = Arc::clone(&state.media_materializer);
+    run_blocking(move || materializer.register_verified(&registry, &data_dir, source)).await
 }
 
 #[tauri::command]
 pub fn get_media_asset_url(id: String, state: State<'_, AppState>) -> Result<String, String> {
     RATE_LIMITER.check("get_media_asset_url")?;
     validate::validate_identifier(&id)?;
-    let mut registry = state.lock_media_registry();
-    registry.resolve(&id)
+    let (result, retired) = {
+        let mut registry = state.lock_media_registry();
+        let result = registry.resolve(&id);
+        (result, registry.take_retired_artifacts())
+    };
+    crate::media::cleanup_retired_media_artifacts(retired, "expired media grant");
+    result
 }
 
 #[tauri::command]

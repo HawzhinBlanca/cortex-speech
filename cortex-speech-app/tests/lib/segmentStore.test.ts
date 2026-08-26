@@ -16,6 +16,7 @@ import {
   libraryLoadError,
 } from '../../src/lib/stores/segmentStore';
 import type { SpeechSegment } from '../../src/lib/types';
+import { locale } from '../../src/lib/i18n';
 
 const invokeMock = vi.mocked(invoke);
 
@@ -37,7 +38,11 @@ function fakeBackend(total: number) {
     const count = Math.max(0, Math.min(a.limit, total - offset));
     const items = Array.from({ length: count }, (_, k) => makeSeg(String(offset + k)));
     const nextOffset = offset + items.length;
-    return Promise.resolve({ items, total, nextCursor: nextOffset < total ? String(nextOffset) : null });
+    return Promise.resolve({
+      items,
+      total,
+      nextCursor: nextOffset < total ? String(nextOffset) : null,
+    });
   };
 }
 
@@ -58,6 +63,7 @@ function makeSeg(id: string, overrides: Partial<SpeechSegment> = {}): SpeechSegm
 
 describe('segmentStore', () => {
   beforeEach(() => {
+    locale.set('en');
     segments.set([]);
     selectedSegmentId.set(null);
     filterVerified.set(null);
@@ -130,8 +136,8 @@ describe('segmentStore', () => {
     segments.set(original);
     sortOrder.set('oldest');
     get(filteredSegments);
-    expect(get(segments).map(s => s.id)).toEqual(['c', 'a', 'b']);
-    expect(original.map(s => s.id)).toEqual(['c', 'a', 'b']);
+    expect(get(segments).map((s) => s.id)).toEqual(['c', 'a', 'b']);
+    expect(original.map((s) => s.id)).toEqual(['c', 'a', 'b']);
   });
 
   it('keeps corpus stats independent from the bounded row window', async () => {
@@ -163,6 +169,22 @@ describe('segmentStore', () => {
       expect((pageCalls[1][1] as { cursor: string | null }).cursor).toBe('200');
     });
 
+    it('retains at most three pages while continuing the forward keyset walk', async () => {
+      invokeMock.mockImplementation(fakeBackend(1_000) as typeof invoke);
+      await segments.load();
+      await segments.loadMore();
+      await segments.loadMore();
+      expect(get(segments)).toHaveLength(600);
+
+      await segments.loadMore();
+      const resident = get(segments);
+      expect(resident).toHaveLength(600);
+      expect(resident[0].id).toBe('200');
+      expect(resident.at(-1)?.id).toBe('799');
+      expect(get(libraryTotal)).toBe(1_000);
+      expect(get(libraryTruncated)).toBe(true);
+    });
+
     it('loads exactly the last partial page and stops', async () => {
       invokeMock.mockImplementation(fakeBackend(11) as typeof invoke);
       await segments.load();
@@ -189,14 +211,15 @@ describe('segmentStore', () => {
 
     it('surfaces a load FAILURE as a distinct error state, not an empty library, and clears it on retry', async () => {
       // P2.1 (audit F1): a DB/IPC read failure must NEVER be indistinguishable from an empty/wiped
-      // library. load() must set libraryLoadError (the backend message) instead of swallowing it, so
+      // library. load() must set libraryLoadError (localized public text) instead of swallowing it, so
       // the empty view renders "load failed + Retry". A subsequent successful load must clear it.
       invokeMock.mockImplementation(((command: string) => {
         if (command === 'get_dataset_certificate') return Promise.resolve({ threshold: 0.35 });
         return Promise.reject(new Error('database is locked'));
       }) as typeof invoke);
       await segments.load();
-      expect(get(libraryLoadError)).toBe('database is locked');
+      expect(get(libraryLoadError)).toContain('unexpected error');
+      expect(get(libraryLoadError)).not.toContain('database is locked');
       expect(get(segments)).toHaveLength(0); // still empty, but the view now knows WHY
 
       // Retry succeeds -> the error state clears so the view leaves the error branch.

@@ -42,6 +42,16 @@ impl JobStore {
         self.lock("begin_import").begin_import_job(directory, total_files)
     }
 
+    pub(crate) fn handoff_import_for_resume(&self, prior_job_id: &str) -> AppResult<String> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("handoff_import_for_resume").handoff_import_job_for_resume(prior_job_id)
+    }
+
+    pub(crate) fn continue_import(&self, job_id: &str, directory: &str, total_files: usize) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("continue_import").continue_import_job(job_id, directory, total_files)
+    }
+
     pub(crate) fn mark_import_file_done(&self, job_id: &str, path: &str) -> AppResult<()> {
         let _mutation = begin_mutation().map_err(AppError::Other)?;
         self.lock("mark_import_file_done").mark_import_file_done(job_id, path)
@@ -190,6 +200,23 @@ mod tests {
 
         store.complete_import(&job_id).unwrap();
         assert!(store.find_interrupted_import().unwrap().is_none());
+    }
+
+    #[test]
+    fn resume_handoff_and_worker_admission_stay_serialized_through_the_store() {
+        let (_directory, store) = store_with_jobs();
+        let crashed = store.find_interrupted_import().unwrap().unwrap();
+        let successor = store.handoff_import_for_resume(&crashed.id).unwrap();
+
+        let claimed = store.find_interrupted_import().unwrap().expect("successor is the sole resume authority");
+        assert_eq!(claimed.id, successor);
+        assert_eq!(claimed.completed_paths, crashed.completed_paths);
+
+        store.continue_import(&successor, "C:/audio", 5).unwrap();
+        let admitted = store.find_interrupted_import().unwrap().unwrap();
+        assert_eq!(admitted.id, successor);
+        assert_eq!(admitted.total_files, 5);
+        assert!(store.continue_import(&successor, "C:/other", 5).is_err(), "directory drift must fail closed");
     }
 
     #[test]

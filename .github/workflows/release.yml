@@ -1,7 +1,7 @@
 name: Release
 
 # Lives at the repo root so GitHub Actions discovers it. The Tauri app is in the
-# cortex-speech-app/ subdirectory, so the matrix job sets
+# cortex-speech-app/ subdirectory, so the Windows build job sets
 # defaults.run.working-directory: cortex-speech-app for its shell steps. The
 # setup-node cache-dependency-path and the artifact/release globs are resolved
 # relative to the workspace (they do NOT honor that default), so they carry
@@ -10,26 +10,192 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact existing draft release tag to promote
+        required: true
+        type: string
+      proof_run_id:
+        description: Workflow run containing the exact windows-product proof artifact
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+  rust-coverage-prerequisite:
+    if: github.event_name == 'push'
+    name: Rust Coverage Prerequisite
+    runs-on: windows-latest
+    timeout-minutes: 150
     defaults:
       run:
         working-directory: cortex-speech-app
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cortex-speech-app/package-lock.json
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install exact nightly used only for branch coverage
+        run: rustup toolchain install nightly-2026-07-11 --profile minimal --component llvm-tools-preview
+      - name: Cache exact Rust dependency inputs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cortex-speech-app/src-tauri/target
+          key: release-coverage-cargo-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock', 'cortex-speech-app/scripts/rust_coverage_toolchain.json') }}
+      - name: Install pinned coverage tool
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+      - name: Provision locked build inputs
+        run: |
+          npm ci
+          npm run fetch-models
+          npm run build
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+      - name: Run separately supervised, no-retry coverage authority
+        run: python "${{ github.workspace }}/scripts/verify_10.py" --rust-coverage-prerequisite
+
+  build:
+    if: github.event_name == 'push' && needs.rust-coverage-prerequisite.result == 'success'
+    needs: rust-coverage-prerequisite
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    # Public product contract: Windows 11 x64 only. Cross-platform source smoke tests live in CI;
+    # release jobs must not manufacture unsupported macOS/Linux bundles or imply support.
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: cortex-speech-app
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify signed release tag, version, and protected-main ancestry
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # GitHub omits bypass_actors unless the caller can write the ruleset. A dedicated,
+          # repository-scoped token keeps that proof separate from the normal read-only job token.
+          RULESET_AUDIT_TOKEN: ${{ secrets.RULESET_AUDIT_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_REF_TYPE -ne 'tag' -or $tag -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Release refs must be stable semantic-version tags (vMAJOR.MINOR.PATCH)."
+          }
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($tag -ne "v$packageVersion") {
+            throw "Release tag $tag does not match package version $packageVersion."
+          }
+
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $encodedTag = [Uri]::EscapeDataString($tag)
+          $tagRef = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$encodedTag"
+          if ($tagRef.object.type -ne 'tag') {
+            throw "Lightweight release tags are forbidden; $tag must be an annotated signed tag."
+          }
+          $tagObject = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagRef.object.sha)"
+          if ($tagObject.tag -ne $tag -or $tagObject.object.type -ne 'commit') {
+            throw "Release tag identity is indirect or disagrees with the triggering ref."
+          }
+          if ($tagObject.verification.verified -ne $true -or $tagObject.verification.reason -ne 'valid' -or -not $tagObject.verification.verified_at) {
+            throw "GitHub did not cryptographically verify the annotated release tag signature."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RULESET_AUDIT_TOKEN)) {
+            throw "RULESET_AUDIT_TOKEN is required because the normal workflow token cannot prove that bypass actors are absent."
+          }
+          $rulesetHeaders = $headers.Clone()
+          $rulesetHeaders.Authorization = "Bearer $env:RULESET_AUDIT_TOKEN"
+          $rulesetSummaries = @(Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=tag")
+          $protectedByActiveRuleset = $false
+          foreach ($summary in $rulesetSummaries) {
+            $ruleset = Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets/$($summary.id)"
+            $bypassProperty = $ruleset.PSObject.Properties['bypass_actors']
+            if ($null -eq $bypassProperty) {
+              throw "Ruleset $($summary.id) did not disclose bypass_actors; refusing to treat hidden authority as an empty bypass list."
+            }
+            $includes = @($ruleset.conditions.ref_name.include)
+            $excludes = @($ruleset.conditions.ref_name.exclude)
+            $bypassActors = @($bypassProperty.Value)
+            $ruleTypes = @($ruleset.rules | ForEach-Object { $_.type })
+            if ($ruleset.target -eq 'tag' -and $ruleset.enforcement -eq 'active' -and
+                $includes -contains 'refs/tags/v*' -and $excludes.Count -eq 0 -and $bypassActors.Count -eq 0 -and
+                $ruleTypes -contains 'deletion' -and $ruleTypes -contains 'non_fast_forward') {
+              $protectedByActiveRuleset = $true
+            }
+          }
+          if (-not $protectedByActiveRuleset) {
+            throw "No active, exclusion-free, no-bypass v* tag ruleset blocks release-tag deletion and updates."
+          }
+          $repository = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          if ($repository.default_branch -ne 'main') {
+            throw "The release contract requires main to be the repository default branch."
+          }
+          $branchRulesetSummaries = @(Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=branch")
+          $protectedMain = $false
+          foreach ($summary in $branchRulesetSummaries) {
+            $ruleset = Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets/$($summary.id)"
+            $bypassProperty = $ruleset.PSObject.Properties['bypass_actors']
+            if ($null -eq $bypassProperty) {
+              throw "Branch ruleset $($summary.id) did not disclose bypass_actors; protected-main authority is unprovable."
+            }
+            $includes = @($ruleset.conditions.ref_name.include)
+            $excludes = @($ruleset.conditions.ref_name.exclude)
+            $bypassActors = @($bypassProperty.Value)
+            $ruleTypes = @($ruleset.rules | ForEach-Object { $_.type })
+            $pullRequestRule = @($ruleset.rules | Where-Object { $_.type -eq 'pull_request' }) | Select-Object -First 1
+            $statusChecksRule = @($ruleset.rules | Where-Object { $_.type -eq 'required_status_checks' }) | Select-Object -First 1
+            $requiredStatusContexts = @($statusChecksRule.parameters.required_status_checks | ForEach-Object { $_.context })
+            $coversMain = $includes -contains 'refs/heads/main' -or $includes -contains '~DEFAULT_BRANCH'
+            if ($ruleset.target -eq 'branch' -and $ruleset.enforcement -eq 'active' -and $coversMain -and
+                $excludes.Count -eq 0 -and $bypassActors.Count -eq 0 -and
+                $ruleTypes -contains 'deletion' -and $ruleTypes -contains 'non_fast_forward' -and
+                $ruleTypes -contains 'required_signatures' -and $null -ne $pullRequestRule -and
+                $pullRequestRule.parameters.required_approving_review_count -ge 1 -and
+                $pullRequestRule.parameters.dismiss_stale_reviews_on_push -eq $true -and
+                $pullRequestRule.parameters.require_last_push_approval -eq $true -and
+                $pullRequestRule.parameters.required_review_thread_resolution -eq $true -and
+                $null -ne $statusChecksRule -and
+                $statusChecksRule.parameters.strict_required_status_checks_policy -eq $true -and
+                $requiredStatusContexts -contains 'Provenance & License Gate' -and
+                $requiredStatusContexts -contains 'Windows Release Gate') {
+              $protectedMain = $true
+            }
+          }
+          if (-not $protectedMain) {
+            throw "No active, exclusion-free, no-bypass main ruleset proves signed commits, reviewed pull requests, strict status checks, and immutable history."
+          }
+          $head = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $tagObject.object.sha.ToLowerInvariant() -ne $head -or $env:GITHUB_SHA.ToLowerInvariant() -ne $head) {
+            throw "The signed tag, checked-out commit, and workflow commit are not the same object."
+          }
+          git merge-base --is-ancestor $head origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "The signed release commit is not reachable from protected main."
+          }
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
@@ -40,17 +206,10 @@ jobs:
           cache-dependency-path: cortex-speech-app/package-lock.json
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.12' }
-      - if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
-      - if: startsWith(matrix.os, 'macos')
-        run: brew install gtk+3
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.19.8 --locked
       - run: npm ci
-      - if: startsWith(matrix.os, 'ubuntu')
-        run: npx playwright install --with-deps chromium
-      - if: ${{ !startsWith(matrix.os, 'ubuntu') }}
-        run: npx playwright install chromium
+      - run: npx playwright install chromium
       # Runtime support AND a built dist/ must exist BEFORE any cargo step: build.rs -> tauri-build
       # validates bundle.resources (models/silero_vad_v4.onnx, ...) and tauri::generate_context!
       # (compiled by clippy and cargo test below) requires build.frontendDist ("../dist"). This is
@@ -68,77 +227,519 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run test:python-policies
+      - name: Fail-closed Rust production-module architecture
+        run: python scripts/rust_quality_gate.py architecture
       - run: npm run lint
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
       - run: npm run test:e2e
       - run: npm audit --omit=dev
       - run: npm ls --all
       - run: cargo deny --manifest-path src-tauri/Cargo.toml check
-      - name: Build Tauri app
-        run: npm run tauri build
-      - name: Code-sign and verify Windows installers (Authenticode)
-        if: runner.os == 'Windows'
+      # The executable must be signed BEFORE Tauri packages it. Signing only the outer MSI/NSIS
+      # leaves the installed application unsigned even though both downloads look signed.
+      - name: Build Tauri executable without bundling
+        run: npm run tauri build -- --no-bundle
+      - name: Sign executable, bundle it, then sign Windows installers
         shell: pwsh
         env:
           WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+          WINDOWS_CERT_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
+          WINDOWS_CERT_SHA256: ${{ secrets.WINDOWS_CERT_SHA256 }}
         run: |
-          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PASSWORD) {
-            throw "Public releases require WINDOWS_CERT_BASE64 and WINDOWS_CERT_PASSWORD; refusing to publish unsigned Windows installers."
+          if (-not $env:WINDOWS_CERT_BASE64 -or -not $env:WINDOWS_CERT_PASSWORD -or
+              -not $env:WINDOWS_CERT_THUMBPRINT -or -not $env:WINDOWS_CERT_SHA256) {
+            throw "Public releases require the PFX, password, SHA-1 thumbprint, and SHA-256 certificate fingerprint; refusing to publish unsigned or wrong-publisher Windows installers."
+          }
+          $expectedThumbprint = ($env:WINDOWS_CERT_THUMBPRINT -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+          if ($expectedThumbprint -notmatch '^[0-9A-F]{40}$') {
+            throw "WINDOWS_CERT_THUMBPRINT must be one exact SHA-1 certificate thumbprint (40 hex characters)."
+          }
+          $expectedCertificateSha256 = ($env:WINDOWS_CERT_SHA256 -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+          if ($expectedCertificateSha256 -notmatch '^[0-9A-F]{64}$') {
+            throw "WINDOWS_CERT_SHA256 must be the exact SHA-256 fingerprint of the DER signer certificate (64 hex characters)."
           }
           $pfx = Join-Path $env:RUNNER_TEMP cert.pfx
           try {
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
             $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
             if (-not $st) { throw "signtool.exe was not found" }
-            $installers = @(Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.msi,*-setup.exe)
-            if ($installers.Count -eq 0) { throw "Tauri produced no Windows installers to sign" }
-            foreach ($f in $installers) {
+            $app = Get-Item "src-tauri/target/release/cortex-speech-app.exe"
+            & $st sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $app.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing failed for $($app.Name)" }
+            & $st verify /pa /all /v /tw $app.FullName
+            if ($LASTEXITCODE -ne 0) { throw "verify failed for $($app.Name)" }
+
+            npm run tauri bundle -- --bundles msi,nsis
+            if ($LASTEXITCODE -ne 0) { throw "Tauri installer bundling failed" }
+            $msi = @(Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File -Filter *.msi)
+            $nsis = @(Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File -Filter *-setup.exe)
+            if ($msi.Count -ne 1 -or $nsis.Count -ne 1) {
+              throw "Tauri must produce exactly one MSI and one NSIS setup executable; found MSI=$($msi.Count), NSIS=$($nsis.Count)."
+            }
+            $signedFiles = @($app) + @($msi + $nsis)
+            foreach ($f in @($msi + $nsis)) {
               & $st sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $f.FullName
               if ($LASTEXITCODE -ne 0) { throw "signing failed for $($f.Name)" }
-              & $st verify /pa $f.FullName
+            }
+            foreach ($f in $signedFiles) {
+              & $st verify /pa /all /v /tw $f.FullName
               if ($LASTEXITCODE -ne 0) { throw "verify failed for $($f.Name)" }
+              $signature = Get-AuthenticodeSignature -LiteralPath $f.FullName
+              $actualThumbprint = (($signature.SignerCertificate.Thumbprint) -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+              $actualCertificateSha256 = [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData($signature.SignerCertificate.RawData)
+              )
+              if ($signature.Status -ne 'Valid' -or $actualThumbprint -ne $expectedThumbprint -or
+                  $actualCertificateSha256 -ne $expectedCertificateSha256) {
+                throw "Authenticode publisher identity is invalid or unexpected for $($f.Name)."
+              }
               Write-Output "signed + verified: $($f.Name)"
+            }
+
+            $stage = 'src-tauri/target/release/release-bundle'
+            if (Test-Path -LiteralPath $stage) {
+              Remove-Item -LiteralPath $stage -Recurse -Force
+            }
+            New-Item -ItemType Directory -Path $stage | Out-Null
+            Copy-Item -LiteralPath $app.FullName -Destination (Join-Path $stage 'cortex-speech-app.exe')
+            Copy-Item -LiteralPath $msi[0].FullName -Destination $stage
+            Copy-Item -LiteralPath $nsis[0].FullName -Destination $stage
+            # Safe today (zero files because createUpdaterArtifacts=false), but exact pairing is
+            # ready for the future approved updater. A half-pair is never staged.
+            $updaterArchives = @(Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File | Where-Object { $_.Name -match '\.(nsis|msi)\.zip$' })
+            $updaterSignatures = @(Get-ChildItem "src-tauri/target/release/bundle" -Recurse -File | Where-Object { $_.Name -match '\.(nsis|msi)\.zip\.sig$' })
+            if ($updaterArchives.Count -ne $updaterSignatures.Count -or $updaterArchives.Count -gt 1) {
+              throw "Updater output must be absent or exactly one archive/signature pair."
+            }
+            if ($updaterArchives.Count -eq 1) {
+              Copy-Item -LiteralPath $updaterArchives[0].FullName -Destination $stage
+              Copy-Item -LiteralPath $updaterSignatures[0].FullName -Destination $stage
             }
           } finally {
             Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           }
+      - name: Record exact release build environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rustcVersion = (& rustc -Vv | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "rustc version probe failed" }
+          $cargoVersion = (& cargo --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "cargo version probe failed" }
+          $nodeVersion = (& node --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Node version probe failed" }
+          $npmVersion = (& npm --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "npm version probe failed" }
+          $pythonVersion = (& python --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Python version probe failed" }
+          $tauriVersion = (& npx --no-install tauri --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Tauri CLI version probe failed" }
+          $head = (& git rev-parse HEAD | Out-String).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+            throw "release environment source identity disagrees with the workflow SHA"
+          }
+          $environment = [ordered]@{
+            schema = 1
+            source = [ordered]@{
+              repository = $env:GITHUB_REPOSITORY
+              gitSha = $head
+              ref = $env:GITHUB_REF
+              workflow = "$env:GITHUB_REPOSITORY/.github/workflows/release.yml"
+            }
+            runner = [ordered]@{
+              os = $env:RUNNER_OS
+              arch = $env:RUNNER_ARCH
+              imageOs = $env:ImageOS
+              imageVersion = $env:ImageVersion
+              osVersion = [Environment]::OSVersion.VersionString
+            }
+            tools = [ordered]@{
+              rustc = $rustcVersion
+              cargo = $cargoVersion
+              node = $nodeVersion
+              npm = $npmVersion
+              python = $pythonVersion
+              tauriCli = $tauriVersion
+            }
+            inputs = [ordered]@{
+              packageLockSha256 = (Get-FileHash package-lock.json -Algorithm SHA256).Hash.ToLowerInvariant()
+              cargoLockSha256 = (Get-FileHash src-tauri/Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
+              releaseWorkflowSha256 = (Get-FileHash (Join-Path $env:GITHUB_WORKSPACE '.github/workflows/release.yml') -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          $output = 'src-tauri/target/release/release-bundle/release-environment.json'
+          $environment | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $output -Encoding utf8NoBOM
       # SBOM before checksums and attestation, so it is itself covered by both. Generated from the
       # LOCKFILES (package-lock.json + Cargo.lock), not the installed node_modules: `npm sbom` refuses
       # on this project because a clean `npm ci` yields a tree npm itself calls invalid. See the
       # module docstring in generate_sbom.py.
       - name: Generate CycloneDX SBOM
-        if: runner.os == 'Windows'
-        run: python scripts/generate_sbom.py --output src-tauri/target/release/bundle/cortex-speech.cdx.json
-      - name: Generate release checksums
-        if: runner.os == 'Windows'
-        run: python scripts/generate_release_checksums.py src-tauri/target/release/bundle --output SHA256SUMS-${{ matrix.os }}
-      - name: Attest release artifacts
-        if: runner.os == 'Windows'
+        run: python scripts/generate_sbom.py --output src-tauri/target/release/release-bundle/cortex-speech.cdx.json
+      - name: Generate provenance subject inventory
+        run: python scripts/generate_release_checksums.py src-tauri/target/release/release-bundle --output .provenance-subjects
+      - name: Attest exact release subjects
+        id: attest-subjects
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
-          subject-path: cortex-speech-app/src-tauri/target/release/bundle/**/*
-      - if: runner.os == 'Windows'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+          subject-checksums: cortex-speech-app/src-tauri/target/release/release-bundle/.provenance-subjects
+      - name: Finalize inner provenance and checksum inventory
+        shell: pwsh
+        run: |
+          $stage = 'src-tauri/target/release/release-bundle'
+          Copy-Item -LiteralPath '${{ steps.attest-subjects.outputs.bundle-path }}' -Destination (Join-Path $stage 'github-provenance.sigstore.json')
+          Remove-Item -LiteralPath (Join-Path $stage '.provenance-subjects') -Force
+          python scripts/generate_release_checksums.py $stage --output SHA256SUMS-windows-11-x64
+          if ($LASTEXITCODE -ne 0) { throw "final checksum generation failed" }
+      - name: Independently validate draft release bundle
+        shell: pwsh
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REPO_ROOT: ${{ github.workspace }}
+          SIGNER_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
+          SIGNER_CERT_SHA256: ${{ secrets.WINDOWS_CERT_SHA256 }}
+        run: |
+          python "$env:RELEASE_REPO_ROOT/scripts/windows_release_bundle.py" `
+            src-tauri/target/release/release-bundle `
+            --expected-sha $env:RELEASE_SHA `
+            --expected-repository $env:RELEASE_REPOSITORY `
+            --expected-ref $env:RELEASE_REF `
+            --expected-version ((Get-Content package.json -Raw | ConvertFrom-Json).version) `
+            --signer-thumbprint $env:SIGNER_THUMBPRINT `
+            --signer-cert-sha256 $env:SIGNER_CERT_SHA256 `
+            --repo-root $env:RELEASE_REPO_ROOT `
+            --verify-authenticode `
+            --verify-provenance `
+            --output "$env:RUNNER_TEMP/windows-release-authority.json"
+          if ($LASTEXITCODE -ne 0) { throw "draft release bundle validation failed" }
+      - name: Package exact directory tree
+        shell: pwsh
+        run: |
+          $package = 'src-tauri/target/release/release-package'
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          $archive = Join-Path $package 'cortex-speech-windows-11-x64.zip'
+          Compress-Archive -Path 'src-tauri/target/release/release-bundle/*' -DestinationPath $archive -CompressionLevel Optimal
+      - name: Attest release archive
+        id: attest-archive
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
-          name: cortex-speech-${{ matrix.os }}
-          path: cortex-speech-app/src-tauri/target/release/bundle/**
+          subject-path: cortex-speech-app/src-tauri/target/release/release-package/cortex-speech-windows-11-x64.zip
+      - name: Finalize release package authority
+        shell: pwsh
+        run: |
+          $package = 'src-tauri/target/release/release-package'
+          Copy-Item -LiteralPath '${{ steps.attest-archive.outputs.bundle-path }}' -Destination (Join-Path $package 'cortex-speech-windows-11-x64.zip.sigstore.json')
+          python scripts/generate_release_checksums.py $package --output SHA256SUMS-release
+          if ($LASTEXITCODE -ne 0) { throw "release package checksum generation failed" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cortex-speech-windows-11-x64
+          path: cortex-speech-app/src-tauri/target/release/release-package/**
+          if-no-files-found: error
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    timeout-minutes: 20
     permissions:
       contents: write
+      attestations: read
     steps:
-      - name: Download attested platform bundles
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download exact release package
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          pattern: cortex-speech-windows-latest
-          path: release-assets
+          name: cortex-speech-windows-11-x64
+          path: release-package
+      - name: Re-verify archive digest, provenance, inner checksums, signing, and source identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNER_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
+          SIGNER_CERT_SHA256: ${{ secrets.WINDOWS_CERT_SHA256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedPackage = @(
+            'SHA256SUMS-release',
+            'cortex-speech-windows-11-x64.zip',
+            'cortex-speech-windows-11-x64.zip.sigstore.json'
+          ) | Sort-Object
+          $actualPackage = @(Get-ChildItem release-package -File | ForEach-Object Name | Sort-Object)
+          if (Compare-Object $expectedPackage $actualPackage) {
+            throw "release package inventory is not exact"
+          }
+          $declared = @{}
+          foreach ($line in Get-Content release-package/SHA256SUMS-release) {
+            if ($line -notmatch '^([0-9a-f]{64}) [ *]([^/\\]+)$') {
+              throw "malformed outer checksum line: $line"
+            }
+            if ($declared.ContainsKey($Matches[2])) { throw "duplicate outer checksum path" }
+            $declared[$Matches[2]] = $Matches[1]
+          }
+          if ($declared.Count -ne 2) { throw "outer checksum manifest must cover exactly two files" }
+          foreach ($name in $expectedPackage | Where-Object { $_ -ne 'SHA256SUMS-release' }) {
+            $actual = (Get-FileHash (Join-Path release-package $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($declared[$name] -ne $actual) { throw "outer checksum mismatch for $name" }
+          }
+          gh attestation verify release-package/cortex-speech-windows-11-x64.zip `
+            --bundle release-package/cortex-speech-windows-11-x64.zip.sigstore.json `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/release.yml" `
+            --source-digest "$env:GITHUB_SHA" `
+            --source-ref "$env:GITHUB_REF" `
+            --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { throw "release archive provenance verification failed" }
+          Expand-Archive release-package/cortex-speech-windows-11-x64.zip -DestinationPath release-bundle
+          $version = (Get-Content cortex-speech-app/package.json -Raw | ConvertFrom-Json).version
+          python scripts/windows_release_bundle.py release-bundle `
+            --expected-sha "$env:GITHUB_SHA" `
+            --expected-repository "$env:GITHUB_REPOSITORY" `
+            --expected-ref "$env:GITHUB_REF" `
+            --expected-version $version `
+            --signer-thumbprint $env:SIGNER_THUMBPRINT `
+            --signer-cert-sha256 $env:SIGNER_CERT_SHA256 `
+            --repo-root "$env:GITHUB_WORKSPACE" `
+            --verify-authenticode `
+            --verify-provenance `
+            --output "$env:RUNNER_TEMP/windows-release-authority.json"
+          if ($LASTEXITCODE -ne 0) { throw "downloaded release bundle validation failed" }
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: release-assets/**
+          files: release-package/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Missing updater/signing/external evidence can only leave this candidate private. The
+          # workflow_dispatch promotion job below is the sole stable-publication path.
+          draft: true
+          target_commitish: ${{ github.sha }}
+
+  promote:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag }}
+      - name: Re-verify signed immutable tag and exact draft target
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RULESET_AUDIT_TOKEN: ${{ secrets.RULESET_AUDIT_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PROMOTION_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedWorkflowRef = "$env:GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main"
+          if ($env:GITHUB_REF -ne 'refs/heads/main' -or $env:PROMOTION_WORKFLOW_REF -ne $expectedWorkflowRef) {
+            throw "Stable promotion must execute the exact release workflow from protected main."
+          }
+          if ($env:RELEASE_TAG -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Promotion requires one exact stable semantic-version tag."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RULESET_AUDIT_TOKEN)) {
+            throw "RULESET_AUDIT_TOKEN is required to prove the tag has no bypass authority."
+          }
+          $head = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $encodedTag = [Uri]::EscapeDataString($env:RELEASE_TAG)
+          $tagRef = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$encodedTag"
+          if ($tagRef.object.type -ne 'tag') { throw "Promotion refuses a lightweight tag." }
+          $tagObject = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagRef.object.sha)"
+          if ($tagObject.object.type -ne 'commit' -or $tagObject.object.sha.ToLowerInvariant() -ne $head -or
+              $tagObject.verification.verified -ne $true -or $tagObject.verification.reason -ne 'valid' -or
+              -not $tagObject.verification.verified_at) {
+            throw "Promotion tag signature/commit identity is invalid."
+          }
+          $rulesetHeaders = $headers.Clone()
+          $rulesetHeaders.Authorization = "Bearer $env:RULESET_AUDIT_TOKEN"
+          $summaries = @(Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=tag")
+          $protected = $false
+          foreach ($summary in $summaries) {
+            $ruleset = Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets/$($summary.id)"
+            $bypass = $ruleset.PSObject.Properties['bypass_actors']
+            if ($null -eq $bypass) { throw "Tag ruleset hid bypass authority." }
+            $types = @($ruleset.rules | ForEach-Object type)
+            if ($ruleset.target -eq 'tag' -and $ruleset.enforcement -eq 'active' -and
+                @($ruleset.conditions.ref_name.include) -contains 'refs/tags/v*' -and
+                @($ruleset.conditions.ref_name.exclude).Count -eq 0 -and @($bypass.Value).Count -eq 0 -and
+                $types -contains 'deletion' -and $types -contains 'non_fast_forward') {
+              $protected = $true
+            }
+          }
+          if (-not $protected) { throw "Promotion cannot prove immutable no-bypass release tags." }
+          $packageVersion = (Get-Content cortex-speech-app/package.json -Raw | ConvertFrom-Json).version
+          if ($env:RELEASE_TAG -ne "v$packageVersion") {
+            throw "Promotion tag does not match the committed package version."
+          }
+          $repository = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          if ($repository.default_branch -ne 'main') { throw "Promotion requires main as the default branch." }
+          $branchSummaries = @(Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=branch")
+          $protectedMain = $false
+          foreach ($summary in $branchSummaries) {
+            $ruleset = Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets/$($summary.id)"
+            $bypass = $ruleset.PSObject.Properties['bypass_actors']
+            if ($null -eq $bypass) { throw "Branch ruleset hid bypass authority." }
+            $includes = @($ruleset.conditions.ref_name.include)
+            $excludes = @($ruleset.conditions.ref_name.exclude)
+            $types = @($ruleset.rules | ForEach-Object type)
+            $pullRequest = @($ruleset.rules | Where-Object type -eq 'pull_request') | Select-Object -First 1
+            $statusChecks = @($ruleset.rules | Where-Object type -eq 'required_status_checks') | Select-Object -First 1
+            $contexts = @($statusChecks.parameters.required_status_checks | ForEach-Object context)
+            $coversMain = $includes -contains 'refs/heads/main' -or $includes -contains '~DEFAULT_BRANCH'
+            if ($ruleset.target -eq 'branch' -and $ruleset.enforcement -eq 'active' -and $coversMain -and
+                $excludes.Count -eq 0 -and @($bypass.Value).Count -eq 0 -and
+                $types -contains 'deletion' -and $types -contains 'non_fast_forward' -and
+                $types -contains 'required_signatures' -and $null -ne $pullRequest -and
+                $pullRequest.parameters.required_approving_review_count -ge 1 -and
+                $pullRequest.parameters.dismiss_stale_reviews_on_push -eq $true -and
+                $pullRequest.parameters.require_last_push_approval -eq $true -and
+                $pullRequest.parameters.required_review_thread_resolution -eq $true -and
+                $null -ne $statusChecks -and $statusChecks.parameters.strict_required_status_checks_policy -eq $true -and
+                $contexts -contains 'Provenance & License Gate' -and $contexts -contains 'Windows Release Gate') {
+              $protectedMain = $true
+            }
+          }
+          if (-not $protectedMain) { throw "Promotion cannot prove protected no-bypass main authority." }
+          git merge-base --is-ancestor $head origin/main
+          if ($LASTEXITCODE -ne 0) { throw "Promotion commit is not reachable from protected main." }
+          $release = gh release view $env:RELEASE_TAG --json isDraft,tagName,targetCommitish | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.isDraft -ne $true -or $release.tagName -ne $env:RELEASE_TAG -or
+              $release.targetCommitish.ToLowerInvariant() -ne $head) {
+            throw "Promotion target is not the exact private draft for the signed commit."
+          }
+          "RELEASE_SHA=$head" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_REF=refs/tags/$env:RELEASE_TAG" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Download exact draft assets and external proof bundle
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+        run: |
+          if ($env:PROOF_RUN_ID -notmatch '^[1-9][0-9]*$') { throw "proof_run_id must be one exact workflow run ID" }
+          New-Item -ItemType Directory release-package | Out-Null
+          gh release download $env:RELEASE_TAG --dir release-package --pattern 'SHA256SUMS-release' --pattern 'cortex-speech-windows-11-x64.zip' --pattern 'cortex-speech-windows-11-x64.zip.sigstore.json'
+          if ($LASTEXITCODE -ne 0) { throw "draft release asset download failed" }
+          gh run download $env:PROOF_RUN_ID --name "cortex-speech-windows-product-proof-$env:RELEASE_SHA" --dir certifying-proof
+          if ($LASTEXITCODE -ne 0) { throw "exact windows-product proof artifact download failed" }
+      - name: Consume exact completed windows-product proof and artifact hashes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNER_THUMBPRINT: ${{ secrets.WINDOWS_CERT_THUMBPRINT }}
+          SIGNER_CERT_SHA256: ${{ secrets.WINDOWS_CERT_SHA256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $declared = @{}
+          foreach ($line in Get-Content release-package/SHA256SUMS-release) {
+            if ($line -notmatch '^([0-9a-f]{64}) [ *]([^/\\]+)$' -or $declared.ContainsKey($Matches[2])) {
+              throw "outer release checksum authority is malformed"
+            }
+            $declared[$Matches[2]] = $Matches[1]
+          }
+          $expectedNames = @('cortex-speech-windows-11-x64.zip', 'cortex-speech-windows-11-x64.zip.sigstore.json')
+          if ($declared.Count -ne 2) { throw "outer release checksum inventory is not exact" }
+          foreach ($name in $expectedNames) {
+            $actual = (Get-FileHash (Join-Path release-package $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($declared[$name] -ne $actual) { throw "outer release checksum mismatch for $name" }
+          }
+          gh attestation verify release-package/cortex-speech-windows-11-x64.zip `
+            --bundle release-package/cortex-speech-windows-11-x64.zip.sigstore.json `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/release.yml" `
+            --source-digest "$env:RELEASE_SHA" `
+            --source-ref "$env:RELEASE_REF" `
+            --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { throw "draft archive provenance verification failed" }
+          Expand-Archive release-package/cortex-speech-windows-11-x64.zip -DestinationPath release-bundle
+          $manifests = @(Get-ChildItem certifying-proof -Recurse -File -Filter manifest.json)
+          if ($manifests.Count -ne 1) { throw "proof artifact must contain exactly one manifest.json" }
+          $version = (Get-Content cortex-speech-app/package.json -Raw | ConvertFrom-Json).version
+          python scripts/verify_10.py `
+            --require-certifying-proof `
+            --profile windows-product `
+            --proof-manifest $manifests[0].FullName `
+            --expected-sha "$env:RELEASE_SHA" `
+            --windows-release-bundle release-bundle `
+            --expected-repository "$env:GITHUB_REPOSITORY" `
+            --expected-ref "$env:RELEASE_REF" `
+            --expected-version $version `
+            --windows-signer-thumbprint $env:SIGNER_THUMBPRINT `
+            --windows-signer-cert-sha256 $env:SIGNER_CERT_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "certifying proof or exact artifact binding was rejected" }
+      - name: Recheck immutable asset digests and publish stable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RULESET_AUDIT_TOKEN: ${{ secrets.RULESET_AUDIT_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:RULESET_AUDIT_TOKEN)) {
+            throw "Final publication cannot re-prove immutable tag authority without RULESET_AUDIT_TOKEN."
+          }
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $rulesetHeaders = $headers.Clone()
+          $rulesetHeaders.Authorization = "Bearer $env:RULESET_AUDIT_TOKEN"
+          $tagRulesets = @(Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets?includes_parents=true&targets=tag")
+          $immutableTagAuthority = $false
+          foreach ($summary in $tagRulesets) {
+            $ruleset = Invoke-RestMethod -Headers $rulesetHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets/$($summary.id)"
+            $bypass = $ruleset.PSObject.Properties['bypass_actors']
+            if ($null -eq $bypass) { throw "Final tag ruleset response hid bypass authority." }
+            $ruleTypes = @($ruleset.rules | ForEach-Object type)
+            if ($ruleset.target -eq 'tag' -and $ruleset.enforcement -eq 'active' -and
+                @($ruleset.conditions.ref_name.include) -contains 'refs/tags/v*' -and
+                @($ruleset.conditions.ref_name.exclude).Count -eq 0 -and @($bypass.Value).Count -eq 0 -and
+                $ruleTypes -contains 'deletion' -and $ruleTypes -contains 'non_fast_forward') {
+              $immutableTagAuthority = $true
+            }
+          }
+          if (-not $immutableTagAuthority) { throw "Immutable no-bypass tag authority changed after proof consumption." }
+          $encodedTag = [Uri]::EscapeDataString($env:RELEASE_TAG)
+          $tagRef = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$encodedTag"
+          if ($tagRef.ref -ne "refs/tags/$env:RELEASE_TAG" -or $tagRef.object.type -ne 'tag') {
+            throw "Release tag identity changed after proof consumption."
+          }
+          $tagObject = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/tags/$($tagRef.object.sha)"
+          if ($tagObject.tag -ne $env:RELEASE_TAG -or $tagObject.object.type -ne 'commit' -or
+              $tagObject.object.sha.ToLowerInvariant() -ne $env:RELEASE_SHA -or
+              $tagObject.verification.verified -ne $true -or $tagObject.verification.reason -ne 'valid' -or
+              -not $tagObject.verification.verified_at) {
+            throw "Signed release tag changed after proof consumption."
+          }
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.draft -ne $true -or $release.tag_name -ne $env:RELEASE_TAG -or
+              $release.target_commitish.ToLowerInvariant() -ne $env:RELEASE_SHA) {
+            throw "draft release identity changed after proof consumption"
+          }
+          $localFiles = @(Get-ChildItem release-package -File)
+          if ($release.assets.Count -ne $localFiles.Count) { throw "draft asset count changed after proof consumption" }
+          foreach ($local in $localFiles) {
+            $remote = @($release.assets | Where-Object name -eq $local.Name)
+            $digest = "sha256:$((Get-FileHash $local.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+            if ($remote.Count -ne 1 -or $remote[0].digest -ne $digest -or $remote[0].size -ne $local.Length) {
+              throw "draft asset identity changed after proof consumption: $($local.Name)"
+            }
+          }
+          gh release edit $env:RELEASE_TAG --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "stable release publication failed" }

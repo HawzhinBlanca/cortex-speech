@@ -4610,6 +4610,401 @@ pub static MIGRATIONS: &[Migration] = &[
                  CREATE INDEX idx_review_drafts_updated_at ON review_drafts(updated_at DESC, segment_id);",
         down_sql: Some("DROP INDEX idx_review_drafts_updated_at; DROP TABLE review_drafts;"),
     },
+    Migration {
+        version: 67,
+        description: "Bind desktop playback evidence to server-issued grants and exact interval unions",
+        // Policy-3 receipts bind the clip/revision/content/span but accept one renderer-supplied
+        // cumulative counter.  That protects against cross-clip replay, not against an accidental or
+        // scripted `played_ms = i64::MAX`.  Policy 4 makes the renderer present a server-issued,
+        // short-lived media-grant session plus a canonical set of non-overlapping clip-relative
+        // intervals. Finalized session/interval authority is append-only; expired never-finalized
+        // attempts are intentionally collectible and do not make a schema rollback irreversible.
+        // The receipt trigger independently proves the exact sum and every immutable clip identity
+        // before the row can authorize a desktop decision.
+        up_sql: "CREATE TABLE desktop_playback_sessions_v4 (
+                     playback_receipt_id       TEXT PRIMARY KEY
+                                                    CHECK(playback_receipt_id=lower(trim(playback_receipt_id))
+                                                      AND length(playback_receipt_id)=36
+                                                      AND substr(playback_receipt_id,9,1)='-'
+                                                      AND substr(playback_receipt_id,14,1)='-'
+                                                      AND substr(playback_receipt_id,19,1)='-'
+                                                      AND substr(playback_receipt_id,24,1)='-'
+                                                      AND length(replace(playback_receipt_id,'-',''))=32
+                                                      AND replace(playback_receipt_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     media_grant_id             TEXT NOT NULL
+                                                    CHECK(media_grant_id=lower(trim(media_grant_id))
+                                                      AND length(media_grant_id)=36
+                                                      AND substr(media_grant_id,9,1)='-'
+                                                      AND substr(media_grant_id,14,1)='-'
+                                                      AND substr(media_grant_id,19,1)='-'
+                                                      AND substr(media_grant_id,24,1)='-'
+                                                      AND length(replace(media_grant_id,'-',''))=32
+                                                      AND replace(media_grant_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     client_attempt_id           TEXT NOT NULL
+                                                    CHECK(client_attempt_id=lower(trim(client_attempt_id))
+                                                      AND length(client_attempt_id)=36
+                                                      AND substr(client_attempt_id,9,1)='-'
+                                                      AND substr(client_attempt_id,14,1)='-'
+                                                      AND substr(client_attempt_id,19,1)='-'
+                                                      AND substr(client_attempt_id,24,1)='-'
+                                                       AND length(replace(client_attempt_id,'-',''))=32
+                                                       AND replace(client_attempt_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+                     surface                     TEXT NOT NULL CHECK(surface IN ('desktop','couch')),
+                     session_binding_sha256       TEXT
+                                                    CHECK(session_binding_sha256 IS NULL OR (
+                                                      length(session_binding_sha256)=64
+                                                      AND session_binding_sha256 NOT GLOB '*[^0-9a-f]*')),
+                     grant_source_path_sha256   TEXT NOT NULL
+                                                    CHECK(length(grant_source_path_sha256)=64
+                                                      AND grant_source_path_sha256 NOT GLOB '*[^0-9a-f]*'),
+                     segment_id                 TEXT NOT NULL,
+                     segment_revision           INTEGER NOT NULL CHECK(segment_revision >= 0),
+                     audio_content_hash         TEXT NOT NULL
+                                                    CHECK(length(audio_content_hash)=64
+                                                      AND audio_content_hash NOT GLOB '*[^0-9a-f]*'),
+                     reviewer                   TEXT,
+                     clip_duration_ms           INTEGER NOT NULL CHECK(clip_duration_ms > 0),
+                     source_start_ms             INTEGER NOT NULL CHECK(source_start_ms >= 0),
+                     source_end_ms               INTEGER NOT NULL CHECK(source_end_ms > source_start_ms),
+                     issued_at_ms                INTEGER NOT NULL CHECK(issued_at_ms > 0),
+                     expires_at_ms               INTEGER NOT NULL CHECK(expires_at_ms > issued_at_ms),
+                     CHECK(abs((source_end_ms-source_start_ms)-clip_duration_ms) <= 1),
+                     CHECK((surface='desktop' AND session_binding_sha256 IS NULL)
+                        OR (surface='couch' AND reviewer IS NOT NULL
+                            AND trim(reviewer)<>'' AND session_binding_sha256 IS NOT NULL))
+                  ) STRICT;
+                 CREATE INDEX idx_desktop_playback_sessions_v4_segment
+                     ON desktop_playback_sessions_v4(segment_id, segment_revision, issued_at_ms DESC);
+                 CREATE UNIQUE INDEX idx_desktop_playback_sessions_v4_client_attempt
+                     ON desktop_playback_sessions_v4(client_attempt_id);
+                 CREATE TRIGGER desktop_playback_sessions_v4_immutable_update
+                 BEFORE UPDATE ON desktop_playback_sessions_v4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback sessions are immutable'); END;
+                 CREATE TRIGGER desktop_playback_sessions_v4_immutable_delete
+                 BEFORE DELETE ON desktop_playback_sessions_v4
+                 WHEN EXISTS (
+                     SELECT 1 FROM playback_receipts receipt
+                      WHERE receipt.authority_session_id=OLD.playback_receipt_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'finalized policy-4 playback sessions are immutable'); END;
+
+                 ALTER TABLE playback_receipts
+                     ADD COLUMN authority_session_id TEXT
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id);
+                 ALTER TABLE playback_receipts ADD COLUMN interval_union_sha256 TEXT;
+                 CREATE UNIQUE INDEX idx_playback_receipts_policy4_session
+                     ON playback_receipts(authority_session_id)
+                  WHERE authority_session_id IS NOT NULL;
+
+                 CREATE TABLE desktop_playback_intervals_v4 (
+                     playback_receipt_id TEXT NOT NULL,
+                     ordinal             INTEGER NOT NULL CHECK(ordinal >= 0),
+                     start_ms            INTEGER NOT NULL CHECK(start_ms >= 0),
+                     end_ms              INTEGER NOT NULL CHECK(end_ms > start_ms),
+                     observed_at_ms      INTEGER NOT NULL CHECK(observed_at_ms > 0),
+                     PRIMARY KEY(playback_receipt_id, ordinal),
+                     FOREIGN KEY(playback_receipt_id)
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id)
+                 ) STRICT;
+                 CREATE TRIGGER desktop_playback_intervals_v4_validate_insert
+                 BEFORE INSERT ON desktop_playback_intervals_v4
+                 WHEN NOT EXISTS (
+                         SELECT 1 FROM desktop_playback_sessions_v4 session
+                           WHERE session.playback_receipt_id=NEW.playback_receipt_id
+                             AND NEW.end_ms <= session.clip_duration_ms
+                      )
+                   OR EXISTS (
+                         SELECT 1 FROM playback_receipts receipt
+                          WHERE receipt.authority_session_id=NEW.playback_receipt_id
+                      )
+                   OR NEW.ordinal <> (
+                         SELECT COUNT(*) FROM desktop_playback_intervals_v4 prior
+                          WHERE prior.playback_receipt_id=NEW.playback_receipt_id
+                      )
+                   OR EXISTS (
+                         SELECT 1 FROM desktop_playback_intervals_v4 prior
+                          WHERE prior.playback_receipt_id=NEW.playback_receipt_id
+                            AND NOT (NEW.end_ms < prior.start_ms OR NEW.start_ms > prior.end_ms)
+                      )
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback intervals are invalid, overlapping, or finalized'); END;
+                 CREATE TRIGGER desktop_playback_intervals_v4_immutable_update
+                 BEFORE UPDATE ON desktop_playback_intervals_v4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback intervals are append-only'); END;
+                 CREATE TRIGGER desktop_playback_intervals_v4_immutable_delete
+                 BEFORE DELETE ON desktop_playback_intervals_v4
+                 WHEN EXISTS (
+                     SELECT 1 FROM playback_receipts receipt
+                      WHERE receipt.authority_session_id=OLD.playback_receipt_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'finalized policy-4 playback intervals are append-only'); END;
+                 CREATE TRIGGER playback_receipts_v67_policy4_validate_insert
+                 BEFORE INSERT ON playback_receipts
+                 WHEN NEW.policy_version=4 AND (
+                      NEW.authority_session_id IS NULL
+                      OR NEW.session_id IS NOT NEW.authority_session_id
+                      OR typeof(NEW.interval_union_sha256) <> 'text'
+                      OR length(NEW.interval_union_sha256) <> 64
+                      OR NEW.interval_union_sha256 GLOB '*[^0-9a-f]*'
+                      OR NOT EXISTS (
+                           SELECT 1 FROM desktop_playback_sessions_v4 session
+                            WHERE session.playback_receipt_id=NEW.authority_session_id
+                              AND session.segment_id=NEW.segment_id
+                              AND session.segment_revision=NEW.segment_revision
+                              AND session.audio_content_hash=NEW.audio_fingerprint
+                              AND session.reviewer IS NEW.reviewer
+                              AND session.clip_duration_ms=NEW.clip_duration_ms
+                              AND session.source_start_ms=NEW.source_start_ms
+                              AND session.source_end_ms=NEW.source_end_ms
+                               AND session.issued_at_ms=NEW.started_at_ms
+                               AND ((session.surface='desktop' AND session.session_binding_sha256 IS NULL)
+                                 OR (session.surface='couch' AND session.reviewer IS NOT NULL
+                                     AND session.session_binding_sha256 IS NOT NULL))
+                       )
+                      OR NOT EXISTS (
+                           SELECT 1 FROM desktop_playback_intervals_v4 interval
+                            WHERE interval.playback_receipt_id=NEW.authority_session_id
+                      )
+                      OR NEW.played_ms IS NOT (
+                           SELECT COALESCE(SUM(interval.end_ms-interval.start_ms),0)
+                             FROM desktop_playback_intervals_v4 interval
+                            WHERE interval.playback_receipt_id=NEW.authority_session_id
+                      )
+                      OR ABS(
+                           NEW.coverage_ratio - MIN(1.0,
+                               CAST(NEW.played_ms AS REAL)/CAST(NEW.clip_duration_ms AS REAL))
+                      ) > 0.000000001
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback receipt is not bound to its exact interval authority'); END;
+                 CREATE TRIGGER playback_receipts_v67_policy4_immutable_update
+                 BEFORE UPDATE ON playback_receipts
+                 WHEN OLD.policy_version=4 OR NEW.policy_version=4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback evidence is append-only'); END;
+                 CREATE TRIGGER playback_receipts_v67_policy4_immutable_delete
+                 BEFORE DELETE ON playback_receipts
+                 WHEN OLD.policy_version=4
+                 BEGIN SELECT RAISE(ABORT, 'policy-4 playback evidence is append-only'); END;
+
+                 ALTER TABLE human_decision_effect_events
+                     ADD COLUMN desktop_review_contract_version INTEGER
+                         CHECK(desktop_review_contract_version IS NULL OR desktop_review_contract_version=1);
+                 ALTER TABLE human_decision_effect_events
+                     ADD COLUMN playback_authority_session_id TEXT
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id);
+                 CREATE UNIQUE INDEX idx_human_decision_effect_policy4_authority
+                     ON human_decision_effect_events(playback_authority_session_id)
+                   WHERE playback_authority_session_id IS NOT NULL;
+                 CREATE TRIGGER speech_segments_v67_policy4_paid_identity_immutable_update
+                 BEFORE UPDATE OF audio_content_hash, alignment_json, duration_ms ON speech_segments
+                 WHEN EXISTS (
+                          SELECT 1
+                            FROM playback_receipts receipt
+                           WHERE receipt.segment_id = OLD.id
+                             AND receipt.policy_version = 4
+                      )
+                    OR EXISTS (
+                          SELECT 1
+                            FROM review_events event
+                            JOIN review_compensation_ledger ledger
+                              ON ledger.review_event_id = event.id
+                             AND ledger.reverses_entry_id IS NULL
+                           WHERE event.segment_id = OLD.id
+                             AND event.id > (
+                                  SELECT effective_after_review_event_id
+                                    FROM review_effect_state
+                                   WHERE singleton_key = 1
+                             )
+                             AND event.source IN ('couch', 'couch_spot_check')
+                             AND event.playback_guard_version = 'interval-authority-v4'
+                             AND COALESCE(event.compensation_action, event.action) <> 'skip'
+                             AND ledger.compensation_action <> 'skip'
+                      )
+                    OR EXISTS (
+                          SELECT 1
+                            FROM human_decision_effect_events effect
+                           WHERE effect.segment_id = OLD.id
+                             AND effect.playback_authority_session_id IS NOT NULL
+                      )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'paid policy-4 source identity is immutable');
+                 END;
+                 CREATE TABLE playback_authority_consumptions_v4 (
+                     playback_receipt_id       TEXT PRIMARY KEY,
+                     namespace                 TEXT NOT NULL
+                                                   CHECK(namespace IN ('canonical','spot_check','independent')),
+                     operation_id              TEXT NOT NULL UNIQUE,
+                     reviewer                  TEXT NOT NULL CHECK(trim(reviewer)<>''),
+                     segment_id                TEXT NOT NULL,
+                     created_at_ms             INTEGER NOT NULL CHECK(created_at_ms>0),
+                     FOREIGN KEY(playback_receipt_id)
+                         REFERENCES desktop_playback_sessions_v4(playback_receipt_id),
+                     FOREIGN KEY(segment_id) REFERENCES speech_segments(id) ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE TRIGGER playback_authority_consumptions_v4_validate_insert
+                 BEFORE INSERT ON playback_authority_consumptions_v4
+                 WHEN NOT EXISTS (
+                     SELECT 1
+                       FROM desktop_playback_sessions_v4 session
+                       JOIN playback_receipts receipt
+                         ON receipt.authority_session_id=session.playback_receipt_id
+                        AND receipt.policy_version=4
+                      WHERE session.playback_receipt_id=NEW.playback_receipt_id
+                        AND session.surface='couch'
+                        AND session.reviewer=NEW.reviewer COLLATE NOCASE
+                        AND session.segment_id=NEW.segment_id
+                        AND receipt.segment_id=NEW.segment_id
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'Couch playback consumption is not bound to an exact policy-4 authority'); END;
+                 CREATE TRIGGER playback_authority_consumptions_v4_immutable_update
+                 BEFORE UPDATE ON playback_authority_consumptions_v4
+                 BEGIN SELECT RAISE(ABORT, 'Couch playback consumption is immutable'); END;
+                 CREATE TRIGGER playback_authority_consumptions_v4_immutable_delete
+                 BEFORE DELETE ON playback_authority_consumptions_v4
+                 BEGIN SELECT RAISE(ABORT, 'Couch playback consumption is immutable'); END;
+
+                 DROP TRIGGER review_events_v60_provenance_validate_insert;
+                 CREATE TRIGGER review_events_v60_provenance_validate_insert
+                 BEFORE INSERT ON review_events
+                 WHEN NEW.source IN ('couch', 'couch_spot_check')
+                  AND (
+                       NEW.app_git_sha IS NULL
+                       OR NEW.playback_guard_version IS NULL
+                       OR NEW.operation_id IS NULL
+                       OR NEW.operation_payload_hash IS NULL
+                       OR trim(NEW.operation_id) = ''
+                       OR length(NEW.operation_payload_hash) <> 64
+                       OR NEW.operation_payload_hash GLOB '*[^0-9a-f]*'
+                       OR NEW.requested_action IS NULL
+                       OR NEW.requested_action NOT IN ('accept', 'edit', 'reject', 'skip', 'bad')
+                       OR NEW.requested_transcript IS NULL
+                       OR NEW.served_transcript IS NULL
+                       OR NEW.served_transcript <> trim(NEW.served_transcript)
+                       OR length(NEW.served_transcript) = 0
+                       OR typeof(NEW.served_revision) <> 'integer'
+                       OR NEW.served_revision < 0
+                       OR length(NEW.app_git_sha) <> 40
+                       OR NEW.app_git_sha GLOB '*[^0-9a-f]*'
+                       OR NEW.playback_guard_version NOT IN
+                            ('content-hash-raw-counter-v3','interval-authority-v4')
+                  )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'paid review event requires canonical build and playback-guard provenance');
+                 END;
+                 CREATE TRIGGER human_decision_effect_events_v67_policy4_validate_insert
+                 BEFORE INSERT ON human_decision_effect_events
+                 WHEN (NEW.desktop_review_contract_version IS NOT NULL
+                       OR NEW.playback_authority_session_id IS NOT NULL)
+                  AND (
+                       NEW.playback_authority_session_id IS NULL
+                       OR NOT (
+                          (NEW.source='desktop' AND NEW.desktop_review_contract_version IS 1
+                           AND EXISTS (
+                            SELECT 1
+                             FROM desktop_playback_sessions_v4 session
+                             JOIN playback_receipts receipt
+                               ON receipt.authority_session_id=session.playback_receipt_id
+                              AND receipt.policy_version=4
+                            WHERE session.playback_receipt_id=NEW.playback_authority_session_id
+                              AND session.segment_id=NEW.segment_id
+                              AND session.segment_revision=NEW.prior_revision
+                              AND receipt.segment_id=NEW.segment_id
+                              AND receipt.segment_revision=NEW.prior_revision
+                               AND receipt.audio_fingerprint=session.audio_content_hash
+                               AND session.surface='desktop'
+                           ))
+                          OR
+                          (NEW.source='couch' AND NEW.desktop_review_contract_version IS NULL
+                           AND NEW.reviewer IS NOT NULL
+                           AND EXISTS (
+                            SELECT 1
+                              FROM desktop_playback_sessions_v4 session
+                              JOIN playback_receipts receipt
+                                ON receipt.authority_session_id=session.playback_receipt_id
+                               AND receipt.policy_version=4
+                             WHERE session.playback_receipt_id=NEW.playback_authority_session_id
+                               AND session.surface='couch'
+                               AND session.reviewer=NEW.reviewer COLLATE NOCASE
+                               AND session.segment_id=NEW.segment_id
+                               AND session.segment_revision=NEW.prior_revision
+                               AND receipt.segment_id=NEW.segment_id
+                               AND receipt.segment_revision=NEW.prior_revision
+                               AND receipt.audio_fingerprint=session.audio_content_hash
+                           ))
+                       )
+                   )
+                 BEGIN SELECT RAISE(ABORT, 'review effect is not bound to one exact policy-4 receipt'); END;",
+        down_sql: Some(
+             "DELETE FROM desktop_playback_intervals_v4
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM playback_receipts receipt
+                   WHERE receipt.authority_session_id=desktop_playback_intervals_v4.playback_receipt_id
+              );
+             DELETE FROM desktop_playback_sessions_v4
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM playback_receipts receipt
+                   WHERE receipt.authority_session_id=desktop_playback_sessions_v4.playback_receipt_id
+              );
+             CREATE TEMP TABLE desktop_playback_v67_rollback_guard (
+                 must_be_zero INTEGER NOT NULL CHECK(must_be_zero=0)
+             );
+             INSERT INTO desktop_playback_v67_rollback_guard(must_be_zero)
+              SELECT 1 WHERE EXISTS (SELECT 1 FROM desktop_playback_sessions_v4)
+                          OR EXISTS (SELECT 1 FROM desktop_playback_intervals_v4)
+                          OR EXISTS (SELECT 1 FROM playback_receipts WHERE policy_version=4)
+                          OR EXISTS (SELECT 1 FROM playback_authority_consumptions_v4);
+              DROP TABLE desktop_playback_v67_rollback_guard;
+              DROP TRIGGER playback_authority_consumptions_v4_immutable_delete;
+              DROP TRIGGER playback_authority_consumptions_v4_immutable_update;
+              DROP TRIGGER playback_authority_consumptions_v4_validate_insert;
+              DROP TABLE playback_authority_consumptions_v4;
+              DROP TRIGGER review_events_v60_provenance_validate_insert;
+              CREATE TRIGGER review_events_v60_provenance_validate_insert
+              BEFORE INSERT ON review_events
+              WHEN NEW.source IN ('couch', 'couch_spot_check')
+               AND (
+                    NEW.app_git_sha IS NULL
+                    OR NEW.playback_guard_version IS NULL
+                    OR NEW.operation_id IS NULL
+                    OR NEW.operation_payload_hash IS NULL
+                    OR trim(NEW.operation_id) = ''
+                    OR length(NEW.operation_payload_hash) <> 64
+                    OR NEW.operation_payload_hash GLOB '*[^0-9a-f]*'
+                    OR NEW.requested_action IS NULL
+                    OR NEW.requested_action NOT IN ('accept', 'edit', 'reject', 'skip', 'bad')
+                    OR NEW.requested_transcript IS NULL
+                    OR NEW.served_transcript IS NULL
+                    OR NEW.served_transcript <> trim(NEW.served_transcript)
+                    OR length(NEW.served_transcript) = 0
+                    OR typeof(NEW.served_revision) <> 'integer'
+                    OR NEW.served_revision < 0
+                    OR length(NEW.app_git_sha) <> 40
+                    OR NEW.app_git_sha GLOB '*[^0-9a-f]*'
+                    OR NEW.playback_guard_version <> 'content-hash-raw-counter-v3'
+               )
+              BEGIN
+                  SELECT RAISE(ABORT, 'paid review event requires canonical build and playback-guard provenance');
+              END;
+              DROP TRIGGER playback_receipts_v67_policy4_immutable_delete;
+             DROP TRIGGER playback_receipts_v67_policy4_immutable_update;
+             DROP TRIGGER playback_receipts_v67_policy4_validate_insert;
+             DROP TRIGGER speech_segments_v67_policy4_paid_identity_immutable_update;
+             DROP TRIGGER human_decision_effect_events_v67_policy4_validate_insert;
+             DROP INDEX idx_human_decision_effect_policy4_authority;
+             ALTER TABLE human_decision_effect_events DROP COLUMN playback_authority_session_id;
+             ALTER TABLE human_decision_effect_events DROP COLUMN desktop_review_contract_version;
+             DROP INDEX idx_playback_receipts_policy4_session;
+             DROP TRIGGER desktop_playback_intervals_v4_immutable_delete;
+             DROP TRIGGER desktop_playback_intervals_v4_immutable_update;
+             DROP TRIGGER desktop_playback_intervals_v4_validate_insert;
+             DROP TRIGGER desktop_playback_sessions_v4_immutable_delete;
+             DROP TRIGGER desktop_playback_sessions_v4_immutable_update;
+             ALTER TABLE playback_receipts DROP COLUMN interval_union_sha256;
+             ALTER TABLE playback_receipts DROP COLUMN authority_session_id;
+             DROP TABLE desktop_playback_intervals_v4;
+             DROP INDEX idx_desktop_playback_sessions_v4_segment;
+             DROP INDEX idx_desktop_playback_sessions_v4_client_attempt;
+             DROP TABLE desktop_playback_sessions_v4;",
+        ),
+    },
 ];
 
 #[cfg(test)]
@@ -4621,8 +5016,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 9).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60, 59, 58],
+            rollback(&db, 10).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
             "fixture must stop immediately before v58"
         );
         assert_eq!(get_current_version(&db).unwrap(), 57);
@@ -4633,8 +5028,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the populated-v59 boundary"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -4644,7 +5039,7 @@ mod tests {
     fn database_at_v60() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 6).unwrap(), vec![66, 65, 64, 63, 62, 61], "fixture must expose the v60 boundary");
+        assert_eq!(rollback(&db, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61], "fixture must expose the v60 boundary");
         assert_eq!(get_current_version(&db).unwrap(), 60);
         db
     }
@@ -4924,8 +5319,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "fixture must expose the v59 layer directly"
         );
         assert_eq!(get_current_version(&db).unwrap(), 59);
@@ -5016,10 +5411,10 @@ mod tests {
 
         let empty = Database::open(":memory:").unwrap();
         empty.initialize().unwrap();
-        assert_eq!(rollback(&empty, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(rollback(&empty, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         assert_eq!(rollback(&empty, 1).unwrap(), vec![59]);
         assert_eq!(get_current_version(&empty).unwrap(), 58);
-        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(run_migrations(&empty).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67]);
     }
 
     #[test]
@@ -5073,8 +5468,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
-        assert_eq!(rollback(&db, 6).unwrap(), vec![66, 65, 64, 63, 62, 61], "this test isolates the v60 migration");
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(rollback(&db, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61], "this test isolates the v60 migration");
         assert_eq!(get_current_version(&db).unwrap(), 60);
         let state: (i64, i64) = db
             .connection()
@@ -5375,7 +5770,7 @@ mod tests {
                  VALUES ('delete-memory-proof', 'w', 'r', 'slot', 'phon', 'delete-memory');",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
 
         assert_eq!(
             db.connection().execute("DELETE FROM speech_segments WHERE id='delete-clean'", []).unwrap(),
@@ -7167,8 +7562,8 @@ mod tests {
         let with_reversal = database_at_v59();
         let (_, baseline_entry) =
             insert_review_original(&with_reversal, "baseline-reversal", "baseline-work", "Sara", "legacy");
-        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
-        assert_eq!(rollback(&with_reversal, 6).unwrap(), vec![66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&with_reversal).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(rollback(&with_reversal, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61]);
         reverse_review_entry(&with_reversal, &baseline_entry, "post-v60-baseline-undo").unwrap();
         let reversal_error = rollback(&with_reversal, 1)
             .expect_err("the ledger cutoff must distinguish a reversal appended after migration")
@@ -7198,8 +7593,8 @@ mod tests {
                          1, 'human correction', 'edit', '2026-08-20 00:00:00', 'Sara', 1);",
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
-        assert_eq!(rollback(&db, 6).unwrap(), vec![66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(rollback(&db, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61]);
 
         let (machine_snapshots, human_overlap, exact): (i64, i64, i64) = db
             .connection()
@@ -7262,8 +7657,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
-        assert_eq!(rollback(&drifted, 6).unwrap(), vec![66, 65, 64, 63, 62, 61]);
+        assert_eq!(run_migrations(&drifted).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        assert_eq!(rollback(&drifted, 7).unwrap(), vec![67, 66, 65, 64, 63, 62, 61]);
         drifted
             .connection()
             .execute("UPDATE speech_segments SET rationale='forged rationale' WHERE id='legacy-machine-drift'", [])
@@ -7873,7 +8268,7 @@ mod tests {
     fn v63_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 4).unwrap(), vec![66, 65, 64, 63]);
+        assert_eq!(rollback(&db, 5).unwrap(), vec![67, 66, 65, 64, 63]);
         assert_eq!(get_current_version(&db).unwrap(), 62);
         db.connection().execute("CREATE TABLE review_pool_owner_adjudications(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v63 object collision must fail the entire migration");
@@ -7892,15 +8287,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v63 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_owner_adjudications", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66]);
-        assert_eq!(get_current_version(&db).unwrap(), 66);
+        assert_eq!(run_migrations(&db).unwrap(), vec![63, 64, 65, 66, 67]);
+        assert_eq!(get_current_version(&db).unwrap(), 67);
     }
 
     #[test]
     fn v64_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 3).unwrap(), vec![66, 65, 64]);
+        assert_eq!(rollback(&db, 4).unwrap(), vec![67, 66, 65, 64]);
         assert_eq!(get_current_version(&db).unwrap(), 63);
         db.connection().execute("CREATE TABLE review_pool_dedup_manifests(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v64 object collision must fail the entire migration");
@@ -7919,15 +8314,15 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_objects, 0, "failed v64 leaked later tables or triggers");
         db.connection().execute("DROP TABLE review_pool_dedup_manifests", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66]);
-        assert_eq!(get_current_version(&db).unwrap(), 66);
+        assert_eq!(run_migrations(&db).unwrap(), vec![64, 65, 66, 67]);
+        assert_eq!(get_current_version(&db).unwrap(), 67);
     }
 
     #[test]
     fn v65_partial_migration_failure_is_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 2).unwrap(), vec![66, 65]);
+        assert_eq!(rollback(&db, 3).unwrap(), vec![67, 66, 65]);
         assert_eq!(get_current_version(&db).unwrap(), 64);
         let v64_trigger_sql: String = db
             .connection()
@@ -7944,8 +8339,8 @@ mod tests {
         assert!(error.to_string().contains("no such trigger"), "unexpected v65 failure: {error}");
         assert_eq!(get_current_version(&db).unwrap(), 64, "failed v65 must not record its migration row");
         db.connection().execute_batch(&v64_trigger_sql).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66]);
-        assert_eq!(get_current_version(&db).unwrap(), 66);
+        assert_eq!(run_migrations(&db).unwrap(), vec![65, 66, 67]);
+        assert_eq!(get_current_version(&db).unwrap(), 67);
         let v65_trigger_sql: String = db
             .connection()
             .query_row(
@@ -7962,7 +8357,7 @@ mod tests {
     fn v66_review_draft_migration_is_additive_atomic_and_recoverable() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(rollback(&db, 1).unwrap(), vec![66]);
+        assert_eq!(rollback(&db, 2).unwrap(), vec![67, 66]);
         assert_eq!(get_current_version(&db).unwrap(), 65);
         db.connection().execute("CREATE TABLE review_drafts(collision INTEGER)", []).unwrap();
         let error = run_migrations(&db).expect_err("a v66 object collision must fail the entire migration");
@@ -7976,8 +8371,8 @@ mod tests {
             .unwrap();
         assert_eq!(leaked_index, 0, "failed v66 leaked its later index");
         db.connection().execute("DROP TABLE review_drafts", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![66]);
-        assert_eq!(get_current_version(&db).unwrap(), 66);
+        assert_eq!(run_migrations(&db).unwrap(), vec![66, 67]);
+        assert_eq!(get_current_version(&db).unwrap(), 67);
         let strict_sql: String = db
             .connection()
             .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_drafts'", [], |row| {
@@ -7985,6 +8380,104 @@ mod tests {
             })
             .unwrap();
         assert!(strict_sql.ends_with(" STRICT"), "review drafts must use SQLite STRICT typing");
+    }
+
+    #[test]
+    fn v67_desktop_playback_authority_migration_is_atomic_strict_and_recoverable() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![67]);
+        assert_eq!(get_current_version(&db).unwrap(), 66);
+
+        db.connection().execute("CREATE TABLE desktop_playback_sessions_v4(collision INTEGER)", []).unwrap();
+        let error = run_migrations(&db).expect_err("a v67 object collision must fail the entire migration");
+        assert!(error.to_string().contains("already exists"), "unexpected v67 failure: {error}");
+        assert_eq!(get_current_version(&db).unwrap(), 66, "failed v67 must not record its migration row");
+        let leaked_objects: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name IN ('desktop_playback_intervals_v4',
+                                 'idx_desktop_playback_sessions_v4_segment',
+                                 'playback_receipts_v67_policy4_validate_insert',
+                                 'speech_segments_v67_policy4_paid_identity_immutable_update')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_objects, 0, "failed v67 leaked later tables, indexes, or triggers");
+        let receipt_columns: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('playback_receipts')
+                  WHERE name IN ('authority_session_id','interval_union_sha256')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_columns, 0, "failed v67 leaked additive receipt columns");
+
+        db.connection().execute("DROP TABLE desktop_playback_sessions_v4", []).unwrap();
+        assert_eq!(run_migrations(&db).unwrap(), vec![67]);
+        assert_eq!(get_current_version(&db).unwrap(), 67);
+        let paid_identity_trigger: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type='trigger'
+                    AND name='speech_segments_v67_policy4_paid_identity_immutable_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema 67 must install the policy-4 paid-identity freeze");
+        assert!(paid_identity_trigger.contains("receipt.policy_version = 4"));
+        assert!(paid_identity_trigger.contains("interval-authority-v4"));
+        for table in ["desktop_playback_sessions_v4", "desktop_playback_intervals_v4"] {
+            let sql: String = db
+                .connection()
+                .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [table], |row| row.get(0))
+                .unwrap();
+            assert!(sql.ends_with(" STRICT"), "{table} must use SQLite STRICT typing: {sql}");
+        }
+
+        db.connection()
+            .execute(
+                "INSERT INTO desktop_playback_sessions_v4
+                    (playback_receipt_id,media_grant_id,client_attempt_id,surface,session_binding_sha256,
+                     grant_source_path_sha256,segment_id,
+                     segment_revision,audio_content_hash,clip_duration_ms,source_start_ms,
+                     source_end_ms,issued_at_ms,expires_at_ms)
+                 VALUES (?1,?2,?3,'desktop',NULL,?4,'abandoned-only',0,?5,1000,0,1000,1000,2000)",
+                rusqlite::params![
+                    "11111111-1111-4111-8111-111111111111",
+                    "22222222-2222-4222-8222-222222222222",
+                    "33333333-3333-4333-8333-333333333333",
+                    "a".repeat(64),
+                    "b".repeat(64),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rollback(&db, 1).unwrap(), vec![67]);
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='trigger'
+                        AND name='speech_segments_v67_policy4_paid_identity_immutable_update'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "schema-67 rollback must remove its policy-4 identity trigger",
+        );
+        assert_eq!(
+            get_current_version(&db).unwrap(),
+            66,
+            "a never-finalized playback attempt is ephemeral and must not make schema 67 irreversible",
+        );
+        assert_eq!(run_migrations(&db).unwrap(), vec![67]);
+        assert_eq!(get_current_version(&db).unwrap(), 67);
     }
 
     #[test]
@@ -8198,8 +8691,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v20 surface"
         );
         let conn = db.connection();
@@ -8262,8 +8755,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v32 surface"
         );
         let conn = db.connection();
@@ -8293,8 +8786,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -8326,8 +8819,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 v21 surface"
         );
         let conn = db.connection();
@@ -8367,8 +8860,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates the pre-v60 FK behavior"
         );
         let conn = db.connection();
@@ -8580,8 +9073,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v46's historical surface"
         );
         assert!(get_current_version(&db).unwrap() >= 46, "v46 must have applied");
@@ -8638,8 +9131,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 10).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
+            rollback(&db, 11).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58, 57],
             "fixture must return to the v56 schema"
         );
 
@@ -8661,7 +9154,7 @@ mod tests {
             .unwrap();
         let legacy_event_id = db.connection().last_insert_rowid();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
         let cutoff: i64 = db
             .connection()
             .query_row(
@@ -8685,8 +9178,8 @@ mod tests {
         assert_eq!(before.legacy_events_pending_reconciliation, 1);
 
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "the remainder of this test isolates v57 accounting"
         );
         let (priced_event_id, _) = insert_review_original(&db, "pay-cutoff", "prospective-paid-work", "Sara", "couch");
@@ -8701,8 +9194,8 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         assert_eq!(
-            rollback(&db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "this test isolates v57's immutable ledger"
         );
         db.insert_segment(&crate::db::SpeechSegment {
@@ -8832,8 +9325,8 @@ mod tests {
             let db = Database::open(":memory:").unwrap();
             db.initialize().unwrap();
             assert_eq!(
-                rollback(&db, 9).unwrap(),
-                vec![66, 65, 64, 63, 62, 61, 60, 59, 58],
+                rollback(&db, 10).unwrap(),
+                vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58],
                 "fixture must target v57 rollback semantics"
             );
             db.insert_segment(&crate::db::SpeechSegment {
@@ -8964,7 +9457,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archive_counts: (i64, i64) = db
             .connection()
@@ -9211,7 +9704,7 @@ mod tests {
         // Once an operator separately resolves the unknown class, the same pending migration can
         // safely run and preserve the known orphan. No manual schema surgery or retry flag is needed.
         db.connection().execute("DELETE FROM playback_receipts WHERE segment_id = 'v58-unrelated-orphan'", []).unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
         assert_eq!(foreign_key_violation_count(db.connection()), 0);
         let archived: i64 = db
             .connection()
@@ -9241,11 +9734,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
 
         assert_eq!(
-            rollback(&db, 8).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60, 59],
+            rollback(&db, 9).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60, 59],
             "the empty v63/v62/v61/v60/v59 layers must be removed before probing v58"
         );
 
@@ -9317,7 +9810,7 @@ mod tests {
 
         // Re-applying v58 after a safe rollback sees valid parents, archives nothing, and leaves both
         // restored children in place. This pins the full up/down/up round trip.
-        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(run_migrations(&db).unwrap(), vec![58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
         let reapply_counts: (i64, i64, i64, i64) = db
             .connection()
             .query_row(

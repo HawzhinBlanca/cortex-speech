@@ -83,8 +83,11 @@ def test_decision_clear_is_exact_atomic_and_replay_safe() -> None:
     ):
         if required not in database:
             raise AssertionError(f"typed decision/draft atomicity lost: {required}")
-    if database.count("DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2") != 3:
-        raise AssertionError("draft deletion must remain present in replay preflight, replay race, and first commit")
+    if database.count("DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2") < 3:
+        raise AssertionError(
+            "draft deletion must remain present in replay preflight, replay race, and first commit; "
+            "other exact-revision terminal workflows may use the same safe deletion"
+        )
 
 
 def test_drafts_never_enter_truth_export_eval_payment_or_serving_queries() -> None:
@@ -113,12 +116,23 @@ def test_frontend_recovers_without_automatic_merge_or_direct_tauri_access() -> N
         "draft.baseRevision === baseRevision",
         "draftConflict = draft",
         "Never merge human text automatically",
-        "draftWriteChains",
+        "ReviewDraftWriteCoordinator",
+        "draftWrites.flushAll()",
     ):
         if required not in review:
             raise AssertionError(f"ReviewMode lost draft-recovery behavior: {required}")
     if "@tauri-apps" in review or "generatedCommands" in review:
         raise AssertionError("ReviewMode must call domain command adapters, never Tauri/generated IPC directly")
+    coordinator = read(REPO / "src" / "lib" / "reviewDraftWriteCoordinator.ts")
+    for required in (
+        "private readonly desired",
+        "saved.segmentId !== intent.segmentId",
+        "saved.baseRevision !== intent.baseRevision",
+        "saved.text !== intent.text",
+        "Promise.allSettled",
+    ):
+        if required not in coordinator:
+            raise AssertionError(f"draft write coordinator lost fail-closed durability behavior: {required}")
 
 
 def main() -> None:

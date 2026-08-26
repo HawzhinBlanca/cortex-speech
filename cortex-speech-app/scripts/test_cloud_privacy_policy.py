@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,19 @@ def command_surface() -> str:
 def assert_contains(text: str, expected: str, context: str) -> None:
     if expected not in text:
         raise AssertionError(f"{context} is missing: {expected}")
+
+
+def assert_literal_invoke(text: str, command: str, context: str) -> None:
+    """Require a statically named generated or closed handwritten IPC call."""
+    invocation = re.compile(
+        rf"\b(?:invokeLegacy|invokeCritical|__TAURI_INVOKE)"
+        rf"\s*(?:<[\s\S]{{0,2000}}?>\s*)?\(\s*(['\"]){re.escape(command)}\1"
+    )
+    if not invocation.search(text):
+        raise AssertionError(
+            f"{context} lost required champion production invoke {command!r}; "
+            "the absence policy must not pass by deleting the real review flow"
+        )
 
 
 def test_cloud_llm_defaults_are_opt_out() -> None:
@@ -124,8 +138,7 @@ def test_removed_cloud_stt_and_alternative_retranscribe_surfaces_stay_absent() -
     champion_required: dict[Path, tuple[str, ...]] = {
         LIB_RS: ("commands::transcribe_segment",),
         COMMANDS_DIR / "transcribe.rs": ("pub async fn transcribe_segment(",),
-        REPO_ROOT / "src" / "lib" / "commands.ts": ("invoke('transcribe_segment'",),
-        REPO_ROOT / "src" / "App.svelte": ("api.transcribeSegment(",),
+        REPO_ROOT / "src" / "Workstation.svelte": ("api.transcribeSegment(",),
         REPO_ROOT / "src" / "lib" / "ReviewMode.svelte": ("api.transcribeSegment(",),
     }
     for path, required_tokens in champion_required.items():
@@ -136,6 +149,9 @@ def test_removed_cloud_stt_and_alternative_retranscribe_surfaces_stay_absent() -
                     f"{path.relative_to(REPO_ROOT)} lost required champion production token {token!r}; "
                     "the absence policy must not pass by deleting the real review flow"
                 )
+
+    frontend_commands = _strip_comments(read(REPO_ROOT / "src" / "lib" / "commands.ts"))
+    assert_literal_invoke(frontend_commands, "transcribe_segment", "src/lib/commands.ts")
 
     runtime_forbidden: dict[Path, tuple[str, ...]] = {
         LIB_RS: (
@@ -169,7 +185,7 @@ def test_removed_cloud_stt_and_alternative_retranscribe_surfaces_stay_absent() -
                 raise AssertionError(f"{path.relative_to(REPO_ROOT)} still ships removed production token {token!r}")
 
     frontend_forbidden: dict[str, tuple[str, ...]] = {
-        "src/App.svelte": (
+        "src/Workstation.svelte": (
             "handleTranscribeConstrained",
             "handleTranscribeFinetuned",
             "handleTranscribeScribe",

@@ -7,11 +7,13 @@
 //! config state files, on start and periodically, keeping the newest N.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
+use sha2::{Digest, Sha256};
 
 /// Small state files copied alongside the DB. A promoted rotating snapshot must contain this entire
 /// recovery contract; the paid-review pilot policy is special-cased below because losing it silently
@@ -891,6 +893,243 @@ fn safe_manifest_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Exact byte identity of one snapshot artifact as captured into a private restore image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotArtifactDigest {
+    size_bytes: u64,
+    sha256: String,
+}
+
+/// Typed identity of a complete snapshot generation. The manifest is separated from its declared
+/// artifacts so a manifest-less legacy tree can never compare equal to a manifest-bound generation
+/// merely because their database/config bytes happen to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotGenerationDigest {
+    manifest: Option<SnapshotArtifactDigest>,
+    artifacts: std::collections::BTreeMap<String, SnapshotArtifactDigest>,
+}
+
+impl SnapshotGenerationDigest {
+    fn from_files(mut files: std::collections::BTreeMap<String, SnapshotArtifactDigest>) -> Self {
+        let manifest = files.remove(MANIFEST_FILE);
+        Self { manifest, artifacts: files }
+    }
+}
+
+/// Unique private directory owned by one preflight. It is never promoted and is removed when the
+/// in-memory staged database and owned config plan have been produced.
+#[derive(Debug)]
+struct PrivateSnapshotDirectory {
+    root: PathBuf,
+}
+
+impl PrivateSnapshotDirectory {
+    fn create() -> Result<Self, String> {
+        let temp_root = std::env::temp_dir();
+        for _ in 0..16 {
+            let root =
+                temp_root.join(format!("cortex-verified-snapshot-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+            match fs::create_dir(&root) {
+                Ok(()) => return Ok(Self { root }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!("could not create private verified-snapshot directory: {error}"));
+                }
+            }
+        }
+        Err("could not allocate a unique private verified-snapshot directory".to_string())
+    }
+}
+
+impl Drop for PrivateSnapshotDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.root.display(), %error, "could not remove private verified-snapshot directory");
+            }
+        }
+    }
+}
+
+fn snapshot_regular_files(snapshot_dir: &Path) -> Result<std::collections::BTreeMap<String, PathBuf>, String> {
+    let root_metadata =
+        fs::symlink_metadata(snapshot_dir).map_err(|error| format!("snapshot directory is unreadable: {error}"))?;
+    if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+        return Err("snapshot source must be a regular, non-symlink directory".to_string());
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut folded = std::collections::HashSet::new();
+    let entries = fs::read_dir(snapshot_dir).map_err(|error| format!("snapshot directory is unreadable: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("snapshot directory entry is unreadable: {error}"))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "snapshot contains a non-UTF-8 file name".to_string())?
+            .to_string();
+        if name != MANIFEST_FILE {
+            safe_manifest_name(&name)?;
+        }
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(format!("snapshot file '{name}' must be a regular, non-symlink file"));
+        }
+        if !folded.insert(name.to_lowercase()) || files.insert(name.clone(), entry.path()).is_some() {
+            return Err(format!("snapshot tree contains a duplicate/case-colliding file '{name}'"));
+        }
+    }
+    Ok(files)
+}
+
+fn digest_bytes(hasher: Sha256, size_bytes: u64) -> SnapshotArtifactDigest {
+    let sha256 = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    SnapshotArtifactDigest { size_bytes, sha256 }
+}
+
+fn hash_snapshot_file(path: &Path, name: &str) -> Result<SnapshotArtifactDigest, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("snapshot file '{name}' must be a regular, non-symlink file"));
+    }
+    let mut source = fs::File::open(path).map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read =
+            source.read(&mut buffer).map_err(|error| format!("snapshot file '{name}' could not be hashed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("snapshot file '{name}' is too large to identify"))?;
+    }
+    Ok(digest_bytes(hasher, size_bytes))
+}
+
+fn copy_snapshot_file(
+    source_path: &Path,
+    destination_path: &Path,
+    name: &str,
+) -> Result<SnapshotArtifactDigest, String> {
+    let metadata =
+        fs::symlink_metadata(source_path).map_err(|error| format!("snapshot file '{name}' is unreadable: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("snapshot file '{name}' must be a regular, non-symlink file"));
+    }
+    let mut source = fs::File::open(source_path)
+        .map_err(|error| format!("snapshot file '{name}' could not be opened for private capture: {error}"))?;
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination_path)
+        .map_err(|error| format!("snapshot file '{name}' could not be privately staged: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| format!("snapshot file '{name}' could not be privately captured: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("snapshot file '{name}' private capture could not be written: {error}"))?;
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("snapshot file '{name}' is too large to capture"))?;
+    }
+    destination
+        .sync_all()
+        .map_err(|error| format!("snapshot file '{name}' private capture could not be flushed: {error}"))?;
+    Ok(digest_bytes(hasher, size_bytes))
+}
+
+fn snapshot_generation_digest(snapshot_dir: &Path) -> Result<SnapshotGenerationDigest, String> {
+    let files = snapshot_regular_files(snapshot_dir)?;
+    let digests = files
+        .into_iter()
+        .map(|(name, path)| hash_snapshot_file(&path, &name).map(|digest| (name, digest)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    Ok(SnapshotGenerationDigest::from_files(digests))
+}
+
+/// One immutable, private snapshot generation. Source bytes are copied and hashed through the SAME
+/// read stream. The source generation is then re-identified with a typed manifest+inventory digest;
+/// all later semantic parsing and SQLite staging use only this owned directory.
+pub(crate) struct VerifiedSnapshotImage {
+    directory: PrivateSnapshotDirectory,
+    digest: SnapshotGenerationDigest,
+    manifest_verified: bool,
+}
+
+impl VerifiedSnapshotImage {
+    pub(crate) fn capture<F>(snapshot_dir: &Path, after_capture: F) -> Result<Self, String>
+    where
+        F: FnOnce(),
+    {
+        let source_files = snapshot_regular_files(snapshot_dir)?;
+        let directory = PrivateSnapshotDirectory::create()?;
+        let captured = source_files
+            .into_iter()
+            .map(|(name, source)| {
+                let destination = directory.root.join(&name);
+                copy_snapshot_file(&source, &destination, &name).map(|digest| (name, digest))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        let digest = SnapshotGenerationDigest::from_files(captured);
+
+        // Fault-injection boundary used by restore tests: source mutation here is exactly the old
+        // hash-before-parse/stage window. The authoritative bytes are already private, but a changed
+        // promoted source is still refused rather than silently restoring a generation no longer at
+        // the selected path.
+        after_capture();
+        let current = snapshot_generation_digest(snapshot_dir)
+            .map_err(|error| format!("snapshot source generation digest mismatch during restore preflight: {error}"))?;
+        if current != digest {
+            return Err("snapshot source generation digest mismatch during restore preflight".to_string());
+        }
+
+        let private_digest = snapshot_generation_digest(&directory.root)?;
+        if private_digest != digest {
+            return Err("private snapshot image digest mismatch before manifest verification".to_string());
+        }
+        let manifest_verified = verify_snapshot_manifest_for_restore(&directory.root)?;
+        let verified_digest = snapshot_generation_digest(&directory.root)?;
+        if verified_digest != digest {
+            return Err("private snapshot image digest mismatch during manifest verification".to_string());
+        }
+        Ok(Self { directory, digest, manifest_verified })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.directory.root
+    }
+
+    pub(crate) fn database_path(&self) -> PathBuf {
+        self.directory.root.join(DB_FILE)
+    }
+
+    pub(crate) fn manifest_verified(&self) -> bool {
+        self.manifest_verified
+    }
+
+    pub(crate) fn verify_owned_digest(&self) -> Result<(), String> {
+        if snapshot_generation_digest(&self.directory.root)? != self.digest {
+            return Err("private snapshot image digest mismatch before restore staging".to_string());
+        }
+        Ok(())
+    }
+}
+
 fn read_pragma_strings(connection: &rusqlite::Connection, pragma: &str) -> Result<Vec<String>, String> {
     let mut statement = connection.prepare(pragma).map_err(|error| format!("snapshot DB evidence failed: {error}"))?;
     let rows = statement
@@ -1605,7 +1844,11 @@ mod tests {
     #[test]
     fn active_pilot_pre_migration_snapshot_accepts_exact_v59_and_rejects_drift() {
         let db = seeded_db();
-        crate::migrations::rollback(&db, 1).unwrap();
+        assert_eq!(
+            crate::migrations::rollback(&db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
+            "fixture must exercise the exact pre-v60 schema boundary",
+        );
         let policy = pilot_policy();
 
         validate_active_pilot_snapshot_authority(db.connection(), None, None, &policy).unwrap();
@@ -1762,7 +2005,7 @@ mod tests {
         let schema1: serde_json::Value =
             serde_json::from_slice(&std::fs::read(snap.join(MANIFEST_FILE)).unwrap()).unwrap();
         let evidence = inspect_schema2_database_evidence(&snap.join(DB_FILE)).unwrap();
-        assert_eq!(evidence.schema_version, 66);
+        assert_eq!(evidence.schema_version, 67);
         assert_eq!(evidence.row_counts.review_pilot_hidden_keys, Some(0));
         assert_eq!(evidence.row_counts.review_campaign_registry, Some(0));
         assert_eq!(evidence.row_counts.review_pool_registry, Some(0));
@@ -2098,7 +2341,7 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 9).unwrap(), vec![66, 65, 64, 63, 62, 61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 10).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58]);
         db.insert_segment(&crate::db::SpeechSegment {
             id: "pre-upgrade-row".to_string(),
             audio_path: "/must-survive.wav".to_string(),
@@ -2118,7 +2361,7 @@ mod tests {
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("an established v57 profile requires a pin");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 66);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 67);
         assert!(verify_snapshot_manifest_for_restore(&pin).unwrap(), "the migration pin must be self-verifying");
         let pinned = Database::open(pin.join(DB_FILE).to_string_lossy().as_ref()).unwrap();
         assert_eq!(crate::migrations::get_current_version(&pinned).unwrap(), 57);
@@ -2136,12 +2379,12 @@ mod tests {
         let db_path = profile.path().join(DB_FILE);
         let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 9).unwrap(), vec![66, 65, 64, 63, 62, 61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&db, 10).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58]);
 
         let pin = initialize_with_required_pre_migration_pin(&db, profile.path())
             .unwrap()
             .expect("a v57 profile requires a complete safety pin even when config uses defaults");
-        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 66);
+        assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 67);
         for state in OPTIONAL_SNAPSHOT_STATE {
             assert_eq!(std::fs::read(pin.join(state.absent_file)).unwrap(), state.absent_bytes);
         }

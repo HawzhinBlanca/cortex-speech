@@ -142,6 +142,9 @@ def test_real_harness_defaults_and_gate_mode_cannot_substitute_a_small_model() -
     assert "process.env.CORTEX_EGRESS_TRANSCRIBE === '1'" in egress
     assert "provisionEngine(page, DATA_DIR, 'WSL7B')" in egress
     assert "s.asr_model_size = 'CTC300M'" not in egress
+    assert "Get-CimInstance Win32_Process" in egress
+    assert "app process tree" in egress
+    assert "Why the MAIN exe PID only" not in egress
     assert "process.env.CORTEX_ASR_ENGINE || 'WSL7B'" in latency
     assert "provisionEngine(page, DATA_DIR, engine)" in latency
 
@@ -219,10 +222,13 @@ def test_production_importer_can_only_write_an_explicit_isolated_staging_profile
     importer = (APP / "src-tauri" / "src" / "bin" / "batch_importer.rs").read_text(encoding="utf-8")
     assert "CORTEX_APP_DATA_DIR is required" in importer
     assert "live review imports are forbidden" in importer
-    assert "selected.starts_with(&live)" in importer
-    assert "live.starts_with(&selected)" in importer
+    assert "cortex-batch-import-staging-profile" in importer
+    assert "CORTEX_IMPORT_STAGING_TOKEN" in importer
+    assert "sqlite_application_id_from_header" in importer
+    assert "the import-staging sentinel is bound to a different canonical profile" in importer
+    assert "--init-staging-profile" in importer
     assert 'std::env::var_os("CORTEX_APP_DATA_DIR")' in importer
-    assert '.or_else(|| std::env::var_os("APPDATA")' not in importer
+    assert 'std::env::var_os("APPDATA")' not in importer
 
 
 def test_shipped_gold_eval_has_no_auxiliary_engine_selector() -> None:

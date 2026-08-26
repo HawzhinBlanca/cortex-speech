@@ -123,8 +123,16 @@ pub fn export_audio_segments(
     // review decision: bulk verification can set it without anyone approving this audio↔text pair.
     // Unknown ids are deliberately not put in `policy_excluded`, so export_single_segment still
     // reports their not-found error and preserves the existing per-file failure accounting.
-    let requested: Vec<SpeechSegment> =
-        segment_ids.iter().filter_map(|id| db.get_segment_by_id(id).ok().flatten()).collect();
+    let mut requested: Vec<SpeechSegment> = Vec::with_capacity(segment_ids.len());
+    for id in segment_ids {
+        // A policy preflight read is part of the security boundary. Treating an SQL failure like a
+        // missing row let the later per-file lookup succeed and bypass holdout/rights exclusion.
+        // Unknown ids still fall through to the existing per-file not-found accounting; read errors
+        // abort the export before any audio is written.
+        if let Some(segment) = db.get_segment_by_id(id)? {
+            requested.push(segment);
+        }
+    }
     let loaded_ids: std::collections::HashSet<String> = requested.iter().map(|s| s.id.clone()).collect();
     let allowed_ids: std::collections::HashSet<String> = crate::export::exclude_unexportable_segments(db, requested)?
         .into_iter()
@@ -208,6 +216,14 @@ fn export_single_segment(
     let (seg, review_revision) = db
         .get_segment_by_id_with_revision(segment_id)?
         .ok_or_else(|| AppError::Other(format!("Segment not found: {segment_id}")))?;
+    // Defense in depth: this function is intentionally private today, but it owns the actual bytes on
+    // disk. Re-run the central rights/holdout/withdrawal policy on the exact row it will decode so a
+    // future caller—or any batch-preflight regression—cannot bypass the policy boundary.
+    if crate::export::exclude_unexportable_segments(db, vec![seg.clone()])?.len() != 1 {
+        return Err(AppError::Validation(format!(
+            "Segment {segment_id}: export blocked by rights, holdout, withdrawal, or quality policy"
+        )));
+    }
     // Defense in depth against a future caller bypassing export_audio_segments' batch filter. It
     // also guarantees write_metadata_csv never has to guess which transcript or decision was human.
     let (effective_transcript, _) = human_export_label(&seg).ok_or_else(|| {
@@ -225,6 +241,13 @@ fn export_single_segment(
     // Decode audio to 16-bit PCM
     let (sample_rate, pcm_samples) =
         audio::decode_to_pcm(&seg.audio_path).map_err(|e| AppError::Other(format!("Failed to decode audio: {e}")))?;
+    crate::export::require_decoded_segment_audio_identity(
+        db,
+        segment_id,
+        &pcm_samples,
+        sample_rate,
+        "reviewed audio export",
+    )?;
 
     // Slice the clip from the segment's alignment window, sharing the exact guard the HF exporter uses
     // (export::slice_for_export). When the alignment is present and parses but the window is OUT OF RANGE
@@ -517,20 +540,35 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn bind_test_audio_identity(db: &Database, segment_id: &str) {
+        let segment = db.get_segment_by_id(segment_id).unwrap().expect("segment fixture");
+        let content_hash = match crate::audio::decode_to_pcm(&segment.audio_path) {
+            Ok((sample_rate, pcm)) => crate::fingerprint::AudioFingerprint::content_hash(&pcm, sample_rate),
+            // Missing-media drills need a syntactically valid historical authority; the production
+            // export fails on the absent file before comparing it.
+            Err(_) => "0".repeat(64),
+        };
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+                rusqlite::params![segment_id, content_hash],
+            )
+            .unwrap();
+    }
+
     fn record_test_phone_decision(db: &Database, segment_id: &str, decision: &str, text: Option<&str>, reviewer: &str) {
-        let content_hash = blake3::hash(segment_id.as_bytes()).to_hex().to_string();
+        bind_test_audio_identity(db, segment_id);
         db.connection()
             .execute(
                 "UPDATE speech_segments
-                    SET audio_content_hash = ?2,
-                        alignment_json = json_object(
+                    SET alignment_json = json_object(
                             'source_start_ms', 0,
                             'source_end_ms', duration_ms,
                             'chunk_index', 0,
                             'chunk_count', 1
                         )
                   WHERE id = ?1",
-                rusqlite::params![segment_id, content_hash],
+                rusqlite::params![segment_id],
             )
             .unwrap();
         let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
@@ -626,6 +664,39 @@ mod tests {
         // And its transcript must not survive in the sidecar either.
         let metadata = fs::read_to_string(out.join("metadata.csv")).unwrap();
         assert!(!metadata.contains("revoked-1"), "withdrawn transcript leaked into metadata.csv");
+    }
+
+    #[test]
+    fn policy_preflight_database_failure_aborts_before_writing_any_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let wav = tmp.path().join("never-written.wav");
+        make_wav_file(&wav);
+        insert_test_segment(&db, "policy-read-fault", &wav);
+
+        // Deterministic injected read fault after all campaign tables exist. The old
+        // `.ok().flatten()` path converted this SQL error into an omitted prefilter row, then a later
+        // read could admit it. One security-boundary read failure must terminate the whole export.
+        db.connection().execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE speech_segments;").unwrap();
+        let out = tmp.path().join("audio_out");
+        let error = export_audio_segments(
+            &db,
+            &["policy-read-fault".to_string()],
+            &AudioExportOptions {
+                output_dir: out.to_string_lossy().to_string(),
+                format: AudioExportFormat::Wav,
+                sample_rate: 16_000,
+                include_metadata: true,
+            },
+        )
+        .expect_err("an unreadable policy snapshot must never degrade into per-file admission");
+
+        assert!(error.to_string().to_ascii_lowercase().contains("speech_segments"));
+        assert!(
+            !out.exists() || fs::read_dir(&out).unwrap().next().is_none(),
+            "policy read failure must leave no audio, metadata, or checksum artifact"
+        );
     }
 
     #[test]
@@ -967,6 +1038,40 @@ mod tests {
     }
 
     #[test]
+    fn same_path_audio_replacement_cannot_inherit_reviewed_transcript_authority() {
+        let tmp = TempDir::new().unwrap();
+        let wav_path = tmp.path().join("same-path.wav");
+        make_wav_file(&wav_path);
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_test_segment(&db, "source-drift", &wav_path);
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for index in 0..16000i32 {
+            writer.write_sample(((index % 401) - 200) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let out = tmp.path().join("out");
+        let result = export_audio_segments(
+            &db,
+            &["source-drift".to_string()],
+            &AudioExportOptions { output_dir: out.to_string_lossy().to_string(), ..AudioExportOptions::default() },
+        )
+        .unwrap();
+        assert_eq!((result.succeeded, result.failed), (0, 1));
+        assert!(result.errors.iter().any(|error| error.contains("stored canonical PCM identity")));
+        assert!(!out.join("same-path_source-drift.wav").exists());
+        assert!(!out.join("metadata.jsonl").exists());
+    }
+
+    #[test]
     fn test_export_audio_segment() {
         let tmp = TempDir::new().unwrap();
         let wav_path = tmp.path().join("test.wav");
@@ -1019,6 +1124,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
+        bind_test_audio_identity(&db, "oob1");
         db.record_human_decision("oob1", "accept", Some("short utterance"), None).unwrap();
 
         let out_dir = tmp.path().join("out");
@@ -1070,6 +1176,7 @@ mod tests {
             ..SpeechSegment::default()
         };
         db.insert_segment(&seg).unwrap();
+        bind_test_audio_identity(&db, "clamp1");
         db.record_human_decision("clamp1", "accept", Some("clamped utterance"), None).unwrap();
 
         let out_dir = tmp.path().join("out");

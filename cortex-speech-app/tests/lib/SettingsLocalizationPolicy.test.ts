@@ -7,8 +7,10 @@ const root = resolve(import.meta.dirname, '../..');
 describe('settings and playback localization policy', () => {
   it('keeps AI and Jury settings prose behind translation keys', () => {
     const source = readFileSync(resolve(root, 'src/lib/SettingsPanel.svelte'), 'utf8');
+    const apiKeyField = readFileSync(resolve(root, 'src/lib/ApiKeyField.svelte'), 'utf8');
     expect(source).toContain("labelKey: 'settings.aiTab'");
     expect(source).toContain("labelKey: 'settings.juryTab'");
+    expect(source).toContain("import ApiKeyField from './ApiKeyField.svelte'");
     const start = source.indexOf("{:else if activeTab === 'ai'}");
     const end = source.indexOf("{:else if activeTab === 'diagnostics'}", start);
     expect(start).toBeGreaterThan(-1);
@@ -44,11 +46,6 @@ describe('settings and playback localization policy', () => {
       'settings.llmCloudOption',
       'settings.localEndpointHint',
       'settings.quickSelect',
-      'settings.apiKeySaved',
-      'settings.apiKeyMissing',
-      'settings.savingKey',
-      'settings.saveKey',
-      'settings.apiKeyStorageHint',
       'settings.systemPromptHint',
       'settings.juryTitle',
       'settings.juryDescription',
@@ -62,17 +59,34 @@ describe('settings and playback localization policy', () => {
       'settings.selfConsistencyLabel',
       'settings.selfConsistencyHint',
       'settings.juryCloudDisabled',
-      'settings.jurySharedKeyHint',
       'settings.juryConnection',
       'settings.juryConnectionGemini',
       'settings.juryConnectionOpenRouter',
       'settings.juryPolicyLead',
       'settings.juryPolicyModel',
       'settings.juryPolicyDetail',
-      'settings.openRouterApiKey',
-      'settings.openRouterKeyHint',
     ];
     for (const key of requiredKeys) expect(section).toContain(`$t('${key}')`);
+
+    for (const key of [
+      'settings.apiKeySaved',
+      'settings.apiKeyMissing',
+      'settings.savingKey',
+      'settings.saveKey',
+    ]) {
+      expect(apiKeyField).toContain(`$t('${key}')`);
+    }
+    expect(apiKeyField).toContain('{$t(labelKey)}');
+    expect(apiKeyField).toContain('{$t(hintKey)}');
+    for (const binding of [
+      'labelKey="settings.geminiApiKey"',
+      'labelKey="settings.openRouterApiKey"',
+      'hintKey="settings.apiKeyStorageHint"',
+      'hintKey="settings.jurySharedKeyHint"',
+      'hintKey="settings.openRouterKeyHint"',
+    ]) {
+      expect(section).toContain(binding);
+    }
 
     for (const hardcodedNotice of [
       "'OpenRouter key saved to secrets.env'",
@@ -83,17 +97,21 @@ describe('settings and playback localization policy', () => {
       "'Failed to save Gemini key'",
     ]) {
       expect(source).not.toContain(hardcodedNotice);
+      expect(apiKeyField).not.toContain(hardcodedNotice);
     }
     expect(source).toContain("$t('settings.apiKeySavedToast'");
     expect(source).toContain("$t('settings.apiKeySaveFailedToast'");
   });
 
   it('keeps the Inbox local-only notice behind translation keys', () => {
-    const source = readFileSync(resolve(root, 'src/lib/ReviewInbox.svelte'), 'utf8');
-    expect(source).toContain("$t('inbox.localOnly')");
-    expect(source).toContain("$t('inbox.localOnlyTitle')");
-    expect(source).not.toContain('>🔒 Local only<');
-    expect(source).not.toContain('title="Cloud T2 (Gemini)');
+    const owner = readFileSync(resolve(root, 'src/lib/ReviewInbox.svelte'), 'utf8');
+    const header = readFileSync(resolve(root, 'src/lib/ReviewInboxHeader.svelte'), 'utf8');
+    expect(owner).toContain("import ReviewInboxHeader from './ReviewInboxHeader.svelte'");
+    expect(owner).toContain('<ReviewInboxHeader');
+    expect(header).toContain("$t('inbox.localOnly')");
+    expect(header).toContain("$t('inbox.localOnlyTitle')");
+    expect(header).not.toContain('>🔒 Local only<');
+    expect(header).not.toContain('title="Cloud T2 (Gemini)');
   });
 
   it('keeps AudioPlayer controls and user-facing failures behind translation keys', () => {

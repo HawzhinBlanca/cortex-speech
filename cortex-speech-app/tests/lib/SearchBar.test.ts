@@ -2,7 +2,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { get } from 'svelte/store';
 import SearchBar from '../../src/lib/SearchBar.svelte';
-import { filteredSegments, searchQuery, searchResults, filterVerified, sortOrder, segments } from '../../src/lib/stores/segmentStore';
+import {
+  filteredSegments,
+  searchQuery,
+  searchResults,
+  filterVerified,
+  sortOrder,
+  segments,
+} from '../../src/lib/stores/segmentStore';
 import { ckb } from '../../src/lib/i18n/ckb';
 import { getSegmentsPage } from '../../src/lib/commands';
 import type { SpeechSegment } from '../../src/lib/types';
@@ -10,12 +17,14 @@ import type { SpeechSegment } from '../../src/lib/types';
 vi.mock('../../src/lib/commands', () => ({
   getSegmentsPage: vi.fn(() => Promise.resolve({ items: [], total: 0, nextCursor: null })),
   getDatasetCertificate: vi.fn(() => Promise.resolve({ threshold: 0.35 })),
-  getDatasetStats: vi.fn(() => Promise.resolve({
-    totalSegments: 0,
-    verifiedCount: 0,
-    pendingCount: 0,
-    totalDurationSeconds: 0,
-  })),
+  getDatasetStats: vi.fn(() =>
+    Promise.resolve({
+      totalSegments: 0,
+      verifiedCount: 0,
+      pendingCount: 0,
+      totalDurationSeconds: 0,
+    }),
+  ),
   getSegment: vi.fn(),
 }));
 
@@ -99,13 +108,13 @@ describe('SearchBar', () => {
   it('updates filterVerified when verified filter buttons are clicked', async () => {
     render(SearchBar);
 
-    await fireEvent.click(screen.getByText(ckb.filterVerified));
+    await fireEvent.click(screen.getByRole('button', { name: ckb.filterVerified }));
     expect(get(filterVerified)).toBe(true);
 
-    await fireEvent.click(screen.getByText(ckb.filterPending));
+    await fireEvent.click(screen.getByRole('button', { name: ckb.filterPending }));
     expect(get(filterVerified)).toBe(false);
 
-    await fireEvent.click(screen.getByText(ckb.all));
+    await fireEvent.click(screen.getByRole('button', { name: ckb.all }));
     expect(get(filterVerified)).toBeNull();
   });
 

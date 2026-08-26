@@ -53,9 +53,13 @@ pub async fn transcribe_segment(
     let pipeline = state.lock_pipeline().clone();
     run_blocking(move || {
         let _mutation = mutation;
-        let draft = pipeline
-            .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
-            .map_err(|e| e.to_string())?;
+        let id = segment_id.as_deref().ok_or_else(|| {
+            "E_TRANSCRIPTION_SOURCE_UNBOUND: an imported segment id is required for transcription".to_string()
+        })?;
+        let source = pipeline
+            .bind_existing_transcription_source(id, Some(&audio_path), alignment_json.as_deref())
+            .map_err(|error| error.to_string())?;
+        let draft = pipeline.transcribe_bound(&source, None).map_err(|e| e.to_string())?;
         // A blank draft is NOT a transcript. Returning Ok("") lets the frontend upsert "" over an
         // existing good transcript, destroying it and persisting a blank. The production command must
         // fail closed so the frontend keeps the current transcript. (Memory:
@@ -73,6 +77,7 @@ pub async fn transcribe_segment(
             "confidenceSource": draft.confidence_source,
             "modelVersionId": draft.model_version_id,
             "cloudCall": draft.cloud_call
+            ,"segmentId": source.segment().id
         }))
     })
     .await

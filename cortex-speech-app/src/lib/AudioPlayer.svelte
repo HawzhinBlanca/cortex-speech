@@ -1,6 +1,14 @@
 <script lang="ts">
-  import { convertFileSrc } from '@tauri-apps/api/core';
-  import { getMediaAssetUrl, registerMediaAsset } from './commands';
+  import Pause from '@lucide/svelte/icons/pause';
+  import Play from '@lucide/svelte/icons/play';
+  import { localMediaUrl } from './mediaSource';
+  import {
+    beginDesktopPlaybackSessionV1,
+    cancelDesktopPlaybackSessionV1,
+    getMediaAssetUrl,
+    registerMediaAsset,
+    registerReviewMediaAsset,
+  } from './commands';
   import { onDestroy } from 'svelte';
   import { notifications } from './stores/notificationStore';
   import { t } from './i18n';
@@ -13,6 +21,12 @@
     type AudioMachineEvent,
     type AudioPhase,
   } from './audioMachine';
+  import {
+    addAbsolutePlaybackInterval,
+    emptyPlaybackCoverage,
+    type PlaybackInterval,
+    type PlaybackCoverage,
+  } from './playbackCoverage';
 
   interface Props {
     audioPath: string;
@@ -27,9 +41,17 @@
     // collapse the scrubber + time read-out to 0:00 on every tap.
     displayStart?: number;
     displayEnd?: number;
+    /** Absolute source bounds of the database segment whose receipt is being proven. Playback may
+     * temporarily narrow to one word, but evidence remains relative to this immutable full span. */
+    evidenceStart?: number;
+    evidenceEnd?: number;
     currentTime?: number;
     duration?: number;
     autoplay?: boolean;
+    /** Decision surfaces opt in. Library/curation playback must not require a review receipt. */
+    requirePlaybackProof?: boolean;
+    /** Review revision rendered with this clip. Authority issuance is compare-and-swap against it. */
+    expectedRevision?: number;
     playing?: boolean;
     // The load/playback failure, surfaced to the PARENT so a decision surface can refuse to record a
     // human verdict on audio nobody could hear. Internal-only until 2026-08-17, when an external
@@ -39,12 +61,19 @@
     // VERBATIM corpus — the queue already refuses clips whose FILE is gone (2026-08-15); this closes
     // the same disease coming through every other failure mode.
     audioError?: string | null;
-    // Cumulative MEDIA time this clip has actually advanced, in ms. Not wall-clock, not a play()
-    // call, not a download — a file can arrive, decode and sit at 0:00 while nobody hears a word of
-    // it, which is exactly the hole `audioError` left open: it proved the absence of a FAILURE, never
-    // the presence of listening. Seeks and pauses stop the accounting; a replay resumes adding to it,
-    // so hearing the first half twice never counts as hearing the whole clip.
+    // UNIQUE clip-relative MEDIA time this clip has actually traversed, in ms. Not wall-clock, not a
+    // play() call, not a download — and not a cumulative counter that lets replaying one half twice
+    // impersonate hearing the whole clip. The existing backend command accepts only a scalar today,
+    // so this bound value is the exact interval-union length until policy-4 receipts carry the union.
     heardMs?: number;
+    // Opaque policy-4 authority issued by the backend for this exact clip/media-grant attempt.
+    // The parent finalizes the bound interval union and passes the resulting receipt into the
+    // decision command; neither identity is useful for another clip or after this grant expires.
+    playbackReceiptId?: string | null;
+    playbackMediaGrantId?: string | null;
+    /** Exact canonical duration returned by the backend session that issued playbackReceiptId. */
+    playbackClipDurationMs?: number | null;
+    heardIntervals?: readonly PlaybackInterval[];
   }
   let {
     audioPath,
@@ -53,37 +82,84 @@
     endTime = 0,
     displayStart,
     displayEnd,
+    evidenceStart,
+    evidenceEnd,
     currentTime = $bindable(0),
     duration = $bindable(0),
     autoplay = false,
+    requirePlaybackProof = false,
+    expectedRevision,
     playing = $bindable(false),
     audioError = $bindable<string | null>(null),
     heardMs = $bindable(0),
+    playbackReceiptId = $bindable<string | null>(null),
+    playbackMediaGrantId = $bindable<string | null>(null),
+    playbackClipDurationMs = $bindable<number | null>(null),
+    heardIntervals = $bindable<readonly PlaybackInterval[]>([]),
   }: Props = $props();
 
-  // Media-time position at the previous tick. Only FORWARD movement of a playing element counts, and
-  // a jump larger than one tick is a seek, not listening.
+  // Media-time position at the previous continuous-playback tick. Discontinuities clear this anchor;
+  // the immutable union survives ordinary pause/resume and replay within the same clip.
   let lastMediaPos: number | null = null;
+  let playbackCoverage: PlaybackCoverage = emptyPlaybackCoverage();
   const MAX_TICK_ADVANCE_S = 1.5;
 
+  function publishHeardMs(value: number) {
+    if (heardMs !== value) heardMs = value;
+    const nextIntervals = playbackCoverage.intervals.map((interval) => ({ ...interval }));
+    if (
+      heardIntervals.length !== nextIntervals.length ||
+      nextIntervals.some(
+        (interval, index) =>
+          interval.startMs !== heardIntervals[index]?.startMs ||
+          interval.endMs !== heardIntervals[index]?.endMs,
+      )
+    ) {
+      heardIntervals = nextIntervals;
+    }
+  }
+
   function accrueHeardTime(now: number) {
+    if (!Number.isFinite(now) || now < 0) {
+      lastMediaPos = null;
+      return;
+    }
     if (lastMediaPos !== null) {
       const delta = now - lastMediaPos;
-      if (delta > 0 && delta <= MAX_TICK_ADVANCE_S) heardMs += delta * 1000;
+      if (delta > 0 && delta <= MAX_TICK_ADVANCE_S) {
+        const origin = evidenceMode && Number.isFinite(evidenceOrigin) ? evidenceOrigin : 0;
+        playbackCoverage = addAbsolutePlaybackInterval(
+          playbackCoverage,
+          lastMediaPos,
+          now,
+          origin,
+          evidenceLength,
+        );
+        publishHeardMs(playbackCoverage.uniqueMs);
+      }
     }
     lastMediaPos = now;
   }
 
-  /// A new clip (or new audio) starts its own accounting: evidence never carries across clips.
-  export function resetHeardTime() {
-    heardMs = 0;
+  function resetPlaybackBaseline() {
     lastMediaPos = null;
+  }
+
+  /// A new clip or newly-granted audio starts its own union: evidence never crosses clip identity.
+  export function resetHeardTime() {
+    playbackCoverage = emptyPlaybackCoverage();
+    publishHeardMs(0);
+    resetPlaybackBaseline();
   }
   let audioEl: HTMLAudioElement | undefined = $state();
   let audioMachine = createAudioMachine();
   let audioPhase = $state<AudioPhase>('idle');
+  let playbackSessionPending = $state(false);
   const loading = $derived(
-    audioPhase === 'idle' || audioPhase === 'resolving' || audioPhase === 'loading',
+    playbackSessionPending ||
+      audioPhase === 'idle' ||
+      audioPhase === 'resolving' ||
+      audioPhase === 'loading',
   );
   function transitionAudio(event: AudioMachineEvent): AudioAttemptBinding | null {
     audioMachine = audioTransition(audioMachine, event);
@@ -94,6 +170,13 @@
   let loop = $state(false);
   const RATES = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
+  // Browser media metadata is not trustworthy numeric input. Chromium can report `Infinity` for a
+  // stream-like source and `NaN` while metadata is incomplete. Neither value may reach a range input,
+  // timer, aria value or visible clock: it previously rendered `Infinity:NaN` in the review surface.
+  function safeMediaSeconds(value: number): number {
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+  }
+
   // Clip-relative scrubber: when bounded to a segment ([startTime, endTime]) show the CLIP
   // timeline (0:00 → clip length) instead of the whole source file, so a short sentence
   // doesn't render as a multi-minute bar you can't navigate. Internal playback still uses
@@ -102,9 +185,15 @@
   const dispStart = $derived(displayStart ?? startTime);
   const dispEnd = $derived(displayEnd ?? endTime);
   const clipMode = $derived(dispEnd > dispStart);
-  const clipLength = $derived(clipMode ? dispEnd - dispStart : duration);
+  const clipLength = $derived(safeMediaSeconds(clipMode ? dispEnd - dispStart : duration));
+  const evidenceOrigin = $derived(evidenceStart ?? dispStart);
+  const evidenceLimit = $derived(evidenceEnd ?? dispEnd);
+  const evidenceMode = $derived(evidenceLimit > evidenceOrigin);
+  const evidenceLength = $derived(
+    safeMediaSeconds(evidenceMode ? evidenceLimit - evidenceOrigin : duration),
+  );
   const clipPosition = $derived(
-    clipMode ? Math.max(0, Math.min(currentTime - dispStart, clipLength)) : currentTime,
+    Math.min(safeMediaSeconds(clipMode ? currentTime - dispStart : currentTime), clipLength),
   );
 
   function toggleRate() {
@@ -115,30 +204,149 @@
   }
 
   let resolveController: AbortController | null = null;
+  let playbackSessionController: AbortController | null = null;
+  let currentMediaGrantId: string | null = null;
   let mediaLoadBinding: AudioAttemptBinding | null = null;
   let activePlayBinding: AudioAttemptBinding | null = null;
+  let authorityClientAttemptId: string | null = null;
+  let authoritySegmentId: string | null = null;
+  let authorityRevision: number | null = null;
+
+  function retirePlaybackAuthority(receiptId: string | null, clientAttemptId: string | null) {
+    if (!receiptId || !clientAttemptId) return;
+    // Component teardown cannot wait for IPC. The exact receipt/attempt pair makes a late call safe,
+    // and the backend independently reclaims oldest unfinalized attempts if this best-effort call is
+    // lost during WebView shutdown. Finalized evidence is immutable, so that expected race is ignored.
+    void cancelDesktopPlaybackSessionV1(receiptId, clientAttemptId).catch(() => undefined);
+  }
+
+  function forgetPlaybackAuthority() {
+    playbackSessionController?.abort();
+    playbackSessionController = null;
+    playbackSessionPending = false;
+    playbackReceiptId = null;
+    playbackMediaGrantId = null;
+    playbackClipDurationMs = null;
+    authorityClientAttemptId = null;
+    authoritySegmentId = null;
+    authorityRevision = null;
+  }
+
+  function clearPlaybackAuthority() {
+    const receiptId = playbackReceiptId;
+    const clientAttemptId = authorityClientAttemptId;
+    forgetPlaybackAuthority();
+    retirePlaybackAuthority(receiptId, clientAttemptId);
+  }
+
+  async function beginPlaybackAuthority(
+    mediaGrantId: string,
+    binding: AudioAttemptBinding,
+    revision: number | undefined,
+    clientAttemptId: string,
+  ): Promise<boolean> {
+    playbackSessionController?.abort();
+    const controller = new AbortController();
+    playbackSessionController = controller;
+    playbackSessionPending = true;
+    playbackReceiptId = null;
+    playbackMediaGrantId = null;
+    playbackClipDurationMs = null;
+    let issuedReceiptId: string | null = null;
+    try {
+      if (!Number.isSafeInteger(revision) || (revision ?? -1) < 0) {
+        throw new Error('playback proof requires the exact rendered review revision');
+      }
+      const session = await beginDesktopPlaybackSessionV1(
+        binding.clipId,
+        mediaGrantId,
+        revision as number,
+        clientAttemptId,
+      );
+      issuedReceiptId = session.playbackReceiptId || null;
+      if (
+        controller.signal.aborted ||
+        !isCurrentAudioAttempt(audioMachine, binding) ||
+        authorityClientAttemptId !== clientAttemptId
+      ) {
+        retirePlaybackAuthority(issuedReceiptId, clientAttemptId);
+        return false;
+      }
+      if (
+        session.segmentId !== binding.clipId ||
+        session.segmentRevision !== revision ||
+        !session.playbackReceiptId ||
+        !Number.isSafeInteger(session.clipDurationMs) ||
+        session.clipDurationMs <= 0
+      ) {
+        throw new Error('playback session identity mismatch');
+      }
+      playbackReceiptId = session.playbackReceiptId;
+      playbackMediaGrantId = mediaGrantId;
+      playbackClipDurationMs = session.clipDurationMs;
+      authoritySegmentId = binding.clipId;
+      authorityRevision = revision as number;
+      issuedReceiptId = null; // Ownership transferred to the component's current authority state.
+      return true;
+    } catch (error) {
+      retirePlaybackAuthority(issuedReceiptId, clientAttemptId);
+      if (!controller.signal.aborted && isCurrentAudioAttempt(audioMachine, binding)) {
+        console.error('[AudioPlayer] could not start playback proof:', error);
+        stopPhysicalPlayback();
+        transitionAudio({ type: 'failed', binding, errorCode: 'PLAYBACK_PROOF_FAILED' });
+        audioError = $t('audio.proofFailed');
+      }
+      return false;
+    } finally {
+      if (playbackSessionController === controller) {
+        playbackSessionController = null;
+        playbackSessionPending = false;
+      }
+    }
+  }
 
   function stopPhysicalPlayback() {
     clearClipStop();
     if (audioEl && !audioEl.paused) audioEl.pause();
     playing = false;
-    lastMediaPos = null;
+    resetPlaybackBaseline();
   }
 
-  async function resolveAudioUrl(path: string, binding: AudioAttemptBinding) {
+  async function resolveAudioUrl(
+    path: string,
+    binding: AudioAttemptBinding,
+    revision: number | undefined,
+    clientAttemptId: string | null,
+  ) {
     // Cancel any in-flight resolution for the previous path. Its promise also carries `binding`, so
     // even a dependency that ignores AbortSignal cannot publish into the newly selected clip.
     resolveController?.abort();
     const ctrl = new AbortController();
     resolveController = ctrl;
+    let issuedReceiptId: string | null = null;
 
     try {
-      const grant = await registerMediaAsset(path);
+      const grant = requirePlaybackProof
+        ? await registerReviewMediaAsset(path)
+        : await registerMediaAsset(path);
       if (ctrl.signal.aborted || !isCurrentAudioAttempt(audioMachine, binding)) return;
       // Guard: the asset grant can be null/denied (missing file, permission,
       // or no backend) — never deref blindly or we surface a raw TypeError.
-      const grantedPath = grant?.id ? await getMediaAssetUrl(grant.id) : null;
-      if (ctrl.signal.aborted || !isCurrentAudioAttempt(audioMachine, binding)) return;
+      if (!grant?.id) throw new Error('audio asset unavailable');
+      currentMediaGrantId = grant.id;
+      if (
+        requirePlaybackProof &&
+        (!clientAttemptId ||
+          !(await beginPlaybackAuthority(grant.id, binding, revision, clientAttemptId)))
+      ) {
+        return;
+      }
+      if (requirePlaybackProof) issuedReceiptId = playbackReceiptId;
+      const grantedPath = await getMediaAssetUrl(grant.id);
+      if (ctrl.signal.aborted || !isCurrentAudioAttempt(audioMachine, binding)) {
+        retirePlaybackAuthority(issuedReceiptId, clientAttemptId);
+        return;
+      }
       if (!grantedPath) throw new Error('audio asset unavailable');
       let cleanPath = grantedPath.replaceAll('\\', '/');
       if (cleanPath.startsWith('//?/')) {
@@ -146,7 +354,7 @@
       }
       transitionAudio({ type: 'resolved', binding });
       // Set src directly; the metadata/error handlers retain the attempt that owns this load.
-      const url = convertFileSrc(cleanPath);
+      const url = localMediaUrl(cleanPath);
       if (!audioEl) throw new Error('audio element unavailable');
       mediaLoadBinding = binding;
       resetHeardTime(); // new source => new evidence; a previous clip's listen never carries
@@ -154,6 +362,14 @@
       audioEl.playbackRate = playbackRate;
       audioEl.load();
     } catch (e) {
+      retirePlaybackAuthority(issuedReceiptId, clientAttemptId);
+      if (
+        issuedReceiptId &&
+        playbackReceiptId === issuedReceiptId &&
+        authorityClientAttemptId === clientAttemptId
+      ) {
+        forgetPlaybackAuthority();
+      }
       if (!ctrl.signal.aborted && isCurrentAudioAttempt(audioMachine, binding)) {
         // Keep the technical detail in the console; show the user a clean,
         // consistent message instead of a raw "TypeError: …".
@@ -166,35 +382,72 @@
 
   function retryAudio() {
     stopPhysicalPlayback();
+    // A retry obtains a fresh media grant. Until the backend can bind intervals to that grant, never
+    // combine evidence observed on opposite sides of the retry boundary.
+    resetHeardTime();
+    clearPlaybackAuthority();
+    const revision = expectedRevision;
+    const clientAttemptId = requirePlaybackProof ? crypto.randomUUID() : null;
+    authorityClientAttemptId = clientAttemptId;
     resolveController?.abort();
     const binding = transitionAudio({ type: 'retry' });
     audioError = null;
-    if (binding && audioPath) void resolveAudioUrl(audioPath, binding);
+    if (binding && audioPath) void resolveAudioUrl(audioPath, binding, revision, clientAttemptId);
+  }
+
+  /** Start a wholly new grant/session/evidence attempt after a proven non-commit finalization. */
+  export function restartPlaybackAuthority() {
+    retryAudio();
   }
 
   // Abort any pending resolution when the component is torn down.
   onDestroy(() => {
     resolveController?.abort();
+    clearPlaybackAuthority();
     stopPhysicalPlayback();
     transitionAudio({ type: 'reset' });
   });
 
   let selectedClipMarker: string | null = null;
   let selectedSourceMarker: string | null = null;
+  let selectedRevisionMarker: number | undefined = undefined;
   $effect(() => {
     const sourceId = audioPath;
     const clipId = String(clipKey ?? sourceId);
-    if (!sourceId || (clipId === selectedClipMarker && sourceId === selectedSourceMarker)) return;
+    const revision = requirePlaybackProof ? expectedRevision : undefined;
+    if (
+      !sourceId ||
+      (clipId === selectedClipMarker &&
+        sourceId === selectedSourceMarker &&
+        revision === selectedRevisionMarker)
+    ) {
+      return;
+    }
 
     const sourceChanged = sourceId !== selectedSourceMarker;
     selectedClipMarker = clipId;
     selectedSourceMarker = sourceId;
+    selectedRevisionMarker = revision;
     stopPhysicalPlayback();
+    resetHeardTime();
+    clearPlaybackAuthority();
+    const clientAttemptId = requirePlaybackProof ? crypto.randomUUID() : null;
+    authorityClientAttemptId = clientAttemptId;
     resolveController?.abort();
     const binding = transitionAudio({ type: 'select', clipId, sourceId });
     audioError = null;
     if (sourceChanged) currentTime = 0;
-    if (binding && audioMachine.phase === 'resolving') void resolveAudioUrl(sourceId, binding);
+    if (binding && audioMachine.phase === 'resolving') {
+      void resolveAudioUrl(sourceId, binding, revision, clientAttemptId);
+    } else if (binding && currentMediaGrantId && requirePlaybackProof) {
+      // Same recording, different clip: the cached source can be reused, but listening authority is
+      // always per clip/revision.  Autoplay waits on playbackSessionPending before it can advance.
+      if (clientAttemptId) {
+        void beginPlaybackAuthority(currentMediaGrantId, binding, revision, clientAttemptId);
+      }
+    } else if (binding) {
+      void resolveAudioUrl(sourceId, binding, revision, clientAttemptId);
+    }
   });
 
   // Autoplay each newly-selected CLIP. handleLoaded covers a fresh SOURCE load (onloadedmetadata), but
@@ -202,30 +455,40 @@
   // onloadedmetadata never re-fires — without this, autoplay dies after the first clip. Key on clipKey (the
   // segment identity), not startTime, so a tap-a-word (which only narrows startTime) never re-autoplays.
   // Guarded on !loading: a different-source selection enters resolving/loading first, so this skips
-  // and handleLoaded owns that autoplay — no double play. `autoplayedClip` is a plain (non-reactive)
-  // marker so setting it here never re-triggers the effect.
-  let autoplayedClip: string | number | undefined = undefined;
+  // and handleLoaded owns that autoplay — no double play. `autoplayedClip` is a plain marker,
+  // so setting it here never re-triggers the effect.
+  let autoplayedClip: string | null = null;
   $effect(() => {
-    if (autoplay && audioEl && !loading && clipKey !== undefined && clipKey !== autoplayedClip) {
-      autoplayedClip = clipKey;
+    const marker = `${String(clipKey)}\0${requirePlaybackProof ? String(expectedRevision) : ''}`;
+    if (autoplay && audioEl && !loading && clipKey !== undefined && marker !== autoplayedClip) {
+      autoplayedClip = marker;
       play();
     }
   });
 
-  // Evidence accounting is PER CLIP, and this is the reset that makes it true. Found by the
-  // 2026-08-19 bug hunt, verified certain: resetHeardTime() had zero external callers and the only
-  // internal one runs on a SOURCE change — but consecutive review clips share their source file
-  // (403 of 414 clips live in one recording), so heardMs accumulated across an entire same-file
-  // session and clip B passed the listening guard on clip A's minutes. Keyed on clipKey exactly
-  // like autoplay above, but unconditionally: evidence hygiene must not depend on the autoplay
-  // setting. The parent's bound heardMs snapshot is taken at decision time, before advance, so
-  // resetting on the NEW clip's arrival never races the receipt.
-  let accountedClip: string | number | undefined = undefined;
+  // Evidence accounting is PER CLIP. Consecutive review clips often share one source recording, so
+  // source identity alone cannot fence the union: key the reset on clipKey exactly like autoplay,
+  // but unconditionally. The parent's bound heardMs snapshot is taken at decision time, before
+  // advance, so resetting on the NEW clip's arrival never races the receipt.
+  let accountedSelection: string | null = null;
   $effect(() => {
-    if (clipKey !== undefined && clipKey !== accountedClip) {
-      accountedClip = clipKey;
+    const marker = `${String(clipKey)}\0${requirePlaybackProof ? String(expectedRevision) : ''}`;
+    if (clipKey !== undefined && marker !== accountedSelection) {
+      accountedSelection = marker;
       resetHeardTime();
     }
+  });
+
+  // Clip-relative coordinates are meaningful only inside one stable display/review span. ReviewMode
+  // keeps this span stable while tap-a-word transiently narrows startTime/endTime; any real span or
+  // duration replacement starts a fresh union rather than remapping old evidence onto new bounds.
+  let accountedCoverageWindow: string | null = null;
+  $effect(() => {
+    const originMs = clipMode && Number.isFinite(dispStart) ? Math.round(dispStart * 1000) : 0;
+    const durationMs = Math.floor(clipLength * 1000);
+    const marker = `${originMs}:${durationMs}`;
+    if (accountedCoverageWindow !== null && marker !== accountedCoverageWindow) resetHeardTime();
+    accountedCoverageWindow = marker;
   });
 
   // Sync playbackRate changes to the audio element reactively.
@@ -236,6 +499,7 @@
   $effect(() => {
     if (audioEl && Math.abs(audioEl.currentTime - currentTime) > 0.05) {
       try {
+        resetPlaybackBaseline();
         audioEl.currentTime = currentTime;
         // A programmatic seek WHILE PLAYING (tapping a word, a parent scrubber, a loop/replay jump)
         // invalidates the clip-stop timer, which was scheduled for the OLD position's remaining time —
@@ -261,15 +525,15 @@
 
   function reportPlaybackFailure(message: string, cause: unknown, binding: AudioAttemptBinding) {
     if (!isCurrentAudioAttempt(audioMachine, binding)) return;
+    stopPhysicalPlayback();
     if ((cause as { name?: string } | null)?.name === 'NotAllowedError') {
       transitionAudio({ type: 'blocked', binding, errorCode: 'AUDIO_PLAYBACK_BLOCKED' });
     } else {
       transitionAudio({ type: 'failed', binding, errorCode: 'AUDIO_PLAYBACK_FAILED' });
     }
     audioError = message;
-    playing = false;
-    lastMediaPos = null;
-    notifications.error(message, { detail: String(cause) });
+    activePlayBinding = null;
+    notifications.error(message, { cause });
   }
 
   // Precise clip-boundary stop. The HTMLAudioElement `timeupdate` event only fires ~every 250ms, so
@@ -300,13 +564,14 @@
         // Only act if still actively playing — a timer that survived a pause or a source switch must
         // not resurrect playback (e.g. loop-restart the newly-selected clip).
         if (!audioEl || !playing || !isCurrentAudioAttempt(audioMachine, binding)) return;
+        accrueHeardTime(audioEl.currentTime);
+        resetPlaybackBaseline();
         if (loop) {
           audioEl.currentTime = startTime;
           attemptPlay($t('audio.loopFailed'));
         } else {
           audioEl.pause();
           playing = false;
-          lastMediaPos = null;
           transitionAudio({ type: 'ended', binding });
         }
       },
@@ -326,6 +591,17 @@
   //
   function attemptPlay(failureMessage: string) {
     if (!audioEl) return;
+    // Audio may not advance before its server-issued authority exists. Otherwise a fast autoplay on
+    // a same-source clip can finish before the asynchronous session call returns, leaving real
+    // listening that the commit boundary is correctly unable to prove.
+    if (
+      requirePlaybackProof &&
+      (playbackSessionPending || !playbackReceiptId || !playbackMediaGrantId)
+    )
+      return;
+    // A fresh play promise is a fresh continuity boundary. Coverage already proved for this clip is
+    // retained, but no interval may bridge a pause, failed promise, loop jump or superseded attempt.
+    resetPlaybackBaseline();
     const priorAttempt = audioMachine.attemptId;
     const binding = transitionAudio({ type: 'playRequested' });
     if (!binding || audioMachine.attemptId === priorAttempt) return;
@@ -342,6 +618,9 @@
         transitionAudio({ type: 'playStarted', binding });
         audioError = null;
         playing = true;
+        if (lastMediaPos === null && audioEl && Number.isFinite(audioEl.currentTime)) {
+          lastMediaPos = audioEl.currentTime;
+        }
         scheduleClipStop();
       })
       .catch((e: unknown) => {
@@ -352,7 +631,7 @@
         if ((e as { name?: string } | null)?.name === 'AbortError') {
           transitionAudio({ type: 'pause' });
           playing = false;
-          lastMediaPos = null;
+          resetPlaybackBaseline();
           return;
         }
         reportPlaybackFailure(failureMessage, e, binding);
@@ -368,6 +647,7 @@
       endTime > startTime &&
       (audioEl.currentTime < startTime || audioEl.currentTime >= endTime)
     ) {
+      resetPlaybackBaseline();
       audioEl.currentTime = startTime;
     }
     attemptPlay($t('audio.playbackFailed'));
@@ -375,10 +655,34 @@
 
   function pause() {
     clearClipStop();
+    if (audioEl && !audioEl.paused) accrueHeardTime(audioEl.currentTime);
     audioEl?.pause();
     playing = false;
-    lastMediaPos = null;
+    resetPlaybackBaseline();
     transitionAudio({ type: 'pause' });
+  }
+
+  /**
+   * Retire physical playback and return one child-owned evidence snapshot.
+   *
+   * A parent cannot safely set the bound `playing` flag and immediately read its other bindings:
+   * the final media delta is accrued by this component while pausing, after the parent's click
+   * handler has already started. Returning the values directly from the authority owner closes that
+   * race and also binds the snapshot to the exact server-issued segment revision and duration.
+   */
+  export function pauseAndSnapshot() {
+    pause();
+    const intervals = playbackCoverage.intervals.map(({ startMs, endMs }) =>
+      Object.freeze({ startMs, endMs }),
+    );
+    return Object.freeze({
+      segmentId: authoritySegmentId,
+      segmentRevision: authorityRevision,
+      playbackReceiptId,
+      mediaGrantId: playbackMediaGrantId,
+      clipDurationMs: playbackClipDurationMs,
+      intervals: Object.freeze(intervals),
+    });
   }
 
   $effect(() => {
@@ -396,19 +700,20 @@
     if (activePlayBinding && !isCurrentAudioAttempt(audioMachine, activePlayBinding)) return;
     currentTime = audioEl.currentTime;
     if (!audioEl.paused) accrueHeardTime(audioEl.currentTime);
-    else lastMediaPos = null;
+    else resetPlaybackBaseline();
     // When the precise clip-stop timer is armed, let IT own the exact stop/loop. Acting here too, at
     // the ~250ms timeupdate granularity, can double-loop a short word window at the seam.
     if (clipStopTimer) return;
     if (endTime > 0 && audioEl.currentTime >= endTime) {
       if (loop) {
         // Respect startTime when looping a clip.
+        resetPlaybackBaseline();
         audioEl.currentTime = startTime > 0 ? startTime : 0;
         attemptPlay($t('audio.loopFailed'));
       } else {
         audioEl.pause();
         playing = false;
-        lastMediaPos = null;
+        resetPlaybackBaseline();
         if (activePlayBinding) transitionAudio({ type: 'ended', binding: activePlayBinding });
       }
     }
@@ -417,12 +722,14 @@
   function handleLoaded() {
     const binding = mediaLoadBinding;
     if (!audioEl || !binding || !isCurrentAudioAttempt(audioMachine, binding)) return;
-    duration = audioEl.duration;
+    duration = safeMediaSeconds(audioEl.duration);
     transitionAudio({ type: 'loaded', binding });
     if (autoplay) {
       // Mark this clip as autoplayed so the clip-identity effect (which re-runs when loading flips
       // false) doesn't fire a second play() for the same clip.
-      autoplayedClip = clipKey;
+      autoplayedClip = `${String(clipKey)}\0${
+        requirePlaybackProof ? String(expectedRevision) : ''
+      }`;
       play();
     }
   }
@@ -433,13 +740,20 @@
         ? activePlayBinding
         : mediaLoadBinding;
     if (!binding || !isCurrentAudioAttempt(audioMachine, binding)) return;
+    // A media error is terminal for this attempt. Retire its exact-stop timer and physical transport
+    // before publishing `failed`; otherwise the old timer can later loop/restart the broken source or
+    // overwrite failed→ended while the parent still treats the clip as unplayable.
+    stopPhysicalPlayback();
     transitionAudio({ type: 'failed', binding, errorCode: 'AUDIO_DECODE_FAILED' });
+    activePlayBinding = null;
     audioError = $t('audio.loadFailed');
   }
 
   function handleEnded() {
     const binding = activePlayBinding;
     if (!binding || !isCurrentAudioAttempt(audioMachine, binding)) return;
+    if (audioEl) accrueHeardTime(audioEl.currentTime);
+    resetPlaybackBaseline();
     transitionAudio({ type: 'ended', binding });
     if (loop) {
       if (audioEl) {
@@ -448,7 +762,18 @@
       }
     } else {
       playing = false;
-      lastMediaPos = null;
+    }
+  }
+
+  function handleSeeking() {
+    // Native controls, waveform clicks, replay and loop all pass through a media seek. Clearing the
+    // anchor prevents even a sub-1.5-second seek from looking like continuous audible progression.
+    resetPlaybackBaseline();
+  }
+
+  function handleSeeked() {
+    if (audioEl && !audioEl.paused && Number.isFinite(audioEl.currentTime)) {
+      lastMediaPos = audioEl.currentTime;
     }
   }
 
@@ -457,6 +782,7 @@
     // Slider value is display-relative when bounded; map back to absolute file time.
     const abs = clipMode ? dispStart + parseFloat(target.value) : parseFloat(target.value);
     if (audioEl) {
+      resetPlaybackBaseline();
       audioEl.currentTime = abs;
       currentTime = abs;
       if (playing) scheduleClipStop(); // remaining clip time changed with the seek
@@ -464,8 +790,9 @@
   }
 
   function fmt(s: number) {
-    const m = Math.floor(s / 60);
-    const sec = Math.floor(s % 60);
+    const bounded = safeMediaSeconds(s);
+    const m = Math.floor(bounded / 60);
+    const sec = Math.floor(bounded % 60);
     return `${m}:${sec.toString().padStart(2, '0')}`;
   }
 
@@ -515,13 +842,9 @@
         aria-label={playing ? $t('audio.pause') : $t('audio.play')}
       >
         {#if playing}
-          <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"
-            ><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg
-          >
+          <Pause class="h-5 w-5" strokeWidth={2.5} aria-hidden="true" />
         {:else}
-          <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"
-            ><path d="M8 5v14l11-7z" /></svg
-          >
+          <Play class="h-5 w-5" strokeWidth={2.5} aria-hidden="true" />
         {/if}
       </button>
 
@@ -569,6 +892,9 @@
     ontimeupdate={handleTimeUpdate}
     onloadedmetadata={handleLoaded}
     onended={handleEnded}
+    onseeking={handleSeeking}
+    onseeked={handleSeeked}
+    onpause={resetPlaybackBaseline}
     onkeydown={handleKeydown}
     onerror={handleError}
   ></audio>

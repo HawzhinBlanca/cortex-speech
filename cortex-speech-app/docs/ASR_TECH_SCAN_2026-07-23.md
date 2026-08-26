@@ -12,10 +12,10 @@ Five parallel researchers did real web searches + source fetches on 2026-07-23. 
 someone else's claim with its source; nothing is a Cortex measurement.** Refresh this doc on the loop's
 research cadence and date the new file.
 
-> **One-line headline:** As of 2026-07-23, the app's champion (fine-tuned OmniASR-7B, **7.03% micro-CER
-> on FLEURS-ckb read speech**) appears to be **at or above the verifiable Sorani SOTA** — no 2026 release
-> credibly beats it on FLEURS-ckb. The real levers are not a new model; they are **data, an LM, a
-> literature-standard normalizer, and the review marathon** — almost all owner-gated to *run*.
+> **Superseded 2026-08-26:** this scan's former headline treated a duplication-weighted result
+> (922 rows / 348 distinct clips) as current evidence. It is retained below only as historical
+> research provenance. No current SOTA or release claim is authorized until a clean N=348 scorecard
+> and its model attestation are regenerated and verified on the integrated release line.
 
 ---
 

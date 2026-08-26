@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -9,6 +10,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # validates the live root workflows that CI actually executes.
 WORKFLOWS_DIR = REPO_ROOT.parent / ".github" / "workflows"
 CARGO_DENY_VERSION = "0.19.8"
+RUST_COVERAGE_TOOL_VERSION = "0.8.7"
+RUST_COVERAGE_CONTRACT_PATH = REPO_ROOT / "scripts" / "rust_coverage_toolchain.json"
+RUST_COVERAGE_CONTRACT = json.loads(RUST_COVERAGE_CONTRACT_PATH.read_text(encoding="utf-8"))
+RUST_COVERAGE_TOOLCHAIN = str(RUST_COVERAGE_CONTRACT["toolchain"])
 CLEAN_RELEASE_GATE_COMMANDS = [
     "npm ci",
     "npx playwright install chromium",
@@ -17,8 +22,8 @@ CLEAN_RELEASE_GATE_COMMANDS = [
     "npm run test:python-policies",
     "npm run lint",
     "cargo fmt --manifest-path src-tauri/Cargo.toml --all --check",
-    "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
-    "cargo test --manifest-path src-tauri/Cargo.toml",
+    "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
+    "cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features",
     "npm run test:e2e",
     "npm audit --omit=dev",
     "cargo deny --manifest-path src-tauri/Cargo.toml check",
@@ -140,6 +145,86 @@ def test_cargo_deny_install_is_pinned() -> None:
     assert_contains(release_docs(), expected, "docs/RELEASE.md")
 
 
+def test_rust_quality_authorities_are_split_mandatory_and_fail_closed() -> None:
+    """Coverage is a separately supervised prerequisite, not an overlong in-process gate.
+
+    The consumer gate must explicitly fail when the prerequisite is skipped or fails; relying on
+    GitHub's default `needs` skip semantics would let the required Windows status appear without an
+    actual coverage verdict. The diagnostic coverage-json mode is never certifying.
+    """
+
+    install = f"cargo install cargo-llvm-cov --version {RUST_COVERAGE_TOOL_VERSION} --locked"
+    install_toolchain = (
+        f"rustup toolchain install {RUST_COVERAGE_TOOLCHAIN} "
+        "--profile minimal --component llvm-tools-preview"
+    )
+    prerequisite = 'python "${{ github.workspace }}/scripts/verify_10.py" --rust-coverage-prerequisite'
+    architecture = "python scripts/rust_quality_gate.py architecture"
+    for name in ["ci.yml", "release.yml"]:
+        text = workflow_steps_text(name)
+        if text.count(install) != 1:
+            raise AssertionError(f"{name} must install exactly one pinned cargo-llvm-cov authority")
+        if text.count(install_toolchain) != 1:
+            raise AssertionError(f"{name} must install exactly one date-pinned coverage nightly")
+        if "rustup toolchain install nightly " in text or "toolchain: nightly" in text:
+            raise AssertionError(f"{name} must never resolve coverage through rolling nightly")
+        assert_contains(
+            text,
+            "cortex-speech-app/scripts/rust_coverage_toolchain.json",
+            f"{name} coverage cache authority",
+        )
+        if text.count(prerequisite) != 1:
+            raise AssertionError(f"{name} must run exactly one supervised Rust coverage prerequisite")
+        if text.count(architecture) != 1:
+            raise AssertionError(f"{name} must run exactly one independent Rust architecture gate")
+        for required in (
+            "cargo fetch --locked --manifest-path src-tauri/Cargo.toml",
+            "npm run fetch-models",
+            "npm run build",
+        ):
+            assert_contains(text, required, f"{name} coverage provisioning")
+        if "coverage-json" in text or "continue-on-error" in text:
+            raise AssertionError(f"{name} contains a non-certifying or non-blocking Rust truth path")
+    assert_contains(release_docs(), install_toolchain, "docs/RELEASE.md coverage nightly")
+
+    ci = workflow_steps_text("ci.yml")
+    for guard in (
+        "needs: rust-coverage-prerequisite",
+        "if: ${{ always() }}",
+        "RUST_COVERAGE_RESULT: ${{ needs.rust-coverage-prerequisite.result }}",
+        "Windows Release Gate refuses a missing, skipped, cancelled, or failed Rust coverage prerequisite.",
+    ):
+        assert_contains(ci, guard, "ci.yml coverage prerequisite consumer")
+    prerequisite_job = ci.find("  rust-coverage-prerequisite:")
+    windows_job = ci.find("  windows-release-gate:")
+    prerequisite_run = ci.find("--rust-coverage-prerequisite", prerequisite_job)
+    refusal = ci.find("Windows Release Gate refuses", windows_job)
+    architecture_run = ci.find(architecture, windows_job)
+    if min(prerequisite_job, windows_job, prerequisite_run, refusal, architecture_run) < 0 or not (
+        prerequisite_job < prerequisite_run < windows_job < refusal < architecture_run
+    ):
+        raise AssertionError("CI must complete coverage before the independently blocking architecture/source gate")
+
+    release = workflow_steps_text("release.yml")
+    for guard in (
+        "needs: rust-coverage-prerequisite",
+        "needs.rust-coverage-prerequisite.result == 'success'",
+    ):
+        assert_contains(release, guard, "release.yml coverage prerequisite consumer")
+    prerequisite_job = release.find("  rust-coverage-prerequisite:")
+    build_job = release.find("  build:")
+    prerequisite_run = release.find("--rust-coverage-prerequisite", prerequisite_job)
+    architecture_run = release.find(architecture, build_job)
+    if min(prerequisite_job, build_job, prerequisite_run, architecture_run) < 0 or not (
+        prerequisite_job < prerequisite_run < build_job < architecture_run
+    ):
+        raise AssertionError("release build must be unreachable until coverage passes, then run architecture independently")
+
+    production_toolchain = (REPO_ROOT.parent / "rust-toolchain.toml").read_text(encoding="utf-8")
+    if 'channel = "1.95.0"' not in production_toolchain or "nightly" in production_toolchain:
+        raise AssertionError("the production Rust toolchain must remain exact stable 1.95.0")
+
+
 def test_release_docs_and_tag_workflow_share_clean_gate() -> None:
     docs = release_docs()
     release = workflow("release.yml")
@@ -151,6 +236,20 @@ def test_release_docs_and_tag_workflow_share_clean_gate() -> None:
         else:
             assert_contains(release, command, "release.yml")
     assert_contains(release, "npm run tauri build", "release.yml")
+    for contract_text in (
+        "Add five repository secrets",
+        "RULESET_AUDIT_TOKEN",
+        "WINDOWS_CERT_BASE64",
+        "WINDOWS_CERT_PASSWORD",
+        "WINDOWS_CERT_THUMBPRINT",
+        "WINDOWS_CERT_SHA256",
+        "SHA256SUMS-windows-11-x64",
+        "refs/tags/v*",
+        "signtool verify /pa /all /v /tw",
+    ):
+        assert_contains(docs, contract_text, "docs/RELEASE.md release identity contract")
+    if "either signing secret" in docs:
+        raise AssertionError("docs/RELEASE.md still describes the retired two-secret signing contract")
 
 
 def test_playwright_browser_install_precedes_e2e() -> None:
@@ -207,22 +306,158 @@ def test_release_runs_the_governance_gate() -> None:
     assert_contains(workflow("release.yml"), "verify_10.py", "release.yml")
 
 
+def test_windows_ci_covers_every_rust_target_and_feature() -> None:
+    ci = workflow_steps_text("ci.yml")
+    assert_contains(
+        ci,
+        "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
+        "ci.yml Windows clippy gate",
+    )
+    assert_contains(
+        ci,
+        "cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features",
+        "ci.yml Windows Rust test gate",
+    )
+
+
+def test_bundle_contract_is_explicitly_windows_only_and_has_no_unsigned_updater() -> None:
+    config = json.loads((REPO_ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+    bundle = config.get("bundle", {})
+    if bundle.get("targets") != ["msi", "nsis"]:
+        raise AssertionError("the public bundle contract must contain exactly the Windows MSI and NSIS targets")
+    if bundle.get("createUpdaterArtifacts") is not False:
+        raise AssertionError(
+            "updater artifacts must remain explicitly disabled until a pinned public key, endpoint, "
+            "private signing-key workflow, and update/rollback proof are implemented"
+        )
+
+
 def test_release_fails_closed_on_signing_and_attests_artifacts() -> None:
     """A public tag must never degrade to an unsigned Windows download, and every published
     artifact must carry both an offline-verifiable digest and GitHub build provenance."""
     release = workflow_steps_text("release.yml")
     assert_contains(release, "id-token: write", "release.yml")
     assert_contains(release, "attestations: write", "release.yml")
-    assert_contains(release, "refusing to publish unsigned Windows installers", "release.yml")
+    assert_contains(release, "artifact-metadata: write", "release.yml")
+    assert_contains(release, "refusing to publish unsigned or wrong-publisher Windows installers", "release.yml")
     if "Installers UNSIGNED" in release or "exit 0" in release:
         raise AssertionError("release.yml must fail closed when Windows signing credentials are missing")
+    for signed_tag_guard in (
+        "fetch-depth: 0",
+        "GitHub did not cryptographically verify the annotated release tag signature",
+        "$tagObject.verification.verified",
+        "rulesets?includes_parents=true&targets=tag",
+        "RULESET_AUDIT_TOKEN: ${{ secrets.RULESET_AUDIT_TOKEN }}",
+        "$rulesetHeaders.Authorization = \"Bearer $env:RULESET_AUDIT_TOKEN\"",
+        "$null -eq $bypassProperty",
+        "refusing to treat hidden authority as an empty bypass list",
+        "$includes -contains 'refs/tags/v*'",
+        "$bypassActors.Count -eq 0",
+        "$ruleTypes -contains 'deletion'",
+        "$ruleTypes -contains 'non_fast_forward'",
+        "rulesets?includes_parents=true&targets=branch",
+        "$repository.default_branch -ne 'main'",
+        "$includes -contains 'refs/heads/main'",
+        "$includes -contains '~DEFAULT_BRANCH'",
+        "$ruleTypes -contains 'required_signatures'",
+        "$pullRequestRule.parameters.required_approving_review_count -ge 1",
+        "$pullRequestRule.parameters.dismiss_stale_reviews_on_push -eq $true",
+        "$pullRequestRule.parameters.require_last_push_approval -eq $true",
+        "$pullRequestRule.parameters.required_review_thread_resolution -eq $true",
+        "$statusChecksRule.parameters.strict_required_status_checks_policy -eq $true",
+        "$requiredStatusContexts -contains 'Provenance & License Gate'",
+        "$requiredStatusContexts -contains 'Windows Release Gate'",
+        "protected-main authority is unprovable",
+        "$tagObject.object.sha.ToLowerInvariant() -ne $head",
+        "git merge-base --is-ancestor $head origin/main",
+        'if ($tag -ne "v$packageVersion")',
+    ):
+        assert_contains(release, signed_tag_guard, "release.yml signed-tag gate")
+    if 'Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/rulesets' in release:
+        raise AssertionError(
+            "release.yml must use the privileged, repository-scoped audit token for every ruleset "
+            "request; the normal workflow token can receive a response with bypass_actors omitted"
+        )
     assert_contains(release, "scripts/generate_release_checksums.py", "release.yml")
     assert_contains(release, "actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26", "release.yml")
     assert_contains(release, "needs: build", "release.yml")
     assert_contains(release, "actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53", "release.yml")
-    assert_contains(release, "pattern: cortex-speech-windows-latest", "release.yml")
-    if release.count("if: runner.os == 'Windows'") < 4:
-        raise AssertionError("only the supported signed Windows bundle may enter the public release path")
+    assert_contains(release, "name: cortex-speech-windows-11-x64", "release.yml")
+    assert_contains(release, "runs-on: windows-latest", "release.yml")
+    if "matrix.os" in release or "macos-latest" in release or "runs-on: ubuntu-latest" in release[: release.find("  publish:")]:
+        raise AssertionError("the public build job must produce only the supported Windows 11 x64 bundle")
+    assert_contains(release, "signtool", "release.yml")
+    assert_contains(release, "verify /pa /all /v /tw", "release.yml")
+    assert_contains(release, "WINDOWS_CERT_THUMBPRINT", "release.yml")
+    assert_contains(release, "WINDOWS_CERT_SHA256", "release.yml")
+    assert_contains(release, "$msi.Count -ne 1 -or $nsis.Count -ne 1", "release.yml")
+    assert_contains(release, "$actualThumbprint -ne $expectedThumbprint", "release.yml")
+    assert_contains(release, "$actualCertificateSha256 -ne $expectedCertificateSha256", "release.yml")
+    assert_contains(release, "if-no-files-found: error", "release.yml")
+    assert_contains(release, "scripts/windows_release_bundle.py", "release.yml")
+    assert_contains(release, "--verify-authenticode", "release.yml")
+    assert_contains(release, "--verify-provenance", "release.yml")
+    assert_contains(release, "release package inventory is not exact", "release.yml")
+    assert_contains(release, "release-environment.json", "release.yml")
+    assert_contains(release, 'release environment source identity disagrees with the workflow SHA', "release.yml")
+    assert_contains(release, '--expected-sha "$env:GITHUB_SHA"', "release.yml")
+    assert_contains(release, "gh attestation verify", "release.yml")
+    assert_contains(release, "--signer-workflow", "release.yml")
+    assert_contains(release, '--source-digest "$env:GITHUB_SHA"', "release.yml")
+    assert_contains(release, '--source-ref "$env:GITHUB_REF"', "release.yml")
+    assert_contains(release, "fail_on_unmatched_files: true", "release.yml")
+    assert_contains(release, "draft: true", "release.yml uncertified-publication fence")
+    if "draft: false" in release:
+        raise AssertionError("release.yml must not publish a stable release before windows-product proof is consumed")
+    for proof_guard in (
+        "workflow_dispatch:",
+        "proof_run_id:",
+        "--require-certifying-proof",
+        "--profile windows-product",
+        "--proof-manifest",
+        "--expected-sha",
+        "--windows-release-bundle",
+        "certifying proof or exact artifact binding was rejected",
+        "draft asset identity changed after proof consumption",
+        "github.ref == 'refs/heads/main'",
+        "PROMOTION_WORKFLOW_REF: ${{ github.workflow_ref }}",
+        "$env:GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main",
+        "Stable promotion must execute the exact release workflow from protected main.",
+        "Immutable no-bypass tag authority changed after proof consumption.",
+        "Signed release tag changed after proof consumption.",
+        "gh release edit $env:RELEASE_TAG --draft=false --latest",
+    ):
+        assert_contains(release, proof_guard, "release.yml certifying-proof consumer")
+    proof_consumer = release.find("--require-certifying-proof")
+    final_tag_recheck = release.find("Signed release tag changed after proof consumption.")
+    stable_publication = release.find("--draft=false")
+    if (
+        proof_consumer < 0
+        or final_tag_recheck < 0
+        or stable_publication < 0
+        or not proof_consumer < final_tag_recheck < stable_publication
+        or release.count("--draft=false") != 1
+    ):
+        raise AssertionError(
+            "stable publication must occur only after exact proof consumption and a final signed-tag recheck"
+        )
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+        if path.name == "release.yml":
+            continue
+        other = path.read_text(encoding="utf-8")
+        if "action-gh-release" in other or "gh release create" in other or "--draft=false" in other:
+            raise AssertionError(f"{path.name} contains an alternate release-publication path")
+
+    no_bundle = release.find("npm run tauri build -- --no-bundle")
+    app_sign = release.find("$st sign /f $pfx", no_bundle)
+    bundle = release.find("npm run tauri bundle -- --bundles msi,nsis")
+    installer_sign = release.find("$st sign /f $pfx", app_sign + 1)
+    if min(no_bundle, app_sign, bundle, installer_sign) < 0 or not (
+        no_bundle < app_sign < bundle < installer_sign
+    ):
+        raise AssertionError(
+            "the app executable must be signed before bundling and installers signed afterward"
+        )
 
     assert_contains(release, "scripts/generate_sbom.py", "release.yml")
     sbom = release.find("scripts/generate_sbom.py")
@@ -261,10 +496,13 @@ def main() -> None:
     test_workflow_permissions_are_explicit()
     test_workflow_jobs_have_timeouts()
     test_cargo_deny_install_is_pinned()
+    test_rust_quality_authorities_are_split_mandatory_and_fail_closed()
     test_release_docs_and_tag_workflow_share_clean_gate()
     test_playwright_browser_install_precedes_e2e()
     test_provisioning_precedes_every_compiling_cargo_step()
     test_release_runs_the_governance_gate()
+    test_windows_ci_covers_every_rust_target_and_feature()
+    test_bundle_contract_is_explicitly_windows_only_and_has_no_unsigned_updater()
     test_release_fails_closed_on_signing_and_attests_artifacts()
     test_nightly_real_audio_fails_on_real_regressions_but_skips_missing_fixtures()
     print("workflow policy regression passed")

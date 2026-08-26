@@ -794,6 +794,9 @@ pub struct IndependentDecisionInput<'a> {
     pub served_transcript: &'a str,
     pub served_revision: i64,
     pub audio_content_hash: Option<&'a str>,
+    /// Exact finalized policy-4 Couch authority. Required for every non-skip production decision and
+    /// consumed in the same transaction as the independent observation.
+    pub playback_authority_session_id: Option<&'a str>,
     pub source_start_ms: Option<i64>,
     pub source_end_ms: Option<i64>,
     pub duration_ms: i64,
@@ -844,6 +847,9 @@ pub fn record_independent_decision(
     if !policy.is_blinded_second_pass() || !policy.matches_reviewer(input.reviewer) {
         return Err("independent decision is outside the active Alle second pass".to_string());
     }
+    let canonical_reviewer = policy
+        .authorized_reviewer()
+        .ok_or_else(|| "independent decision has no active canonical reviewer".to_string())?;
     canonical_uuid(input.operation_id, "independent decision operation id")?;
     if !valid_lower_sha256(input.operation_payload_hash)
         || input.created_at_ms <= 0
@@ -857,8 +863,44 @@ pub fn record_independent_decision(
         "reject" | "skip" if input.submitted_transcript.is_none() => {}
         _ => return Err("independent decision action/transcript is invalid".to_string()),
     }
-    let changed = db
-        .connection()
+    let expected_payload_hash = crate::db::review_operation_payload_hash(
+        input.segment_id,
+        input.requested_action,
+        input.requested_transcript,
+        canonical_reviewer,
+    );
+    if input.operation_payload_hash != expected_payload_hash {
+        return Err(
+            "independent operation payload hash does not match the campaign's canonical reviewer identity".to_string()
+        );
+    }
+    #[cfg(not(test))]
+    if input.action != "skip" && input.playback_authority_session_id.is_none() {
+        return Err("E_NO_PLAYBACK_EVIDENCE: independent Couch verdict requires policy-4 authority".to_string());
+    }
+    if input.action == "skip" && input.playback_authority_session_id.is_some() {
+        return Err("skip must not consume a playback authority".to_string());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(db.connection(), rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("independent decision cannot lock its exact proof transaction: {error}"))?;
+    let canonical_collision: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM review_events WHERE operation_id=?1
+                 UNION ALL
+                 SELECT 1 FROM human_decision_effect_events WHERE operation_id=?1
+             )",
+            [input.operation_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("independent operation namespace cannot be checked: {error}"))?;
+    if canonical_collision {
+        return Err(
+            "E_REVIEW_OPERATION_NAMESPACE_COLLISION: operation UUID is already bound to canonical review truth"
+                .to_string(),
+        );
+    }
+    let changed = tx
         .execute(
             "INSERT INTO independent_review_decisions
                 (campaign_id, segment_id, reviewer, action, submitted_transcript,
@@ -885,7 +927,7 @@ pub fn record_independent_decision(
             rusqlite::params![
                 policy.campaign_id,
                 input.segment_id,
-                input.reviewer,
+                canonical_reviewer,
                 input.action,
                 input.submitted_transcript,
                 input.served_transcript,
@@ -905,9 +947,23 @@ pub fn record_independent_decision(
         )
         .map_err(|error| format!("independent decision cannot be committed: {error}"))?;
     if changed == 0 {
+        tx.rollback().map_err(|error| format!("independent no-op transaction cannot roll back: {error}"))?;
         return Ok(None);
     }
-    let id = db.connection().last_insert_rowid();
+    let id = tx.last_insert_rowid();
+    if let Some(authority_id) = input.playback_authority_session_id {
+        crate::db::consume_couch_playback_authority_on(
+            &tx,
+            authority_id,
+            "independent",
+            input.operation_id,
+            canonical_reviewer,
+            input.segment_id,
+            input.created_at_ms,
+        )
+        .map_err(|error| format!("independent playback authority cannot be consumed: {error}"))?;
+    }
+    tx.commit().map_err(|error| format!("independent decision cannot commit: {error}"))?;
     Ok(Some(id))
 }
 
@@ -1598,6 +1654,7 @@ mod tests {
                 served_transcript: &raw,
                 served_revision,
                 audio_content_hash: Some(&content_hash),
+                playback_authority_session_id: None,
                 source_start_ms: Some(source_span.0),
                 source_end_ms: Some(source_span.1),
                 duration_ms: 1_000,
@@ -1643,6 +1700,100 @@ mod tests {
     }
 
     #[test]
+    fn independent_reviewer_identity_is_canonical_and_operation_namespace_is_fenced_both_ways() {
+        let (db, ids, _, _temp) = seeded_first_pass(1);
+        activate_second_pass(&db, &ids, db.max_review_event_id().unwrap()).unwrap();
+        let policy = load(&db).unwrap().unwrap();
+        let segment_id = ids.iter().next().unwrap();
+        let segment = db.get_segment_by_id(segment_id).unwrap().unwrap();
+        let raw = segment.raw_transcript.clone();
+        let content_hash = db.segment_audio_content_hash(segment_id).unwrap().unwrap();
+        let source_span = db.segment_source_span(segment_id).unwrap().unwrap();
+        let served_revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+        let canonical_payload_hash = crate::db::review_operation_payload_hash(segment_id, "accept", &raw, "Alle");
+
+        // The first-pass writer already committed this UUID to canonical truth. Separate tables do
+        // not create separate idempotency namespaces: an independent replay must fail before it can
+        // bind a different human act to the same externally visible operation identity.
+        let first_pass_operation_id = "00000000-0000-4000-8000-000000000001";
+        let collision = record_independent_decision(
+            &db,
+            &policy,
+            &IndependentDecisionInput {
+                segment_id,
+                reviewer: "alle",
+                action: "accept",
+                submitted_transcript: Some(&raw),
+                served_transcript: &raw,
+                served_revision,
+                audio_content_hash: Some(&content_hash),
+                playback_authority_session_id: None,
+                source_start_ms: Some(source_span.0),
+                source_end_ms: Some(source_span.1),
+                duration_ms: 1_000,
+                requested_action: "accept",
+                requested_transcript: &raw,
+                operation_id: first_pass_operation_id,
+                operation_payload_hash: &canonical_payload_hash,
+                created_at_ms: 2_000,
+            },
+        )
+        .unwrap_err();
+        assert!(collision.contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"), "{collision}");
+
+        // Authentication remains case-insensitive, but the durable row and its payload bind the
+        // exact campaign-authoritative spelling. This satisfies the schema-61 roster trigger and
+        // prevents a case-only re-login from creating a second reviewer identity.
+        let independent_operation_id = "20000000-0000-4000-8000-000000000099";
+        let decision_id = record_independent_decision(
+            &db,
+            &policy,
+            &IndependentDecisionInput {
+                segment_id,
+                reviewer: "aLLe",
+                action: "accept",
+                submitted_transcript: Some(&raw),
+                served_transcript: &raw,
+                served_revision,
+                audio_content_hash: Some(&content_hash),
+                playback_authority_session_id: None,
+                source_start_ms: Some(source_span.0),
+                source_end_ms: Some(source_span.1),
+                duration_ms: 1_000,
+                requested_action: "accept",
+                requested_transcript: &raw,
+                operation_id: independent_operation_id,
+                operation_payload_hash: &canonical_payload_hash,
+                created_at_ms: 3_000,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let stored_reviewer: String = db
+            .connection()
+            .query_row("SELECT reviewer FROM independent_review_decisions WHERE id=?1", [decision_id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored_reviewer, "Alle");
+
+        // Prove the symmetric fence. The canonical skip writer holds the same IMMEDIATE
+        // reservation and must refuse a UUID that independent truth claimed first.
+        let skip_hash = crate::db::review_operation_payload_hash(segment_id, "skip", "", "Rubar");
+        let reverse_collision = db
+            .record_review_event_with_operation(
+                segment_id,
+                "Rubar",
+                "skip",
+                "couch",
+                4_000,
+                independent_operation_id,
+                &skip_hash,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(reverse_collision.contains("E_REVIEW_OPERATION_NAMESPACE_COLLISION"), "{reverse_collision}");
+    }
+
+    #[test]
     fn independent_undo_reopens_only_the_second_pass_projection() {
         let (db, ids, _, _temp) = seeded_first_pass(1);
         let maximum = db.max_review_event_id().unwrap();
@@ -1664,6 +1815,7 @@ mod tests {
             served_transcript: &raw,
             served_revision,
             audio_content_hash: Some(&content_hash),
+            playback_authority_session_id: None,
             source_start_ms: Some(source_span.0),
             source_end_ms: Some(source_span.1),
             duration_ms: 1_000,
@@ -1713,6 +1865,7 @@ mod tests {
                 served_transcript: &raw,
                 served_revision: revision,
                 audio_content_hash: Some(&content_hash),
+                playback_authority_session_id: None,
                 source_start_ms: Some(source_span.0),
                 source_end_ms: Some(source_span.1),
                 duration_ms: 1_000,

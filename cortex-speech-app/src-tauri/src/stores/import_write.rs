@@ -1,7 +1,10 @@
 //! Durable import and processing write boundaries for publication, evidence, metadata and rollback.
 
 use crate::database_runtime::{begin_mutation, DatabaseRuntime};
-use crate::db::{SegmentHypothesis, SourceAudioProvenance, SourceTranscriptRecord, SpeechSegment};
+use crate::db::{
+    ChampionTranscriptionSourceSnapshot, SegmentHypothesis, SourceAudioProvenance, SourceTranscriptRecord,
+    SpeechSegment,
+};
 use crate::error::{AppError, AppResult};
 use crate::fingerprint::AudioIdentity;
 use std::sync::MutexGuard;
@@ -26,6 +29,15 @@ impl ImportWriteStore {
     pub(crate) fn publish_segments(&self, segments: &[SpeechSegment]) -> AppResult<()> {
         let _mutation = begin_mutation().map_err(AppError::Other)?;
         self.lock("publish_import_segments").insert_segments_batch(segments)
+    }
+
+    pub(crate) fn publish_segments_with_identity(
+        &self,
+        segments: &[SpeechSegment],
+        identity: &AudioIdentity,
+    ) -> AppResult<()> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("publish_import_segments_with_identity").insert_segments_with_audio_identity_batch(segments, identity)
     }
 
     pub(crate) fn publish_champion_segments(
@@ -73,11 +85,6 @@ impl ImportWriteStore {
         self.lock("upsert_import_source_provenance").upsert_source_audio_provenance(record)
     }
 
-    pub(crate) fn set_audio_identity(&self, audio_path: &str, identity: &AudioIdentity) -> AppResult<usize> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("set_import_audio_identity").set_audio_identity(audio_path, identity)
-    }
-
     pub(crate) fn record_loop0_shadow(&self, segment_id: &str, memory_fired: bool) -> AppResult<()> {
         let _mutation = begin_mutation().map_err(AppError::Other)?;
         self.lock("record_import_loop0_shadow").record_loop0_shadow(segment_id, memory_fired)
@@ -93,6 +100,7 @@ impl ImportWriteStore {
         self.lock("insert_import_hypothesis").insert_hypothesis(hypothesis)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_champion_transcript_if_unreviewed(
         &self,
         champion: &SegmentHypothesis,
@@ -108,6 +116,26 @@ impl ImportWriteStore {
             normalized_transcript,
             confidence_source,
             cloud_call,
+        )
+    }
+
+    pub(crate) fn commit_bound_champion_transcript_if_unreviewed(
+        &self,
+        champion: &SegmentHypothesis,
+        expected_deployment_sha256: Option<&str>,
+        normalized_transcript: Option<&str>,
+        confidence_source: Option<&str>,
+        cloud_call: bool,
+        expected_source: &ChampionTranscriptionSourceSnapshot,
+    ) -> AppResult<bool> {
+        let _mutation = begin_mutation().map_err(AppError::Other)?;
+        self.lock("commit_bound_import_champion_transcript").commit_bound_champion_transcript_if_unreviewed(
+            champion,
+            expected_deployment_sha256,
+            normalized_transcript,
+            confidence_source,
+            cloud_call,
+            expected_source,
         )
     }
 }
@@ -176,10 +204,11 @@ mod tests {
         let audio_path = "C:/recordings/evidence.wav";
         let mut speech = segment("evidence", None);
         speech.audio_path = audio_path.into();
-        store.publish_segments(&[speech]).unwrap();
-
         store
-            .set_audio_identity(audio_path, &AudioIdentity { spectral: 42, content: "recording-content-sha256".into() })
+            .publish_segments_with_identity(
+                &[speech],
+                &AudioIdentity { spectral: 42, content: "recording-content-sha256".into() },
+            )
             .unwrap();
         store
             .upsert_source_audio_provenance(&SourceAudioProvenance {

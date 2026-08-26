@@ -1,6 +1,11 @@
 import { writable, derived } from 'svelte/store';
-import { en } from './en';
+import { en, type TranslationKey } from './en';
 import { ckb } from './ckb';
+
+export type { TranslationKey } from './en';
+export { autonomyLabelKey, autonomyValues, type AutonomyLevel } from './autonomy';
+
+export type Translate = (key: TranslationKey, params?: Record<string, string>) => string;
 
 export type Locale = 'en' | 'ckb';
 
@@ -20,12 +25,17 @@ locale.subscribe((value) => {
 
 const translations = { en, ckb };
 
+/** Narrow untrusted/runtime strings before they are allowed into the typed translator. */
+export function isTranslationKey(key: string): key is TranslationKey {
+  return Object.prototype.hasOwnProperty.call(en, key);
+}
+
 export const t = derived(locale, ($locale) => {
   const dict = translations[$locale];
-  return (key: string, params?: Record<string, string>) => {
-    // Fall back to English before showing the raw key, so a label that only exists in `en`
-    // (e.g. an advanced/dev feature not yet translated) degrades to English rather than a key string.
-    let text = dict[key] || en[key] || key;
+  return (key: TranslationKey, params?: Record<string, string>): string => {
+    // English and Sorani have a compile-time exact key contract. The explicit fallback protects
+    // against malformed runtime replacement data; it is not permission to ship a missing locale.
+    let text: string = dict[key] || en[key];
     if (params) {
       for (const [k, v] of Object.entries(params)) {
         // replaceAll, not replace: a string that repeats a placeholder (e.g. speaker.mergeConfirm uses

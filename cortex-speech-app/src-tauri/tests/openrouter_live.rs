@@ -17,20 +17,23 @@
 ///
 /// A test that re-implements credential loading is testing a file format, not the product — and it
 /// fails on the day the product improves.
-fn read_key(name: &str) -> Option<String> {
-    let data_dir = std::path::Path::new(&std::env::var("APPDATA").ok()?).join("cortex-speech");
-    let keys = cortex_speech_app_lib::api_keys::ApiKeys::load(&data_dir);
-    match name {
+fn read_key(name: &str) -> Result<Option<String>, String> {
+    let Some(appdata) = std::env::var("APPDATA").ok() else {
+        return Ok(None);
+    };
+    let data_dir = std::path::Path::new(&appdata).join("cortex-speech");
+    let keys = cortex_speech_app_lib::api_keys::ApiKeys::load(&data_dir)?;
+    Ok(match name {
         "OPENROUTER_API_KEY" => keys.openrouter,
         "GEMINI_API_KEY" => keys.gemini,
         _ => None,
-    }
+    })
 }
 
 #[test]
 #[ignore = "live: needs OPENROUTER_API_KEY + network"]
 fn openrouter_refines_sorani() {
-    let key = match read_key("OPENROUTER_API_KEY") {
+    let key = match read_key("OPENROUTER_API_KEY").expect("credential store must load or fail explicitly") {
         Some(k) => k,
         None => {
             eprintln!("skip: no OPENROUTER_API_KEY");

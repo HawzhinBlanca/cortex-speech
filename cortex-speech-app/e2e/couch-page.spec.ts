@@ -77,6 +77,62 @@ async function showAClip(page: import('@playwright/test').Page) {
   await expect(page.locator('#card')).toBeVisible();
 }
 
+/**
+ * Give a non-playback-focused test one already-finalized policy-4 authority for the visible clip.
+ * The playback protocol itself has dedicated transition and HTTP tests; queue, outbox and recovery
+ * tests must still cross the production verdict guard instead of relying on the retired policy-3
+ * client-duration fixture.
+ */
+async function authorizeCurrentClipForNonPlaybackTest(page: import('@playwright/test').Page) {
+  await page.evaluate(`
+    (() => {
+      if (!window.__cortexNonPlaybackFetchInstalled) {
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = async (input, init) => {
+          const url = String(input);
+          if (url.includes('/api/playback/start')) {
+            const request = JSON.parse(String(init && init.body || '{}'));
+            const segment = queue.find((item) => item.id === request.id);
+            if (!segment) return new Response('unknown test segment', { status: 404 });
+            return new Response(JSON.stringify({
+              playbackContractVersion: 4,
+              clientAttemptId: request.clientAttemptId,
+              playbackReceiptId: crypto.randomUUID(),
+              segmentId: segment.id,
+              segmentRevision: segment.rowVersion,
+              clipDurationMs: segment.durationMs,
+            }), { status: 200, headers: { 'content-type': 'application/json' } });
+          }
+          if (url.includes('/api/playback/finalize')) {
+            const request = JSON.parse(String(init && init.body || '{}'));
+            const segment = queue[i];
+            return new Response(JSON.stringify({
+              playbackContractVersion: 4,
+              playbackReceiptId: request.playbackReceiptId,
+              segmentId: segment.id,
+              segmentRevision: segment.rowVersion,
+              uniquePlayedMs: segment.durationMs,
+              clipDurationMs: segment.durationMs,
+              coverageRatio: 1,
+            }), { status: 200, headers: { 'content-type': 'application/json' } });
+          }
+          return originalFetch(input, init);
+        };
+        window.__cortexNonPlaybackFetchInstalled = true;
+      }
+      const segment = queue[i];
+      if (!segment) throw new Error('cannot authorize playback without a visible test clip');
+      playbackAttempt = {
+        identity: playbackIdentity(segment),
+        clientAttemptId: crypto.randomUUID(),
+        playbackReceiptId: crypto.randomUUID(),
+        finalized: true,
+      };
+      resetPlaybackTraversalCoverage(playbackIdentity(segment));
+    })()
+  `);
+}
+
 test.describe('Couch Review phone page', () => {
   test.beforeEach(async ({ page }) => {
     // A fresh origin per test: the page persists locale/size/loop in localStorage, and a leaked
@@ -175,6 +231,7 @@ test.describe('Couch Review phone page', () => {
 
     // The network drops, then the reviewer saves.
     await page.evaluate(`window.__net.fail = true`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     // Their decision is HELD, not lost — and they are moved on rather than stranded on a dead clip.
@@ -236,6 +293,7 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await showAClip(page);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect.poll(async () => operationOutboxCount(page)).toBe(0);
   });
@@ -275,16 +333,24 @@ test.describe('Couch Review phone page', () => {
         ],
         [],
       ];
-      window.fetch = async (input: RequestInfo | URL) => {
+      window.fetch = async (input: RequestInfo | URL, _init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
           const st = (window as unknown as { __q: { fetches: number } }).__q;
           const items = batches[Math.min(st.fetches, batches.length - 1)];
           st.fetches += 1;
-          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items,
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         return new Response('{"ok":true}', {
           status: 200,
@@ -296,11 +362,13 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
 
     // Draining batch 1 must go BACK to the server, not declare victory.
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#text')).toHaveValue('دووەم', { timeout: 5000 });
     await expect(page.locator('#done')).toBeHidden();
 
     // Only a fetch that genuinely comes back empty may draw the finished state.
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
     await expect(page.locator('#done')).toContainText('هەموو پارچەکان');
@@ -329,6 +397,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -360,6 +429,7 @@ test.describe('Couch Review phone page', () => {
 
     // Offline: type a correction and save. It is QUEUED, and must not be called "Saved".
     await page.locator('#text').fill('ڕاستکراوەی سارا');
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#save').click();
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
     await expect(page.locator('#toast')).toHaveText(
@@ -403,10 +473,18 @@ test.describe('Couch Review phone page', () => {
           });
         }
         if (url.includes('/api/queue')) {
-          return new Response(JSON.stringify({ reviewer: 'Hemn', items: [], heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Hemn',
+              items: [],
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         return new Response('{"ok":true}', {
           status: 200,
@@ -479,10 +557,18 @@ test.describe('Couch Review phone page', () => {
                 ]
               : [];
           st.n += 1;
-          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items,
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         return new Response('{"ok":true}', {
           status: 200,
@@ -497,6 +583,7 @@ test.describe('Couch Review phone page', () => {
     // durationMs the fixture serves — so the exact-match keeps guarding the count against off-by-one.
     await expect(page.locator('#progress')).toHaveText('پارچەی 1 لە 1 (1s)');
 
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
 
@@ -535,10 +622,18 @@ test.describe('Couch Review phone page', () => {
                 ]
               : [];
           st.n += 1;
-          return new Response(JSON.stringify({ reviewer: 'Sara', items, heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items,
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         if (url.includes('/api/decision')) throw new TypeError('Failed to fetch'); // offline
         return new Response('{"ok":true}', {
@@ -549,6 +644,7 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('کۆتا پارچە', { timeout: 5000 });
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     await expect(page.locator('#done')).toBeVisible({ timeout: 5000 });
@@ -571,6 +667,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -646,6 +743,7 @@ test.describe('Couch Review phone page', () => {
           await new Promise((r) => setTimeout(r, 1500)); // a slow round trip
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -685,11 +783,12 @@ test.describe('Couch Review phone page', () => {
     // left stranded on the clip, at exactly the moment they were working fastest.
     await page.addInitScript(() => {
       (window as unknown as { __throttle: boolean }).__throttle = true;
-      window.fetch = async (input: RequestInfo | URL) => {
+      window.fetch = async (input: RequestInfo | URL, _init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -729,6 +828,7 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('یەکەم', { timeout: 5000 });
 
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     // HELD in the outbox, and the reviewer is moved on rather than stranded re-submitting.
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
@@ -759,6 +859,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -812,6 +913,7 @@ test.describe('Couch Review phone page', () => {
 
     // The reviewer goes back and re-reviews that same clip, and this time it lands.
     await page.evaluate(`window.__refuse = false`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     await expect
@@ -829,6 +931,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -860,6 +963,7 @@ test.describe('Couch Review phone page', () => {
       document.getElementById('err').hidden = false;
       document.getElementById('err').textContent = STRINGS[locale].linkExpired;
     `);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     // The refusal is retracted from storage, but the link notice stays up.
@@ -888,6 +992,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -921,6 +1026,7 @@ test.describe('Couch Review phone page', () => {
     await page.goto(PAGE);
     await expect(page.locator('#text')).toHaveValue('پارچە', { timeout: 5000 });
 
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
@@ -944,10 +1050,18 @@ test.describe('Couch Review phone page', () => {
       window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
-          return new Response(JSON.stringify({ reviewer: 'Sara', items: [], heldByOthers: 0 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              reviewer: 'Sara',
+              items: [],
+              heldByOthers: 0,
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          );
         }
         if (url.includes('/api/decision')) {
           (window as unknown as { __posts: string[] }).__posts.push(String(init?.body ?? ''));
@@ -1021,6 +1135,7 @@ test.describe('Couch Review phone page', () => {
 
     // Offline: the decision is held.
     await page.evaluate(`localStorage.setItem('__netmode', 'offline')`);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect.poll(async () => operationOutboxCount(page)).toBe(1);
 
@@ -1055,6 +1170,7 @@ test.describe('Couch Review phone page', () => {
     });
     await page.goto(PAGE);
     await showAClip(page);
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
 
     // The verdict is held for the next working link...
@@ -1161,6 +1277,7 @@ test.describe('Couch Review phone page', () => {
           if (!up) return new Response('unauthorized', { status: 401 }); // no cookie was ever minted
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -1281,6 +1398,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -1318,6 +1436,7 @@ test.describe('Couch Review phone page', () => {
     await expect(page.locator('#progress')).toContainText('407');
     await expect(page.locator('#progress')).not.toContainText('لە 2');
     // And the position advances within it rather than restarting at every batch boundary.
+    await authorizeCurrentClipForNonPlaybackTest(page);
     await page.locator('#accept').click();
     await expect(page.locator('#progress')).toContainText('2');
     await expect(page.locator('#progress')).toContainText('407');
@@ -1335,6 +1454,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -1389,6 +1509,7 @@ test.describe('Couch Review phone page', () => {
           });
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -1451,11 +1572,12 @@ test.describe('Couch Review phone page', () => {
         w.__plays.push(this.getAttribute('src') || '');
         return Promise.resolve();
       };
-      window.fetch = async (input: RequestInfo | URL) => {
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -1477,6 +1599,41 @@ test.describe('Couch Review phone page', () => {
               ],
               heldByOthers: 0,
               pendingTotal: 2,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/playback/start')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as {
+            id: 'one' | 'two';
+            rowVersion: string;
+            clientAttemptId: string;
+          };
+          const playbackReceiptId =
+            body.id === 'one'
+              ? '11111111-1111-4111-8111-111111111111'
+              : '22222222-2222-4222-8222-222222222222';
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              clientAttemptId: body.clientAttemptId,
+              playbackReceiptId,
+              segmentId: body.id,
+              segmentRevision: Number(body.rowVersion),
+              clipDurationMs: 1000,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (url.includes('/api/playback/finalize')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as { playbackReceiptId: string };
+          const first = body.playbackReceiptId.startsWith('11111111');
+          return new Response(
+            JSON.stringify({
+              playbackContractVersion: 4,
+              playbackReceiptId: body.playbackReceiptId,
+              segmentId: first ? 'one' : 'two',
+              segmentRevision: first ? 1 : 2,
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
           );
@@ -1514,6 +1671,7 @@ test.describe('Couch Review phone page', () => {
         if (url.includes('/api/queue')) {
           return new Response(
             JSON.stringify({
+              playbackContractVersion: 4,
               reviewer: 'Sara',
               items: [
                 {
@@ -1811,7 +1969,7 @@ test.describe('Couch Review phone page', () => {
       const results = await new AxeBuilder({ page }).withTags(WCAG_AA).analyze();
       for (const v of results.violations) {
         for (const n of v.nodes) {
-          console.log(
+          console.error(
             `[axe:${scheme}] ${v.id}: ${n.target.join(' ')} — ${n.failureSummary?.split('\n')[1] ?? ''}`,
           );
         }

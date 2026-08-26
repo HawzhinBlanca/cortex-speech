@@ -8,12 +8,26 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 /// The file, inside the app data dir, the user pastes their keys into.
 pub const SECRETS_FILE: &str = "secrets.env";
 
 /// The keys Cortex looks for.
 pub const KEY_NAMES: [&str; 2] = ["GEMINI_API_KEY", "OPENROUTER_API_KEY"];
+
+/// One process-wide authority for the complete secrets-file read/modify/replace transaction.
+///
+/// The Settings panel can legitimately issue Gemini and OpenRouter saves at the same time.  The
+/// canonical file is shared, so serializing only each individual fs call is insufficient: both
+/// writers could read the same old bytes, then each publish a different one-key update and report
+/// success while the later replace silently erased the earlier key.  Keep the gate here, at the
+/// lowest write boundary, so every current and future caller receives the same protection.
+static SECRETS_WRITE_GATE: Mutex<()> = Mutex::new(());
+
+fn lock_secrets_write() -> MutexGuard<'static, ()> {
+    SECRETS_WRITE_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// API keys, loaded from the local secrets file / environment. Optional — a provider with no key is
 /// simply not used.
@@ -35,11 +49,17 @@ impl std::fmt::Debug for ApiKeys {
 }
 
 impl ApiKeys {
-    /// Load keys from `{data_dir}/secrets.env`, with environment variables taking precedence. A
-    /// missing file yields all-`None` (never an error). Blank values count as unset, so a template
-    /// line like `GEMINI_API_KEY=` does not register a key.
-    pub fn load(data_dir: &Path) -> Self {
-        let mut map = parse_env_file(&data_dir.join(SECRETS_FILE));
+    /// Load keys from `{data_dir}/secrets.env`, with environment variables taking precedence.
+    ///
+    /// A genuinely missing file yields all-`None`; recovery, read, and decryption failures are
+    /// returned. Treating those failures as "unset" would make a crash-stranded replacement backup
+    /// indistinguishable from an intentional clear and could erase the other provider on the next
+    /// save. Blank values still count as unset.
+    pub fn load(data_dir: &Path) -> Result<Self, String> {
+        let path = data_dir.join(SECRETS_FILE);
+        crate::atomic_file::recover_interrupted_replace(&path)
+            .map_err(|e| format!("recover interrupted secrets-file replacement: {e}"))?;
+        let mut map = parse_env_file(&path)?;
         for name in KEY_NAMES {
             if let Ok(value) = std::env::var(name) {
                 let trimmed = value.trim();
@@ -50,7 +70,7 @@ impl ApiKeys {
                 }
             }
         }
-        Self { gemini: map.remove("GEMINI_API_KEY"), openrouter: map.remove("OPENROUTER_API_KEY") }
+        Ok(Self { gemini: map.remove("GEMINI_API_KEY"), openrouter: map.remove("OPENROUTER_API_KEY") })
     }
 
     /// The provider names that have a key configured — for an honest "what's connected" status. This
@@ -92,7 +112,16 @@ impl ApiKeys {
     /// Shared writer: replace/insert `NAME=<stored>` in secrets.env atomically, preserving all other
     /// lines. `stored` is written verbatim (already plaintext-validated or a dpapi blob).
     fn write_key_line(data_dir: &Path, name: &str, stored: String) -> Result<(), String> {
+        // Hold this across recovery, read, merge, staged write, atomic replace and directory sync.
+        // Shorter locking still permits a lost update between the read and the final replace.
+        let _write = lock_secrets_write();
         let path = data_dir.join(SECRETS_FILE);
+        // Recover BEFORE reading or deciding this is a first save. On Windows the atomic swap can be
+        // interrupted after canonical -> backup but before temp -> canonical; the backup then holds
+        // every provider key while `path` is absent. Falling back to the blank template in that state
+        // would overwrite the only complete copy when saving one provider.
+        crate::atomic_file::recover_interrupted_replace(&path)
+            .map_err(|e| format!("recover interrupted secrets-file replacement: {e}"))?;
         // ONLY "the file does not exist yet" may fall back to the template. Every other read error —
         // a sharing violation from an AV scanner or the search indexer, a permission error, a
         // transient IO fault — must abort the write.
@@ -157,10 +186,12 @@ fn validate_key_value(name: &str, value: &str) -> Result<String, String> {
 
 /// Parse a minimal `.env` file: `KEY=VALUE` per line; `#` comments and blank lines ignored;
 /// surrounding whitespace and a matching pair of single/double quotes stripped; blank values dropped.
-fn parse_env_file(path: &Path) -> HashMap<String, String> {
+fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return map;
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(map),
+        Err(error) => return Err(format!("read secrets file: {error}")),
     };
     for line in contents.lines() {
         let line = line.trim();
@@ -181,23 +212,23 @@ fn parse_env_file(path: &Path) -> HashMap<String, String> {
         }
         if !key.is_empty() && !value.is_empty() {
             // DPAPI-protected values (`dpapi:<base64>`) are transparently decrypted here so the rest of
-            // the app only ever sees plaintext. A blob that can't be decrypted (copied to another
-            // Windows account, or moved to a non-Windows box) is treated as UNSET — never surfaced as
-            // the literal ciphertext — and logged so the failure is visible, not silent.
+            // the app only ever sees plaintext. A blob that cannot be decrypted (copied to another
+            // Windows account, or damaged) is an explicit load error — never surfaced as ciphertext
+            // and never misreported as an intentionally unset provider.
             if crate::dpapi::is_protected(value) {
                 match crate::dpapi::unprotect(value) {
                     Ok(plain) if !plain.is_empty() => {
                         map.insert(key.to_string(), plain);
                     }
                     Ok(_) => {}
-                    Err(e) => tracing::warn!("could not decrypt DPAPI-protected {key} (treated as unset): {e}"),
+                    Err(e) => return Err(format!("could not decrypt DPAPI-protected {key}: {e}")),
                 }
             } else {
                 map.insert(key.to_string(), value.to_string());
             }
         }
     }
-    map
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -247,6 +278,71 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_provider_writes_cannot_erase_each_other() {
+        use std::sync::{Arc, Barrier};
+
+        // Repeat the simultaneous start so this remains a meaningful characterization of the
+        // read/modify/replace boundary instead of a one-off scheduling accident.
+        for round in 0..32 {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().to_path_buf();
+            let barrier = Arc::new(Barrier::new(3));
+            let gemini_barrier = Arc::clone(&barrier);
+            let gemini_dir = dir.clone();
+            let gemini = std::thread::spawn(move || {
+                gemini_barrier.wait();
+                ApiKeys::save_key(&gemini_dir, "GEMINI_API_KEY", &format!("gem-{round}"))
+            });
+            let router_barrier = Arc::clone(&barrier);
+            let router_dir = dir.clone();
+            let router = std::thread::spawn(move || {
+                router_barrier.wait();
+                ApiKeys::save_key(&router_dir, "OPENROUTER_API_KEY", &format!("router-{round}"))
+            });
+
+            barrier.wait();
+            gemini.join().unwrap().unwrap();
+            router.join().unwrap().unwrap();
+
+            let loaded = ApiKeys::load(&dir).unwrap();
+            assert_eq!(loaded.gemini.as_deref(), Some(format!("gem-{round}").as_str()));
+            assert_eq!(loaded.openrouter.as_deref(), Some(format!("router-{round}").as_str()));
+        }
+    }
+
+    #[test]
+    fn concurrent_clear_and_update_preserve_the_unrelated_provider() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        ApiKeys::save_key(&dir, "GEMINI_API_KEY", "old-gem").unwrap();
+        ApiKeys::save_key(&dir, "OPENROUTER_API_KEY", "old-router").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let clear_barrier = Arc::clone(&barrier);
+        let clear_dir = dir.clone();
+        let clear = std::thread::spawn(move || {
+            clear_barrier.wait();
+            ApiKeys::save_key(&clear_dir, "GEMINI_API_KEY", "")
+        });
+        let update_barrier = Arc::clone(&barrier);
+        let update_dir = dir.clone();
+        let update = std::thread::spawn(move || {
+            update_barrier.wait();
+            ApiKeys::save_key(&update_dir, "OPENROUTER_API_KEY", "new-router")
+        });
+
+        barrier.wait();
+        clear.join().unwrap().unwrap();
+        update.join().unwrap().unwrap();
+
+        let loaded = ApiKeys::load(&dir).unwrap();
+        assert_eq!(loaded.gemini, None);
+        assert_eq!(loaded.openrouter.as_deref(), Some("new-router"));
+    }
+
+    #[test]
     fn parse_env_file_handles_comments_quotes_and_blanks() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("s.env");
@@ -255,7 +351,7 @@ mod tests {
             "# my keys\nGEMINI_API_KEY = abc123 \n\nQUOTED=\"xyz\"\nEMPTY=\n# OPENROUTER_API_KEY=nope\n",
         )
         .unwrap();
-        let m = parse_env_file(&p);
+        let m = parse_env_file(&p).unwrap();
         assert_eq!(m.get("GEMINI_API_KEY").map(String::as_str), Some("abc123"), "whitespace trimmed");
         assert_eq!(m.get("QUOTED").map(String::as_str), Some("xyz"), "quotes stripped");
         assert!(!m.contains_key("EMPTY"), "blank value dropped");
@@ -264,7 +360,7 @@ mod tests {
 
     #[test]
     fn parse_env_file_missing_is_empty_no_error() {
-        assert!(parse_env_file(Path::new("/no/such/secrets.env")).is_empty());
+        assert!(parse_env_file(Path::new("/no/such/secrets.env")).unwrap().is_empty());
     }
 
     #[test]
@@ -296,7 +392,7 @@ mod tests {
 
         // First save on a machine with no secrets.env: file is created from the template.
         ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "sk-or-abc123").unwrap();
-        let keys = ApiKeys::load(dir);
+        let keys = ApiKeys::load(dir).unwrap();
         assert_eq!(keys.openrouter.as_deref(), Some("sk-or-abc123"));
         let contents = std::fs::read_to_string(dir.join(SECRETS_FILE)).unwrap();
         assert!(contents.contains("GEMINI_API_KEY="), "template placeholders preserved");
@@ -305,7 +401,7 @@ mod tests {
         // Update in place — other keys/lines untouched.
         ApiKeys::save_key(dir, "GEMINI_API_KEY", "g-key").unwrap();
         ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "sk-or-NEW").unwrap();
-        let keys = ApiKeys::load(dir);
+        let keys = ApiKeys::load(dir).unwrap();
         assert_eq!(keys.openrouter.as_deref(), Some("sk-or-NEW"));
         assert_eq!(keys.gemini.as_deref(), Some("g-key"));
         let contents = std::fs::read_to_string(dir.join(SECRETS_FILE)).unwrap();
@@ -313,7 +409,7 @@ mod tests {
 
         // Empty value clears the key (line stays as an unset placeholder).
         ApiKeys::save_key(dir, "OPENROUTER_API_KEY", "").unwrap();
-        assert!(ApiKeys::load(dir).openrouter.is_none(), "cleared key must read back as unset");
+        assert!(ApiKeys::load(dir).unwrap().openrouter.is_none(), "cleared key must read back as unset");
     }
 
     #[cfg(windows)]
@@ -330,28 +426,59 @@ mod tests {
         assert!(!on_disk.contains(secret), "the plaintext key must never be on disk");
         assert!(on_disk.contains("OPENROUTER_API_KEY=dpapi:"), "value stored as a DPAPI blob: {on_disk}");
 
-        assert_eq!(ApiKeys::load(dir).openrouter.as_deref(), Some(secret), "loads back transparently");
+        assert_eq!(ApiKeys::load(dir).unwrap().openrouter.as_deref(), Some(secret), "loads back transparently");
 
         // A plaintext key alongside the protected one still loads (additive, not a replacement).
         ApiKeys::save_key(dir, "GEMINI_API_KEY", "g-plain").unwrap();
-        let keys = ApiKeys::load(dir);
+        let keys = ApiKeys::load(dir).unwrap();
         assert_eq!(keys.gemini.as_deref(), Some("g-plain"));
         assert_eq!(keys.openrouter.as_deref(), Some(secret));
 
         // Clearing a protected key works through the same path.
         ApiKeys::save_key_protected(dir, "OPENROUTER_API_KEY", "").unwrap();
-        assert!(ApiKeys::load(dir).openrouter.is_none());
+        assert!(ApiKeys::load(dir).unwrap().openrouter.is_none());
     }
 
     #[test]
-    fn a_corrupt_dpapi_blob_reads_as_unset_never_as_ciphertext() {
-        // A dpapi: value that can't be decrypted (wrong account / non-Windows) must be treated as unset,
-        // never surfaced as the literal ciphertext to the app.
+    fn a_corrupt_dpapi_blob_is_an_explicit_load_error_never_ciphertext_or_unset() {
+        // A dpapi: value that can't be decrypted (wrong account / non-Windows) is not equivalent to
+        // an intentionally absent key. Surface the error without ever returning the ciphertext.
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join(SECRETS_FILE);
         std::fs::write(&p, "OPENROUTER_API_KEY=dpapi:not-valid-base64-or-blob!!!\n").unwrap();
-        let keys = ApiKeys::load(tmp.path());
-        assert!(keys.openrouter.is_none(), "an undecryptable blob must read as unset, not as the raw string");
+        let error = ApiKeys::load(tmp.path()).expect_err("an undecryptable key must be explicit");
+        assert!(error.contains("could not decrypt DPAPI-protected OPENROUTER_API_KEY"));
+        assert!(!error.contains("not-valid-base64-or-blob"), "the ciphertext must not leak in the error");
+    }
+
+    #[test]
+    fn load_recovers_a_crash_stranded_secrets_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join(SECRETS_FILE);
+        let backup = tmp.path().join(format!("{SECRETS_FILE}.replace-bak-1234"));
+        std::fs::write(&backup, "GEMINI_API_KEY=gem\nOPENROUTER_API_KEY=router\n").unwrap();
+        assert!(!canonical.exists(), "fixture models the gap between the Windows swap renames");
+
+        let keys = ApiKeys::load(tmp.path()).expect("load must promote the orphaned good copy");
+        assert_eq!(keys.gemini.as_deref(), Some("gem"));
+        assert_eq!(keys.openrouter.as_deref(), Some("router"));
+        assert!(canonical.exists() && !backup.exists(), "the backup is promoted into canonical place");
+    }
+
+    #[test]
+    fn save_recovers_a_crash_stranded_backup_before_preserving_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join(SECRETS_FILE);
+        let backup = tmp.path().join(format!("{SECRETS_FILE}.replace-bak-5678"));
+        std::fs::write(&backup, "GEMINI_API_KEY=old-gem\nOPENROUTER_API_KEY=router\n").unwrap();
+
+        ApiKeys::save_key(tmp.path(), "GEMINI_API_KEY", "new-gem").expect("save recovers before read");
+        let contents = std::fs::read_to_string(canonical).unwrap();
+        assert!(contents.contains("GEMINI_API_KEY=new-gem"));
+        assert!(
+            contents.contains("OPENROUTER_API_KEY=router"),
+            "saving one key after recovery must preserve the other provider: {contents}"
+        );
     }
 
     #[test]

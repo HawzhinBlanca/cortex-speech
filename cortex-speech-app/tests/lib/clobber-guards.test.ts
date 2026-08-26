@@ -16,7 +16,7 @@ describe('schema-v60 frontend review-write boundary', () => {
   });
 
   it('the library exposes only a fail-closed metadata partial writer', () => {
-    const app = read('../../src/App.svelte');
+    const app = read('../../src/Workstation.svelte');
     const commands = read('../../src/lib/commands.ts');
     expect(commands).not.toContain('export async function updateSegment(');
     expect(commands).toContain("Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>");

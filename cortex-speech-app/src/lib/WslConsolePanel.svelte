@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { focusTrap } from './actions/focusTrap';
-  import { listen } from '@tauri-apps/api/event';
+  import { subscribeDesktopEvent } from './events';
   import * as api from './commands';
   import { showWslConsole } from './stores/uiStore';
   import { notifications } from './stores/notificationStore';
   import { appendBoundedLogLine } from './logBuffer';
   import { t } from './i18n';
+  import { formatUnknownError } from './errorText';
 
   let running = $state(false);
   let status = $state<'idle' | 'running' | 'completed' | 'failed' | 'cancelled'>('idle');
@@ -41,14 +42,18 @@
     running = true;
     status = 'running';
     logs = [];
-    appendLog('>>> Starting Meta OmniASR 7B batch transcription of pending segments...');
+    appendLog(`>>> ${$t('wsl.logStarting')}`);
     const opts = [
-      limitFiles ? `files ≤ ${limitFiles}` : '',
-      limitSegments ? `segments ≤ ${limitSegments}` : '',
-      dryRun ? 'dry-run (no writes)' : '',
-      testOne ? 'test-one (single segment)' : '',
+      limitFiles ? $t('wsl.logOptionFiles', { count: String(limitFiles) }) : '',
+      limitSegments ? $t('wsl.logOptionSegments', { count: String(limitSegments) }) : '',
+      dryRun ? $t('wsl.logOptionDryRun') : '',
+      testOne ? $t('wsl.logOptionTestOne') : '',
     ].filter(Boolean);
-    appendLog(`>>> Options: ${opts.length ? opts.join(', ') : 'all pending segments'}`);
+    appendLog(
+      `>>> ${$t('wsl.logOptions', {
+        options: opts.length ? opts.join(', ') : $t('wsl.logAllPending'),
+      })}`,
+    );
 
     try {
       await api.runWslRefinement({
@@ -58,22 +63,22 @@
         test_one: testOne,
       });
     } catch (e) {
-      appendLog(`[SYSTEM ERROR] Failed to start refinement: ${e}`);
+      appendLog(`[SYSTEM ERROR] ${$t('wsl.logStartFailed')}: ${formatUnknownError(e)}`);
       status = 'failed';
       running = false;
-      notifications.error($t('wsl.startFailed'), { detail: String(e) });
+      notifications.error($t('wsl.startFailed'), { cause: e });
     }
   }
 
   async function stopRefinement() {
     if (!running) return;
-    appendLog('\n>>> Aborting process by user request...');
+    appendLog(`\n>>> ${$t('wsl.logCancelling')}`);
     try {
       await api.cancelWslRefinement();
       status = 'cancelled';
     } catch (e) {
-      appendLog(`[SYSTEM ERROR] Abort failed: ${e}`);
-      notifications.error($t('wsl.cancelFailed'), { detail: String(e) });
+      appendLog(`[SYSTEM ERROR] ${$t('wsl.logCancelFailed')}: ${formatUnknownError(e)}`);
+      notifications.error($t('wsl.cancelFailed'), { cause: e });
     }
   }
 
@@ -104,10 +109,10 @@
     // onMount must be SYNCHRONOUS for the returned function to be treated as teardown — and because an
     // async onMount does NOT block onDestroy, capturing the resolved handle in an awaited assignment
     // could miss teardown (panel closed before listen() resolves) and leak the listener forever.
-    const logHandle = listen<string>('wsl-log', (event) => {
+    const logHandle = subscribeDesktopEvent<string>('wsl-log', (event) => {
       appendLog(event.payload);
     });
-    const statusHandle = listen<{
+    const statusHandle = subscribeDesktopEvent<{
       status: 'completed' | 'failed' | 'cancelled';
       transcribed?: number;
       failed?: number;
@@ -132,6 +137,8 @@
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md"
   role="dialog"
   aria-modal="true"
+  aria-labelledby="wsl-title"
+  aria-describedby="wsl-description"
   tabindex="-1"
   use:focusTrap
   onkeydown={handleKeydown}
@@ -145,25 +152,18 @@
     <!-- Header -->
     <div class="flex items-center justify-between px-6 py-4 border-b border-cortex-800/50">
       <div class="flex items-center gap-3">
-        <svg class="w-5 h-5 text-cortex-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
-          />
-        </svg>
-        <h2 class="text-md font-semibold text-default">
-          Meta OmniASR 7B v2 Local Transcription (WSL)
+        <h2 id="wsl-title" class="text-md font-semibold text-default">
+          {$t('wsl.title', { model: 'Meta OmniASR 7B v2' })}
         </h2>
       </div>
       <button
         class="text-muted hover:text-default transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
         onclick={close}
         disabled={running}
-        aria-label="Close"
+        aria-label={$t('close')}
+        aria-describedby={running ? 'wsl-close-disabled-reason' : undefined}
       >
-        ✕
+        {$t('close')}
       </button>
     </div>
 
@@ -171,11 +171,12 @@
     <div class="flex-1 overflow-y-auto p-6 space-y-4 min-h-0 flex flex-col">
       <!-- Description & Config -->
       <div class="bg-cortex-900/50 border border-cortex-800/40 rounded-xl p-4 space-y-3 shrink-0">
-        <p class="text-xs text-cortex-300">
-          Run high-accuracy offline transcription on the GPU using Meta's 7B encoder-decoder model.
-          This process executes inside WSL (Ubuntu) and updates segment transcripts directly in the
-          database.
+        <p id="wsl-description" class="text-xs text-cortex-300">
+          {$t('wsl.description')}
         </p>
+        {#if running}
+          <p id="wsl-close-disabled-reason" class="sr-only">{$t('wsl.closeDisabled')}</p>
+        {/if}
 
         <div class="grid grid-cols-2 gap-4">
           <label class="flex flex-col gap-1 text-xs text-muted">
@@ -184,7 +185,9 @@
               type="number"
               min="1"
               bind:value={limitFiles}
-              placeholder="e.g., 5"
+              placeholder={$t('wsl.limitFilesPlaceholder')}
+              inputmode="numeric"
+              dir="ltr"
               class="input !py-1"
               disabled={running}
             />
@@ -195,7 +198,9 @@
               type="number"
               min="1"
               bind:value={limitSegments}
-              placeholder="e.g., 20"
+              placeholder={$t('wsl.limitSegmentsPlaceholder')}
+              inputmode="numeric"
+              dir="ltr"
               class="input !py-1"
               disabled={running}
             />
@@ -231,36 +236,28 @@
           <span>{$t('wsl.terminalLogs')}</span>
           <div class="flex items-center gap-2">
             {#if status === 'running'}
-              <span class="flex items-center gap-1.5 text-cyan-400 font-semibold">
-                <svg class="animate-spin h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
-                  <circle
-                    class="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    stroke-width="4"
-                  />
-                  <path
-                    class="opacity-75"
-                    fill="currentColor"
-                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                  />
-                </svg>
+              <span
+                class="flex items-center gap-1.5 text-cyan-400 font-semibold"
+                role="status"
+                aria-live="polite"
+              >
                 {$t('wsl.processing')}
               </span>
             {:else if status === 'completed'}
               {#if lastFailed > 0}
-                <span class="text-amber-400 font-semibold"
-                  >● {lastTranscribed} ✓ · {lastFailed} ✗</span
-                >
+                <span class="text-amber-400 font-semibold">
+                  {$t('wsl.completedCounts', {
+                    completed: String(lastTranscribed),
+                    failed: String(lastFailed),
+                  })}
+                </span>
               {:else}
-                <span class="text-emerald-400 font-semibold">● {$t('wsl.completed')}</span>
+                <span class="text-emerald-400 font-semibold">{$t('wsl.completed')}</span>
               {/if}
             {:else if status === 'failed'}
-              <span class="text-red-400 font-semibold">● {$t('wsl.failed')}</span>
+              <span class="text-red-400 font-semibold">{$t('wsl.failed')}</span>
             {:else if status === 'cancelled'}
-              <span class="text-amber-400 font-semibold">● {$t('wsl.cancelled')}</span>
+              <span class="text-amber-400 font-semibold">{$t('wsl.cancelled')}</span>
             {:else}
               <span class="text-cortex-500">{$t('wsl.idle')}</span>
             {/if}
@@ -271,6 +268,10 @@
         <div
           bind:this={consoleContainer}
           class="terminal-dark flex-1 overflow-y-auto bg-black font-mono text-[11px] p-4 rounded-xl border border-cortex-800/60 space-y-1 select-text scrollbar-thin scrollbar-thumb-cortex-800 scrollbar-track-transparent min-h-0"
+          role="log"
+          aria-live="polite"
+          aria-label={$t('wsl.terminalLogs')}
+          dir="auto"
         >
           {#if logs.length === 0}
             <div class="text-cortex-600 italic">
@@ -315,7 +316,12 @@
       </div>
 
       <div class="flex gap-3">
-        <button class="btn btn-secondary !text-xs" onclick={close} disabled={running}>
+        <button
+          class="btn btn-secondary !text-xs"
+          onclick={close}
+          disabled={running}
+          aria-describedby={running ? 'wsl-close-disabled-reason' : undefined}
+        >
           {$t('close')}
         </button>
         {#if running}

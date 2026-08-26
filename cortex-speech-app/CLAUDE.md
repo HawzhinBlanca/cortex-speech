@@ -55,9 +55,10 @@ or a busy server. Fine-tuned MMS and CTC-300M/1B remain offline diagnostic/evalu
 
 *Why this is a rule:* measured 2026-08-10, a 494-clip review queue was drafted **494/494 by
 `finetuned-mms-ckb`** while `asr_model_size` said WSL7B and the champion sat up and idle on both GPUs.
-No UI, DB field or gate said so; the owner found it by reading the transcripts. Measured gap on
-identical FLEURS ckb clips: **7.03% CER vs 9.32%** — and the app runs the int8 build, whose own
-baseline is 21.00%.
+No UI, DB field or gate said so; the owner found it by reading the transcripts. Historical
+duplication-weighted experiments showed that the engines were materially different, but those
+figures are not current model evidence. The operational lesson does not depend on an accuracy claim:
+silent substitution destroys provenance and must hard-stop.
 
 **2. Stop on the first failure. Never degrade, never continue.** If any stage fails for any clip —
 ASR, refinement, alignment, decode — the run **halts** and reports the cause. Do not skip the clip,
@@ -192,7 +193,7 @@ Run the relevant gates and paste the real output. A fix without a regression gat
 ## Key map
 
 - Backend: `src-tauri/src/` — `commands.rs` (IPC), `pipeline.rs`, `asr.rs`, `audio.rs`, `db.rs`, `normalizer.rs`, `eval.rs`, `models.rs`, `settings.rs`, `jury/`, `export*.rs`.
-- Frontend: `src/App.svelte` (shell) + `src/lib/*.svelte` (`AudioPlayer`, `ReviewMode`, `ReviewInbox`, `ValidationPanel`, `DiffView`, `StatsDashboard`, ...).
+- Frontend: `src/App.svelte` (bounded composition root), `src/Workstation.svelte` (legacy runtime orchestration pending further strangler extraction), and `src/lib/*.svelte` (`AudioPlayer`, `ReviewMode`, `ReviewInbox`, `ValidationPanel`, `DiffView`, `StatsDashboard`, ...).
 - Docs: `../AGENT_CHARTER.md` (repo root), `ROAD_TO_10.md`, `docs/REAL_READINESS_PLAN.md`, `docs/HARDENING_PLAN_10.md`, `docs/COWORK_PIPELINE_PROMPT.md`.
 - Scripts: `scripts/*.py` (dataset build/review + policy gates), `e2e_real_app.cjs` (real-app driver).
 

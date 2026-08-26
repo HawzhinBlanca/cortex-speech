@@ -254,6 +254,50 @@ pub(crate) fn export_audio_ref(audio_path: &str) -> &str {
     audio_path.rsplit(['/', '\\']).next().unwrap_or(audio_path)
 }
 
+/// Require the durable, canonical PCM identity that binds one segment's transcript/review authority
+/// to its source recording. A missing v51 identity is UNKNOWN, never permission to export whatever
+/// bytes happen to occupy the path today.
+pub(crate) fn required_segment_audio_content_hash(db: &Database, segment_id: &str, context: &str) -> AppResult<String> {
+    db.segment_audio_content_hash(segment_id)?.ok_or_else(|| {
+        AppError::Validation(format!(
+            "{context}: segment {segment_id} has no canonical audio-content authority; backfill/re-import it before exporting audio"
+        ))
+    })
+}
+
+/// Verify an already-decoded PCM buffer before any bytes derived from it are written. The caller
+/// writes from this same buffer, closing the path-level TOCTOU where a source could be replaced after
+/// a metadata/path check but before decode.
+pub(crate) fn require_decoded_segment_audio_identity(
+    db: &Database,
+    segment_id: &str,
+    pcm: &[i16],
+    sample_rate: u32,
+    context: &str,
+) -> AppResult<String> {
+    let actual = crate::fingerprint::AudioFingerprint::content_hash(pcm, sample_rate);
+    require_segment_audio_identity_hash(db, segment_id, &actual, context)?;
+    Ok(actual)
+}
+
+/// Compare a canonical PCM hash computed over the exact decode an exporter is about to consume.
+/// Split out so grouped/streaming exporters hash a source once while still checking every row's
+/// independently stored authority.
+pub(crate) fn require_segment_audio_identity_hash(
+    db: &Database,
+    segment_id: &str,
+    actual_content_hash: &str,
+    context: &str,
+) -> AppResult<()> {
+    let expected = required_segment_audio_content_hash(db, segment_id, context)?;
+    if expected != actual_content_hash {
+        return Err(AppError::Validation(format!(
+            "{context}: source audio for segment {segment_id} no longer matches its stored canonical PCM identity; refusing to pair current bytes with prior transcript/review authority"
+        )));
+    }
+    Ok(())
+}
+
 /// `unreadable_source_audio_counts_as_verified` exists for ONE caller: the `dropped_unavailable`
 /// tally, which must answer "would this row have been written had the audio been there?". Every other
 /// gate below reads only the grade and DB records, but the source-reference identity check opens and
@@ -426,6 +470,27 @@ pub(crate) fn exclude_unexportable_segments(
     db: &Database,
     segments: Vec<SpeechSegment>,
 ) -> AppResult<Vec<SpeechSegment>> {
+    exclude_unexportable_segments_with_holdout_policy(db, segments, true)
+}
+
+/// Apply every universal export exclusion while intentionally retaining eval holdouts.
+///
+/// Human-facing transcript/subtitle exports are not training artifacts, so the owner may export a
+/// holdout transcript. Revoked consent, rejects, technical-unusable rows, placeholders, and hidden
+/// review answer keys remain universal exclusions. Keeping this as a named wrapper prevents a caller
+/// from bypassing the shared rights gate merely because its holdout policy differs.
+pub(crate) fn exclude_unexportable_segments_including_holdouts(
+    db: &Database,
+    segments: Vec<SpeechSegment>,
+) -> AppResult<Vec<SpeechSegment>> {
+    exclude_unexportable_segments_with_holdout_policy(db, segments, false)
+}
+
+fn exclude_unexportable_segments_with_holdout_policy(
+    db: &Database,
+    segments: Vec<SpeechSegment>,
+    exclude_holdouts: bool,
+) -> AppResult<Vec<SpeechSegment>> {
     let mut kept = Vec::with_capacity(segments.len());
     for seg in segments {
         if db.rights_for_segment(&seg.id)?.is_revoked() {
@@ -439,6 +504,10 @@ pub(crate) fn exclude_unexportable_segments(
         // them.
         if crate::quality::is_human_rejected(&seg) {
             tracing::info!(segment_id = %seg.id, "export: dropping human-rejected segment");
+            continue;
+        }
+        if let Some(reason) = crate::quality::technical_unusable_reason(&seg) {
+            tracing::info!(segment_id = %seg.id, reason, "export: dropping technically unusable segment");
             continue;
         }
         if crate::quality::is_effective_placeholder(&seg) {
@@ -458,6 +527,9 @@ pub(crate) fn exclude_unexportable_segments(
         kept.push(seg);
     }
     let segments = kept;
+    if !exclude_holdouts {
+        return Ok(segments);
+    }
     let holdout = crate::jury::learning::holdout_content_hashes(db)?;
     let holdout_paths = crate::jury::learning::holdout_audio_paths(db)?;
     // All VAD chunks of one recording share a single audio_path. Memoize path -> held_out so a source
@@ -1260,6 +1332,11 @@ pub fn export_huggingface_dataset(
                             continue;
                         }
                     };
+                    // Hash the exact in-memory decode used for every slice below. Path metadata or a
+                    // pre-decode hash leaves a replacement window; this buffer identity cannot drift
+                    // out from under the bytes written to the staged dataset generation.
+                    let current_content_hash =
+                        crate::fingerprint::AudioFingerprint::content_hash(&full_pcm, sample_rate);
 
                     for seg in segs {
                         let grade = quality::training_grade_for_segment(seg);
@@ -1283,9 +1360,15 @@ pub fn export_huggingface_dataset(
                             tracing::warn!(
                                     "Skipping segment {} in HF export: machine training-ready row is missing multi-model hypothesis coverage, ready agentic promotion coverage, or configured source-reference model coverage/current audio identity",
                                     seg.id
-                                );
+                            );
                             continue;
                         }
+                        require_segment_audio_identity_hash(
+                            db,
+                            &seg.id,
+                            &current_content_hash,
+                            "Hugging Face audio export",
+                        )?;
 
                         // Slice from the already-decoded PCM buffer. An out-of-range/degenerate
                         // alignment window skips the row instead of emitting the whole source file.

@@ -275,7 +275,7 @@ pub fn run_t0_gate(
     // (nonconformity score, committed-CER) contaminates the conformal coverage guarantee for the gate that
     // decides auto-accept WITHOUT human review. Every export/gate path drops these via is_human_rejected.
     let all_verified: Vec<_> =
-        db.get_segments(Some(true))?.into_iter().filter(|s| !crate::quality::is_human_rejected(s)).collect();
+        db.get_segments(Some(true))?.into_iter().filter(|s| !crate::quality::is_excluded_from_exports(s)).collect();
 
     // 2. Run IRT over all hypotheses. When ability-learning is enabled (opt-in, F7), warm-start the
     //    consensus from the persisted per-model abilities and persist the freshly-fit ones so the jury
@@ -926,7 +926,7 @@ mod tests {
     fn legacy_machine_db() -> Database {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         db
     }
 
@@ -1209,7 +1209,7 @@ mod tests {
     fn few_shot_legacy_example_requires_current_verified_edit_with_matching_text() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         db.insert_segment(&make_seg("legacy-example", "wrong draft")).unwrap();
         db.insert_segment(&make_seg("legacy-query", "human fix")).unwrap();
         db.connection()
@@ -1227,7 +1227,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
 
         assert_eq!(get_few_shot_examples(&db, "legacy-query", 10).unwrap().len(), 1);
         db.connection()

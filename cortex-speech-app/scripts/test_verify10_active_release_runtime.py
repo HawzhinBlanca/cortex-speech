@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -89,6 +91,64 @@ def test_active_release_manifest_git_sha_must_match_the_binary_marker() -> None:
         else:
             raise AssertionError("manifest/binary git mismatch was accepted")
     finally:
+        temporary.cleanup()
+
+
+def test_latest_proof_reobserves_active_executable_after_measurement() -> None:
+    temporary, root, manifest, exe = fixture()
+    old_environment = {
+        key: os.environ.get(key)
+        for key in ("APPDATA", "LOCALAPPDATA", "CORTEX_APP_EXE")
+    }
+    old_configured = GATE._RUNTIME_EXE_CONFIGURED
+    old_error = GATE._RUNTIME_EXE_ERROR
+    try:
+        appdata = Path(temporary.name) / "appdata"
+        localappdata = Path(temporary.name) / "localappdata"
+        expected_root = localappdata / "CortexSpeech" / "private-production-releases"
+        expected_directory = expected_root / "release-id"
+        expected_root.parent.mkdir(parents=True)
+        root.rename(expected_root)
+        expected_exe = expected_directory / exe.name
+        manifest["directory"] = str(expected_directory)
+        manifest["appExe"] = str(expected_exe)
+
+        pointer = appdata / "cortex-speech" / GATE.ACTIVE_RELEASE_POINTER
+        pointer.parent.mkdir(parents=True)
+        pointer.write_text(json.dumps(manifest), encoding="utf-8")
+        os.environ["APPDATA"] = str(appdata)
+        os.environ["LOCALAPPDATA"] = str(localappdata)
+        os.environ.pop("CORTEX_APP_EXE", None)
+        GATE._RUNTIME_EXE_CONFIGURED = False
+        GATE._RUNTIME_EXE_ERROR = None
+
+        recorded = GATE._release_artifact_bindings(GIT_SHA)
+        assert recorded[0]["authority"] == "active-immutable-release"
+        GATE._revalidate_latest_release_executable(
+            GATE.PROFILE_OWNER,
+            recorded,
+            GIT_SHA,
+        )
+
+        expected_exe.write_bytes(expected_exe.read_bytes() + b"tampered-after-proof")
+        try:
+            GATE._revalidate_latest_release_executable(
+                GATE.PROFILE_OWNER,
+                recorded,
+                GIT_SHA,
+            )
+        except GATE.EvidenceError as error:
+            assert "changed after measurement" in str(error)
+        else:
+            raise AssertionError("latest-proof accepted an executable changed after measurement")
+    finally:
+        GATE._RUNTIME_EXE_CONFIGURED = old_configured
+        GATE._RUNTIME_EXE_ERROR = old_error
+        for key, value in old_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         temporary.cleanup()
 
 

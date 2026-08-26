@@ -1,7 +1,8 @@
 <script lang="ts">
+  import Search from '@lucide/svelte/icons/search';
   import Modal from './Modal.svelte';
   import { globalKeyboardManager } from './keyboard';
-  import { t } from './i18n';
+  import { t, type TranslationKey } from './i18n';
 
   export interface Command {
     id: string;
@@ -30,7 +31,7 @@
   let activeIndex = $state(0);
   let listEl: HTMLDivElement | undefined = $state();
 
-  const shortcutCategoryKeys: Record<string, string> = {
+  const shortcutCategoryKeys: Readonly<Record<string, TranslationKey>> = {
     general: 'general',
     file: 'fileOperations',
     edit: 'editing',
@@ -38,13 +39,18 @@
     playback: 'playback',
   };
 
+  function shortcutCategoryLabel(category: string): string {
+    const key = shortcutCategoryKeys[category];
+    return key ? $t(key) : category;
+  }
+
   const commands = $derived.by<Command[]>(() => {
     const fromShortcuts: Command[] = (globalKeyboardManager?.getAll() ?? [])
       .filter((s) => !reviewActive || s.allowInReview)
       .map((s, i) => ({
         id: `sc-${i}`,
         label: s.descriptionKey ? $t(s.descriptionKey) : s.description,
-        category: $t(shortcutCategoryKeys[s.category] ?? s.category),
+        category: shortcutCategoryLabel(s.category),
         hint: globalKeyboardManager?.formatShortcut(s),
         run: s.action,
       }));
@@ -118,18 +124,7 @@
 <Modal {open} {onClose} size="lg" ariaLabel={$t('cmdk.title')}>
   <div>
     <div class="flex items-center gap-3 border-b border-line px-4 py-3.5">
-      <svg
-        class="text-subtle"
-        width="18"
-        height="18"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-      >
-        <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
-      </svg>
+      <Search class="text-subtle" size={18} aria-hidden="true" />
       <!-- svelte-ignore a11y_autofocus -->
       <input
         autofocus

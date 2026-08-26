@@ -3,17 +3,12 @@
  * egress_probe.cjs — RUNTIME proof for audit-point #9 ("default runtime egress measured as zero").
  *
  * Launches the REAL built exe with DEFAULT (fully-offline) settings and, while it starts up and serves
- * a representative offline workflow, monitors the MAIN exe process's outbound TCP connections. It asserts
+ * a representative offline workflow, monitors the full app process tree's outbound TCP connections. It asserts
  * ZERO connections to any non-loopback / non-local address — i.e. the default path opens no connection to
  * the public internet (no telemetry, no update check, no cloud STT/LLM).
  *
- * Why the MAIN exe PID only: cloud requests originate in the Rust backend (reqwest/ureq) inside the main
- * `cortex-speech-app.exe` process. The WebView2 child processes (msedgewebview2.exe, separate PIDs) have
- * their own benign runtime traffic (component updates, etc.) that is NOT the app's egress — monitoring the
- * backend PID isolates the property the audit cares about.
- *
  * HONEST SCOPE / LIMITATIONS (do not overclaim):
- *   - Measures the MAIN process's TCP connections by polling (default 200ms). A connection that opens and
+ *   - Measures the app and every descendant process (including WebView2) by polling (default 200ms). A connection that opens and
  *     closes entirely between two samples could be missed; a real cloud HTTPS call (DNS + TCP + TLS +
  *     request) lasts well over one sample, so a SUSTAINED phone-home is caught. This is a strong runtime
  *     signal, not a formal proof — a kernel/ETW socket trace would be the airtight version.
@@ -27,11 +22,12 @@
  *     Without the explicit flag the verdict says startup+browse only and makes no ASR-path claim.
  *   - The airtight non-poll version (a kernel/ETW socket trace) is still a further stretch; this poll-based
  *     probe with a positive control is a strong runtime signal, not a formal proof.
- *   - TCP only. A UDP/DNS lookup with no TCP connect is not counted (no data egress without a connection).
+ *   - TCP only. UDP/DNS traffic is not observed, so this probe alone cannot certify zero outbound
+ *     packets; the Windows-product evidence profile still needs an ETW/WFP or equivalent trace.
  *
  * Isolation (same contract as heartbeat_probe.cjs / jobs_probe.cjs): a DISPOSABLE CORTEX_APP_DATA_DIR, a
  * per-run WEBVIEW2_USER_DATA_FOLDER, REFUSES the real %APPDATA%\cortex-speech profile, kills ONLY the
- * process tree it spawned. Exit 0 iff no external connection is observed from the main exe PID.
+ * process tree it spawned. Exit 0 iff no external connection is observed from the app process tree.
  *
  * Env: CORTEX_APP_EXE (default: release build), CORTEX_DEBUG_PORT (default 9335),
  *      CORTEX_EGRESS_SAMPLE_MS (default 200), CORTEX_EGRESS_WORKLOAD_MS (default 6000).
@@ -140,12 +136,16 @@ function isLocalAddress(addr) {
 // each newly-seen `RemoteAddress|RemotePort|State` line as it appears. Runs concurrently with the CDP
 // workload (spawn is non-blocking, unlike execSync). Returns a handle; call stopSampler() to end it and
 // collect the distinct endpoints observed.
-function startSampler(pid) {
+function startSampler(rootPid) {
   const ps =
-    `$ErrorActionPreference='SilentlyContinue';$seen=@{};` +
-    `while($true){Get-NetTCPConnection -OwningProcess ${pid} 2>$null|ForEach-Object{` +
-    `$k="$($_.RemoteAddress)|$($_.RemotePort)|$($_.State)";` +
-    `if(-not $seen.ContainsKey($k)){$seen[$k]=$true;Write-Output $k}};` +
+    `$ErrorActionPreference='SilentlyContinue';$seen=@{};$owned=@{${rootPid}=$true};` +
+    `while($true){$all=@(Get-CimInstance Win32_Process);$changed=$true;` +
+    `while($changed){$changed=$false;foreach($p in $all){` +
+    `if($owned.ContainsKey([int]$p.ParentProcessId)-and-not $owned.ContainsKey([int]$p.ProcessId)){` +
+    `$owned[[int]$p.ProcessId]=$true;$changed=$true}}};` +
+    `foreach($processId in @($owned.Keys)){Get-NetTCPConnection -OwningProcess $processId 2>$null|ForEach-Object{` +
+    `$k="$processId|$($_.RemoteAddress)|$($_.RemotePort)|$($_.State)";` +
+    `if(-not $seen.ContainsKey($k)){$seen[$k]=$true;Write-Output $k}}};` +
     `Start-Sleep -Milliseconds ${SAMPLE_MS}}`;
   const proc = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
     stdio: ['ignore', 'pipe', 'ignore'],
@@ -173,8 +173,14 @@ function stopSampler(handle) {
   }
   const all = handle.lines
     .map((l) => l.split('|'))
-    .filter((p) => p.length >= 3)
-    .map(([addr, port, state]) => ({ addr, port, state, raw: `${addr}:${port} [${state}]` }));
+    .filter((p) => p.length >= 4)
+    .map(([ownerPid, addr, port, state]) => ({
+      ownerPid,
+      addr,
+      port,
+      state,
+      raw: `pid=${ownerPid} ${addr}:${port} [${state}]`,
+    }));
   return { external: all.filter((c) => !isLocalAddress(c.addr)), total: all.length };
 }
 
@@ -341,7 +347,7 @@ async function run() {
 
   await browser.close();
 
-  // Stop sampling now that the workload is done, and collect what the backend PID connected to.
+  // Stop sampling now that the workload is done, and collect what the complete app tree connected to.
   const result = stopSampler(sampler);
   killApp();
 
@@ -360,7 +366,7 @@ async function run() {
   );
 
   if (result.external.length > 0) {
-    console.error('==> EXTERNAL connections observed from the main exe PID:');
+    console.error('==> EXTERNAL connections observed from the app process tree:');
     for (const c of result.external) console.error(`    ${c.raw}`);
     throw new Error(
       `EGRESS DETECTED: the default offline path opened ${result.external.length} non-local connection(s).`,
@@ -387,7 +393,7 @@ async function run() {
     ? `+ a REAL champion transcription (${transcribeLeg.segments} segment(s) via WSL7B)`
     : `; champion transcribe leg not requested — verdict covers startup+browse only`;
   console.log(
-    `\nEGRESS OK: the default offline path opened ZERO non-loopback connections from the backend PID ` +
+    `\nEGRESS OK: the default offline path opened ZERO non-loopback connections from the app process tree ` +
       `(covering startup + a ${(WORKLOAD_MS / 1000) | 0}s get_settings/get_jobs/get_waveform workload ${legDesc}). ` +
       `Scope: TCP, poll-sampled every ${SAMPLE_MS}ms; airtight kernel/ETW trace still a stretch (see header).`,
   );

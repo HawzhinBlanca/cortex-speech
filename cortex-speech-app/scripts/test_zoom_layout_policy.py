@@ -13,6 +13,7 @@ content, and nothing in the app says so. jsdom has no layout engine, so a unit t
 of this — these source pins are what keeps the fix from being undone by a later "cleanup".
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def test_full_height_boxes_do_not_centre_their_overflow() -> None:
 def test_the_empty_state_uses_the_scroll_safe_centring() -> None:
     # The positive half: the two boxes that were actually measured clipped must still carry the fix,
     # so this policy cannot be satisfied by deleting the centring altogether.
-    for relative_path in ("src/lib/EmptyState.svelte", "src/App.svelte"):
+    for relative_path in ("src/lib/EmptyState.svelte", "src/Workstation.svelte"):
         source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
         if SCROLL_SAFE_CENTRE not in source:
             raise AssertionError(
@@ -68,11 +69,33 @@ def test_settings_tab_column_can_scroll() -> None:
         )
 
 
+def test_packaged_window_can_reach_every_supported_responsive_tier() -> None:
+    """Browser-only viewport proof is irrelevant if the packaged window forbids those widths."""
+    config = json.loads((REPO_ROOT / "src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+    windows = config.get("app", {}).get("windows", [])
+    if len(windows) != 1:
+        raise AssertionError("the desktop viewport policy requires one explicit primary window")
+    window = windows[0]
+    if window.get("resizable") is not True:
+        raise AssertionError("the primary workstation window must remain resizable")
+    if window.get("minWidth", float("inf")) > 320:
+        raise AssertionError(
+            "tauri.conf.json prevents the supported 320–499, 500–799 and 800–1199 responsive "
+            f"tiers from being reached in the packaged desktop (minWidth={window.get('minWidth')})"
+        )
+    if window.get("minHeight", float("inf")) > 480:
+        raise AssertionError(
+            "tauri.conf.json prevents the compact workstation from reaching its supported short-window "
+            f"state (minHeight={window.get('minHeight')})"
+        )
+
+
 def main() -> None:
     test_full_height_boxes_do_not_centre_their_overflow()
     test_the_empty_state_uses_the_scroll_safe_centring()
     test_settings_tab_column_can_scroll()
-    print("zoom layout policy passed (3 assertions)")
+    test_packaged_window_can_reach_every_supported_responsive_tier()
+    print("zoom layout policy passed (4 assertions)")
 
 
 if __name__ == "__main__":

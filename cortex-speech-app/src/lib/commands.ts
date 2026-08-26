@@ -1,12 +1,33 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invokeCritical, invokeLegacy } from './adapters/legacyIpc';
 import { commands as generatedCommands } from './generated/ipc';
+import { formatUnknownError } from './errorText';
 import type {
+  ActiveVoiceFocusV1,
   CommandErrorV1,
   CommitReviewRequestV1,
   CommittedReviewV1,
+  DesktopPlaybackReceiptV1,
+  DesktopPlaybackSessionV1,
+  MarkedSegmentUnusableV1,
+  MarkSegmentUnusableRequestV1,
+  PlaybackIntervalV1,
   ReviewDraftV1,
   ReviewPageV1,
   ReviewScope,
+  SettingsPatchResultV1,
+  SettingsPatchV1,
+  SettingsSnapshotV1,
+} from './generated/ipc';
+export type {
+  ActiveVoiceFocusV1,
+  DesktopPlaybackReceiptV1,
+  DesktopPlaybackSessionV1,
+  MarkedSegmentUnusableV1,
+  MarkSegmentUnusableRequestV1,
+  PlaybackIntervalV1,
+  ReviewDraftV1,
+  ReviewPageV1,
+  TechnicalUnusableReasonV1,
 } from './generated/ipc';
 import type {
   SpeechSegment,
@@ -23,11 +44,11 @@ import {
 } from './settingsAdapter';
 
 export async function openAudioFile(): Promise<string | null> {
-  return invoke<string | null>('open_audio_file');
+  return invokeCritical('open_audio_file');
 }
 
 export async function importDirectory(): Promise<{ status: string }> {
-  return invoke('import_directory');
+  return invokeCritical('import_directory');
 }
 
 /** P3.2: a directory import interrupted by a crash, offered for resume at startup. */
@@ -40,23 +61,23 @@ export interface ImportJob {
 }
 
 export async function getInterruptedImport(): Promise<ImportJob | null> {
-  return invoke<ImportJob | null>('get_interrupted_import');
+  return invokeCritical('get_interrupted_import');
 }
 
 export async function resumeInterruptedImport(): Promise<{ status: string; resuming: boolean }> {
-  return invoke('resume_interrupted_import');
+  return invokeCritical('resume_interrupted_import');
 }
 
 export async function discardInterruptedImport(jobId: string): Promise<void> {
-  return invoke('discard_interrupted_import', { jobId });
+  return invokeCritical('discard_interrupted_import', { jobId });
 }
 
 export async function importAudioFile(path: string): Promise<{ status: string; source?: string }> {
-  return invoke('import_audio_file', { path });
+  return invokeCritical('import_audio_file', { path });
 }
 
 export async function cancelOperation(): Promise<void> {
-  return invoke<void>('cancel_operation');
+  return invokeCritical('cancel_operation');
 }
 
 /**
@@ -71,7 +92,10 @@ export const ASR_7B_UNAVAILABLE_TAG = 'E_ASR_7B_UNAVAILABLE';
 /** True when a transcription error is the "7B champion unavailable/failed" signal above. */
 export function is7bUnavailableError(e: unknown): boolean {
   const msg = typeof e === 'string' ? e : ((e as { message?: unknown } | null)?.message ?? '');
-  return String(msg).includes(ASR_7B_UNAVAILABLE_TAG) || String(e).includes(ASR_7B_UNAVAILABLE_TAG);
+  return (
+    formatUnknownError(msg, '').includes(ASR_7B_UNAVAILABLE_TAG) ||
+    formatUnknownError(e, '').includes(ASR_7B_UNAVAILABLE_TAG)
+  );
 }
 
 export async function transcribeSegment(
@@ -86,7 +110,14 @@ export async function transcribeSegment(
   modelVersionId?: string | null;
   cloudCall?: boolean;
 }> {
-  return invoke('transcribe_segment', {
+  return invokeLegacy<{
+    text: string;
+    rawTranscript: string;
+    confidence?: number | null;
+    confidenceSource?: string | null;
+    modelVersionId?: string | null;
+    cloudCall?: boolean;
+  }>('transcribe_segment', {
     segmentId: segmentId ?? null,
     audioPath,
     alignmentJson: alignmentJson ?? null,
@@ -94,11 +125,11 @@ export async function transcribeSegment(
 }
 
 export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
-  return invoke('batch_transcribe', { ids });
+  return invokeLegacy<{ status: string }>('batch_transcribe', { ids });
 }
 
 export async function normalizeText(text: string): Promise<string> {
-  return invoke<string>('normalize_text', { text });
+  return invokeLegacy<string>('normalize_text', { text });
 }
 
 export async function alignSegment(
@@ -107,7 +138,7 @@ export async function alignSegment(
   alignmentJson?: string | null,
   segmentId?: string | null,
 ): Promise<WordTimestamp[]> {
-  return invoke<WordTimestamp[]>('align_segment', {
+  return invokeLegacy<WordTimestamp[]>('align_segment', {
     audioPath,
     text,
     alignmentJson: alignmentJson ?? null,
@@ -149,7 +180,7 @@ export function engineLabel(modelId: string): string {
 
 /** Offline best-of-N consensus draft for a segment (ability-weighted vote over its ASR hypotheses). */
 export async function getSegmentConsensus(segmentId: string): Promise<SegmentConsensus> {
-  return invoke<SegmentConsensus>('get_segment_consensus', { segmentId });
+  return invokeLegacy<SegmentConsensus>('get_segment_consensus', { segmentId });
 }
 
 export interface GetSegmentsPageOptions {
@@ -163,7 +194,7 @@ export interface GetSegmentsPageOptions {
 }
 
 export async function getSegment(segmentId: string): Promise<SpeechSegment> {
-  const data = await invoke<SpeechSegment>('get_segment', { segmentId });
+  const data = await invokeLegacy<SpeechSegment>('get_segment', { segmentId });
   if (!data || typeof data.id !== 'string') {
     throw new Error(`get_segment returned an invalid payload for ${segmentId}`);
   }
@@ -171,7 +202,7 @@ export async function getSegment(segmentId: string): Promise<SpeechSegment> {
 }
 
 export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Promise<SegmentsPage> {
-  const data = await invoke<SegmentsPage>('get_segments_page', {
+  const data = await invokeLegacy<SegmentsPage>('get_segments_page', {
     verified: options.verified ?? null,
     query: options.query ?? null,
     sort: options.sort ?? 'newest',
@@ -206,8 +237,10 @@ export function isCommandErrorV1(error: unknown, code?: string): error is Comman
   );
 }
 
-export function reviewErrorMessage(error: unknown, fallback: string): string {
-  return isCommandErrorV1(error) ? error.message : fallback;
+export function reviewErrorMessage(_error: unknown, fallback: string): string {
+  // Backend messages are useful in explicit diagnostics, but ordinary review surfaces are localized.
+  // Typed callers can separately retain the structured code, action and operation ID.
+  return fallback;
 }
 
 /** Revision-paired queue read generated from the Rust contract. */
@@ -221,6 +254,24 @@ export async function getReviewPageV1(
   return result.data;
 }
 
+/** Discover the opaque identity of the active file-owned focus without exposing its private label,
+ * segment ids or data-directory path. `null` means no focus policy is active. */
+export async function getActiveVoiceFocusV1(): Promise<ActiveVoiceFocusV1 | null> {
+  const result = await generatedCommands.getActiveVoiceFocusV1();
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Load only the exact focus generation previously returned by `getActiveVoiceFocusV1`. A changed,
+ * missing or malformed owner policy is rejected by the backend rather than silently widened. */
+export async function getVoiceFocusReviewPageV1(
+  focusId: string,
+  cursor: string | null = null,
+  limit = 100,
+): Promise<ReviewPageV1> {
+  return getReviewPageV1({ kind: 'voiceFocus', focusId }, cursor, limit);
+}
+
 /**
  * Commit an exact versioned review request. A transport-level lost response gets one replay with the
  * SAME operation id and payload; a structured backend refusal is never retried blindly.
@@ -228,6 +279,28 @@ export async function getReviewPageV1(
 export async function commitReviewV1(request: CommitReviewRequestV1): Promise<CommittedReviewV1> {
   const invokeExact = async (): Promise<CommittedReviewV1> => {
     const result = await generatedCommands.commitReviewV1(request);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+/**
+ * Persist one closed technical media disposition. This is intentionally separate from
+ * `commitReviewV1`: it records no transcript verdict and carries no playback receipt. A lost
+ * transport response gets one replay with the byte-identical operation id and payload; a typed
+ * backend refusal is definitive and is never retried blindly.
+ */
+export async function markSegmentUnusableV1(
+  request: MarkSegmentUnusableRequestV1,
+): Promise<MarkedSegmentUnusableV1> {
+  const invokeExact = async (): Promise<MarkedSegmentUnusableV1> => {
+    const result = await generatedCommands.markSegmentUnusableV1(request);
     if (result.status === 'error') throw result.error;
     return result.data;
   };
@@ -280,7 +353,7 @@ export async function getSegmentIdsForView(
     transcriptState?: 'any' | 'real' | 'missing';
   } = {},
 ): Promise<string[]> {
-  const data = await invoke<string[]>('get_segment_ids_for_view', {
+  const data = await invokeLegacy<string[]>('get_segment_ids_for_view', {
     verified: options.verified ?? null,
     query: options.query ?? null,
     transcriptState: options.transcriptState ?? 'any',
@@ -292,7 +365,7 @@ export async function getSegmentIdsForView(
 }
 
 export async function getSignalAnomalySegments(limit = 100): Promise<SpeechSegment[]> {
-  const data = await invoke<SpeechSegment[]>('get_signal_anomaly_segments', { limit });
+  const data = await invokeLegacy<SpeechSegment[]>('get_signal_anomaly_segments', { limit });
   if (!Array.isArray(data))
     throw new Error('get_signal_anomaly_segments returned an invalid payload');
   return data;
@@ -307,24 +380,24 @@ export async function updateSegmentFields(
   segmentId: string,
   fields: Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>,
 ): Promise<boolean> {
-  return invoke<boolean>('update_segment_fields', { segmentId, fields });
+  return invokeCritical('update_segment_fields', { segmentId, fields });
 }
 
 export async function deleteSegment(id: string): Promise<void> {
-  return invoke<void>('delete_segment', { id });
+  return invokeCritical('delete_segment', { id });
 }
 
 export async function deleteSegmentsBatch(ids: string[]): Promise<void> {
-  return invoke<void>('delete_segments_batch', { ids });
+  return invokeCritical('delete_segments_batch', { ids });
 }
 
 export async function exportDataset(path: string, format: string): Promise<void> {
-  return invoke<void>('export_dataset', { path, format });
+  return invokeCritical('export_dataset', { path, format });
 }
 
 /** Plain human transcript / subtitle export (format: 'txt' | 'srt' | 'vtt'). */
 export async function exportTranscript(path: string, format: 'txt' | 'srt' | 'vtt'): Promise<void> {
-  return invoke<void>('export_transcript', { path, format });
+  return invokeCritical('export_transcript', { path, format });
 }
 
 export interface EngineStatus {
@@ -340,7 +413,7 @@ export interface EngineStatus {
 
 /** Health of the champion (OmniASR-7B) warm server, for the engine-status pill. */
 export async function getChampionEngineStatus(): Promise<EngineStatus> {
-  return invoke<EngineStatus>('get_champion_engine_status');
+  return invokeLegacy<EngineStatus>('get_champion_engine_status');
 }
 
 /** A durable background job (P0 #3 Job Supervisor). Mirrors crate::jobs::Job (camelCase). */
@@ -356,12 +429,12 @@ export interface Job {
 
 /** Recent durable jobs (newest first) for the activity surface. Cheap read; safe to poll. */
 export async function getJobs(): Promise<Job[]> {
-  return invoke<Job[]>('get_jobs');
+  return invokeLegacy<Job[]>('get_jobs');
 }
 
 /** Start the champion 7B server (WSL) from the app; returns immediately, then poll status. */
 export async function startChampionEngine(): Promise<void> {
-  return invoke<void>('start_champion_engine');
+  return invokeLegacy<void>('start_champion_engine');
 }
 
 export interface AgentSourceReferenceSummary {
@@ -477,22 +550,62 @@ export interface MediaGrant {
 }
 
 export async function listAgentImportReports(limit = 25): Promise<AgentImportReport[]> {
-  return invoke<AgentImportReport[]>('list_agent_import_reports', { limit });
+  return invokeLegacy<AgentImportReport[]>('list_agent_import_reports', { limit });
 }
 
 export async function listAgentStageEvents(
   runId?: string | null,
   limit = 50,
 ): Promise<AgentStageEvent[]> {
-  return invoke<AgentStageEvent[]>('list_agent_stage_events', { runId: runId ?? null, limit });
+  return invokeLegacy<AgentStageEvent[]>('list_agent_stage_events', {
+    runId: runId ?? null,
+    limit,
+  });
 }
 
 export async function registerMediaAsset(audioPath: string): Promise<MediaGrant> {
-  return invoke<MediaGrant>('register_media_asset', { audioPath });
+  return invokeCritical('register_media_asset', { audioPath });
+}
+
+/** A decoded-PCM-verified immutable grant. Only review workstations request this stronger authority. */
+export async function registerReviewMediaAsset(audioPath: string): Promise<MediaGrant> {
+  return invokeCritical('register_review_media_asset', { audioPath });
 }
 
 export async function getMediaAssetUrl(id: string): Promise<string> {
-  return invoke<string>('get_media_asset_url', { id });
+  return invokeCritical('get_media_asset_url', { id });
+}
+
+export async function beginDesktopPlaybackSessionV1(
+  segmentId: string,
+  mediaGrantId: string,
+  expectedRevision: number,
+  clientAttemptId: string,
+): Promise<DesktopPlaybackSessionV1> {
+  const result = await generatedCommands.beginDesktopPlaybackSessionV1(
+    segmentId,
+    mediaGrantId,
+    expectedRevision,
+    clientAttemptId,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/**
+ * Retire one exact renderer playback attempt only while it has not produced an immutable receipt.
+ * Replaying a successful cancellation returns false; finalized authority is refused by the backend.
+ */
+export async function cancelDesktopPlaybackSessionV1(
+  playbackReceiptId: string,
+  clientAttemptId: string,
+): Promise<boolean> {
+  const result = await generatedCommands.cancelDesktopPlaybackSessionV1(
+    playbackReceiptId,
+    clientAttemptId,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -501,7 +614,7 @@ export async function getMediaAssetUrl(id: string): Promise<string> {
  * values — so it is safe to surface in the UI.
  */
 export async function getConfiguredProviders(): Promise<string[]> {
-  return invoke<string[]>('get_configured_providers');
+  return invokeCritical('get_configured_providers');
 }
 
 /**
@@ -510,7 +623,7 @@ export async function getConfiguredProviders(): Promise<string[]> {
  * provider NAMES is returned so the UI can refresh its set/unset badges.
  */
 export async function setApiKey(provider: 'gemini' | 'openrouter', key: string): Promise<string[]> {
-  return invoke<string[]>('set_api_key', { provider, key });
+  return invokeCritical('set_api_key', { provider, key });
 }
 
 /** One reviewer's private way in. Each named reviewer gets their own token, so two people never share
@@ -539,15 +652,15 @@ export interface CouchStatus {
 
 /** Start the server. An empty list starts a single-reviewer session under the default name. */
 export async function startCouchReview(reviewers: string[] = []): Promise<CouchStatus> {
-  return invoke<CouchStatus>('start_couch_review', { reviewers });
+  return invokeCritical('start_couch_review', { reviewers });
 }
 
 export async function stopCouchReview(): Promise<CouchStatus> {
-  return invoke<CouchStatus>('stop_couch_review');
+  return invokeCritical('stop_couch_review');
 }
 
 export async function couchReviewStatus(): Promise<CouchStatus> {
-  return invoke<CouchStatus>('couch_review_status');
+  return invokeCritical('couch_review_status');
 }
 
 /** How one remote reviewer scored on clips whose answer was already known. */
@@ -563,7 +676,7 @@ export interface SpotCheckScore {
 
 /** Worst `noticed` rate first — the reviewer who may not be listening comes top, not last. */
 export async function spotCheckReport(): Promise<SpotCheckScore[]> {
-  return invoke<SpotCheckScore[]>('spot_check_report');
+  return invokeCritical('spot_check_report');
 }
 
 /** One reviewer's measured throughput, from the append-only review trail. */
@@ -579,12 +692,12 @@ export interface ReviewerThroughput {
 
 /** Busiest reviewer first. Partitioned per reviewer, unlike the global stats.rs timing. */
 export async function reviewerThroughput(): Promise<ReviewerThroughput[]> {
-  return invoke<ReviewerThroughput[]>('reviewer_throughput');
+  return invokeCritical('reviewer_throughput');
 }
 
 /** Revoke ONE reviewer's link; everyone else's keeps working. */
 export async function revokeCouchReviewer(reviewer: string): Promise<CouchStatus> {
-  return invoke<CouchStatus>('revoke_couch_reviewer', { reviewer });
+  return invokeCritical('revoke_couch_reviewer', { reviewer });
 }
 
 /** A two-rater agreement sample, ready for `scripts/agreement_kappa.py`. */
@@ -601,7 +714,7 @@ export interface AgreementExport {
 
 /** Null when no clip has been answered by two different people yet. */
 export async function exportAgreementSample(): Promise<AgreementExport | null> {
-  return invoke<AgreementExport | null>('export_agreement_sample');
+  return invokeCritical('export_agreement_sample');
 }
 
 /** A row of the model-version registry (snake_case, as serialized by the backend). */
@@ -618,7 +731,7 @@ export interface ModelVersion {
 
 /** The registered model versions, newest-first within each family. */
 export async function listModelVersions(): Promise<ModelVersion[]> {
-  return invoke<ModelVersion[]>('list_model_versions');
+  return invokeLegacy<ModelVersion[]>('list_model_versions');
 }
 
 /**
@@ -632,7 +745,7 @@ export async function importModelCheckpoint(args: {
   license: string;
   modelCardName?: string | null;
 }): Promise<string> {
-  return invoke<string>('import_model_checkpoint', {
+  return invokeCritical('import_model_checkpoint', {
     id: args.id,
     checkpointPath: args.checkpointPath,
     source: args.source,
@@ -652,7 +765,7 @@ export async function importModelDeployment(args: {
   source: string;
   license: string;
 }): Promise<ModelVersion> {
-  return invoke<ModelVersion>('import_model_deployment', {
+  return invokeCritical('import_model_deployment', {
     manifestPath: args.manifestPath,
     expectedDeploymentSha256: args.expectedDeploymentSha256,
     expectedModelId: args.expectedModelId,
@@ -672,7 +785,7 @@ export async function bootstrapLegacyChampion(args: {
   expectedModelId: string;
   license: string;
 }): Promise<ModelVersion> {
-  return invoke<ModelVersion>('bootstrap_legacy_champion', {
+  return invokeCritical('bootstrap_legacy_champion', {
     manifestPath: args.manifestPath,
     expectedDeploymentSha256: args.expectedDeploymentSha256,
     expectedModelId: args.expectedModelId,
@@ -694,7 +807,7 @@ export interface SessionState {
 
 /** Restore the last session's view-state, or null if there is no recent session. */
 export async function restoreSession(): Promise<SessionState | null> {
-  return invoke<SessionState | null>('restore_session');
+  return invokeCritical('restore_session');
 }
 
 /** Persist the current search query + sort order so they survive a restart. */
@@ -703,12 +816,12 @@ export async function saveSession(
   sortOrder: string,
   filterVerified: boolean | null = null,
 ): Promise<void> {
-  return invoke('save_session', { searchQuery, sortOrder, filterVerified });
+  return invokeCritical('save_session', { searchQuery, sortOrder, filterVerified });
 }
 
 /** Number of audio fingerprints stored for duplicate-import detection. */
 export async function getFingerprintCount(): Promise<number> {
-  return invoke<number>('get_fingerprint_count');
+  return invokeCritical('get_fingerprint_count');
 }
 
 /** Aggregate telemetry stats (snake_case, as serialized by the backend Tracer). */
@@ -730,15 +843,15 @@ export interface TracingSpan {
 }
 
 export async function getTracingStats(): Promise<TracingStats> {
-  return invoke<TracingStats>('get_tracing_stats');
+  return invokeLegacy<TracingStats>('get_tracing_stats');
 }
 
 export async function getRecentSpans(count?: number): Promise<TracingSpan[]> {
-  return invoke<TracingSpan[]>('get_recent_spans', { count: count ?? null });
+  return invokeLegacy<TracingSpan[]>('get_recent_spans', { count: count ?? null });
 }
 
 export async function clearTracingSpans(): Promise<void> {
-  return invoke('clear_tracing_spans');
+  return invokeLegacy<void>('clear_tracing_spans');
 }
 
 export async function getWaveform(
@@ -746,7 +859,7 @@ export async function getWaveform(
   numPoints: number,
   alignmentJson?: string | null,
 ): Promise<number[]> {
-  return invoke<number[]>('get_waveform', {
+  return invokeLegacy<number[]>('get_waveform', {
     path,
     numPoints,
     alignmentJson: alignmentJson ?? null,
@@ -754,7 +867,7 @@ export async function getWaveform(
 }
 
 export async function getDatasetStats(): Promise<DatasetStats> {
-  return invoke<DatasetStats>('get_dataset_stats');
+  return invokeLegacy<DatasetStats>('get_dataset_stats');
 }
 
 /** P3.3: which distinct source audio files are missing on disk. */
@@ -771,12 +884,12 @@ export interface RelinkResult {
 }
 
 export async function getAudioHealth(): Promise<AudioHealth> {
-  return invoke<AudioHealth>('get_audio_health');
+  return invokeCritical('get_audio_health');
 }
 
 /** P3.3: relink missing source audio by basename against a folder the owner picks. */
 export async function relinkAudio(searchDir: string): Promise<RelinkResult> {
-  return invoke<RelinkResult>('relink_audio', { searchDir });
+  return invokeCritical('relink_audio', { searchDir });
 }
 
 /** Intelligence read-side: LOOP-0 shadow precision (C5 go-live evidence) + auto-accept precision (C4). */
@@ -808,7 +921,7 @@ export interface IntelligenceReport {
 }
 
 export async function getIntelligenceReport(): Promise<IntelligenceReport> {
-  return invoke<IntelligenceReport>('get_intelligence_report');
+  return invokeLegacy<IntelligenceReport>('get_intelligence_report');
 }
 
 /** B2: a past corruption quarantine, if any, plus how many restore snapshots exist. */
@@ -819,7 +932,7 @@ export interface QuarantineNotice {
 }
 
 export async function getQuarantineNotice(): Promise<QuarantineNotice> {
-  return invoke<QuarantineNotice>('get_quarantine_notice');
+  return invokeCritical('get_quarantine_notice');
 }
 
 /** B2: one rotating auto-snapshot in the restore picker (newest first). */
@@ -831,17 +944,17 @@ export interface SnapshotInfo {
 }
 
 export async function listDbSnapshots(): Promise<SnapshotInfo[]> {
-  return invoke<SnapshotInfo[]>('list_db_snapshots');
+  return invokeCritical('list_db_snapshots');
 }
 
 /** B2: restore the live database from a named auto-snapshot (destructive — confirm first). */
 export async function restoreDbFromSnapshot(name: string): Promise<void> {
-  return invoke<void>('restore_db_from_snapshot', { name });
+  return invokeCritical('restore_db_from_snapshot', { name });
 }
 
 /** Complete speaker list (not the truncated top-10 dashboard summary) for the speaker manager. */
 export async function getSpeakers(): Promise<SpeakerStat[]> {
-  return invoke<SpeakerStat[]>('get_speakers');
+  return invokeLegacy<SpeakerStat[]>('get_speakers');
 }
 
 export interface DatasetQuality {
@@ -879,7 +992,7 @@ export interface DatasetQuality {
 }
 
 export async function getDatasetQuality(): Promise<DatasetQuality> {
-  return invoke<DatasetQuality>('get_dataset_quality');
+  return invokeLegacy<DatasetQuality>('get_dataset_quality');
 }
 
 /**
@@ -904,7 +1017,7 @@ export interface TrainingGradeBreakdown {
 }
 
 export async function getTrainingGradeBreakdown(): Promise<TrainingGradeBreakdown> {
-  const data = await invoke<TrainingGradeBreakdown>('get_training_grade_breakdown');
+  const data = await invokeLegacy<TrainingGradeBreakdown>('get_training_grade_breakdown');
   // THROW on a malformed payload, exactly like the library reads above. A caller that receives `{}`
   // and reads `.summary.trainingReadySegments` dies with a TypeError instead of showing "readiness
   // unknown" — which is what happened: the dev IPC mock has no case for this command, so it fell
@@ -924,18 +1037,204 @@ export async function getTrainingGradeBreakdown(): Promise<TrainingGradeBreakdow
   return data;
 }
 
-export async function getSettings(): Promise<AppSettings> {
-  const raw = await invoke<BackendSettings>('get_settings');
-  return mapBackendToFrontend(raw);
+interface CachedSettingsSnapshot {
+  revision: number;
+  backend: BackendSettings;
 }
 
+let cachedSettingsSnapshot: CachedSettingsSnapshot | null = null;
+
+const FRONTEND_PATCH_FIELDS = [
+  'vad_threshold',
+  'min_segment_duration_ms',
+  'max_segment_duration_ms',
+  'num_asr_threads',
+  'enable_gpu',
+  'language',
+  'export_format',
+  'auto_normalize',
+  'verbalize_numbers',
+  'auto_align',
+  'assign_speaker_from_filename',
+  'enable_diarization',
+  'enable_denoising',
+  'autoplay_segments',
+  'max_speakers',
+  'max_wer_threshold',
+  'max_cer_threshold',
+  'enforce_quality_gates',
+  'theme',
+  'llm_mode',
+  'llm_endpoint',
+  'llm_system_prompt',
+  'llm_model',
+  'external_asr_script_path',
+  'hf_train_ratio',
+  'hf_val_ratio',
+  'hf_test_ratio',
+  'hf_split_seed',
+  'hf_speaker_disjoint',
+  'hf_license',
+  'jury_model',
+  'jury_provider',
+  'jury_self_consistency_n',
+  'jury_autonomy_level',
+  'jury_t1_threshold',
+] as const satisfies readonly (keyof BackendSettings)[];
+
+function checkedSettingsSnapshot(snapshot: SettingsSnapshotV1): CachedSettingsSnapshot {
+  if (!Number.isSafeInteger(snapshot.settingsRevision) || snapshot.settingsRevision < 0) {
+    throw new Error('The generated settings contract returned an invalid revision token.');
+  }
+  return {
+    revision: snapshot.settingsRevision,
+    backend: { ...snapshot.settings },
+  };
+}
+
+async function loadSettingsSnapshotV1(): Promise<CachedSettingsSnapshot> {
+  const result = await generatedCommands.getSettingsV1();
+  if (result.status === 'error') throw result.error;
+  const snapshot = checkedSettingsSnapshot(result.data);
+  cachedSettingsSnapshot = snapshot;
+  return snapshot;
+}
+
+function cacheSettingsResult(result: SettingsPatchResultV1): CachedSettingsSnapshot {
+  const snapshot = checkedSettingsSnapshot({
+    settingsRevision: result.settingsRevision,
+    settings: result.settings,
+  });
+  cachedSettingsSnapshot = snapshot;
+  return snapshot;
+}
+
+function changedSettingsFields(
+  current: BackendSettings,
+  desired: BackendSettings,
+): SettingsPatchV1['changedFields'] {
+  const currentRecord = current as unknown as Record<string, unknown>;
+  const desiredRecord = desired as unknown as Record<string, unknown>;
+  const changed: SettingsPatchV1['changedFields'] = {};
+  for (const field of FRONTEND_PATCH_FIELDS) {
+    const value = desiredRecord[field];
+    if (Object.is(value, currentRecord[field])) continue;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      changed[field] = value;
+    }
+  }
+  return changed;
+}
+
+async function patchSettingsExact(patch: SettingsPatchV1): Promise<SettingsPatchResultV1> {
+  const invokeExact = async (): Promise<SettingsPatchResultV1> => {
+    const result = await generatedCommands.patchSettingsV1(patch);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    // `Error` means the invoke transport did not establish whether the backend committed. Replay the
+    // exact CAS payload once; the backend returns alreadyApplied only when the whole requested effect
+    // is already authoritative. Structured backend refusals are definitive and never retried.
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+async function setCloudConsentExact(
+  expectedSettingsRevision: number,
+  consent: 'llm' | 'jury',
+  granted: boolean,
+): Promise<SettingsPatchResultV1> {
+  const request = { expectedSettingsRevision, consent, granted } as const;
+  const invokeExact = async (): Promise<SettingsPatchResultV1> => {
+    const result = await generatedCommands.setCloudConsentV1(request);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+/** A settings write failed after the renderer had optimistic state. When available, the attached
+ * snapshot is a fresh server read and is the only safe rollback target after partial/stale writes. */
+export class SettingsWriteError extends Error {
+  readonly authoritativeSettings: AppSettings | null;
+  readonly backendError: unknown;
+
+  constructor(backendError: unknown, authoritativeSettings: AppSettings | null) {
+    super('The settings change could not be confirmed.');
+    this.name = 'SettingsWriteError';
+    this.backendError = backendError;
+    this.authoritativeSettings = authoritativeSettings;
+  }
+}
+
+export function authoritativeSettingsFromWriteError(error: unknown): AppSettings | null {
+  return error instanceof SettingsWriteError ? error.authoritativeSettings : null;
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  const snapshot = await loadSettingsSnapshotV1();
+  return mapBackendToFrontend(snapshot.backend);
+}
+
+/** Persist changed settings through generated revision-guarded contracts. Secrets remain on
+ * `setApiKey`; cloud grants/withdrawals are explicit consent transactions and never enter the
+ * generic changed-field patch. The legacy whole-object command is compatibility-only. */
 export async function updateSettings(
   settings: AppSettings,
   existingBackend?: BackendSettings,
 ): Promise<void> {
-  const existing = existingBackend ?? (await invoke<BackendSettings>('get_settings'));
-  const backend = mapFrontendToBackend(settings, existing);
-  return invoke<void>('update_settings', { settings: backend });
+  let active = cachedSettingsSnapshot ?? (await loadSettingsSnapshotV1());
+  const desired = mapFrontendToBackend(settings, existingBackend ?? active.backend);
+
+  try {
+    // Withdrawals are stop instructions and therefore happen before ordinary preferences. Grants
+    // happen last so a preference-save failure can never accidentally enable cloud work.
+    for (const [consent, field] of [
+      ['llm', 'cloud_llm_opt_in'],
+      ['jury', 'jury_cloud_opt_in'],
+    ] as const) {
+      if (active.backend[field] && !desired[field]) {
+        active = cacheSettingsResult(await setCloudConsentExact(active.revision, consent, false));
+      }
+    }
+
+    const changedFields = changedSettingsFields(active.backend, desired);
+    if (Object.keys(changedFields).length > 0) {
+      active = cacheSettingsResult(
+        await patchSettingsExact({
+          expectedSettingsRevision: active.revision,
+          changedFields,
+        }),
+      );
+    }
+
+    for (const [consent, field] of [
+      ['llm', 'cloud_llm_opt_in'],
+      ['jury', 'jury_cloud_opt_in'],
+    ] as const) {
+      if (!active.backend[field] && desired[field]) {
+        active = cacheSettingsResult(await setCloudConsentExact(active.revision, consent, true));
+      }
+    }
+  } catch (error) {
+    let authoritative: AppSettings | null = null;
+    try {
+      authoritative = mapBackendToFrontend((await loadSettingsSnapshotV1()).backend);
+    } catch {
+      // Keep the original mutation failure authoritative. A failed recovery read means the UI must
+      // retain its previous confirmed state; it must never invent server truth.
+    }
+    throw new SettingsWriteError(error, authoritative);
+  }
 }
 
 export const ValidationSeverity = {
@@ -976,7 +1275,7 @@ export interface ValidationReport {
 }
 
 export async function validateDataset(): Promise<ValidationReport> {
-  return invoke<ValidationReport>('validate_dataset_cmd');
+  return invokeCritical('validate_dataset_cmd');
 }
 
 export const AudioExportFormat = {
@@ -1001,52 +1300,52 @@ export async function exportAudio(
   files: string[];
   errors: string[];
 }> {
-  return invoke('export_audio', { segmentIds, options });
+  return invokeCritical('export_audio', { segmentIds, options });
 }
 
 export async function batchAssignSpeaker(
   ids: string[],
   speakerId: string,
 ): Promise<{ status: string }> {
-  return invoke('batch_assign_speaker', { ids, speakerId });
+  return invokeLegacy<{ status: string }>('batch_assign_speaker', { ids, speakerId });
 }
 
 export async function batchNormalize(ids: string[]): Promise<{ status: string }> {
-  return invoke('batch_normalize', { ids });
+  return invokeLegacy<{ status: string }>('batch_normalize', { ids });
 }
 
 export async function rediarizeSegments(ids: string[]): Promise<number> {
-  return invoke<number>('rediarize_segments', { ids });
+  return invokeLegacy<number>('rediarize_segments', { ids });
 }
 
 export async function renameSpeaker(oldId: string, newId: string): Promise<number> {
-  return invoke<number>('rename_speaker', { oldId, newId });
+  return invokeLegacy<number>('rename_speaker', { oldId, newId });
 }
 
 export async function mergeDatasetJson(
   jsonContent: string,
 ): Promise<{ created: number; updated: number }> {
-  return invoke<{ created: number; updated: number }>('merge_dataset_json', { jsonContent });
+  return invokeCritical('merge_dataset_json', { jsonContent });
 }
 
 export async function exportHuggingfaceDataset(outputDir: string): Promise<void> {
-  return invoke<void>('export_huggingface_dataset', { path: outputDir });
+  return invokeCritical('export_huggingface_dataset', { path: outputDir });
 }
 
 export async function undo(): Promise<string | null> {
-  return invoke<string | null>('undo');
+  return invokeCritical('undo');
 }
 
 export async function redo(): Promise<string | null> {
-  return invoke<string | null>('redo');
+  return invokeCritical('redo');
 }
 
 export async function canUndo(): Promise<boolean> {
-  return invoke<boolean>('can_undo');
+  return invokeCritical('can_undo');
 }
 
 export async function canRedo(): Promise<boolean> {
-  return invoke<boolean>('can_redo');
+  return invokeCritical('can_redo');
 }
 
 export async function computeDiff(
@@ -1064,7 +1363,18 @@ export async function computeDiff(
     similarity: number;
   };
 }> {
-  return invoke('compute_diff', { raw, annotated });
+  return invokeLegacy<{
+    raw: string;
+    annotated: string;
+    changes: Array<{ op: string; value: string }>;
+    stats: {
+      added_words: number;
+      removed_words: number;
+      changed_words: number;
+      unchanged_words: number;
+      similarity: number;
+    };
+  }>('compute_diff', { raw, annotated });
 }
 
 /** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then
@@ -1073,55 +1383,59 @@ export async function computeDiff(
 export async function dbBackup(
   dest: string,
 ): Promise<{ integrityOk: boolean; segmentCount: number }> {
-  return invoke('db_backup', { dest });
+  return invokeCritical('db_backup', { dest });
 }
 
 /** Archive every quarantined `*.corrupt.*` artifact into `<data_dir>/quarantine/`, releasing the
  * snapshot prune-pin explicitly (bytes stay salvageable). Returns how many files were archived. */
 export async function acknowledgeQuarantine(): Promise<number> {
-  return invoke('acknowledge_quarantine');
+  return invokeCritical('acknowledge_quarantine');
 }
 
 /** Restore the live library from a backup .db file (the counterpart to dbBackup). Destructive — the
  *  backend PRAGMA integrity_check's the source before overwriting, so a corrupt file fails fast. */
 export async function dbRestore(src: string): Promise<void> {
-  return invoke('db_restore', { src });
+  return invokeCritical('db_restore', { src });
 }
 
 export async function dbVacuum(): Promise<void> {
-  return invoke('db_vacuum');
+  return invokeCritical('db_vacuum');
 }
 
-export async function modelsStatus(): Promise<
-  Array<{
-    name: string;
-    filename: string;
-    downloaded: boolean;
-    exists?: boolean;
-    size_bytes: number | null;
-    min_size_bytes: number;
-    source?: 'user' | 'bundled' | 'missing';
-    downloadable?: boolean;
-  }>
-> {
-  return invoke('models_status');
+export interface ModelStatusEntry {
+  name: string;
+  filename: string;
+  downloaded: boolean;
+  exists?: boolean;
+  size_bytes: number | null;
+  min_size_bytes: number;
+  source?: 'user' | 'bundled' | 'missing';
+  downloadable?: boolean;
 }
 
-export async function modelsDownloadAll(): Promise<{
+export async function modelsStatus(): Promise<ModelStatusEntry[]> {
+  return invokeLegacy<ModelStatusEntry[]>('models_status');
+}
+
+export interface ModelDownloadSummary {
   downloaded: number;
   failed: number;
   total: number;
   skipped: number;
-}> {
-  return invoke('models_download_all');
 }
 
-export async function getInferenceStats(): Promise<{
+export async function modelsDownloadAll(): Promise<ModelDownloadSummary> {
+  return invokeLegacy<ModelDownloadSummary>('models_download_all');
+}
+
+export interface InferenceStats {
   vad: { calls: number; failures: number; p50_ms: number; p99_ms: number };
   asr: { calls: number; failures: number; p50_ms: number; p99_ms: number };
   model_load_ms: number;
-}> {
-  return invoke('get_inference_stats');
+}
+
+export async function getInferenceStats(): Promise<InferenceStats> {
+  return invokeLegacy<InferenceStats>('get_inference_stats');
 }
 
 export interface AppHealth {
@@ -1141,12 +1455,12 @@ export interface AppHealth {
 }
 
 export async function appHealth(): Promise<AppHealth> {
-  return invoke('app_health');
+  return invokeLegacy<AppHealth>('app_health');
 }
 
 /** One-line summary of the previous session's crash (surfaced once), or null if it exited cleanly. */
 export async function takeLastCrash(): Promise<string | null> {
-  return invoke('take_last_crash');
+  return invokeLegacy<string | null>('take_last_crash');
 }
 
 export interface AgenticReadinessCheck {
@@ -1166,7 +1480,7 @@ export interface AgenticReadiness {
 }
 
 export async function checkAgenticReadiness(): Promise<AgenticReadiness> {
-  return invoke<AgenticReadiness>('check_agentic_readiness');
+  return invokeLegacy<AgenticReadiness>('check_agentic_readiness');
 }
 
 export interface WslRefinementOptions {
@@ -1177,7 +1491,7 @@ export interface WslRefinementOptions {
 }
 
 export async function runWslRefinement(options: WslRefinementOptions): Promise<{ status: string }> {
-  return invoke('run_wsl_refinement', {
+  return invokeLegacy<{ status: string }>('run_wsl_refinement', {
     limitFiles: options.limit_files ?? null,
     limitSegments: options.limit_segments ?? null,
     dryRun: options.dry_run,
@@ -1186,7 +1500,7 @@ export async function runWslRefinement(options: WslRefinementOptions): Promise<{
 }
 
 export async function cancelWslRefinement(): Promise<void> {
-  return invoke('cancel_wsl_refinement');
+  return invokeLegacy<void>('cancel_wsl_refinement');
 }
 
 export interface ConformalCertificate {
@@ -1212,11 +1526,14 @@ export async function getDatasetCertificate(
   targetError: number,
   confidenceLevel: number,
 ): Promise<ConformalCertificate> {
-  return invoke<ConformalCertificate>('get_dataset_certificate', { targetError, confidenceLevel });
+  return invokeLegacy<ConformalCertificate>('get_dataset_certificate', {
+    targetError,
+    confidenceLevel,
+  });
 }
 
 export async function computeSignalAnomalyScores(): Promise<number> {
-  return invoke<number>('compute_signal_anomaly_scores');
+  return invokeLegacy<number>('compute_signal_anomaly_scores');
 }
 
 export async function getActiveLearningQueue(
@@ -1224,7 +1541,7 @@ export async function getActiveLearningQueue(
   confidenceLevel: number,
   limit: number,
 ): Promise<SpeechSegment[]> {
-  return invoke<SpeechSegment[]>('get_active_learning_queue', {
+  return invokeLegacy<SpeechSegment[]>('get_active_learning_queue', {
     targetError,
     confidenceLevel,
     limit,
@@ -1237,12 +1554,12 @@ import type { EvalRun, EvalRunResult, EscalationTrendPoint, LabelQualityLift } f
 
 /** Run the real pinned champion over the gold set; the renderer cannot supply a model label. */
 export async function runGoldEvalAsr(): Promise<EvalRunResult> {
-  return invoke<EvalRunResult>('run_gold_eval_asr');
+  return invokeLegacy<EvalRunResult>('run_gold_eval_asr');
 }
 
 /** Create gold-eval segments from a verified file. Returns the number created. */
 export async function createGoldFromFile(audioPath: string): Promise<number> {
-  return invoke<number>('create_gold_from_file', { audioPath });
+  return invokeCritical('create_gold_from_file', { audioPath });
 }
 
 /** M2.7 / P1.6: summary of an export_gold_eval_set run. */
@@ -1255,12 +1572,12 @@ export interface GoldEvalExport {
 
 /** M2.7 / P1.6: bulk-promote every reviewed source file into the gold set; returns rows created. */
 export async function importVerifiedSegmentsAsGold(): Promise<number> {
-  return invoke<number>('import_verified_segments_as_gold');
+  return invokeCritical('import_verified_segments_as_gold');
 }
 
 /** M2.7 / P1.6: export the gold set (manifest.jsonl + 16 kHz WAV clips) under outDir. */
 export async function exportGoldEvalSet(outDir: string): Promise<GoldEvalExport> {
-  return invoke<GoldEvalExport>('export_gold_eval_set', { outDir });
+  return invokeCritical('export_gold_eval_set', { outDir });
 }
 
 /** M5.1 / P5.1: summary of an export_finetune_pack run. */
@@ -1278,12 +1595,12 @@ export interface FinetunePackResult {
 
 /** M5.1 / P5.1: export a fine-tune training pack from verified segments (holdout-excluded) under outDir. */
 export async function exportFinetunePack(outDir: string): Promise<FinetunePackResult> {
-  return invoke<FinetunePackResult>('export_finetune_pack', { outDir });
+  return invokeCritical('export_finetune_pack', { outDir });
 }
 
 /** P0.2: the git SHA the running binary was built from (baked at build time). Used for build-info display. */
 export async function appGitSha(): Promise<string> {
-  return invoke<string>('app_git_sha');
+  return invokeLegacy<string>('app_git_sha');
 }
 
 /** A reproducible scorecard built from already-computed gold-eval results. */
@@ -1297,47 +1614,49 @@ export async function buildScorecard(
   system: EvalRunResult,
   baseline?: EvalRunResult | null,
 ): Promise<ScorecardResponse> {
-  return invoke<ScorecardResponse>('build_scorecard', { system, baseline: baseline ?? null });
+  return invokeLegacy<ScorecardResponse>('build_scorecard', { system, baseline: baseline ?? null });
 }
 
 export async function listEvalRuns(): Promise<EvalRun[]> {
-  return invoke<EvalRun[]>('list_eval_runs');
+  return invokeLegacy<EvalRun[]>('list_eval_runs');
 }
 
 export async function getLabelQualityLift(): Promise<LabelQualityLift> {
-  return invoke<LabelQualityLift>('get_label_quality_lift');
+  return invokeLegacy<LabelQualityLift>('get_label_quality_lift');
 }
 
 // ── Phase 2 — T0 Gate + Jury ───────────────────────────────────────────────
 
 export async function getEscalationQueue(limit: number): Promise<SpeechSegment[]> {
-  return invoke<SpeechSegment[]>('get_escalation_queue', { limit });
+  return invokeLegacy<SpeechSegment[]>('get_escalation_queue', { limit });
 }
 
-/** Cumulative MEDIA time a reviewer actually advanced through one clip, at one revision.
+/** Cumulative canonical MEDIA time the authorized renderer reported traversing for one clip revision.
  *
- * Not wall-clock, not a `play()` call, not a download — those prove the file arrived, never that
- * anyone heard it. The backend binds the receipt to the segment, the revision AND the audio
- * fingerprint, so it cannot be replayed against a different clip or survive the audio changing.
+ * Not wall-clock, not a `play()` call, not a download, and not proof of human attention or
+ * comprehension. The backend binds the receipt to the segment, revision, exact source span, and
+ * decoded-PCM content hash, so it cannot be replayed against a different clip or survive the audio
+ * changing.
  */
 export async function recordPlaybackReceipt(args: {
-  segmentId: string;
-  playedMs: number;
-  clipDurationMs: number;
-  reviewer?: string | null;
-  sessionId?: string | null;
-  startedAtMs?: number;
-}): Promise<void> {
-  // Revision and audio fingerprint are resolved by the BACKEND from the row itself; a client that
-  // could name them could mint a receipt for a clip it never heard.
-  return invoke<void>('record_playback_receipt', {
-    segmentId: args.segmentId,
-    playedMs: Math.max(0, Math.round(args.playedMs)),
-    clipDurationMs: Math.max(0, Math.round(args.clipDurationMs)),
-    reviewer: args.reviewer ?? null,
-    sessionId: args.sessionId ?? null,
-    startedAtMs: args.startedAtMs ?? Date.now(),
-  });
+  playbackReceiptId: string;
+  mediaGrantId: string;
+  intervals: readonly PlaybackIntervalV1[];
+}): Promise<DesktopPlaybackReceiptV1> {
+  // Policy 4 accepts no scalar duration claim. The backend checks this exact canonical interval
+  // union against its short-lived media-grant session and server elapsed time, stores every interval,
+  // and returns the immutable receipt identity consumed by commitReviewV1.
+  const intervals = args.intervals.map((interval) => ({
+    startMs: Math.max(0, Math.round(interval.startMs)),
+    endMs: Math.max(0, Math.round(interval.endMs)),
+  }));
+  const result = await generatedCommands.finalizeDesktopPlaybackSessionV1(
+    args.playbackReceiptId,
+    args.mediaGrantId,
+    intervals,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export interface HumanDecisionCommit {
@@ -1355,27 +1674,19 @@ export type HumanDecisionUndoOutcome =
   | { status: 'conflict'; segment: SpeechSegment };
 
 export async function recordHumanDecision(
-  segmentId: string,
-  decision: 'accept' | 'edit' | 'reject',
-  correctedTranscript?: string | null,
-  timestampMs: number = Date.now(),
+  _segmentId: string,
+  _decision: 'accept' | 'edit' | 'reject',
+  _correctedTranscript?: string | null,
+  _timestampMs: number = Date.now(),
 ): Promise<HumanDecisionCommit> {
-  // Freeze one client-authored identity and one payload across the bounded replay. If the backend
-  // committed but the WebView lost the response, the retry resolves that exact effect instead of
-  // creating a second decision. A changed payload under the same UUID is rejected server-side.
-  const operationId = crypto.randomUUID();
-  const args = {
-    segmentId,
-    decision,
-    correctedTranscript: correctedTranscript ?? null,
-    timestampMs,
-    operationId,
-  };
-  try {
-    return await invoke<HumanDecisionCommit>('record_human_decision', args);
-  } catch {
-    return invoke<HumanDecisionCommit>('record_human_decision', args);
-  }
+  throw {
+    schema: 1,
+    code: 'TYPED_REVIEW_REQUIRED',
+    message: 'This legacy review writer is retired. Reload the review workstation and try again.',
+    retryable: false,
+    suggestedAction: 'reloadClip',
+    operationId: null,
+  } satisfies CommandErrorV1;
 }
 
 /** Exact server-owned inverse of one committed human decision. */
@@ -1383,7 +1694,7 @@ export async function undoHumanDecision(
   effectEventId: number,
   operationId: string,
 ): Promise<HumanDecisionUndoOutcome> {
-  return invoke<HumanDecisionUndoOutcome>('undo_human_decision', { effectEventId, operationId });
+  return invokeCritical('undo_human_decision', { effectEventId, operationId });
 }
 
 export interface HumanFlagCommit {
@@ -1407,9 +1718,9 @@ export async function recordReviewFlag(
   const operationId = crypto.randomUUID();
   const args = { segmentId, rationale, operationId };
   try {
-    return await invoke<HumanFlagCommit>('record_review_flag', args);
+    return await invokeCritical('record_review_flag', args);
   } catch {
-    return invoke<HumanFlagCommit>('record_review_flag', args);
+    return invokeCritical('record_review_flag', args);
   }
 }
 
@@ -1418,11 +1729,11 @@ export async function undoReviewFlag(
   effectEventId: number,
   operationId: string,
 ): Promise<HumanFlagUndoOutcome> {
-  return invoke<HumanFlagUndoOutcome>('undo_review_flag', { effectEventId, operationId });
+  return invokeCritical('undo_review_flag', { effectEventId, operationId });
 }
 
 export async function getEscalationRateTrend(): Promise<EscalationTrendPoint[]> {
-  return invoke<EscalationTrendPoint[]>('get_escalation_rate_trend');
+  return invokeLegacy<EscalationTrendPoint[]>('get_escalation_rate_trend');
 }
 
 // ── Jury Pipeline (Items 1 & 2) ───────────────────────────────────────────────
@@ -1438,7 +1749,7 @@ export interface JuryPipelineReport {
 
 /** Run the full T0→T1→T2 cascade on a batch of segment IDs. */
 export async function runJuryPipeline(segmentIds: string[]): Promise<JuryPipelineReport> {
-  return invoke<JuryPipelineReport>('run_jury_pipeline', { segmentIds });
+  return invokeLegacy<JuryPipelineReport>('run_jury_pipeline', { segmentIds });
 }
 
 export interface T2Verdict {
@@ -1458,5 +1769,5 @@ export interface T2Result {
 
 /** Run Gemini audio T2 judge directly on a single segment. */
 export async function runT2ForSegment(segmentId: string, apiKey: string): Promise<T2Result> {
-  return invoke<T2Result>('run_t2_for_segment', { segmentId, apiKey });
+  return invokeLegacy<T2Result>('run_t2_for_segment', { segmentId, apiKey });
 }

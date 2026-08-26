@@ -298,9 +298,12 @@ def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
         # flag is passed to it.)
         "run_wsl_segment_transcript_with_script(",
         "Some(&WSL_REFINE_CANCEL)",
-        # Transcript + sole champion hypothesis share the human-decision-safe atomic commit, so the
-        # batch can neither clobber reviewed text nor leave provenance half-written.
-        "db.commit_champion_transcript_if_unreviewed(",
+        # Transcript + sole champion hypothesis share the human-decision-safe, source-bound atomic
+        # commit, so the batch can neither clobber reviewed text, publish against replaced audio,
+        # nor leave provenance half-written.
+        "db.commit_bound_champion_transcript_if_unreviewed(",
+        "&source_snapshot",
+        "verify_current_source_lease(",
         'Some("external_provider")',
         "crate::pipeline::CHAMPION_MODEL_ID.to_string()",
     ]
@@ -856,6 +859,7 @@ def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> Non
 
 def test_media_cache_cleanup_reports_failures() -> None:
     media = (REPO_ROOT / "src-tauri/src/media.rs").read_text(encoding="utf-8")
+    infra = (REPO_ROOT / "src-tauri/src/commands/infra.rs").read_text(encoding="utf-8")
     forbidden = [
         "let _ = std::fs::remove_file(record.cached_path);",
     ]
@@ -866,8 +870,9 @@ def test_media_cache_cleanup_reports_failures() -> None:
 
     required = [
         "fn remove_cached_media_file(path: &Path, context: &str)",
-        'remove_cached_media_file(&record.cached_path, "stale grant");',
-        'remove_cached_media_file(&record.cached_path, "expired grant");',
+        "pub(crate) fn cleanup_retired_media_artifacts(",
+        "self.retired_artifacts.push(RetiredMediaArtifact::from_grant(record));",
+        "remove_cached_media_file(&cached_path, context);",
         "Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}",
         'tracing::warn!("Failed to remove {context} cached media file {}: {error}", path.display()),',
     ]
@@ -875,6 +880,10 @@ def test_media_cache_cleanup_reports_failures() -> None:
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"media.rs must keep observable cached media cleanup handling:\n{formatted}")
+    if 'cleanup_retired_media_artifacts(retired, "expired media grant")' not in infra:
+        raise AssertionError(
+            "media resolution must drain expired artifacts after releasing the registry mutex"
+        )
 
 
 def test_jury_db_and_export_paths_do_not_silently_drop_errors() -> None:
@@ -1402,14 +1411,22 @@ def test_t0_calibration_excludes_human_rejected_from_the_conformal_set() -> None
     must too. This is the 7th instance of the "rejected/empty counted as real" class and can't be
     unit-injected cheaply (a full jury run), so it is source-pinned. Scoped to the all_verified statement."""
     jury = (REPO_ROOT / "src-tauri" / "src" / "jury" / "mod.rs").read_text(encoding="utf-8")
+    quality = (REPO_ROOT / "src-tauri" / "src" / "quality.rs").read_text(encoding="utf-8")
     idx = jury.find("let all_verified")
     if idx == -1:
         raise AssertionError("jury/mod.rs `all_verified` not found — this gate would pass vacuously")
     stmt = jury[idx : jury.index(";", idx)]
-    if "is_human_rejected" not in stmt:
+    direct_rejection_guard = "is_human_rejected" in stmt
+    shared_export_guard = "is_excluded_from_exports" in stmt and (
+        "pub fn is_excluded_from_exports(seg: &SpeechSegment) -> bool {\n"
+        "    is_human_rejected(seg) || is_technically_unusable(seg)\n"
+        "}" in quality
+    )
+    if not direct_rejection_guard and not shared_export_guard:
         raise AssertionError(
             "jury/mod.rs `all_verified` (the T0 conformal calibration set) must exclude is_human_rejected "
-            "clips — a mark-bad clip is verified=true and would contaminate the auto-accept threshold."
+            "clips directly or through the pinned shared export-exclusion predicate — a mark-bad clip is "
+            "verified=true and would contaminate the auto-accept threshold."
         )
 
 
@@ -1453,7 +1470,7 @@ def test_pipeline_wsl_retranscribe_rejects_an_empty_result() -> None:
         raise AssertionError("run_wsl_segment_transcript call not found — this gate would pass vacuously")
     # Match the METHOD CALL, not a prose mention in the guard's own comment — otherwise the search
     # lands on the comment and excludes the guard below it.
-    write = pipeline.find(".commit_champion_transcript_if_unreviewed(", start)
+    write = pipeline.find(".commit_bound_champion_transcript_if_unreviewed(", start)
     if write == -1:
         raise AssertionError("atomic champion commit not found after the WSL call — gate vacuous")
     between = pipeline[start:write]
@@ -1476,6 +1493,9 @@ def test_champion_transcript_and_provenance_commit_atomically() -> None:
     db = db_surface()
     required_db = [
         "pub fn commit_champion_transcript_if_unreviewed(",
+        "pub(crate) fn commit_bound_champion_transcript_if_unreviewed(",
+        "fn commit_champion_transcript_inner(",
+        "expected_source: Option<&ChampionTranscriptionSourceSnapshot>",
         'self.conn.execute("SAVEPOINT champion_commit", [])?',
         "AND verified = 0",
         "AND (human_decision IS NULL OR human_decision = '')",
@@ -1489,8 +1509,14 @@ def test_champion_transcript_and_provenance_commit_atomically() -> None:
         raise AssertionError(f"atomic champion DB commit is missing contracts: {missing}")
 
     for name, source in (("pipeline.rs", pipeline_surface()), ("commands.rs", command_surface())):
-        if ".commit_champion_transcript_if_unreviewed(" not in source:
-            raise AssertionError(f"{name} does not route champion writes through the atomic DB helper")
+        if ".commit_bound_champion_transcript_if_unreviewed(" not in source:
+            raise AssertionError(
+                f"{name} does not route champion writes through the source-bound atomic DB helper"
+            )
+        if ".commit_champion_transcript_if_unreviewed(" in source:
+            raise AssertionError(
+                f"{name} routes a production champion write through the unbound test-only helper"
+            )
         for retired in (".update_asr_transcript_if_unreviewed(", ".replace_hypotheses_with("):
             if retired in source:
                 raise AssertionError(
@@ -2297,8 +2323,8 @@ def test_wsl_refinement_loop_refuses_blank_draft() -> None:
     must SKIP a blank draft. Runtime path needs the WSL server, so source-pinned. (blank-transcript-never-
     overwrites-good class; siblings transcribe_segment / batch_transcribe / batch_processor.)"""
     src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
-    if "commit_champion_transcript_if_unreviewed" not in src:
-        raise AssertionError("atomic WSL refinement persist call not found in commands.rs")
+    if "commit_bound_champion_transcript_if_unreviewed" not in src:
+        raise AssertionError("source-bound atomic WSL refinement persist call not found in commands.rs")
     # parse_wsl_segment_result now returns a Wsl7bResult STRUCT (it carries the serving identity too),
     # so the guard destructures a field instead of a tuple. The behaviour is unchanged: a blank draft
     # is skipped before the commit and the existing transcript is kept.

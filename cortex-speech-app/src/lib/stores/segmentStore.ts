@@ -4,9 +4,12 @@ import * as api from '../commands';
 import { dedupeById } from '../dedupeById';
 import { notifications } from './notificationStore';
 import { t } from '../i18n';
+import { formatPublicErrorReference } from '../errorText';
 
 // A bounded render window. More rows are appended only as the virtual list approaches its end.
 const PAGE_SIZE = 200;
+const MAX_RESIDENT_PAGES = 3;
+const MAX_RESIDENT_SEGMENTS = PAGE_SIZE * MAX_RESIDENT_PAGES;
 
 function createSegmentsStore() {
   const { subscribe, set, update } = writable<SpeechSegment[]>([]);
@@ -58,9 +61,9 @@ function createSegmentsStore() {
         // loaded" — indistinguishable from a wiped library, in an app whose one law is honesty about
         // data. Surface a distinct, PERSISTENT error the empty view reads (with a Retry), plus a toast
         // for the case where a background reload fails while the user is on another view.
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = formatPublicErrorReference(e) ?? get(t)('errors.unknown');
         libraryLoadError.set(msg);
-        notifications.error(get(t)('notifications.loadSegmentsFailed'), { detail: msg });
+        notifications.error(get(t)('notifications.loadSegmentsFailed'), { cause: e });
       }
     },
     async loadMore() {
@@ -74,14 +77,18 @@ function createSegmentsStore() {
       try {
         const page = await api.getSegmentsPage({ verified, query, sort, limit: PAGE_SIZE, cursor });
         if (seq !== loadSeq) return;
-        update((current) => dedupeById([...current, ...page.items]));
+        update((current) => {
+          const merged = dedupeById([...current, ...page.items]);
+          return merged.length > MAX_RESIDENT_SEGMENTS
+            ? merged.slice(merged.length - MAX_RESIDENT_SEGMENTS)
+            : merged;
+        });
         nextCursor = page.nextCursor;
         libraryTotal.set(page.total);
         libraryTruncated.set(nextCursor !== null);
       } catch (e) {
         if (seq !== loadSeq) return;
-        const msg = e instanceof Error ? e.message : String(e);
-        notifications.error(get(t)('notifications.loadSegmentsFailed'), { detail: msg });
+        notifications.error(get(t)('notifications.loadSegmentsFailed'), { cause: e });
       } finally {
         if (seq === loadSeq) loadingMore = false;
       }

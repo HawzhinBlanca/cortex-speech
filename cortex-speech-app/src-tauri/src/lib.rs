@@ -10,6 +10,7 @@ pub mod asr;
 pub mod atomic_file;
 pub mod audio;
 pub mod audio_quality;
+mod backup_service;
 pub mod cache;
 pub mod cancel;
 pub mod champion_promotion;
@@ -54,6 +55,7 @@ pub mod jobs;
 pub mod jury;
 pub mod llm_refiner;
 pub mod media;
+pub mod media_materialization_worker;
 pub mod migrations;
 pub mod models;
 pub mod normalizer;
@@ -62,6 +64,7 @@ pub mod production_dataset;
 pub mod quality;
 mod recovery;
 pub mod registry;
+mod restore_service;
 pub mod review_campaign;
 pub mod review_pilot;
 pub mod review_pool;
@@ -76,6 +79,7 @@ pub mod snapshot;
 pub mod source_provenance;
 pub mod stats;
 mod stores;
+pub mod technical_audio_probe;
 pub mod telemetry;
 pub mod throttle;
 pub mod transcript_export;
@@ -155,6 +159,93 @@ pub enum BatchState {
     Running,
 }
 
+/// Stable machine code returned by every production audio-import entry point when the cross-run
+/// duplicate index could not be proved authoritative at startup.
+pub const DEDUP_INDEX_UNAVAILABLE_CODE: &str = "DEDUP_INDEX_UNAVAILABLE";
+
+/// Keep this message stable while import commands still use their legacy string-error adapter. The
+/// leading machine code is deliberately separate from the human action text so callers never need to
+/// classify a database error or a localized sentence.
+pub const DEDUP_INDEX_UNAVAILABLE_MESSAGE: &str = "DEDUP_INDEX_UNAVAILABLE: Audio import is disabled because the cross-run duplicate index could not be verified. Repair or backfill audio identities, then restart Cortex.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupUnavailableReason {
+    IdentityReadFailed,
+    IncompleteAudioIdentities { recordings: usize },
+}
+
+/// Startup-owned import admission state. An unavailable index degrades only audio import; the app is
+/// still allowed to open the library, review existing work, recover data, and export eligible rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupReadiness {
+    Ready { rehydrated_recordings: usize },
+    Unavailable(DedupUnavailableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupIndexUnavailable;
+
+impl DedupIndexUnavailable {
+    pub const fn code(self) -> &'static str {
+        DEDUP_INDEX_UNAVAILABLE_CODE
+    }
+}
+
+impl std::fmt::Display for DedupIndexUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(DEDUP_INDEX_UNAVAILABLE_MESSAGE)
+    }
+}
+
+impl std::error::Error for DedupIndexUnavailable {}
+
+impl DedupReadiness {
+    pub fn require_import_ready(&self) -> Result<(), DedupIndexUnavailable> {
+        match self {
+            Self::Ready { .. } => Ok(()),
+            Self::Unavailable(_) => Err(DedupIndexUnavailable),
+        }
+    }
+}
+
+/// Rehydrate only after one snapshot has proved that every active recording has both durable identity
+/// tiers. A read fault or even one incomplete recording leaves the cache empty and import fail-closed.
+pub fn rehydrate_dedup_index(db: &Database, fingerprint: &AudioFingerprint) -> DedupReadiness {
+    // This function is intentionally replacement, not merge, semantics. Startup passes a fresh map,
+    // while a future lifecycle caller may not; retaining identities from another database generation
+    // would create false duplicate refusals just as surely as omitting current identities creates
+    // false admissions.
+    fingerprint.clear();
+    match db.load_audio_identity_inventory() {
+        Ok((_known, incomplete_recordings)) if incomplete_recordings > 0 => {
+            tracing::error!(
+                incomplete_recordings,
+                dedup_error_code = DEDUP_INDEX_UNAVAILABLE_CODE,
+                "Audio import disabled: active recordings have incomplete durable identities"
+            );
+            DedupReadiness::Unavailable(DedupUnavailableReason::IncompleteAudioIdentities {
+                recordings: incomplete_recordings,
+            })
+        }
+        Ok((known, _)) => {
+            let rehydrated_recordings = fingerprint.rehydrate(known);
+            tracing::info!(
+                rehydrated_recordings,
+                "Audio dedup: rehydrated authoritative recording identities from the library"
+            );
+            DedupReadiness::Ready { rehydrated_recordings }
+        }
+        Err(error) => {
+            tracing::error!(
+                dedup_error_code = DEDUP_INDEX_UNAVAILABLE_CODE,
+                %error,
+                "Audio import disabled: durable recording identities could not be read"
+            );
+            DedupReadiness::Unavailable(DedupUnavailableReason::IdentityReadFailed)
+        }
+    }
+}
+
 pub struct AppState {
     // Arc so a slow command can clone the handle and move DB work into `spawn_blocking` (off the
     // main/UI thread) without borrowing `State` across an await. lock_db() still returns a guard.
@@ -163,9 +254,14 @@ pub struct AppState {
     pub normalizer: Arc<SoraniNormalizer>,
     pub cache: Arc<TranscriptCache>,
     pub fingerprint: Arc<AudioFingerprint>,
+    pub(crate) dedup_readiness: DedupReadiness,
     pub history: HistKeyMgr,
     pub session: Mutex<SessionManager>,
     pub settings: Mutex<AppSettings>,
+    /// Serializes the complete compare/save/publish settings transaction. `settings` alone cannot
+    /// cover the pipeline update without violating the pipeline-before-settings lock hierarchy;
+    /// this operation gate preserves writer order while each inner lock remains short-lived.
+    settings_write: Mutex<()>,
     pub data_dir: Mutex<Option<PathBuf>>,
     pub model_manager: Mutex<ModelManager>,
     /// Separate cancellation slots per long-running operation kind. Imports (start_cancel_token) and
@@ -177,7 +273,8 @@ pub struct AppState {
     pub batch_cancel_token: Mutex<Option<CancellationToken>>,
     pub import_state: Mutex<ImportState>,
     pub batch_state: Mutex<BatchState>,
-    pub media_registry: Mutex<MediaRegistry>,
+    pub media_registry: Arc<Mutex<MediaRegistry>>,
+    pub(crate) media_materializer: Arc<crate::media::MediaMaterializationCoordinator>,
 }
 
 type HistKeyMgr = Arc<Mutex<HistoryManager>>;
@@ -221,6 +318,13 @@ impl AppState {
     pub(crate) fn lock_settings(&self) -> MutexGuard<'_, AppSettings> {
         self.settings.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned settings lock");
+            poisoned.into_inner()
+        })
+    }
+
+    pub(crate) fn lock_settings_write(&self) -> MutexGuard<'_, ()> {
+        self.settings_write.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned settings write gate");
             poisoned.into_inner()
         })
     }
@@ -292,12 +396,6 @@ impl AppState {
 
     pub(crate) fn review_drafts(&self) -> crate::stores::ReviewDraftStore {
         crate::stores::ReviewDraftStore::new(self.db.clone())
-    }
-
-    /// Serialized playback-evidence writer. Renderer claims stop at the observation DTO; the store
-    /// and database resolve the current revision and canonical audio identity under the writer lock.
-    pub(crate) fn playback_writes(&self) -> crate::stores::PlaybackWriteStore {
-        crate::stores::PlaybackWriteStore::new(self.db.clone())
     }
 
     /// Serialized human-review writer for desktop decisions, exact undo and review flags.
@@ -391,7 +489,15 @@ impl AppState {
             || self.lock_batch_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
     }
 
+    pub(crate) fn require_audio_import_ready(&self) -> Result<(), DedupIndexUnavailable> {
+        self.dedup_readiness.require_import_ready()
+    }
+
     pub fn try_start_import(&self) -> Result<(), String> {
+        // Import alone degrades when startup could not prove the durable cross-run identity index.
+        // This check precedes the Running transition, cancellation-token creation, worker spawn,
+        // decoding, and durable import-journal creation for every desktop audio-import command.
+        self.require_audio_import_ready().map_err(|error| error.to_string())?;
         let mut import = self.lock_import_state();
         // P1.3b: refuse to start while a DB restore is reserved. Checked UNDER the import_state lock (and
         // set-Running is under the same lock) so it can't race prepare_restore's writers_active() read.
@@ -708,31 +814,10 @@ pub fn run() {
     // started empty every launch and cross-session duplicate detection did not exist (external review
     // 2026-08-06 #4).
     //
-    // Best-effort by design: a failed read must not block startup. It costs this session cross-run
-    // dedup — exactly the behaviour that shipped before v50 — and says so loudly rather than degrading
-    // silently. Rows predating v50 have a NULL fingerprint and are simply absent until backfilled.
-    //
-    // v51: a row that has a spectral bucket but no content hash (imported between v50 and v51) IS
-    // loaded, but can never reject an import, because a value that cannot distinguish content must not
-    // discard a legitimate recording. The count is reported separately so the gap is visible in the log
-    // rather than implied by silence.
-    match db.load_audio_identities() {
-        Ok(known) => {
-            let unhashed = known.iter().filter(|k| k.content.is_none()).count();
-            let n = fingerprint.rehydrate(known);
-            tracing::info!("Audio dedup: rehydrated {n} recording identity/identities from the library");
-            if unhashed > 0 {
-                tracing::warn!(
-                    "Audio dedup: {unhashed} recording(s) predate v51 and have no content hash — they \
-                     cannot prove a duplicate and will never reject an import. Run \
-                     `backfill_fingerprints --apply` to close the gap."
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Audio dedup: could not rehydrate identities ({e}) — within-run dedup only");
-        }
-    }
+    // Import is a degradable capability, not a startup prerequisite. A read fault or legacy unhashed
+    // recording keeps review/library/export available but makes every audio import fail closed with a
+    // stable code before it can decode, journal, or publish anything.
+    let dedup_readiness = rehydrate_dedup_index(&db, &fingerprint);
 
     let database_runtime = DatabaseRuntime::new(db);
     let pipeline = ProcessingPipeline::new_with_runtime(
@@ -781,16 +866,19 @@ pub fn run() {
             normalizer,
             cache,
             fingerprint,
+            dedup_readiness,
             history: Arc::new(Mutex::new(history)),
             session: Mutex::new(session),
             settings: Mutex::new(settings),
+            settings_write: Mutex::new(()),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
             import_cancel_token: Mutex::new(None),
             batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
             batch_state: Mutex::new(BatchState::Idle),
-            media_registry: Mutex::new(MediaRegistry::default()),
+            media_registry: Arc::new(Mutex::new(MediaRegistry::default())),
+            media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
@@ -843,6 +931,7 @@ pub fn run() {
             commands::reviewer_throughput,
             commands::export_agreement_sample,
             commands::register_media_asset,
+            commands::register_review_media_asset,
             commands::get_media_asset_url,
             commands::check_agentic_readiness,
             commands::rediarize_segments,
@@ -858,6 +947,9 @@ pub fn run() {
             commands::list_recording_rights,
             commands::get_settings,
             commands::update_settings,
+            commands::get_settings_v1,
+            commands::patch_settings_v1,
+            commands::set_cloud_consent_v1,
             commands::get_fingerprint_count,
             commands::undo,
             commands::redo,
@@ -907,15 +999,20 @@ pub fn run() {
             // Phase 2 — T0 Gate + Jury
             commands::run_t0_gate,
             commands::get_escalation_queue,
+            commands::get_active_voice_focus_v1,
             commands::get_review_page_v1,
             commands::record_human_decision,
             commands::commit_review_v1,
+            commands::mark_segment_unusable_v1,
             commands::get_review_draft_v1,
             commands::save_review_draft_v1,
             commands::delete_review_draft_v1,
             commands::undo_human_decision,
             commands::record_review_flag,
             commands::undo_review_flag,
+            commands::begin_desktop_playback_session_v1,
+            commands::cancel_desktop_playback_session_v1,
+            commands::finalize_desktop_playback_session_v1,
             commands::record_playback_receipt,
             commands::get_few_shot_examples,
             commands::get_escalation_rate_trend,
@@ -939,6 +1036,11 @@ pub fn run() {
                 let media_cache = crate::media::media_cache_dir(&data_dir);
                 if let Err(e) = std::fs::create_dir_all(&media_cache) {
                     tracing::warn!("Could not create media cache dir {}: {e}", media_cache.display());
+                } else {
+                    // No media command can run before setup completes. This is the only safe point
+                    // for directory-wide orphan cleanup; runtime builders prune only exact grants so
+                    // one parallel materialization can never delete another's unpublished file.
+                    crate::media::prune_media_cache_on_startup(&media_cache);
                 }
                 match app.asset_protocol_scope().allow_directory(&media_cache, true) {
                     Ok(()) => {
@@ -1285,17 +1387,99 @@ mod tests {
             normalizer,
             cache,
             fingerprint,
+            dedup_readiness: DedupReadiness::Ready { rehydrated_recordings: 0 },
             history: Arc::new(Mutex::new(HistoryManager::new(10))),
             session: Mutex::new(SessionManager::new(data_dir.join("session"))),
             settings: Mutex::new(settings),
+            settings_write: Mutex::new(()),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
             import_cancel_token: Mutex::new(None),
             batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
             batch_state: Mutex::new(BatchState::Idle),
-            media_registry: Mutex::new(MediaRegistry::default()),
+            media_registry: Arc::new(Mutex::new(MediaRegistry::default())),
+            media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
         }
+    }
+
+    #[test]
+    fn dedup_identity_read_failure_degrades_import_only_with_the_stable_code() {
+        // An open connection without schema is a deterministic identity-query failure. Startup must
+        // retain that as typed readiness state instead of silently treating the library as empty.
+        let db = Database::open(":memory:").unwrap();
+        let fingerprint = AudioFingerprint::new();
+        let readiness = rehydrate_dedup_index(&db, &fingerprint);
+        assert_eq!(readiness, DedupReadiness::Unavailable(DedupUnavailableReason::IdentityReadFailed));
+        assert_eq!(fingerprint.count(), 0, "a failed inventory read must leave no partially trusted cache");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_app_state(dir.path().to_path_buf());
+        state.dedup_readiness = readiness;
+        assert_eq!(
+            state.try_start_import(),
+            Err(DEDUP_INDEX_UNAVAILABLE_MESSAGE.to_string()),
+            "all desktop import entry points share this pre-worker gate"
+        );
+        assert_eq!(DedupIndexUnavailable.code(), DEDUP_INDEX_UNAVAILABLE_CODE);
+        assert_eq!(*state.lock_import_state(), ImportState::Idle, "a refusal must not claim the import gate");
+        assert!(state.lock_import_cancel_token().is_none(), "a refusal must not arm a worker cancellation token");
+
+        // The degraded state is deliberately capability-scoped: the application remains usable for
+        // existing-library work. Batch state is an independent gate and is representative of the app
+        // not entering a global fatal/maintenance mode merely because new audio cannot be admitted.
+        state.try_start_batch().expect("non-import capability remains available");
+        state.finish_batch();
+    }
+
+    #[test]
+    fn active_incomplete_recording_identity_blocks_before_any_rehydration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dedup-readiness.db");
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        crate::snapshot::initialize_with_required_pre_migration_pin(&db, dir.path()).unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "legacy-unhashed".into(),
+            audio_path: "C:/audio/legacy.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "degenerate-identity".into(),
+            audio_path: "C:/audio/degenerate.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.set_audio_identity(
+            "C:/audio/degenerate.wav",
+            &crate::fingerprint::AudioIdentity { spectral: 0, content: "a".repeat(64) },
+        )
+        .unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "malformed-hash".into(),
+            audio_path: "C:/audio/malformed.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.set_audio_identity(
+            "C:/audio/malformed.wav",
+            &crate::fingerprint::AudioIdentity { spectral: 42, content: "not-a-canonical-hash".into() },
+        )
+        .unwrap();
+
+        let fingerprint = AudioFingerprint::new();
+        assert_eq!(
+            rehydrate_dedup_index(&db, &fingerprint),
+            DedupReadiness::Unavailable(DedupUnavailableReason::IncompleteAudioIdentities { recordings: 3 })
+        );
+        assert_eq!(
+            fingerprint.count(),
+            0,
+            "complete neighbors must not create a falsely authoritative partial index while one recording is unhashed"
+        );
     }
 
     #[test]

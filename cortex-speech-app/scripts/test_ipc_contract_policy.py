@@ -1,6 +1,6 @@
 """IPC contract gate (P3.1 — closes T1; auto-discovered by run_python_policies.py).
 
-Nothing else diffs the frontend `invoke('name')` call sites against the AUTHORITATIVE Rust command
+Nothing else diffs generated and handwritten frontend IPC call sites against the AUTHORITATIVE Rust command
 registry — the `tauri::generate_handler![...]` list in lib.rs. So a renamed or removed `#[tauri::command]`
 stays green in vitest + Playwright + cargo simultaneously: vitest mocks `@tauri-apps/api/core`'s invoke,
 the Playwright tauri-mock's default branch returns `null` for any unknown command, and cargo never sees
@@ -10,8 +10,9 @@ This gate is a generated CONTRACT, not an allow-list: it parses BOTH real source
 frontend invokes a command name the registry does not export. Registered-but-never-invoked commands are
 reported as INFO only (many are legitimately reached from events/tests/other surfaces, or reserved).
 
-Dynamic `invoke(expr)` calls (a name built at runtime, not a string literal) cannot be resolved statically;
-they are reported so a reviewer knows they are NOT contract-checked, but they do not fail the gate.
+Dynamic command names fail the gate. The sole low-level exception is the closed handwritten adapter:
+its one `invokeDesktop(command, ...)` bridge accepts a TypeScript union sourced from an audited literal
+inventory, while every service call into that bridge remains a statically named literal.
 """
 
 import re
@@ -20,9 +21,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIB_RS = REPO_ROOT / "src-tauri" / "src" / "lib.rs"
 FRONTEND_DIR = REPO_ROOT / "src"
+LEGACY_ADAPTER = FRONTEND_DIR / "lib" / "adapters" / "legacyIpc.ts"
 
-# Any `invoke(` opening; the first-arg char right after decides literal vs dynamic (see below).
-_INVOKE_OPEN = re.compile(r"\binvoke\s*(?:<[^>]*>)?\s*\(\s*")
+# Every supported IPC boundary. The bounded non-greedy generic matcher handles multiline explicit
+# result types without treating ordinary functions whose names merely contain "invoke" as IPC.
+_INVOKE_OPEN = re.compile(
+    r"\b(invoke|invokeLegacy|invokeCritical|invokeDesktop|__TAURI_INVOKE)"
+    r"\s*(?:<[\s\S]{0,4000}?>\s*)?\(\s*"
+)
 
 
 from _policy_util import strip_comments as _strip_comments  # noqa: E402
@@ -56,8 +62,8 @@ def registered_commands() -> set[str]:
     return names
 
 
-def frontend_invocations() -> tuple[set[str], list[str]]:
-    """(app-command names invoked from the frontend as string literals, dynamic-invoke site descriptions).
+def frontend_invocations() -> tuple[set[str], set[str], list[str]]:
+    """Return (handwritten literals, generated literals, dynamic site descriptions).
 
     Classify EVERY `invoke(` by its first-arg char so a quoted-but-odd name cannot fall through both paths
     (the tight-regex gap an adversary found): a `'`/`"`/backtick literal is extracted WHOLE — spaces, a
@@ -65,12 +71,20 @@ def frontend_invocations() -> tuple[set[str], list[str]]:
     silently dropped); a backtick with `${...}` interpolation, or a non-quote first arg (a variable), is a
     runtime name reported as dynamic (not statically checkable). Plugin/core commands (`plugin:dialog|open`
     — they carry `:`/`|` and are registered by the plugin, not generate_handler!) are skipped, not flagged."""
-    literals: set[str] = set()
+    handwritten: set[str] = set()
+    generated: set[str] = set()
     dynamic: list[str] = []
-    files = sorted(FRONTEND_DIR.rglob("*.ts")) + sorted(FRONTEND_DIR.rglob("*.svelte"))
+    files = [
+        path
+        for path in sorted(FRONTEND_DIR.rglob("*.ts")) + sorted(FRONTEND_DIR.rglob("*.svelte"))
+        if not path.name.endswith((".test.ts", ".spec.ts"))
+    ]
     for path in files:
         code = _strip_comments(path.read_text(encoding="utf-8"))
         for m in _INVOKE_OPEN.finditer(code):
+            if re.search(r"\bfunction\s*$", code[max(0, m.start() - 32) : m.start()]):
+                continue  # declaration, not a call expression
+            callee = m.group(1)
             pos = m.end()
             quote = code[pos : pos + 1]
             site = f"{path.relative_to(REPO_ROOT).as_posix()}:{code[:m.start()].count(chr(10)) + 1}"
@@ -85,10 +99,24 @@ def frontend_invocations() -> tuple[set[str], list[str]]:
                 elif ":" in name or "|" in name:
                     continue  # a plugin/core command (plugin:dialog|open) — not a generate_handler! command
                 else:
-                    literals.add(name)
+                    if callee == "__TAURI_INVOKE":
+                        generated.add(name)
+                    else:
+                        handwritten.add(name)
             else:
                 dynamic.append(site)  # first arg is a variable / expression — a runtime name
-    return literals, dynamic
+    return handwritten, generated, dynamic
+
+
+def handwritten_inventory() -> set[str]:
+    code = _strip_comments(LEGACY_ADAPTER.read_text(encoding="utf-8"))
+    match = re.search(r"LEGACY_IPC_COMMANDS\s*=\s*\[([\s\S]*?)]\s*as\s+const", code)
+    if not match:
+        raise AssertionError("closed LEGACY_IPC_COMMANDS inventory is missing from legacyIpc.ts")
+    names = set(re.findall(r"['\"]([a-z][a-z0-9_]*)['\"]", match.group(1)))
+    if not names:
+        raise AssertionError("closed handwritten IPC inventory is empty — the gate would be vacuous")
+    return names
 
 
 def test_no_command_rename_attribute() -> None:
@@ -105,11 +133,12 @@ def test_no_command_rename_attribute() -> None:
 
 def test_frontend_invokes_only_registered_commands() -> None:
     registry = registered_commands()
-    invoked, dynamic = frontend_invocations()
+    handwritten, generated, dynamic = frontend_invocations()
+    invoked = handwritten | generated
+    inventory = handwritten_inventory()
     if not invoked:
         raise AssertionError(
-            "no invoke('...') string-literal call sites found in the frontend — the contract would be vacuous "
-            "(did the invoke wrapper move, or the parser break?)"
+            "no generated or handwritten string-literal IPC call sites found — the contract would be vacuous"
         )
     dangling = sorted(invoked - registry)
     if dangling:
@@ -119,14 +148,40 @@ def test_frontend_invokes_only_registered_commands() -> None:
             "at runtime (vitest mocks invoke; the Playwright tauri-mock returns null for unknown commands). "
             "Rename the frontend call to match the registry, or restore/register the command."
         )
+    stale_inventory = sorted(inventory - registry)
+    if stale_inventory:
+        raise AssertionError(
+            f"legacyIpc.ts allow-lists commands absent from the Rust registry: {stale_inventory}"
+        )
+    missing_inventory = sorted(handwritten - inventory)
+    if missing_inventory:
+        raise AssertionError(
+            f"handwritten IPC calls bypass the closed legacy inventory: {missing_inventory}"
+        )
+    unused_inventory = sorted(inventory - handwritten)
+    if unused_inventory:
+        raise AssertionError(
+            f"legacyIpc.ts carries unused command capabilities: {unused_inventory}; remove them"
+        )
+    generated_through_legacy = sorted(generated & inventory)
+    if generated_through_legacy:
+        raise AssertionError(
+            f"generated commands regressed into the handwritten adapter: {generated_through_legacy}"
+        )
+    expected_dynamic_prefix = "src/lib/adapters/legacyIpc.ts:"
+    unexpected_dynamic = [site for site in dynamic if not site.startswith(expected_dynamic_prefix)]
+    if unexpected_dynamic or len(dynamic) != 1:
+        raise AssertionError(
+            "dynamic IPC names are forbidden; expected only the single closed legacy bridge, got: "
+            + ", ".join(dynamic)
+        )
     # INFO (never fails): coverage of the registry + any un-checkable dynamic invokes.
     uninvoked = sorted(registry - invoked)
     print(
-        f"ipc contract: {len(invoked)} invoked / {len(registry)} registered; "
-        f"{len(uninvoked)} registered-but-not-invoked (info); {len(dynamic)} dynamic invoke(s) not statically checked"
+        f"ipc contract: {len(invoked)} invoked ({len(generated)} generated, "
+        f"{len(handwritten)} handwritten) / {len(registry)} registered; "
+        f"{len(uninvoked)} registered-but-not-invoked (info); one closed low-level bridge"
     )
-    if dynamic:
-        print("  dynamic invoke sites (NOT contract-checked): " + ", ".join(dynamic))
 
 
 def main() -> None:

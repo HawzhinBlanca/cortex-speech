@@ -66,6 +66,67 @@ def test_prepare_restore_reserves_before_the_fence_and_returns_the_guard() -> No
             raise AssertionError(f"durable restore marker authority was not isolated: {moved}")
 
 
+def test_restore_service_owns_sql_authority_without_ui_dependencies() -> None:
+    service_dir = SRC / "restore_service"
+    service_files = sorted(service_dir.glob("*.rs"))
+    if not service_files:
+        raise AssertionError("restore service is missing — command-layer SQL isolation cannot be verified")
+    service = "\n".join(path.read_text(encoding="utf-8") for path in service_files)
+    for forbidden in ("use tauri", "tauri::", "crate::AppState", "crate::commands"):
+        if forbidden in service:
+            raise AssertionError(f"restore service depends on the UI/command layer: {forbidden}")
+    for required in (
+        "fn require_restore_authority_superset(",
+        "fn validate_restore_target_semantics(",
+        "fn require_active_pilot_policy_binding(",
+        "fn restore_with_mandatory_snapshot(",
+        "fn prepare_and_restore_named_transaction(",
+        "fn recover_interrupted_named_restore_with_admission(",
+    ):
+        if required not in service:
+            raise AssertionError(f"restore service lost authority/orchestration seam: {required}")
+
+    database = _read("db.rs")
+    policy4_wrapper = _fn_body(database, "pub(crate) fn validate_policy4_restore_authority(", span=500)
+    if "validate_policy4_effect_authority(&self.conn)" not in policy4_wrapper:
+        raise AssertionError("restore must reuse the canonical policy-4 semantic validator, not duplicate or skip it")
+    playback = _read("restore_service/playback.rs")
+    if "db.validate_policy4_restore_authority()" not in playback:
+        raise AssertionError("restore playback validation does not prove policy-4 multi-table authority")
+    compensation = _read("restore_service/compensation.rs")
+    for required in (
+        "crate::db::DESKTOP_PLAYBACK_POLICY_VERSION",
+        "playback_authority_consumptions_v4",
+        "effect.playback_authority_session_id = receipt.authority_session_id",
+    ):
+        if required not in compensation:
+            raise AssertionError(f"restore compensation validation lost policy-4 operation binding: {required}")
+
+    commands = _read("commands.rs")
+    for moved in (
+        "fn require_restore_authority_superset(",
+        "fn validate_restore_target_semantics(",
+        "fn require_active_pilot_policy_binding(",
+        "fn restore_with_mandatory_snapshot(",
+        "fn prepare_and_restore_named_transaction(",
+        "fn recover_interrupted_named_restore_with_admission(",
+    ):
+        if moved in commands:
+            raise AssertionError(f"restore authority leaked back into the Tauri command module: {moved}")
+    fixture = _fn_body(commands, "fn canonical_policy4_phone_playback(", span=5000)
+    for required in (
+        "finalize_couch_playback_attempt_v1(",
+        "couch_playback_proof_v4(",
+        "current_canonical_pcm_blake3(&source_path)",
+    ):
+        if required not in fixture:
+            raise AssertionError(f"restore policy-4 characterization uses a synthetic/bypass fixture: {required}")
+    adapter = commands[commands.find("fn prepare_restore(") : commands.find("pub fn cancel_operation(")]
+    for forbidden in (".connection()", "rusqlite::", "query_row(", "prepare("):
+        if forbidden in adapter:
+            raise AssertionError(f"restore command adapter issues SQL instead of calling the service: {forbidden}")
+
+
 def test_both_restore_callers_hold_the_reservation() -> None:
     commands = _read("commands.rs")
     binding = "let (restore_reservation,"
@@ -135,11 +196,12 @@ def test_restore_admission_is_exclusive_and_all_appstate_handles_delegate() -> N
 
 def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
     commands = _read("commands.rs")
+    service = _read("restore_service/orchestration.rs")
     runtime = _read("database_runtime.rs")
     production = commands.split("#[cfg(test)]\nmod tests", 1)[0]
     # Restore validation now includes the complete durable-history and semantic gates before the
     # pin. Keep the scan wide enough to include the final publish call as that safety work grows.
-    helper = _fn_body(commands, "fn restore_with_mandatory_snapshot(", span=1800)
+    helper = _fn_body(service, "pub(crate) fn restore_with_mandatory_snapshot(", span=1800)
     # Match the production call exactly.  The restore helper uses the fully-qualified path so this
     # gate cannot silently pass against an unrelated `Database` import or a similarly named helper.
     stage = helper.find("crate::db::Database::stage_restore_source(source)")
@@ -147,14 +209,14 @@ def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
     restore = helper.find("db.commit_staged_restore(&staged)")
     if -1 in (stage, snapshot, restore) or not (stage < snapshot < restore):
         raise AssertionError("bare restore must stage/validate first, then pin the live DB, then atomically publish")
-    named = _fn_body(commands, "fn prepare_and_restore_named_transaction(", span=2600)
+    named = _fn_body(service, "pub(crate) fn prepare_and_restore_named_transaction(", span=2600)
     if "prepare_named_restore_artifacts(" not in named or "begin_named_restore_transaction(" not in named:
         raise AssertionError("named restore must bind verified artifacts to its reusable safety-pin transaction")
     if "db.commit_staged_restore(&staged)" not in named:
         raise AssertionError("named restore no longer publishes only the isolated, verified staged database")
     if production.count("restore_with_mandatory_snapshot(&restore_reservation, writer") != 1:
         raise AssertionError("db_restore must call the one-guard bare snapshot+restore helper exactly once")
-    if production.count("prepare_and_restore_named_transaction(") < 2:
+    if production.count("prepare_and_restore_named_transaction(") != 1:
         raise AssertionError("restore_db_from_snapshot must call the named one-guard transaction helper")
     if "db_arc_for_restore" in production or "writer_arc_for_restore" in runtime:
         raise AssertionError("restore commands must not escape DatabaseRuntime through a raw writer Arc")
@@ -379,6 +441,7 @@ def test_every_writer_start_checks_restore_pending() -> None:
 
 def main() -> None:
     test_prepare_restore_reserves_before_the_fence_and_returns_the_guard()
+    test_restore_service_owns_sql_authority_without_ui_dependencies()
     test_both_restore_callers_hold_the_reservation()
     test_restore_admission_is_exclusive_and_all_appstate_handles_delegate()
     test_snapshot_and_restore_share_one_mutex_guard_in_both_commands()

@@ -16,9 +16,11 @@
   import ModelDownload from './ModelDownload.svelte';
   import ModelRegistry from './ModelRegistry.svelte';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
-  import { t } from './i18n';
+  import ApiKeyField from './ApiKeyField.svelte';
+  import { autonomyLabelKey, autonomyValues, t } from './i18n';
   import { get } from 'svelte/store';
   import { onDestroy, onMount } from 'svelte';
+  import { chooseDirectory } from './fileDialogs';
   import { isTauriRuntime } from './runtime';
 
   let localSettings: AppSettings = $state({ ...$settings });
@@ -74,7 +76,7 @@
               .filter(Boolean),
           );
     } catch (e) {
-      notifications.error($t('settings.couchFailed'), { detail: String(e) });
+      notifications.error($t('settings.couchFailed'), { cause: e });
     } finally {
       couchBusy = false;
     }
@@ -94,7 +96,7 @@
     try {
       couchStatus = await api.revokeCouchReviewer(name);
     } catch (e) {
-      notifications.error($t('settings.couchRevoke'), { detail: String(e) });
+      notifications.error($t('settings.couchRevoke'), { cause: e });
     } finally {
       couchBusy = false;
     }
@@ -108,7 +110,7 @@
       agreement = await api.exportAgreementSample();
       if (!agreement) notifications.info($t('settings.couchAgreementNone'));
     } catch (e) {
-      notifications.error($t('settings.couchAgreement'), { detail: String(e) });
+      notifications.error($t('settings.couchAgreement'), { cause: e });
     } finally {
       agreementBusy = false;
     }
@@ -142,22 +144,43 @@
   // only ever reflects set/unset (configuredProviders holds provider NAMES, never values).
   let openrouterKeyInput = $state('');
   let savingOpenrouterKey = $state(false);
-  async function saveOpenrouterKey() {
-    if (!tauriAvailable || savingOpenrouterKey) return;
+  let openrouterKeySave: Promise<void> | null = null;
+
+  class ApiKeySaveFailure extends Error {
+    constructor(provider: string) {
+      super(`The ${provider} API key was not saved`);
+      this.name = 'ApiKeySaveFailure';
+    }
+  }
+
+  async function saveOpenrouterKey(): Promise<void> {
+    if (!tauriAvailable) return;
+    if (openrouterKeySave) return openrouterKeySave;
+    const requested = openrouterKeyInput.trim();
     savingOpenrouterKey = true;
+    const operation = (async () => {
+      try {
+        configuredProviders = await api.setApiKey('openrouter', requested);
+        // If a paste/input event raced the IPC, clear only the value actually acknowledged by the
+        // backend. A newer value remains visible and pending instead of disappearing.
+        if (openrouterKeyInput.trim() === requested) openrouterKeyInput = '';
+        notifications.success(
+          configuredProviders.includes('openrouter')
+            ? $t('settings.apiKeySavedToast', { provider: 'OpenRouter' })
+            : $t('settings.apiKeyClearedToast', { provider: 'OpenRouter' }),
+        );
+      } catch (e) {
+        notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'OpenRouter' }), {
+          cause: e,
+        });
+        throw new ApiKeySaveFailure('OpenRouter');
+      }
+    })();
+    openrouterKeySave = operation;
     try {
-      configuredProviders = await api.setApiKey('openrouter', openrouterKeyInput.trim());
-      openrouterKeyInput = '';
-      notifications.success(
-        configuredProviders.includes('openrouter')
-          ? $t('settings.apiKeySavedToast', { provider: 'OpenRouter' })
-          : $t('settings.apiKeyClearedToast', { provider: 'OpenRouter' }),
-      );
-    } catch (e) {
-      notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'OpenRouter' }), {
-        detail: String(e),
-      });
+      await operation;
     } finally {
+      if (openrouterKeySave === operation) openrouterKeySave = null;
       savingOpenrouterKey = false;
     }
   }
@@ -173,22 +196,33 @@
   // set_api_key already accepted 'gemini'; nothing in the UI ever called it. This does.
   let geminiKeyInput = $state('');
   let savingGeminiKey = $state(false);
-  async function saveGeminiKey() {
-    if (!tauriAvailable || savingGeminiKey) return;
+  let geminiKeySave: Promise<void> | null = null;
+  async function saveGeminiKey(): Promise<void> {
+    if (!tauriAvailable) return;
+    if (geminiKeySave) return geminiKeySave;
+    const requested = geminiKeyInput.trim();
     savingGeminiKey = true;
+    const operation = (async () => {
+      try {
+        configuredProviders = await api.setApiKey('gemini', requested);
+        if (geminiKeyInput.trim() === requested) geminiKeyInput = '';
+        notifications.success(
+          configuredProviders.includes('gemini')
+            ? $t('settings.apiKeySavedToast', { provider: 'Gemini' })
+            : $t('settings.apiKeyClearedToast', { provider: 'Gemini' }),
+        );
+      } catch (e) {
+        notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'Gemini' }), {
+          cause: e,
+        });
+        throw new ApiKeySaveFailure('Gemini');
+      }
+    })();
+    geminiKeySave = operation;
     try {
-      configuredProviders = await api.setApiKey('gemini', geminiKeyInput.trim());
-      geminiKeyInput = '';
-      notifications.success(
-        configuredProviders.includes('gemini')
-          ? $t('settings.apiKeySavedToast', { provider: 'Gemini' })
-          : $t('settings.apiKeyClearedToast', { provider: 'Gemini' }),
-      );
-    } catch (e) {
-      notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'Gemini' }), {
-        detail: String(e),
-      });
+      await operation;
     } finally {
+      if (geminiKeySave === operation) geminiKeySave = null;
       savingGeminiKey = false;
     }
   }
@@ -206,14 +240,17 @@
   // reaches for does the right thing. Awaited in save() (which then closes the panel); fire-and-forget
   // in onDestroy, where the component is already going away and there is nothing left to await for.
   async function flushPendingKeys() {
-    if (openrouterKeyInput.trim()) await saveOpenrouterKey();
-    if (geminiKeyInput.trim()) await saveGeminiKey();
+    if (openrouterKeyInput.trim() || openrouterKeySave) await saveOpenrouterKey();
+    if (geminiKeyInput.trim() || geminiKeySave) await saveGeminiKey();
   }
 
   onDestroy(() => {
     // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
     if (cancelled) return;
-    void flushPendingKeys();
+    void flushPendingKeys().catch(() => {
+      // Explicit close/Save paths are admission-blocking below. onDestroy cannot keep an already
+      // removed component alive; consume the rejection so it cannot become an unhandled promise.
+    });
     // Close-to-save for theme/sliders (they have no per-field auto-save). Route through saveQuietly so
     // this path gets the SAME NaN coercion + rollback-on-failure + error toast as every other persist.
     // The old bare fire-and-forget updateSettings here skipped coerceSettingsForRuntime: clearing a
@@ -338,14 +375,12 @@
         // REJECTED the write. A silent consent mismatch — the user believes advisory cloud work is on (or off)
         // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
         // to the last-persisted state and surface the failure instead of only logging it.
-        rollbackTo(prev);
-        notifications.error($t('settingsSaveFailed'), { detail: String(e) });
+        rollbackTo(prev, e);
+        notifications.error($t('settingsSaveFailed'), { cause: e });
       }
     });
   }
-
   // What the store may hold: a COPY, never the object the panel's inputs are bound to.
-  //
   // `settings.set(localSettings)` handed the store the very object `bind:` keeps mutating, so after
   // any save every later keystroke edited the store's value in place — no subscriber notified, the
   // rest of the app silently running on half-typed settings, and the close-to-save diff below
@@ -353,14 +388,16 @@
   function publishable(): AppSettings {
     return { ...localSettings };
   }
-
-  // Put the last-persisted state back after the backend REJECTED a write, so the UI and the rest of
-  // the app can never keep running on values that were never saved.
-  function rollbackTo(prev: AppSettings) {
-    localSettings = { ...prev };
-    settings.set({ ...prev });
+  // Roll back to fresh server truth when a stale/partial write supplied it, otherwise the last confirmation.
+  function rollbackTo(prev: AppSettings, error?: unknown) {
+    const authoritative =
+      error && typeof error === 'object' && 'authoritativeSettings' in error
+        ? ((error as { authoritativeSettings?: AppSettings | null }).authoritativeSettings ?? null)
+        : null;
+    if (authoritative) lastPersisted = { ...authoritative };
+    localSettings = { ...(authoritative ?? prev) };
+    settings.set({ ...localSettings });
   }
-
   const tabs = [
     { id: 'general', labelKey: 'general' },
     { id: 'asr', labelKey: 'asr' },
@@ -373,6 +410,7 @@
   ] as const;
 
   async function save() {
+    if (saving) return;
     saving = true;
     try {
       // Through the SAME queue as saveQuietly: a Save pressed while an auto-save is in flight must
@@ -400,8 +438,12 @@
           // The store was set optimistically above and the backend then REFUSED the write. Without this
           // the panel stayed open showing rejected values while the whole app read them as current —
           // the same lie `saveQuietly` already rolls back, on the path the user actually presses.
-          rollbackTo(prev);
-          notifications.error($t('settingsSaveFailed'), { detail: String(e) });
+          rollbackTo(prev, e);
+          // The provider-specific failure was already surfaced without exposing the secret. Avoid
+          // a second generic toast while keeping the panel and typed key open for retry.
+          if (!(e instanceof ApiKeySaveFailure)) {
+            notifications.error($t('settingsSaveFailed'), { cause: e });
+          }
         }
       });
     } finally {
@@ -424,9 +466,8 @@
       return;
     }
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const dir = await open({ directory: true, multiple: false });
-      if (!dir || typeof dir !== 'string') return;
+      const dir = await chooseDirectory();
+      if (!dir) return;
 
       exportingAudio = true;
       startOperation('export-audio');
@@ -453,7 +494,7 @@
         });
       }
     } catch (e) {
-      notifications.error($t('exportAudio.failed'), { detail: String(e) });
+      notifications.error($t('exportAudio.failed'), { cause: e });
     } finally {
       exportingAudio = false;
       isProcessing.set(false);
@@ -463,8 +504,18 @@
     }
   }
 
+  function requestClose() {
+    // Pending/in-flight keys require an awaited admission path. The historical onDestroy flush was
+    // too late to keep the panel/input alive after DPAPI or disk failure.
+    if (openrouterKeyInput.trim() || geminiKeyInput.trim() || openrouterKeySave || geminiKeySave) {
+      void save();
+      return;
+    }
+    showSettings.set(false);
+  }
+
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') showSettings.set(false);
+    if (e.key === 'Escape') requestClose();
   }
 </script>
 
@@ -473,6 +524,7 @@
   data-testid="settings-panel"
   role="dialog"
   aria-modal="true"
+  aria-labelledby="settings-title"
   tabindex="-1"
   use:focusTrap
   onkeydown={handleKeydown}
@@ -484,13 +536,14 @@
     onclick={(e) => e.stopPropagation()}
   >
     <div class="flex items-center justify-between px-6 py-4 border-b border-cortex-800/50">
-      <h2 class="text-lg font-semibold text-default">{$t('settings')}</h2>
+      <h2 id="settings-title" class="text-lg font-semibold text-default">{$t('settings')}</h2>
       <button
         data-testid="settings-close-btn"
-        class="text-muted hover:text-default transition-colors"
-        onclick={() => showSettings.set(false)}
-        aria-label={$t('close')}>✕</button
+        class="text-muted hover:text-default transition-colors text-xs"
+        onclick={requestClose}
       >
+        {$t('close')}
+      </button>
     </div>
 
     <div class="flex gap-0 flex-1 min-h-0">
@@ -574,7 +627,7 @@
                The URL carries a random session token; audio never leaves the local network. -->
           <div class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3 space-y-2">
             <div class="flex items-center justify-between">
-              <span class="text-sm text-default">📱 {$t('settings.couchTitle')}</span>
+              <span class="text-sm text-default">{$t('settings.couchTitle')}</span>
               <button
                 type="button"
                 class="btn-secondary text-xs px-3"
@@ -582,7 +635,7 @@
                 onclick={() => void toggleCouch()}
               >
                 {couchBusy
-                  ? '…'
+                  ? $t('settings.couchWorking')
                   : couchStatus?.running
                     ? $t('settings.couchStop')
                     : $t('settings.couchStart')}
@@ -594,7 +647,7 @@
                   <span class="text-[10px] text-subtle block"
                     >{$t('settings.couchTlsFingerprint')}</span
                   >
-                  <code class="block break-all text-[10px] text-default select-all"
+                  <code class="block break-all text-[10px] text-default select-all" dir="ltr"
                     >{couchStatus.certificateFingerprint}</code
                   >
                   <span class="text-[10px] text-subtle block"
@@ -610,7 +663,7 @@
                   class="space-y-1 border-t border-cortex-700/30 pt-2 first:border-t-0 first:pt-0"
                 >
                   <div class="flex items-center justify-between">
-                    <span class="text-xs text-default font-semibold">{reviewer.name}</span>
+                    <bdi class="text-xs text-default font-semibold" dir="auto">{reviewer.name}</bdi>
                     {#if couchStatus.reviewers.length > 1}
                       <!-- Revoking one link leaves every other reviewer working. Their completed work,
                            scores and audit trail are untouched - a record, not a permission. -->
@@ -628,6 +681,7 @@
                     class="input w-full !text-xs font-mono"
                     readonly
                     value={reviewer.url}
+                    dir="ltr"
                     onfocus={(e) => (e.target as HTMLInputElement).select()}
                   />
                   {#if reviewer.tailscaleUrl}
@@ -638,6 +692,7 @@
                       class="input w-full !text-xs font-mono"
                       readonly
                       value={reviewer.tailscaleUrl}
+                      dir="ltr"
                       onfocus={(e) => (e.target as HTMLInputElement).select()}
                     />
                   {/if}
@@ -649,6 +704,7 @@
                       class="input w-full !text-xs font-mono"
                       readonly
                       value={reviewer.funnelUrl}
+                      dir="ltr"
                       onfocus={(e) => (e.target as HTMLInputElement).select()}
                     />
                   {/if}
@@ -672,10 +728,10 @@
                 <span class="text-[10px] text-subtle">{$t('settings.couchThroughput')}</span>
                 {#each throughput as r (r.reviewer)}
                   <div class="flex items-center justify-between text-xs">
-                    <span class="text-default">{r.reviewer}</span>
-                    <span class="text-muted">
+                    <bdi class="text-default" dir="auto">{r.reviewer}</bdi>
+                    <bdi class="text-muted" dir="ltr">
                       {r.clips}{r.medianSeconds !== null ? ` · ${r.medianSeconds.toFixed(1)}s` : ''}
-                    </span>
+                    </bdi>
                   </div>
                 {/each}
               </div>
@@ -689,14 +745,15 @@
                 <span class="text-[10px] text-subtle">{$t('settings.couchSpotChecks')}</span>
                 {#each spotChecks as s (s.reviewer)}
                   <div class="flex items-center justify-between text-xs">
-                    <span class="text-default">{s.reviewer}</span>
-                    <span
+                    <bdi class="text-default" dir="auto">{s.reviewer}</bdi>
+                    <bdi
+                      dir="ltr"
                       class={s.noticed < s.checks / 2
                         ? 'text-rose-300 font-semibold'
                         : 'text-muted'}
                     >
                       {s.noticed}/{s.checks} · CER {(s.meanCer * 100).toFixed(1)}%
-                    </span>
+                    </bdi>
                   </div>
                 {/each}
                 <p class="text-[10px] text-subtle">{$t('settings.couchSpotChecksHint')}</p>
@@ -713,16 +770,19 @@
                   {$t('settings.couchAgreement')}
                 </button>
                 {#if agreement}
-                  <p class="text-[10px] text-subtle">
-                    {agreement.raterA} · {agreement.raterB} — {agreement.items}
-                    {#if agreement.otherReviewers.length}· +{agreement.otherReviewers.join(
-                        ', ',
-                      )}{/if}
+                  <p class="text-[10px] text-subtle" dir="auto">
+                    <bdi dir="auto">{agreement.raterA}</bdi> ·
+                    <bdi dir="auto">{agreement.raterB}</bdi>
+                    — <bdi dir="ltr">{agreement.items}</bdi>
+                    {#if agreement.otherReviewers.length}· +<bdi dir="auto"
+                        >{agreement.otherReviewers.join(', ')}</bdi
+                      >{/if}
                   </p>
                   <input
                     class="input w-full !text-[10px] font-mono"
                     readonly
                     value={agreement.path}
+                    dir="ltr"
                     onfocus={(e) => (e.target as HTMLInputElement).select()}
                   />
                   <p class="text-[10px] text-subtle">{$t('settings.couchAgreementHint')}</p>
@@ -733,7 +793,7 @@
         {:else if activeTab === 'asr'}
           <div class="flex items-center gap-3" data-testid="production-asr-model">
             <span class="text-sm text-muted w-32">{$t('asrModel')}</span>
-            <span class="input flex-1">Meta OmniASR 7B Champion + LoRA</span>
+            <bdi class="input flex-1" dir="ltr">Meta OmniASR 7B Champion + LoRA</bdi>
           </div>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('threads')}</span>
@@ -800,7 +860,7 @@
               bind:checked={localSettings.enableDenoising}
               class="accent-cortex-500"
             />
-            <span class="text-sm text-muted">AI Audio Cleanup (Denoise before ASR)</span>
+            <span class="text-sm text-muted">{$t('settings.aiAudioCleanup')}</span>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
             <input
@@ -873,8 +933,8 @@
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('exportFormat')}</span>
             <select class="input flex-1" bind:value={localSettings.exportFormat}>
-              <option value="json">JSON (COCO-style manifest)</option>
-              <option value="jsonl">JSONL (one segment per line)</option>
+              <option value="json">{$t('settings.exportJson')}</option>
+              <option value="jsonl">{$t('settings.exportJsonl')}</option>
               <option value="csv">CSV</option>
               <option value="parquet">Parquet</option>
             </select>
@@ -918,6 +978,7 @@
                 onblur={saveQuietly}
                 onchange={saveQuietly}
                 placeholder="/mnt/c/path/to/provider_refine.py"
+                dir="ltr"
               />
               <span class="text-[10px] text-subtle">{$t('settings.externalAsrScriptHint')}</span>
             </label>
@@ -944,6 +1005,7 @@
                   onblur={saveQuietly}
                   onchange={saveQuietly}
                   placeholder="http://127.0.0.1:11434/v1/chat/completions"
+                  dir="ltr"
                 />
                 <span class="text-[10px] text-subtle">{$t('settings.localEndpointHint')}</span>
               </label>
@@ -956,6 +1018,7 @@
                   onblur={saveQuietly}
                   onchange={saveQuietly}
                   placeholder="heretic-final:latest"
+                  dir="ltr"
                 />
                 <span class="text-[10px] text-subtle">
                   {$t('settings.quickSelect')}
@@ -965,7 +1028,8 @@
                     onclick={() => {
                       localSettings.llmModel = 'heretic-final:latest';
                       saveQuietly();
-                    }}>heretic-final:latest</button
+                    }}
+                    dir="ltr">heretic-final:latest</button
                   >
                   <button
                     type="button"
@@ -973,7 +1037,8 @@
                     onclick={() => {
                       localSettings.llmModel = 'qwen2.5-coder:7b';
                       saveQuietly();
-                    }}>qwen2.5-coder:7b</button
+                    }}
+                    dir="ltr">qwen2.5-coder:7b</button
                   >
                 </span>
               </label>
@@ -991,41 +1056,16 @@
                   {$t('settings.cloudLlmConsent')}
                 </span>
               </label>
-              <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">
-                  {$t('settings.geminiApiKey')}
-                  {#if configuredProviders.includes('gemini')}
-                    <span class="ms-2 text-[10px] text-emerald-400"
-                      >● {$t('settings.apiKeySaved')}</span
-                    >
-                  {:else}
-                    <span class="ms-2 text-[10px] text-amber-400"
-                      >○ {$t('settings.apiKeyMissing')}</span
-                    >
-                  {/if}
-                </span>
-                <div class="flex gap-2">
-                  <input
-                    type="password"
-                    class="input flex-1"
-                    bind:value={geminiKeyInput}
-                    placeholder="AIzaSy..."
-                    autocomplete="off"
-                    onkeydown={(e) => {
-                      if (e.key === 'Enter') void saveGeminiKey();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    class="btn-secondary text-xs px-3"
-                    disabled={savingGeminiKey}
-                    onclick={() => void saveGeminiKey()}
-                  >
-                    {savingGeminiKey ? $t('settings.savingKey') : $t('settings.saveKey')}
-                  </button>
-                </div>
-                <span class="text-[10px] text-subtle">{$t('settings.apiKeyStorageHint')}</span>
-              </label>
+              <ApiKeyField
+                labelKey="settings.geminiApiKey"
+                hintKey="settings.apiKeyStorageHint"
+                placeholder="AIzaSy..."
+                configured={configuredProviders.includes('gemini')}
+                bind:value={geminiKeyInput}
+                saving={savingGeminiKey}
+                disabled={savingGeminiKey || savingOpenrouterKey}
+                onSave={saveGeminiKey}
+              />
               <div class="flex flex-col gap-1 mt-2">
                 <span class="text-sm text-muted">{$t('settings.geminiModel')}</span>
                 <div
@@ -1086,21 +1126,21 @@
                 role="group"
                 aria-label={$t('settings.autonomyLevel')}
               >
-                {#each [['observe', '👁', 'inbox.autonomy.observe'], ['propose', '💡', 'inbox.autonomy.propose'], ['act_confirm', '✅', 'inbox.autonomy.actConfirm'], ['act_auto', '🤖', 'inbox.autonomy.actAuto']] as [val, emoji, labelKey]}
+                {#each autonomyValues as value (value)}
                   <button
                     type="button"
-                    aria-pressed={localSettings.juryAutonomyLevel === val}
+                    aria-pressed={localSettings.juryAutonomyLevel === value}
                     class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all
-                      {localSettings.juryAutonomyLevel === val
+                      {localSettings.juryAutonomyLevel === value
                       ? 'bg-purple-700 border-purple-500 text-white'
                       : 'bg-cortex-900/40 border-cortex-700/50 text-cortex-300 hover:border-cortex-500'}"
                     onclick={() => {
                       localSettings = {
                         ...localSettings,
-                        juryAutonomyLevel: val as typeof localSettings.juryAutonomyLevel,
+                        juryAutonomyLevel: value,
                       };
                       saveQuietly();
-                    }}>{emoji} {$t(labelKey)}</button
+                    }}>{$t(autonomyLabelKey(value))}</button
                   >
                 {/each}
               </div>
@@ -1168,41 +1208,16 @@
 
             <!-- API key (shared with LLM) — same secrets.env route as the AI Post-Processing tab. -->
             {#if localSettings.juryCloudOptIn}
-              <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">
-                  {$t('settings.geminiApiKey')}
-                  {#if configuredProviders.includes('gemini')}
-                    <span class="ms-2 text-[10px] text-emerald-400"
-                      >● {$t('settings.apiKeySaved')}</span
-                    >
-                  {:else}
-                    <span class="ms-2 text-[10px] text-amber-400"
-                      >○ {$t('settings.apiKeyMissing')}</span
-                    >
-                  {/if}
-                </span>
-                <div class="flex gap-2">
-                  <input
-                    type="password"
-                    class="input flex-1"
-                    bind:value={geminiKeyInput}
-                    placeholder="AIzaSy…"
-                    autocomplete="off"
-                    onkeydown={(e) => {
-                      if (e.key === 'Enter') void saveGeminiKey();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    class="btn-secondary text-xs px-3"
-                    disabled={savingGeminiKey}
-                    onclick={() => void saveGeminiKey()}
-                  >
-                    {savingGeminiKey ? $t('settings.savingKey') : $t('settings.saveKey')}
-                  </button>
-                </div>
-                <span class="text-[10px] text-subtle">{$t('settings.jurySharedKeyHint')}</span>
-              </label>
+              <ApiKeyField
+                labelKey="settings.geminiApiKey"
+                hintKey="settings.jurySharedKeyHint"
+                placeholder="AIzaSy…"
+                configured={configuredProviders.includes('gemini')}
+                bind:value={geminiKeyInput}
+                saving={savingGeminiKey}
+                disabled={savingGeminiKey || savingOpenrouterKey}
+                onSave={saveGeminiKey}
+              />
 
               <!-- T2 transport: direct Gemini REST, or the SAME Gemini 2.5 Pro via OpenRouter -->
               <label class="flex flex-col gap-1">
@@ -1223,41 +1238,16 @@
               </label>
 
               {#if localSettings.juryProvider === 'openrouter'}
-                <div class="flex flex-col gap-1">
-                  <span class="text-sm text-muted">
-                    {$t('settings.openRouterApiKey')}
-                    {#if configuredProviders.includes('openrouter')}
-                      <span class="ms-2 text-[10px] text-emerald-400"
-                        >● {$t('settings.apiKeySaved')}</span
-                      >
-                    {:else}
-                      <span class="ms-2 text-[10px] text-amber-400"
-                        >○ {$t('settings.apiKeyMissing')}</span
-                      >
-                    {/if}
-                  </span>
-                  <div class="flex gap-2">
-                    <input
-                      type="password"
-                      class="input flex-1"
-                      bind:value={openrouterKeyInput}
-                      placeholder="sk-or-…"
-                      autocomplete="off"
-                      onkeydown={(e) => {
-                        if (e.key === 'Enter') void saveOpenrouterKey();
-                      }}
-                    />
-                    <button
-                      type="button"
-                      class="btn-secondary text-xs px-3"
-                      disabled={savingOpenrouterKey}
-                      onclick={() => void saveOpenrouterKey()}
-                    >
-                      {savingOpenrouterKey ? $t('settings.savingKey') : $t('settings.saveKey')}
-                    </button>
-                  </div>
-                  <span class="text-[10px] text-subtle">{$t('settings.openRouterKeyHint')}</span>
-                </div>
+                <ApiKeyField
+                  labelKey="settings.openRouterApiKey"
+                  hintKey="settings.openRouterKeyHint"
+                  placeholder="sk-or-…"
+                  configured={configuredProviders.includes('openrouter')}
+                  bind:value={openrouterKeyInput}
+                  saving={savingOpenrouterKey}
+                  disabled={savingGeminiKey || savingOpenrouterKey}
+                  onSave={saveOpenrouterKey}
+                />
               {/if}
             {/if}
           </div>

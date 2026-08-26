@@ -5,6 +5,9 @@ export. Tauri v2 + Svelte 5 + Rust. The quality-first default is the local **Omn
 server under WSL. Smaller 300M/1B/MMS models remain explicitly installed diagnostics; standard
 release builds never bundle or select them as production fallbacks. No path requires a cloud service.
 
+**Supported product platform:** Windows 11 x64 only. Linux/macOS source-compilation checks are
+engineering diagnostics and do not constitute packaged-product support.
+
 > The desktop application lives in **[`cortex-speech-app/`](cortex-speech-app/)**.
 > Start there: [`cortex-speech-app/README.md`](cortex-speech-app/README.md) has setup, model
 > placement, build, and run instructions.

@@ -11,6 +11,7 @@ use super::{run_blocking, send_audio_duration_probe_result, RATE_LIMITER, STRICT
 use crate::db::SpeechSegment;
 use crate::validation::input as validate;
 use crate::{audio, AppState};
+use std::path::Path;
 use std::time::Duration;
 use tauri::State;
 
@@ -28,6 +29,76 @@ fn public_review_read_error(error: &str) -> crate::ipc_contract::CommandErrorV1 
         crate::ipc_contract::CommandErrorV1::new("REVIEW_PAGE_FAILED", "The review queue could not be loaded.", false)
             .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
     }
+}
+
+fn voice_focus_policy_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "VOICE_FOCUS_POLICY_INVALID",
+        "The active voice-focus policy cannot be read. Open Health before loading focused review work.",
+        false,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+}
+
+fn require_active_voice_focus(
+    data_dir: Option<&Path>,
+    expected_focus_id: &str,
+) -> Result<crate::voice_focus::VoiceFocusBinding, crate::ipc_contract::CommandErrorV1> {
+    let binding = crate::voice_focus::resolve_binding(data_dir).map_err(|_| voice_focus_policy_error())?;
+    let Some(binding) = binding else {
+        return Err(crate::ipc_contract::CommandErrorV1::new(
+            "VOICE_FOCUS_NOT_ACTIVE",
+            "No voice-focus policy is active. Reload the review workspace.",
+            false,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+    };
+    if binding.focus_id != expected_focus_id {
+        return Err(crate::ipc_contract::CommandErrorV1::new(
+            "STALE_VOICE_FOCUS",
+            "The voice-focus policy changed. Reload the review workspace before continuing.",
+            false,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+    }
+    Ok(binding)
+}
+
+/// Discover only the opaque identity and cardinality of the active focus. The private policy name,
+/// individual segment ids and owner data-dir path never cross IPC.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_active_voice_focus_v1(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::ipc_contract::ActiveVoiceFocusV1>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_active_voice_focus_v1").map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "RATE_LIMITED",
+            "Too many voice-focus requests. Retry in a moment.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?;
+    let data_dir = state.lock_data_dir().clone();
+    tokio::task::spawn_blocking(move || {
+        let binding =
+            crate::voice_focus::resolve_binding(data_dir.as_deref()).map_err(|_| voice_focus_policy_error())?;
+        binding
+            .map(|binding| {
+                let segment_count = i64::try_from(binding.segment_ids.len()).map_err(|_| voice_focus_policy_error())?;
+                Ok(crate::ipc_contract::ActiveVoiceFocusV1 { focus_id: binding.focus_id, segment_count })
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "VOICE_FOCUS_READ_FAILED",
+            "The voice-focus worker stopped unexpectedly.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?
 }
 
 /// Versioned review queue read. Each rendered row and `baseRevision` originate in one SQLite result
@@ -49,8 +120,8 @@ pub async fn get_review_page_v1(
         )
         .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
     })?;
-    let (query, scope_label) = match scope {
-        crate::ipc_contract::ReviewScope::Pending => (None, "pending".to_string()),
+    let (query, scope_label, escalation_only, expected_focus_id) = match scope {
+        crate::ipc_contract::ReviewScope::Pending => (None, "pending".to_string(), false, None),
         crate::ipc_contract::ReviewScope::Search { query } => {
             validate::validate_text(&query, 1000, "Search query").map_err(|_| {
                 crate::ipc_contract::CommandErrorV1::new(
@@ -59,21 +130,19 @@ pub async fn get_review_page_v1(
                     false,
                 )
             })?;
-            (Some(query), "search".to_string())
+            (Some(query), "search".to_string(), false, None)
         }
-        crate::ipc_contract::ReviewScope::Escalation => {
-            return Err(crate::ipc_contract::CommandErrorV1::new(
-                "SCOPE_NOT_IMPLEMENTED",
-                "The versioned escalation queue is not available in this release.",
-                false,
-            ));
-        }
-        crate::ipc_contract::ReviewScope::VoiceFocus { .. } => {
-            return Err(crate::ipc_contract::CommandErrorV1::new(
-                "SCOPE_NOT_IMPLEMENTED",
-                "Named voice-focus selection is not available in this release.",
-                false,
-            ));
+        crate::ipc_contract::ReviewScope::Escalation => (None, "escalation".to_string(), true, None),
+        crate::ipc_contract::ReviewScope::VoiceFocus { focus_id } => {
+            if !crate::voice_focus::is_opaque_focus_id(&focus_id) {
+                return Err(crate::ipc_contract::CommandErrorV1::new(
+                    "INVALID_REVIEW_SCOPE",
+                    "The voice-focus identity is invalid. Reload the review workspace.",
+                    false,
+                )
+                .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+            }
+            (None, "voiceFocus".to_string(), false, Some(focus_id))
         }
     };
     if let Some(cursor) = cursor.as_deref() {
@@ -94,20 +163,34 @@ pub async fn get_review_page_v1(
             .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip));
         }
     }
-    let focus = crate::voice_focus::resolve(state.lock_data_dir().as_deref())
-        .map_err(|error| public_review_read_error(&error))?;
+    let data_dir = state.lock_data_dir().clone();
+    let focus = if let Some(expected_focus_id) = expected_focus_id.as_deref() {
+        Some(require_active_voice_focus(data_dir.as_deref(), expected_focus_id)?.segment_ids)
+    } else {
+        crate::voice_focus::resolve(data_dir.as_deref()).map_err(|error| public_review_read_error(&error))?
+    };
     let segment_queries = state.segment_queries();
+    let limit = limit.unwrap_or(100).clamp(1, 200);
     tokio::task::spawn_blocking(move || {
-        let page = segment_queries
-            .get_segments_page(
+        let page = if escalation_only {
+            segment_queries.get_escalation_review_page(limit, cursor.as_deref(), focus.as_deref())
+        } else {
+            segment_queries.get_segments_page(
                 Some(false),
                 query.as_deref(),
                 "oldest",
-                limit.unwrap_or(100).clamp(1, 200),
+                limit,
                 cursor.as_deref(),
                 focus.as_deref(),
             )
-            .map_err(|error| public_review_read_error(&error.to_string()))?;
+        }
+        .map_err(|error| public_review_read_error(&error.to_string()))?;
+        // A bound page must still describe the active file policy when it leaves the worker. This
+        // second read closes the material query window for atomic policy replacements; a stale id is
+        // reported loudly instead of returning rows from a retired focus generation.
+        if let Some(expected_focus_id) = expected_focus_id.as_deref() {
+            require_active_voice_focus(data_dir.as_deref(), expected_focus_id)?;
+        }
         let total = i64::try_from(page.total).map_err(|_| {
             crate::ipc_contract::CommandErrorV1::new(
                 "REVIEW_PAGE_FAILED",
@@ -147,6 +230,55 @@ pub async fn get_review_page_v1(
         )
         .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
     })?
+}
+
+#[cfg(test)]
+mod voice_focus_scope_tests {
+    use super::*;
+
+    fn write_focus(dir: &Path, ids: &[&str]) {
+        std::fs::write(
+            dir.join(crate::voice_focus::VOICE_FOCUS_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "private owner label",
+                "segment_ids": ids,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn exact_active_focus_identity_is_accepted_without_exposing_private_policy_data() {
+        let dir = tempfile::tempdir().unwrap();
+        write_focus(dir.path(), &["segment-b", "segment-a"]);
+        let discovered = crate::voice_focus::resolve_binding(Some(dir.path())).unwrap().unwrap();
+        let accepted = require_active_voice_focus(Some(dir.path()), &discovered.focus_id).unwrap();
+
+        assert_eq!(accepted.segment_ids.len(), 2);
+        assert!(accepted.segment_ids.contains("segment-a"));
+        assert!(!accepted.focus_id.contains("private owner label"));
+        assert!(!accepted.focus_id.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn changed_missing_and_broken_focus_policies_fail_closed_with_public_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_focus(dir.path(), &["segment-old"]);
+        let stale = crate::voice_focus::resolve_binding(Some(dir.path())).unwrap().unwrap().focus_id;
+
+        write_focus(dir.path(), &["segment-new"]);
+        assert_eq!(require_active_voice_focus(Some(dir.path()), &stale).unwrap_err().code, "STALE_VOICE_FOCUS");
+
+        std::fs::remove_file(dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE)).unwrap();
+        assert_eq!(require_active_voice_focus(Some(dir.path()), &stale).unwrap_err().code, "VOICE_FOCUS_NOT_ACTIVE");
+
+        std::fs::write(dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE), b"{ broken").unwrap();
+        let error = require_active_voice_focus(Some(dir.path()), &stale).unwrap_err();
+        assert_eq!(error.code, "VOICE_FOCUS_POLICY_INVALID");
+        assert!(!error.message.contains(dir.path().to_string_lossy().as_ref()));
+        assert!(!error.message.contains(crate::voice_focus::VOICE_FOCUS_FILE));
+    }
 }
 
 #[tauri::command]

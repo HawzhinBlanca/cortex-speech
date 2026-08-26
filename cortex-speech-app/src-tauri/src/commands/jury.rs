@@ -127,7 +127,7 @@ pub async fn run_t2_for_segment(
     let data_dir = state.lock_data_dir().clone();
     // T2 transport: direct Gemini (the passed key) by default, or OpenRouter (its key from secrets.env)
     // when the jury provider is "openrouter". `api_key`/`jury_model` are the resolved judge credentials.
-    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(&settings, &api_key, data_dir.as_deref());
+    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(&settings, &api_key, data_dir.as_deref())?;
     // Floor at 3: self-consistency is meaningless below 3 samples, and a misconfigured 1 would let a
     // single Gemini sample masquerade as a "majority". majority_vote also requires >= 2 agreeing
     // samples, so this is defense in depth at the config boundary.

@@ -5,16 +5,47 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 /** Commands */
 export const commands = {
 	/**
+	 *  Discover only the opaque identity and cardinality of the active focus. The private policy name,
+	 *  individual segment ids and owner data-dir path never cross IPC.
+	 */
+	getActiveVoiceFocusV1: () => typedError<{
+	focusId: string,
+	segmentCount: number,
+} | null, CommandErrorV1>(__TAURI_INVOKE("get_active_voice_focus_v1")),
+	/**
 	 *  Versioned review queue read. Each rendered row and `baseRevision` originate in one SQLite result
 	 *  row, so a concurrent writer cannot pair old text with a newer compare-and-swap token. The read and
 	 *  DTO hydration stay off the desktop main thread even for a live-sized library.
 	 */
 	getReviewPageV1: (scope: ReviewScope, limit: number | null, cursor: string | null) => typedError<ReviewPageV1, CommandErrorV1>(__TAURI_INVOKE("get_review_page_v1", { scope, limit, cursor })),
 	/**
-	 *  Versioned, compare-and-swap desktop review boundary. Legacy callers remain registered while the
-	 *  renderer migrates one review domain at a time.
+	 *  Versioned, compare-and-swap desktop review boundary. The legacy command name remains registered
+	 *  only to return `TYPED_REVIEW_REQUIRED`; it has no production write path.
 	 */
 	commitReviewV1: (request: CommitReviewRequestV1) => typedError<CommittedReviewV1, CommandErrorV1>(__TAURI_INVOKE("commit_review_v1", { request })),
+	/**
+	 *  Record a technical inability to review this clip. This is not a transcript decision and therefore
+	 *  neither requires nor creates playback evidence, reviewer compensation or human truth.
+	 */
+	markSegmentUnusableV1: (request: MarkSegmentUnusableRequestV1) => typedError<MarkedSegmentUnusableV1, CommandErrorV1>(__TAURI_INVOKE("mark_segment_unusable_v1", { request })),
+	/**
+	 *  Start a policy-4 desktop playback attempt bound to one live media grant and the current immutable
+	 *  clip identity.  The server creates the receipt capability before the media element can play; the
+	 *  capability alone never authorizes a decision.
+	 */
+	beginDesktopPlaybackSessionV1: (segmentId: string, mediaGrantId: string, expectedRevision: number, clientAttemptId: string) => typedError<DesktopPlaybackSessionV1, CommandErrorV1>(__TAURI_INVOKE("begin_desktop_playback_session_v1", { segmentId, mediaGrantId, expectedRevision, clientAttemptId })),
+	/**
+	 *  Retire a superseded policy-4 authority only while it is still an unfinalized renderer attempt.
+	 *  The exact receipt/client-attempt pair prevents an old AudioPlayer instance from cancelling a
+	 *  newer one. Replays after successful retirement are harmless; finalized evidence fails closed.
+	 */
+	cancelDesktopPlaybackSessionV1: (playbackReceiptId: string, clientAttemptId: string) => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("cancel_desktop_playback_session_v1", { playbackReceiptId, clientAttemptId })),
+	/**
+	 *  Finalize the exact interval union observed under one server-issued playback session.  The
+	 *  database stores the interval rows and policy-4 receipt atomically; a retry with the same union is
+	 *  idempotent, while any altered replay fails closed.
+	 */
+	finalizeDesktopPlaybackSessionV1: (playbackReceiptId: string, mediaGrantId: string, intervals: PlaybackIntervalV1[]) => typedError<DesktopPlaybackReceiptV1, CommandErrorV1>(__TAURI_INVOKE("finalize_desktop_playback_session_v1", { playbackReceiptId, mediaGrantId, intervals })),
 	/**
 	 *  Load the non-authoritative desktop draft for one clip. Draft text never participates in review
 	 *  truth, exports, evaluation, readiness, compensation, or serving queries.
@@ -35,9 +66,38 @@ export const commands = {
 	 *  saved against a newer server state.
 	 */
 	deleteReviewDraftV1: (segmentId: string, baseRevision: number) => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("delete_review_draft_v1", { segmentId, baseRevision })),
+	/**
+	 *  Read one authoritative settings snapshot and its opaque compare-and-swap revision atomically.
+	 *  API-key values and private app-owned paths are absent from the generated renderer contract.
+	 */
+	getSettingsV1: () => typedError<SettingsSnapshotV1, CommandErrorV1>(__TAURI_INVOKE("get_settings_v1")),
+	/**
+	 *  Apply only explicitly changed preference fields against the exact snapshot revision. A stale
+	 *  writer cannot replace unrelated newer state; an exact response-loss replay succeeds only when
+	 *  its complete requested effect is already authoritative.
+	 */
+	patchSettingsV1: (patch: SettingsPatchV1) => typedError<SettingsPatchResultV1, CommandErrorV1>(__TAURI_INVOKE("patch_settings_v1", { patch })),
+	/**
+	 *  Change one cloud permission as an explicit privacy transaction. Withdrawals stop live egress
+	 *  before persistence; grants become effective only after durable settings publication.
+	 */
+	setCloudConsentV1: (request: SetCloudConsentRequestV1) => typedError<SettingsPatchResultV1, CommandErrorV1>(__TAURI_INVOKE("set_cloud_consent_v1", { request })),
 };
 
 /* Types */
+/**
+ *  Renderer-safe discovery result for the currently active file-owned voice focus. The identifier
+ *  is an opaque digest of the exact semantic allow-list; private voice names, ids and paths stay in
+ *  the owner data directory.
+ */
+export type ActiveVoiceFocusV1 = {
+	focusId: string,
+	segmentCount: number,
+};
+
+// Consent remains an explicit privacy transaction instead of an ordinary preference field.
+export type CloudConsentKindV1 = "llm" | "jury";
+
 export type CommandErrorDetailV1 = string | number | boolean;
 
 export type CommandErrorV1 = {
@@ -57,7 +117,7 @@ export type CommitReviewRequestV1 = {
 	decision: ReviewDecisionV1,
 	transcript: string | null,
 	reasonCode: string | null,
-	playbackReceiptId: string | null,
+	playbackReceiptId: string,
 };
 
 export type CommittedReviewV1 = {
@@ -67,7 +127,43 @@ export type CommittedReviewV1 = {
 	decisionId: string,
 };
 
+export type DesktopPlaybackReceiptV1 = {
+	playbackReceiptId: string,
+	segmentId: string,
+	segmentRevision: number,
+	uniquePlayedMs: number,
+	clipDurationMs: number,
+	coverageRatio: number,
+};
+
+export type DesktopPlaybackSessionV1 = {
+	playbackReceiptId: string,
+	segmentId: string,
+	segmentRevision: number,
+	clipDurationMs: number,
+	expiresAtMs: number,
+};
+
+export type MarkSegmentUnusableRequestV1 = {
+	operationId: string,
+	segmentId: string,
+	baseRevision: number,
+	reason: TechnicalUnusableReasonV1,
+};
+
+export type MarkedSegmentUnusableV1 = {
+	segmentId: string,
+	committedRevision: number,
+	reason: TechnicalUnusableReasonV1,
+	effectId: string,
+};
+
 export type OperationEventV1 = { type: "started"; operationId: string } | { type: "progress"; operationId: string; completed: number; total: number } | { type: "completed"; operationId: string } | { type: "failed"; operationId: string; error: CommandErrorV1 } | { type: "cancelled"; operationId: string } | { type: "halted"; operationId: string; haltedBy: string };
+
+export type PlaybackIntervalV1 = {
+	startMs: number,
+	endMs: number,
+};
 
 export type ProductAttestationV1 = {
 	proofManifestSha256: string,
@@ -93,6 +189,55 @@ export type ProofRunManifestV1 = {
 	results: ProofGateResultV1[],
 	logs: { [key in string]: string },
 	artifactHashes: { [key in string]: string },
+};
+
+/**
+ *  Renderer-safe settings snapshot. This deliberately omits API-key values and the app's internal
+ *  data/model/output paths. The revision is an opaque server-owned compare-and-swap token; the
+ *  renderer must never synthesize it from these fields.
+ */
+export type RendererSettingsV1 = {
+	asr_model_size: string,
+	use_finetuned_asr: boolean,
+	vad_threshold: number,
+	min_segment_duration_ms: number,
+	max_segment_duration_ms: number,
+	num_asr_threads: number,
+	enable_gpu: boolean,
+	language: string,
+	export_format: string,
+	auto_normalize: boolean,
+	verbalize_numbers: boolean,
+	auto_align: boolean,
+	assign_speaker_from_filename: boolean,
+	enable_diarization: boolean,
+	enable_denoising: boolean,
+	autoplay_segments: boolean,
+	max_speakers: number,
+	max_wer_threshold: number,
+	max_cer_threshold: number,
+	enforce_quality_gates: boolean,
+	theme: string,
+	llm_mode: string,
+	llm_endpoint: string,
+	llm_api_key_configured: boolean,
+	cloud_llm_opt_in: boolean,
+	llm_system_prompt: string,
+	llm_model: string,
+	external_asr_script_path: string,
+	hf_train_ratio: number,
+	hf_val_ratio: number,
+	hf_test_ratio: number,
+	hf_split_seed: number,
+	hf_speaker_disjoint: boolean,
+	hf_license: string,
+	jury_cloud_opt_in: boolean,
+	jury_model: string,
+	jury_provider: string,
+	source_reference_models: string[],
+	jury_self_consistency_n: number,
+	jury_autonomy_level: string,
+	jury_t1_threshold: number,
 };
 
 export type ReviewDecisionV1 = "accept" | "edit" | "reject" | "skip";
@@ -121,11 +266,28 @@ export type ReviewPageV1 = {
 
 export type ReviewScope = { kind: "pending" } | { kind: "escalation" } | { kind: "search"; query: string } | { kind: "voiceFocus"; focusId: string };
 
+export type SetCloudConsentRequestV1 = {
+	expectedSettingsRevision: number,
+	consent: CloudConsentKindV1,
+	granted: boolean,
+};
+
 export type SettingValueV1 = string | number | boolean;
+
+export type SettingsPatchResultV1 = {
+	settingsRevision: number,
+	settings: RendererSettingsV1,
+	alreadyApplied: boolean,
+};
 
 export type SettingsPatchV1 = {
 	expectedSettingsRevision: number,
 	changedFields: { [key in string]: SettingValueV1 },
+};
+
+export type SettingsSnapshotV1 = {
+	settingsRevision: number,
+	settings: RendererSettingsV1,
 };
 
 export type SpeechSegment = {
@@ -209,6 +371,12 @@ export type SpeechSegment = {
 };
 
 export type SuggestedActionV1 = "retry" | "openHealth" | "openModels" | "reloadClip";
+
+/**
+ *  A closed technical classification, never a human transcript decision. Wire spellings are stable
+ *  camelCase reason codes so audit/export policy does not depend on localized prose.
+ */
+export type TechnicalUnusableReasonV1 = "decodeFailed" | "missingFile" | "permissionDenied" | "corruptContainer";
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

@@ -28,6 +28,9 @@ export default [
     },
     rules: {
       ...ts.configs.recommended.rules,
+      // TypeScript resolves type-space names such as RequestInfo; ESLint's JavaScript-only
+      // no-undef rule cannot distinguish that namespace and reports valid annotations as globals.
+      'no-undef': 'off',
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_' }],
       '@typescript-eslint/no-explicit-any': 'warn',
       'no-console': ['warn', { allow: ['warn', 'error'] }],
@@ -49,7 +52,14 @@ export default [
     },
   },
   {
-    ignores: ['dist/', 'node_modules/', 'src/lib/generated/', '*.config.*', '*.config.js', '*.config.cjs'],
+    ignores: [
+      'dist/',
+      'node_modules/',
+      'src/lib/generated/',
+      '*.config.*',
+      '*.config.js',
+      '*.config.cjs',
+    ],
   },
   prettier,
 ];

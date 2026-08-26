@@ -88,17 +88,13 @@ export interface EscalationTrendPoint {
 }
 
 export interface LabelQualityLift {
+  /** Count of scoreable triples; empty-normalizing references are excluded. */
   n: number;
   rawMicroCer: number;
   juryMicroCer: number;
   cerLift: number;
   liftCiLow: number;
   liftCiHigh: number;
-  /** Scored rows whose reference is identical to the jury verdict, so their jury error is zero by
-   *  construction. Accepting a clip copies the jury's output into the reference, so an accept scores
-   *  the jury against itself. When this equals `n`, `juryMicroCer` and `cerLift` are arithmetic, not
-   *  measurement, and must not be displayed as accuracy. */
-  selfReferentialN: number;
 }
 
 export interface FewShotExample {

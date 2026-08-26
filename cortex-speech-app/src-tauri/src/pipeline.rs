@@ -4,7 +4,9 @@ use crate::audio;
 use crate::cache::TranscriptCache;
 use crate::cancel::CancellationToken;
 use crate::chunking::{self, MAX_PCM_SAMPLES};
-use crate::db::{Database, SegmentHypothesis, SourceTranscriptRecord, SpeechSegment};
+use crate::db::{
+    ChampionTranscriptionSourceSnapshot, Database, SegmentHypothesis, SourceTranscriptRecord, SpeechSegment,
+};
 use crate::error::{AppError, AppResult};
 use crate::fingerprint::AudioFingerprint;
 use crate::models::ModelManager;
@@ -15,7 +17,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -56,6 +58,27 @@ pub struct TranscriptionDraft {
     /// same result, so a failed second write reported "failed" for a row the first commit had
     /// already changed — two owners for one commit. One inference, one commit, one owner.
     pub committed_by_pipeline: bool,
+}
+
+/// An imported segment bound to both its one-statement database snapshot and an immutable decoded-
+/// PCM source lease. The lease is deliberately owned by this value so it cannot be dropped between
+/// inference and the compare-and-swap commit.
+#[derive(Debug)]
+pub(crate) struct BoundTranscriptionSource {
+    snapshot: ChampionTranscriptionSourceSnapshot,
+    _source_lease: crate::media::VerifiedMediaSourceLease,
+}
+
+/// Batch-scoped single-flight cache for verified source leases. Segments cut from the same recording
+/// share one decoded-PCM verification and one immutable OS handle, while different recordings may
+/// still verify concurrently. The cache belongs to the batch and therefore outlives every worker.
+pub(crate) type TranscriptionSourceLeaseCache =
+    Mutex<HashMap<(String, String), Arc<OnceLock<Result<crate::media::VerifiedMediaSourceLease, String>>>>>;
+
+impl BoundTranscriptionSource {
+    pub(crate) fn segment(&self) -> &SpeechSegment {
+        &self.snapshot.segment
+    }
 }
 
 /// A primary transcript that was already computed for this exact PCM during the current operation.
@@ -254,15 +277,37 @@ fn log_hypothesis_population_failure(segment_id: &str, error: &AppError) {
     tracing::error!("Failed to populate ASR hypotheses for {segment_id}: {error}");
 }
 
-/// Resume decision: should this file be SKIPPED (its already-persisted segments adopted into the
-/// jury batch rather than re-processed)? A file is already done when EITHER the resume journal
-/// recorded it (`journaled`) OR — while resuming — its segments are already in the DB
-/// (`has_persisted_segments`). The second case closes the crash window between `persist_segments`
-/// (an atomic batch commit) and `mark_import_file_done`: the rows exist but the journal never saw
-/// them, so without it resume would re-persist and DUPLICATE every segment of the in-flight file.
-/// Only fires while resuming — a fresh import (`resuming == false`) must never skip.
-fn resume_should_skip_file(resuming: bool, journaled: bool, has_persisted_segments: bool) -> bool {
-    journaled || (resuming && has_persisted_segments)
+/// A durable row is adoptable on resume only when its transcript authority is complete. The journal
+/// is intentionally absent from this predicate: it is crash-recovery bookkeeping, not evidence that
+/// the champion ever replaced a placeholder, that a draft came from the current champion, or that no
+/// cloud path touched it. A real human accept/edit/reject outranks machine provenance; otherwise the
+/// exact current local champion must own a non-empty, non-placeholder draft.
+fn resume_segment_has_authoritative_transcript(seg: &SpeechSegment, champion_model_id: &str) -> bool {
+    let human_decision = seg.human_decision.as_deref().or(seg.verdict.as_deref());
+    let human_rejected = human_decision.is_some_and(|decision| {
+        ["reject", "human_reject"].iter().any(|candidate| decision.eq_ignore_ascii_case(candidate))
+    });
+    if human_rejected {
+        return true;
+    }
+    if let Some(text) = crate::quality::human_verified_text(seg) {
+        return !text.trim().is_empty() && !crate::quality::is_placeholder_transcript(text);
+    }
+    seg.model_version_id.as_deref() == Some(champion_model_id)
+        && !seg.cloud_call
+        && !seg.raw_transcript.trim().is_empty()
+        && !crate::quality::is_placeholder_transcript(&seg.raw_transcript)
+}
+
+/// Resume decision: a file is skipped only when the current database rows themselves prove complete
+/// authority. A journal entry with no rows, or rows with stale/placeholder/wrong-model/cloud drafts,
+/// must never mint completion merely because a previous process wrote "done" before crashing.
+fn resume_should_skip_file(resuming: bool, has_authoritative_segments: bool) -> bool {
+    resuming && has_authoritative_segments
+}
+
+fn resume_path_key(path: &str) -> String {
+    path.replace('/', "\\").to_lowercase()
 }
 
 fn insert_hypothesis_checked(
@@ -1324,8 +1369,9 @@ impl ProcessingPipeline {
     /// Measured 2026-08-10, which is why this changed: a 494-clip review queue was drafted 494/494 by
     /// `finetuned-mms-ckb` while `asr_model_size` said WSL7B and the champion sat up and idle on both
     /// GPUs. Nothing in the UI, the DB or any gate said so — the owner found it by reading the
-    /// transcripts. Measured gap on identical FLEURS ckb clips: 7.03% CER vs 9.32% (and the app runs
-    /// the int8 build, whose own baseline is 21.00%).
+    /// transcripts. Historical duplication-weighted experiments showed that the engines were
+    /// materially different, but those figures are not current model evidence. The operational
+    /// lesson does not depend on an accuracy claim: silent substitution destroys provenance.
     ///
     /// The desktop trust boundary clamps production to WSL7B. Smaller engines remain available only
     /// to explicit offline diagnostic/evaluation code, never as an interactive substitute.
@@ -1528,13 +1574,19 @@ impl ProcessingPipeline {
     /// The in-memory settings field is still honoured as a fallback: within the single session where
     /// the owner has just typed a key, it holds the value before any reload scrubs it, and refusing it
     /// there would be a surprising "I just entered it" failure.
-    fn jury_cloud_api_key(&self) -> Option<String> {
-        let from_store =
-            Path::new(&self.db_path).parent().and_then(|data_dir| crate::api_keys::ApiKeys::load(data_dir).gemini);
-        from_store.or_else(|| {
+    fn jury_cloud_api_key(&self) -> AppResult<Option<String>> {
+        let from_store = match Path::new(&self.db_path).parent() {
+            Some(data_dir) => {
+                crate::api_keys::ApiKeys::load(data_dir)
+                    .map_err(|error| AppError::Other(format!("Could not load the encrypted API-key store: {error}")))?
+                    .gemini
+            }
+            None => None,
+        };
+        Ok(from_store.or_else(|| {
             let typed = self.settings.llm_api_key.trim();
             (!typed.is_empty()).then(|| typed.to_string())
-        })
+        }))
     }
 
     fn reusable_source_reference_record(
@@ -1625,7 +1677,7 @@ impl ProcessingPipeline {
             return Ok(Vec::new());
         }
         let import_writes = self.import_write_store(db.path())?;
-        let Some(api_key) = self.jury_cloud_api_key() else {
+        let Some(api_key) = self.jury_cloud_api_key()? else {
             return Err(AppError::Other(
                 "Gemini API key is required for whole-file reference transcript when jury cloud opt-in \
                  is enabled. Save it from Settings (it goes to secrets.env, DPAPI-encrypted); note that \
@@ -1718,18 +1770,22 @@ impl ProcessingPipeline {
         cancel: Option<CancellationToken>,
         callback: impl Fn(PipelineEvent),
     ) -> AppResult<()> {
-        self.import_directory_with_agent_run_id(dir_path, cancel, None, None, callback)
+        self.import_directory_with_agent_run_id(dir_path, cancel, None, None, None, callback)
     }
 
     /// `resume_completed`: when resuming a crashed import, the set of file paths already imported in the
     /// interrupted run — they are skipped (their segments already persisted, per-file). `None` for a
     /// normal import, so the default path's behavior is unchanged.
+    /// `resume_job_id`: the atomically published successor journal created by the command before the
+    /// worker starts. When present, this worker validates and continues it instead of opening a gap by
+    /// creating another journal generation.
     pub fn import_directory_with_agent_run_id(
         &self,
         dir_path: &Path,
         cancel: Option<CancellationToken>,
         agent_run_id: Option<&str>,
         resume_completed: Option<&std::collections::HashSet<String>>,
+        resume_job_id: Option<&str>,
         callback: impl Fn(PipelineEvent),
     ) -> AppResult<()> {
         let db = self.open_db()?;
@@ -1768,10 +1824,17 @@ impl ProcessingPipeline {
         self.reset_finetuned_counters();
         callback(PipelineEvent::Phase { phase: "importing".into() });
         self.set_import_status(0, total, "");
-        // An empty selection is a successful no-op, not an import generation.  Recording a completed
-        // zero-file job pollutes the recovery journal and makes an accidental folder pick look like
-        // durable work.  Preserve the public event contract while leaving both journal tables clean.
+        // An empty FRESH selection is a successful no-op, not an import generation. A resume already
+        // owns a durable successor journal, however: silently reporting success would leave that row
+        // running and surface the same interruption again after restart. Fail while retaining it so
+        // the missing/moved source directory can be repaired without losing recovery authority.
         if total == 0 {
+            if resume_job_id.is_some() {
+                self.finish_import_status();
+                return Err(AppError::Validation(
+                    "Resume folder contains no supported audio files; the durable import journal was retained".into(),
+                ));
+            }
             callback(PipelineEvent::Completed { total: 0, succeeded: 0, failed: 0 });
             self.finish_import_status();
             return Ok(());
@@ -1792,12 +1855,53 @@ impl ProcessingPipeline {
         // crash window silently non-resumable.
         let import_jobs = self.import_job_store()?;
         let import_writes = self.import_write_store(db.path())?;
-        let job_id = import_jobs.begin_import(&dir_path.to_string_lossy(), total).map_err(|error| {
-            AppError::Other(format!("Could not create the durable import recovery journal: {error}"))
-        })?;
+        let dir_text = dir_path.to_string_lossy();
+        let job_id = if let Some(job_id) = resume_job_id {
+            if resume_completed.is_none() {
+                return Err(AppError::Validation(
+                    "A claimed resume journal requires resume authority; refusing to run it as a fresh import".into(),
+                ));
+            }
+            import_jobs.continue_import(job_id, &dir_text, total).map_err(|error| {
+                AppError::Other(format!(
+                    "Could not admit the claimed durable resume journal before audio work: {error}"
+                ))
+            })?;
+            job_id.to_string()
+        } else {
+            import_jobs.begin_import(&dir_text, total).map_err(|error| {
+                AppError::Other(format!("Could not create the durable import recovery journal: {error}"))
+            })?
+        };
         let mut succeeded = 0;
         let failed = 0; // halt-on-first-failure (2026-08-20): a COMPLETED import has zero failures by definition
         let mut imported_ids = Vec::new();
+
+        // A resume journal is only a hint about where the old process reached. Build the authority
+        // inventory from the current database, and bind it to the exact champion plus the current
+        // canonical PCM before any row can be adopted. Normalising only for lookup preserves the
+        // Windows case/separator re-run fix without changing the stored source path.
+        let (resume_champion_model_id, resume_paths_by_key, resume_journal_keys) = if let Some(done) = resume_completed
+        {
+            let champion_model_id = crate::review_pool::current_champion_7b_model_id(&db).map_err(|error| {
+                AppError::Other(format!(
+                    "Resume cannot establish the current OmniASR-7B champion; no prior row was adopted: {error}"
+                ))
+            })?;
+            let mut paths_by_key: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+            for stored in db.audio_paths_with_segments_under(&dir_path.to_string_lossy()).map_err(|error| {
+                AppError::Other(format!(
+                    "Resume could not inventory existing source paths under {}; no prior row was adopted: {error}",
+                    dir_path.display()
+                ))
+            })? {
+                paths_by_key.entry(resume_path_key(&stored)).or_default().push(stored);
+            }
+            let journal_keys = done.iter().map(|path| resume_path_key(path)).collect();
+            (Some(champion_model_id), paths_by_key, journal_keys)
+        } else {
+            (None, std::collections::HashMap::new(), std::collections::HashSet::new())
+        };
 
         for (idx, file) in files.iter().enumerate() {
             if let Some(ref token) = cancel {
@@ -1807,45 +1911,73 @@ impl ProcessingPipeline {
             let fname = file.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
             let file_path_str = file.to_string_lossy().to_string();
 
-            // P3.2 + resume-journal-gap fix: on resume, skip (adopt, never re-persist) any file whose
-            // segments are already in the DB. A file is "already done" two ways: (1) the resume journal
-            // recorded it, or (2) it is NOT journaled yet its rows exist — the crash landed in the window
-            // between persist_segments (an atomic batch commit) and mark_import_file_done, so the journal
-            // never saw it. Without case (2), resume reprocesses the in-flight file and DUPLICATES every
-            // segment. Query the existing ids once (resume only), then let resume_should_skip_file decide.
-            let resume_existing_ids: Vec<String> = if resume_completed.is_some() {
-                db.segment_ids_for_audio_path(&file_path_str).unwrap_or_else(|e| {
-                    tracing::warn!("resume: could not fetch segment ids for {file_path_str}: {e}");
-                    Vec::new()
-                })
-            } else {
-                Vec::new()
-            };
-            let journaled = resume_completed.is_some_and(|done| done.contains(&file_path_str));
-            // An UN-journaled file whose rows still hold placeholders/empty drafts is an interrupted
-            // STAGE, not a completed file (2026-08-20 external review; the 2026-08-14 incident's 36
-            // rows are exactly this state). Adopting it would publish a file the champion never
-            // finished. Discard the stage and re-import it from scratch — the per-file pipeline is
-            // the unit of atomicity, and the resume journal marks only files that truly finished.
-            // An unreadable placeholder check counts as incomplete: fail toward re-doing work, never
-            // toward publishing an unfinished stage.
-            let staged_incomplete = resume_completed.is_some()
-                && !journaled
-                && !resume_existing_ids.is_empty()
-                && db.audio_path_has_placeholder_rows(&file_path_str).unwrap_or(true);
-            if staged_incomplete {
+            // The old journal cannot make a row authoritative. Fetch every row under this logical
+            // Windows path (including case/separator variants), require a complete human/champion
+            // transcript on every row, and require every stored source identity to match the exact
+            // canonical PCM decoded in this run. A stale journal with zero rows therefore processes
+            // the file; placeholder/wrong-model/cloud/source-drift stages are rolled back and redone.
+            let file_key = resume_path_key(&file_path_str);
+            let journaled = resume_journal_keys.contains(&file_key);
+            let mut resume_existing_ids = Vec::new();
+            if resume_completed.is_some() {
+                let stored_paths = resume_paths_by_key.get(&file_key).cloned().unwrap_or_default();
+                if stored_paths.len() > 1 {
+                    return Err(AppError::Validation(format!(
+                        "Resume found multiple stored path spellings for {} ({:?}); refusing to choose one or adopt duplicate authority",
+                        file.display(), stored_paths
+                    )));
+                }
+                let lookup_path = stored_paths.first().map(String::as_str).unwrap_or(file_path_str.as_str());
+                resume_existing_ids = db.segment_ids_for_audio_path(lookup_path).map_err(|error| {
+                    AppError::Other(format!(
+                        "Resume could not determine whether {file_path_str} already has durable segments; import halted without reprocessing: {error}"
+                    ))
+                })?;
+            }
+
+            let mut has_authoritative_segments = false;
+            if !resume_existing_ids.is_empty() {
+                let segments = db.get_segments_by_ids(&resume_existing_ids).map_err(|error| {
+                    AppError::Other(format!(
+                        "Resume could not read the durable rows for {file_path_str}; import halted without rollback: {error}"
+                    ))
+                })?;
+                if segments.len() != resume_existing_ids.len() {
+                    return Err(AppError::Other(format!(
+                        "Resume read only {}/{} durable rows for {file_path_str}; refusing partial authority",
+                        segments.len(),
+                        resume_existing_ids.len()
+                    )));
+                }
+                let champion_model_id = resume_champion_model_id.as_deref().ok_or_else(|| {
+                    AppError::Other("resume authority was requested without a champion identity".to_string())
+                })?;
+                let (sample_rate, current_pcm) = audio::decode_to_pcm(file).map_err(|error| {
+                    AppError::Other(format!(
+                        "Resume could not verify the current canonical audio for {file_path_str}; existing rows were left untouched: {error}"
+                    ))
+                })?;
+                let current_content_hash = AudioFingerprint::content_hash(&current_pcm, sample_rate);
+                let source_identity_matches = resume_existing_ids.iter().try_fold(true, |matches, segment_id| {
+                    db.segment_audio_content_hash(segment_id)
+                        .map(|stored| matches && stored.as_deref() == Some(current_content_hash.as_str()))
+                })?;
+                has_authoritative_segments = source_identity_matches
+                    && segments
+                        .iter()
+                        .all(|segment| resume_segment_has_authoritative_transcript(segment, champion_model_id));
+            }
+
+            if !resume_existing_ids.is_empty() && !has_authoritative_segments {
                 tracing::warn!(
-                    "resume: {} left {} staged row(s) from an interrupted import — discarding the stage and re-importing",
+                    "resume: {} has {} row(s), but they do not prove current human/champion transcript and canonical-audio authority (journaled={}); discarding the replaceable stage and re-importing",
                     file_path_str,
-                    resume_existing_ids.len()
+                    resume_existing_ids.len(),
+                    journaled
                 );
                 import_writes.rollback_segments(&resume_existing_ids)?;
             }
-            if resume_should_skip_file(
-                resume_completed.is_some(),
-                journaled,
-                !resume_existing_ids.is_empty() && !staged_incomplete,
-            ) {
+            if resume_should_skip_file(resume_completed.is_some(), has_authoritative_segments) {
                 import_jobs.mark_import_file_done(&job_id, &file_path_str).map_err(|error| {
                     AppError::Other(format!(
                         "Could not durably journal resumed file {file_path_str}; import halted: {error}"
@@ -2248,15 +2380,13 @@ impl ProcessingPipeline {
             // rows, sole champion hypotheses and cross-session audio identity share one savepoint.
             import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?;
             prepared
+        } else if identity.spectral != 0 {
+            // Compatibility publication is still one source operation: rows and identity commit
+            // together, and a changed recording at the same logical path rolls the whole batch back.
+            import_writes.publish_segments_with_identity(&prepared, &identity)?;
+            prepared
         } else {
-            let persisted = self.persist_segments(&import_writes, prepared)?;
-            // Non-champion compatibility path: retain the historical best-effort fingerprint stamp.
-            if identity.spectral != 0 {
-                if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
-                    tracing::warn!("audio identity not persisted for {}: {e}", path.display());
-                }
-            }
-            persisted
+            self.persist_segments(&import_writes, prepared)?
         };
         // Deferred to AFTER the 7B pass so both evaluate the real transcript, not the placeholder, and
         // so alignment does not clobber the slice offsets the pass depends on. See persist_segments.
@@ -2535,15 +2665,11 @@ impl ProcessingPipeline {
         let persisted = if let Some(deployment_sha256) = champion_deployment.as_deref() {
             import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?;
             prepared
+        } else if identity.spectral != 0 {
+            import_writes.publish_segments_with_identity(&prepared, &identity)?;
+            prepared
         } else {
-            let persisted = self.persist_segments(&import_writes, prepared)?;
-            // Non-champion compatibility path retains the historical best-effort identity stamp.
-            if identity.spectral != 0 {
-                if let Err(e) = import_writes.set_audio_identity(&path.to_string_lossy(), &identity) {
-                    tracing::warn!("audio identity not persisted for {}: {e}", path.display());
-                }
-            }
-            persisted
+            self.persist_segments(&import_writes, prepared)?
         };
         // Deferred to here so both see the real transcript and alignment doesn't clobber offsets.
         self.shadow_log_loop0(db, &import_writes, &persisted);
@@ -3231,7 +3357,14 @@ impl ProcessingPipeline {
         let mut last_problem = String::from("7B produced no result");
         let mut infra = false;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.transcribe_with_champion_commit(Some(segment_id), audio_path, alignment_json, cancel, false) {
+            match self.transcribe_with_champion_commit(
+                Some(segment_id),
+                audio_path,
+                alignment_json,
+                cancel,
+                false,
+                None,
+            ) {
                 Ok(draft) => {
                     let usable = !draft.raw_text.trim().is_empty() && !draft.raw_text.contains("[Pending");
                     if usable {
@@ -3404,18 +3537,130 @@ impl ProcessingPipeline {
         result
     }
 
-    /// Transcribe an audio file, optionally limited to a source-time range from chunk metadata.
+    /// Draft an unbound standalone audio file without publishing it to an existing segment. Existing
+    /// segment callers must use [`Self::bind_existing_transcription_source`] +
+    /// [`Self::transcribe_bound`]; accepting an id here would recreate the ID/path mix-up this split
+    /// is designed to make unrepresentable.
     pub fn transcribe(
         &self,
         segment_id: Option<&str>,
         audio_path: &str,
         alignment_json: Option<&str>,
-        // Optional cancel flag threaded down to the WSL-7B subprocess poller so an in-flight 7B call is
-        // killed within ~50 ms of Cancel, not only between segments (import/batch callers pass their
-        // token; one-off callers pass None).
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> AppResult<TranscriptionDraft> {
-        self.transcribe_with_champion_commit(segment_id, audio_path, alignment_json, cancel, true)
+        if segment_id.is_some() {
+            return Err(AppError::Validation(
+                "E_TRANSCRIPTION_SOURCE_UNBOUND: existing-segment transcription requires immutable source authority"
+                    .into(),
+            ));
+        }
+        self.transcribe_with_champion_commit(None, audio_path, alignment_json, cancel, false, None)
+    }
+
+    /// Bind one already-imported segment to the exact database and decoded-PCM authority that will
+    /// be rechecked after inference. A list row may omit alignment JSON, but any supplied caller
+    /// value must still match; the database copy is always the value sent to the engine.
+    pub(crate) fn bind_existing_transcription_source(
+        &self,
+        segment_id: &str,
+        requested_audio_path: Option<&str>,
+        requested_alignment_json: Option<&str>,
+    ) -> AppResult<BoundTranscriptionSource> {
+        self.bind_existing_transcription_source_inner(segment_id, requested_audio_path, requested_alignment_json, None)
+    }
+
+    /// Batch variant of [`Self::bind_existing_transcription_source`]. A 500-segment recording used
+    /// to be decoded and hashed 500 times before inference; this shares exactly one verified lease
+    /// per (stored path, canonical PCM hash) without weakening the per-segment database snapshot.
+    pub(crate) fn bind_existing_transcription_source_cached(
+        &self,
+        segment_id: &str,
+        requested_audio_path: Option<&str>,
+        requested_alignment_json: Option<&str>,
+        lease_cache: &TranscriptionSourceLeaseCache,
+    ) -> AppResult<BoundTranscriptionSource> {
+        self.bind_existing_transcription_source_inner(
+            segment_id,
+            requested_audio_path,
+            requested_alignment_json,
+            Some(lease_cache),
+        )
+    }
+
+    fn bind_existing_transcription_source_inner(
+        &self,
+        segment_id: &str,
+        requested_audio_path: Option<&str>,
+        requested_alignment_json: Option<&str>,
+        lease_cache: Option<&TranscriptionSourceLeaseCache>,
+    ) -> AppResult<BoundTranscriptionSource> {
+        let runtime = self.shared_database_runtime(&self.db_path)?;
+        let snapshot = runtime
+            .open_read()?
+            .champion_transcription_source_snapshot(segment_id)?
+            .ok_or_else(|| AppError::Validation(format!("Segment '{segment_id}' no longer exists")))?;
+
+        if let Some(requested) = requested_audio_path {
+            if requested != snapshot.segment.audio_path {
+                return Err(AppError::Validation(format!(
+                    "E_TRANSCRIPTION_SOURCE_CHANGED: segment '{segment_id}' now names a different audio path; reload it before transcribing"
+                )));
+            }
+        }
+        if let Some(requested) = requested_alignment_json {
+            if snapshot.segment.alignment_json.as_deref() != Some(requested) {
+                return Err(AppError::Validation(format!(
+                    "E_TRANSCRIPTION_SOURCE_CHANGED: segment '{segment_id}' source span changed; reload it before transcribing"
+                )));
+            }
+        }
+        let expected_hash = snapshot.audio_content_hash.as_deref().ok_or_else(|| {
+            AppError::Validation(format!(
+                "E_TRANSCRIPTION_SOURCE_UNVERIFIED: segment '{segment_id}' has no canonical decoded-PCM identity; repair or re-import it before transcribing"
+            ))
+        })?;
+        if !crate::db::is_canonical_audio_content_hash(expected_hash) {
+            return Err(AppError::Validation(format!(
+                "E_TRANSCRIPTION_SOURCE_UNVERIFIED: segment '{segment_id}' has a malformed decoded-PCM identity; repair or re-import it before transcribing"
+            )));
+        }
+        let verify =
+            || crate::media::verify_current_source_lease(Path::new(&snapshot.segment.audio_path), expected_hash);
+        let source_lease = if let Some(cache) = lease_cache {
+            let key = (snapshot.segment.audio_path.clone(), expected_hash.to_string());
+            let verifier = {
+                let mut entries = cache.lock().unwrap_or_else(|poisoned| {
+                    tracing::warn!("Recovering poisoned batch transcription source-lease cache");
+                    poisoned.into_inner()
+                });
+                Arc::clone(entries.entry(key).or_insert_with(|| Arc::new(OnceLock::new())))
+            };
+            verifier.get_or_init(verify).clone()
+        } else {
+            verify()
+        }
+        .map_err(|error| {
+            AppError::Validation(format!(
+                "E_TRANSCRIPTION_SOURCE_CHANGED: current audio for segment '{segment_id}' does not match its imported identity: {error}"
+            ))
+        })?;
+        Ok(BoundTranscriptionSource { snapshot, _source_lease: source_lease })
+    }
+
+    /// Transcribe one source whose segment id, path, span, duration and decoded PCM are already bound.
+    pub(crate) fn transcribe_bound(
+        &self,
+        source: &BoundTranscriptionSource,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> AppResult<TranscriptionDraft> {
+        self.transcribe_with_champion_commit(
+            Some(&source.snapshot.segment.id),
+            &source.snapshot.segment.audio_path,
+            source.snapshot.segment.alignment_json.as_deref(),
+            cancel,
+            true,
+            Some(&source.snapshot),
+        )
     }
 
     /// Shared transcription implementation. Normal re-transcription commits the champion result
@@ -3428,7 +3673,14 @@ impl ProcessingPipeline {
         alignment_json: Option<&str>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
         commit_champion: bool,
+        expected_source: Option<&ChampionTranscriptionSourceSnapshot>,
     ) -> AppResult<TranscriptionDraft> {
+        if commit_champion && expected_source.is_none() {
+            return Err(AppError::Validation(
+                "E_TRANSCRIPTION_SOURCE_UNBOUND: existing-segment transcription requires immutable source authority"
+                    .into(),
+            ));
+        }
         let path = Path::new(audio_path);
         let duration_ms = audio::get_duration_ms(path)?;
         if duration_ms == 0 {
@@ -3479,7 +3731,7 @@ impl ProcessingPipeline {
                 let db = runtime.open_read()?;
 
                 // Stage 2: Dual-Pass LLM Refinement (OpenRouter when configured + key present)
-                let final_text = if let Some(refiner) = self.build_refiner() {
+                let final_text = if let Some(refiner) = self.build_refiner()? {
                     tracing::info!("Running LLM refinement on {} bytes...", raw_transcript.len());
                     let refine_result = if self.settings.ger_refinement_enabled {
                         // Generative error correction: prime the refiner with the N-best (populated
@@ -3555,12 +3807,17 @@ impl ProcessingPipeline {
                 drop(db);
                 if commit_champion {
                     let updated = import_writes
-                        .commit_champion_transcript_if_unreviewed(
+                        .commit_bound_champion_transcript_if_unreviewed(
                             &champion,
                             Some(&wsl_result.deployment_sha256),
                             normalized_transcript.as_deref(),
                             Some("external_provider"),
                             cloud_call,
+                            expected_source.ok_or_else(|| {
+                                AppError::Validation(
+                                    "E_TRANSCRIPTION_SOURCE_UNBOUND: champion commit lost its source authority".into(),
+                                )
+                            })?,
                         )
                         .map_err(|e| AppError::Other(format!("Failed to commit champion transcript: {e}")))?;
                     if !updated {
@@ -3605,7 +3862,7 @@ impl ProcessingPipeline {
             if let Some((onnx, vocab)) = Self::finetuned_model_paths() {
                 match Self::transcribe_chunk_finetuned(&onnx, &vocab, &chunk_pcm) {
                     Ok(raw_text) if !raw_text.trim().is_empty() => {
-                        let final_text = match self.build_refiner() {
+                        let final_text = match self.build_refiner()? {
                             Some(refiner) => match refiner.refine_text(&raw_text) {
                                 Ok(refined) => accept_refinement(&raw_text, &refined),
                                 Err(_) => raw_text.clone(),
@@ -3667,7 +3924,7 @@ impl ProcessingPipeline {
             // refinement + LOOP-0 with CURRENT settings — otherwise a refiner/settings change would be
             // ignored and the raw element would be contaminated with refined text.
             let raw = cached.raw_transcript.clone();
-            let refined = match self.build_refiner() {
+            let refined = match self.build_refiner()? {
                 Some(refiner) => match refiner.refine_text(&raw) {
                     Ok(refined) => accept_refinement(&raw, &refined),
                     Err(_) => raw.clone(),
@@ -3699,7 +3956,7 @@ impl ProcessingPipeline {
         })?;
 
         // Stage 2: Dual-Pass LLM Refinement (OpenRouter when configured + key present)
-        let final_text = if let Some(refiner) = self.build_refiner() {
+        let final_text = if let Some(refiner) = self.build_refiner()? {
             tracing::info!("Running LLM refinement on {} bytes...", raw_text.len());
             match refiner.refine_text(&raw_text) {
                 Ok(refined) => {
@@ -3840,13 +4097,13 @@ impl ProcessingPipeline {
     /// is present in secrets.env, route through OpenRouter instead — it is verified working and
     /// reaches Gemini-class models, whereas direct Gemini is commonly 429 quota-blocked. Respects
     /// `None` (refinement disabled) and `Local` (the user's own endpoint).
-    fn build_refiner(&self) -> Option<crate::llm_refiner::LlmRefiner> {
+    fn build_refiner(&self) -> AppResult<Option<crate::llm_refiner::LlmRefiner>> {
         use crate::settings::LlmMode;
         // When the user has not opted into cloud LLM, `effective_llm_mode()` downgrades
         // Gemini -> None, so no refiner (and therefore no outbound cloud call) is ever
         // constructed. Mirrors the gate in `llm_refinement_permitted`.
         if !self.llm_refinement_permitted() {
-            return None;
+            return Ok(None);
         }
         let refiner_from_settings = |mode: &LlmMode| {
             crate::llm_refiner::LlmRefiner::new(
@@ -3857,14 +4114,19 @@ impl ProcessingPipeline {
                 self.settings.llm_model.clone(),
             )
         };
-        match self.settings.effective_llm_mode() {
+        let refiner = match self.settings.effective_llm_mode() {
             LlmMode::None => None,
             LlmMode::Local => refiner_from_settings(&LlmMode::Local),
             LlmMode::Gemini => {
                 // secrets.env lives in the app data dir, next to the database.
                 if let Some(data_dir) = std::path::Path::new(&self.db_path).parent() {
-                    if let Some(openrouter_key) = crate::api_keys::ApiKeys::load(data_dir).openrouter {
-                        return crate::llm_refiner::LlmRefiner::for_openrouter(
+                    if let Some(openrouter_key) = crate::api_keys::ApiKeys::load(data_dir)
+                        .map_err(|error| {
+                            AppError::Other(format!("Could not load the encrypted API-key store: {error}"))
+                        })?
+                        .openrouter
+                    {
+                        return Ok(crate::llm_refiner::LlmRefiner::for_openrouter(
                             openrouter_key,
                             // Pass the CONFIGURED model, not an empty string (which silently defaulted to
                             // openai/gpt-4o-mini — a different family than the "Gemini" mode the owner chose,
@@ -3872,12 +4134,13 @@ impl ProcessingPipeline {
                             // to the Gemini-class model the user expects.
                             openrouter_model_id(&self.settings.llm_model),
                             self.settings.llm_system_prompt.clone(),
-                        );
+                        ));
                     }
                 }
                 refiner_from_settings(&LlmMode::Gemini)
             }
-        }
+        };
+        Ok(refiner)
     }
 
     /// Explicit offline diagnostic evaluation. This is intentionally not registered as shipped IPC.
@@ -3902,8 +4165,6 @@ impl ProcessingPipeline {
         // Open our own DB connection so no AppState lock is held across the (slow) decode+ASR loop —
         // mirrors run_gold_eval_asr. Holding the global db/pipeline mutexes here froze the whole UI.
         let db = self.open_db()?;
-        let gold_segments = crate::eval::list_gold_segments(&db)?;
-        let mut hypotheses = Vec::new();
 
         let model_dir = self.root_for_size(&model_size);
         let config = asr::AsrLoadConfig {
@@ -3914,41 +4175,21 @@ impl ProcessingPipeline {
         };
         self.asr_pool.warmup(&model_dir, &config)?;
 
-        for gold in &gold_segments {
+        crate::eval::run_gold_eval_with_transcriber(&db, model_id, |gold| {
             let path = std::path::Path::new(&gold.audio_path);
-            if !path.exists() {
-                tracing::warn!("Gold segment audio path does not exist: {}", gold.audio_path);
-                continue;
-            }
-
-            let (_sr, full_pcm) = match audio::decode_to_pcm(path) {
-                Ok(pcm) => pcm,
-                Err(e) => {
-                    tracing::warn!("Failed to decode gold segment {}: {}", gold.id, e);
-                    continue;
-                }
-            };
+            let (_sr, full_pcm) = audio::decode_to_pcm(path)?;
 
             let f32_pcm: Vec<f32> = full_pcm.iter().map(|&s| s as f32 / 32768.0).collect();
 
-            let res = self.asr_pool.with_service(&model_dir, &config, |asr| {
+            self.asr_pool.with_service(&model_dir, &config, |asr| {
                 if !asr.is_available() {
-                    return Err("ASR service unavailable".to_string());
+                    return Err(AppError::Other("ASR service unavailable".to_string()));
                 }
                 asr.transcribe(&f32_pcm, audio::TARGET_SAMPLE_RATE)
-            });
-
-            match res {
-                Ok((text, _conf, _source)) => {
-                    hypotheses.push((gold.id.clone(), text));
-                }
-                Err(e) => {
-                    tracing::warn!("ASR failed for gold segment {}: {}", gold.id, e);
-                }
-            }
-        }
-
-        crate::eval::run_gold_eval(&db, model_id, hypotheses)
+                    .map(|(text, _confidence, _source)| text)
+                    .map_err(AppError::Other)
+            })
+        })
     }
 
     pub fn populate_hypotheses(&self, db: &Database, segment_id: &str, f32_pcm: &[f32]) -> AppResult<()> {

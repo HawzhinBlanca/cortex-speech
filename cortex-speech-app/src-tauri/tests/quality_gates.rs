@@ -43,7 +43,7 @@ fn setup_db_with_audio() -> (Database, TempDir, PathBuf) {
     // These fixtures intentionally exercise the historical annotated-row quality metric, not the
     // schema-v60 human-decision write boundary. Author them only on the exact legacy schema where
     // whole-row review fields were legal; production schemas remain fail-closed.
-    assert_eq!(cortex_speech_app_lib::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+    assert_eq!(cortex_speech_app_lib::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
     (db, tmp, audio_dir)
 }
 

@@ -1,3 +1,5 @@
+import type { TranslationKey } from './i18n';
+
 /**
  * Machine-stable escalation reason codes, as recorded by the jury into `evidence_json`.
  *
@@ -25,6 +27,24 @@ export const KNOWN_REASON_CODES = [
 ] as const;
 
 export type ReasonCode = (typeof KNOWN_REASON_CODES)[number];
+
+const knownReasonCodeSet: ReadonlySet<string> = new Set(KNOWN_REASON_CODES);
+
+const reasonLabelKeys = {
+  low_snr: 'reason.low_snr',
+  clipping: 'reason.clipping',
+  single_recognizer: 'reason.single_recognizer',
+  model_disagreement: 'reason.model_disagreement',
+  uncalibrated_bucket: 'reason.uncalibrated_bucket',
+  policy_hold: 'reason.policy_hold',
+  missing_audio: 'reason.missing_audio',
+  t2_no_majority: 'reason.t2_no_majority',
+  t1_unresolved: 'reason.t1_unresolved',
+} as const satisfies Record<ReasonCode, TranslationKey>;
+
+export function isReasonCode(code: string): code is ReasonCode {
+  return knownReasonCodeSet.has(code);
+}
 
 export interface EscalationEvidence {
   /** Codes in the order the backend recorded them. Empty when the row carries none. */
@@ -73,8 +93,8 @@ export function parseEscalationEvidence(
  * untranslated string in the UI is a prompt to add the translation, whereas a dropped code is invisible
  * and stays that way.
  */
-export function reasonLabelKey(code: string): string | null {
-  return (KNOWN_REASON_CODES as readonly string[]).includes(code) ? `reason.${code}` : null;
+export function reasonLabelKey(code: string): TranslationKey | null {
+  return isReasonCode(code) ? reasonLabelKeys[code] : null;
 }
 
 /**

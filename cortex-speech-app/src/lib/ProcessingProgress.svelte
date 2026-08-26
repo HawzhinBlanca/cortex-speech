@@ -3,6 +3,7 @@
   // Replaces "the progress is a 10px line in the status bar" with a real bar + percent + elapsed +
   // ETA + always-visible stage chips. Reads the existing pipeline stores; the math lives in the
   // unit-tested progressStats.ts. Frontend-only — no backend/IPC change.
+  import LoaderCircle from '@lucide/svelte/icons/loader-circle';
   import { t } from './i18n';
   import { cancelOperation } from './commands';
   import {
@@ -115,14 +116,7 @@
   >
     <!-- Row 1: phase + live detail + percent + cancel -->
     <div class="flex items-center gap-3">
-      <svg class="animate-spin w-4 h-4 shrink-0 text-amber-400" fill="none" viewBox="0 0 24 24">
-        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
-        <path
-          class="opacity-75"
-          fill="currentColor"
-          d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-        />
-      </svg>
+      <LoaderCircle class="h-4 w-4 shrink-0 animate-spin text-amber-400" aria-hidden="true" />
       <span class="text-sm font-semibold text-default shrink-0">{phaseLabel}</span>
       {#if $pipelineStatus}
         <span class="text-xs text-cortex-400 truncate" title={$pipelineStatus}

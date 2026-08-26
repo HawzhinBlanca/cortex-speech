@@ -63,7 +63,7 @@ def main() -> int:
     #    Human writers (submit/save/draft paths persisting the reviewer's editText) stay legal —
     #    provenance is per-function, so the check is function-scoped, not line-scoped.
     machine_handlers = {
-        APP / "src" / "App.svelte": ["handleTranscribe"],
+        APP / "src" / "Workstation.svelte": ["handleTranscribe"],
         APP / "src" / "lib" / "ReviewMode.svelte": ["doRetranscribe"],
     }
     for path, names in machine_handlers.items():

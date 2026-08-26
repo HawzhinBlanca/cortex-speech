@@ -17,11 +17,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import AudioPlayer from './AudioPlayer.svelte';
 import AudioPlayerHost from '../../tests/fixtures/AudioPlayerHost.svelte';
+import { addPlaybackInterval, emptyPlaybackCoverage } from './playbackCoverage';
 import { notifications, type Notification } from './stores/notificationStore';
+import * as commandApi from './commands';
 
 vi.mock('./commands', () => ({
   registerMediaAsset: vi.fn(async (path: string) => ({ id: `grant-${path}`, path, expiresAt: '' })),
+  registerReviewMediaAsset: vi.fn(async (path: string) => ({
+    id: `review-grant-${path}`,
+    path,
+    expiresAt: '',
+  })),
   getMediaAssetUrl: vi.fn(async (id: string) => `C:/cache/${id}.wav`),
+  cancelDesktopPlaybackSessionV1: vi.fn(async () => true),
+  beginDesktopPlaybackSessionV1: vi.fn(
+    async (
+      segmentId: string,
+      _mediaGrantId: string,
+      expectedRevision: number,
+      clientAttemptId: string,
+    ) => ({
+      playbackReceiptId: `receipt-${clientAttemptId}`,
+      segmentId,
+      segmentRevision: expectedRevision,
+      clipDurationMs: 10_000,
+      expiresAtMs: Date.now() + 60_000,
+    }),
+  ),
 }));
 
 /** Pending play() settlers, so pause() can abort them the way a real media element does. */
@@ -79,6 +101,7 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
   let unsubscribe: () => void;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     installMediaElementStub();
     pendingPlays = [];
     pendingPlayResolvers = [];
@@ -119,6 +142,119 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     expect(get(notifications).length, 'no notification of any kind for a normal advance').toBe(0);
   });
 
+  it('keeps ordinary Library playback independent from review-proof authority', async () => {
+    render(AudioPlayer, {
+      props: { audioPath: 'D:/library/legacy-null-fingerprint.wav', clipKey: 'library-preview' },
+    });
+    await settle();
+
+    expect(commandApi.registerMediaAsset).toHaveBeenCalledWith(
+      'D:/library/legacy-null-fingerprint.wav',
+    );
+    expect(commandApi.registerReviewMediaAsset).not.toHaveBeenCalled();
+    expect(commandApi.beginDesktopPlaybackSessionV1).not.toHaveBeenCalled();
+  });
+
+  it('uses only a verified grant when a review surface requires playback proof', async () => {
+    render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/canonical.wav',
+        clipKey: 'seg-proof',
+        requirePlaybackProof: true,
+        expectedRevision: 0,
+      },
+    });
+    await settle();
+
+    expect(commandApi.registerReviewMediaAsset).toHaveBeenCalledWith('D:/review/canonical.wav');
+    expect(commandApi.registerMediaAsset).not.toHaveBeenCalled();
+    expect(commandApi.beginDesktopPlaybackSessionV1).toHaveBeenCalledWith(
+      'seg-proof',
+      'review-grant-D:/review/canonical.wav',
+      0,
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    );
+  });
+
+  it('reissues authority and clears old evidence when only the rendered revision changes', async () => {
+    const { rerender } = render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/same-source.wav',
+        clipKey: 'seg-same',
+        requirePlaybackProof: true,
+        expectedRevision: 7,
+      },
+    });
+    await settle();
+
+    const first = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls[0];
+    expect(first?.slice(0, 3)).toEqual(['seg-same', 'review-grant-D:/review/same-source.wav', 7]);
+
+    await rerender({ expectedRevision: 8 });
+    await settle();
+
+    const calls = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.slice(0, 3)).toEqual([
+      'seg-same',
+      'review-grant-D:/review/same-source.wav',
+      8,
+    ]);
+    expect(calls[1]?.[3]).not.toBe(calls[0]?.[3]);
+  });
+
+  it('retires the exact authority when URL resolution fails after begin succeeds', async () => {
+    vi.mocked(commandApi.getMediaAssetUrl).mockRejectedValueOnce(new Error('cache lookup failed'));
+    render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/url-failure.wav',
+        clipKey: 'seg-url-failure',
+        requirePlaybackProof: true,
+        expectedRevision: 4,
+      },
+    });
+    await settle();
+
+    const issuance = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls[0];
+    expect(issuance).toBeDefined();
+    const clientAttemptId = issuance![3];
+    expect(commandApi.cancelDesktopPlaybackSessionV1).toHaveBeenCalledWith(
+      `receipt-${clientAttemptId}`,
+      clientAttemptId,
+    );
+  });
+
+  it('retires every superseded A-B-A-B-A authority with its exact client attempt', async () => {
+    const { rerender, unmount } = render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/shared.wav',
+        clipKey: 'seg-a',
+        requirePlaybackProof: true,
+        expectedRevision: 0,
+      },
+    });
+    await settle();
+    for (const clipKey of ['seg-b', 'seg-a', 'seg-b', 'seg-a']) {
+      await rerender({ clipKey });
+      await settle();
+    }
+    unmount();
+    await settle();
+
+    const issuanceCalls = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls;
+    expect(issuanceCalls).toHaveLength(5);
+    expect(commandApi.cancelDesktopPlaybackSessionV1).toHaveBeenCalledTimes(5);
+    for (const issuance of issuanceCalls) {
+      const clientAttemptId = issuance[3];
+      expect(commandApi.cancelDesktopPlaybackSessionV1).toHaveBeenCalledWith(
+        `receipt-${clientAttemptId}`,
+        clientAttemptId,
+      );
+    }
+  });
+
   it('a genuinely undecodable clip is STILL reported', async () => {
     // The guard must not swallow real failures. A clip the WebView cannot decode rejects with
     // NotSupportedError, which nothing superseded — the reviewer has to see that one.
@@ -139,6 +275,56 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
       errors.length,
       'an undecodable clip is still an error the reviewer sees',
     ).toBeGreaterThan(0);
+  });
+
+  it('a media error retires an armed loop timer and remains terminal', async () => {
+    const { container } = render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/queue/decodes-then-fails.wav',
+        clipKey: 'seg-terminal-error',
+        autoplay: true,
+        startTime: 0,
+        endTime: 0.04,
+      },
+    });
+    await settle();
+    const audio = container.querySelector('audio')!;
+    audio.dispatchEvent(new Event('loadedmetadata'));
+    await settle();
+    resolveNewestPlay();
+    await settle();
+
+    const loopButton = container.querySelector<HTMLButtonElement>(
+      '[data-testid="audio-player-options"] button:last-child',
+    );
+    expect(loopButton).not.toBeNull();
+    loopButton!.click();
+    audio.dispatchEvent(new Event('error'));
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(audio.paused).toBe(true);
+    expect(pendingPlays, 'the retired clip-stop timer must not restart broken media').toHaveLength(
+      0,
+    );
+    expect(container.querySelector('[data-testid="audio-player-timeline"]')).toBeNull();
+  });
+
+  it('never renders non-finite media metadata into the clock or seek range', async () => {
+    const { container } = render(AudioPlayer, {
+      props: { audioPath: 'D:/queue/stream-like.wav', clipKey: 'seg-stream' },
+    });
+    await settle();
+
+    const audio = container.querySelector('audio')!;
+    Object.defineProperty(audio, 'duration', { configurable: true, value: Infinity });
+    audio.dispatchEvent(new Event('loadedmetadata'));
+    await settle();
+
+    const timeline = container.querySelector('[data-testid="audio-player-timeline"]');
+    expect(timeline, 'loaded media exposes the transport').not.toBeNull();
+    expect(timeline?.textContent).not.toMatch(/Infinity|NaN/);
+    expect(timeline?.querySelector('input[type="range"]')).toHaveAttribute('max', '0');
   });
 
   it('the next clip of the SAME recording is not still blocked by the previous failure', async () => {
@@ -176,23 +362,24 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
   });
 });
 
-describe('cumulative media-time accounting (playback evidence)', () => {
+describe('unique media-time accounting (playback evidence)', () => {
   // `audioError` proved the absence of a FAILURE, never the presence of listening. These pin the
   // measure that replaces it: media time actually advanced.
   function player() {
     // A minimal stand-in: `paused` is read-only on the real element, so the accounting rules are
     // exercised against a writable shape rather than a live media element.
     const el = { currentTime: 0, paused: false };
-    let heard = 0;
+    let coverage = emptyPlaybackCoverage();
     let last: number | null = null;
     const MAX = 1.5;
+    const CLIP_MS = 10_000;
     return {
       el,
       get heardMs() {
-        return heard;
+        return coverage.uniqueMs;
       },
       reset() {
-        heard = 0;
+        coverage = emptyPlaybackCoverage();
         last = null;
       },
       tick() {
@@ -202,7 +389,9 @@ describe('cumulative media-time accounting (playback evidence)', () => {
         }
         if (last !== null) {
           const d = el.currentTime - last;
-          if (d > 0 && d <= MAX) heard += d * 1000;
+          if (d > 0 && d <= MAX) {
+            coverage = addPlaybackInterval(coverage, last * 1000, el.currentTime * 1000, CLIP_MS);
+          }
         }
         last = el.currentTime;
       },
@@ -249,9 +438,7 @@ describe('cumulative media-time accounting (playback evidence)', () => {
       p.el.currentTime = t;
       p.tick();
     }
-    // Two listens of the first second are 2s of media time, but the clip is longer than that —
-    // coverage is decided by the backend against clip_duration_ms, and this only reports what played.
-    expect(Math.round(p.heardMs)).toBe(2000);
+    expect(Math.round(p.heardMs)).toBe(1000);
   });
 
   it('a new source resets the evidence', () => {

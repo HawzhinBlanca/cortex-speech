@@ -208,12 +208,12 @@ def test_frontend_has_no_generic_whole_row_segment_writer() -> None:
 
 
 def test_app_export_audio_excludes_human_rejected() -> None:
-    """App.svelte handleExportAudio must filter the exported clip ids with isVerifiedGood (verified AND NOT
+    """Workstation.svelte handleExportAudio must filter ids with isVerifiedGood (verified AND NOT
     human-rejected), never raw s.verified: markBad finalizes a REJECTED clip with verified=true (to pull it
     out of the review queue), so a plain s.verified filter ships human-rejected clips + their bad transcripts
     into the 'verified audio' dataset as if human-gold — the export-honesty / count-must-exclude-rejected
     class. The SettingsPanel export and the Rust export_dataset (!is_human_rejected) already exclude them."""
-    body = _function_body(_read("src/App.svelte"), "async function handleExportAudio(")
+    body = _function_body(_read("src/Workstation.svelte"), "async function handleExportAudio(")
     if "isVerifiedGood(s)" not in body:
         raise AssertionError(
             "handleExportAudio does not filter with isVerifiedGood — a raw s.verified filter exports "
@@ -245,7 +245,7 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
     """The main library may play and inspect transcript/diff data, but only ReviewMode can correct and
     approve it. Its remaining partial writer is statically and dynamically limited to speaker/alignment
     metadata, and no frontend call may send annotatedTranscript or verified through it."""
-    app = _read("src/App.svelte")
+    app = _read("src/Workstation.svelte")
     commands = _read("src/lib/commands.ts")
     review_mode = _read("src/lib/ReviewMode.svelte")
 
@@ -265,7 +265,7 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
     present = [marker for marker in forbidden_ui if marker in app]
     if present:
         raise AssertionError(
-            "App.svelte still exposes a library review mutation path: "
+            "Workstation.svelte still exposes a library review mutation path: "
             + ", ".join(repr(marker) for marker in present)
         )
 
@@ -533,7 +533,7 @@ def test_batch_verify_controls_are_not_reachable_and_review_mode_owns_approval()
     restore gate. Keep the compatibility IPC wrapper out of the reachable UI, and leave ReviewMode's
     atomic human-decision command as the approval path.
     """
-    app = _read("src/App.svelte")
+    app = _read("src/Workstation.svelte")
     commands = _read("src/lib/commands.ts")
     forbidden = (
         "handleBatchVerify(",
@@ -544,7 +544,7 @@ def test_batch_verify_controls_are_not_reachable_and_review_mode_owns_approval()
     present = [marker for marker in forbidden if marker in app]
     if present:
         raise AssertionError(
-            "App.svelte must not expose legacy batch verification under schema v60; found "
+            "Workstation.svelte must not expose legacy batch verification under schema v60; found "
             + ", ".join(repr(marker) for marker in present)
         )
 
@@ -587,7 +587,7 @@ def test_selection_reseats_playback_centrally_for_store_only_selections() -> Non
     endTime while the UI shows the new clip — the reviewer verifies one clip while HEARING another. The reset
     MUST live in a $selectedSegmentId-keyed effect so EVERY selection path gets it. Runtime is Svelte reactive
     glue + an <audio> element, not unit-testable; source-pinned (hunt-4 / iter 160)."""
-    src = _read("src/App.svelte")
+    src = _read("src/Workstation.svelte")
     marker = "const id = $selectedSegmentId;"
     start = src.find(marker)
     if start == -1:
@@ -644,55 +644,25 @@ def test_a_skip_never_clears_the_reviewers_draft_on_either_route() -> None:
             )
 
 
-def test_post_jury_cer_is_withheld_when_every_row_scored_the_jury_against_itself() -> None:
-    """RefineryPanel must not print a post-jury CER that is zero by arithmetic.
+def test_post_jury_cer_uses_the_independently_persisted_jury_transcript() -> None:
+    """Do not revive the legacy verdict-vs-itself suppression.
 
-    The lift's reference is the human's confirmed transcript, and ACCEPTING a clip copies the jury's
-    own verdict into it — so an accepted row scores the jury against itself and contributes zero jury
-    error whatever the jury produced. Measured on the real library on 2026-08-03: 39 of 39 scored rows.
-    The card was therefore showing "Post-jury CER 0.0%" with a 95% CI as if it were accuracy, and
-    "CER lift = raw - jury" was the raw ASR error wearing the jury's name.
-
-    Pinned at source for the reason this whole file exists: the frontend tests are pure functions and
-    the project has no component-mount harness, so the branch cannot be asserted by rendering it.
+    Schema v48 persists the machine's `jury_transcript` independently from the later human-owned
+    verdict text. Exact jury/reference matches are now valid zero-error observations. The former
+    `selfReferentialN` heuristic confused correctness with identity and hid a genuinely perfect jury.
     """
     src = _read("src/lib/RefineryPanel.svelte")
+    if "{#if lift && lift.n > 0}" not in src:
+        raise AssertionError("RefineryPanel must display a non-empty independently measured lift")
+    for stale in ("selfReferentialN", "refinery-lift-self-referential"):
+        if stale in src:
+            raise AssertionError(f"RefineryPanel revived the invalid verdict-vs-itself heuristic: {stale}")
 
-    # The guard itself: numbers only when at least one row is NOT self-referential.
-    for needle in (
-        "lift.selfReferentialN >= lift.n",
-        'data-testid="refinery-lift-self-referential"',
-    ):
-        if needle not in src:
-            raise AssertionError(
-                f"RefineryPanel.svelte lost the self-referential guard ({needle!r}): a post-jury CER "
-                f"of 0.0% would again be presented as measured accuracy when it is forced arithmetic."
-            )
-
-    # The WITHHOLDING branch must be the `{#if}` and the numbers the `{:else if}`. Swap them and the
-    # numbers render first for every row, with the explanation unreachable — the guard string would
-    # still be in the file, so a mere "is it present" check calls that fine.
-    #
-    # (An earlier version of this check compared string OFFSETS, which the swap does not change: both
-    # branch conditions keep their positions relative to the grid. It passed the very regression it was
-    # written for. Pinning the two conditions to their exact roles is what actually holds.)
-    withhold_branch = "{#if lift && lift.n > 0 && lift.selfReferentialN >= lift.n}"
-    numbers_branch = "{:else if lift && lift.n > 0}"
-    if withhold_branch not in src or numbers_branch not in src:
-        raise AssertionError(
-            "the lift card must WITHHOLD first and show numbers only as the fallback:\n"
-            f"  expected `{withhold_branch}` then `{numbers_branch}`\n"
-            "  swapping them renders the forced-zero CER for every row and makes the explanation dead code"
-        )
-    if src.index(numbers_branch) < src.index(withhold_branch):
-        raise AssertionError("the numbers branch precedes the withholding branch; the guard never runs")
-
-    # And the partial case must still disclose the count rather than showing a quietly diluted figure.
-    if "lift.selfReferentialN > 0" not in src:
-        raise AssertionError(
-            "RefineryPanel.svelte no longer discloses how many rows were accepted verbatim when only "
-            "SOME are self-referential; the displayed lift is then diluted with no way to tell"
-        )
+    backend = _read("src-tauri/src/eval.rs")
+    if "SELECT annotated_transcript, raw_transcript, jury_transcript" not in backend:
+        raise AssertionError("label-quality lift no longer reads the independent jury transcript")
+    if "self_referential_n" in backend:
+        raise AssertionError("backend revived the invalid exact-match-is-self-reference field")
 
 
 def test_certified_segment_count_is_withheld_while_the_certificate_is_uncalibrated() -> None:
@@ -769,12 +739,12 @@ def test_a_failed_waveform_decode_is_not_rendered_as_a_silent_clip() -> None:
     same way — the existing user-visible error path is used instead of swallowing.
 
     BOTH waveform call sites are covered. ReviewMode was fixed first; grepping the class afterwards
-    found the identical swallow in App.svelte's curate view. Fixing one caller and leaving the other
+    found the identical swallow in Workstation.svelte's curate view. Fixing one caller and leaving the other
     is how a class of bug survives its own fix, so the guard pins both or it pins nothing.
     """
     for component, testid in (
         ("src/lib/ReviewMode.svelte", "review-waveform-error"),
-        ("src/App.svelte", "curate-waveform-error"),
+        ("src/Workstation.svelte", "curate-waveform-error"),
     ):
         src = _read(component)
         body = _function_body(src, "  async function loadWaveform(")
@@ -933,31 +903,55 @@ def test_review_decisions_stay_on_screen_in_one_sticky_bar() -> None:
     tests cannot observe. What CAN regress silently is someone dropping the sticky positioning or
     moving a decision back out of the bar, and that is exactly what this catches.
     """
-    src = _read("src/lib/ReviewMode.svelte")
+    owner = _read("src/lib/ReviewMode.svelte")
+    bar_src = _read("src/lib/ReviewActionBar.svelte")
 
-    if "position: sticky;" not in src or ".review-action-bar" not in src:
+    # Follow the live composition seam instead of assuming the bar's markup and CSS remain embedded in
+    # ReviewMode. Requiring both the exact import and mount keeps this from passing on an unused/dead
+    # component while still allowing the large workspace to shed presentation-only lines.
+    if "import ReviewActionBar from './ReviewActionBar.svelte';" not in owner:
+        raise AssertionError("ReviewMode no longer imports the one authoritative ReviewActionBar")
+    mount_start = owner.find("<ReviewActionBar")
+    if mount_start == -1:
+        raise AssertionError("ReviewMode no longer mounts the one authoritative ReviewActionBar")
+    mount_end = owner.find("/>", mount_start)
+    if mount_end == -1:
+        raise AssertionError("ReviewMode's ReviewActionBar mount is malformed")
+    mount = owner[mount_start : mount_end + 2]
+    for decision, callback in (
+        ("accept as-is", "onAccept={() => void submit(true)}"),
+        ("save & next", "onSave={() => void submit(false)}"),
+        ("mark bad audio", "onReject={() => void markBad()}"),
+        ("undo", "onUndo={() => void undoLast()}"),
+    ):
+        if callback not in mount:
+            raise AssertionError(
+                f"ReviewMode no longer wires the {decision!r} decision through its mounted action bar"
+            )
+
+    if "position: sticky;" not in bar_src or ".review-action-bar" not in bar_src:
         raise AssertionError(
             "ReviewMode's action bar is no longer sticky — the accept/save/bad-audio/undo decisions fall "
             "below the fold at 1280x720. ReviewInbox's .verb-bar is the reference pattern."
         )
     # `fixed` would leave the flow and could then cover the waveform or a 200%-zoom reflow; `sticky`
     # keeps its space and only pins once it would scroll away.
-    if "position: fixed" in src:
+    if "position: fixed" in bar_src:
         raise AssertionError(
             "the review action bar must be `sticky`, not `fixed` — a fixed bar leaves the flow and can "
             "sit on top of the waveform, the transcript, or a zoomed/reflowed layout"
         )
 
-    bar_start = src.find('data-testid="review-action-bar"')
+    bar_start = bar_src.find('data-testid="review-action-bar"')
     if bar_start == -1:
         raise AssertionError('the sticky bar lost its data-testid="review-action-bar" hook')
     # The bar's markup runs to the end of the template (</div> chain before <style>).
-    bar = src[bar_start : src.find("<style>", bar_start)]
+    bar = bar_src[bar_start : bar_src.find("<style>", bar_start)]
     for decision, handler in (
-        ("accept as-is", "submit(true)"),
-        ("save & next", "submit(false)"),
-        ("mark bad audio", "onclick={markBad}"),
-        ("undo", "undoLast()"),
+        ("accept as-is", "onclick={onAccept}"),
+        ("save & next", "onclick={onSave}"),
+        ("mark bad audio", "onclick={onReject}"),
+        ("undo", "onclick={onUndo}"),
     ):
         if handler not in bar:
             raise AssertionError(

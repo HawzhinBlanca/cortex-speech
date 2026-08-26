@@ -146,7 +146,7 @@ fn an_export_declares_which_recordings_were_processed_before_import() {
 }
 
 #[test]
-fn the_shared_export_filter_drops_rejected_and_placeholder_rows() {
+fn the_shared_export_filter_drops_rejected_placeholder_and_technical_unusable_rows() {
     // Audit #11/#12: export_audio applied neither filter, so a human-REJECTED clip (verified is
     // deliberately true on it) and a placeholder-only clip both shipped in the audio export while
     // every other exporter dropped them. Enforced at the shared root so no caller can miss it.
@@ -163,16 +163,29 @@ fn the_shared_export_filter_drops_rejected_and_placeholder_rows() {
     placeholder.normalized_transcript = None;
     placeholder.annotated_transcript = None;
     placeholder.human_decision = None;
-    for s in [&good, &rejected, &placeholder] {
+    let mut technical = sample_segment("drop-technical-unusable");
+    technical.audio_path = "/technical.wav".into();
+    technical.rationale = crate::quality::canonical_technical_unusable_rationale(
+        "missingFile",
+        &"a".repeat(64),
+        Some(&"b".repeat(64)),
+        7,
+    );
+    for s in [&good, &rejected, &placeholder, &technical] {
         db.insert_legacy_segment_fixture(s).unwrap();
     }
     db.record_human_decision("drop-rejected", "reject", None, None).unwrap();
     let rejected = db.get_segment_by_id("drop-rejected").unwrap().unwrap();
     let placeholder = db.get_segment_by_id("drop-placeholder").unwrap().unwrap();
+    let technical = db.get_segment_by_id("drop-technical-unusable").unwrap().unwrap();
 
-    let kept = exclude_unexportable_segments(&db, vec![good, rejected, placeholder]).unwrap();
+    let kept = exclude_unexportable_segments(&db, vec![good, rejected, placeholder, technical]).unwrap();
     let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, vec!["keep-good"], "rejected + placeholder rows must never leave the app: {ids:?}");
+    assert_eq!(
+        ids,
+        vec!["keep-good"],
+        "rejected + placeholder + technical-unusable rows must never leave the app: {ids:?}"
+    );
 }
 
 fn insert_machine_silver_segment_with_hf_coverage(
@@ -299,6 +312,26 @@ fn all_huggingface_metadata(out_dir: &std::path::Path) -> String {
     let validation_metadata = std::fs::read_to_string(out_dir.join("data/validation/metadata.csv")).unwrap_or_default();
     let test_metadata = std::fs::read_to_string(out_dir.join("data/test/metadata.csv")).unwrap_or_default();
     format!("{train_metadata}\n{validation_metadata}\n{test_metadata}")
+}
+
+/// Legacy fixture insertion deliberately omits the v51 PCM identity. Real imports never do. Bind
+/// every decodable fixture immediately before HF export so these tests exercise the production
+/// authority gate instead of accidentally modelling an incomplete legacy row.
+fn export_huggingface_dataset(
+    db: &Database,
+    dir: &std::path::Path,
+    settings: &crate::settings::AppSettings,
+) -> AppResult<()> {
+    for segment in db.get_segments(None)? {
+        if let Ok((sample_rate, pcm)) = crate::audio::decode_to_pcm(&segment.audio_path) {
+            let content_hash = crate::fingerprint::AudioFingerprint::content_hash(&pcm, sample_rate);
+            db.connection().execute(
+                "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+                rusqlite::params![segment.id, content_hash],
+            )?;
+        }
+    }
+    super::export_huggingface_dataset(db, dir, settings)
 }
 
 fn sample_segment(id: &str) -> SpeechSegment {
@@ -1213,6 +1246,43 @@ fn export_huggingface_writes_dataset_files() {
         let (hash, rel) = line.split_once("  ").unwrap();
         assert_eq!(hash, sha256_hex(&std::fs::read(out_dir.path().join(rel)).unwrap()));
     }
+}
+
+#[test]
+fn huggingface_export_rejects_same_path_audio_replacement() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let wav_path = tmp.path().join("same-path.wav");
+    write_silent_wav(&wav_path);
+    let mut segment = sample_segment("hf-source-drift");
+    segment.audio_path = wav_path.to_string_lossy().into_owned();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
+    let (sample_rate, pcm) = crate::audio::decode_to_pcm(&wav_path).unwrap();
+    let original_hash = crate::fingerprint::AudioFingerprint::content_hash(&pcm, sample_rate);
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+            rusqlite::params![segment.id, original_hash],
+        )
+        .unwrap();
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+    for index in 0..16000i32 {
+        writer.write_sample(((index % 257) - 128) as i16).unwrap();
+    }
+    writer.finalize().unwrap();
+
+    let out = tmp.path().join("hf-out");
+    let error = super::export_huggingface_dataset(&db, &out, &crate::settings::AppSettings::default()).unwrap_err();
+    assert!(error.to_string().contains("stored canonical PCM identity"));
+    assert!(!out.join("data").exists(), "the stale source must not publish a replacement dataset generation");
 }
 
 #[test]

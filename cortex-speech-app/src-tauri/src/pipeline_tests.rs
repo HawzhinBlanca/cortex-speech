@@ -171,21 +171,52 @@ fn resume_skips_persisted_but_unjournaled_file_to_avoid_duplicates() {
 
     // Fresh import (not resuming): never skip, even if the path somehow already has rows — a fresh
     // import of a previously-imported directory is a legitimate (separate) re-import, not a resume.
-    assert!(!resume_should_skip_file(false, false, false));
-    assert!(!resume_should_skip_file(false, false, true), "a fresh import must never skip on pre-existing rows");
+    assert!(!resume_should_skip_file(false, false));
+    assert!(!resume_should_skip_file(false, true), "a fresh import must never skip on pre-existing rows");
 
-    // Resuming, journal recorded the file: skip (pre-existing P3.2 behavior, preserved).
-    assert!(resume_should_skip_file(true, true, false));
+    // A stale journal entry with no authoritative rows is bookkeeping, not completion.
+    assert!(!resume_should_skip_file(true, false));
 
-    // Resuming, NOT journaled but segments already persisted: MUST skip. Before the fix this branch
-    // returned false and the in-flight file was reprocessed into duplicate segments.
+    // Resuming with rows that independently proved transcript + source authority: MUST skip. This
+    // includes the crash window where the rows committed but the journal did not.
     assert!(
-        resume_should_skip_file(true, false, true),
-        "resume must skip a persisted-but-unjournaled file, else duplicate segments on re-import"
+        resume_should_skip_file(true, true),
+        "resume must skip an authoritative persisted file, else duplicate segments on re-import"
     );
 
-    // Resuming, not journaled, no rows yet (a genuinely unprocessed file past the crash point): process it.
-    assert!(!resume_should_skip_file(true, false, false));
+    // Resuming with missing/placeholder/wrong-model/cloud/source-drift rows: process it.
+    assert!(!resume_should_skip_file(true, false));
+}
+
+#[test]
+fn resume_authority_rejects_placeholder_wrong_model_cloud_and_blank_drafts() {
+    use super::resume_segment_has_authoritative_transcript;
+
+    let mut segment = SpeechSegment {
+        raw_transcript: "دەنگێکی ڕاستەقینە".into(),
+        model_version_id: Some("champion-v1".into()),
+        ..SpeechSegment::default()
+    };
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+
+    segment.raw_transcript = "[Pending WSL 7B ASR]".into();
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.raw_transcript = "   ".into();
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.raw_transcript = "دەنگ".into();
+    segment.model_version_id = Some("wrong-model".into());
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.model_version_id = Some("champion-v1".into());
+    segment.cloud_call = true;
+    assert!(!resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+
+    // Durable human truth outranks the draft's machine provenance, including an explicit reject.
+    segment.human_decision = Some("edit".into());
+    segment.verdict_transcript = Some("دەقی مرۆڤ".into());
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
+    segment.human_decision = Some("reject".into());
+    segment.verdict_transcript = None;
+    assert!(resume_segment_has_authoritative_transcript(&segment, "champion-v1"));
 }
 
 #[test]
@@ -271,7 +302,7 @@ fn build_refiner_routes_gemini_through_openrouter_when_key_present() {
     let settings = AppSettings { llm_mode: LlmMode::Gemini, cloud_llm_opt_in: true, ..AppSettings::default() };
     let (pipeline, dir) = test_pipeline_with_settings(settings);
     std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
-    let refiner = pipeline.build_refiner().expect("a refiner should be built");
+    let refiner = pipeline.build_refiner().expect("API-key store should load").expect("a refiner should be built");
     assert!(
         refiner.endpoint.contains("openrouter.ai"),
         "Gemini mode + OpenRouter key should route through OpenRouter, got: {}",
@@ -296,7 +327,7 @@ fn build_refiner_none_mode_disables_refinement() {
     use crate::settings::LlmMode;
     let (pipeline, _dir) =
         test_pipeline_with_settings(AppSettings { llm_mode: LlmMode::None, ..AppSettings::default() });
-    assert!(pipeline.build_refiner().is_none());
+    assert!(pipeline.build_refiner().expect("API-key store should load").is_none());
 }
 
 #[test]
@@ -309,7 +340,10 @@ fn build_refiner_respects_cloud_opt_out() {
         ..AppSettings::default()
     });
     std::fs::write(dir.path().join("secrets.env"), "OPENROUTER_API_KEY=test-or-key\n").unwrap();
-    assert!(pipeline.build_refiner().is_none(), "cloud opt-out must disable refinement even with a key");
+    assert!(
+        pipeline.build_refiner().expect("API-key store should load").is_none(),
+        "cloud opt-out must disable refinement even with a key"
+    );
 }
 
 #[test]
@@ -325,7 +359,7 @@ fn cancelled_directory_import_clears_running_status() {
     let token = crate::cancel::CancellationToken::new();
     token.cancel(); // pre-cancel so the loop's first token.check()? returns Err before any decode
 
-    let res = pipeline.import_directory_with_agent_run_id(&import_dir, Some(token), None, None, |_evt| {});
+    let res = pipeline.import_directory_with_agent_run_id(&import_dir, Some(token), None, None, None, |_evt| {});
     assert!(res.is_err(), "a cancelled import returns Err");
     assert!(!pipeline.import_status().running, "running must be cleared after a cancelled import");
 }
@@ -358,6 +392,52 @@ fn import_refuses_before_audio_work_when_the_durable_journal_cannot_start() {
     assert_eq!(db.segment_count().unwrap(), 0, "no segment may publish without a durable recovery journal");
     let jobs: i64 = db.connection().query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0)).unwrap();
     assert_eq!(jobs, 0, "the failed journal transaction must not leave a partial generation");
+}
+
+#[test]
+fn resume_worker_refuses_an_unowned_journal_before_decode_and_preserves_the_successor() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    let crashed = db.begin_import_job("C:/recordings", 1).unwrap();
+    let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+    let import_dir = dir.path().join("resume_admission");
+    std::fs::create_dir_all(&import_dir).unwrap();
+    std::fs::write(import_dir.join("must-not-decode.wav"), b"not-real-audio").unwrap();
+    // The directory must match the claimed journal for a successful admission. Supplying a different,
+    // valid UUID models stale worker state and proves the durable check happens before audio decode.
+    let stale_job_id = uuid::Uuid::new_v4().to_string();
+    let resume_paths = std::collections::HashSet::new();
+    let error = pipeline
+        .import_directory_with_agent_run_id(&import_dir, None, None, Some(&resume_paths), Some(&stale_job_id), |_| {})
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("claimed durable resume journal"), "worker admission must be the terminal cause: {error}");
+    assert_eq!(db.segment_count().unwrap(), 0, "stale worker authority must fail before decode/publication");
+    let still_resumable = db.find_interrupted_import_job().unwrap().expect("claimed successor must survive refusal");
+    assert_eq!(still_resumable.id, successor);
+}
+
+#[test]
+fn resume_of_an_empty_or_moved_source_fails_without_consuming_the_successor_journal() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db = pipeline.open_db().unwrap();
+    db.initialize().unwrap();
+    let import_dir = dir.path().join("empty_resume");
+    std::fs::create_dir_all(&import_dir).unwrap();
+    let crashed = db.begin_import_job(&import_dir.to_string_lossy(), 2).unwrap();
+    let successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+    let resume_paths = std::collections::HashSet::new();
+
+    let error = pipeline
+        .import_directory_with_agent_run_id(&import_dir, None, None, Some(&resume_paths), Some(&successor), |_| {})
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("journal was retained"), "empty resume must be loud and recoverable: {error}");
+    assert_eq!(db.find_interrupted_import_job().unwrap().unwrap().id, successor);
 }
 
 #[test]
@@ -433,7 +513,7 @@ fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
     let data_dir = dir.path();
 
     // Nothing anywhere -> None, so the caller can say so instead of calling Gemini with "".
-    assert_eq!(pipeline.jury_cloud_api_key(), None, "no key anywhere must resolve to None");
+    assert_eq!(pipeline.jury_cloud_api_key().unwrap(), None, "no key anywhere must resolve to None");
 
     // A key in the ENCRYPTED store is found. Plaintext in secrets.env is a supported form
     // (parse_env_file reads both), which keeps this test independent of DPAPI availability.
@@ -446,7 +526,7 @@ fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
     std::fs::write(data_dir.join("secrets.env"), "GEMINI_API_KEY=AIzaFromTheStore\n").unwrap();
     let mut seen = None;
     for _ in 0..500 {
-        seen = pipeline.jury_cloud_api_key();
+        seen = pipeline.jury_cloud_api_key().expect("API-key store should load");
         if seen.is_some() {
             break;
         }
@@ -463,7 +543,7 @@ fn the_gemini_key_comes_from_the_encrypted_store_not_the_scrubbed_setting() {
     let typed = AppSettings { llm_api_key: "AIzaJustTyped".to_string(), ..AppSettings::default() };
     let (typed_pipeline, typed_dir) = test_pipeline_with_settings(typed);
     assert_eq!(
-        typed_pipeline.jury_cloud_api_key().as_deref(),
+        typed_pipeline.jury_cloud_api_key().unwrap().as_deref(),
         Some("AIzaJustTyped"),
         "a key typed in THIS session must still work before any reload scrubs it - refusing it would \
          be a surprising 'I just entered it' failure"
@@ -484,6 +564,113 @@ fn test_pipeline_with_settings(settings: AppSettings) -> (super::ProcessingPipel
         Arc::new(ModelManager::new(models_dir)),
     );
     (pipeline, dir)
+}
+
+#[test]
+fn existing_transcription_binding_rejects_cross_segment_path_and_pcm_drift() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(db_path.to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+
+    let write_wav = |path: &Path, sample: i16| {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..16_000 {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    };
+    let wav_a = dir.path().join("a.wav");
+    let wav_b = dir.path().join("b.wav");
+    write_wav(&wav_a, 1_000);
+    write_wav(&wav_b, 2_000);
+    let hash_a = crate::export_bundle::current_canonical_pcm_blake3(&wav_a).unwrap();
+
+    let alignment = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#;
+    let mut a = SpeechSegment {
+        id: "source-a".into(),
+        audio_path: wav_a.to_string_lossy().into_owned(),
+        duration_ms: 1_000,
+        alignment_json: Some(alignment.into()),
+        ..SpeechSegment::default()
+    };
+    a.raw_transcript = "incumbent".into();
+    db.insert_segment(&a).unwrap();
+    db.connection()
+        .execute("UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1", rusqlite::params![a.id, hash_a])
+        .unwrap();
+
+    let error = pipeline
+        .bind_existing_transcription_source("source-a", Some(wav_b.to_str().unwrap()), Some(alignment))
+        .expect_err("segment A paired with file B must fail before inference");
+    assert!(error.to_string().contains("E_TRANSCRIPTION_SOURCE_CHANGED"), "{error}");
+
+    // Replacing the bytes at A's path after import must be detected by decoded-PCM identity, even
+    // though the caller still supplies the same segment id, path and span.
+    write_wav(&wav_a, 3_000);
+    let error = pipeline
+        .bind_existing_transcription_source("source-a", Some(wav_a.to_str().unwrap()), Some(alignment))
+        .expect_err("same-path PCM replacement must fail closed");
+    assert!(error.to_string().contains("E_TRANSCRIPTION_SOURCE_CHANGED"), "{error}");
+}
+
+#[test]
+fn batch_transcription_binding_single_flights_one_shared_recording() {
+    let (pipeline, dir) = test_pipeline_with_settings(AppSettings::default());
+    let db_path = dir.path().join("db.sqlite");
+    let db = Database::open(db_path.to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+    let wav = dir.path().join("shared.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+    for sample in 0..32_000 {
+        writer.write_sample::<i16>((sample % 257) as i16).unwrap();
+    }
+    writer.finalize().unwrap();
+    let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&wav).unwrap();
+    let alignment = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":2}"#;
+
+    for id in ["shared-a", "shared-b"] {
+        db.insert_segment(&SpeechSegment {
+            id: id.into(),
+            audio_path: wav.to_string_lossy().into_owned(),
+            raw_transcript: "incumbent".into(),
+            alignment_json: Some(alignment.into()),
+            duration_ms: 1_000,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params![id, content_hash],
+            )
+            .unwrap();
+    }
+
+    let cache: super::TranscriptionSourceLeaseCache = Default::default();
+    let first = pipeline
+        .bind_existing_transcription_source_cached("shared-a", Some(wav.to_str().unwrap()), Some(alignment), &cache)
+        .unwrap();
+    let second = pipeline
+        .bind_existing_transcription_source_cached("shared-b", Some(wav.to_str().unwrap()), Some(alignment), &cache)
+        .unwrap();
+
+    assert_eq!(first._source_lease, second._source_lease, "both segments must hold the exact shared source lease");
+    let entries = cache.lock().unwrap();
+    assert_eq!(entries.len(), 1, "one recording/hash pair must have exactly one verifier cell");
+    assert!(entries.values().all(|entry| entry.get().is_some()), "the verifier cell must be initialized");
 }
 
 fn test_pipeline_for_status() -> (super::ProcessingPipeline, tempfile::TempDir) {

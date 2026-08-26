@@ -327,7 +327,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     if (cmd === 'get_audio_health') {
       return { totalFiles: sampleSegments().length, missingFiles: 0, missingPaths: [] };
     }
-    if (cmd === 'register_media_asset') {
+    if (cmd === 'register_media_asset' || cmd === 'register_review_media_asset') {
       const audioPath = String(args?.audioPath ?? '');
       return {
         id: `preview-${audioPath}`,
@@ -337,6 +337,35 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     }
     if (cmd === 'get_media_asset_url') {
       return 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+    }
+    if (cmd === 'begin_desktop_playback_session_v1') {
+      const segmentId = String(args?.segmentId ?? '');
+      const expectedRevision = Number(args?.expectedRevision ?? 0);
+      return {
+        playbackReceiptId: crypto.randomUUID(),
+        segmentId,
+        segmentRevision: expectedRevision,
+        clipDurationMs: 6200,
+        expiresAtMs: Date.now() + 30 * 60_000,
+      };
+    }
+    if (cmd === 'finalize_desktop_playback_session_v1') {
+      const intervals = Array.isArray(args?.intervals)
+        ? (args.intervals as Array<{ startMs?: number; endMs?: number }>)
+        : [];
+      const uniquePlayedMs = intervals.reduce(
+        (total, interval) =>
+          total + Math.max(0, Number(interval.endMs ?? 0) - Number(interval.startMs ?? 0)),
+        0,
+      );
+      return {
+        playbackReceiptId: String(args?.playbackReceiptId ?? ''),
+        segmentId: 'dev-preview-segment',
+        segmentRevision: 0,
+        uniquePlayedMs,
+        clipDurationMs: 6200,
+        coverageRatio: Math.min(1, uniquePlayedMs / 6200),
+      };
     }
     if (cmd === 'get_stats' || cmd === 'compute_stats' || cmd === 'get_dataset_stats')
       return sampleStats();

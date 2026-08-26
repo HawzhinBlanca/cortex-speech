@@ -42,7 +42,13 @@ def test_budget_counts_every_static_initial_dependency() -> None:
 
 
 def test_secondary_workspaces_are_literal_dynamic_imports_only() -> None:
-    app = read(REPO / "src" / "App.svelte")
+    root = read(REPO / "src" / "App.svelte")
+    if "import Workstation from './Workstation.svelte';" not in root or "<Workstation />" not in root:
+        raise AssertionError("App.svelte must statically compose the Workstation source audited below")
+    if len(root.splitlines()) > 350:
+        raise AssertionError("App.svelte exceeded the 350-line composition-shell ceiling")
+
+    app = read(REPO / "src" / "Workstation.svelte")
     components = (
         "SettingsPanel",
         "RefineryPanel",

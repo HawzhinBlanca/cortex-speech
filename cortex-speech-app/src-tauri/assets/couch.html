@@ -74,8 +74,8 @@
     "speakerChange": "more than one speaker",
     "stillSending": "{n} decision(s) have not been sent yet. Keep this page open until they go through.",
     "refused": "{n} decision(s) could not be saved: another reviewer got there first, or the link changed. Your typed text is kept — find those clips and review them again.",
-    "mustListen": "Not saved: play the whole clip first. A verdict on audio nobody heard is a guess.",
-    "editHint": "Listen, and correct the text if needed"
+    "mustListen": "Not saved: the server could not verify enough renderer-reported playback traversal for this clip. Replay it, then try again.",
+    "editHint": "Listen, then fix the text if needed"
   },
   "ckb": {
     "progress": "پارچەی {n} لە {total}",
@@ -109,7 +109,7 @@
     "speakerChange": "زیاتر لە یەک قسەکەر",
     "stillSending": "{n} بڕیار هێشتا نەنێردراون. ئەم پەڕەیە کراوە بهێڵەوە تا دەنێردرێن.",
     "refused": "{n} بڕیار پاشەکەوت نەکران: پێداچوونەوەرێکی تر پێشتر کردوویەتی، یان بەستەرەکە گۆڕاوە. دەقە نووسراوەکەت پارێزراوە — ئەو پارچانە بدۆزەرەوە و دووبارە پێداچوونەوەیان بۆ بکە.",
-    "mustListen": "پاشەکەوت نەکرا: سەرەتا گوێ لە هەموو پارچەکە بگرە. بڕیاردان لەسەر دەنگێک کە کەس گوێی لێ نەگرتووە، تەنیا مەزەندەیە.",
+    "mustListen": "پاشەکەوت نەکرا: ڕاژەکار نەیتوانی گەڕانی پەخشکردنی ڕاپۆرتکراو بۆ ئەم پارچەیە بە ڕادەی پێویست بسەلمێنێت. دووبارە پەخشی بکە و هەوڵ بدەرەوە.",
     "editHint": "گوێ بگرە، ئەگەر پێویست بوو دەقەکە ڕاست بکەرەوە"
   },
   "source": {
@@ -313,7 +313,7 @@
   <!-- ALWAYS available (R4.4), not just when the audio fails to load. Broken audio was only the most
        obvious way to meet a clip you cannot judge; two people talking over each other, or an accent you
        do not have, leaves you just as stuck. Without this the reviewer has exactly two ways forward and
-       BOTH write a verdict they cannot justify: accept, which promotes an unheard ASR draft to gold, or
+       BOTH write a verdict they cannot justify: accept, which promotes an unverified ASR draft to gold, or
        reject, which permanently excludes a clip that may be perfectly fine. Skipping writes nothing —
        it hands the clip to somebody who can judge it. Below the decision row, not in it: a fourth
        button among three would make the honest exit as prominent as the work. -->
@@ -684,8 +684,14 @@
   const OUTBOX = 'cortex.couch.outbox';
   const OUTBOX_OPERATION_PREFIX = OUTBOX + '.operation.';
   const OUTBOX_MIGRATION_LOCK = 'cortex.couch.outbox.migration.v2';
+  // A pre-policy-4 verdict has no server-issued playback authority. Send it once so an operation
+  // that already committed on an older server can still receive its exact idempotent ACK; if the
+  // current server refuses it, hold the immutable record for manual replay instead of hammering the
+  // endpoint forever or silently discarding the reviewer's transcript and verdict.
+  const PLAYBACK_UPGRADE_HOLD_PREFIX = 'cortex.couch.playback-upgrade.';
   const OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   const outboxOperationKey = (operationId) => OUTBOX_OPERATION_PREFIX + operationId;
+  const playbackUpgradeHoldKey = (operationId) => PLAYBACK_UPGRADE_HOLD_PREFIX + operationId;
   function newOperationId() {
     // `Math.random()` is not an operation identity: collisions here can alias two people's money.
     // randomUUID is ideal; getRandomValues keeps older embedded WebViews safe without weakening it.
@@ -882,6 +888,7 @@
   function removeSubmission(operationId) {
     if (!OPERATION_ID_PATTERN.test(operationId || '')) return;
     localStorage.removeItem(outboxOperationKey(operationId));
+    localStorage.removeItem(playbackUpgradeHoldKey(operationId));
   }
   // Decisions the server REFUSED on replay. Kept so the reviewer can be told, once, that specific work
   // did not land — silently discarding it after having toasted "Saved" is how a corpus quietly loses
@@ -964,6 +971,7 @@
       // A legacy decision that could not obtain AND persist a secure UUID is real work, but it is not
       // safe to transmit. Leave it untouched and make the persistent banner above the visible state.
       if (!item || !item.operationId) { showOutboxIdentityFailure(); return; }
+      if (localStorage.getItem(playbackUpgradeHoldKey(item.operationId)) !== null) continue;
       // Not mine to send. A decision names its author, and flushing someone else's under this cookie
       // would attribute their judgement to this reviewer. Left queued for whoever actually made it.
       // (Items with no author predate this field; sending them is still better than dropping work,
@@ -998,6 +1006,14 @@
         // the exact loss the fence exists to prevent (2026-08-20 hunt). Hold everything and stop —
         // the flush under the right identity sends it.
         if (e.status === 409 && item.reviewer && /was made by/.test(e.message || '')) return;
+        // A legacy verdict can only be an ACK on policy 4; it can never authorize a new write. Keep
+        // its exact operation record and draft, but mark it held after the server's explicit 428 so
+        // reconnect timers do not retry a permanently insufficient proof every thirty seconds.
+        if (e.status === 428 && item.action !== 'skip' && !item.playbackReceiptId) {
+          localStorage.setItem(playbackUpgradeHoldKey(item.operationId), 'policy-4-playback-required');
+          noteRefused(item.id);
+          continue;
+        }
         // Everything else (409 taken, 400 invalid) IS a real answer about this decision. Retrying can
         // never change it, so drop it rather than wedging the queue behind something that will never
         // land — but the reviewer's TYPED TEXT is not the server's to discard. Deleting the draft here
@@ -1022,6 +1038,96 @@
   }
   addEventListener('online', () => void flushOutbox());
 
+  // Playback policy 4 is a two-phase authority protocol. The server first binds an attempt to this
+  // cookie session, reviewer, segment revision, source hash and span. Only the audio element's GET
+  // carries that opaque attempt id; waveform decoding and speculative prefetch stay uncredited.
+  // Finalization later submits the renderer-reported media-time interval union and receives the only
+  // receipt a new verdict may carry.
+  let playbackAttempt = null;
+  let playbackPreparation = null;
+  let playbackPreparationSerial = 0;
+  let playbackPreparationAutoplay = false;
+  const playbackIdentity = (seg) => seg ? String(seg.id) + '\u0000' + String(seg.rowVersion ?? '') : null;
+  const plainAudioUrl = (seg) => '/api/audio/' + encodeURIComponent(seg.id);
+  const proofAudioUrl = (seg, receiptId) => plainAudioUrl(seg) + '?playbackAttemptId=' + encodeURIComponent(receiptId);
+  function playerCarriesAttempt(seg, receiptId) {
+    try {
+      const source = new URL($('player').src || '', location.href);
+      return source.pathname === plainAudioUrl(seg)
+        && source.searchParams.get('playbackAttemptId') === receiptId;
+    } catch { return false; }
+  }
+  function invalidatePlaybackPreparation() {
+    playbackPreparationSerial += 1;
+    playbackPreparation = null;
+    playbackPreparationAutoplay = false;
+    playbackAttempt = null;
+  }
+  async function preparePlayback(seg, autoplay) {
+    const identity = playbackIdentity(seg);
+    if (playbackAttempt && playbackAttempt.identity === identity
+        && playerCarriesAttempt(seg, playbackAttempt.playbackReceiptId)) {
+      if (autoplay) {
+        const started = $('player').play();
+        if (started && typeof started.catch === 'function') started.catch(() => {});
+      }
+      return playbackAttempt;
+    }
+    if (playbackPreparation && playbackPreparation.identity === identity) {
+      playbackPreparationAutoplay = playbackPreparationAutoplay || !!autoplay;
+      return playbackPreparation.promise;
+    }
+
+    const serial = ++playbackPreparationSerial;
+    const clientAttemptId = newOperationId();
+    playbackPreparationAutoplay = !!autoplay;
+    const promise = (async () => {
+      const authority = await api('/api/playback/start', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: seg.id, rowVersion: String(seg.rowVersion), clientAttemptId }),
+      });
+      if (serial !== playbackPreparationSerial || playbackIdentity(queue[i]) !== identity) return null;
+      if (authority.playbackContractVersion !== 4
+          || authority.clientAttemptId !== clientAttemptId
+          || authority.segmentId !== seg.id
+          || String(authority.segmentRevision) !== String(seg.rowVersion)
+          || Number(authority.clipDurationMs) !== Number(seg.durationMs)
+          || !OPERATION_ID_PATTERN.test(authority.playbackReceiptId || '')) {
+        throw new Error('invalid playback authority response');
+      }
+      playbackAttempt = {
+        identity,
+        clientAttemptId,
+        playbackReceiptId: authority.playbackReceiptId,
+        finalized: false,
+      };
+      resetPlaybackTraversalCoverage(identity);
+      const source = proofAudioUrl(seg, authority.playbackReceiptId);
+      $('player').src = source;
+      void loadWave(plainAudioUrl(seg));
+      if (playbackPreparationAutoplay) {
+        const started = $('player').play();
+        if (started && typeof started.catch === 'function') started.catch(() => {});
+      }
+      return playbackAttempt;
+    })().catch((error) => {
+      if (serial === playbackPreparationSerial && playbackIdentity(queue[i]) === identity) {
+        playbackAttempt = null;
+        // A jsdom/browser teardown can settle an aborted fetch after the document is gone. Production
+        // navigation needs no toast at that point, and touching the destroyed DOM creates an unhandled
+        // rejection that hides the original network outcome.
+        if (typeof document !== 'undefined' && document.getElementById('toast')) {
+          toast(t('saveFailed', { err: error.status || '—' }), true);
+        }
+      }
+      return null;
+    }).finally(() => {
+      if (playbackPreparation && playbackPreparation.serial === serial) playbackPreparation = null;
+    });
+    playbackPreparation = { identity, serial, promise };
+    return promise;
+  }
+
   // `autoplay` is true ONLY when the advance came from the reviewer deciding a clip (R2.2). A load, an
   // undo or a skip must not start audio on its own — those are navigation, not a rhythm. A skip in
   // particular is somebody saying "I cannot judge this": a burst of sound is the last thing they want.
@@ -1038,19 +1144,26 @@
       // Hiding the card does not stop the <audio> element inside it. The last clip kept playing behind
       // the empty state — forever, if loop was on — with every transport control now unreachable.
       $('player').pause();
+      invalidatePlaybackPreparation();
+      resetPlaybackTraversalCoverage(null);
       // Recomputed here, not just at load: a decision queued offline since then changes what the empty
       // state is allowed to claim.
       renderEmptyState();
       return;
     }
-    const audioUrl = '/api/audio/' + encodeURIComponent(seg.id);
-    // Re-assigning even the SAME src reloads the element, and loadstart zeroes heardMs — so a
-    // re-show of the clip already on screen (background refill, held position after a refusal)
-    // must not touch it, or real accumulated listening evaporates (2026-08-20 hunt).
-    if (!($('player').src || '').endsWith(audioUrl)) {
-      $('player').src = audioUrl;
-      void loadWave(audioUrl);
+    const evidenceIdentity = playbackIdentity(seg);
+    // A background queue refresh can keep the same segment id while advancing rowVersion. Playback
+    // is revision-bound, so that is a new evidence identity even when the audio URL itself is stable.
+    if (playbackTraversalIdentity !== evidenceIdentity) {
+      $('player').pause();
+      $('player').removeAttribute('src');
+      invalidatePlaybackPreparation();
+      resetPlaybackTraversalCoverage(evidenceIdentity);
     }
+    // Re-assigning even the SAME src reloads the element and zeroes traversal evidence — so a
+    // re-show of the clip already on screen (background refill, held position after a refusal)
+    // must not touch it, or real accumulated traversal evidence evaporates (2026-08-20 hunt).
+    void preparePlayback(seg, autoplay);
     $('player').playbackRate = speed;
     $('player').loop = looping;
     pausedByEdit = false; // a new clip owes the reviewer no rewind
@@ -1080,13 +1193,8 @@
     // why there is deliberately no welcome/Start screen: the first clip's own play button does the
     // unlocking, so the only cost is that clip 1 takes two taps instead of one.
     //
-    // If a browser refuses anyway, the rejected promise is swallowed and the reviewer gets exactly
-    // today's behaviour: a loaded clip waiting for them to press play. Never a thrown error, and never
-    // a state where the page thinks it is playing and is not.
-    if (autoplay) {
-      const started = $('player').play();
-      if (started && typeof started.catch === 'function') started.catch(() => {});
-    }
+    // `preparePlayback` performs autoplay only after the server-issued attempt is installed as the
+    // media URL. Playing a prefetched/plain URL must never create verdict authority.
   }
   // Warm the NEXT clip's audio while this one is being reviewed. The gap between clips is dead time,
   // and on a phone it is the difference between a steady rhythm and a stutter every few seconds.
@@ -1094,7 +1202,7 @@
   function prefetchNext() {
     const next = queue[i + 1];
     if (!next) return;
-    prefetched = new Audio('/api/audio/' + encodeURIComponent(next.id));
+    prefetched = new Audio(plainAudioUrl(next));
     prefetched.preload = 'auto';
     prefetched.load();
   }
@@ -1127,11 +1235,14 @@
       await ensureClaimed();
       await flushOutbox();
       const res = await api('/api/queue');
+      if (res.playbackContractVersion !== 4) {
+        throw new Error('Couch playback policy 4 is required');
+      }
       retryable = false;
       clearErr('load');
       // If the clip on screen survives into the fresh batch, STAY on it (2026-08-20 hunt): the 60s
-      // background retry lands mid-listen, and snapping to clip 0 re-assigns the src, which zeroes
-      // the accumulated heardMs — destroying real listening the 0.85 gate then makes them redo.
+      // background retry lands mid-playback, and snapping to clip 0 re-assigns the src, which zeroes
+      // the renderer-reported traversal union and makes the reviewer replay the clip.
       const showingId = queue[i] && queue[i].id;
       queue = res.items; i = 0; heldByOthers = res.heldByOthers || 0;
       if (showingId) {
@@ -1191,25 +1302,136 @@
       $('retry').textContent = '↻ ' + t('retry');
     }
   }
-  // Cumulative MEDIA time heard for the CURRENT clip. Not wall-clock, not a play() call, not a
-  // download: a clip can arrive, decode and sit at 0:00 while nobody hears a word of it. Only forward
-  // movement of a playing element counts, and a jump beyond one tick is a seek, not listening.
-  let heardMs = 0, lastPos = null;
+  // UNIQUE clip-relative media positions traversed by the renderer for the CURRENT attempt. This is
+  // deliberately not called "heard" or "listened": software can prove media-element traversal, not a
+  // person's physiology or attention. Replaying one half twice still covers only that half.
+  let playbackTraversalMs = 0, playbackTraversalIntervals = [], playbackTraversalIdentity = null, lastPos = null;
   const MAX_TICK_ADVANCE_S = 1.5;
-  (function trackHeardTime() {
+
+  function resetPlaybackTraversalBaseline() { lastPos = null; }
+  function resetPlaybackTraversalCoverage(identity) {
+    playbackTraversalMs = 0;
+    playbackTraversalIntervals = [];
+    playbackTraversalIdentity = identity || null;
+    resetPlaybackTraversalBaseline();
+  }
+  function currentPlaybackAttemptMatches(el) {
+    const seg = queue[i];
+    return !!seg && !!playbackAttempt
+      && playbackTraversalIdentity === playbackIdentity(seg)
+      && playbackAttempt.identity === playbackIdentity(seg)
+      && playerCarriesAttempt(seg, playbackAttempt.playbackReceiptId);
+  }
+  function playbackTraversalLimitMs(el) {
+    const mediaMs = Number(el.duration) * 1000;
+    const servedMs = Number(queue[i] && queue[i].durationMs);
+    const mediaValid = Number.isFinite(mediaMs) && mediaMs > 0;
+    const servedValid = Number.isFinite(servedMs) && servedMs > 0;
+    if (mediaValid && servedValid) return Math.floor(Math.min(mediaMs, servedMs));
+    if (mediaValid) return Math.floor(mediaMs);
+    if (servedValid) return Math.floor(servedMs);
+    return 0;
+  }
+  function addUniquePlaybackTraversalInterval(startMs, endMs, limitMs) {
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || !Number.isFinite(limitMs)
+        || limitMs <= 0 || endMs <= startMs) return;
+    const limit = Math.max(0, Math.floor(limitMs));
+    const start = Math.min(limit, Math.max(0, Math.ceil(startMs)));
+    const end = Math.min(limit, Math.max(0, Math.floor(endMs)));
+    if (end <= start) return;
+
+    const merged = [];
+    let nextStart = start, nextEnd = end, inserted = false;
+    for (const interval of playbackTraversalIntervals) {
+      if (interval.endMs < nextStart) { merged.push(interval); continue; }
+      if (nextEnd < interval.startMs) {
+        if (!inserted) { merged.push({ startMs: nextStart, endMs: nextEnd }); inserted = true; }
+        merged.push(interval);
+        continue;
+      }
+      nextStart = Math.min(nextStart, interval.startMs);
+      nextEnd = Math.max(nextEnd, interval.endMs);
+    }
+    if (!inserted) merged.push({ startMs: nextStart, endMs: nextEnd });
+    playbackTraversalIntervals = merged;
+    playbackTraversalMs = playbackTraversalIntervals.reduce(
+      (total, interval) => total + interval.endMs - interval.startMs,
+      0,
+    );
+  }
+  function observePlaybackTraversal(el) {
+    if (!currentPlaybackAttemptMatches(el)) { resetPlaybackTraversalBaseline(); return; }
+    const now = Number(el.currentTime);
+    if (!Number.isFinite(now) || now < 0) { resetPlaybackTraversalBaseline(); return; }
+    if (lastPos !== null) {
+      const delta = now - lastPos;
+      if (delta > 0 && delta <= MAX_TICK_ADVANCE_S) {
+        addUniquePlaybackTraversalInterval(lastPos * 1000, now * 1000, playbackTraversalLimitMs(el));
+      }
+    }
+    lastPos = now;
+  }
+  (function trackPlaybackTraversal() {
     const el = $('player');
     if (!el) return;
     el.addEventListener('timeupdate', () => {
-      if (el.paused) { lastPos = null; return; }
-      if (lastPos !== null) {
-        const d = el.currentTime - lastPos;
-        if (d > 0 && d <= MAX_TICK_ADVANCE_S) heardMs += d * 1000;
-      }
-      lastPos = el.currentTime;
+      if (el.paused) { resetPlaybackTraversalBaseline(); return; }
+      observePlaybackTraversal(el);
     });
-    // A new clip is new evidence; a previous clip's listen must never travel with the reviewer.
-    el.addEventListener('loadstart', () => { heardMs = 0; lastPos = null; });
+    // A new media load is a new grant/attempt boundary. A previous artifact's intervals never cross it.
+    el.addEventListener('loadstart', () => resetPlaybackTraversalCoverage(playbackIdentity(queue[i])));
+    // Every seek is a discontinuity, including small (<1.5s) slider/waveform jumps and native loops.
+    el.addEventListener('seeking', resetPlaybackTraversalBaseline);
+    el.addEventListener('seeked', () => {
+      if (!el.paused && currentPlaybackAttemptMatches(el) && Number.isFinite(el.currentTime)) lastPos = el.currentTime;
+    });
+    el.addEventListener('play', () => {
+      if (currentPlaybackAttemptMatches(el) && Number.isFinite(el.currentTime)) lastPos = el.currentTime;
+      else resetPlaybackTraversalBaseline();
+    });
+    el.addEventListener('pause', () => {
+      // Capture only media position the element actually reached; then fence the next play attempt.
+      if (lastPos !== null && currentPlaybackAttemptMatches(el)) observePlaybackTraversal(el);
+      resetPlaybackTraversalBaseline();
+    });
+    el.addEventListener('ended', () => {
+      if (lastPos !== null && currentPlaybackAttemptMatches(el)) observePlaybackTraversal(el);
+      resetPlaybackTraversalBaseline();
+    });
+    el.addEventListener('error', resetPlaybackTraversalBaseline);
+    el.addEventListener('abort', resetPlaybackTraversalBaseline);
+    el.addEventListener('emptied', () => resetPlaybackTraversalCoverage(playbackIdentity(queue[i])));
   })();
+
+  async function finalizePlaybackForDecision(seg) {
+    const identity = playbackIdentity(seg);
+    if (!playbackAttempt || playbackAttempt.identity !== identity) await preparePlayback(seg, false);
+    if (!playbackAttempt || playbackAttempt.identity !== identity) {
+      const error = new Error('playback authority is unavailable');
+      error.status = 428;
+      throw error;
+    }
+    if (!$('player').paused) observePlaybackTraversal($('player'));
+    if (playbackAttempt.finalized) return playbackAttempt.playbackReceiptId;
+    const expectedAttempt = playbackAttempt;
+    const finalized = await api('/api/playback/finalize', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        playbackReceiptId: expectedAttempt.playbackReceiptId,
+        clientAttemptId: expectedAttempt.clientAttemptId,
+        intervals: playbackTraversalIntervals.map((interval) => ({ ...interval })),
+      }),
+    });
+    if (playbackIdentity(queue[i]) !== identity || playbackAttempt !== expectedAttempt
+        || finalized.playbackContractVersion !== 4
+        || finalized.playbackReceiptId !== expectedAttempt.playbackReceiptId
+        || finalized.segmentId !== seg.id
+        || String(finalized.segmentRevision) !== String(seg.rowVersion)) {
+      throw new Error('invalid playback finalization response');
+    }
+    expectedAttempt.finalized = true;
+    return expectedAttempt.playbackReceiptId;
+  }
 
   async function decide(action) {
     if (busy || !queue[i]) return;
@@ -1222,23 +1444,23 @@
     const btns = ['save','accept','bad','skip','undo'].map($); btns.forEach(b => b.disabled = true);
     // rowVersion: the row fingerprint this clip was SERVED with — the server refuses the decision
     // if the draft changed in between, so what gets recorded is always judged-as-seen.
-    // heardMs travels WITH the decision: the server mints the receipt for the clip it served, and
-    // resolves the revision and audio fingerprint itself, so a client cannot claim to have heard
-    // a clip it never loaded.
+    // A non-skip verdict carries only the immutable receipt returned after policy-4 finalization.
+    // Finalization failure creates no outbox verdict, advances nowhere, and leaves the draft intact.
     let submission;
     try {
+      const playbackReceiptId = isSkip ? undefined : await finalizePlaybackForDecision(queue[i]);
       submission = { operationId: newOperationId(), id: queue[i].id, action, text: $('text').value, reviewer: me, rowVersion: queue[i].rowVersion,
                      pilotAfterReviewEventId: queue[i].pilotAfterReviewEventId,
-                     heardMs: Math.max(0, Math.round(heardMs)),
-                     clipDurationMs: Math.max(0, Math.round((($('player') || {}).duration || 0) * 1000)) };
+                     playbackReceiptId };
       // The durable write MUST precede the first network byte. If localStorage is unavailable/full,
       // do not submit: a server commit followed by a dropped response would otherwise have no stable
       // identity to replay, which is exactly the double-pay window this outbox closes.
       queueSubmission(submission);
-    } catch {
+    } catch (error) {
       // A persistence failure is NOT an offline/queued decision. Stay on the clip, keep the draft,
       // and never tell the reviewer work is durable when no outbox entry exists.
-      toast(t('saveFailed', { err: '—' }), true);
+      if (error.status === 428) toast(t('mustListen'), true);
+      else toast(t('saveFailed', { err: error.status || '—' }), true);
       busy = false;
       btns.forEach(b => b.disabled = false);
       return;
@@ -1316,8 +1538,17 @@
         // keeping it would replay a known refusal forever. Retryable/attribution failures returned
         // above and deliberately leave the exact durable entry intact.
         removeSubmission(submission.operationId);
-        if (e.status === 428) toast(t('mustListen'), true);
-        else toast(t('saveFailed', { err: e.status || '—' }), true);
+        if (e.status === 428) {
+          // Finalization succeeded, so a 428 here means the durable authority no longer matches the
+          // decision coordinates. It cannot be repaired by resending the same receipt: retire the
+          // local attempt, request a fresh exact grant, and require traversal again on this clip.
+          invalidatePlaybackPreparation();
+          resetPlaybackTraversalCoverage(playbackIdentity(queue[i]));
+          $('player').pause();
+          $('player').removeAttribute('src');
+          void preparePlayback(queue[i], false);
+          toast(t('mustListen'), true);
+        } else toast(t('saveFailed', { err: e.status || '—' }), true);
         // The server refused because someone else has this clip (409). Staying here would keep
         // re-submitting a decision that can never land, so move past it rather than trapping the reviewer.
         if (e.status === 409) { i += 1; show(); }
@@ -1340,20 +1571,21 @@
   }
   $('speed').onclick = () => { speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length]; applyTransport(); };
   $('loop').onclick  = () => { looping = !looping; applyTransport(); };
-  // Re-listening to the last couple of seconds is the single most repeated action in transcription,
+  // Replaying the last couple of seconds is the single most repeated action in transcription,
   // and dragging a phone-sized scrubber to do it is where the time goes.
   $('again').onclick = () => {
     // Clear the edit-pause flag FIRST: otherwise the play() below fires the `play` handler, which
     // rewinds another 2s on top of this one and the reviewer silently gets -4s.
     pausedByEdit = false;
+    resetPlaybackTraversalBaseline();
     $('player').currentTime = Math.max(0, $('player').currentTime - 2);
     void $('player').play();
   };
 
-  // ── pause to type, and hear the run-up again on resume (R2.3) ──────────────
+  // ── pause to type, and replay the run-up on resume (R2.3) ──────────────────
   // The Express Scribe / Descript mechanic, and the reason it matters here: a reviewer who reaches for
   // the textarea while audio is still running is trying to do two things at once, and loses the tail of
-  // what they just heard. Pausing on focus lets them type in quiet; rewinding 2s when they press play
+  // the current playback position. Pausing on focus lets them type in quiet; rewinding 2s on resume
   // again gives back the run-up, which is exactly the ↺2s button's amount, applied automatically at the
   // one moment it is always wanted. Only ever rewinds when THIS pause caused it — a manual pause is the
   // reviewer's own choice of position and must be left exactly where they put it.
@@ -1368,6 +1600,7 @@
   $('player').addEventListener('play', () => {
     if (!pausedByEdit) return;
     pausedByEdit = false;
+    resetPlaybackTraversalBaseline();
     $('player').currentTime = Math.max(0, $('player').currentTime - 2);
   });
 
@@ -1394,7 +1627,7 @@
       // row CAN clear the keyboard — but the browser scrolls the FOCUSED element into view, and that is
       // the transcript, which sits above the buttons. So the reviewer was left having to notice they
       // could scroll at all. Nudge the row itself, and only while they are actually typing: scrolling
-      // the page under someone who is merely listening would be the tool grabbing the wheel.
+      // the page under someone who is only playing audio would be the tool grabbing the wheel.
       //
       // Computed against the VISUAL viewport, not via scrollIntoView. `scrollIntoView({block:'end'})`
       // aligns to the LAYOUT viewport, and on iOS the layout viewport's bottom edge is the part hidden
@@ -1470,9 +1703,10 @@
   // element has no error handler, loadWave swallows the body in a bare catch, and show() hides #warn
   // on every clip. The reviewer saw a normal card with a player that did nothing — and no way past it,
   // because the queue only advances on a DECISION. Both available exits write a verdict they cannot
-  // justify: accept promotes an unheard ASR draft to gold, reject permanently excludes a clip that may
+  // justify: accept promotes an unverified ASR draft to gold, reject permanently excludes a clip that may
   // be fine. Say what happened, and offer the one honest action: move on without judging it.
   $('player').addEventListener('error', () => {
+    resetPlaybackTraversalBaseline();
     if (!queue[i]) return;
     // The skip button is always on screen now; this only NAMES the reason the reviewer is stuck, so
     // they do not sit waiting for audio that is never going to arrive.
@@ -1492,6 +1726,7 @@
     if (!dur || !isFinite(dur)) return;
     const r = $('wave').getBoundingClientRect();
     const x = (e.clientX - r.left) / r.width;
+    resetPlaybackTraversalBaseline();
     $('player').currentTime = Math.min(dur, Math.max(0, x * dur));
     void drawWave();
   });

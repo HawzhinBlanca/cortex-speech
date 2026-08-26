@@ -1,9 +1,11 @@
 <script lang="ts">
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import * as api from './commands';
   import { computeLocalDiff } from './diff/compute';
   import type { DiffResult } from './diff/types';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
+  import { formatPublicErrorReference } from './errorText';
 
   interface Props {
     raw: string;
@@ -42,7 +44,7 @@
       .catch((e) => {
         if (!cancelled) {
           diff = null;
-          error = String(e);
+          error = formatPublicErrorReference(e) ?? $t('errors.unknown');
         }
       })
       .finally(() => {
@@ -85,19 +87,10 @@
         {:else if diff}
           {$t('diff.similarity', { pct: diff.stats.similarity.toFixed(0) })}
         {/if}
-        <svg
+        <ChevronDown
           class="w-3 h-3 transition-transform {collapsed ? '' : 'rotate-180'}"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            stroke-width="2"
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
+          aria-hidden="true"
+        />
       </span>
     </button>
 

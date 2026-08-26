@@ -170,7 +170,7 @@ pub fn compute_quality_from_segments(segments: &[SpeechSegment]) -> DatasetQuali
 /// reject, pointed the other way. `placeholder_transcripts_count_as_low_confidence` and
 /// `pending_wsl_counts_as_low_confidence` pin that on purpose.
 fn counts_toward_shipped_quality(seg: &SpeechSegment) -> bool {
-    !is_human_rejected(seg)
+    !is_excluded_from_exports(seg)
 }
 
 pub fn compute_quality_from_segments_with_settings(
@@ -309,15 +309,87 @@ pub fn is_human_rejected(seg: &SpeechSegment) -> bool {
         || decision_is(seg.verdict.as_deref(), &["human_reject"])
 }
 
+/// Reserved, machine-readable rationale namespace for a durable technical-audio exclusion.
+///
+/// This is deliberately separate from [`is_human_rejected`]: unreadable audio is an equipment/file
+/// fact, not a human judgement about transcript truth. The immutable review-flag effect graph stores
+/// the exact rationale, while this strict parser prevents arbitrary free text from becoming an export
+/// exclusion by accident.
+pub(crate) const TECHNICAL_UNUSABLE_RATIONALE_PREFIX: &str = "technical_unusable:v1:";
+
+pub(crate) fn is_supported_technical_unusable_reason(reason: &str) -> bool {
+    matches!(reason, "decodeFailed" | "missingFile" | "permissionDenied" | "corruptContainer")
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn canonical_technical_unusable_rationale(
+    reason: &str,
+    source_path_sha256: &str,
+    audio_content_hash: Option<&str>,
+    review_revision: i64,
+) -> Option<String> {
+    if !is_supported_technical_unusable_reason(reason)
+        || !is_canonical_sha256(source_path_sha256)
+        || audio_content_hash.is_some_and(|hash| !is_canonical_sha256(hash))
+        || review_revision < 0
+    {
+        return None;
+    }
+    Some(format!(
+        "{TECHNICAL_UNUSABLE_RATIONALE_PREFIX}{reason}:path={source_path_sha256}:audio={}:revision={review_revision}",
+        audio_content_hash.unwrap_or("none")
+    ))
+}
+
+pub fn technical_unusable_reason_from_rationale(rationale: Option<&str>) -> Option<&str> {
+    let encoded = rationale?.strip_prefix(TECHNICAL_UNUSABLE_RATIONALE_PREFIX)?;
+    let mut fields = encoded.split(':');
+    let reason = fields.next()?;
+    let source_path_sha256 = fields.next()?.strip_prefix("path=")?;
+    let audio_content_hash = fields.next()?.strip_prefix("audio=")?;
+    let review_revision = fields.next()?.strip_prefix("revision=")?.parse::<i64>().ok()?;
+    if fields.next().is_some()
+        || !is_supported_technical_unusable_reason(reason)
+        || !is_canonical_sha256(source_path_sha256)
+        || (audio_content_hash != "none" && !is_canonical_sha256(audio_content_hash))
+        || review_revision < 0
+    {
+        return None;
+    }
+    Some(reason)
+}
+
+pub fn technical_unusable_reason(seg: &SpeechSegment) -> Option<&str> {
+    technical_unusable_reason_from_rationale(seg.rationale.as_deref())
+}
+
+pub fn is_technically_unusable(seg: &SpeechSegment) -> bool {
+    technical_unusable_reason(seg).is_some()
+}
+
+/// Single membership rule for artifacts that claim to contain usable reviewed/training material.
+/// Human rejection and technical unreadability stay distinct in audit/UI semantics, but both are
+/// fail-closed at every export boundary.
+pub fn is_excluded_from_exports(seg: &SpeechSegment) -> bool {
+    is_human_rejected(seg) || is_technically_unusable(seg)
+}
+
 pub fn training_grade_for_segment(seg: &SpeechSegment) -> TrainingGradeReport {
     let (transcript, source) = training_transcript_with_source(seg);
     let text = transcript.trim();
     let mut reasons = Vec::new();
 
     let human_rejected = is_human_rejected(seg);
+    let technical_unusable = technical_unusable_reason(seg);
 
     if human_rejected {
         reasons.push("human_rejected".to_string());
+    }
+    if let Some(reason) = technical_unusable {
+        reasons.push(format!("technical_unusable:{reason}"));
     }
     if text.is_empty() {
         reasons.push("blank_transcript".to_string());
@@ -335,7 +407,12 @@ pub fn training_grade_for_segment(seg: &SpeechSegment) -> TrainingGradeReport {
         reasons.push("energy_heuristic_alignment".to_string());
     }
 
-    if human_rejected || text.is_empty() || is_placeholder_transcript(text) || severe_audio_issue {
+    if human_rejected
+        || technical_unusable.is_some()
+        || text.is_empty()
+        || is_placeholder_transcript(text)
+        || severe_audio_issue
+    {
         return TrainingGradeReport {
             transcript: text.to_string(),
             transcript_source: source.to_string(),
@@ -716,7 +793,7 @@ fn compute_wer_cer_metrics(
         // this count was the one that did not. (Measured on the live library 2026-08-03: 27 rejects, 0
         // of them currently carrying an annotation — latent, not yet firing, and one reject-after-edit
         // away from firing.)
-        if is_human_rejected(seg) {
+        if is_excluded_from_exports(seg) {
             continue;
         }
 
@@ -830,7 +907,7 @@ fn find_duplicate_transcripts(segments: &[SpeechSegment]) -> (usize, usize, Vec<
     for seg in segments {
         // Same membership rule as every other quality tally: this is a signal about the dataset that
         // will SHIP, so rows `export_dataset` drops cannot raise an alarm about it.
-        if is_human_rejected(seg) {
+        if is_excluded_from_exports(seg) {
             continue;
         }
         let text = effective_transcript(seg);
@@ -1218,6 +1295,29 @@ mod tests {
         let (groups, members, _detail) = find_duplicate_transcripts(&[a, b, p1, p2, r1, r2]);
         assert_eq!(groups, 1, "only the real duplicate pair is a duplicate group");
         assert_eq!(members, 2, "placeholders and rejects must not be counted as duplicate segments");
+    }
+
+    #[test]
+    fn technical_unusable_is_strictly_parsed_and_never_training_ready() {
+        let mut marked = seg("technical", "دەقی دروست", 4_000);
+        marked.verified = true;
+        marked.human_decision = Some("accept".into());
+        marked.verdict_transcript = Some("دەقی دروست".into());
+        marked.rationale =
+            canonical_technical_unusable_rationale("corruptContainer", &"a".repeat(64), Some(&"b".repeat(64)), 7);
+
+        assert_eq!(technical_unusable_reason(&marked), Some("corruptContainer"));
+        assert!(is_technically_unusable(&marked));
+        assert!(!is_human_rejected(&marked), "technical failure is not a human rejection");
+        let report = training_grade_for_segment(&marked);
+        assert!(!report.training_ready);
+        assert_eq!(report.grade, TRAINING_GRADE_REJECT);
+        assert!(report.reasons.iter().any(|reason| reason == "technical_unusable:corruptContainer"));
+
+        marked.rationale = Some("technical_unusable:v1:unknownFutureReason".into());
+        assert!(!is_technically_unusable(&marked), "unknown/free-form suffixes cannot mint policy state");
+        marked.rationale = Some("technically unusable because reviewer said so".into());
+        assert!(!is_technically_unusable(&marked));
     }
 
     #[test]

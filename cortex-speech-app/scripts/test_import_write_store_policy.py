@@ -28,6 +28,8 @@ def test_store_owns_import_publication_rollback_and_revision_guarded_alignment()
         "runtime: DatabaseRuntime",
         "begin_mutation().map_err(AppError::Other)?",
         'self.lock("publish_import_segments").insert_segments_batch(segments)',
+        'self.lock("publish_import_segments_with_identity")',
+        ".insert_segments_with_audio_identity_batch(segments, identity)",
         'self.lock("publish_champion_import_segments")',
         ".insert_champion_segments_batch(",
         "deployment_sha256,",
@@ -35,7 +37,6 @@ def test_store_owns_import_publication_rollback_and_revision_guarded_alignment()
         'self.lock("update_import_alignment").update_segment_alignment_if_unchanged(',
         'self.lock("upsert_import_source_transcript").upsert_source_transcript(record)',
         'self.lock("upsert_import_source_provenance").upsert_source_audio_provenance(record)',
-        'self.lock("set_import_audio_identity").set_audio_identity(audio_path, identity)',
         'self.lock("record_import_loop0_shadow").record_loop0_shadow(segment_id, memory_fired)',
         'self.lock("update_machine_speaker").update_speaker_id(segment_id, Some(speaker_id))',
         'self.lock("insert_import_hypothesis").insert_hypothesis(hypothesis)',
@@ -81,6 +82,8 @@ def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> 
         raise AssertionError("both import paths must delegate atomic champion publication through ImportWriteStore")
     if pipeline.count("self.run_primary_wsl_pass_for_import(&mut prepared, cancel)?") != 2:
         raise AssertionError("both import paths must complete champion drafting before publication")
+    if pipeline.count("import_writes.publish_segments_with_identity(&prepared, &identity)?") != 2:
+        raise AssertionError("both compatibility import paths must atomically publish rows with scoped identity")
 
     background = method(pipeline, "fn enqueue_background_alignments(")
     if "import_writes.update_alignment_if_unchanged(" not in background:
@@ -94,7 +97,7 @@ def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> 
         "let db = runtime.open_read()?;",
         "if commit_champion",
         "let updated = import_writes",
-        ".commit_champion_transcript_if_unreviewed(",
+        ".commit_bound_champion_transcript_if_unreviewed(",
     ):
         if required not in champion:
             raise AssertionError(f"champion transcription lost serialized store authority: {required}")
@@ -111,7 +114,7 @@ def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> 
         'self.conn.execute("SAVEPOINT champion_import_publish", [])?',
         "self.insert_segments_batch(segments)?;",
         'DELETE FROM segment_hypotheses WHERE segment_id = ?1',
-        "self.set_audio_identity(audio_path, identity)?;",
+        "self.set_audio_identity_for_segments(audio_path, &segment_ids, identity)?;",
         'self.release_savepoint("champion_import_publish")?',
         'self.cleanup_savepoint_after_error("champion_import_publish")',
     ):
@@ -121,6 +124,20 @@ def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> 
         raise AssertionError("atomic champion publication no longer rejects placeholders")
     if "champion_file_publication_is_atomic_and_never_exposes_placeholders" not in read("stores/import_write.rs"):
         raise AssertionError("atomic champion publication needs an injected-failure Rust regression")
+
+    scoped_publish = method(database, "pub(crate) fn insert_segments_with_audio_identity_batch(")
+    for required in (
+        'self.conn.execute("SAVEPOINT import_identity_publish", [])?',
+        "self.insert_segments_batch(segments)?;",
+        "self.set_audio_identity_for_segments(audio_path, &segment_ids, identity)?;",
+        'self.release_savepoint("import_identity_publish")?',
+        'self.cleanup_savepoint_after_error("import_identity_publish")',
+    ):
+        if required not in scoped_publish:
+            raise AssertionError(f"scoped import identity publication lost invariant: {required}")
+    path_identity = method(database, "pub fn set_audio_identity(")
+    if "self.ensure_audio_identity_compatible(audio_path, identity)?;" not in path_identity:
+        raise AssertionError("legacy path-wide identity backfill can rebind changed source bytes")
 
     for required in (
         "database_runtime: Arc<Mutex<Option<crate::database_runtime::DatabaseRuntime>>>",

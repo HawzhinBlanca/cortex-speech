@@ -5,8 +5,8 @@ Both halves exist because BOTH failed silently on the same real run:
 
   * A 494-clip review queue was drafted 494/494 by `finetuned-mms-ckb` while `asr_model_size` said
     WSL7B and the champion sat up and idle on both GPUs. `use_finetuned_asr` diverted every clip and
-    nothing said so. Measured gap on identical FLEURS ckb clips: 7.03% CER vs 9.32%, and the app runs
-    the int8 build whose own baseline is 21.00%.
+    nothing said so. Historical duplication-weighted experiments showed material engine differences,
+    but they are not current model evidence; the operational defect is silent substitution itself.
   * 25 clips whose container the champion could not decode failed one at a time, were counted, and the
     batch ran to "completion" — leaving 462 clips at champion quality and 25 at a weaker engine,
     invisibly mixed.

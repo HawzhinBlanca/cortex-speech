@@ -30,7 +30,45 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 pub const VOICE_FOCUS_FILE: &str = "voice_focus.json";
+
+/// Renderer-safe identity for one exact semantic focus set. The data-dir filename, private voice
+/// name and segment ids never cross IPC; callers receive only this domain-separated digest.
+#[derive(Debug, Clone)]
+pub struct VoiceFocusBinding {
+    pub focus_id: String,
+    pub segment_ids: Arc<HashSet<String>>,
+}
+
+const FOCUS_ID_PREFIX: &str = "vf1_";
+const FOCUS_ID_DOMAIN: &[u8] = b"cortex.voice-focus.v1\0";
+
+/// Deterministic, platform-independent identity for an unordered focus set. Length-prefixing every
+/// UTF-8 id avoids delimiter ambiguity even for legacy ids containing whitespace or newlines.
+pub fn opaque_focus_id(ids: &HashSet<String>) -> String {
+    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(FOCUS_ID_DOMAIN);
+    digest.update((sorted.len() as u64).to_be_bytes());
+    for id in sorted {
+        let bytes = id.as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    let hex: String = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{FOCUS_ID_PREFIX}{hex}")
+}
+
+/// Strict public-wire validation. Accepting uppercase, shortened or prefix-free digests would create
+/// aliases for one policy identity and make logs/caches unable to compare request authority exactly.
+pub fn is_opaque_focus_id(value: &str) -> bool {
+    value.len() == FOCUS_ID_PREFIX.len() + 64
+        && value.starts_with(FOCUS_ID_PREFIX)
+        && value[FOCUS_ID_PREFIX.len()..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// The refusal a serving path must give while the focus file is present-but-broken. One string, so
 /// every queue tells the reviewer the same thing and a grep finds every site that can emit it.
@@ -59,11 +97,19 @@ pub const POLICY_BROKEN_PREFIX: &str = "policy file broken, no clips served";
 /// audio costs real money per minute. The read is a stat and a parse of one small file against a
 /// query that already touches the library; that is not the expensive part of serving a queue.
 pub fn resolve(data_dir: Option<&Path>) -> Result<Option<Arc<HashSet<String>>>, String> {
+    Ok(resolve_binding(data_dir)?.map(|binding| binding.segment_ids))
+}
+
+/// Resolve one exact semantic focus snapshot plus its opaque public identity. Both values are built
+/// from the same parsed bytes, so a caller can never validate one file generation and query another.
+pub fn resolve_binding(data_dir: Option<&Path>) -> Result<Option<VoiceFocusBinding>, String> {
     let Some(dir) = data_dir else {
         return Ok(None); // no library on disk: nothing to narrow against
     };
     // Pre-worded, so every serving path refuses in the same words.
-    Ok(load_focus(dir).map_err(|e| format!("{POLICY_BROKEN_PREFIX}: {e}"))?.map(Arc::new))
+    Ok(load_focus(dir)
+        .map_err(|e| format!("{POLICY_BROKEN_PREFIX}: {e}"))?
+        .map(|ids| VoiceFocusBinding { focus_id: opaque_focus_id(&ids), segment_ids: Arc::new(ids) }))
 }
 
 /// The set of segment ids a reviewer may currently be served.
@@ -179,5 +225,31 @@ mod tests {
         let dir = dir_with(Some(r#"{"name":"V","segment_ids":["a", 7, null, "b"]}"#));
         let focus = load_focus(dir.path()).unwrap().unwrap();
         assert_eq!(focus.len(), 2, "the two real ids survive; junk entries are dropped, not fatal");
+    }
+
+    #[test]
+    fn opaque_id_is_set_deterministic_and_hides_private_policy_fields() {
+        let first = dir_with(Some(r#"{"name":"Private Voice","segment_ids":["b","a","a"]}"#));
+        let second = dir_with(Some(r#"{"name":"Different private label","segment_ids":["a","b"]}"#));
+        let first_binding = resolve_binding(Some(first.path())).unwrap().unwrap();
+        let second_binding = resolve_binding(Some(second.path())).unwrap().unwrap();
+
+        assert_eq!(first_binding.focus_id, second_binding.focus_id);
+        assert!(is_opaque_focus_id(&first_binding.focus_id));
+        assert!(!first_binding.focus_id.contains("Private"));
+        assert!(!first_binding.focus_id.contains("Voice"));
+    }
+
+    #[test]
+    fn opaque_id_changes_for_any_semantic_focus_change_and_has_one_wire_form() {
+        let first: HashSet<String> = ["a".to_string(), "bc".to_string()].into_iter().collect();
+        let second: HashSet<String> = ["ab".to_string(), "c".to_string()].into_iter().collect();
+        assert_ne!(opaque_focus_id(&first), opaque_focus_id(&second), "length prefixes prevent concatenation aliases");
+
+        let valid = opaque_focus_id(&first);
+        assert!(is_opaque_focus_id(&valid));
+        assert!(!is_opaque_focus_id(valid.trim_start_matches(FOCUS_ID_PREFIX)));
+        assert!(!is_opaque_focus_id(&valid.to_ascii_uppercase()));
+        assert!(!is_opaque_focus_id(&format!("{valid}0")));
     }
 }

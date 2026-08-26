@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import SettingsPanel from '../../src/lib/SettingsPanel.svelte';
 import { locale } from '../../src/lib/i18n';
+import { notifications } from '../../src/lib/stores/notificationStore';
 import {
   defaultSettings,
   settings,
@@ -41,6 +42,7 @@ describe('SettingsPanel cloud-consent transaction', () => {
     locale.set('en');
     mocks.updateSettings.mockResolvedValue(undefined);
     mocks.getConfiguredProviders.mockResolvedValue([]);
+    mocks.setApiKey.mockResolvedValue([]);
     settings.set({ ...defaultSettings, llmMode: 'Gemini', cloudLlmOptIn: false });
     settingsTab.set('ai');
     showSettings.set(true);
@@ -53,6 +55,7 @@ describe('SettingsPanel cloud-consent transaction', () => {
     settingsTab.set('general');
     showSettings.set(false);
     locale.set('ckb');
+    vi.restoreAllMocks();
     vi.clearAllMocks();
   });
 
@@ -89,7 +92,7 @@ describe('SettingsPanel cloud-consent transaction', () => {
     const box = llmCheckbox();
 
     await fireEvent.click(box); // grant, then press the real Save button
-    await fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+    await fireEvent.click(await screen.findByRole('button', { name: /^save$/i }));
 
     expect(mocks.updateSettings).toHaveBeenCalledTimes(1);
     // The backend refused, so nothing may claim the grant took effect — not the store the rest of
@@ -97,6 +100,53 @@ describe('SettingsPanel cloud-consent transaction', () => {
     expect(get(settings).cloudLlmOptIn).toBe(false);
     expect(llmCheckbox().checked).toBe(false);
     expect(get(showSettings)).toBe(true); // and the panel stays open, showing the failure
+  });
+
+  it('a failed API-key flush blocks Settings close and preserves the exact input for retry', async () => {
+    const success = vi.spyOn(notifications, 'success');
+    mocks.setApiKey.mockRejectedValueOnce(new Error('disk full')).mockResolvedValueOnce(['gemini']);
+    render(SettingsPanel);
+    const input = screen.getByPlaceholderText('AIzaSy...') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'AIzaSy-test-secret' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+    await vi.waitFor(() => expect(mocks.setApiKey).toHaveBeenCalledTimes(1));
+
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+    expect(get(showSettings)).toBe(true);
+    expect(input.value).toBe('AIzaSy-test-secret');
+    expect(success).not.toHaveBeenCalled();
+
+    await fireEvent.click(await screen.findByRole('button', { name: /^save$/i }));
+    await vi.waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(1));
+    expect(mocks.setApiKey).toHaveBeenCalledTimes(2);
+    expect(mocks.setApiKey).toHaveBeenLastCalledWith('gemini', 'AIzaSy-test-secret');
+    expect(get(showSettings)).toBe(false);
+  });
+
+  it('reuses one in-flight key promise when panel Save joins a provider save', async () => {
+    let resolveKey!: (providers: string[]) => void;
+    mocks.setApiKey.mockReturnValue(
+      new Promise<string[]>((resolve) => {
+        resolveKey = resolve;
+      }),
+    );
+    render(SettingsPanel);
+    const input = screen.getByPlaceholderText('AIzaSy...') as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: 'AIzaSy-one-operation' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: /^save key$/i }));
+    await vi.waitFor(() => expect(mocks.setApiKey).toHaveBeenCalledTimes(1));
+    await fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    expect(mocks.setApiKey).toHaveBeenCalledTimes(1);
+    expect(mocks.updateSettings).not.toHaveBeenCalled();
+    expect(get(showSettings)).toBe(true);
+
+    resolveKey(['gemini']);
+    await vi.waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(1));
+    expect(mocks.setApiKey).toHaveBeenCalledTimes(1);
+    expect(get(showSettings)).toBe(false);
   });
 
   it('the store never shares the object the inputs mutate', async () => {

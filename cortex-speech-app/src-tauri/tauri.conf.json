@@ -14,8 +14,8 @@
         "title": "Cortex Kurdish Speech Processor",
         "width": 1400,
         "height": 900,
-        "minWidth": 1000,
-        "minHeight": 600,
+        "minWidth": 320,
+        "minHeight": 480,
         "resizable": true,
         "decorations": true,
         "center": true
@@ -31,7 +31,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "targets": ["msi", "nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "resources": [
       "models/silero_vad_v4.onnx",
@@ -41,6 +42,7 @@
       "../scripts/cortex_7b_client.py"
     ],
     "windows": {
+      "allowDowngrades": false,
       "webviewInstallMode": {
         "type": "offlineInstaller"
       },
@@ -50,12 +52,8 @@
       "nsis": {
         "installMode": "perMachine",
         "installerIcon": "icons/icon.ico",
-        "displayLanguageSelector": true
+        "displayLanguageSelector": false
       }
-    },
-    "macOS": {
-      "minimumSystemVersion": "11.0",
-      "exceptionDomain": ""
     }
   }
 }

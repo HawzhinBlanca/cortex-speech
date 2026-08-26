@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import { openSettingsFromHeader } from './helpers/header';
 
 test.describe('App smoke tests', () => {
   test('loads and renders the three-panel layout', async ({ page }) => {
@@ -39,7 +40,7 @@ test.describe('App smoke tests', () => {
   test('settings panel opens and closes', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
     await expect(settings.getByText('Settings')).toBeVisible();
@@ -53,7 +54,7 @@ test.describe('App smoke tests', () => {
   }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
 
@@ -75,7 +76,7 @@ test.describe('App smoke tests', () => {
 
   test('cloud advisory settings expose only fixed Gemini 2.5 Pro', async ({ page }) => {
     await page.goto('/');
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const panel = page.getByTestId('settings-panel');
 
     await panel.getByRole('button', { name: 'AI Post-Processing', exact: true }).click();
@@ -94,7 +95,7 @@ test.describe('App smoke tests', () => {
   test('model registry lists registered models with a champion badge', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
 
@@ -121,7 +122,7 @@ test.describe('App smoke tests', () => {
   test('model registry can import a checkpoint as a candidate', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
     await settings.getByRole('button', { name: 'AI Models', exact: true }).click();
@@ -130,9 +131,9 @@ test.describe('App smoke tests', () => {
     const form = settings.getByTestId('model-import-form');
     await expect(form).toBeVisible();
 
-    await form.getByPlaceholder('id (e.g. omniasr-7b-challenger)').fill('test-candidate');
-    await form.getByPlaceholder('source (e.g. fine-tune)').fill('fine-tune');
-    await form.getByPlaceholder('license (e.g. CC-BY-NC-4.0)').fill('CC-BY-NC-4.0');
+    await form.getByLabel('Model ID').fill('test-candidate');
+    await form.getByLabel('Model source').fill('fine-tune');
+    await form.getByLabel('Model license').fill('CC-BY-NC-4.0');
 
     // Submit is disabled until a checkpoint file is chosen.
     await expect(settings.getByTestId('model-import-submit')).toBeDisabled();
@@ -158,7 +159,8 @@ test.describe('App smoke tests', () => {
     await page.getByTestId('eval-honest-cer').click();
     const result = page.getByTestId('eval-result');
     await expect(result).toBeVisible();
-    await expect(result).toContainText('CER 29.0%');
+    await expect(result).toContainText('CER');
+    await expect(result).toContainText('29.0%');
 
     // Build a scorecard from that result (build_scorecard).
     await page.getByTestId('eval-build-scorecard').click();
@@ -170,7 +172,7 @@ test.describe('App smoke tests', () => {
   test('diagnostics panel shows tracing stats and recent spans', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
 

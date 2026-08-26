@@ -3,8 +3,11 @@ import { ADVISORY_CLOUD_MODEL } from './stores/settingsStore';
 
 /** Backend settings shape returned by Tauri `get_settings` / `update_settings`. */
 export interface BackendSettings {
-  model_dir: string;
-  output_dir: string;
+  // Internal model/output paths are deliberately absent from the generated renderer snapshot.
+  // They remain optional here only so legacy adapter tests and compatibility callers can preserve
+  // an already-held value; the revision-guarded patch never transmits either field.
+  model_dir?: string;
+  output_dir?: string;
   asr_model_size: string;
   use_finetuned_asr?: boolean;
   vad_threshold: number;
@@ -28,7 +31,8 @@ export interface BackendSettings {
   theme: string;
   llm_mode: string;
   llm_endpoint: string;
-  llm_api_key: string;
+  // Secret values never cross the generated settings contract. Key writes use set_api_key.
+  llm_api_key?: string;
   llm_api_key_configured: boolean;
   cloud_llm_opt_in: boolean;
   llm_system_prompt: string;
@@ -150,7 +154,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     hfLicense: raw.hf_license ?? 'mit',
     llmMode: llmModeFromBackend(raw.llm_mode),
     llmEndpoint: raw.llm_endpoint ?? 'http://127.0.0.1:11434/v1/chat/completions',
-    llmApiKey: raw.llm_api_key ?? '',
+    llmApiKey: '',
     llmApiKeyConfigured: raw.llm_api_key_configured ?? false,
     cloudLlmOptIn: raw.cloud_llm_opt_in ?? false,
     llmSystemPrompt:

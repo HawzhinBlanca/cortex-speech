@@ -108,6 +108,7 @@ fn build_dpo_dataset_filtered(
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
          WHERE ss.is_gold = 0 AND ae.verified_by_human = 1
+           AND ss.rights_revoked_at IS NULL
            AND (
                 (ae.effect_event_id IS NOT NULL AND EXISTS (
                      SELECT 1
@@ -148,6 +149,10 @@ fn build_dpo_dataset_filtered(
     for r in rows {
         let row = r?;
         if allowed_segment_ids.is_some_and(|allowed| !allowed.contains(&row.segment_id)) {
+            continue;
+        }
+        if crate::quality::technical_unusable_reason_from_rationale(row.rationale.as_deref()).is_some() {
+            tracing::info!(segment_id = %row.segment_id, "Excluding technically unusable segment from DPO export");
             continue;
         }
         let wrong = row.wrong_transcript.trim();
@@ -270,17 +275,23 @@ pub fn export_lm_corpus(db: &Database) -> AppResult<Vec<String>> {
     // (annotated ▸ raw) and quality.rs's training_transcript_with_source.
     let mut stmt = db.connection().prepare(
         "SELECT COALESCE(NULLIF(verdict_transcript, ''), NULLIF(annotated_transcript, ''), raw_transcript),
-                audio_path
+                audio_path, rationale
          FROM speech_segments
-         WHERE is_gold = 0 AND human_decision IN ('accept', 'edit')
+         WHERE is_gold = 0 AND rights_revoked_at IS NULL
+           AND human_decision IN ('accept', 'edit')
          ORDER BY created_at DESC",
     )?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+    })?;
 
     let mut corpus = Vec::new();
     for row_res in rows {
-        let (text, audio_path) = row_res?;
+        let (text, audio_path, rationale) = row_res?;
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { continue };
+        if crate::quality::technical_unusable_reason_from_rationale(rationale.as_deref()).is_some() {
+            continue;
+        }
 
         // Never emit an ASR PLACEHOLDER ("[Pending WSL 7B ASR]", "[ASR unavailable: …]", "n/a") as
         // human-confirmed LM training text. The COALESCE can fall through to a raw placeholder on an
@@ -566,24 +577,92 @@ fn json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
 
 use crate::normalizer::learning_text_key;
 
+/// Validate the DPO destination as a literal loopback HTTP(S) address.
+///
+/// This channel carries human correction pairs, not a generic LLM prompt. Arbitrary HTTPS is not an
+/// allow-list: it would let a compromised renderer choose its own exfiltration host. Hostnames are
+/// rejected too (including `localhost`) so DNS/hosts-file resolution cannot redirect a supposedly
+/// local submission. Userinfo, malformed ports, fragments, and non-loopback literals fail closed.
+fn validate_local_dpo_endpoint(endpoint: &str) -> AppResult<&str> {
+    use crate::error::AppError;
+
+    const MAX_ENDPOINT_LEN: usize = 2048;
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(AppError::Validation("DPO endpoint URL must not be empty".into()));
+    }
+    if endpoint.len() > MAX_ENDPOINT_LEN {
+        return Err(AppError::Validation("DPO endpoint URL is too long".into()));
+    }
+    if endpoint.contains('#') {
+        return Err(AppError::Validation("DPO endpoint must not contain a URL fragment".into()));
+    }
+
+    let lower = endpoint.to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .ok_or_else(|| AppError::Validation("DPO endpoint must use http:// or https://".into()))?;
+    let authority = after_scheme.split(['/', '?']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(AppError::Validation(
+            "DPO endpoint must use a literal loopback address without credentials".into(),
+        ));
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed.find(']').ok_or_else(|| AppError::Validation("Malformed DPO IPv6 endpoint".into()))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').ok_or_else(|| AppError::Validation("Malformed DPO IPv6 endpoint".into()))?)
+        };
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if let Some(port) = port {
+        if port.parse::<u16>().ok().filter(|value| *value > 0).is_none() {
+            return Err(AppError::Validation("DPO endpoint has an invalid port".into()));
+        }
+    }
+    let address = host
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| AppError::Validation("DPO endpoint host must be a literal loopback IP address".into()))?;
+    if !address.is_loopback() {
+        return Err(AppError::Validation("DPO endpoint must target a literal loopback IP address".into()));
+    }
+    Ok(endpoint)
+}
+
 /// POST the DPO preference dataset to a local fine-tuning endpoint.
 pub fn run_dpo_update(db: &Database, endpoint: &str) -> AppResult<String> {
-    // Same outbound allow-list the settings LLM endpoint enforces — this is a parallel channel that
-    // POSTs private preference pairs, so it must not be repointable at an arbitrary/non-https host.
-    crate::settings::validate_outbound_endpoint(endpoint)?;
+    // Validate before building/serializing any private data. The dedicated agent follows zero
+    // redirects, and a non-2xx response is failure rather than an implied successful submission.
+    let endpoint = validate_local_dpo_endpoint(endpoint)?;
     let export = build_dpo_dataset(db)?;
 
     if export.pair_count == 0 {
         return Ok("No preference pairs to export.".into());
     }
 
-    let resp = crate::http::API_AGENT
+    let resp = crate::http::LOCAL_DPO_AGENT
         .post(endpoint)
         .set("Content-Type", "application/x-ndjson")
         .send_string(&export.jsonl)
         .map_err(|e| crate::error::AppError::Other(format!("DPO update POST failed: {e}")))?;
 
     let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(crate::error::AppError::Other(format!(
+            "DPO update refused non-success HTTP status {status}; redirects are never followed"
+        )));
+    }
     Ok(format!("DPO update submitted: {} pairs → {} (HTTP {})", export.pair_count, endpoint, status))
 }
 
@@ -603,18 +682,73 @@ mod tests {
 
     #[test]
     fn run_dpo_update_rejects_unsafe_endpoints_before_posting() {
-        // Hardening-audit MEDIUM (exfil channel): the DPO export must enforce the same outbound
-        // allow-list as the settings LLM endpoint, so it can't be repointed at an arbitrary host.
+        // DPO pairs contain private human corrections. Only a literal loopback destination is
+        // eligible; arbitrary HTTPS, DNS names, userinfo tricks, and remote HTTP fail before data is
+        // built or any network request is attempted.
         let db = open_mem_db();
-        assert!(
-            run_dpo_update(&db, "http://attacker.example.com/collect").is_err(),
-            "plain-http remote endpoint must be rejected up front"
-        );
-        assert!(run_dpo_update(&db, "").is_err(), "empty endpoint must be rejected");
+        for endpoint in [
+            "http://attacker.example.com/collect",
+            "https://attacker.example.com/collect",
+            "https://localhost:65535/ingest",
+            "http://localhost:65535/ingest",
+            "http://localhost@127.0.0.1:65535/ingest",
+            "http://192.0.2.10:65535/ingest",
+            "",
+        ] {
+            assert!(run_dpo_update(&db, endpoint).is_err(), "unsafe DPO endpoint passed: {endpoint:?}");
+        }
         // An allowed endpoint passes validation; with no preference pairs it's a clean no-op (no POST
         // is attempted, so no network is touched in the test).
-        let msg = run_dpo_update(&db, "https://localhost:65535/ingest").expect("valid endpoint passes validation");
+        let msg = run_dpo_update(&db, "http://127.0.0.1:65535/ingest").expect("literal loopback passes");
         assert!(msg.contains("No preference pairs"), "expected no-op export, got: {msg}");
+        let ipv6 = run_dpo_update(&db, "http://[::1]:65535/ingest").expect("literal IPv6 loopback passes");
+        assert!(ipv6.contains("No preference pairs"));
+    }
+
+    #[test]
+    fn run_dpo_update_refuses_a_loopback_redirect_without_following_it() {
+        use std::io::{Read, Write};
+
+        let db = open_mem_db();
+        db.insert_segment(&SpeechSegment {
+            id: "redirect-pair".into(),
+            audio_path: "/redirect-pair.wav".into(),
+            raw_transcript: "wrong".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "redirect-pair-example",
+            "redirect-pair",
+            "wrong",
+            "correct",
+            None,
+        );
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "fixture must exercise the POST");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept DPO request");
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).expect("read DPO request");
+            assert!(read > 0, "the fixture server received the POST");
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://attacker.invalid/collect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write redirect");
+        });
+
+        let error = run_dpo_update(&db, &format!("http://{address}/train")).expect_err("redirect must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("redirects are never followed"),
+            "failure must identify the redirect policy: {message}"
+        );
+        server.join().expect("fixture server exits");
     }
 
     #[test]
@@ -624,7 +758,17 @@ mod tests {
         let db = open_mem_db();
         let temp = tempfile::tempdir().unwrap();
         let audio = temp.path().join("gold.wav");
-        std::fs::write(&audio, b"gold audio bytes").unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: crate::audio::TARGET_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio, spec).unwrap();
+        for sample in [0_i16, 1000, -1000, 500, -500] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
 
         crate::eval::import_gold_segments(
             &db,
@@ -708,7 +852,7 @@ mod tests {
     #[test]
     fn dpo_legacy_example_requires_current_matching_verified_edit() {
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         db.insert_segment(&SpeechSegment {
             id: "legacy-dpo".into(),
             audio_path: "/legacy-dpo.wav".into(),
@@ -731,7 +875,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
 
         assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1);
         db.connection()
@@ -758,7 +902,7 @@ mod tests {
         // differ from annotated/raw. Memory evidence must be judged against what the human actually
         // accepted; comparing the prior draft to itself would invert this Confirm into an Override.
         let db = open_mem_db();
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         let original = "ئەو ساڵە باش بوو";
         let accepted = "ئەو ساڵە خراپ بوو";
         let memory = crate::corrections::extract_substitution_memories(original, accepted)
@@ -774,7 +918,7 @@ mod tests {
                 params![memory.wrong_token, memory.human_token, memory.slot_key, memory.phonetic_key],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
 
         db.insert_segment(&SpeechSegment {
             id: "accepted-hypothesis-segment".into(),
@@ -1355,6 +1499,80 @@ mod tests {
         assert!(
             !corpus.iter().any(|t| t.contains("Pending") || t.contains('[')),
             "an ASR placeholder must not be emitted as human-confirmed LM text: {corpus:?}"
+        );
+    }
+
+    #[test]
+    fn technical_unusable_effect_excludes_dpo_and_lm_even_if_human_text_later_exists() {
+        let db = open_mem_db();
+        db.insert_segment(&SpeechSegment {
+            id: "technical-learning-exclusion".into(),
+            audio_path: "/missing-technical-learning.wav".into(),
+            raw_transcript: "دەقی هەڵە".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        let revision = db.segment_review_revision("technical-learning-exclusion").unwrap().unwrap();
+        let source = db.technical_unusable_source_snapshot("technical-learning-exclusion").unwrap().unwrap();
+        db.mark_segment_technically_unusable_after_verified_failure(
+            "technical-learning-exclusion",
+            revision,
+            "decodeFailed",
+            &source.source_path_sha256,
+            source.audio_content_hash.as_deref(),
+            "00000000-0000-4000-8000-000000000925",
+        )
+        .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "technical-learning-example",
+            "technical-learning-exclusion",
+            "دەقی هەڵە",
+            "دەقی ڕاست",
+            None,
+        );
+
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 0, "technical audio leaked into DPO export");
+        assert!(export_lm_corpus(&db).unwrap().is_empty(), "technical audio leaked into LM corpus");
+    }
+
+    #[test]
+    fn withdrawn_recording_rights_retract_dpo_and_lm_training_text() {
+        let db = open_mem_db();
+        let audio_path = "/withdrawn-learning.wav";
+        db.insert_segment(&SpeechSegment {
+            id: "withdrawn-learning".into(),
+            audio_path: audio_path.into(),
+            raw_transcript: "دەقی هەڵە".into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        })
+        .unwrap();
+        super::super::insert_active_human_example_fixture(
+            &db,
+            "withdrawn-learning-example",
+            "withdrawn-learning",
+            "دەقی هەڵە",
+            "دەقی ڕاست",
+            None,
+        );
+
+        assert_eq!(build_dpo_dataset(&db).unwrap().pair_count, 1, "fixture starts as one DPO pair");
+        assert!(
+            export_lm_corpus(&db).unwrap().iter().any(|line| line.contains("دەقی ڕاست")),
+            "fixture starts as one human-confirmed LM row"
+        );
+
+        assert_eq!(db.revoke_recording(audio_path).unwrap(), 1, "withdraw exactly this recording");
+        assert_eq!(
+            build_dpo_dataset(&db).unwrap().pair_count,
+            0,
+            "withdrawn human corrections must not remain in DPO material"
+        );
+        assert!(
+            export_lm_corpus(&db).unwrap().is_empty(),
+            "withdrawn human corrections must not remain in LM material"
         );
     }
 

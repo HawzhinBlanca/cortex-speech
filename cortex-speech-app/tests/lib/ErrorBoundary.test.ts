@@ -18,7 +18,7 @@ describe('ErrorBoundary', () => {
   });
 
   /**
-   * The whole point of the 2026-08-17 rewrite. App.svelte mounts TEN of these; when each one
+   * The whole point of the 2026-08-17 rewrite. Workstation.svelte mounts these boundaries; when each one
    * listened for window 'error' itself, a single uncaught error made all ten render their fallback
    * — the user saw the entire app replaced by red boxes because one panel failed. A boundary must
    * only ever catch what is below it.
@@ -37,6 +37,7 @@ describe('ErrorBoundary', () => {
     // Exactly one fallback, not one per boundary.
     expect(screen.getAllByText('Retry')).toHaveLength(1);
     expect(screen.queryByText('undefined')).not.toBeInTheDocument();
+    expect(screen.queryByText('panel exploded')).not.toBeInTheDocument();
     consoleError.mockRestore();
   });
 

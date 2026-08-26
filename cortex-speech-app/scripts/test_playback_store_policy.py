@@ -35,19 +35,21 @@ def test_store_is_backend_only_and_serialized() -> None:
 
 
 def test_command_validates_then_delegates_without_raw_database_authority() -> None:
-    commands = read("commands/segments_write.rs").split("#[cfg(test)]", 1)[0]
+    commands = read("commands/segments_write.rs")
     body = command(commands, "pub fn record_playback_receipt(")
     for required in (
         'RATE_LIMITER.check("record_playback_receipt")',
         "validate::validate_identifier(&segment_id)",
         "validate_playback_receipt_identity",
-        ".playback_writes()",
-        ".record_observation(PlaybackObservation",
+        "played_ms < 0 || clip_duration_ms < 0",
+        "PLAYBACK_SESSION_REQUIRED",
     ):
         if required not in body:
-            raise AssertionError(f"playback command lost validation/delegation: {required}")
+            raise AssertionError(f"retired scalar playback command lost its fail-closed contract: {required}")
     for forbidden in (
         "state.lock_db()",
+        ".playback_writes()",
+        ".record_observation(PlaybackObservation",
         "segment_audio_content_hash",
         "segment_review_revision",
         "crate::db::PlaybackReceipt",

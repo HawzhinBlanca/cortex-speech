@@ -21,7 +21,7 @@
       // beyond the top ten were invisible here and could never be renamed.
       speakers = (await api.getSpeakers()) ?? [];
     } catch (e) {
-      notifications.error($t('speaker.loadFailed'), { detail: String(e) });
+      notifications.error($t('speaker.loadFailed'), { cause: e });
     } finally {
       loading = false;
     }
@@ -52,7 +52,7 @@
       // Force segments reload
       segments.load();
     } catch (e) {
-      notifications.error($t('speaker.renameFailed'), { detail: String(e) });
+      notifications.error($t('speaker.renameFailed'), { cause: e });
     }
   }
 
@@ -73,6 +73,7 @@
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
   role="dialog"
   aria-modal="true"
+  aria-labelledby="speaker-panel-title"
   tabindex="-1"
   use:focusTrap
   onkeydown={(e) => {
@@ -84,15 +85,20 @@
 >
   <div class="card w-full max-w-lg shadow-2xl flex flex-col max-h-[80vh]">
     <header class="flex items-center justify-between p-4 border-b border-cortex-800/50">
-      <h2 class="text-sm font-bold text-cortex-200 uppercase tracking-widest">
+      <h2
+        id="speaker-panel-title"
+        class="text-sm font-bold text-cortex-200 uppercase tracking-widest"
+      >
         {$t('speaker.title')}
       </h2>
-      <button class="text-cortex-500 hover:text-cortex-300" onclick={close}>✕</button>
+      <button class="text-cortex-500 hover:text-cortex-300 text-xs" onclick={close}>
+        {$t('close')}
+      </button>
     </header>
 
     <div class="flex-1 overflow-y-auto p-4 space-y-3">
       {#if loading}
-        <div class="animate-pulse space-y-2">
+        <div class="animate-pulse space-y-2" role="status" aria-label={$t('loading')}>
           <div class="h-10 bg-cortex-800 rounded"></div>
           <div class="h-10 bg-cortex-800 rounded"></div>
         </div>

@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "toolchain": "nightly-2026-07-11",
+  "host": "x86_64-pc-windows-msvc",
+  "rustc": {
+    "release": "1.99.0-nightly",
+    "commitHash": "375b1431b7d89d1c2e2bc168c011848ae12b7d14",
+    "commitDate": "2026-07-10",
+    "llvmVersion": "22.1.8"
+  },
+  "cargo": {
+    "release": "1.99.0-nightly",
+    "commitHash": "59800466c5c41c444d264b1010b4d57e85a7117f",
+    "commitDate": "2026-07-07"
+  },
+  "cargoLlvmCovVersion": "0.8.7"
+}

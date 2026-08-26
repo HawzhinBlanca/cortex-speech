@@ -11,7 +11,7 @@
  * Env: CORTEX_AUDIO (required), CORTEX_APP_EXE (optional), CORTEX_DEBUG_PORT (optional, 9222).
  * Exit 0 only when a segment is produced AND transcribe_segment returns non-empty text.
  */
-const { spawn, execSync } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const { chromium } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
@@ -30,7 +30,12 @@ const AUDIO = process.env.CORTEX_AUDIO || DEFAULT_AUDIO;
 const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9261';
 // DISPOSABLE profile, never the owner's library — see e2e_profile.cjs. Resolved before any
 // spawn so there is no window in which this harness could launch against %APPDATA%.
-const { dataDir: DATA_DIR, ours: DATA_DIR_IS_OURS } = resolveDisposableProfile('e2e_pipeline_ipc');
+const {
+  dataDir: DATA_DIR,
+  ours: DATA_DIR_IS_OURS,
+  profileToken: PROFILE_TOKEN,
+  profileHarness: PROFILE_HARNESS,
+} = resolveDisposableProfile('e2e_pipeline_ipc');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function die(m) { console.error('PRECONDITION FAILED: ' + m); process.exit(1); }
 if (!fs.existsSync(AUDIO)) die('CORTEX_AUDIO does not exist: ' + AUDIO);
@@ -40,15 +45,20 @@ function killApp() { killSpawned(appProcess); }
 
 async function run() {
   await refuseIfDebugPortBusy(DEBUG_PORT, 'e2e_pipeline_ipc');
-  try {
-    // Against the DISPOSABLE profile, with the confirmation clear_db.py demands. Previously
-    // this ran with neither, so it was refused (exit 2) and swallowed — a clean-slate step
-    // that never once cleaned anything.
-    execSync('python clear_db.py --yes', {
-      cwd: REPO, stdio: 'ignore',
-      env: { ...process.env, CORTEX_APP_DATA_DIR: DATA_DIR, CORTEX_DB_CLEAR_CONFIRM: '1' },
-    });
-  } catch (e) { /* a fresh profile has no DB yet, which is the normal case */ }
+  // The profile helper has already minted an fs sentinel and a matching SQLite marker. This clear
+  // independently validates both. A safety refusal is fatal; swallowing it would turn containment
+  // failure into a green pipeline run.
+  execFileSync(process.env.PYTHON || 'python', [path.join(REPO, 'clear_db.py'), '--yes'], {
+    cwd: REPO,
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      CORTEX_APP_DATA_DIR: DATA_DIR,
+      CORTEX_DB_CLEAR_CONFIRM: '1',
+      CORTEX_TEST_PROFILE_TOKEN: PROFILE_TOKEN,
+      CORTEX_TEST_PROFILE_HARNESS: PROFILE_HARNESS,
+    },
+  });
   console.log(`==> Launching ${path.basename(APP_EXE)} (remote-debug ${DEBUG_PORT})...`);
   const app = appProcess = spawn(APP_EXE, [], {
     env: launchEnv(DATA_DIR, DEBUG_PORT),

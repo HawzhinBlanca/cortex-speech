@@ -5,6 +5,9 @@ Built with **Tauri v2**, **Svelte 5**, and Rust. The quality-first default is th
 provisioned local **OmniASR-7B Champion** server under WSL and fails closed when it is unavailable;
 smaller CTC/MMS engines are explicit offline diagnostics and are not selectable production fallbacks.
 
+**Supported product platform:** Windows 11 x64 only. Linux/macOS source-compilation checks are
+engineering diagnostics, not packaged-product claims.
+
 ## Production features
 
 | Feature | Details |
@@ -15,7 +18,7 @@ smaller CTC/MMS engines are explicit offline diagnostics and are not selectable 
 | **VAD chunking** | Podcasts/audiobooks -> many annotatable segments |
 | **Quality metrics** | Duplicates, empty text, low confidence, duration outliers |
 | **Speaker hints** | Multi-chunk files auto-tagged with filename stem |
-| **Models** | User `%APPDATA%` dir with bundled dev fallback |
+| **Models** | User-provisioned `%APPDATA%` diagnostics; no bundled or automatic production fallback |
 
 ## Long-form audio (podcasts & audiobooks)
 

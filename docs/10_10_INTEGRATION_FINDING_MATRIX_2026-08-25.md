@@ -1,14 +1,17 @@
 # Cortex Speech 10/10 Integration Finding Matrix
 
-**Date:** 2026-08-25 (updated 2026-08-26)
+**Date:** 2026-08-25 (updated 2026-08-27)
 
 **Branch:** `codex/10-10-integration`
 
 **Production base:** `bd581ef` (schema 65)
 
-**Current evidence commit:** `7f173fa`
+**Current evidence authority:** the completed immutable proof manifest for the final release commit.
+The exact full SHA is intentionally left manifest-bound until the integration tree is committed; this
+document does not attempt to certify the commit that contains itself.
 
-**Status:** integrated source checkpoint; **not a product or model certification**
+**Status:** **NOT CERTIFIED** — integrated source checkpoint only; not a product, Windows, model, or
+full-charter attestation.
 
 This matrix is the authority for the audit-remediation replay onto the schema-65 production line.
 An old statement that a finding was fixed is not accepted by itself: each row requires integrated
@@ -37,7 +40,11 @@ requires the immutable profile manifest and the external evidence listed under O
 
 ## New release-contract slices
 
-| Contract | Commit | Proof on exact integrated tree | Remaining boundary |
+The per-slice commands and counts below are historical landing evidence for the named commit. They
+are useful regression provenance, but they are not current release authority and cannot replace the
+exact-tree checkpoint or a completed immutable profile manifest.
+
+| Contract | Commit | Recorded proof when the slice landed | Remaining boundary |
 |---|---|---|---|
 | Self-healing profiled verifier: typed argv gates, isolated workers, explicit timeouts, Job Objects, identity-bound leases, durable journal, immutable manifests, and non-certifying retries. | `4f30df4` | 9/9 supervisor/fault regressions; probe and abnormal-exit policies passed | Timeout calibration from three clean baselines, three complete fault campaigns, and completed profile manifests remain open |
 | Generated, versioned IPC plus revision-bound review commit and exact operation-ID replay. | `df861d7` | Binding drift gate passed; full Rust, frontend and Python suites passed; strict Clippy passed | Remaining command domains still require typed migration; zero dynamic/untyped invokes is not yet reached |
@@ -66,48 +73,128 @@ requires the immutable profile manifest and the external evidence listed under O
 | Snapshot artifacts are converted into typed restore plans inside `recovery`: policy versus explicit absence is unambiguous, policy-bearing generations require a verified manifest and exact controlled focus, policy baseline/schema are checked against the immutable snapshot database, and every optional state receives one typed action. | `ad3085d` | Existing fail-closed pilot-policy and named-restore rehash characterizations execute through the moved inspectors. The recovery architecture policy requires all three definitions in `recovery` and absent from commands. Full Rust passed 1,612/0/8 with every integration, soak, binary and benchmark target green; all 121 Python policies passed sequentially; strict all-target/all-feature Clippy, rustfmt and diff hygiene passed. | Durable review-history/pilot semantic validation, authoritative-floor comparison, database target validation and startup/named/bare transactions remain in `commands.rs`; process-kill restore campaigns and the 50,000-segment proof remain open. |
 | Named-restore artifact preparation and transaction preflight are owned by `recovery`: source/config bytes are converted to an owned plan and staged database, the manifest is rehashed after both captures, every new transaction takes a mandatory pinned safety snapshot, interrupted work reuses only its exact verified original pin, and restore parking arms immediately before the durable pending marker. | `7f173fa` | Existing mandatory-snapshot, original-pin reuse, selector-drift refusal and post-plan/post-staging manifest-rehash regressions execute through the moved boundary. The architecture policy requires artifact preparation, safety pinning, selector derivation and transaction begin in `recovery`, absent from production commands, and asserts arm-before-marker ordering. Full Rust passed 1,612/0/8 with every integration, soak, binary and benchmark target green; all 121 Python policies passed sequentially; strict all-target/all-feature Clippy, rustfmt and diff hygiene passed. | Durable review-history/pilot semantic validation, authoritative-floor comparison, database target semantics, the full `prepare_and_restore_named_transaction`, startup/named/bare orchestration, process-kill restore campaigns and the 50,000-segment proof remain open. |
 
+## Final-hunt closure slices
+
+All rows in this section were closed on the final integration tree. Their authority is the exact full
+SHA in the immutable manifest, not a short hash copied into this file.
+
+| Imperfection closed | Integrated behavior and regression authority | Exact-tree status |
+|---|---|---|
+| Schema-67 policy-4 paid identity could escape the older policy-3 immutability trigger. | Additive schema 67 installs `speech_segments_v67_policy4_paid_identity_immutable_update`; characterization verifies policy-4 receipt/source identity cannot drift. Migrations 1–65 remain unchanged. | Integrated and covered by the exact all-target Rust run; certification still depends on the manifest-bound final SHA. |
+| Parallel Couch tests shared one process-wide writable WAV path for repeated short IDs and intermittently collided on Windows. | Couch fixture audio is thread-local, real and content-addressed; a 16-worker regression proves identical segment IDs receive independent paths. | Integrated; exact all-target Rust run passed without the sharing failure. |
+| Review drafts and ambiguous transport responses could lose or misapply human work across navigation, exit, A→B→A transitions, or retry. | Draft ownership is segment/revision-bound, exit flush is crash-safe, failed or ambiguous commits retain the clip/draft/focus, exact operation replay is idempotent, and wrong-segment responses cannot advance the controller. | Integrated; frontend unit and Playwright runs are green. Power-loss and field-soak evidence remain external gates. |
+| Settings writes were not an exact generated compare-and-swap contract. | Generated `get_settings_v1`, `patch_settings_v1`, and `set_cloud_consent_v1` bind writes to an opaque revision, refuse stale state, replay an exact lost response idempotently, and keep secrets and consent in separate explicit commands. | Integrated; binding drift and settings regressions are green. |
+| Verifier evidence could remain apparently current after the active executable or immutable release pointer changed. | Proof consumption revalidates both the executable and pointer hashes; durable rollback/publication failure cannot leave a trusted latest-proof/status authority. | Integrated; verifier fault/policy regressions are green. A completed certifying profile run is still absent. |
+| Windows release assembly could sign only the outer installer, flatten the app tree, or let an outer checksum stand in for inner executable authority. | The app executable is signed before MSI/NSIS packaging, the release tree is preserved exactly, and inner/outer hashes, SBOM, provenance, updater and signed-tag policy have distinct fail-closed checks. | Integrated policy/build logic only. Real credentials, signed artifacts and clean-VM install/update/rollback evidence are absent. |
+| The committed Windows icon was a single 32×32 placeholder and could not support a credible installer/product surface. | The existing approved 512×512 Cortex couch asset now generates a real 512×512 RGBA runtime PNG plus a 32-bit ICO with 16/24/32/48/64/256 frames. A standard-library policy verifies source quality, ICO structure and Tauri/NSIS references. | **CLOSED locally**: icon policy 3/3; ICO SHA-256 `7fc3b8ddf7c64568547d7afa3b6a5ecd30ca0b355ed7b67d4fa97d3900d23baa`. This does not substitute for signed-installer or clean-VM proof. |
+| Handwritten IPC calls were diffuse and could bypass inventory review. | One closed legacy adapter rejects unregistered commands; generated commands cannot regress through it; inventory policy currently reports 116 invoked commands: 13 generated and 103 explicitly contained handwritten calls. | Containment is green; the required zero-handwritten end state is **RED (103 remain)**. |
+| Oversized source modules and unverifiable Rust coverage could be hidden by an optimistic aggregate gate. | A fail-closed quality gate requires branch-bearing `cargo llvm-cov` JSON and scans all shipped Rust modules, with only one exact-hash immutable-migration exception. | Gate works and correctly reports both conditions **RED**; details are below. |
+| Stable-toolchain checks did not expose two atomics deprecated by the pinned branch-coverage compiler. | Cortex media singleflight and the vendored bounded HTTP worker pool use an MSRV-safe compare-exchange loop; the deprecated API is gone without requiring Rust 1.95. | **CLOSED locally**: affected media tests 24/24, vendored worker-ceiling test 1/1, strict MSRV-aware Clippy and rustfmt green; the exact nightly coverage rerun compiled without the prior deprecation warnings. |
+
 ## Integrated checkpoint evidence
 
-- `cargo test --all-targets --all-features`: 1,612 library tests passed, 0 failed, 8 explicitly ignored; all integration, soak, binary and benchmark targets exited 0.
+- `cargo test --locked --all-targets --all-features`: **1,849 passed, 0 failed and 43 ignored** in
+  1,244.319 seconds. The main library target passed **1,729**, failed 0 and ignored 8; the importer
+  passed 14/14, the soak passed 1/1 and the Tauri integration passed 1/1. Ignored live/model/fixture
+  diagnostics are not certification evidence.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
-- Frontend: 58 files / 310 tests passed; typecheck reported 0 errors and 0 warnings; lint and formatting passed.
-- Browser E2E/accessibility: 97/97 passed with zero retries against a gate-owned Vite server.
-- Python policies: all 121 reachable policy scripts passed sequentially, including generated-binding drift.
-- Production build and its fail-closed manifest budget passed. Initial JavaScript is **111.19 KB gzip**
-  against the 125 KB ceiling; initial CSS is **11.20 KB gzip** against the 15 KB ceiling. The gate
+- Canonical `cargo deny` passed advisories, bans, licenses and sources with zero errors; it reported
+  28 allowed duplicate-version warnings.
+- Frontend: **72 files / 435 tests passed**; typecheck reported 0 errors and 0 warnings; the configured
+  source lint and formatting gates passed.
+- Browser E2E/accessibility: **101/101 passed in one run with zero retries** against a gate-owned Vite
+  server.
+- Python policy sweep: **128/128 reachable policy scripts passed** sequentially; the discovery gate
+  also proved that every tracked policy test defines and executes its assertions.
+- Production build and its fail-closed manifest budget passed. Initial JavaScript is **118.72 KB gzip**
+  against the 125 KB ceiling; initial CSS is **11.42 KB gzip** against the 15 KB ceiling. The gate
   recursively counts the entry and all static imports, excludes on-demand chunks, and was proven to
   reject an oversized transitive dependency. This closes only the declared bundle-size slice, not the
   remaining startup, latency, interaction, scrolling or memory budgets.
 - Migrations 1–65 are byte-identical to production base `bd581ef` (normalized catalog SHA-256
   `c47d4be689871b8191c13d96a59dd502a9de4d8868788f8cd9cfa4efca7cc2e3`).
+- The additive integrated schema is 67; the production base remains schema 65.
+- The isolated durable-decision gate passed at mean 1.7 ms and P95 1.6 ms for 40 commits. The
+  fixed-seed refinery gate passed with raw CER 0.05167, jury CER 0.02082, 59.7% relative reduction
+  and 5.5% escalation. That schema-59 disposable benchmark is algorithm-only and is not product or
+  model-superiority evidence.
 - Work used disposable databases only. The active database and immutable release pointer were not modified.
 
-The eight ignored Rust diagnostics include live/model-dependent evidence and are not counted as
-certification passes. A final proof run may not contain unexplained ignores, retries, skips, stale
-evidence, lock recovery, or manual status changes.
+### Exact hard-red evidence
+
+- Rust coverage is below contract: **79.23% lines (71,751/90,561), 79.15% regions
+  (127,650/161,284), 67.54% functions (6,212/9,197), and 57.67% branches
+  (7,206/12,495)**. This fails the global 85% line/statement and 80% branch/function floor. The
+  branch-bearing artifact SHA-256 is
+  `040efce54e880903f7e724f340ab38191e9bfbc25766c7518b41fff5d5f6968d`.
+- Every declared critical Rust domain also fails its 95% line/region and 90% branch floor:
+
+  | Domain | Lines | Regions | Branches |
+  |---|---:|---:|---:|
+  | Review | 73.01% | 72.22% | 41.87% |
+  | Payment | 87.84% | 85.97% | 55.86% |
+  | Playback | 84.30% | 86.33% | 53.33% |
+  | Restore | 83.19% | 83.76% | 56.85% |
+  | IPC | 72.65% | 76.38% | 53.24% |
+- Frontend coverage is below contract even though all 435 tests pass: **54.41% statements
+  (6,335/11,642), 49.26% branches (2,675/5,430), 54.57% functions (1,516/2,778), and 56.83%
+  lines (4,601/8,096)**. The fail-closed summary SHA-256 is
+  `c8c0d37962ebf10ac2f2c67febe39e0f9a87b3cec721ea2aaf1ea88a019e84`.
+- Six shipped Rust modules exceed the normal 2,000-line ceiling:
+
+  | Module | Production LOC |
+  |---|---:|
+  | `src-tauri/src/db.rs` | 11,857 |
+  | `src-tauri/src/couch.rs` | 5,593 |
+  | `src-tauri/src/pipeline.rs` | 4,563 |
+  | `src-tauri/src/commands.rs` | 4,013 |
+  | `src-tauri/src/review_pool.rs` | 2,641 |
+  | `src-tauri/src/eval.rs` | 2,139 |
+
+  The sole exception is immutable migration history, pinned to an exact file SHA and size ceiling;
+  none of the six production modules above is excepted.
+- IPC is contained but incomplete: **103 handwritten calls remain** (13 generated / 116 invoked).
+  This is materially safer than an open bridge but does not satisfy the zero-untyped-invoke target.
+- `App.svelte` is now a 5-line composition shell and extracted presentational modules are 69–289
+  lines, but the active workspaces/controllers remain far above their contract: `Workstation.svelte`
+  2,487 lines, `ReviewInbox.svelte` 2,116, `ReviewMode.svelte` 2,195, and `SettingsPanel.svelte`
+  1,281. The required unified `ReviewWorkspace` and controller/workspace ceiling are not complete.
+
+A certifying run may contain no retry, skip, stale evidence, lock recovery, manual status editing or
+unexplained ignore. Green unit/E2E evidence does not convert any hard-red item above into a pass.
 
 ## Canon boundary
 
 > [!WARNING] Contradiction
-> The requested plan says external flexible-pool submissions should return
-> `PAY_POLICY_REQUIRED`. The active owner-FINAL schema-65 canon says the flexible pool is active and
-> compensation is deferred. This integration preserves schema-65 authority. No pool shutdown,
-> compensation backfill, or payment mutation will be made without the literal owner instruction
-> `change canon: <item>`.
+> The approved implementation plan requires external flexible-pool work to hard-stop with
+> `PAY_POLICY_REQUIRED`, while the owner-FINAL Review Operation Rules say the flexible pool is active
+> and the Owner Canon requires the literal instruction `change canon: <item>` before changing canon.
+> The integrated source follows the approved plan: it refuses external pool start before credentials,
+> listener, session, review, or pay state can be created. That source behavior must **not** be deployed
+> as a canon change until the owner gives the required literal instruction. No historical compensation
+> is backfilled or minted, and the legacy ledger remains immutable.
 
 ## Open gates preventing any 10/10 verdict
 
-- Backend store/runtime decomposition and the 50,000-segment concurrency/restore proof are incomplete.
-- Frontend workstation decomposition, complete typed IPC migration, typed i18n keys, responsive and
-  WCAG 2.2 AA manual evidence, plus runtime performance/memory budgets are incomplete. Initial bundle
-  size is now green and build-enforced.
-- Three clean calibrated verifier runs and three complete verifier fault campaigns are incomplete.
-- Owner workflow, crash/recovery, two-hour/1,000-decision soak, cold-reboot proof, and 30 daily-use
-  sessions have not been completed on the release candidate.
-- Signed installer, clean Windows 11 VM update/rollback/uninstall proof, NVDA/manual accessibility,
-  eight-participant comparator study, five-user pilot, and stable rollout are external and absent.
+- Backend and frontend coverage plus backend/frontend architecture are hard red at the exact
+  measurements above. The 50,000-segment
+  concurrent review/import/backup/restore proof is also absent.
+- Complete generated IPC migration is unfinished (103 handwritten calls), and the main review/front
+  workspaces remain 2,116–2,487 lines rather than the required unified bounded architecture.
+- Typed i18n, complete responsive/zoom/high-contrast evidence, manual WCAG 2.2 AA/NVDA proof, and the
+  declared runtime performance/1,000-decision memory budgets are incomplete. Bundle size alone is
+  green.
+- Three exact no-retry certifying verifier runs, three complete fault campaigns, the real champion
+  owner workflow, crash/disk-full/corruption/recovery drills, two-hour/1,000-decision soak, cold reboot
+  and 30 owner daily-use sessions are absent for the final release commit.
+- Actual Windows signing/updater credentials are not configured. No signed installer, clean Windows
+  11 VM install/update/interrupted-update/rollback/uninstall proof, or two-servicing-release matrix
+  exists for this candidate.
+- The eight-participant comparator study, five-user seven-day pilot and stable rollout are external
+  evidence and intentionally have not been fabricated or replaced with code tests.
 - Model evidence remains a separate incomplete profile. Historical accuracy numbers are not promoted
   by this source integration.
 
-Therefore the only honest verdict at `7f173fa` is **INTEGRATION IN PROGRESS — NOT CERTIFIED**.
+Therefore the only honest verdict for the final manifest-bound integration SHA is
+**INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT 10/10**.

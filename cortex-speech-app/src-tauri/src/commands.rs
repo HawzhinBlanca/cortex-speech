@@ -19,17 +19,23 @@ use crate::pipeline::PipelineEvent;
 use crate::quality;
 #[cfg(test)]
 use crate::recovery::{
-    apply_snapshot_pilot_policy, inspect_snapshot_pilot_policy, preserve_live_asr_runtime_controls,
-    restore_required_snapshot_state_atomic, write_named_restore_pending, NamedRestorePending,
-    NAMED_RESTORE_PENDING_SCHEMA,
+    apply_snapshot_pilot_policy, inspect_snapshot_pilot_policy, prepare_named_restore_artifacts,
+    preserve_live_asr_runtime_controls, restore_required_snapshot_state_atomic, take_mandatory_pre_restore_snapshot,
+    write_named_restore_pending, NamedRestorePending, SnapshotPilotPolicyRestore, NAMED_RESTORE_PENDING_SCHEMA,
 };
 use crate::recovery::{
-    begin_named_restore_transaction, clear_review_pilot_restore_pending, explicit_snapshot_pilot_policy,
-    install_snapshot_restore_plan, load_named_restore_pending, mark_named_restore_completed,
-    prepare_named_restore_artifacts, prepare_restore_admission, refuse_bare_restore_during_controlled_pilot,
-    strict_live_settings_for_restore, take_mandatory_pre_restore_snapshot, SnapshotPilotPolicyRestore,
-    SnapshotRestorePlan,
+    clear_review_pilot_restore_pending, install_snapshot_restore_plan, load_named_restore_pending,
+    mark_named_restore_completed, prepare_restore_admission, refuse_bare_restore_during_controlled_pilot,
 };
+pub(crate) use crate::restore_service::recover_interrupted_named_restore_at_startup;
+#[cfg(test)]
+use crate::restore_service::{
+    has_durable_review_activity, recover_interrupted_named_restore_with_admission, require_active_pilot_policy_binding,
+    require_consent_revocation_superset, require_durable_review_history_superset, validate_active_pilot_semantics,
+    validate_playback_receipt_semantics, validate_restore_target_semantics, validate_review_compensation_semantics,
+    validate_review_effect_semantics,
+};
+use crate::restore_service::{prepare_and_restore_named_transaction, restore_with_mandatory_snapshot};
 use crate::settings::{AppSettings, AsrModelSize};
 use crate::stats;
 use crate::throttle::{RATE_LIMITER, STRICT_RATE_LIMITER};
@@ -511,6 +517,12 @@ fn log_jury_pipeline_failure(context: &str, error: &str) {
 #[tauri::command]
 pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("import_directory")?;
+    {
+        // Scope State before the dialog await. An unavailable dedup index must return its stable code
+        // immediately rather than opening a picker for work the backend is forbidden to admit.
+        let state = app.state::<AppState>();
+        state.require_audio_import_ready().map_err(|error| error.to_string())?;
+    }
     use tauri_plugin_dialog::DialogExt;
     // async + non-blocking folder picker — blocking_pick_folder on this main-thread command froze
     // the whole UI while the picker was open (same footgun as open_audio_file). State is fetched
@@ -551,7 +563,7 @@ pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value
         // Panic-guard the directory worker (same rationale as the single-file path): an unwound
         // panic must not leave the import UI stuck "processing".
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pipeline.import_directory_with_agent_run_id(&dir_path, cancel, Some(&agent_run_id), None, |event| {
+            pipeline.import_directory_with_agent_run_id(&dir_path, cancel, Some(&agent_run_id), None, None, |event| {
                 emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory");
             })
         }));
@@ -609,24 +621,33 @@ pub fn resume_interrupted_import(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("resume_interrupted_import")?;
+    state.require_audio_import_ready().map_err(|error| error.to_string())?;
     let job = state.job_store().find_interrupted_import().map_err(|error| error.to_string())?;
     let Some(job) = job else { return Err("No interrupted import to resume".into()) };
     let dir_path = std::path::PathBuf::from(&job.dir);
     if !dir_path.is_dir() {
         return Err(format!("The import folder no longer exists: {}", job.dir));
     }
-    let completed: std::collections::HashSet<String> = job.completed_paths.into_iter().collect();
+    let completed: std::collections::HashSet<String> = job.completed_paths.iter().cloned().collect();
 
     state.try_start_import()?;
-    {
-        // Retire the crashed job now that we are resuming it; the fresh import job supersedes it.
-        let _ = state.job_store().discard_interrupted_import(&job.id);
-    }
+    // Atomically hand the old journal to a successor BEFORE the worker is spawned. The transaction
+    // copies every completed path and retires the old row in one commit, so a kill here leaves exactly
+    // one resumable journal. On a handoff error, release the in-process single-flight claim while the
+    // original durable journal remains untouched.
+    let resume_job_id = match state.job_store().handoff_import_for_resume(&job.id) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            state.finish_import();
+            return Err(format!("Could not claim the interrupted import journal for resume: {error}"));
+        }
+    };
     let cancel = Some(state.start_cancel_token());
     let pipeline = state.lock_pipeline().clone();
     let agent_run_id = uuid::Uuid::new_v4().to_string();
     let app_clone = app.clone();
-    std::thread::spawn(move || {
+    let worker_resume_job_id = resume_job_id.clone();
+    let worker = std::thread::Builder::new().name("cortex-import-resume".into()).spawn(move || {
         struct ImportGuard {
             app: tauri::AppHandle,
         }
@@ -644,6 +665,7 @@ pub fn resume_interrupted_import(
                 cancel,
                 Some(&agent_run_id),
                 Some(&completed),
+                Some(&worker_resume_job_id),
                 |event| emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory"),
             )
         }));
@@ -666,7 +688,13 @@ pub fn resume_interrupted_import(
             emit_or_log(&app_clone, "pipeline-complete", payload);
         }
     });
-    Ok(serde_json::json!({ "status": "started", "resuming": true }))
+    if let Err(error) = worker {
+        state.finish_import();
+        return Err(format!(
+            "Could not start the resume worker: {error}. Durable import journal {resume_job_id} remains resumable."
+        ));
+    }
+    Ok(serde_json::json!({ "status": "started", "resuming": true, "importJobId": resume_job_id }))
 }
 
 #[tauri::command]
@@ -676,6 +704,7 @@ pub fn import_audio_file(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     RATE_LIMITER.check("import_audio_file")?;
+    state.require_audio_import_ready().map_err(|error| error.to_string())?;
     let validated = validate::validate_file_path(&path)?;
     let file_path = Path::new(&validated).to_path_buf();
 
@@ -1095,99 +1124,6 @@ pub(crate) struct ClipSpan {
     pub end_ms: i64,
 }
 
-/// Decode MANY clips out of ONE source recording in a SINGLE streaming pass.
-///
-/// A per-clip decoder walks the file from byte zero to the clip's end. That is right for one clip and
-/// QUADRATIC for a pack: this library keeps 416 verified clips inside a single podcast FLAC,
-/// so exporting it re-decoded that FLAC 416 times, each walk longer than the last. Measured
-/// 2026-08-18 on the live library: **87 rows in 56 minutes (~36 s/row)**, which puts a full pack in
-/// the hours and makes the challenger loop's "zero manual steps" unreachable in practice.
-///
-/// This walks the source once and hands each clip over the moment its window has passed, so peak
-/// memory is the clips overlapping the current 30 s window rather than the whole file — the same
-/// bound the streaming import already holds itself to. The PCM handed to `on_clip` is
-/// byte-for-byte what the per-clip decoder produced: same decoder, same window size, same slice
-/// arithmetic, so a pack's manifest hash (its snapshot id) does not move because of this change.
-pub(crate) fn decode_finetuned_clips_16k<F>(audio_path: &str, spans: &[ClipSpan], mut on_clip: F) -> Result<(), String>
-where
-    F: FnMut(&str, Vec<i16>) -> Result<(), String>,
-{
-    if spans.is_empty() {
-        return Ok(());
-    }
-    // Opened in start order so a clip can be closed and its buffer freed as soon as the walk passes it.
-    let mut order: Vec<usize> = (0..spans.len()).collect();
-    order.sort_by_key(|&i| (spans[i].start_ms, i));
-    let last_end = spans.iter().map(|s| s.end_ms).max().unwrap_or(0);
-
-    let mut next = 0_usize;
-    let mut open: Vec<(usize, Vec<i16>)> = Vec::new();
-    let mut rate = crate::audio::TARGET_SAMPLE_RATE;
-    const CLIPS_DONE: &str = "__clip_windows_done__";
-
-    let finish = |idx: usize, acc: Vec<i16>, rate: u32, on_clip: &mut F| -> Result<(), String> {
-        let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, acc).map_err(|e| e.to_string())?;
-        on_clip(&spans[idx].segment_id, pcm16)
-    };
-
-    let res = crate::audio::decode_pcm_windows(audio_path, 30_000, |win| {
-        rate = win.sample_rate.max(1);
-        let win_start = win.offset_ms;
-        let dur_ms = (win.pcm.len() as i64 * 1000) / rate as i64;
-        let win_end = win_start + dur_ms;
-
-        while next < order.len() && spans[order[next]].start_ms < win_end {
-            open.push((order[next], Vec::new()));
-            next += 1;
-        }
-        for (idx, acc) in open.iter_mut() {
-            let span = &spans[*idx];
-            if win_end > span.start_ms && win_start < span.end_ms {
-                let a_ms = (span.start_ms.max(win_start) - win_start).max(0);
-                let b_ms = (span.end_ms.min(win_end) - win_start).max(0);
-                let a = ((a_ms * rate as i64) / 1000) as usize;
-                let b = (((b_ms * rate as i64) / 1000) as usize).min(win.pcm.len());
-                if b > a {
-                    acc.extend_from_slice(&win.pcm[a..b]);
-                }
-            }
-        }
-        // Hand over every clip the walk has now passed, so its buffer does not outlive its window.
-        let mut still_open = Vec::with_capacity(open.len());
-        for (idx, acc) in open.drain(..) {
-            if spans[idx].end_ms <= win_end {
-                finish(idx, acc, rate, &mut on_clip).map_err(crate::error::AppError::Other)?;
-            } else {
-                still_open.push((idx, acc));
-            }
-        }
-        open = still_open;
-
-        // Everything asked for has been delivered — stop rather than decode the rest of a long file.
-        if next >= order.len() && open.is_empty() && win_start >= last_end {
-            return Err(crate::error::AppError::Other(CLIPS_DONE.to_string()));
-        }
-        Ok(())
-    });
-    match res {
-        Ok(()) => {}
-        Err(crate::error::AppError::Other(m)) if m == CLIPS_DONE => return Ok(()),
-        // An `on_clip` failure travels back out as itself, not as a decode error.
-        Err(crate::error::AppError::Other(m)) => return Err(m),
-        Err(e) => return Err(e.to_string()),
-    }
-    // EOF with clips still open (a span running past the end of the file) or never opened at all:
-    // hand over what was actually decoded. An empty buffer reaches the caller as an empty clip, which
-    // is the same "undecodable, skip it" signal the per-clip decoder gives.
-    for (idx, acc) in std::mem::take(&mut open) {
-        finish(idx, acc, rate, &mut on_clip)?;
-    }
-    for &idx in &order[next..] {
-        finish(idx, Vec::new(), rate, &mut on_clip)?;
-    }
-    Ok(())
-}
-
 /// Record the FIRST failure only, so the reported cause is the one that actually stopped the run.
 /// The terminal cause of a batch run, or `None` — the ONLY shape that may be reported as `completed`.
 ///
@@ -1295,6 +1231,10 @@ pub fn batch_transcribe(
         // The FIRST failure, kept verbatim: it is the one that explains the stop, and later workers
         // finishing their in-flight clip must not overwrite it with a downstream symptom.
         let first_failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        // Segments commonly share one long source recording. Verify/decode each unique source once,
+        // keep its immutable handle alive through the whole batch, and single-flight concurrent
+        // workers that reach the same recording together.
+        let source_lease_cache: crate::pipeline::TranscriptionSourceLeaseCache = Default::default();
 
         // Pre-fetch all target segments in a SINGLE DB lock (one WHERE IN query)
         // instead of re-locking on every loop iteration. For a 500-segment batch
@@ -1352,15 +1292,23 @@ pub fn batch_transcribe(
 
             if let Some(seg) = seg {
                 // Capture full snapshot BEFORE transcription for complete undo.
-                let pre_transcription_snapshot = seg.clone();
+                let mut pre_transcription_snapshot = seg.clone();
                 // The batch's cancel token rides into the 7B call (2026-08-20 external review: it
                 // passed None, so Cancel could not reach an in-flight or gate-queued champion call).
-                match pipeline.transcribe(
-                    Some(id),
-                    &seg.audio_path,
+                let bound_source = pipeline.bind_existing_transcription_source_cached(
+                    id,
+                    Some(&seg.audio_path),
                     seg.alignment_json.as_deref(),
-                    Some(cancel.as_atomic()),
-                ) {
+                    &source_lease_cache,
+                );
+                let transcription = match bound_source {
+                    Ok(source) => {
+                        pre_transcription_snapshot = source.segment().clone();
+                        pipeline.transcribe_bound(&source, Some(cancel.as_atomic()))
+                    }
+                    Err(error) => Err(error),
+                };
+                match transcription {
                     Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty() => {
                         // A blank draft is NOT a transcript. update_batch_transcription_if_unreviewed would
                         // overwrite an existing good (unreviewed) transcript with "" — e.g. a jury_accept 7B
@@ -2092,3223 +2040,22 @@ pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde
     run_blocking(move || {
         let backup_db = database.open_read().map_err(|e| e.to_string())?;
         backup_db.backup(&validated).map_err(|e| e.to_string())?;
-        // Verify the file we WROTE — an off-disk "disaster copy" that is itself bad (destination volume
-        // corruption) must fail the backup NOW, not at the disaster. Read-only open: never mutate it.
-        let conn = rusqlite::Connection::open_with_flags(
-            &validated,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| format!("backup written but could not be opened for verification: {e}"))?;
-        let integrity: String = conn
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-            .map_err(|e| format!("backup written but failed verification: {e}"))?;
-        if integrity != "ok" {
-            return Err(format!("backup written but FAILED integrity check: {integrity}"));
-        }
-        let segment_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get(0))
-            .map_err(|e| format!("backup written but could not count segments: {e}"))?;
-        Ok(serde_json::json!({ "integrityOk": true, "segmentCount": segment_count }))
+        // Verify the file we WROTE — an off-disk "disaster copy" that is itself bad (destination
+        // corruption) must fail now, not at the disaster. SQL remains behind the service boundary.
+        let verification = crate::backup_service::verify_backup_file(Path::new(&validated)).map_err(String::from)?;
+        serde_json::to_value(verification).map_err(|error| format!("backup verification could not be encoded: {error}"))
     })
     .await
 }
 
 // Compatibility re-exports keep established command/subcommand paths stable while process-level
 // connection ownership and restore admission live behind DatabaseRuntime.
+#[cfg(test)]
+use crate::database_runtime::RestoreAdmission;
 pub(crate) use crate::database_runtime::{
-    begin_mutation, restore_pending, RestoreAdmission, RestoreReservation, RESTORE_ADMISSION, RESTORE_IN_PROGRESS_MSG,
+    begin_mutation, restore_pending, RestoreReservation, RESTORE_IN_PROGRESS_MSG,
 };
 
-/// These rows are irreversible review/payment evidence, not ordinary dataset state. A restore may
-/// add rows, but it may never make any exact pre-restore row disappear or change one of its values.
-/// Keep this list explicit so adding another monetary/audit authority requires a conscious review.
-const DURABLE_REVIEW_RESTORE_TABLES: [&str; 33] = [
-    "review_pilot_hidden_keys",
-    "review_events",
-    "spot_checks",
-    "review_compensation_ledger",
-    "review_compensation_settlements",
-    "review_compensation_policies",
-    "review_effect_state",
-    "human_decision_effect_events",
-    "human_decision_effect_reversals",
-    "review_flag_effect_events",
-    "review_flag_effect_reversals",
-    "correction_memory",
-    "correction_memory_contributions",
-    "corrections",
-    "playback_receipts",
-    "legacy_agent_examples_v60",
-    "legacy_corrections_v60",
-    "legacy_reviewed_segments_v60",
-    "legacy_machine_verdict_segments_v60",
-    "review_campaign_registry",
-    "review_campaign_focus",
-    "review_campaign_transitions",
-    "independent_review_decisions",
-    "independent_review_reversals",
-    "review_campaign_adjudications",
-    "review_pool_registry",
-    "review_pool_members",
-    "review_pool_decisions",
-    "review_pool_reversals",
-    "review_pool_owner_adjudications",
-    "review_pool_voice_certificates",
-    "review_pool_dedup_manifests",
-    "review_pool_duplicate_exclusions",
-];
-
-const EFFECT_BOUND_AGENT_EXAMPLES_RESTORE_PROJECTION: &str =
-    "SELECT * FROM agent_examples WHERE effect_event_id IS NOT NULL";
-const LEGACY_CORRECTION_MEMORY_RESTORE_PROJECTION: &str = "SELECT * FROM correction_memory WHERE legacy_seed = 1";
-const LEGACY_AGENT_EXAMPLES_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_agent_examples_v60";
-const LEGACY_CORRECTIONS_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_corrections_v60";
-const LEGACY_REVIEWED_SEGMENTS_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_reviewed_segments_v60";
-const LEGACY_MACHINE_VERDICTS_RESTORE_PROJECTION: &str = "SELECT * FROM legacy_machine_verdict_segments_v60";
-
-const REVIEWED_SEGMENT_RESTORE_PROJECTION: &str = "SELECT segment.id,
-            segment.audio_content_hash,
-            segment.audio_fingerprint,
-            segment.alignment_json,
-            segment.duration_ms,
-            segment.human_decision,
-            segment.verdict,
-            segment.verdict_transcript,
-            segment.annotated_transcript,
-            segment.verified,
-            segment.reviewed_by,
-            segment.corrected_at,
-            segment.review_revision,
-            segment.escalated,
-            segment.is_gold
-       FROM speech_segments segment
-      WHERE segment.human_decision IS NOT NULL
-         OR segment.reviewed_by IS NOT NULL
-         OR (
-            segment.verified = 1
-            AND (segment.annotated_transcript IS NOT NULL OR segment.verdict_transcript IS NOT NULL)
-         )
-         OR EXISTS (
-            SELECT 1 FROM review_events event
-             WHERE event.segment_id = segment.id
-               AND event.source <> 'couch_spot_check'
-               AND event.action IN ('accept', 'edit', 'reject')
-      )
-         OR EXISTS (
-            SELECT 1 FROM review_compensation_ledger ledger
-             WHERE ledger.segment_id = segment.id
-               AND ledger.compensation_action = 'undo'
-      )";
-
-fn encode_durable_sqlite_value(value: rusqlite::types::ValueRef<'_>, encoded: &mut Vec<u8>) {
-    use rusqlite::types::ValueRef;
-
-    match value {
-        ValueRef::Null => encoded.push(0),
-        ValueRef::Integer(value) => {
-            encoded.push(1);
-            encoded.extend_from_slice(&value.to_be_bytes());
-        }
-        ValueRef::Real(value) => {
-            encoded.push(2);
-            encoded.extend_from_slice(&value.to_bits().to_be_bytes());
-        }
-        ValueRef::Text(value) => {
-            encoded.push(3);
-            encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
-            encoded.extend_from_slice(value);
-        }
-        ValueRef::Blob(value) => {
-            encoded.push(4);
-            encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
-            encoded.extend_from_slice(value);
-        }
-    }
-}
-
-fn exact_query_rows(db: &crate::db::Database, label: &str, sql: &str) -> Result<(Vec<String>, Vec<Vec<u8>>), String> {
-    let mut statement = db
-        .connection()
-        .prepare(sql)
-        .map_err(|error| format!("durable restore floor {label} is unreadable: {error}"))?;
-    let columns = statement.column_names().iter().map(|name| (*name).to_string()).collect::<Vec<_>>();
-    let column_count = statement.column_count();
-    let mut query =
-        statement.query([]).map_err(|error| format!("durable restore floor {label} cannot be scanned: {error}"))?;
-    let mut rows = Vec::new();
-    while let Some(row) =
-        query.next().map_err(|error| format!("durable restore floor {label} cannot be scanned: {error}"))?
-    {
-        let mut encoded = Vec::new();
-        for column in 0..column_count {
-            let value = row
-                .get_ref(column)
-                .map_err(|error| format!("durable restore floor {label} has an unreadable value: {error}"))?;
-            encode_durable_sqlite_value(value, &mut encoded);
-        }
-        rows.push(encoded);
-    }
-    Ok((columns, rows))
-}
-
-fn exact_table_rows(db: &crate::db::Database, table: &str) -> Result<(Vec<String>, Vec<Vec<u8>>), String> {
-    // `table` is selected only from DURABLE_REVIEW_RESTORE_TABLES, never caller input.
-    exact_query_rows(db, &format!("table {table}"), &format!("SELECT * FROM \"{table}\""))
-}
-
-fn require_encoded_row_superset(
-    label: &str,
-    floor_columns: Vec<String>,
-    floor_rows: Vec<Vec<u8>>,
-    target_columns: Vec<String>,
-    target_rows: Vec<Vec<u8>>,
-) -> Result<(), String> {
-    if target_columns != floor_columns {
-        return Err(format!(
-            "database restore refused: target {label} columns do not match the authoritative review-history floor"
-        ));
-    }
-    let mut target_counts = std::collections::BTreeMap::<Vec<u8>, usize>::new();
-    for row in target_rows {
-        *target_counts.entry(row).or_default() += 1;
-    }
-    let mut missing = 0usize;
-    for row in floor_rows {
-        match target_counts.get_mut(&row) {
-            Some(count) if *count > 0 => *count -= 1,
-            _ => missing += 1,
-        }
-    }
-    if missing != 0 {
-        return Err(format!(
-            "database restore refused: target would drop or modify {missing} durable row(s) from {label}"
-        ));
-    }
-    Ok(())
-}
-
-fn require_encoded_row_equality(
-    label: &str,
-    floor_columns: Vec<String>,
-    floor_rows: Vec<Vec<u8>>,
-    target_columns: Vec<String>,
-    target_rows: Vec<Vec<u8>>,
-) -> Result<(), String> {
-    if target_columns != floor_columns {
-        return Err(format!(
-            "database restore refused: target {label} columns do not match the authoritative review-history floor"
-        ));
-    }
-    let row_counts = |rows: Vec<Vec<u8>>| {
-        let mut counts = std::collections::BTreeMap::<Vec<u8>, usize>::new();
-        for row in rows {
-            *counts.entry(row).or_default() += 1;
-        }
-        counts
-    };
-    if row_counts(floor_rows) != row_counts(target_rows) {
-        return Err(format!(
-            "database restore refused: target must exactly preserve {label}; pseudo-legacy additions are forbidden"
-        ));
-    }
-    Ok(())
-}
-
-/// Require `target` to contain every exact durable row in `floor`. Values as well as identities are
-/// compared with SQLite storage-class fidelity; a row with the same primary key but changed text,
-/// amount, policy, timestamp, or REAL bits is therefore a regression, not a match.
-fn require_durable_review_history_superset(
-    floor: &crate::db::Database,
-    target: &crate::db::Database,
-) -> Result<(), String> {
-    for table in DURABLE_REVIEW_RESTORE_TABLES {
-        let (floor_columns, floor_rows) = exact_table_rows(floor, table)?;
-        let (target_columns, target_rows) = exact_table_rows(target, table)?;
-        require_encoded_row_superset(table, floor_columns, floor_rows, target_columns, target_rows)?;
-    }
-    let (floor_columns, floor_rows) =
-        exact_query_rows(floor, "effect-bound agent examples", EFFECT_BOUND_AGENT_EXAMPLES_RESTORE_PROJECTION)?;
-    let (target_columns, target_rows) =
-        exact_query_rows(target, "effect-bound agent examples", EFFECT_BOUND_AGENT_EXAMPLES_RESTORE_PROJECTION)?;
-    require_encoded_row_superset(
-        "effect-bound agent examples",
-        floor_columns,
-        floor_rows,
-        target_columns,
-        target_rows,
-    )?;
-    let (floor_columns, floor_rows) =
-        exact_query_rows(floor, "legacy correction memories", LEGACY_CORRECTION_MEMORY_RESTORE_PROJECTION)?;
-    let (target_columns, target_rows) =
-        exact_query_rows(target, "legacy correction memories", LEGACY_CORRECTION_MEMORY_RESTORE_PROJECTION)?;
-    require_encoded_row_equality("legacy correction memories", floor_columns, floor_rows, target_columns, target_rows)?;
-    for (label, projection) in [
-        ("legacy agent-example snapshot", LEGACY_AGENT_EXAMPLES_RESTORE_PROJECTION),
-        ("legacy correction snapshot", LEGACY_CORRECTIONS_RESTORE_PROJECTION),
-        ("legacy reviewed-segment snapshot", LEGACY_REVIEWED_SEGMENTS_RESTORE_PROJECTION),
-        ("legacy machine-verdict snapshot", LEGACY_MACHINE_VERDICTS_RESTORE_PROJECTION),
-    ] {
-        let (floor_columns, floor_rows) = exact_query_rows(floor, label, projection)?;
-        let (target_columns, target_rows) = exact_query_rows(target, label, projection)?;
-        require_encoded_row_equality(label, floor_columns, floor_rows, target_columns, target_rows)?;
-    }
-    let (floor_columns, floor_rows) =
-        exact_query_rows(floor, "reviewed speech-segment export projection", REVIEWED_SEGMENT_RESTORE_PROJECTION)?;
-    let (target_columns, target_rows) =
-        exact_query_rows(target, "reviewed speech-segment export projection", REVIEWED_SEGMENT_RESTORE_PROJECTION)?;
-    require_encoded_row_superset(
-        "reviewed speech-segment export projection",
-        floor_columns,
-        floor_rows,
-        target_columns,
-        target_rows,
-    )?;
-    Ok(())
-}
-
-fn has_durable_review_activity(db: &crate::db::Database) -> Result<bool, String> {
-    // The policy table is installed before the first paid action and is protected by exact-row
-    // comparison below. Once any actual audit/payment/grant row exists, a bare DB-only swap is no
-    // longer an adequate recovery protocol because it cannot bind the companion policy/config files.
-    for table in [
-        "review_pilot_hidden_keys",
-        "review_events",
-        "spot_checks",
-        "review_compensation_ledger",
-        "review_compensation_settlements",
-        "human_decision_effect_events",
-        "human_decision_effect_reversals",
-        "review_flag_effect_events",
-        "review_flag_effect_reversals",
-        "correction_memory",
-        "correction_memory_contributions",
-        "corrections",
-        "playback_receipts",
-        "legacy_agent_examples_v60",
-        "legacy_corrections_v60",
-        "legacy_reviewed_segments_v60",
-        "legacy_machine_verdict_segments_v60",
-        "review_campaign_registry",
-        "review_campaign_focus",
-        "review_campaign_transitions",
-        "independent_review_decisions",
-        "independent_review_reversals",
-        "review_campaign_adjudications",
-        "review_pool_registry",
-        "review_pool_members",
-        "review_pool_decisions",
-        "review_pool_reversals",
-        "review_pool_owner_adjudications",
-        "review_pool_voice_certificates",
-        "review_pool_dedup_manifests",
-        "review_pool_duplicate_exclusions",
-    ] {
-        let exists: bool = db
-            .connection()
-            .query_row(&format!("SELECT EXISTS(SELECT 1 FROM \"{table}\" LIMIT 1)"), [], |row| row.get(0))
-            .map_err(|error| format!("bare restore could not verify durable review history in {table}: {error}"))?;
-        if exists {
-            return Ok(true);
-        }
-    }
-    let effect_bound_example_exists: bool = db
-        .connection()
-        .query_row("SELECT EXISTS(SELECT 1 FROM agent_examples WHERE effect_event_id IS NOT NULL LIMIT 1)", [], |row| {
-            row.get(0)
-        })
-        .map_err(|error| format!("bare restore could not verify effect-bound human examples: {error}"))?;
-    if effect_bound_example_exists {
-        return Ok(true);
-    }
-    // The singleton exists in every pristine schema-v60 database.  It becomes durable activity only
-    // when it records a non-empty pre-v60 frontier; presence alone must not disable a first restore.
-    let nonempty_effect_frontier: bool = db
-        .connection()
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM review_effect_state
-                  WHERE singleton_key = 1
-                    AND (effective_after_review_event_id > 0 OR effective_after_ledger_id > 0)
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("bare restore could not verify the review-effect frontier: {error}"))?;
-    if nonempty_effect_frontier {
-        return Ok(true);
-    }
-    let reviewed_truth_exists: bool = db
-        .connection()
-        .query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM ({REVIEWED_SEGMENT_RESTORE_PROJECTION}) LIMIT 1)"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("bare restore could not verify reviewed segment truth: {error}"))?;
-    if reviewed_truth_exists {
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn exact_review_entitlement(duration_ms: i64, basis_points: i64) -> Result<i64, String> {
-    if duration_ms <= 0 || !(0..=10_000).contains(&basis_points) {
-        return Err("review compensation has invalid duration or basis points".to_string());
-    }
-    let numerator = i128::from(duration_ms)
-        .checked_mul(i128::from(crate::db::REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR))
-        .and_then(|value| value.checked_mul(i128::from(basis_points)))
-        .ok_or_else(|| "review compensation arithmetic overflow".to_string())?;
-    let denominator = 3_600_000_i128 * 10_000_i128;
-    if numerator % denominator != 0 {
-        return Err("review compensation duration/rate is not an exact micro-IQD amount".to_string());
-    }
-    i64::try_from(numerator / denominator)
-        .map_err(|_| "review compensation entitlement exceeds the supported integer range".to_string())
-}
-
-fn review_action_basis_points(action: &str) -> Option<i64> {
-    match action {
-        "edit" => Some(crate::db::REVIEW_PAY_EDIT_BPS),
-        "accept" => Some(crate::db::REVIEW_PAY_ACCEPT_BPS),
-        "reject" => Some(crate::db::REVIEW_PAY_REJECT_BPS),
-        "skip" => Some(crate::db::REVIEW_PAY_SKIP_BPS),
-        _ => None,
-    }
-}
-
-fn is_canonical_lowercase_uuid(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).map(|parsed| parsed.hyphenated().to_string() == value).unwrap_or(false)
-}
-
-fn is_canonical_lowercase_64_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn valid_compensation_reviewer(reviewer: &str) -> bool {
-    !reviewer.is_empty()
-        && reviewer == reviewer.trim()
-        && reviewer.chars().count() <= 40
-        && !reviewer.chars().any(char::is_control)
-}
-
-fn canonical_work_id_has_writer_shape(work_id: &str, reviewer: &str, duration_ms: i64) -> bool {
-    let reviewer_key = reviewer.trim().to_lowercase();
-    let prefix = format!("reviewer-work-v1:{}:{reviewer_key}:audio-segment-v1:", reviewer_key.len());
-    let Some(audio_identity) = work_id.strip_prefix(&prefix) else {
-        return false;
-    };
-    let mut parts = audio_identity.split(':');
-    let (Some(content_hash), Some(start), Some(end), None) = (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let (Ok(start), Ok(end)) = (start.parse::<i64>(), end.parse::<i64>()) else {
-        return false;
-    };
-    is_canonical_lowercase_64_hex(content_hash) && crate::db::source_span_matches_duration(start, end, duration_ms)
-}
-
-fn canonical_work_audio_identity<'a>(work_id: &'a str, reviewer: &str) -> Option<(&'a str, i64, i64)> {
-    let reviewer_key = reviewer.trim().to_lowercase();
-    let prefix = format!("reviewer-work-v1:{}:{reviewer_key}:audio-segment-v1:", reviewer_key.len());
-    let audio_identity = work_id.strip_prefix(&prefix)?;
-    let mut parts = audio_identity.split(':');
-    let content_hash = parts.next()?;
-    let start = parts.next()?.parse::<i64>().ok()?;
-    let end = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some() || !is_canonical_lowercase_64_hex(content_hash) || start < 0 || end <= start {
-        return None;
-    }
-    Some((content_hash, start, end))
-}
-
-/// Reproduce `Database::compensation_audio_identity_tx` and the reviewer namespace byte for byte.
-/// Restore validation cannot trust a ledger's self-declared work id: a forged target could otherwise
-/// split one clip into several invented work ids and earn the full rate on every split.
-fn canonical_compensation_work(
-    db: &crate::db::Database,
-    segment_id: &str,
-    reviewer: &str,
-    decision_revision: i64,
-) -> Result<Option<(String, i64)>, String> {
-    use rusqlite::OptionalExtension;
-
-    if !valid_compensation_reviewer(reviewer) {
-        return Err("database restore refused: compensation row has an invalid reviewer identity".to_string());
-    }
-    let row: Option<(Option<String>, Option<String>, i64, i64)> = db
-        .connection()
-        .query_row(
-            "SELECT audio_content_hash, alignment_json, duration_ms, COALESCE(review_revision, 0)
-               FROM speech_segments WHERE id = ?1",
-            [segment_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()
-        .map_err(|error| format!("restore target compensation segment identity is unreadable: {error}"))?;
-    let Some((content_hash, alignment_json, duration_ms, current_revision)) = row else {
-        return Ok(None);
-    };
-    if current_revision < decision_revision || current_revision < 0 {
-        return Err(format!(
-            "database restore refused: compensation segment {segment_id} regresses its decision revision"
-        ));
-    }
-    if current_revision != decision_revision {
-        return Ok(None);
-    }
-    if duration_ms <= 0 {
-        return Err(format!(
-            "database restore refused: current compensation segment {segment_id} has invalid duration"
-        ));
-    }
-    let content_hash = content_hash.as_deref().map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
-        format!("database restore refused: compensation segment {segment_id} has fallback audio identity")
-    })?;
-    let alignment_json = alignment_json.as_deref().ok_or_else(|| {
-        format!("database restore refused: compensation segment {segment_id} has no source-span identity")
-    })?;
-    let alignment: serde_json::Value = serde_json::from_str(alignment_json).map_err(|_| {
-        format!("database restore refused: compensation segment {segment_id} has invalid source-span identity")
-    })?;
-    let start = alignment.get("source_start_ms").and_then(serde_json::Value::as_i64);
-    let end = alignment.get("source_end_ms").and_then(serde_json::Value::as_i64);
-    let (Some(start), Some(end)) = (start, end) else {
-        return Err(format!(
-            "database restore refused: compensation segment {segment_id} has incomplete source-span identity"
-        ));
-    };
-    if !crate::db::source_span_matches_duration(start, end, duration_ms) {
-        return Err(format!(
-            "database restore refused: compensation segment {segment_id} source span disagrees with decoded duration"
-        ));
-    }
-    let reviewer_key = reviewer.trim().to_lowercase();
-    let audio_work_id = format!("audio-segment-v1:{content_hash}:{start}:{end}");
-    Ok(Some((format!("reviewer-work-v1:{}:{reviewer_key}:{audio_work_id}", reviewer_key.len()), duration_ms)))
-}
-
-/// Re-derive the current compensation ledger and settlements from their immutable inputs. Schema
-/// triggers protect future writes, but a restored database may contain pre-existing forged extras;
-/// this read-only pass proves their complete arithmetic/identity semantics before page publication.
-fn validate_review_compensation_semantics(db: &crate::db::Database) -> Result<(), String> {
-    use rusqlite::OptionalExtension;
-
-    #[derive(Clone)]
-    struct Event {
-        segment_id: String,
-        reviewer: String,
-        action: String,
-        compensation_action: Option<String>,
-        source: String,
-        duration_ms: Option<i64>,
-        operation_id: Option<String>,
-        operation_payload_hash: Option<String>,
-        requested_action: Option<String>,
-        requested_transcript: Option<String>,
-        served_transcript: Option<String>,
-        served_revision: Option<i64>,
-    }
-
-    #[derive(Clone)]
-    struct Ledger {
-        id: i64,
-        entry_id: String,
-        entry_key: String,
-        review_event_id: Option<i64>,
-        canonical_work_id: String,
-        canonical_identity_kind: String,
-        reviewer: String,
-        segment_id: String,
-        source: String,
-        compensation_action: String,
-        effective_decision: String,
-        decision_revision: Option<i64>,
-        duration_ms: i64,
-        rate_basis_points: i64,
-        entitlement_micro_iqd: i64,
-        delta_micro_iqd: i64,
-        corrected_entitlement_ms: i64,
-        delta_corrected_ms: i64,
-        reverses_entry_id: Option<String>,
-    }
-
-    let mut policy_statement = db
-        .connection()
-        .prepare(
-            "SELECT policy_version, effective_after_event_id, base_rate_micro_iqd_per_hour,
-                    edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points
-               FROM review_compensation_policies ORDER BY policy_version",
-        )
-        .map_err(|error| format!("restore target compensation policy is unreadable: {error}"))?;
-    let policies = policy_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })
-        .map_err(|error| format!("restore target compensation policy is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target compensation policy is unreadable: {error}"))?;
-    drop(policy_statement);
-    if policies.len() != 1 || policies[0].0 != crate::db::REVIEW_PAY_POLICY_VERSION {
-        return Err(format!(
-            "database restore refused: target must contain only the exact {} compensation policy row",
-            crate::db::REVIEW_PAY_POLICY_VERSION
-        ));
-    }
-    let policy = &policies[0];
-    if (policy.2, policy.3, policy.4, policy.5, policy.6)
-        != (
-            crate::db::REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR,
-            crate::db::REVIEW_PAY_EDIT_BPS,
-            crate::db::REVIEW_PAY_ACCEPT_BPS,
-            crate::db::REVIEW_PAY_REJECT_BPS,
-            crate::db::REVIEW_PAY_SKIP_BPS,
-        )
-    {
-        return Err(
-            "database restore refused: target compensation policy constants differ from this binary".to_string()
-        );
-    }
-    let cutoff = policy.1;
-    let effect_event_frontier: i64 = db
-        .connection()
-        .query_row(
-            "SELECT effective_after_review_event_id FROM review_effect_state WHERE singleton_key = 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("restore target review-effect frontier is unreadable: {error}"))?;
-    let maximum_event_id: i64 = db
-        .connection()
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
-        .map_err(|error| format!("restore target compensation cutoff cannot be verified: {error}"))?;
-    if cutoff < 0 || cutoff > maximum_event_id {
-        return Err(format!(
-            "database restore refused: target compensation cutoff {cutoff} is outside review history 0..={maximum_event_id}"
-        ));
-    }
-
-    let mut event_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, segment_id, reviewer, action, compensation_action, source, duration_ms,
-                    operation_id, operation_payload_hash, requested_action,
-                    requested_transcript, served_transcript, served_revision
-               FROM review_events WHERE id > ?1 ORDER BY id",
-        )
-        .map_err(|error| format!("restore target prospective compensation events are unreadable: {error}"))?;
-    let event_rows = event_statement
-        .query_map([cutoff], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                Event {
-                    segment_id: row.get(1)?,
-                    reviewer: row.get(2)?,
-                    action: row.get(3)?,
-                    compensation_action: row.get(4)?,
-                    source: row.get(5)?,
-                    duration_ms: row.get(6)?,
-                    operation_id: row.get(7)?,
-                    operation_payload_hash: row.get(8)?,
-                    requested_action: row.get(9)?,
-                    requested_transcript: row.get(10)?,
-                    served_transcript: row.get(11)?,
-                    served_revision: row.get(12)?,
-                },
-            ))
-        })
-        .map_err(|error| format!("restore target prospective compensation events are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target prospective compensation events are unreadable: {error}"))?;
-    drop(event_statement);
-    let events = event_rows.into_iter().collect::<std::collections::HashMap<_, _>>();
-
-    let mut operation_ids = std::collections::HashSet::<String>::new();
-    for (event_id, event) in &events {
-        if !valid_compensation_reviewer(&event.reviewer)
-            || !matches!(event.source.as_str(), "couch" | "couch_spot_check")
-            || !matches!(event.action.as_str(), "accept" | "edit" | "reject" | "skip")
-        {
-            return Err(format!(
-                "database restore refused: post-cutoff review event {event_id} is not a valid production Couch action"
-            ));
-        }
-        let compensation_action = event.compensation_action.as_deref().ok_or_else(|| {
-            format!("database restore refused: post-cutoff review event {event_id} has no compensation action")
-        })?;
-        let requested_action = event.requested_action.as_deref().unwrap_or_default();
-        let requested_transcript = event.requested_transcript.as_deref().unwrap_or_default();
-        let served_transcript = event.served_transcript.as_deref().unwrap_or_default();
-        let served_revision = event.served_revision.unwrap_or(-1);
-        let expected_compensation = match requested_action {
-            "skip" => Some("skip"),
-            "bad" | "reject" => Some("reject"),
-            "accept" | "edit" => Some(
-                if crate::normalizer::learning_text_key(requested_transcript)
-                    == crate::normalizer::learning_text_key(served_transcript)
-                {
-                    "accept"
-                } else {
-                    "edit"
-                },
-            ),
-            _ => None,
-        };
-        let valid_action_pair = if event.source == "couch_spot_check" {
-            compensation_action == event.action && expected_compensation == Some(compensation_action)
-        } else {
-            match event.action.as_str() {
-                "skip" => compensation_action == "skip" && expected_compensation == Some("skip"),
-                "reject" => compensation_action == "reject" && expected_compensation == Some("reject"),
-                // Corpus provenance may reclassify an unchanged earlier human correction as edit
-                // while pay remains an accept, or an alternate ASR hypothesis as accept while pay
-                // remains an edit. Both are deliberate writer outcomes; no other cross-pair is.
-                "accept" | "edit" => {
-                    matches!(compensation_action, "accept" | "edit")
-                        && expected_compensation == Some(compensation_action)
-                }
-                _ => false,
-            }
-        };
-        if review_action_basis_points(compensation_action).is_none() || !valid_action_pair {
-            return Err(format!(
-                "database restore refused: post-cutoff review event {event_id} has invalid action/pay semantics"
-            ));
-        }
-        if requested_transcript != crate::db::to_nfc(requested_transcript.trim())
-            || served_transcript.is_empty()
-            || served_transcript != crate::db::to_nfc(served_transcript.trim())
-            || served_revision < 0
-        {
-            return Err(format!(
-                "database restore refused: post-cutoff review event {event_id} has invalid served/request evidence"
-            ));
-        }
-        let operation_id = event.operation_id.as_deref().unwrap_or_default();
-        if !is_canonical_lowercase_uuid(operation_id) || !operation_ids.insert(operation_id.to_string()) {
-            return Err(format!(
-                "database restore refused: post-cutoff Couch event {event_id} lacks a unique canonical lowercase UUID"
-            ));
-        }
-        let operation_hash = event.operation_payload_hash.as_deref().unwrap_or_default();
-        if !is_canonical_lowercase_64_hex(operation_hash) {
-            return Err(format!(
-                "database restore refused: post-cutoff Couch event {event_id} lacks a canonical payload hash"
-            ));
-        }
-        if !event.duration_ms.is_some_and(|duration| duration > 0) {
-            return Err(format!(
-                "database restore refused: post-cutoff review event {event_id} has no valid durable duration"
-            ));
-        }
-        if event.source == "couch_spot_check" {
-            let exact_results: i64 = db
-                .connection()
-                .query_row(
-                    "SELECT COUNT(*) FROM spot_checks
-                      WHERE segment_id = ?1 AND reviewer = ?2 COLLATE NOCASE AND action = ?3",
-                    rusqlite::params![event.segment_id, event.reviewer, event.action],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("restore target spot-check compensation evidence is unreadable: {error}"))?;
-            if exact_results != 1 {
-                return Err(format!(
-                    "database restore refused: hidden review event {event_id} lacks its exact immutable spot-check result"
-                ));
-            }
-        }
-    }
-
-    let mut ledger_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, entry_id, entry_key, review_event_id, canonical_work_id, canonical_identity_kind,
-                    reviewer, segment_id, source, compensation_action, effective_decision,
-                    decision_revision, duration_ms, rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
-                    corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id
-               FROM review_compensation_ledger
-              WHERE policy_version = ?1 ORDER BY id",
-        )
-        .map_err(|error| format!("restore target compensation ledger is unreadable: {error}"))?;
-    let ledger_rows = ledger_statement
-        .query_map([crate::db::REVIEW_PAY_POLICY_VERSION], |row| {
-            Ok(Ledger {
-                id: row.get(0)?,
-                entry_id: row.get(1)?,
-                entry_key: row.get(2)?,
-                review_event_id: row.get(3)?,
-                canonical_work_id: row.get(4)?,
-                canonical_identity_kind: row.get(5)?,
-                reviewer: row.get(6)?,
-                segment_id: row.get(7)?,
-                source: row.get(8)?,
-                compensation_action: row.get(9)?,
-                effective_decision: row.get(10)?,
-                decision_revision: row.get(11)?,
-                duration_ms: row.get(12)?,
-                rate_basis_points: row.get(13)?,
-                entitlement_micro_iqd: row.get(14)?,
-                delta_micro_iqd: row.get(15)?,
-                corrected_entitlement_ms: row.get(16)?,
-                delta_corrected_ms: row.get(17)?,
-                reverses_entry_id: row.get(18)?,
-            })
-        })
-        .map_err(|error| format!("restore target compensation ledger is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target compensation ledger is unreadable: {error}"))?;
-    drop(ledger_statement);
-
-    let mut event_entry_counts = std::collections::HashMap::<i64, usize>::new();
-    let mut entries = std::collections::HashMap::<String, Ledger>::new();
-    let mut entry_keys = std::collections::HashSet::<String>::new();
-    let mut reversed_entries = std::collections::HashSet::<String>::new();
-    let mut balances = std::collections::HashMap::<String, i64>::new();
-    let mut corrected_balances = std::collections::HashMap::<String, i64>::new();
-    for ledger in &ledger_rows {
-        if ledger.id <= 0
-            || !is_canonical_lowercase_uuid(&ledger.entry_id)
-            || !valid_compensation_reviewer(&ledger.reviewer)
-            || !entry_keys.insert(ledger.entry_key.clone())
-        {
-            return Err(format!(
-                "database restore refused: compensation ledger entry {} has invalid or duplicate durable identity",
-                ledger.entry_id
-            ));
-        }
-        let decision_revision = ledger.decision_revision.ok_or_else(|| {
-            format!("database restore refused: compensation ledger entry {} has no decision revision", ledger.entry_id)
-        })?;
-        if ledger.canonical_identity_kind != "audio_content_hash+source_span"
-            || !canonical_work_id_has_writer_shape(&ledger.canonical_work_id, &ledger.reviewer, ledger.duration_ms)
-            || ledger.duration_ms <= 0
-            || decision_revision < 0
-        {
-            return Err(format!(
-                "database restore refused: compensation ledger entry {} disagrees with canonical segment/work identity",
-                ledger.entry_id
-            ));
-        }
-        if let Some((expected_work_id, segment_duration)) =
-            canonical_compensation_work(db, &ledger.segment_id, &ledger.reviewer, decision_revision)?
-        {
-            if ledger.canonical_work_id != expected_work_id || ledger.duration_ms != segment_duration {
-                return Err(format!(
-                    "database restore refused: current compensation ledger entry {} disagrees with its segment identity",
-                    ledger.entry_id
-                ));
-            }
-        }
-        let prior = *balances.get(&ledger.canonical_work_id).unwrap_or(&0);
-        let prior_corrected = *corrected_balances.get(&ledger.canonical_work_id).unwrap_or(&0);
-
-        if let Some(event_id) = ledger.review_event_id {
-            *event_entry_counts.entry(event_id).or_default() += 1;
-            let event = events.get(&event_id).ok_or_else(|| {
-                format!(
-                    "database restore refused: compensation ledger entry {} points outside the post-cutoff event range",
-                    ledger.entry_id
-                )
-            })?;
-            let expected_action = event
-                .compensation_action
-                .as_deref()
-                .ok_or_else(|| format!("database restore refused: event {event_id} has no compensation action"))?;
-            let event_duration = event
-                .duration_ms
-                .ok_or_else(|| format!("database restore refused: event {event_id} has no durable duration"))?;
-            if ledger.compensation_action != expected_action
-                || ledger.effective_decision != event.action
-                || ledger.segment_id != event.segment_id
-                || ledger.reviewer.trim().to_lowercase() != event.reviewer.trim().to_lowercase()
-                || ledger.source != event.source
-                || ledger.duration_ms != event_duration
-                || ledger.entry_key != format!("review-event:{event_id}")
-                || ledger.reverses_entry_id.is_some()
-                || (event.source == "couch" && event.action != "skip" && decision_revision == 0)
-                || ((event.source == "couch_spot_check" || event.action == "skip")
-                    && event.served_revision != Some(decision_revision))
-            {
-                return Err(format!(
-                    "database restore refused: compensation ledger entry {} disagrees with review event {event_id}",
-                    ledger.entry_id
-                ));
-            }
-            if event.action != "skip" && event_id > effect_event_frontier {
-                let receipt_revision = event
-                    .served_revision
-                    .ok_or_else(|| format!("database restore refused: paid event {event_id} has no served revision"))?;
-                if event.source == "couch" {
-                    let (effect_count, prior_revision): (i64, Option<i64>) = db
-                        .connection()
-                        .query_row(
-                            "SELECT COUNT(*), MIN(prior_revision)
-                               FROM human_decision_effect_events
-                              WHERE review_event_id = ?1 AND decision_revision = ?2",
-                            rusqlite::params![event_id, decision_revision],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .map_err(|error| format!("restore target paid playback revision is unreadable: {error}"))?;
-                    if effect_count != 1 {
-                        return Err(format!(
-                            "database restore refused: paid corpus event {event_id} has no unique decision effect for playback binding"
-                        ));
-                    }
-                    let effect_prior_revision = prior_revision.ok_or_else(|| {
-                        format!("database restore refused: paid corpus event {event_id} has no receipt revision")
-                    })?;
-                    if effect_prior_revision != receipt_revision {
-                        return Err(format!(
-                            "database restore refused: paid corpus event {event_id} served revision disagrees with its decision effect"
-                        ));
-                    }
-                }
-                let (content_hash, source_start_ms, source_end_ms) = canonical_work_audio_identity(
-                    &ledger.canonical_work_id,
-                    &ledger.reviewer,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "database restore refused: paid event {event_id} has no canonical content-hash/source-span work identity"
-                    )
-                })?;
-                let retained_identity: Option<(Option<String>, i64, i64, Option<String>)> = db
-                    .connection()
-                    .query_row(
-                        "SELECT audio_content_hash, duration_ms, COALESCE(review_revision, 0), alignment_json
-                           FROM speech_segments WHERE id = ?1",
-                        [&ledger.segment_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .optional()
-                    .map_err(|error| format!("restore target paid segment identity is unreadable: {error}"))?;
-                let Some((retained_hash, retained_duration, retained_revision, retained_alignment)) = retained_identity
-                else {
-                    return Err(format!(
-                        "database restore refused: post-v60 paid segment {} is missing; policy-3 evidence forbids reviewed-segment deletion",
-                        ledger.segment_id
-                    ));
-                };
-                let retained_span = crate::db::canonical_source_span(retained_alignment.as_deref());
-                if retained_hash.as_deref() != Some(content_hash)
-                    || retained_span != Some((source_start_ms, source_end_ms))
-                    || retained_duration != ledger.duration_ms
-                    || retained_revision < decision_revision
-                {
-                    return Err(format!(
-                        "database restore refused: paid review event {event_id} disagrees with its retained BLAKE3/source-span/duration identity"
-                    ));
-                }
-                let sufficient_receipts: i64 = db
-                    .connection()
-                    .query_row(
-                        "SELECT COUNT(*)
-                           FROM playback_receipts receipt
-                          WHERE receipt.segment_id = ?1
-                            AND receipt.reviewer = ?2 COLLATE NOCASE
-                            AND receipt.segment_revision = ?3
-                            AND receipt.audio_fingerprint = ?4
-                            AND receipt.source_start_ms = ?5
-                            AND receipt.source_end_ms = ?6
-                            AND receipt.clip_duration_ms = ?7
-                            AND receipt.policy_version = ?8
-                            AND receipt.started_at_ms >= 0
-                            AND receipt.played_ms >= 0
-                            AND receipt.coverage_ratio >= ?9",
-                        rusqlite::params![
-                            ledger.segment_id,
-                            ledger.reviewer,
-                            receipt_revision,
-                            content_hash,
-                            source_start_ms,
-                            source_end_ms,
-                            ledger.duration_ms,
-                            crate::db::PLAYBACK_POLICY_VERSION,
-                            crate::db::MIN_PLAYBACK_COVERAGE,
-                        ],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| format!("restore target paid playback evidence is unreadable: {error}"))?;
-                if sufficient_receipts == 0 {
-                    return Err(format!(
-                        "database restore refused: paid review event {event_id} has no exact sufficient policy-3 playback receipt"
-                    ));
-                }
-            }
-            let expected_bps = review_action_basis_points(expected_action).ok_or_else(|| {
-                format!("database restore refused: ledger entry {} has an unsupported action", ledger.entry_id)
-            })?;
-            let entitlement = if expected_bps == 0 {
-                if ledger.duration_ms <= 0 {
-                    return Err(format!(
-                        "database restore refused: ledger entry {} has non-positive duration",
-                        ledger.entry_id
-                    ));
-                }
-                0
-            } else {
-                exact_review_entitlement(ledger.duration_ms, expected_bps)?
-            };
-            let expected_delta = if expected_action == "skip" {
-                0
-            } else {
-                entitlement.checked_sub(prior).ok_or_else(|| "review compensation delta overflow".to_string())?
-            };
-            let corrected_target = match expected_action {
-                "edit" => ledger.duration_ms,
-                "skip" => prior_corrected,
-                "accept" | "reject" => 0,
-                _ => return Err(format!("database restore refused: unsupported ledger action {expected_action}")),
-            };
-            let expected_corrected_delta = corrected_target
-                .checked_sub(prior_corrected)
-                .ok_or_else(|| "review corrected-entitlement delta overflow".to_string())?;
-            if ledger.rate_basis_points != expected_bps
-                || ledger.entitlement_micro_iqd != entitlement
-                || ledger.delta_micro_iqd != expected_delta
-                || ledger.corrected_entitlement_ms != corrected_target
-                || ledger.delta_corrected_ms != expected_corrected_delta
-            {
-                return Err(format!(
-                    "database restore refused: compensation rate/delta/corrected math is invalid at {}",
-                    ledger.entry_id
-                ));
-            }
-        } else if ledger.compensation_action == "undo" {
-            if ledger.effective_decision != "undo"
-                || ledger.source != "couch_undo"
-                || ledger.rate_basis_points != 0
-                || ledger.entitlement_micro_iqd != 0
-            {
-                return Err(format!(
-                    "database restore refused: undo ledger entry {} has invalid fixed semantics",
-                    ledger.entry_id
-                ));
-            }
-            let reversed_id = ledger.reverses_entry_id.as_deref().ok_or_else(|| {
-                format!("database restore refused: undo {} does not name an earlier entry", ledger.entry_id)
-            })?;
-            let reversed = entries.get(reversed_id).ok_or_else(|| {
-                format!("database restore refused: undo {} references a missing or later entry", ledger.entry_id)
-            })?;
-            let latest_eligible = entries
-                .values()
-                .filter(|entry| {
-                    entry.review_event_id.is_some()
-                        && entry.compensation_action != "undo"
-                        && entry.canonical_work_id == ledger.canonical_work_id
-                        && entry.reviewer.trim().eq_ignore_ascii_case(ledger.reviewer.trim())
-                        && !reversed_entries.contains(&entry.entry_id)
-                })
-                .max_by_key(|entry| entry.id)
-                .map(|entry| entry.entry_id.as_str());
-            if reversed.compensation_action == "undo"
-                || reversed.canonical_work_id != ledger.canonical_work_id
-                || reversed.segment_id != ledger.segment_id
-                || reversed.reviewer.trim().to_lowercase() != ledger.reviewer.trim().to_lowercase()
-                || reversed.duration_ms != ledger.duration_ms
-                || reversed.decision_revision != ledger.decision_revision
-                || latest_eligible != Some(reversed_id)
-                || !reversed_entries.insert(reversed_id.to_string())
-            {
-                return Err(format!(
-                    "database restore refused: undo {} does not exactly bind its earlier decision entry",
-                    ledger.entry_id
-                ));
-            }
-            let reversed_event_id = reversed.review_event_id.ok_or_else(|| {
-                format!("database restore refused: undo {} does not reverse a production decision", ledger.entry_id)
-            })?;
-            let reversed_event = events.get(&reversed_event_id).ok_or_else(|| {
-                format!("database restore refused: undo {} reverses an unknown event", ledger.entry_id)
-            })?;
-            let undo_operation = ledger.entry_key.strip_prefix("undo:").unwrap_or_default();
-            if reversed.source != "couch"
-                || reversed.effective_decision == "skip"
-                || !is_canonical_lowercase_uuid(undo_operation)
-                || reversed_event.operation_id.as_deref() != Some(undo_operation)
-            {
-                return Err(format!(
-                    "database restore refused: undo {} has invalid operation/event linkage",
-                    ledger.entry_id
-                ));
-            }
-            let expected_delta = reversed
-                .delta_micro_iqd
-                .checked_neg()
-                .ok_or_else(|| "review compensation undo overflow".to_string())?;
-            let expected_corrected_delta = reversed
-                .delta_corrected_ms
-                .checked_neg()
-                .ok_or_else(|| "review corrected-entitlement undo overflow".to_string())?;
-            let expected_corrected_entitlement = prior_corrected
-                .checked_add(expected_corrected_delta)
-                .ok_or_else(|| "review corrected-entitlement undo balance overflow".to_string())?;
-            if ledger.delta_micro_iqd != expected_delta
-                || ledger.delta_corrected_ms != expected_corrected_delta
-                || ledger.corrected_entitlement_ms != expected_corrected_entitlement
-            {
-                return Err(format!(
-                    "database restore refused: undo compensation math is invalid at {}",
-                    ledger.entry_id
-                ));
-            }
-        } else {
-            return Err(format!(
-                "database restore refused: ledger entry {} has neither event nor undo semantics",
-                ledger.entry_id
-            ));
-        }
-
-        let balance = prior
-            .checked_add(ledger.delta_micro_iqd)
-            .ok_or_else(|| "review compensation running balance overflow".to_string())?;
-        let corrected_balance = prior_corrected
-            .checked_add(ledger.delta_corrected_ms)
-            .ok_or_else(|| "review corrected-entitlement running balance overflow".to_string())?;
-        if balance < 0 || corrected_balance < 0 {
-            return Err(format!(
-                "database restore refused: compensation entry {} creates a negative running balance",
-                ledger.entry_id
-            ));
-        }
-        balances.insert(ledger.canonical_work_id.clone(), balance);
-        corrected_balances.insert(ledger.canonical_work_id.clone(), corrected_balance);
-        if entries.insert(ledger.entry_id.clone(), ledger.clone()).is_some() {
-            return Err("database restore refused: compensation ledger has duplicate entry identity".to_string());
-        }
-    }
-    for event_id in events.keys() {
-        if event_entry_counts.get(event_id).copied().unwrap_or(0) != 1 {
-            return Err(format!(
-                "database restore refused: post-cutoff review event {event_id} does not have exactly one current-policy ledger entry"
-            ));
-        }
-    }
-
-    let mut settlement_statement = db
-        .connection()
-        .prepare(
-            "SELECT settlement_id, reviewer, from_ledger_id_exclusive,
-                    through_ledger_id_inclusive, allocated_micro_iqd, payout_reference
-               FROM review_compensation_settlements
-              WHERE policy_version = ?1
-              ORDER BY reviewer COLLATE NOCASE, through_ledger_id_inclusive",
-        )
-        .map_err(|error| format!("restore target compensation settlements are unreadable: {error}"))?;
-    let settlements = settlement_statement
-        .query_map([crate::db::REVIEW_PAY_POLICY_VERSION], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })
-        .map_err(|error| format!("restore target compensation settlements are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target compensation settlements are unreadable: {error}"))?;
-    drop(settlement_statement);
-    let maximum_ledger_id = ledger_rows.last().map(|row| row.id).unwrap_or(0);
-    let mut boundaries = std::collections::HashMap::<String, i64>::new();
-    let mut payout_references = std::collections::HashSet::<String>::new();
-    for (settlement_id, reviewer, from, through, amount, payout_reference) in settlements {
-        let reviewer_key = reviewer.trim().to_lowercase();
-        let expected_from = boundaries.get(&reviewer_key).copied().unwrap_or(0);
-        if !is_canonical_lowercase_uuid(&settlement_id)
-            || !valid_compensation_reviewer(&reviewer)
-            || from != expected_from
-            || through <= from
-            || through > maximum_ledger_id
-        {
-            return Err(format!(
-                "database restore refused: settlement {settlement_id} has a non-contiguous or invalid ledger range"
-            ));
-        }
-        let mut exact_amount = 0i64;
-        let mut matching_rows = 0usize;
-        for ledger in &ledger_rows {
-            if ledger.reviewer.trim().to_lowercase() == reviewer_key && ledger.id > from && ledger.id <= through {
-                exact_amount = exact_amount
-                    .checked_add(ledger.delta_micro_iqd)
-                    .ok_or_else(|| "review settlement amount overflow".to_string())?;
-                matching_rows += 1;
-            }
-        }
-        if matching_rows == 0 || exact_amount != amount {
-            return Err(format!(
-                "database restore refused: settlement {settlement_id} amount differs from its immutable ledger range"
-            ));
-        }
-        let reference = payout_reference.trim().to_string();
-        if reference.is_empty() || reference != payout_reference || !payout_references.insert(reference) {
-            return Err(format!(
-                "database restore refused: settlement {settlement_id} has an empty or duplicate payout reference"
-            ));
-        }
-        boundaries.insert(reviewer_key, through);
-    }
-    Ok(())
-}
-
-/// Re-derive schema-v60 review-effect meaning from immutable authorities.  Triggers constrain new
-/// writes, but a restored file may already contain rows created with triggers disabled; this pass
-/// therefore cross-checks the complete event/effect/inverse graph before the database is published.
-fn validate_review_effect_semantics(db: &crate::db::Database) -> Result<(), String> {
-    use rusqlite::OptionalExtension;
-
-    fn optional_text_is_blank(value: Option<&str>) -> bool {
-        match value {
-            Some(value) => value.trim().is_empty(),
-            None => true,
-        }
-    }
-
-    #[derive(Clone)]
-    struct DecisionEffect {
-        id: i64,
-        review_event_id: Option<i64>,
-        segment_id: String,
-        reviewer: Option<String>,
-        source: String,
-        operation_id: Option<String>,
-        operation_payload_hash: Option<String>,
-        action: String,
-        served_transcript: String,
-        decision_transcript: Option<String>,
-        decision_annotated_transcript: Option<String>,
-        decision_verified: i64,
-        decision_corrected_at: String,
-        decision_rationale: Option<String>,
-        requested_action: Option<String>,
-        requested_transcript: Option<String>,
-        requested_timestamp_ms: Option<i64>,
-        prior_revision: i64,
-        decision_revision: i64,
-        prior_verified: i64,
-        prior_annotated_transcript: Option<String>,
-        prior_verdict: Option<String>,
-        prior_verdict_transcript: Option<String>,
-        prior_rationale: Option<String>,
-        prior_escalated: i64,
-        prior_human_decision: Option<String>,
-        prior_corrected_at: Option<String>,
-        prior_reviewed_by: Option<String>,
-        reversal_operation: Option<String>,
-    }
-
-    #[derive(Clone)]
-    struct FlagEffect {
-        id: i64,
-        operation_id: String,
-        segment_id: String,
-        prior_revision: i64,
-        flag_revision: i64,
-        prior_verdict: Option<String>,
-        prior_rationale: Option<String>,
-        flag_rationale: String,
-        prior_escalated: i64,
-        reversal_operation: Option<String>,
-    }
-
-    #[derive(Clone)]
-    struct PostV60Event {
-        id: i64,
-        segment_id: String,
-        reviewer: String,
-        action: String,
-        compensation_action: String,
-        source: String,
-        operation_id: String,
-        operation_payload_hash: String,
-        requested_action: String,
-        requested_transcript: String,
-        served_transcript: String,
-        served_revision: i64,
-    }
-
-    #[derive(Clone)]
-    enum ReviewMutation {
-        Decision(Box<DecisionEffect>),
-        Flag(FlagEffect),
-    }
-
-    #[derive(PartialEq, Eq)]
-    struct DecisionOwnedState {
-        verified: i64,
-        annotated_transcript: Option<String>,
-        verdict: Option<String>,
-        verdict_transcript: Option<String>,
-        escalated: i64,
-        human_decision: Option<String>,
-        corrected_at: Option<String>,
-        reviewed_by: Option<String>,
-    }
-
-    #[derive(PartialEq, Eq)]
-    struct FlagOwnedState {
-        verdict: Option<String>,
-        rationale: Option<String>,
-        escalated: i64,
-    }
-
-    #[derive(Clone, PartialEq, Eq)]
-    struct StableHumanState {
-        verified: i64,
-        annotated_transcript: Option<String>,
-        verdict_transcript: Option<String>,
-        human_decision: Option<String>,
-        corrected_at: Option<String>,
-        reviewed_by: Option<String>,
-    }
-
-    #[derive(Clone)]
-    struct LegacyReviewedState {
-        review_revision: i64,
-        human_decision: Option<String>,
-        verdict: Option<String>,
-        verdict_transcript: Option<String>,
-        annotated_transcript: Option<String>,
-        verified: i64,
-        reviewed_by: Option<String>,
-        corrected_at: Option<String>,
-        escalated: i64,
-        is_gold: i64,
-        rationale: Option<String>,
-    }
-
-    fn decision_terminal_state(effect: &DecisionEffect) -> DecisionOwnedState {
-        if effect.reversal_operation.is_some() {
-            DecisionOwnedState {
-                verified: effect.prior_verified,
-                annotated_transcript: effect.prior_annotated_transcript.clone(),
-                verdict: effect.prior_verdict.clone(),
-                verdict_transcript: effect.prior_verdict_transcript.clone(),
-                escalated: effect.prior_escalated,
-                human_decision: effect.prior_human_decision.clone(),
-                corrected_at: effect.prior_corrected_at.clone(),
-                reviewed_by: effect.prior_reviewed_by.clone(),
-            }
-        } else {
-            DecisionOwnedState {
-                verified: effect.decision_verified,
-                annotated_transcript: effect.decision_annotated_transcript.clone(),
-                verdict: Some(format!("human_{}", effect.action)),
-                verdict_transcript: if effect.action == "reject" {
-                    effect.prior_verdict_transcript.clone()
-                } else {
-                    effect.decision_transcript.clone()
-                },
-                escalated: 0,
-                human_decision: Some(effect.action.clone()),
-                corrected_at: Some(effect.decision_corrected_at.clone()),
-                reviewed_by: effect.reviewer.clone(),
-            }
-        }
-    }
-
-    fn flag_terminal_state(effect: &FlagEffect) -> FlagOwnedState {
-        if effect.reversal_operation.is_some() {
-            FlagOwnedState {
-                verdict: effect.prior_verdict.clone(),
-                rationale: effect.prior_rationale.clone(),
-                escalated: effect.prior_escalated,
-            }
-        } else {
-            FlagOwnedState {
-                verdict: Some("escalated".to_string()),
-                rationale: Some(effect.flag_rationale.clone()),
-                escalated: 1,
-            }
-        }
-    }
-
-    fn decision_prior_stable_state(effect: &DecisionEffect) -> StableHumanState {
-        StableHumanState {
-            verified: effect.prior_verified,
-            annotated_transcript: effect.prior_annotated_transcript.clone(),
-            verdict_transcript: effect.prior_verdict_transcript.clone(),
-            human_decision: effect.prior_human_decision.clone(),
-            corrected_at: effect.prior_corrected_at.clone(),
-            reviewed_by: effect.prior_reviewed_by.clone(),
-        }
-    }
-
-    fn decision_terminal_stable_state(effect: &DecisionEffect) -> StableHumanState {
-        let terminal = decision_terminal_state(effect);
-        StableHumanState {
-            verified: terminal.verified,
-            annotated_transcript: terminal.annotated_transcript,
-            verdict_transcript: terminal.verdict_transcript,
-            human_decision: terminal.human_decision,
-            corrected_at: terminal.corrected_at,
-            reviewed_by: terminal.reviewed_by,
-        }
-    }
-
-    type CurrentReviewState = (
-        i64,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-
-    impl ReviewMutation {
-        fn segment_id(&self) -> &str {
-            match self {
-                Self::Decision(effect) => &effect.segment_id,
-                Self::Flag(effect) => &effect.segment_id,
-            }
-        }
-
-        fn prior_revision(&self) -> i64 {
-            match self {
-                Self::Decision(effect) => effect.prior_revision,
-                Self::Flag(effect) => effect.prior_revision,
-            }
-        }
-
-        fn applied_revision(&self) -> i64 {
-            match self {
-                Self::Decision(effect) => effect.decision_revision,
-                Self::Flag(effect) => effect.flag_revision,
-            }
-        }
-
-        fn terminal_revision(&self) -> i64 {
-            self.applied_revision()
-                + match self {
-                    Self::Decision(effect) => i64::from(effect.reversal_operation.is_some()),
-                    Self::Flag(effect) => i64::from(effect.reversal_operation.is_some()),
-                }
-        }
-    }
-
-    let mut state_statement = db
-        .connection()
-        .prepare(
-            "SELECT singleton_key, effective_after_review_event_id,
-                    effective_after_ledger_id, created_at
-               FROM review_effect_state ORDER BY singleton_key",
-        )
-        .map_err(|error| format!("restore target review-effect frontier is unreadable: {error}"))?;
-    let states = state_statement
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?))
-        })
-        .map_err(|error| format!("restore target review-effect frontier is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target review-effect frontier is unreadable: {error}"))?;
-    drop(state_statement);
-    if states.len() != 1 || states[0].0 != 1 || states[0].1 < 0 || states[0].2 < 0 || states[0].3.trim().is_empty() {
-        return Err("database restore refused: review_effect_state is not the one canonical schema-v60 frontier row"
-            .to_string());
-    }
-    let event_frontier = states[0].1;
-    let ledger_frontier = states[0].2;
-    let maximum_event_id: i64 = db
-        .connection()
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
-        .map_err(|error| format!("restore target review-event frontier cannot be verified: {error}"))?;
-    let maximum_ledger_id: i64 = db
-        .connection()
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM review_compensation_ledger", [], |row| row.get(0))
-        .map_err(|error| format!("restore target review-ledger frontier cannot be verified: {error}"))?;
-    if event_frontier > maximum_event_id || ledger_frontier > maximum_ledger_id {
-        return Err(format!(
-            "database restore refused: review-effect frontiers ({event_frontier}, {ledger_frontier}) exceed retained history ({maximum_event_id}, {maximum_ledger_id})"
-        ));
-    }
-
-    let mut event_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, segment_id, reviewer, action, compensation_action, source, app_git_sha,
-                    playback_guard_version, operation_id, operation_payload_hash,
-                    requested_action, requested_transcript, served_transcript, served_revision
-               FROM review_events WHERE id > ?1 ORDER BY id",
-        )
-        .map_err(|error| format!("restore target post-v60 review events are unreadable: {error}"))?;
-    let post_v60_events = event_statement
-        .query_map([event_frontier], |row| {
-            Ok((
-                PostV60Event {
-                    id: row.get(0)?,
-                    segment_id: row.get(1)?,
-                    reviewer: row.get(2)?,
-                    action: row.get(3)?,
-                    compensation_action: row.get(4)?,
-                    source: row.get(5)?,
-                    operation_id: row.get(8)?,
-                    operation_payload_hash: row.get(9)?,
-                    requested_action: row.get(10)?,
-                    requested_transcript: row.get(11)?,
-                    served_transcript: row.get(12)?,
-                    served_revision: row.get(13)?,
-                },
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-            ))
-        })
-        .map_err(|error| format!("restore target post-v60 review events are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target post-v60 review events are unreadable: {error}"))?;
-    drop(event_statement);
-
-    let mut post_v60_events_by_id = std::collections::HashMap::<i64, PostV60Event>::new();
-    for (event, git_sha, playback_guard) in &post_v60_events {
-        let git_sha = git_sha.as_deref().unwrap_or_default();
-        let request_text_is_canonical =
-            crate::db::to_nfc(event.requested_transcript.trim()) == event.requested_transcript;
-        let served_text_is_canonical = !event.served_transcript.is_empty()
-            && crate::db::to_nfc(event.served_transcript.trim()) == event.served_transcript;
-        let expected_payload_hash = crate::db::review_operation_payload_hash(
-            &event.segment_id,
-            &event.requested_action,
-            &event.requested_transcript,
-            &event.reviewer,
-        );
-        let request_classification_is_valid = match event.requested_action.as_str() {
-            "skip" => event.action == "skip" && event.compensation_action == "skip",
-            "bad" | "reject" => event.action == "reject" && event.compensation_action == "reject",
-            "accept" | "edit" => {
-                let expected_compensation = if crate::normalizer::learning_text_key(&event.requested_transcript)
-                    == crate::normalizer::learning_text_key(&event.served_transcript)
-                {
-                    "accept"
-                } else {
-                    "edit"
-                };
-                matches!(event.action.as_str(), "accept" | "edit") && event.compensation_action == expected_compensation
-            }
-            _ => false,
-        };
-        if !matches!(event.source.as_str(), "couch" | "couch_spot_check")
-            || !matches!(event.action.as_str(), "accept" | "edit" | "reject" | "skip")
-            || !matches!(event.requested_action.as_str(), "accept" | "edit" | "reject" | "bad" | "skip")
-            || !is_canonical_lowercase_uuid(&event.operation_id)
-            || !is_canonical_lowercase_64_hex(&event.operation_payload_hash)
-            || event.operation_payload_hash != expected_payload_hash
-            || !request_text_is_canonical
-            || !served_text_is_canonical
-            || event.served_revision < 0
-            || !request_classification_is_valid
-            || git_sha.len() != 40
-            || !git_sha.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || playback_guard.as_deref() != Some("content-hash-raw-counter-v3")
-        {
-            return Err(format!(
-                "database restore refused: post-v60 review event {} lacks canonical Couch/build/playback provenance",
-                event.id
-            ));
-        }
-        post_v60_events_by_id.insert(event.id, event.clone());
-        let total_effects: i64 = db
-            .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM human_decision_effect_events WHERE review_event_id = ?1",
-                [event.id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("restore target decision-effect linkage is unreadable: {error}"))?;
-        if event.source == "couch" && event.action != "skip" {
-            let exact_effects: i64 = db
-                .connection()
-                .query_row(
-                    "SELECT COUNT(*)
-                       FROM human_decision_effect_events effect
-                       JOIN review_compensation_ledger ledger
-                         ON ledger.review_event_id = ?1
-                        AND ledger.reverses_entry_id IS NULL
-                      WHERE effect.review_event_id = ?1
-                        AND effect.segment_id = ?2
-                        AND effect.reviewer = ?3
-                        AND effect.source = 'couch'
-                        AND effect.action = ?4
-                        AND ledger.segment_id = effect.segment_id
-                        AND ledger.reviewer = effect.reviewer
-                        AND ledger.source = effect.source
-                        AND ledger.effective_decision = effect.action
-                        AND ledger.decision_revision IS effect.decision_revision",
-                    rusqlite::params![event.id, event.segment_id, event.reviewer, event.action],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("restore target decision-effect linkage is unreadable: {error}"))?;
-            if total_effects != 1 || exact_effects != 1 {
-                return Err(format!(
-                    "database restore refused: post-v60 Couch decision event {} does not have exactly one matching human/pay effect",
-                    event.id
-                ));
-            }
-        } else if total_effects != 0 {
-            return Err(format!(
-                "database restore refused: post-v60 {}/{} event {} must not create a human-decision effect",
-                event.source, event.action, event.id
-            ));
-        }
-    }
-
-    let mut effect_statement = db
-        .connection()
-        .prepare(
-            "SELECT effect.id, effect.review_event_id, effect.segment_id, effect.reviewer,
-                    effect.source, effect.operation_id, effect.operation_payload_hash,
-                    effect.action, effect.served_transcript, effect.decision_transcript,
-                    effect.decision_annotated_transcript, effect.decision_verified,
-                    effect.decision_corrected_at, effect.decision_rationale, effect.requested_action,
-                    effect.requested_transcript, effect.requested_timestamp_ms,
-                    effect.prior_revision, effect.decision_revision, effect.prior_verified,
-                    effect.prior_annotated_transcript, effect.prior_verdict,
-                    effect.prior_verdict_transcript, effect.prior_rationale, effect.prior_escalated,
-                    effect.prior_human_decision, effect.prior_corrected_at,
-                    effect.prior_reviewed_by, reversal.operation_id
-               FROM human_decision_effect_events effect
-               LEFT JOIN human_decision_effect_reversals reversal
-                 ON reversal.effect_event_id = effect.id
-              ORDER BY effect.id",
-        )
-        .map_err(|error| format!("restore target human-decision effects are unreadable: {error}"))?;
-    let effects = effect_statement
-        .query_map([], |row| {
-            Ok(DecisionEffect {
-                id: row.get(0)?,
-                review_event_id: row.get(1)?,
-                segment_id: row.get(2)?,
-                reviewer: row.get(3)?,
-                source: row.get(4)?,
-                operation_id: row.get(5)?,
-                operation_payload_hash: row.get(6)?,
-                action: row.get(7)?,
-                served_transcript: row.get(8)?,
-                decision_transcript: row.get(9)?,
-                decision_annotated_transcript: row.get(10)?,
-                decision_verified: row.get(11)?,
-                decision_corrected_at: row.get(12)?,
-                decision_rationale: row.get(13)?,
-                requested_action: row.get(14)?,
-                requested_transcript: row.get(15)?,
-                requested_timestamp_ms: row.get(16)?,
-                prior_revision: row.get(17)?,
-                decision_revision: row.get(18)?,
-                prior_verified: row.get(19)?,
-                prior_annotated_transcript: row.get(20)?,
-                prior_verdict: row.get(21)?,
-                prior_verdict_transcript: row.get(22)?,
-                prior_rationale: row.get(23)?,
-                prior_escalated: row.get(24)?,
-                prior_human_decision: row.get(25)?,
-                prior_corrected_at: row.get(26)?,
-                prior_reviewed_by: row.get(27)?,
-                reversal_operation: row.get(28)?,
-            })
-        })
-        .map_err(|error| format!("restore target human-decision effects are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target human-decision effects are unreadable: {error}"))?;
-    drop(effect_statement);
-
-    let effects_by_id = effects.iter().map(|effect| (effect.id, effect)).collect::<std::collections::HashMap<_, _>>();
-    for effect in &effects {
-        if effect.id <= 0
-            || effect.segment_id.trim().is_empty()
-            || effect.decision_revision != effect.prior_revision + 1
-            || !matches!(effect.action.as_str(), "accept" | "edit" | "reject")
-            || !matches!(effect.decision_verified, 0 | 1)
-            || !matches!(effect.prior_verified, 0 | 1)
-            || !matches!(effect.prior_escalated, 0 | 1)
-            || effect.decision_corrected_at.trim().is_empty()
-            || effect.decision_rationale != effect.prior_rationale
-            || effect.served_transcript.is_empty()
-            || crate::db::to_nfc(effect.served_transcript.trim()) != effect.served_transcript
-        {
-            return Err(format!(
-                "database restore refused: human-decision effect {} violates its immutable identity/revision boundary",
-                effect.id
-            ));
-        }
-        let canonical_decision_text = effect
-            .decision_transcript
-            .as_deref()
-            .is_some_and(|text| !text.trim().is_empty() && crate::db::to_nfc(text.trim()) == text);
-        if (matches!(effect.action.as_str(), "accept" | "edit")
-            && (!canonical_decision_text || effect.decision_annotated_transcript != effect.decision_transcript))
-            || (effect.action == "reject" && effect.decision_transcript.is_some())
-        {
-            return Err(format!(
-                "database restore refused: human-decision effect {} has no exact canonical post-decision transcript",
-                effect.id
-            ));
-        }
-        if let Some(event_id) = effect.review_event_id {
-            let Some(event) = post_v60_events_by_id.get(&event_id) else {
-                return Err(format!(
-                    "database restore refused: phone decision effect {} names no post-v60 review event",
-                    effect.id
-                ));
-            };
-            let exact_link: i64 = db
-                .connection()
-                .query_row(
-                    "SELECT COUNT(*)
-                       FROM review_events event
-                       JOIN review_compensation_ledger ledger
-                         ON ledger.review_event_id = event.id
-                        AND ledger.reverses_entry_id IS NULL
-                      WHERE event.id = ?1 AND event.id > ?2
-                        AND event.segment_id = ?3
-                        AND event.reviewer = ?4
-                        AND event.source = 'couch'
-                        AND event.action = ?5
-                        AND ledger.segment_id = ?3
-                        AND ledger.reviewer = ?4
-                        AND ledger.source = 'couch'
-                        AND ledger.effective_decision = ?5
-                        AND ledger.decision_revision IS ?6",
-                    rusqlite::params![
-                        event_id,
-                        event_frontier,
-                        effect.segment_id,
-                        effect.reviewer,
-                        effect.action,
-                        effect.decision_revision,
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("restore target phone-effect linkage is unreadable: {error}"))?;
-            if effect.source != "couch"
-                || optional_text_is_blank(effect.reviewer.as_deref())
-                || effect.operation_id.is_some()
-                || effect.operation_payload_hash.is_some()
-                || effect.requested_action.is_some()
-                || effect.requested_transcript.is_some()
-                || effect.requested_timestamp_ms.is_some()
-                || event.segment_id != effect.segment_id
-                || event.reviewer.as_str() != effect.reviewer.as_deref().unwrap_or_default()
-                || event.action != effect.action
-                || event.served_transcript != effect.served_transcript
-                || event.served_revision != effect.prior_revision
-                || exact_link != 1
-            {
-                return Err(format!(
-                    "database restore refused: phone decision effect {} is not the exact post-v60 event/pay effect",
-                    effect.id
-                ));
-            }
-        } else {
-            let desktop_request_ok = match (
-                effect.operation_id.as_deref(),
-                effect.operation_payload_hash.as_deref(),
-                effect.requested_action.as_deref(),
-                effect.requested_timestamp_ms,
-            ) {
-                (Some(operation_id), Some(payload_hash), Some(requested_action), Some(timestamp_ms)) => {
-                    is_canonical_lowercase_uuid(operation_id)
-                        && is_canonical_lowercase_64_hex(payload_hash)
-                        && matches!(requested_action, "accept" | "edit" | "reject")
-                        && timestamp_ms > 0
-                        && effect
-                            .requested_transcript
-                            .as_deref()
-                            .map_or(true, |text| crate::db::to_nfc(text.trim()) == text && !text.is_empty())
-                        && crate::db::desktop_decision_payload_hash(
-                            &effect.segment_id,
-                            requested_action,
-                            effect.requested_transcript.as_deref(),
-                            Some(timestamp_ms),
-                        ) == payload_hash
-                }
-                _ => false,
-            };
-            if effect.source != "desktop" || effect.reviewer.is_some() || !desktop_request_ok {
-                return Err(format!(
-                    "database restore refused: unlinked human-decision effect {} is outside the exact anonymous desktop operation boundary",
-                    effect.id
-                ));
-            }
-        }
-
-        let original_reversal_count: i64 = if let Some(event_id) = effect.review_event_id {
-            db.connection()
-                .query_row(
-                    "SELECT COUNT(*)
-                       FROM review_compensation_ledger original
-                       JOIN review_compensation_ledger reversal
-                         ON reversal.reverses_entry_id = original.entry_id
-                      WHERE original.review_event_id = ?1
-                        AND original.reverses_entry_id IS NULL",
-                    [event_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("restore target effect reversal linkage is unreadable: {error}"))?
-        } else {
-            0
-        };
-        if let Some(operation_id) = effect.reversal_operation.as_deref() {
-            if !is_canonical_lowercase_uuid(operation_id) {
-                return Err(format!(
-                    "database restore refused: human-decision reversal {} has no canonical operation UUID",
-                    effect.id
-                ));
-            }
-            if let Some(event_id) = effect.review_event_id {
-                let exact_inverse: i64 = db
-                    .connection()
-                    .query_row(
-                        "SELECT COUNT(*)
-                           FROM review_events event
-                           JOIN review_compensation_ledger original
-                             ON original.review_event_id = event.id
-                            AND original.reverses_entry_id IS NULL
-                           JOIN review_compensation_ledger reversal
-                             ON reversal.reverses_entry_id = original.entry_id
-                          WHERE event.id = ?1
-                            AND event.operation_id = ?2
-                            AND reversal.id > ?3
-                            AND reversal.entry_key = 'undo:' || ?2
-                            AND reversal.policy_version = original.policy_version
-                            AND reversal.canonical_work_id = original.canonical_work_id
-                            AND reversal.canonical_identity_kind = original.canonical_identity_kind
-                            AND reversal.reviewer = original.reviewer
-                            AND reversal.segment_id = original.segment_id
-                            AND reversal.source = 'couch_undo'
-                            AND reversal.compensation_action = 'undo'
-                            AND reversal.effective_decision = 'undo'
-                            AND reversal.decision_revision IS original.decision_revision
-                            AND reversal.duration_ms = original.duration_ms
-                            AND reversal.rate_basis_points = 0
-                            AND reversal.entitlement_micro_iqd = 0
-                            AND reversal.delta_micro_iqd = -original.delta_micro_iqd
-                            AND reversal.delta_corrected_ms = -original.delta_corrected_ms",
-                        rusqlite::params![event_id, operation_id, ledger_frontier],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| format!("restore target effect reversal linkage is unreadable: {error}"))?;
-                if original_reversal_count != 1 || exact_inverse != 1 {
-                    return Err(format!(
-                        "database restore refused: phone decision reversal {} lacks its exact operation-bound compensation inverse",
-                        effect.id
-                    ));
-                }
-            } else {
-                let conflicting_pay_inverse: i64 = db
-                    .connection()
-                    .query_row(
-                        "SELECT COUNT(*) FROM review_compensation_ledger
-                          WHERE entry_key = 'undo:' || ?1",
-                        [operation_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| format!("restore target desktop reversal identity is unreadable: {error}"))?;
-                if conflicting_pay_inverse != 0 {
-                    return Err(format!(
-                        "database restore refused: desktop decision reversal {} reuses a paid-review inverse identity",
-                        effect.id
-                    ));
-                }
-            }
-        } else if original_reversal_count != 0 {
-            return Err(format!(
-                "database restore refused: active phone decision effect {} already has a compensation inverse",
-                effect.id
-            ));
-        }
-    }
-
-    let mut reversal_statement = db
-        .connection()
-        .prepare(
-            "SELECT id FROM review_compensation_ledger
-              WHERE id > ?1 AND reverses_entry_id IS NOT NULL ORDER BY id",
-        )
-        .map_err(|error| format!("restore target post-v60 compensation reversals are unreadable: {error}"))?;
-    let post_v60_reversal_ids = reversal_statement
-        .query_map([ledger_frontier], |row| row.get::<_, i64>(0))
-        .map_err(|error| format!("restore target post-v60 compensation reversals are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target post-v60 compensation reversals are unreadable: {error}"))?;
-    drop(reversal_statement);
-    for reversal_id in post_v60_reversal_ids {
-        let matching_effect_inverse: i64 = db
-            .connection()
-            .query_row(
-                "SELECT COUNT(*)
-                   FROM review_compensation_ledger reversal
-                   JOIN review_compensation_ledger original
-                     ON original.entry_id = reversal.reverses_entry_id
-                   JOIN human_decision_effect_events effect
-                     ON effect.review_event_id = original.review_event_id
-                   JOIN human_decision_effect_reversals effect_reversal
-                     ON effect_reversal.effect_event_id = effect.id
-                   JOIN review_events event ON event.id = effect.review_event_id
-                  WHERE reversal.id = ?1
-                    AND reversal.entry_key = 'undo:' || effect_reversal.operation_id
-                    AND event.operation_id = effect_reversal.operation_id",
-                [reversal_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("restore target post-v60 compensation reversal linkage is unreadable: {error}"))?;
-        if matching_effect_inverse != 1 {
-            return Err(format!(
-                "database restore refused: post-v60 compensation reversal {reversal_id} is not owned by one exact human-effect reversal"
-            ));
-        }
-    }
-
-    let (legacy_example_columns, legacy_example_rows) =
-        exact_query_rows(db, "legacy agent-example snapshot", "SELECT * FROM legacy_agent_examples_v60")?;
-    let (raw_legacy_example_columns, raw_legacy_example_rows) = exact_query_rows(
-        db,
-        "raw legacy agent examples",
-        "SELECT example.rowid AS original_rowid, example.id, example.segment_id,
-                example.audio_features, example.wrong_transcript, example.human_fix,
-                example.created_at, example.source, example.verified_by_human,
-                example.corrector_model_id
-           FROM agent_examples example
-          WHERE example.effect_event_id IS NULL
-            AND EXISTS (
-                 SELECT 1 FROM legacy_agent_examples_v60 legacy
-                  WHERE legacy.id = example.id
-            )",
-    )?;
-    require_encoded_row_equality(
-        "legacy agent-example snapshot versus retained raw rows",
-        legacy_example_columns,
-        legacy_example_rows,
-        raw_legacy_example_columns,
-        raw_legacy_example_rows,
-    )?;
-    let forged_unbound_human_examples: i64 = db
-        .connection()
-        .query_row(
-            "SELECT COUNT(*)
-               FROM agent_examples example
-              WHERE example.effect_event_id IS NULL
-                AND (example.source = 'human' OR example.verified_by_human = 1)
-                AND NOT EXISTS (
-                     SELECT 1 FROM legacy_agent_examples_v60 legacy
-                      WHERE legacy.id = example.id AND legacy.original_rowid = example.rowid
-                )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("restore target unbound agent-example provenance is unreadable: {error}"))?;
-    if forged_unbound_human_examples != 0 {
-        return Err(
-            "database restore refused: post-v60 unbound rows cannot claim human agent-example provenance".to_string()
-        );
-    }
-
-    let (legacy_correction_columns, legacy_correction_rows) =
-        exact_query_rows(db, "legacy correction snapshot", "SELECT * FROM legacy_corrections_v60")?;
-    let (raw_legacy_correction_columns, raw_legacy_correction_rows) = exact_query_rows(
-        db,
-        "raw legacy corrections",
-        "SELECT correction.rowid AS original_rowid, correction.id, correction.segment_id,
-                correction.audio_content_hash, correction.raw_hypothesis,
-                correction.ensemble_hyps_json, correction.agreement_score,
-                correction.jury_verdict, correction.human_fix,
-                correction.model_version_id, correction.adapter_id,
-                correction.reviewer_id, correction.loop_applied, correction.decided_at
-           FROM corrections correction
-          WHERE correction.effect_event_id IS NULL",
-    )?;
-    require_encoded_row_equality(
-        "legacy correction snapshot versus retained raw rows",
-        legacy_correction_columns,
-        legacy_correction_rows,
-        raw_legacy_correction_columns,
-        raw_legacy_correction_rows,
-    )?;
-
-    let mut example_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, segment_id, wrong_transcript, human_fix, source,
-                    verified_by_human, effect_event_id
-               FROM agent_examples WHERE effect_event_id IS NOT NULL ORDER BY id",
-        )
-        .map_err(|error| format!("restore target effect-bound human examples are unreadable: {error}"))?;
-    let examples = example_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })
-        .map_err(|error| format!("restore target effect-bound human examples are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target effect-bound human examples are unreadable: {error}"))?;
-    drop(example_statement);
-    for (id, segment_id, wrong, fix, source, verified, effect_id) in examples {
-        let Some(effect) = effects_by_id.get(&effect_id).copied() else {
-            return Err(format!(
-                "database restore refused: effect-bound agent example {id} names a missing decision effect"
-            ));
-        };
-        let exact_correction_text: Option<(String, String)> = db
-            .connection()
-            .query_row(
-                "SELECT raw_hypothesis, human_fix FROM corrections WHERE effect_event_id = ?1",
-                [effect_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| format!("restore target example/correction linkage is unreadable: {error}"))?;
-        let retained_draft: Option<(Option<String>, String)> = db
-            .connection()
-            .query_row(
-                "SELECT normalized_transcript, raw_transcript FROM speech_segments WHERE id = ?1",
-                [&effect.segment_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| format!("restore target example wrong-side provenance is unreadable: {error}"))?;
-        let expected_wrong = retained_draft.and_then(|(normalized, raw)| {
-            crate::db::rejected_transcript_for_learning(
-                &fix,
-                &[
-                    effect.prior_verdict_transcript.clone(),
-                    effect.prior_annotated_transcript.clone(),
-                    normalized,
-                    Some(raw),
-                ],
-            )
-        });
-        if !is_canonical_lowercase_uuid(&id)
-            || segment_id != effect.segment_id
-            || effect.action != "edit"
-            || source != "human"
-            || verified != 1
-            || wrong.trim().is_empty()
-            || fix.trim().is_empty()
-            || crate::normalizer::learning_text_key(&wrong) == crate::normalizer::learning_text_key(&fix)
-            || effect.decision_transcript.as_deref() != Some(fix.as_str())
-            || expected_wrong.as_deref() != Some(wrong.as_str())
-            || exact_correction_text.as_ref() != Some(&(wrong.clone(), fix.clone()))
-        {
-            return Err(format!(
-                "database restore refused: effect-bound agent example {id} is not one genuine human edit"
-            ));
-        }
-    }
-
-    let mut correction_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, segment_id, audio_content_hash, raw_hypothesis, human_fix,
-                    reviewer_id, effect_event_id
-               FROM corrections WHERE effect_event_id IS NOT NULL ORDER BY id",
-        )
-        .map_err(|error| format!("restore target effect-bound corrections are unreadable: {error}"))?;
-    let corrections = correction_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })
-        .map_err(|error| format!("restore target effect-bound corrections are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target effect-bound corrections are unreadable: {error}"))?;
-    drop(correction_statement);
-    let mut correction_text_by_effect = std::collections::HashMap::<i64, (String, String)>::new();
-    for (id, segment_id, audio_hash, wrong, fix, reviewer, effect_id) in corrections {
-        let Some(effect) = effects_by_id.get(&effect_id).copied() else {
-            return Err(format!(
-                "database restore refused: effect-bound correction {id} names a missing decision effect"
-            ));
-        };
-        let reviewer_matches = match (reviewer.as_deref(), effect.reviewer.as_deref()) {
-            (None, None) => true,
-            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
-            _ => false,
-        };
-        let retained_segment_matches = match segment_id.as_deref() {
-            Some(segment_id) if segment_id == effect.segment_id => {
-                db.connection()
-                    .query_row(
-                        "SELECT audio_content_hash = ?2 FROM speech_segments WHERE id = ?1",
-                        rusqlite::params![segment_id, audio_hash],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .optional()
-                    .map_err(|error| format!("restore target correction segment identity is unreadable: {error}"))?
-                    == Some(true)
-            }
-            _ => false,
-        };
-        let retained_draft: Option<(Option<String>, String)> = db
-            .connection()
-            .query_row(
-                "SELECT normalized_transcript, raw_transcript FROM speech_segments WHERE id = ?1",
-                [&effect.segment_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| format!("restore target correction wrong-side provenance is unreadable: {error}"))?;
-        let expected_wrong = retained_draft.map(|(normalized, raw)| {
-            crate::db::rejected_transcript_for_learning(
-                &fix,
-                &[
-                    effect.prior_verdict_transcript.clone(),
-                    effect.prior_annotated_transcript.clone(),
-                    normalized,
-                    Some(raw.clone()),
-                ],
-            )
-            .unwrap_or(raw)
-        });
-        if !is_canonical_lowercase_uuid(&id)
-            || effect.action != "edit"
-            || !retained_segment_matches
-            || !reviewer_matches
-            || !crate::db::is_canonical_audio_content_hash(&audio_hash)
-            || wrong.trim().is_empty()
-            || fix.trim().is_empty()
-            || crate::normalizer::learning_text_key(&wrong) == crate::normalizer::learning_text_key(&fix)
-            || effect.decision_transcript.as_deref() != Some(fix.as_str())
-            || expected_wrong.as_deref() != Some(wrong.as_str())
-        {
-            return Err(format!(
-                "database restore refused: effect-bound correction {id} violates edit/audio/reviewer identity"
-            ));
-        }
-        if correction_text_by_effect.insert(effect_id, (wrong, fix)).is_some() {
-            return Err(format!("database restore refused: decision effect {effect_id} owns more than one correction"));
-        }
-    }
-
-    let mut memory_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
-                    confidence, hit_count, last_fired_at, confirm_count, override_count,
-                    legacy_seed
-               FROM correction_memory ORDER BY id",
-        )
-        .map_err(|error| format!("restore target correction-memory identities are unreadable: {error}"))?;
-    let memories = memory_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, f64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-                row.get::<_, i64>(11)?,
-            ))
-        })
-        .map_err(|error| format!("restore target correction-memory identities are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target correction-memory identities are unreadable: {error}"))?;
-    drop(memory_statement);
-    let memory_ids = memories.iter().map(|memory| memory.0.as_str()).collect::<std::collections::HashSet<_>>();
-    for (
-        id,
-        wrong,
-        human,
-        slot,
-        _phonetic,
-        source_segment,
-        confidence,
-        hit_count,
-        last_fired_at,
-        confirm_count,
-        override_count,
-        legacy_seed,
-    ) in &memories
-    {
-        if *legacy_seed == 0 {
-            let capture_count: i64 = db
-                .connection()
-                .query_row(
-                    "SELECT COUNT(*) FROM correction_memory_contributions
-                      WHERE memory_id = ?1 AND capture_delta = 1",
-                    [id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("restore target correction-memory capture lineage is unreadable: {error}"))?;
-            let capture_origin_count: i64 = db
-                .connection()
-                .query_row(
-                    "SELECT COUNT(*)
-                       FROM correction_memory_contributions contribution
-                       JOIN human_decision_effect_events effect
-                         ON effect.id = contribution.effect_event_id
-                      WHERE contribution.memory_id = ?1
-                        AND contribution.capture_delta = 1
-                        AND (?2 IS NULL OR effect.segment_id = ?2)",
-                    rusqlite::params![id, source_segment],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("restore target correction-memory capture identity is unreadable: {error}"))?;
-            if !is_canonical_lowercase_uuid(id)
-                || wrong.trim().is_empty()
-                || human.trim().is_empty()
-                || slot.trim().is_empty()
-                || crate::normalizer::learning_text_key(wrong) == crate::normalizer::learning_text_key(human)
-                || !confidence.is_finite()
-                || (*confidence - 0.5).abs() > f64::EPSILON
-                || *hit_count != 0
-                || *confirm_count != 0
-                || *override_count != 0
-                || last_fired_at.is_some()
-                || capture_count == 0
-                || capture_origin_count == 0
-            {
-                return Err(format!(
-                    "database restore refused: post-v60 correction memory {id} lacks its zero-baseline capture identity"
-                ));
-            }
-        } else if *legacy_seed != 1 {
-            return Err(format!("database restore refused: correction memory {id} has an invalid legacy boundary"));
-        }
-    }
-
-    let mut contribution_statement = db
-        .connection()
-        .prepare(
-            "SELECT effect_event_id, memory_id, capture_delta, confirm_delta,
-                    override_delta, fired_at
-               FROM correction_memory_contributions ORDER BY effect_event_id, memory_id",
-        )
-        .map_err(|error| format!("restore target correction-memory contributions are unreadable: {error}"))?;
-    let contributions = contribution_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })
-        .map_err(|error| format!("restore target correction-memory contributions are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target correction-memory contributions are unreadable: {error}"))?;
-    drop(contribution_statement);
-    for (effect_id, memory_id, capture, confirm, override_delta, fired_at) in &contributions {
-        let Some(effect) = effects_by_id.get(effect_id).copied() else {
-            return Err(format!(
-                "database restore refused: correction-memory contribution {effect_id}/{memory_id} names a missing effect"
-            ));
-        };
-        let evidence_fired = confirm + override_delta > 0;
-        if !memory_ids.contains(memory_id.as_str())
-            || !matches!(effect.action.as_str(), "accept" | "edit")
-            || !matches!(*capture, 0 | 1)
-            || !matches!(*confirm, 0 | 1)
-            || !matches!(*override_delta, 0 | 1)
-            || capture + confirm + override_delta == 0
-            || confirm + override_delta > 1
-            || (*capture == 1 && effect.action != "edit")
-            || evidence_fired != fired_at.as_deref().is_some_and(|value| !value.trim().is_empty())
-        {
-            return Err(format!(
-                "database restore refused: correction-memory contribution {effect_id}/{memory_id} violates its action/evidence identity"
-            ));
-        }
-    }
-
-    // Re-derive every post-v60 memory capture from the exact immutable correction owned by the
-    // same decision effect. Merely linking arbitrary tokens to an edit effect is not provenance:
-    // those tokens feed the live corrector. The extracted substitution tuple (including phonetic
-    // key) and the contribution set must be byte-exact.
-    type MemoryNaturalKey = (String, String, String, String);
-    let memory_by_id =
-        memories.iter().map(|memory| (memory.0.as_str(), memory)).collect::<std::collections::HashMap<_, _>>();
-    let mut capture_ids_by_effect = std::collections::HashMap::<i64, std::collections::BTreeSet<String>>::new();
-    let mut first_capture_effect_by_memory = std::collections::HashMap::<String, i64>::new();
-    for (effect_id, memory_id, capture, _, _, _) in &contributions {
-        if *capture == 1 {
-            capture_ids_by_effect.entry(*effect_id).or_default().insert(memory_id.clone());
-            first_capture_effect_by_memory
-                .entry(memory_id.clone())
-                .and_modify(|existing| *existing = (*existing).min(*effect_id))
-                .or_insert(*effect_id);
-        }
-    }
-    let memory_id_by_natural_key = memories
-        .iter()
-        .map(|memory| ((memory.3.clone(), memory.1.clone(), memory.2.clone(), memory.4.clone()), memory.0.clone()))
-        .collect::<std::collections::HashMap<MemoryNaturalKey, String>>();
-
-    for memory in &memories {
-        if memory.11 != 0 {
-            continue;
-        }
-        let Some(first_effect_id) = first_capture_effect_by_memory.get(&memory.0) else {
-            return Err(format!(
-                "database restore refused: post-v60 correction memory {} has no first capture effect",
-                memory.0
-            ));
-        };
-        let Some(first_effect) = effects_by_id.get(first_effect_id).copied() else {
-            return Err(format!(
-                "database restore refused: post-v60 correction memory {} names a missing first capture effect",
-                memory.0
-            ));
-        };
-        if memory.5.as_deref() != Some(first_effect.segment_id.as_str()) {
-            return Err(format!(
-                "database restore refused: post-v60 correction memory {} source segment differs from its first capture",
-                memory.0
-            ));
-        }
-    }
-
-    for effect in &effects {
-        let segment_is_gold: bool = db
-            .connection()
-            .query_row("SELECT is_gold FROM speech_segments WHERE id = ?1", [&effect.segment_id], |row| row.get(0))
-            .optional()
-            .map_err(|error| format!("restore target correction-memory segment state is unreadable: {error}"))?
-            .unwrap_or(false);
-        let mut expected_capture_ids = std::collections::BTreeSet::<String>::new();
-        if !segment_is_gold {
-            if let Some((wrong, fix)) = correction_text_by_effect.get(&effect.id) {
-                let mut seen = std::collections::HashSet::<MemoryNaturalKey>::new();
-                for extracted in crate::corrections::extract_substitution_memories(wrong, fix) {
-                    let natural_key =
-                        (extracted.slot_key, extracted.wrong_token, extracted.human_token, extracted.phonetic_key);
-                    if seen.insert(natural_key.clone()) {
-                        let Some(memory_id) = memory_id_by_natural_key.get(&natural_key) else {
-                            return Err(format!(
-                                "database restore refused: decision effect {} is missing an exactly derived correction memory",
-                                effect.id
-                            ));
-                        };
-                        expected_capture_ids.insert(memory_id.clone());
-                    }
-                }
-            }
-        }
-        let actual_capture_ids = capture_ids_by_effect.get(&effect.id).cloned().unwrap_or_default();
-        if actual_capture_ids != expected_capture_ids {
-            return Err(format!(
-                "database restore refused: decision effect {} has arbitrary or incomplete correction-memory captures",
-                effect.id
-            ));
-        }
-    }
-
-    for (effect_id, memory_id, _, confirm, override_delta, _) in &contributions {
-        if confirm + override_delta == 0 {
-            continue;
-        }
-        let effect = effects_by_id[effect_id];
-        let memory = memory_by_id[memory_id.as_str()];
-        let existed_before_effect = memory.11 == 1
-            || first_capture_effect_by_memory
-                .get(memory_id)
-                .is_some_and(|capture_effect_id| *capture_effect_id < *effect_id);
-        let Some(reference) = effect.decision_transcript.as_deref() else {
-            return Err(format!(
-                "database restore refused: memory outcome {effect_id}/{memory_id} has no accepted decision text"
-            ));
-        };
-        let entry = crate::corrections::MemoryEntry {
-            wrong_token: memory.1.clone(),
-            human_token: memory.2.clone(),
-            slot_key: memory.3.clone(),
-            phonetic_key: memory.4.clone(),
-            confidence: memory.6,
-            hit_count: memory.7,
-        };
-        let expected_outcome = crate::corrections::classify_memory_outcome(
-            &effect.served_transcript,
-            reference,
-            &entry,
-            &crate::corrections::FiringConfig::default(),
-        );
-        let outcome_matches = match expected_outcome {
-            crate::corrections::MemoryOutcome::Confirm => *confirm == 1 && *override_delta == 0,
-            crate::corrections::MemoryOutcome::Override => *confirm == 0 && *override_delta == 1,
-            crate::corrections::MemoryOutcome::Neutral => false,
-        };
-        if !existed_before_effect || !outcome_matches {
-            return Err(format!(
-                "database restore refused: correction-memory outcome {effect_id}/{memory_id} is not re-derived from the served/decision text"
-            ));
-        }
-    }
-
-    let mut flag_statement = db
-        .connection()
-        .prepare(
-            "SELECT effect.id, effect.operation_id, effect.segment_id, effect.prior_revision,
-                    effect.flag_revision, effect.prior_verdict, effect.prior_rationale,
-                    effect.flag_rationale, effect.prior_escalated, reversal.operation_id
-               FROM review_flag_effect_events effect
-               LEFT JOIN review_flag_effect_reversals reversal
-                 ON reversal.flag_effect_event_id = effect.id
-              ORDER BY effect.id",
-        )
-        .map_err(|error| format!("restore target review-flag effects are unreadable: {error}"))?;
-    let flags = flag_statement
-        .query_map([], |row| {
-            Ok(FlagEffect {
-                id: row.get(0)?,
-                operation_id: row.get(1)?,
-                segment_id: row.get(2)?,
-                prior_revision: row.get(3)?,
-                flag_revision: row.get(4)?,
-                prior_verdict: row.get(5)?,
-                prior_rationale: row.get(6)?,
-                flag_rationale: row.get(7)?,
-                prior_escalated: row.get(8)?,
-                reversal_operation: row.get(9)?,
-            })
-        })
-        .map_err(|error| format!("restore target review-flag effects are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target review-flag effects are unreadable: {error}"))?;
-    drop(flag_statement);
-    for flag in &flags {
-        if flag.id <= 0
-            || !is_canonical_lowercase_uuid(&flag.operation_id)
-            || flag.segment_id.trim().is_empty()
-            || flag.flag_revision != flag.prior_revision + 1
-            || flag.flag_rationale.trim().is_empty()
-            || crate::db::to_nfc(flag.flag_rationale.trim()) != flag.flag_rationale
-            || !matches!(flag.prior_escalated, 0 | 1)
-            || flag.reversal_operation.as_deref().is_some_and(|operation| !is_canonical_lowercase_uuid(operation))
-        {
-            return Err(format!(
-                "database restore refused: review-flag effect {} violates its immutable revision/operation identity",
-                flag.id
-            ));
-        }
-        let initial_collision_count: i64 = db
-            .connection()
-            .query_row(
-                "SELECT
-                     (SELECT COUNT(*) FROM review_events WHERE operation_id = ?1)
-                   + (SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id = ?1)
-                   + (SELECT COUNT(*) FROM human_decision_effect_reversals WHERE operation_id = ?1)
-                   + (SELECT COUNT(*) FROM review_flag_effect_reversals WHERE operation_id = ?1)",
-                [&flag.operation_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("restore target flag operation identity is unreadable: {error}"))?;
-        if initial_collision_count != 0 {
-            return Err(format!(
-                "database restore refused: review-flag effect {} reuses another review operation identity",
-                flag.id
-            ));
-        }
-        if let Some(operation_id) = flag.reversal_operation.as_deref() {
-            let collision_count: i64 = db
-                .connection()
-                .query_row(
-                    "SELECT
-                         (SELECT COUNT(*) FROM review_events WHERE operation_id = ?1)
-                       + (SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id = ?1)
-                       + (SELECT COUNT(*) FROM human_decision_effect_reversals WHERE operation_id = ?1)
-                       + (SELECT COUNT(*) FROM review_flag_effect_events WHERE operation_id = ?1)",
-                    [operation_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("restore target flag-reversal identity is unreadable: {error}"))?;
-            if collision_count != 0 {
-                return Err(format!(
-                    "database restore refused: review-flag reversal {} reuses another review operation identity",
-                    flag.id
-                ));
-            }
-        }
-    }
-
-    let mut expected_active_decisions = std::collections::BTreeMap::<String, i64>::new();
-    for effect in &effects {
-        if effect.reversal_operation.is_none() {
-            expected_active_decisions.insert(effect.segment_id.clone(), effect.id);
-        }
-    }
-    let mut actual_active_statement = db
-        .connection()
-        .prepare("SELECT segment_id, id FROM effective_human_decision_effects_v60 ORDER BY segment_id")
-        .map_err(|error| format!("restore target effective decision projection is unreadable: {error}"))?;
-    let actual_active_decisions = actual_active_statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-        .map_err(|error| format!("restore target effective decision projection is unreadable: {error}"))?
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
-        .map_err(|error| format!("restore target effective decision projection is unreadable: {error}"))?;
-    drop(actual_active_statement);
-    if actual_active_decisions != expected_active_decisions {
-        return Err(
-            "database restore refused: effective human-decision projection does not select the latest active effect"
-                .to_string(),
-        );
-    }
-
-    let mut expected_active_flags = std::collections::BTreeMap::<String, i64>::new();
-    for flag in &flags {
-        if flag.reversal_operation.is_none() {
-            expected_active_flags.insert(flag.segment_id.clone(), flag.id);
-        }
-    }
-    let mut actual_flag_statement = db
-        .connection()
-        .prepare("SELECT segment_id, id FROM effective_review_flag_effects_v60 ORDER BY segment_id")
-        .map_err(|error| format!("restore target effective flag projection is unreadable: {error}"))?;
-    let actual_active_flags = actual_flag_statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-        .map_err(|error| format!("restore target effective flag projection is unreadable: {error}"))?
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
-        .map_err(|error| format!("restore target effective flag projection is unreadable: {error}"))?;
-    drop(actual_flag_statement);
-    if actual_active_flags != expected_active_flags {
-        return Err(
-            "database restore refused: effective review-flag projection does not select the latest active effect"
-                .to_string(),
-        );
-    }
-
-    let mut legacy_reviewed_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, review_revision, human_decision, verdict, verdict_transcript,
-                    annotated_transcript, verified, reviewed_by, corrected_at, escalated,
-                    is_gold, rationale
-               FROM legacy_reviewed_segments_v60 ORDER BY id",
-        )
-        .map_err(|error| format!("restore target legacy reviewed-segment authority is unreadable: {error}"))?;
-    let legacy_reviewed_segments = legacy_reviewed_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                LegacyReviewedState {
-                    review_revision: row.get(1)?,
-                    human_decision: row.get(2)?,
-                    verdict: row.get(3)?,
-                    verdict_transcript: row.get(4)?,
-                    annotated_transcript: row.get(5)?,
-                    verified: row.get(6)?,
-                    reviewed_by: row.get(7)?,
-                    corrected_at: row.get(8)?,
-                    escalated: row.get(9)?,
-                    is_gold: row.get(10)?,
-                    rationale: row.get(11)?,
-                },
-            ))
-        })
-        .map_err(|error| format!("restore target legacy reviewed-segment authority is unreadable: {error}"))?
-        .collect::<Result<std::collections::HashMap<_, _>, _>>()
-        .map_err(|error| format!("restore target legacy reviewed-segment authority is unreadable: {error}"))?;
-    drop(legacy_reviewed_statement);
-
-    let mut mutations_by_segment = std::collections::BTreeMap::<String, Vec<ReviewMutation>>::new();
-    for effect in effects.iter().cloned() {
-        mutations_by_segment
-            .entry(effect.segment_id.clone())
-            .or_default()
-            .push(ReviewMutation::Decision(Box::new(effect)));
-    }
-    for flag in flags.iter().cloned() {
-        mutations_by_segment.entry(flag.segment_id.clone()).or_default().push(ReviewMutation::Flag(flag));
-    }
-
-    for (segment_id, mutations) in &mut mutations_by_segment {
-        mutations.sort_by_key(|mutation| (mutation.applied_revision(), mutation.prior_revision()));
-        let first = mutations
-            .first()
-            .ok_or_else(|| format!("database restore refused: empty review-effect chain for {segment_id}"))?;
-
-        // Flags deliberately do not copy or mutate the human transcript/verification fields.  Bind
-        // those untouched fields to the first decision's immutable prior snapshot (when one follows
-        // the flag), otherwise to the retained row, then replay every later decision across any
-        // intervening flags.  This prevents a forged first flag from laundering an unbound verified
-        // annotation merely because the exhaustive scan sees that an effect names the segment.
-        let first_decision = mutations.iter().find_map(|mutation| match mutation {
-            ReviewMutation::Decision(effect) => Some(effect),
-            ReviewMutation::Flag(_) => None,
-        });
-        let (baseline_human_state, current_is_gold): (StableHumanState, i64) = if let Some(effect) = first_decision {
-            let is_gold = db
-                .connection()
-                .query_row("SELECT is_gold FROM speech_segments WHERE id = ?1", [segment_id], |row| row.get(0))
-                .optional()
-                .map_err(|error| format!("restore target review baseline is unreadable: {error}"))?
-                .ok_or_else(|| format!("database restore refused: review-effect segment {segment_id} is missing"))?;
-            (decision_prior_stable_state(effect), is_gold)
-        } else {
-            db.connection()
-                .query_row(
-                    "SELECT verified, annotated_transcript, verdict_transcript,
-                            human_decision, corrected_at, reviewed_by, is_gold
-                       FROM speech_segments WHERE id = ?1",
-                    [segment_id],
-                    |row| {
-                        Ok((
-                            StableHumanState {
-                                verified: row.get(0)?,
-                                annotated_transcript: row.get(1)?,
-                                verdict_transcript: row.get(2)?,
-                                human_decision: row.get(3)?,
-                                corrected_at: row.get(4)?,
-                                reviewed_by: row.get(5)?,
-                            },
-                            row.get(6)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|error| format!("restore target review baseline is unreadable: {error}"))?
-                .ok_or_else(|| format!("database restore refused: review-effect segment {segment_id} is missing"))?
-        };
-        if let Some(legacy) = legacy_reviewed_segments.get(segment_id) {
-            let baseline_matches = match first {
-                ReviewMutation::Decision(effect) => {
-                    effect.prior_revision >= legacy.review_revision
-                        && effect.prior_verified == legacy.verified
-                        && effect.prior_annotated_transcript == legacy.annotated_transcript
-                        && effect.prior_verdict == legacy.verdict
-                        && effect.prior_verdict_transcript == legacy.verdict_transcript
-                        && effect.prior_rationale == legacy.rationale
-                        && effect.prior_escalated == legacy.escalated
-                        && effect.prior_human_decision == legacy.human_decision
-                        && effect.prior_corrected_at == legacy.corrected_at
-                        && effect.prior_reviewed_by == legacy.reviewed_by
-                }
-                ReviewMutation::Flag(flag) => {
-                    flag.prior_revision >= legacy.review_revision
-                        && flag.prior_verdict == legacy.verdict
-                        && flag.prior_rationale == legacy.rationale
-                        && flag.prior_escalated == legacy.escalated
-                }
-            } && baseline_human_state.verified == legacy.verified
-                && baseline_human_state.annotated_transcript == legacy.annotated_transcript
-                && baseline_human_state.verdict_transcript == legacy.verdict_transcript
-                && baseline_human_state.human_decision == legacy.human_decision
-                && baseline_human_state.corrected_at == legacy.corrected_at
-                && baseline_human_state.reviewed_by == legacy.reviewed_by
-                && current_is_gold == legacy.is_gold;
-            if !baseline_matches {
-                return Err(format!(
-                    "database restore refused: review-effect chain for segment {segment_id} does not start from its immutable pre-v60 reviewed state"
-                ));
-            }
-        } else {
-            let unbound_human_prior = baseline_human_state.verified != 0
-                || !optional_text_is_blank(baseline_human_state.annotated_transcript.as_deref())
-                || !optional_text_is_blank(baseline_human_state.human_decision.as_deref())
-                || !optional_text_is_blank(baseline_human_state.reviewed_by.as_deref())
-                || !optional_text_is_blank(baseline_human_state.corrected_at.as_deref())
-                || current_is_gold != 0;
-            let unbound_flag_prior = match first {
-                ReviewMutation::Flag(flag) => {
-                    flag.prior_escalated != 0
-                        || flag
-                            .prior_verdict
-                            .as_deref()
-                            .is_some_and(|value| value.starts_with("human_") || value == "escalated")
-                }
-                ReviewMutation::Decision(effect) => effect
-                    .prior_verdict
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with("human_") || value == "escalated"),
-            };
-            if unbound_human_prior || unbound_flag_prior {
-                return Err(format!(
-                    "database restore refused: review-effect chain for segment {segment_id} starts from unsnapshotted human review truth"
-                ));
-            }
-        }
-
-        let mut expected_stable_human_state = baseline_human_state;
-        let mut expected_rationale = match first {
-            ReviewMutation::Decision(effect) => effect.prior_rationale.clone(),
-            ReviewMutation::Flag(effect) => effect.prior_rationale.clone(),
-        };
-        for mutation in mutations.iter() {
-            match mutation {
-                ReviewMutation::Decision(effect) => {
-                    if decision_prior_stable_state(effect) != expected_stable_human_state {
-                        return Err(format!(
-                            "database restore refused: review effect chain for segment {segment_id} changes human transcript/verification fields across a flag without authority"
-                        ));
-                    }
-                    if effect.prior_rationale != expected_rationale
-                        || effect.decision_rationale != effect.prior_rationale
-                    {
-                        return Err(format!(
-                            "database restore refused: review effect chain for segment {segment_id} changes rationale across a human decision"
-                        ));
-                    }
-                    expected_stable_human_state = decision_terminal_stable_state(effect);
-                    expected_rationale = effect.decision_rationale.clone();
-                }
-                ReviewMutation::Flag(effect) => {
-                    if effect.prior_rationale != expected_rationale {
-                        return Err(format!(
-                            "database restore refused: review effect chain for segment {segment_id} has a forged flag rationale prior-state"
-                        ));
-                    }
-                    expected_rationale = flag_terminal_state(effect).rationale;
-                }
-            }
-        }
-        for pair in mutations.windows(2) {
-            if pair[1].applied_revision() <= pair[0].applied_revision()
-                || pair[1].prior_revision() < pair[0].terminal_revision()
-            {
-                return Err(format!(
-                    "database restore refused: review effects for segment {segment_id} overlap or reverse a shadowed mutation"
-                ));
-            }
-            let prior_snapshot_continuous = match (&pair[0], &pair[1]) {
-                (ReviewMutation::Decision(previous), ReviewMutation::Decision(next)) => {
-                    decision_terminal_state(previous)
-                        == DecisionOwnedState {
-                            verified: next.prior_verified,
-                            annotated_transcript: next.prior_annotated_transcript.clone(),
-                            verdict: next.prior_verdict.clone(),
-                            verdict_transcript: next.prior_verdict_transcript.clone(),
-                            escalated: next.prior_escalated,
-                            human_decision: next.prior_human_decision.clone(),
-                            corrected_at: next.prior_corrected_at.clone(),
-                            reviewed_by: next.prior_reviewed_by.clone(),
-                        }
-                }
-                (ReviewMutation::Flag(previous), ReviewMutation::Flag(next)) => {
-                    flag_terminal_state(previous)
-                        == FlagOwnedState {
-                            verdict: next.prior_verdict.clone(),
-                            rationale: next.prior_rationale.clone(),
-                            escalated: next.prior_escalated,
-                        }
-                }
-                (ReviewMutation::Decision(previous), ReviewMutation::Flag(next)) => {
-                    let terminal = decision_terminal_state(previous);
-                    terminal.verdict == next.prior_verdict && terminal.escalated == next.prior_escalated
-                }
-                (ReviewMutation::Flag(previous), ReviewMutation::Decision(next)) => {
-                    let terminal = flag_terminal_state(previous);
-                    terminal.verdict == next.prior_verdict && terminal.escalated == next.prior_escalated
-                }
-            };
-            if !prior_snapshot_continuous {
-                return Err(format!(
-                    "database restore refused: review effect chain for segment {segment_id} has a forged or discontinuous prior snapshot"
-                ));
-            }
-        }
-
-        let Some(latest) = mutations.last() else {
-            continue;
-        };
-        debug_assert_eq!(latest.segment_id(), segment_id);
-        let current: Option<CurrentReviewState> = db
-            .connection()
-            .query_row(
-                "SELECT review_revision, verified, annotated_transcript, verdict,
-                        verdict_transcript, escalated, human_decision, corrected_at,
-                        reviewed_by, rationale
-                   FROM speech_segments WHERE id = ?1",
-                [segment_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| format!("restore target current review-effect state is unreadable: {error}"))?;
-        let Some((
-            current_revision,
-            current_verified,
-            current_annotated,
-            current_verdict,
-            current_verdict_transcript,
-            current_escalated,
-            current_human_decision,
-            current_corrected_at,
-            current_reviewed_by,
-            current_rationale,
-        )) = current
-        else {
-            return Err(format!(
-                "database restore refused: reviewed segment {segment_id} is missing while its immutable schema-v60 effect history remains"
-            ));
-        };
-        if current_revision < latest.terminal_revision() {
-            return Err(format!(
-                "database restore refused: segment {segment_id} predates its latest review-effect revision"
-            ));
-        }
-        let current_stable_human_state = StableHumanState {
-            verified: current_verified,
-            annotated_transcript: current_annotated.clone(),
-            verdict_transcript: current_verdict_transcript.clone(),
-            human_decision: current_human_decision.clone(),
-            corrected_at: current_corrected_at.clone(),
-            reviewed_by: current_reviewed_by.clone(),
-        };
-        if current_stable_human_state != expected_stable_human_state {
-            return Err(format!(
-                "database restore refused: segment {segment_id} has unbound human transcript/verification state outside its exact review-effect chain"
-            ));
-        }
-        if current_rationale != expected_rationale {
-            return Err(format!(
-                "database restore refused: segment {segment_id} rationale disagrees with its exact mixed decision/flag effect chain"
-            ));
-        }
-
-        match latest {
-            ReviewMutation::Decision(effect) if effect.reversal_operation.is_none() => {
-                let expected_verdict = format!("human_{}", effect.action);
-                let expected_verdict_transcript = if effect.action == "reject" {
-                    effect.prior_verdict_transcript.as_ref()
-                } else {
-                    effect.decision_transcript.as_ref()
-                };
-                if current_revision < effect.decision_revision
-                    || current_human_decision.as_deref() != Some(effect.action.as_str())
-                    || current_verdict.as_deref() != Some(expected_verdict.as_str())
-                    || current_escalated != 0
-                    || current_verified != effect.decision_verified
-                    || current_annotated != effect.decision_annotated_transcript
-                    || current_verdict_transcript.as_ref() != expected_verdict_transcript
-                    || current_corrected_at.as_deref() != Some(effect.decision_corrected_at.as_str())
-                    || current_reviewed_by != effect.reviewer
-                {
-                    return Err(format!(
-                        "database restore refused: segment {segment_id} disagrees with its latest active human-decision effect {}",
-                        effect.id
-                    ));
-                }
-            }
-            ReviewMutation::Decision(effect) => {
-                let exact_inverse_revision = effect.decision_revision + 1;
-                let exact_snapshot = current_verified == effect.prior_verified
-                    && current_annotated == effect.prior_annotated_transcript
-                    && current_verdict == effect.prior_verdict
-                    && current_verdict_transcript == effect.prior_verdict_transcript
-                    && current_escalated == effect.prior_escalated
-                    && current_human_decision == effect.prior_human_decision
-                    && current_corrected_at == effect.prior_corrected_at
-                    && current_reviewed_by == effect.prior_reviewed_by;
-                if current_revision < exact_inverse_revision || !exact_snapshot {
-                    return Err(format!(
-                        "database restore refused: segment {segment_id} does not reflect human-decision reversal {}",
-                        effect.id
-                    ));
-                }
-            }
-            ReviewMutation::Flag(flag) if flag.reversal_operation.is_none() => {
-                if current_revision < flag.flag_revision
-                    || current_verdict.as_deref() != Some("escalated")
-                    || current_escalated != 1
-                    || current_human_decision.as_deref().is_some_and(|value| !value.trim().is_empty())
-                    || current_rationale.as_deref() != Some(flag.flag_rationale.as_str())
-                {
-                    return Err(format!(
-                        "database restore refused: segment {segment_id} disagrees with its latest active review-flag effect {}",
-                        flag.id
-                    ));
-                }
-            }
-            ReviewMutation::Flag(flag) => {
-                let exact_inverse_revision = flag.flag_revision + 1;
-                let exact_snapshot = current_verdict == flag.prior_verdict
-                    && current_rationale == flag.prior_rationale
-                    && current_escalated == flag.prior_escalated
-                    && optional_text_is_blank(current_human_decision.as_deref());
-                if current_revision < exact_inverse_revision || !exact_snapshot {
-                    return Err(format!(
-                        "database restore refused: segment {segment_id} does not reflect review-flag reversal {}",
-                        flag.id
-                    ));
-                }
-            }
-        }
-    }
-
-    // Exhaustive current-row coverage closes the renderer/staged-file bypass: every row that can
-    // presently export or advertise human-reviewed truth must be explained either by the immutable
-    // pre-v60 snapshot or by the validated schema-v60 mutation chain above. A target-added row is
-    // not legitimate merely because no effect happens to name it.
-    let mut current_reviewed_statement = db
-        .connection()
-        .prepare(
-            "SELECT segment.id, segment.review_revision, segment.human_decision,
-                    segment.verdict, segment.verdict_transcript, segment.annotated_transcript,
-                    segment.verified, segment.reviewed_by, segment.corrected_at,
-                    segment.escalated, segment.is_gold, segment.rationale
-               FROM speech_segments segment
-              WHERE segment.verified = 1
-                 OR segment.is_gold = 1
-                 OR segment.human_decision IS NOT NULL
-                 OR segment.reviewed_by IS NOT NULL
-                 OR segment.corrected_at IS NOT NULL
-                 OR segment.escalated = 1
-                 OR segment.verdict = 'escalated'
-                 OR segment.verdict LIKE 'human_%'
-                 OR EXISTS (
-                      SELECT 1 FROM review_events event
-                       WHERE event.segment_id = segment.id
-                         AND event.source <> 'couch_spot_check'
-                         AND event.action IN ('accept', 'edit', 'reject')
-                 )
-                 OR EXISTS (
-                      SELECT 1 FROM review_compensation_ledger ledger
-                       WHERE ledger.segment_id = segment.id
-                         AND ledger.compensation_action = 'undo'
-                 )
-              ORDER BY segment.id",
-        )
-        .map_err(|error| format!("restore target current reviewed-row authority is unreadable: {error}"))?;
-    let current_reviewed_rows = current_reviewed_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                LegacyReviewedState {
-                    review_revision: row.get(1)?,
-                    human_decision: row.get(2)?,
-                    verdict: row.get(3)?,
-                    verdict_transcript: row.get(4)?,
-                    annotated_transcript: row.get(5)?,
-                    verified: row.get(6)?,
-                    reviewed_by: row.get(7)?,
-                    corrected_at: row.get(8)?,
-                    escalated: row.get(9)?,
-                    is_gold: row.get(10)?,
-                    rationale: row.get(11)?,
-                },
-            ))
-        })
-        .map_err(|error| format!("restore target current reviewed-row authority is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target current reviewed-row authority is unreadable: {error}"))?;
-    drop(current_reviewed_statement);
-    for (segment_id, current) in current_reviewed_rows {
-        if mutations_by_segment.contains_key(&segment_id) {
-            continue;
-        }
-        let Some(legacy) = legacy_reviewed_segments.get(&segment_id) else {
-            return Err(format!(
-                "database restore refused: current reviewed segment {segment_id} has neither immutable legacy authority nor a schema-v60 effect chain"
-            ));
-        };
-        let exact_legacy_terminal = current.review_revision >= legacy.review_revision
-            && current.human_decision == legacy.human_decision
-            && current.verdict == legacy.verdict
-            && current.verdict_transcript == legacy.verdict_transcript
-            && current.annotated_transcript == legacy.annotated_transcript
-            && current.verified == legacy.verified
-            && current.reviewed_by == legacy.reviewed_by
-            && current.corrected_at == legacy.corrected_at
-            && current.escalated == legacy.escalated
-            && current.is_gold == legacy.is_gold
-            && current.rationale == legacy.rationale;
-        if !exact_legacy_terminal {
-            return Err(format!(
-                "database restore refused: current reviewed segment {segment_id} disagrees with its immutable pre-v60 terminal state"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Recompute every restored listening receipt from its integer media counters. A staged file can
-/// carry rows that predate the current triggers/writer; trusting their stored REAL would let
-/// `played_ms = 0, coverage_ratio = 1` become durable no-listen authority after a restore.
-fn validate_playback_receipt_semantics(db: &crate::db::Database) -> Result<(), String> {
-    use rusqlite::OptionalExtension;
-
-    let mut statement = db
-        .connection()
-        .prepare(
-            "SELECT id, segment_id, segment_revision, audio_fingerprint, played_ms,
-                    clip_duration_ms, coverage_ratio, policy_version, started_at_ms,
-                    source_start_ms, source_end_ms
-               FROM playback_receipts ORDER BY id",
-        )
-        .map_err(|error| format!("restore target playback receipts are unreadable: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, f64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-            ))
-        })
-        .map_err(|error| format!("restore target playback receipts are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("restore target playback receipts are unreadable: {error}"))?;
-    drop(statement);
-
-    for (
-        id,
-        segment_id,
-        segment_revision,
-        stored_audio_identity,
-        played_ms,
-        clip_duration_ms,
-        coverage,
-        policy_version,
-        started_at_ms,
-        source_start_ms,
-        source_end_ms,
-    ) in rows
-    {
-        let expected_coverage = if clip_duration_ms > 0 && played_ms >= 0 {
-            (played_ms as f64 / clip_duration_ms as f64).min(1.0)
-        } else {
-            f64::NAN
-        };
-        let tolerance = 1e-12_f64.max(expected_coverage.abs() * f64::EPSILON * 8.0);
-        if id <= 0
-            || segment_id.trim().is_empty()
-            || segment_revision < 0
-            || stored_audio_identity.trim().is_empty()
-            || played_ms < 0
-            || started_at_ms < 0
-            || clip_duration_ms <= 0
-            || !coverage.is_finite()
-            || !expected_coverage.is_finite()
-            || (coverage - expected_coverage).abs() > tolerance
-            || !matches!(policy_version, 1 | 2 | crate::db::PLAYBACK_POLICY_VERSION)
-        {
-            return Err(format!(
-                "database restore refused: playback receipt {id} violates the canonical writer invariants"
-            ));
-        }
-
-        let current: Option<(i64, Option<String>, i64, Option<String>)> = db
-            .connection()
-            .query_row(
-                "SELECT COALESCE(review_revision, 0),
-                        NULLIF(TRIM(COALESCE(audio_content_hash, '')), ''),
-                        COALESCE(duration_ms, 0), alignment_json
-                   FROM speech_segments WHERE id = ?1",
-                [&segment_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(|error| format!("restore target playback segment identity is unreadable: {error}"))?;
-        let Some((current_revision, current_content_hash, current_duration, current_alignment_json)) = current else {
-            return Err(format!("database restore refused: playback receipt {id} points to a missing segment"));
-        };
-        // Production minting reads the current revision atomically; a future-revision receipt is
-        // impossible and would become a pre-minted authorization after the next segment UPDATE.
-        if segment_revision > current_revision {
-            return Err(format!("database restore refused: playback receipt {id} is from a future segment revision"));
-        }
-        // Policy 1 stored the v50 64-bit spectral candidate in the legacy `audio_fingerprint`
-        // receipt column. Preserve it as historical audit evidence; policy 2 stored decoded-PCM
-        // BLAKE3 but predates source-span binding. Neither can authorize policy-3 decisions.
-        if policy_version == 1 {
-            if source_start_ms.is_some() || source_end_ms.is_some() {
-                return Err(format!(
-                    "database restore refused: legacy policy-1 playback receipt {id} claims a policy-3 source span"
-                ));
-            }
-            continue;
-        }
-        if !crate::db::is_canonical_audio_content_hash(&stored_audio_identity) {
-            return Err(format!(
-                "database restore refused: content-hash playback receipt {id} lacks a canonical decoded-PCM BLAKE3 hash"
-            ));
-        }
-        let receipt_source_span = match (source_start_ms, source_end_ms) {
-            (Some(start), Some(end)) if start >= 0 && end > start => Some((start, end)),
-            (None, None) if policy_version == 2 => None,
-            _ => {
-                return Err(format!(
-                    "database restore refused: policy-{policy_version} playback receipt {id} has an invalid source span"
-                ));
-            }
-        };
-        if policy_version == 2 && receipt_source_span.is_some() {
-            return Err(format!(
-                "database restore refused: historical policy-2 playback receipt {id} claims a policy-3 source span"
-            ));
-        }
-        if policy_version == crate::db::PLAYBACK_POLICY_VERSION
-            && !receipt_source_span
-                .is_some_and(|(start, end)| crate::db::source_span_matches_duration(start, end, clip_duration_ms))
-        {
-            return Err(format!(
-                "database restore refused: policy-3 playback receipt {id} source span disagrees with decoded duration"
-            ));
-        }
-        let Some(current_content_hash) =
-            current_content_hash.filter(|value| crate::db::is_canonical_audio_content_hash(value))
-        else {
-            return Err(format!(
-                "database restore refused: content-hash playback receipt {id} has no canonical server-derived segment BLAKE3 identity"
-            ));
-        };
-        let current_source_span = crate::db::canonical_source_span(current_alignment_json.as_deref());
-        if policy_version == crate::db::PLAYBACK_POLICY_VERSION
-            && !current_source_span
-                .is_some_and(|(start, end)| crate::db::source_span_matches_duration(start, end, current_duration))
-        {
-            return Err(format!(
-                "database restore refused: policy-3 playback receipt {id} segment source span disagrees with decoded duration"
-            ));
-        }
-        // Policy 3 freezes the segment's audio identity for the lifetime of the receipt.  Unrelated
-        // metadata writes legitimately advance `review_revision`, so an older receipt revision is
-        // expected, but its decoded-PCM BLAKE3, duration, and exact source window must still equal
-        // the retained server row.  Checking only when revisions happened to be equal let a staged
-        // database bump an unrelated column and then substitute a different valid-looking hash.
-        let identity_must_match =
-            policy_version == crate::db::PLAYBACK_POLICY_VERSION || segment_revision == current_revision;
-        if identity_must_match
-            && (stored_audio_identity != current_content_hash
-                || clip_duration_ms != current_duration
-                || current_duration <= 0
-                || (policy_version == crate::db::PLAYBACK_POLICY_VERSION && receipt_source_span != current_source_span))
-        {
-            return Err(format!(
-                "database restore refused: content-hash playback receipt {id} disagrees with its retained segment identity"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_restore_target_semantics(db: &crate::db::Database) -> Result<(), String> {
-    validate_review_compensation_semantics(db)?;
-    validate_review_effect_semantics(db)?;
-    validate_playback_receipt_semantics(db)?;
-    crate::review_campaign::load(db)
-        .map_err(|error| format!("database restore refused: sequential campaign authority is invalid: {error}"))?;
-    crate::review_pool::load(db)
-        .map_err(|error| format!("database restore refused: flexible review-pool authority is invalid: {error}"))?;
-    Ok(())
-}
-
-/// With ONE caller-owned DB mutex guard, pin the current live database and then replace it. Keeping
-/// both operations in this helper prevents a queued write from landing after the safety snapshot and
-/// being silently discarded by the restore.
-fn restore_with_mandatory_snapshot(
-    reservation: &RestoreReservation<'_>,
-    db: &mut crate::db::Database,
-    data_dir: &Path,
-    source: &Path,
-) -> Result<std::path::PathBuf, String> {
-    // Prove and fully migrate the source in isolation first. A bad source creates neither a safety
-    // pin nor a durable review barrier and cannot touch a live page.
-    let staged = crate::db::Database::stage_restore_source(source).map_err(|error| error.to_string())?;
-    if has_durable_review_activity(db)? || has_durable_review_activity(&staged)? {
-        return Err(
-            "Bare database restore is refused when either the live or target generation contains durable review activity. Use a named recovery snapshot so database, pilot policy, and routing state restore as one verified generation."
-                .to_string(),
-        );
-    }
-    require_durable_review_history_superset(db, &staged)?;
-    validate_restore_target_semantics(&staged)?;
-    let pinned = take_mandatory_pre_restore_snapshot(reservation, db, data_dir)?;
-    tracing::info!("pre-restore snapshot pinned at {}", pinned.display());
-    db.commit_staged_restore(&staged).map_err(|error| error.to_string())?;
-    Ok(pinned)
-}
-
-fn prepare_and_restore_named_transaction(
-    reservation: &RestoreReservation<'_>,
-    db: &mut crate::db::Database,
-    data_dir: &Path,
-    snapshot_dir: &Path,
-    source: &Path,
-    source_selector: &str,
-) -> Result<SnapshotRestorePlan, String> {
-    let (plan, staged) = prepare_named_restore_artifacts(snapshot_dir, source, || {})?;
-    if let Some(pending) = load_named_restore_pending(data_dir)? {
-        if pending.completed_selector.is_some() {
-            return Err("the named restore already completed; only durable barrier cleanup may run".to_string());
-        }
-        if pending.source_selector != source_selector {
-            return Err(format!(
-                "an interrupted restore of '{}' is pending; retry that exact snapshot before selecting '{}'",
-                pending.source_selector, source_selector
-            ));
-        }
-        // The live connection may already contain the target (or a partial prior publication). The
-        // only authoritative pre-restore floor is the original manifest-verified pin recorded before
-        // the first swap; stage that pin independently and compare against it on every retry.
-        let original_pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector)?;
-        let original_source = original_pin.join("cortex-speech.db");
-        let (floor_plan, floor) = prepare_named_restore_artifacts(&original_pin, &original_source, || {})
-            .map_err(|error| format!("interrupted restore's original safety floor is unusable: {error}"))?;
-        let floor_policy = explicit_snapshot_pilot_policy(&floor_plan.pilot, "original safety floor")?;
-        require_durable_review_history_superset(&floor, &staged)?;
-        require_active_pilot_policy_binding(&floor, floor_policy.as_ref(), &staged, &plan.pilot)?;
-    } else {
-        // No transaction has crossed its marker yet, so the locked live DB and its live policy are
-        // the exact authoritative floor. Admission + the caller-owned DB mutex keep that floor fixed
-        // through comparison, pin creation, marker commit, and page publication.
-        let floor_policy = crate::review_pilot::load(data_dir)?;
-        require_durable_review_history_superset(db, &staged)?;
-        require_active_pilot_policy_binding(db, floor_policy.as_ref(), &staged, &plan.pilot)?;
-    }
-    validate_restore_target_semantics(&staged)?;
-    let _pin = begin_named_restore_transaction(reservation, db, data_dir, source_selector)?;
-    db.commit_staged_restore(&staged).map_err(|error| error.to_string())?;
-    Ok(plan)
-}
-
-/// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
-/// be writing, and pin a rotation-exempt copy of the CURRENT live DB first so a mis-restore of the
-/// wrong snapshot is itself recoverable (previously only from a ≤10-min rolling snapshot that
-/// rotated out within ~100 minutes). Returns a RestoreReservation the caller MUST hold across the
-/// restore so no new writer can start mid-restore (P1.3b).
 fn prepare_restore(state: &State<'_, AppState>) -> Result<(RestoreReservation<'static>, std::path::PathBuf), String> {
     let data_dir = state
         .lock_data_dir()
@@ -5399,750 +2146,6 @@ pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<crate::snapsh
     RATE_LIMITER.check("list_db_snapshots")?;
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
     Ok(crate::snapshot::list_snapshots(&data_dir))
-}
-
-fn validate_pilot_hidden_structural_namespaces(db: &crate::db::Database, context: &str) -> Result<(), String> {
-    let structural_violation: bool = db
-        .connection()
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM (
-                     SELECT after_review_event_id
-                       FROM review_pilot_hidden_keys
-                      GROUP BY after_review_event_id
-                     HAVING COUNT(DISTINCT policy_sha256) > 1
-                 )
-                 UNION ALL
-                 SELECT 1 FROM (
-                     SELECT policy_sha256, after_review_event_id, reviewer
-                       FROM review_pilot_hidden_keys
-                      GROUP BY policy_sha256, after_review_event_id, reviewer COLLATE NOCASE
-                     HAVING COUNT(*) > 2
-                 )
-                 UNION ALL
-                 SELECT 1 FROM (
-                     SELECT policy_sha256, after_review_event_id
-                       FROM review_pilot_hidden_keys
-                      GROUP BY policy_sha256, after_review_event_id
-                     HAVING COUNT(*) > 4
-                 )
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("{context} hidden-key structural quotas are unreadable: {error}"))?;
-    if structural_violation {
-        return Err(format!(
-            "database restore refused: {context} contains a historical hidden-key namespace that violates one-policy-per-baseline or grant quotas"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_pilot_hidden_namespace(
-    db: &crate::db::Database,
-    policy: &crate::review_pilot::ReviewPilotPolicy,
-    context: &str,
-) -> Result<(), String> {
-    let policy_sha256 = policy.policy_sha256()?;
-    let baseline = policy.after_review_event_id;
-    let maximum_event_id: i64 = db
-        .connection()
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
-        .map_err(|error| format!("{context} pilot review history is unreadable: {error}"))?;
-    if baseline > maximum_event_id {
-        return Err(format!(
-            "database restore refused: {context} pilot baseline {baseline} is ahead of review history maximum {maximum_event_id}"
-        ));
-    }
-    let inconsistent_namespace: i64 = db
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM review_pilot_hidden_keys
-              WHERE (policy_sha256 = ?1 OR after_review_event_id = ?2)
-                AND NOT (policy_sha256 = ?1 AND after_review_event_id = ?2)",
-            rusqlite::params![policy_sha256, baseline],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("{context} pilot hidden-key namespace is unreadable: {error}"))?;
-    if inconsistent_namespace != 0 {
-        return Err(format!(
-            "database restore refused: {context} has {inconsistent_namespace} hidden-key grant(s) inconsistent with its active policy SHA/baseline"
-        ));
-    }
-
-    let mut statement = db
-        .connection()
-        .prepare(
-            "SELECT reviewer, COUNT(*) FROM review_pilot_hidden_keys
-              WHERE policy_sha256 = ?1 AND after_review_event_id = ?2
-              GROUP BY reviewer COLLATE NOCASE",
-        )
-        .map_err(|error| format!("{context} pilot hidden-key roster is unreadable: {error}"))?;
-    let reviewer_counts = statement
-        .query_map(rusqlite::params![policy_sha256, baseline], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(|error| format!("{context} pilot hidden-key roster is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{context} pilot hidden-key roster is unreadable: {error}"))?;
-    let mut total = 0i64;
-    for (reviewer, count) in reviewer_counts {
-        if policy.cap_for(&reviewer).is_none() {
-            return Err(format!(
-                "database restore refused: {context} hidden-key namespace contains a reviewer outside its exact policy roster"
-            ));
-        }
-        if count > crate::review_pilot::REVIEW_PILOT_HIDDEN_QC_PER_REVIEWER {
-            return Err(format!(
-                "database restore refused: {context} hidden-key namespace exceeds the per-reviewer grant ceiling"
-            ));
-        }
-        total += count;
-    }
-    if total > crate::review_pilot::REVIEW_PILOT_TOTAL_HIDDEN_QC {
-        return Err(format!(
-            "database restore refused: {context} hidden-key namespace exceeds the global grant ceiling"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_active_pilot_semantics(
-    db: &crate::db::Database,
-    policy: &crate::review_pilot::ReviewPilotPolicy,
-    context: &str,
-) -> Result<(), String> {
-    use std::collections::{HashMap, HashSet};
-
-    let policy_sha256 = policy.policy_sha256()?;
-    let baseline = policy.after_review_event_id;
-    let authorized =
-        policy.reviewer_names().into_iter().map(|name| (name.to_ascii_lowercase(), name)).collect::<HashMap<_, _>>();
-    let reviewer_key = |actual: &str| {
-        let key = actual.trim().to_ascii_lowercase();
-        authorized.contains_key(&key).then_some(key)
-    };
-
-    let mut grants = authorized.keys().map(|key| (key.clone(), HashSet::new())).collect::<HashMap<_, _>>();
-    let mut grant_statement = db
-        .connection()
-        .prepare(
-            "SELECT reviewer, segment_id FROM review_pilot_hidden_keys
-              WHERE policy_sha256 = ?1 AND after_review_event_id = ?2
-              ORDER BY reviewer COLLATE NOCASE, segment_id",
-        )
-        .map_err(|error| format!("{context} active pilot grants are unreadable: {error}"))?;
-    let grant_rows = grant_statement
-        .query_map(rusqlite::params![policy_sha256, baseline], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| format!("{context} active pilot grants are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{context} active pilot grants are unreadable: {error}"))?;
-    drop(grant_statement);
-    for (reviewer, segment_id) in grant_rows {
-        let key = reviewer_key(&reviewer).ok_or_else(|| {
-            format!("database restore refused: {context} active pilot grant has an unauthorized reviewer")
-        })?;
-        let reviewer_grants = grants
-            .get_mut(&key)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-        if !reviewer_grants.insert(segment_id) {
-            return Err(format!("database restore refused: {context} active pilot contains a duplicate grant"));
-        }
-    }
-
-    let mut corpus_actions = authorized.keys().map(|key| (key.clone(), 0i64)).collect::<HashMap<_, _>>();
-    let mut hidden_actions = authorized.keys().map(|key| (key.clone(), 0i64)).collect::<HashMap<_, _>>();
-    let mut completed = authorized.keys().map(|key| (key.clone(), HashSet::new())).collect::<HashMap<_, _>>();
-    let mut skipped = authorized.keys().map(|key| (key.clone(), HashSet::new())).collect::<HashMap<_, _>>();
-    let mut hidden_event_actions = HashMap::<(String, String), String>::new();
-
-    let mut event_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, segment_id, reviewer, action, source FROM review_events
-              WHERE id > ?1 AND source IN ('couch', 'couch_spot_check')
-              ORDER BY id",
-        )
-        .map_err(|error| format!("{context} post-baseline pilot history is unreadable: {error}"))?;
-    let events = event_statement
-        .query_map([baseline], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
-        .map_err(|error| format!("{context} post-baseline pilot history is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{context} post-baseline pilot history is unreadable: {error}"))?;
-    drop(event_statement);
-
-    for (event_id, segment_id, reviewer, action, source) in events {
-        let key = reviewer_key(&reviewer).ok_or_else(|| {
-            format!(
-                "database restore refused: {context} post-baseline pilot event {event_id} has an unauthorized reviewer"
-            )
-        })?;
-        if !matches!(action.as_str(), "accept" | "edit" | "reject" | "skip") {
-            return Err(format!(
-                "database restore refused: {context} post-baseline pilot event {event_id} has an invalid action"
-            ));
-        }
-        let is_grant = grants.get(&key).is_some_and(|segments| segments.contains(&segment_id));
-        if source == "couch" {
-            let corpus_count = corpus_actions
-                .get_mut(&key)
-                .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-            *corpus_count += 1;
-            if is_grant {
-                // Pre-v59/session-backed hidden skips were recorded as ordinary Couch skips. Keep
-                // recognizing that exact history: it consumes a corpus slot and resolves the grant,
-                // but any non-skip corpus finalization of a hidden key is corruption.
-                if action != "skip" {
-                    return Err(format!(
-                        "database restore refused: {context} reserved hidden key was non-skip finalized through the corpus path"
-                    ));
-                }
-                let reviewer_skips = skipped
-                    .get_mut(&key)
-                    .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-                if !reviewer_skips.insert(segment_id) {
-                    return Err(format!(
-                        "database restore refused: {context} reserved hidden key was resolved more than once"
-                    ));
-                }
-            }
-            continue;
-        }
-
-        if !is_grant {
-            return Err(format!(
-                "database restore refused: {context} hidden-check event {event_id} has no active durable grant"
-            ));
-        }
-        if completed.get(&key).is_some_and(|segments| segments.contains(&segment_id))
-            || skipped.get(&key).is_some_and(|segments| segments.contains(&segment_id))
-        {
-            return Err(format!("database restore refused: {context} reserved hidden key was resolved more than once"));
-        }
-        if hidden_event_actions.insert((key.clone(), segment_id.clone()), action.clone()).is_some() {
-            return Err(format!("database restore refused: {context} reserved hidden key has duplicate hidden events"));
-        }
-        if action == "skip" {
-            skipped
-                .get_mut(&key)
-                .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?
-                .insert(segment_id);
-        } else {
-            completed
-                .get_mut(&key)
-                .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?
-                .insert(segment_id);
-        }
-        let hidden_count = hidden_actions
-            .get_mut(&key)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-        *hidden_count += 1;
-    }
-
-    let mut result_statement = db
-        .connection()
-        .prepare(
-            "SELECT key.reviewer, key.segment_id, result.action,
-                    result.submitted_transcript, result.expected_transcript,
-                    result.noticed, result.cer
-               FROM review_pilot_hidden_keys key
-               JOIN spot_checks result
-                 ON result.segment_id = key.segment_id
-                AND result.reviewer = key.reviewer COLLATE NOCASE
-              WHERE key.policy_sha256 = ?1 AND key.after_review_event_id = ?2
-              ORDER BY key.reviewer COLLATE NOCASE, key.segment_id",
-        )
-        .map_err(|error| format!("{context} active pilot results are unreadable: {error}"))?;
-    let result_rows = result_statement
-        .query_map(rusqlite::params![policy_sha256, baseline], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, f64>(6)?,
-            ))
-        })
-        .map_err(|error| format!("{context} active pilot results are unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{context} active pilot results are unreadable: {error}"))?;
-    drop(result_statement);
-    let mut result_actions = HashMap::<(String, String), Vec<String>>::new();
-    for (reviewer, segment_id, action, submitted, expected, noticed, cer) in result_rows {
-        let key = reviewer_key(&reviewer).ok_or_else(|| {
-            format!("database restore refused: {context} hidden-check result has an unauthorized reviewer")
-        })?;
-        let submitted = crate::db::to_nfc(submitted.trim());
-        let expected = crate::db::to_nfc(expected.trim());
-        let expected_noticed = action != "reject"
-            && crate::normalizer::learning_text_key(&submitted) == crate::normalizer::learning_text_key(&expected);
-        let expected_cer = crate::wer::compute_cer(&expected, &submitted);
-        let cer_tolerance = 1e-12_f64.max(expected_cer.abs() * f64::EPSILON * 8.0);
-        if !matches!(noticed, 0 | 1)
-            || (noticed != 0) != expected_noticed
-            || !cer.is_finite()
-            || !expected_cer.is_finite()
-            || (cer - expected_cer).abs() > cer_tolerance
-        {
-            return Err(format!(
-                "database restore refused: {context} hidden-check result has impossible noticed/CER semantics"
-            ));
-        }
-        result_actions.entry((key, segment_id)).or_default().push(action);
-    }
-    for (key, expected_action) in &hidden_event_actions {
-        match result_actions.get(key) {
-            Some(observed) if observed.len() == 1 && observed[0] == *expected_action => {}
-            _ => {
-                return Err(format!(
-                    "database restore refused: {context} hidden-check event/result actions do not match exactly"
-                ));
-            }
-        }
-    }
-    if result_actions.keys().any(|key| !hidden_event_actions.contains_key(key)) {
-        return Err(format!(
-            "database restore refused: {context} has an orphan hidden-check result without a matching event"
-        ));
-    }
-
-    // A corpus verdict and its event/ledger are one database transaction in current builds. A
-    // restored target may nevertheless contain pre-existing rows from an older half-write or a
-    // crafted extra. For every CURRENT decision attributed to this active roster, require the latest
-    // still-active campaign event to describe exactly that state. A fully reversed campaign chain is
-    // allowed because atomic Undo deliberately restores the prior row snapshot.
-    let reversed_entries = {
-        let mut statement = db
-            .connection()
-            .prepare(
-                "SELECT reverses_entry_id FROM review_compensation_ledger
-                  WHERE policy_version = ?1 AND compensation_action = 'undo'
-                    AND source = 'couch_undo' AND reverses_entry_id IS NOT NULL",
-            )
-            .map_err(|error| format!("{context} pilot undo ledger is unreadable: {error}"))?;
-        let rows = statement
-            .query_map([crate::db::REVIEW_PAY_POLICY_VERSION], |row| row.get::<_, String>(0))
-            .map_err(|error| format!("{context} pilot undo ledger is unreadable: {error}"))?
-            .collect::<Result<HashSet<_>, _>>()
-            .map_err(|error| format!("{context} pilot undo ledger is unreadable: {error}"))?;
-        rows
-    };
-    let mut active_corpus = HashMap::<String, (i64, String, String, i64)>::new();
-    let mut corpus_statement = db
-        .connection()
-        .prepare(
-            "SELECT event.id, event.segment_id, event.reviewer, event.action,
-                    (SELECT COUNT(*) FROM review_compensation_ledger ledger
-                      WHERE ledger.policy_version = ?2 AND ledger.review_event_id = event.id),
-                    (SELECT entry_id FROM review_compensation_ledger ledger
-                      WHERE ledger.policy_version = ?2 AND ledger.review_event_id = event.id
-                      ORDER BY ledger.id LIMIT 1),
-                    (SELECT decision_revision FROM review_compensation_ledger ledger
-                      WHERE ledger.policy_version = ?2 AND ledger.review_event_id = event.id
-                      ORDER BY ledger.id LIMIT 1)
-               FROM review_events event
-              WHERE event.id > ?1 AND event.source = 'couch'
-                AND event.action IN ('accept','edit','reject')
-              ORDER BY event.id",
-        )
-        .map_err(|error| format!("{context} pilot corpus-state history is unreadable: {error}"))?;
-    let corpus_rows = corpus_statement
-        .query_map(rusqlite::params![baseline, crate::db::REVIEW_PAY_POLICY_VERSION], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-            ))
-        })
-        .map_err(|error| format!("{context} pilot corpus-state history is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{context} pilot corpus-state history is unreadable: {error}"))?;
-    drop(corpus_statement);
-    for (event_id, segment_id, reviewer, action, ledger_count, entry_id, decision_revision) in corpus_rows {
-        if ledger_count != 1 || entry_id.is_none() || decision_revision.is_none() {
-            return Err(format!(
-                "database restore refused: {context} corpus event {event_id} lacks one valid compensation ledger entry"
-            ));
-        }
-        let entry_id = entry_id.ok_or_else(|| {
-            format!("database restore refused: {context} corpus event {event_id} has no ledger identity")
-        })?;
-        if !reversed_entries.contains(&entry_id) {
-            let decision_revision = decision_revision.ok_or_else(|| {
-                format!("database restore refused: {context} corpus event {event_id} has no decision revision")
-            })?;
-            active_corpus.insert(segment_id, (event_id, reviewer, action, decision_revision));
-        }
-    }
-
-    let mut current_statement = db
-        .connection()
-        .prepare(
-            "SELECT id, reviewed_by, human_decision FROM speech_segments
-              WHERE reviewed_by IS NOT NULL AND human_decision IN ('accept','edit','reject')",
-        )
-        .map_err(|error| format!("{context} current reviewed corpus state is unreadable: {error}"))?;
-    let current_rows = current_statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
-        .map_err(|error| format!("{context} current reviewed corpus state is unreadable: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("{context} current reviewed corpus state is unreadable: {error}"))?;
-    drop(current_statement);
-    for (segment_id, reviewer, decision) in current_rows {
-        if reviewer_key(&reviewer).is_none() {
-            continue;
-        }
-        match active_corpus.get(&segment_id) {
-            Some((_, event_reviewer, event_action, _))
-                if event_reviewer.trim().eq_ignore_ascii_case(reviewer.trim()) && event_action == &decision => {}
-            None => {
-                use rusqlite::OptionalExtension;
-                let prior: Option<(String, String)> = db
-                    .connection()
-                    .query_row(
-                        "SELECT reviewer, action FROM review_events
-                          WHERE id <= ?1 AND segment_id = ?2 AND source = 'couch'
-                            AND action IN ('accept','edit','reject')
-                          ORDER BY id DESC LIMIT 1",
-                        rusqlite::params![baseline, segment_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()
-                    .map_err(|error| format!("{context} pre-pilot corpus state is unreadable: {error}"))?;
-                if !prior.is_some_and(|(prior_reviewer, prior_action)| {
-                    prior_reviewer.trim().eq_ignore_ascii_case(reviewer.trim()) && prior_action == decision
-                }) {
-                    return Err(format!(
-                        "database restore refused: {context} current reviewed segment {segment_id} has no matching active campaign event/ledger"
-                    ));
-                }
-                // When all campaign entries were reversed, the exact prior event above proves the
-                // reviewed row is the state atomic Undo restored. With no prior event, a normal Undo
-                // restores an unreviewed row, which never enters this scan; any reviewed row is forged.
-            }
-            _ => {
-                return Err(format!(
-                    "database restore refused: {context} current reviewed segment {segment_id} has no matching active campaign event/ledger"
-                ));
-            }
-        }
-    }
-    for (segment_id, (event_id, event_reviewer, event_action, decision_revision)) in &active_corpus {
-        use rusqlite::OptionalExtension;
-        let current: Option<(i64, Option<String>, Option<String>)> = db
-            .connection()
-            .query_row(
-                "SELECT COALESCE(review_revision, 0), human_decision, reviewed_by
-                   FROM speech_segments WHERE id = ?1",
-                [segment_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| format!("{context} campaign segment state is unreadable: {error}"))?;
-        if let Some((current_revision, current_decision, current_reviewer)) = current {
-            if current_revision == *decision_revision
-                && (current_decision.as_deref() != Some(event_action.as_str())
-                    || !current_reviewer
-                        .as_deref()
-                        .is_some_and(|value| value.trim().eq_ignore_ascii_case(event_reviewer.trim())))
-            {
-                return Err(format!(
-                    "database restore refused: {context} corpus event {event_id} has no matching current-revision segment state"
-                ));
-            }
-        }
-    }
-
-    for key in authorized.keys() {
-        let reviewer_completed = completed
-            .get(key)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-        let reviewer_skipped = skipped
-            .get(key)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-        if reviewer_completed.intersection(reviewer_skipped).next().is_some() {
-            return Err(format!(
-                "database restore refused: {context} hidden key has both completed and skipped resolution"
-            ));
-        }
-        let corpus = *corpus_actions
-            .get(key)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-        let hidden = *hidden_actions
-            .get(key)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-        let reviewer = authorized
-            .get(key)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer map is inconsistent"))?;
-        let corpus_cap = policy
-            .cap_for(reviewer)
-            .ok_or_else(|| format!("database restore refused: {context} pilot reviewer cap is inconsistent"))?;
-        if corpus > corpus_cap {
-            return Err(format!("database restore refused: {context} exceeds the per-reviewer corpus-action ceiling"));
-        }
-        if hidden > crate::review_pilot::REVIEW_PILOT_HIDDEN_QC_PER_REVIEWER {
-            return Err(format!("database restore refused: {context} exceeds the per-reviewer hidden-action ceiling"));
-        }
-        if corpus + hidden
-            > crate::review_pilot::REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER
-                + crate::review_pilot::REVIEW_PILOT_HIDDEN_QC_PER_REVIEWER
-        {
-            return Err(format!("database restore refused: {context} exceeds the per-reviewer UI-action ceiling"));
-        }
-    }
-    let corpus_total: i64 = corpus_actions.values().sum();
-    let hidden_total: i64 = hidden_actions.values().sum();
-    if corpus_total > policy.max_total_corpus_actions {
-        return Err(format!("database restore refused: {context} exceeds the global corpus-action ceiling"));
-    }
-    if hidden_total > crate::review_pilot::REVIEW_PILOT_TOTAL_HIDDEN_QC {
-        return Err(format!("database restore refused: {context} exceeds the global hidden-action ceiling"));
-    }
-    if corpus_total + hidden_total > crate::review_pilot::REVIEW_PILOT_MAX_COMPENSATED_UI_ACTIONS {
-        return Err(format!("database restore refused: {context} exceeds the global UI-action ceiling"));
-    }
-    Ok(())
-}
-
-/// If the authoritative floor has begun using its active controlled-pilot identity, the target must
-/// carry that exact semantic policy. Baseline alone is insufficient: changing the roster at the same
-/// event id would reinterpret grants and mint a fresh paid-action namespace.
-fn require_active_pilot_policy_binding(
-    floor: &crate::db::Database,
-    floor_policy: Option<&crate::review_pilot::ReviewPilotPolicy>,
-    target: &crate::db::Database,
-    target_action: &SnapshotPilotPolicyRestore,
-) -> Result<(), String> {
-    validate_pilot_hidden_structural_namespaces(target, "target snapshot")?;
-    let target_policy = match target_action {
-        SnapshotPilotPolicyRestore::Install(bytes) => {
-            let raw = std::str::from_utf8(bytes)
-                .map_err(|error| format!("target snapshot pilot policy is not UTF-8: {error}"))?;
-            Some(crate::review_pilot::parse(raw)?)
-        }
-        SnapshotPilotPolicyRestore::ExplicitlyAbsent | SnapshotPilotPolicyRestore::PreserveLegacy => None,
-    };
-    if let Some(policy) = target_policy.as_ref() {
-        // Triggers constrain future INSERTs but cannot prove that pre-existing rows obeyed them.
-        // Validate the migrated staged generation itself before it can replace one live page.
-        validate_pilot_hidden_namespace(target, policy, "target snapshot")?;
-        validate_active_pilot_semantics(target, policy, "target snapshot")?;
-    }
-    let Some(floor_policy) = floor_policy else {
-        return Ok(());
-    };
-    validate_pilot_hidden_structural_namespaces(floor, "authoritative floor")?;
-    validate_pilot_hidden_namespace(floor, floor_policy, "authoritative floor")?;
-    let policy_sha256 = floor_policy.policy_sha256()?;
-    let baseline = floor_policy.after_review_event_id;
-    let grants: i64 = floor
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM review_pilot_hidden_keys
-              WHERE policy_sha256 = ?1 AND after_review_event_id = ?2",
-            rusqlite::params![policy_sha256, baseline],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("authoritative pilot hidden-key grants are unreadable: {error}"))?;
-    let activity: i64 = floor
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM review_events
-              WHERE id > ?1 AND source IN ('couch', 'couch_spot_check')",
-            [baseline],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("authoritative pilot review activity is unreadable: {error}"))?;
-    if grants == 0 && activity == 0 {
-        return Ok(());
-    }
-
-    let Some(target_policy) = target_policy else {
-        return Err(
-            "database restore refused: the authoritative floor has policy-bound pilot grants/activity, but the target does not cryptographically bind that policy"
-                .to_string(),
-        );
-    };
-    let target_sha256 = target_policy.policy_sha256()?;
-    if target_policy != *floor_policy || target_sha256 != policy_sha256 {
-        return Err(
-            "database restore refused: target pilot policy identity differs from the authoritative policy already used for grants/activity"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn publish_prepared_snapshot_generation_offline(
-    data_dir: &Path,
-    restore_plan: &SnapshotRestorePlan,
-    staged: &crate::db::Database,
-    live_controls: &AppSettings,
-) -> Result<(), String> {
-    validate_restore_target_semantics(staged)?;
-    let db_path = data_dir.join("cortex-speech.db");
-    let mut live = crate::db::Database::open_with_retry(db_path.to_string_lossy().as_ref())
-        .map_err(|error| format!("could not open live database for recovery: {error}"))?;
-    live.commit_staged_restore(staged)
-        .map_err(|error| format!("could not publish recovered database generation: {error}"))?;
-    let integrity =
-        live.integrity_check().map_err(|error| format!("recovered live database could not be verified: {error}"))?;
-    if integrity.trim() != "ok" {
-        return Err(format!("recovered live database failed integrity_check: {integrity}"));
-    }
-    drop(live);
-    install_snapshot_restore_plan(restore_plan, data_dir, live_controls)?;
-    Ok(())
-}
-
-fn restore_snapshot_generation_offline(
-    data_dir: &Path,
-    selector: &str,
-    live_controls: &AppSettings,
-    authoritative_floor: &crate::db::Database,
-    authoritative_policy: Option<&crate::review_pilot::ReviewPilotPolicy>,
-) -> Result<(), String> {
-    let snapshot_dir = crate::snapshot::resolve_snapshot_dir(data_dir, selector)?;
-    let source = snapshot_dir.join("cortex-speech.db");
-    let source_metadata = std::fs::symlink_metadata(&source)
-        .map_err(|error| format!("snapshot '{selector}' has no readable database file: {error}"))?;
-    if !source_metadata.file_type().is_file() || source_metadata.file_type().is_symlink() {
-        return Err(format!("snapshot '{selector}' has no regular database file"));
-    }
-    let (restore_plan, staged) = prepare_named_restore_artifacts(&snapshot_dir, &source, || {})?;
-    require_durable_review_history_superset(authoritative_floor, &staged)?;
-    require_active_pilot_policy_binding(authoritative_floor, authoritative_policy, &staged, &restore_plan.pilot)?;
-    publish_prepared_snapshot_generation_offline(data_dir, &restore_plan, &staged, live_controls)?;
-    Ok(())
-}
-
-/// Complete an interrupted cross-file restore before normal startup performs ANY DB/config write,
-/// snapshot, Couch resume, or background work. The intended target is retried first. If that target
-/// cannot be made coherent, the manifest-verified original pre-restore generation is restored in
-/// full. Both paths keep the durable marker until DB + all required config have committed.
-fn recover_interrupted_named_restore_with_admission(
-    data_dir: &Path,
-    admission: &RestoreAdmission,
-) -> Result<bool, String> {
-    let Some(pending) = load_named_restore_pending(data_dir)? else {
-        return Ok(false);
-    };
-    let reservation = admission.claim_recovery()?;
-    if let Some(completed_selector) = pending.completed_selector.as_deref() {
-        // The completion marker is written only after every DB/config/settings leg is durable. Verify
-        // the live DB and typed settings without mutating them, then finish the interrupted marker
-        // cleanup. Never roll back a generation already recorded as coherent merely because its
-        // original source was later moved or pruned.
-        let db_path = data_dir.join("cortex-speech.db");
-        // Stage into writable memory: FTS5's integrity path may use temporary writes and therefore
-        // reports a false "attempt to write a readonly database" against an otherwise healthy file.
-        // The shared staging primitive performs immutable-source copy, full integrity, FK and exact
-        // migration-history validation without touching the live artifact.
-        crate::db::Database::stage_restore_source(&db_path)
-            .map_err(|error| format!("completed restore live database could not be verified: {error}"))?;
-        strict_live_settings_for_restore(&data_dir.join("settings.json"))?;
-        clear_review_pilot_restore_pending(data_dir)?;
-        reservation.commit_named_restore()?;
-        tracing::warn!(
-            "finished durable marker cleanup for already-completed restore '{completed_selector}' before startup"
-        );
-        return Ok(true);
-    }
-    let original_pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector)
-        .map_err(|error| format!("interrupted restore has no usable original safety pin: {error}"))?;
-    if !crate::snapshot::verify_snapshot_manifest_for_restore(&original_pin)? {
-        return Err(
-            "interrupted restore's original safety pin is legacy/unverifiable; refusing normal startup".to_string()
-        );
-    }
-    // Stage the recorded original pin once and keep that owned in-memory generation as the floor for
-    // BOTH target retry and fallback. Never consult possibly-swapped live pages for admission, and do
-    // not re-migrate the original twice (time-derived migration values could otherwise differ).
-    let original_source = original_pin.join("cortex-speech.db");
-    let (original_plan, original_floor) = prepare_named_restore_artifacts(&original_pin, &original_source, || {})?;
-    if matches!(original_plan.pilot, SnapshotPilotPolicyRestore::PreserveLegacy)
-        || original_plan
-            .optional
-            .iter()
-            .any(|(_, action)| matches!(action, crate::snapshot::OptionalSnapshotRestore::PreserveLegacy))
-    {
-        return Err("interrupted restore's original safety pin does not explicitly bind every required config state"
-            .to_string());
-    }
-    let original_policy = explicit_snapshot_pilot_policy(&original_plan.pilot, "original safety pin")?;
-
-    let settings_path = data_dir.join("settings.json");
-    let live_controls = strict_live_settings_for_restore(&settings_path)?;
-    let target_result = restore_snapshot_generation_offline(
-        data_dir,
-        &pending.source_selector,
-        &live_controls,
-        &original_floor,
-        original_policy.as_ref(),
-    );
-    let completed_selector = match target_result {
-        Ok(()) => pending.source_selector.clone(),
-        Err(target_error) => {
-            tracing::error!(
-                "interrupted target restore '{}' could not complete ({target_error}); rolling back verified original '{}'",
-                pending.source_selector,
-                pending.pre_restore_pin_selector
-            );
-            require_durable_review_history_superset(&original_floor, &original_floor)
-                .and_then(|()| {
-                    require_active_pilot_policy_binding(
-                        &original_floor,
-                        original_policy.as_ref(),
-                        &original_floor,
-                        &original_plan.pilot,
-                    )
-                })
-                .and_then(|()| {
-                    publish_prepared_snapshot_generation_offline(
-                        data_dir,
-                        &original_plan,
-                        &original_floor,
-                        &live_controls,
-                    )
-                })
-                .map_err(|rollback_error| {
-                    format!(
-                        "interrupted restore could not complete target '{}' ({target_error}) and could not roll back verified original '{}' ({rollback_error}); normal startup is blocked",
-                        pending.source_selector, pending.pre_restore_pin_selector
-                    )
-                })?;
-            pending.pre_restore_pin_selector.clone()
-        }
-    };
-    // Marker deletion is outside the fallback branch: failure here means the selected generation is
-    // already coherent, so rolling it back would be an unnecessary second data transition. Stay fatal
-    // and retry marker cleanup idempotently on the next launch.
-    mark_named_restore_completed(data_dir, &completed_selector)?;
-    clear_review_pilot_restore_pending(data_dir)?;
-    reservation.commit_named_restore()?;
-    tracing::warn!("completed interrupted restore recovery using '{completed_selector}' before normal startup");
-    Ok(true)
-}
-
-pub(crate) fn recover_interrupted_named_restore_at_startup(data_dir: &Path) -> Result<bool, String> {
-    recover_interrupted_named_restore_with_admission(data_dir, RESTORE_ADMISSION.as_ref())
 }
 
 /// Restore a verified rotating or pinned recovery artifact. The selector comes only from
@@ -6551,12 +2554,94 @@ fn run_wsl_refinement_loop(
 
     let mut transcribed = 0usize;
     let mut failed = 0usize;
-    for (idx, (id, _path)) in targets.iter().enumerate() {
+    // Reuse one verified immutable file lease for every segment cut from the same recording. This
+    // keeps source bytes frozen for the whole batch without decoding a multi-hour source once per
+    // chunk.
+    let mut source_leases: std::collections::HashMap<(String, String), crate::media::VerifiedMediaSourceLease> =
+        std::collections::HashMap::new();
+    for (idx, (id, target_path)) in targets.iter().enumerate() {
         if WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
             emit_or_log(app, "wsl-log", format!(">>> Cancelled by user after {idx}/{total} segment(s)."));
             return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
         }
         emit_or_log(app, "wsl-log", format!("[{}/{}] transcribing {}...", idx + 1, total, id));
+
+        let source_snapshot = match db.champion_transcription_source_snapshot(id) {
+            Ok(Some(snapshot)) if snapshot.segment.audio_path == *target_path => snapshot,
+            Ok(Some(_)) => {
+                failed += 1;
+                emit_or_log(
+                    app,
+                    "wsl-log",
+                    format!(
+                        "[ERROR] [{}/{}] {} source path changed after selection; reload the batch before transcribing",
+                        idx + 1,
+                        total,
+                        id
+                    ),
+                );
+                continue;
+            }
+            Ok(None) => {
+                failed += 1;
+                emit_or_log(app, "wsl-log", format!("[ERROR] [{}/{}] {} no longer exists", idx + 1, total, id));
+                continue;
+            }
+            Err(error) => {
+                failed += 1;
+                emit_or_log(
+                    app,
+                    "wsl-log",
+                    format!("[ERROR] [{}/{}] {} source snapshot failed: {}", idx + 1, total, id, error),
+                );
+                continue;
+            }
+        };
+        let expected_hash = match source_snapshot.audio_content_hash.as_deref() {
+            Some(hash) if crate::db::is_canonical_audio_content_hash(hash) => hash.to_string(),
+            _ => {
+                failed += 1;
+                emit_or_log(
+                    app,
+                    "wsl-log",
+                    format!(
+                        "[ERROR] [{}/{}] {} has no canonical decoded-PCM identity; repair or re-import it before transcribing",
+                        idx + 1,
+                        total,
+                        id
+                    ),
+                );
+                continue;
+            }
+        };
+        let lease_key = (source_snapshot.segment.audio_path.clone(), expected_hash.clone());
+        let source_lease = match source_leases.get(&lease_key) {
+            Some(lease) => lease.clone(),
+            None => match crate::media::verify_current_source_lease(
+                std::path::Path::new(&source_snapshot.segment.audio_path),
+                &expected_hash,
+            ) {
+                Ok(lease) => {
+                    source_leases.insert(lease_key, lease.clone());
+                    lease
+                }
+                Err(error) => {
+                    failed += 1;
+                    emit_or_log(
+                        app,
+                        "wsl-log",
+                        format!(
+                            "[ERROR] [{}/{}] {} source identity changed: {}",
+                            idx + 1,
+                            total,
+                            id,
+                            wsl_log_preview(&error)
+                        ),
+                    );
+                    continue;
+                }
+            },
+        };
         match crate::pipeline::run_wsl_segment_transcript_with_script(
             external_script,
             id,
@@ -6593,12 +2678,13 @@ fn run_wsl_refinement_loop(
                     transcript: raw_transcript.clone(),
                     confidence,
                 };
-                match db.commit_champion_transcript_if_unreviewed(
+                match db.commit_bound_champion_transcript_if_unreviewed(
                     &champion,
                     Some(&result.deployment_sha256),
                     normalized.as_deref(),
                     Some("external_provider"),
                     false,
+                    &source_snapshot,
                 ) {
                     Ok(true) => {
                         transcribed += 1;
@@ -6644,6 +2730,8 @@ fn run_wsl_refinement_loop(
                 );
             }
         }
+        // Keep the exact imported file object immutable through the compare-and-swap commit above.
+        drop(source_lease);
     }
 
     // A cancel that arrives during the FINAL segment passes every in-loop check (there is no next
@@ -7495,13 +3583,16 @@ fn resolve_t2_endpoint(
     settings: &crate::settings::AppSettings,
     gemini_key: &str,
     data_dir: Option<&std::path::Path>,
-) -> (crate::jury::t2_listener::T2Endpoint, String, String) {
+) -> Result<(crate::jury::t2_listener::T2Endpoint, String, String), String> {
     let openrouter_key = if settings.jury_provider.eq_ignore_ascii_case("openrouter") {
-        data_dir.and_then(|d| crate::api_keys::ApiKeys::load(d).openrouter)
+        match data_dir {
+            Some(directory) => crate::api_keys::ApiKeys::load(directory)?.openrouter,
+            None => None,
+        }
     } else {
         None
     };
-    resolve_t2_endpoint_from_keys(settings, gemini_key, openrouter_key.as_deref())
+    Ok(resolve_t2_endpoint_from_keys(settings, gemini_key, openrouter_key.as_deref()))
 }
 
 /// Direct-Gemini entry point (the default transport, used by tests and any caller without a data dir).
@@ -7557,7 +3648,7 @@ pub fn run_jury_pipeline_core_via(
     let n_samples = (settings.jury_self_consistency_n as usize).max(3);
     // T2 transport: direct Gemini by default, or OpenRouter (with the OR key from secrets.env) when the
     // jury provider is set to "openrouter".
-    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(settings, &settings.llm_api_key, data_dir);
+    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(settings, &settings.llm_api_key, data_dir)?;
 
     // The Autonomy Dial governs EVERY machine-commit stage of this pipeline, not just T0
     // (round-24 hunt #1, HIGH). Observe/Propose previously gated only run_t0_gate; the SAME run then
@@ -7984,7 +4075,7 @@ mod tests {
     fn legacy_machine_db() -> crate::db::Database {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         db
     }
 
@@ -8040,12 +4131,101 @@ mod tests {
             audio_content_hash,
             source_start_ms,
             source_end_ms,
+            authority_session_id: None,
+            source_lease: None,
         }
+    }
+
+    /// A real policy-4 Couch authority for restore characterizations. The temporary WAV remains
+    /// alive for the complete decision transaction through the proof's verified source lease; no
+    /// synthetic receipt row or cfg(test) writer bypass is involved.
+    struct CanonicalPolicy4Playback {
+        proof: crate::db::PlaybackDecisionProof,
+        _source: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for CanonicalPolicy4Playback {
+        type Target = crate::db::PlaybackDecisionProof;
+
+        fn deref(&self) -> &Self::Target {
+            &self.proof
+        }
+    }
+
+    fn canonical_policy4_phone_playback(
+        db: &crate::db::Database,
+        segment_id: &str,
+        reviewer: &str,
+    ) -> CanonicalPolicy4Playback {
+        let source = tempfile::tempdir().unwrap();
+        let source_path = source.path().join("canonical-policy4.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source_path, spec).unwrap();
+        for sample in 0..16_000_i32 {
+            writer.write_sample::<i16>(((sample % 257) - 128) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&source_path).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_path = ?2,
+                        audio_content_hash = ?3,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![segment_id, source_path.to_string_lossy(), content_hash],
+            )
+            .unwrap();
+        let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+        let session_binding_sha256 = "c".repeat(64);
+        let issued_at_ms =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let authority = crate::db::CouchPlaybackAttemptAuthority {
+            playback_receipt_id: uuid::Uuid::new_v4().to_string(),
+            media_grant_id: uuid::Uuid::new_v4().to_string(),
+            client_attempt_id: uuid::Uuid::new_v4().to_string(),
+            session_binding_sha256: session_binding_sha256.clone(),
+            reviewer: reviewer.to_string(),
+            segment_id: segment_id.to_string(),
+            segment_revision: revision,
+            audio_content_hash: content_hash.clone(),
+            source_path,
+            clip_duration_ms: 1_000,
+            source_start_ms: 0,
+            source_end_ms: 1_000,
+            issued_at_ms,
+            expires_at_ms: issued_at_ms + 60_000,
+        };
+        let receipt = db
+            .finalize_couch_playback_attempt_v1(
+                &authority,
+                &[crate::db::DesktopPlaybackInterval { start_ms: 0, end_ms: 1_000 }],
+                1_000,
+            )
+            .unwrap();
+        let proof = db
+            .couch_playback_proof_v4(
+                segment_id,
+                revision,
+                &content_hash,
+                reviewer,
+                &session_binding_sha256,
+                &receipt.playback_receipt_id,
+            )
+            .unwrap()
+            .expect("canonical policy-4 receipt must resolve to its exact source lease");
+        CanonicalPolicy4Playback { proof, _source: source }
     }
 
     fn record_canonical_phone_edit(db: &crate::db::Database, segment_id: &str, operation_index: u64) -> (i64, String) {
         insert_canonical_pay_segment(db, segment_id);
-        let proof = canonical_phone_playback(db, segment_id, "Reviewer");
+        let proof = canonical_policy4_phone_playback(db, segment_id, "Reviewer");
         let operation = canonical_operation(operation_index);
         db.record_phone_human_decision_by_at_revision_with_operation_limit(
             segment_id,
@@ -8315,7 +4495,7 @@ mod tests {
         // review_effect_state with a different timestamp and test the wrong authority first.
         let correction_floor = crate::db::Database::open(":memory:").unwrap();
         correction_floor.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&correction_floor, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&correction_floor, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         correction_floor
             .connection()
             .execute(
@@ -8327,7 +4507,7 @@ mod tests {
                 ["a".repeat(64)],
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
         let correction_target = copied_database(&correction_floor);
         correction_target
             .connection()
@@ -8618,6 +4798,59 @@ mod tests {
     }
 
     #[test]
+    fn consent_revocation_floor_follows_content_identity_across_relink_and_blocks_unrevoked_aliases() {
+        let floor = crate::db::Database::open(":memory:").unwrap();
+        floor.initialize().unwrap();
+        floor.insert_segment(&test_segment("withdrawn", "old-name.wav", "withdrawn recording")).unwrap();
+        let content_hash = "c".repeat(64);
+        floor
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?1, rights_revoked_at = '2026-08-26 00:00:00'
+                  WHERE id = 'withdrawn'",
+                [&content_hash],
+            )
+            .unwrap();
+
+        let renamed = copied_database(&floor);
+        renamed
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_path = 'renamed.wav', rights_revoked_at = NULL
+                  WHERE id = 'withdrawn'",
+                [],
+            )
+            .unwrap();
+        let error = require_consent_revocation_superset(&floor, &renamed).unwrap_err();
+        assert!(error.contains("resurrect 1 withdrawn recording"), "{error}");
+
+        renamed
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET rights_revoked_at = '2026-08-26 00:00:00'
+                  WHERE id = 'withdrawn'",
+                [],
+            )
+            .unwrap();
+        require_consent_revocation_superset(&floor, &renamed)
+            .expect("a relinked recording remains the same withdrawal authority through its canonical PCM hash");
+
+        renamed.insert_segment(&test_segment("unrevoked-alias", "alias.wav", "same withdrawn recording")).unwrap();
+        renamed
+            .connection()
+            .execute("UPDATE speech_segments SET audio_content_hash = ?1 WHERE id = 'unrevoked-alias'", [&content_hash])
+            .unwrap();
+        let alias_error = require_consent_revocation_superset(&floor, &renamed).unwrap_err();
+        assert!(
+            alias_error.contains("resurrect 1 withdrawn recording"),
+            "an unrevoked alias of withdrawn PCM must not become an export bypass: {alias_error}"
+        );
+    }
+
+    #[test]
     fn staged_compensation_semantics_accept_writer_history_and_refuse_segment_deletion() {
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
@@ -8875,6 +5108,44 @@ mod tests {
             .unwrap();
         validate_playback_receipt_semantics(&legacy)
             .expect("policy-1 spectral receipts remain historical/readable but never authorize policy 3");
+    }
+
+    #[test]
+    fn restore_semantics_accept_exact_policy4_and_reject_interval_or_consumption_drift() {
+        let valid = crate::db::Database::open(":memory:").unwrap();
+        valid.initialize().unwrap();
+        record_canonical_phone_edit(&valid, "policy4-restore", 98);
+        validate_restore_target_semantics(&valid)
+            .expect("an exact writer-produced policy-4 review generation must remain restorable");
+
+        let forged_interval = copied_database(&valid);
+        forged_interval
+            .connection()
+            .execute("DROP TRIGGER playback_receipts_v67_policy4_immutable_update", [])
+            .unwrap();
+        forged_interval
+            .connection()
+            .execute(
+                "UPDATE playback_receipts
+                    SET interval_union_sha256 = ?1
+                  WHERE policy_version = ?2",
+                rusqlite::params!["0".repeat(64), crate::db::DESKTOP_PLAYBACK_POLICY_VERSION],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_interval).unwrap_err();
+        assert!(error.contains("policy-4 playback authority is invalid"), "{error}");
+
+        let forged_consumption = copied_database(&valid);
+        forged_consumption
+            .connection()
+            .execute("DROP TRIGGER playback_authority_consumptions_v4_immutable_update", [])
+            .unwrap();
+        forged_consumption
+            .connection()
+            .execute("UPDATE playback_authority_consumptions_v4 SET operation_id = ?1", [canonical_operation(999)])
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_consumption).unwrap_err();
+        assert!(error.contains("no exact consumed policy-3/4 playback authority"), "{error}");
     }
 
     #[test]
@@ -9154,12 +5425,12 @@ mod tests {
 
         let legacy = crate::db::Database::open(":memory:").unwrap();
         legacy.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&legacy, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&legacy, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         let mut legacy_segment = test_segment("flag-legacy-authority", "flag-legacy.wav", "machine draft");
         legacy_segment.verified = true;
         legacy_segment.annotated_transcript = Some("immutable legacy truth".into());
         legacy.insert_segment_full(&legacy_segment).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
         legacy
             .record_review_flag("flag-legacy-authority", "legacy concern", "00000000-0000-4000-8000-000000000807")
             .unwrap();
@@ -9171,7 +5442,7 @@ mod tests {
     fn mixed_flag_decision_chains_preserve_exact_rationale_through_undo_and_restore() {
         let flag_then_decision = crate::db::Database::open(":memory:").unwrap();
         flag_then_decision.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&flag_then_decision, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&flag_then_decision, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         insert_canonical_pay_segment(&flag_then_decision, "rationale-flag-decision");
         flag_then_decision
             .write_segment_verdict(
@@ -9184,7 +5455,10 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&flag_then_decision).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(
+            crate::migrations::run_migrations(&flag_then_decision).unwrap(),
+            vec![60, 61, 62, 63, 64, 65, 66, 67]
+        );
         flag_then_decision
             .record_review_flag("rationale-flag-decision", "flag rationale", "00000000-0000-4000-8000-000000000808")
             .unwrap();
@@ -9233,7 +5507,7 @@ mod tests {
 
         let decision_then_flag = crate::db::Database::open(":memory:").unwrap();
         decision_then_flag.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&decision_then_flag, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&decision_then_flag, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         insert_canonical_pay_segment(&decision_then_flag, "rationale-decision-flag");
         decision_then_flag
             .write_segment_verdict(
@@ -9246,7 +5520,10 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(crate::migrations::run_migrations(&decision_then_flag).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(
+            crate::migrations::run_migrations(&decision_then_flag).unwrap(),
+            vec![60, 61, 62, 63, 64, 65, 66, 67]
+        );
         decision_then_flag.finalize_human_review("rationale-decision-flag", "accept", None, Some(2), None).unwrap();
         let effect_id: i64 = decision_then_flag
             .connection()
@@ -9455,7 +5732,7 @@ mod tests {
         db.initialize().unwrap();
 
         insert_canonical_pay_segment(&db, "restore-alias-a");
-        let proof_a = canonical_phone_playback(&db, "restore-alias-a", "Reviewer");
+        let proof_a = canonical_policy4_phone_playback(&db, "restore-alias-a", "Reviewer");
         let operation_a = canonical_operation(120);
         let commit_a = db
             .record_phone_human_decision_by_at_revision_with_operation_limit(
@@ -10118,6 +6395,31 @@ mod tests {
     }
 
     #[test]
+    fn bare_restore_refuses_snapshot_that_predates_a_legacy_path_withdrawal_before_pin_or_swap() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("app-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let live_path = temp.path().join("live.db");
+        let source_path = temp.path().join("before-withdrawal.db");
+        let mut live = crate::db::Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("legacy-withdrawal", "legacy-withdrawal.wav", "private recording")).unwrap();
+        assert!(live.segment_audio_content_hash("legacy-withdrawal").unwrap().is_none());
+        live.backup(&source_path).unwrap();
+        assert_eq!(live.revoke_recording("legacy-withdrawal.wav").unwrap(), 1);
+
+        let error = restore_with_mandatory_snapshot(&reservation, &mut live, &data_dir, &source_path).unwrap_err();
+        assert!(error.contains("resurrect 1 withdrawn recording"), "{error}");
+        assert!(live.rights_for_segment("legacy-withdrawal").unwrap().is_revoked());
+        assert!(
+            !data_dir.join("snapshots").join("pinned").exists(),
+            "consent regression must be refused before safety-pin I/O or page publication"
+        );
+    }
+
+    #[test]
     fn named_restore_rejects_missing_durable_rows_before_pin_marker_or_swap() {
         let admission = RestoreAdmission::new();
         let reservation = admission.try_reserve().unwrap();
@@ -10146,6 +6448,48 @@ mod tests {
         let events: i64 =
             live.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
         assert_eq!(events, 1, "the live generation must not be swapped on floor regression");
+    }
+
+    #[test]
+    fn named_restore_cannot_roll_a_reviewed_recording_back_across_consent_withdrawal() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let mut live = crate::db::Database::open(":memory:").unwrap();
+        live.initialize().unwrap();
+        insert_canonical_pay_segment(&live, "reviewed-withdrawal");
+        live.finalize_human_review("reviewed-withdrawal", "accept", Some("machine draft"), Some(1), None).unwrap();
+        // Fork the target before withdrawal. Give that old generation one unrelated metadata update
+        // after the fork so its review revision equals the withdrawal-updated live row. This defeats
+        // an accidental dependency on review_revision and proves the dedicated consent floor is what
+        // refuses the otherwise review-history-equivalent target.
+        let target = copied_database(&live);
+        assert_eq!(live.revoke_recording("reviewed-withdrawal.wav").unwrap(), 1);
+        target
+            .connection()
+            .execute("UPDATE speech_segments SET speaker_id = 'metadata-only' WHERE id = 'reviewed-withdrawal'", [])
+            .unwrap();
+        assert_eq!(
+            live.segment_review_revision("reviewed-withdrawal").unwrap(),
+            target.segment_review_revision("reviewed-withdrawal").unwrap(),
+            "the adversarial target must pass the reviewed-row revision projection"
+        );
+        let source_dir = crate::snapshot::take_snapshot_at(&target, data_dir, 5, 1_500).unwrap().unwrap();
+        let source = source_dir.join("cortex-speech.db");
+        let selector = snapshot_selector(&source_dir, false);
+
+        let error =
+            prepare_and_restore_named_transaction(&reservation, &mut live, data_dir, &source_dir, &source, &selector)
+                .unwrap_err();
+        assert!(error.contains("resurrect 1 withdrawn recording"), "{error}");
+        assert!(live.rights_for_segment("reviewed-withdrawal").unwrap().is_revoked());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let pins = data_dir.join("snapshots").join("pinned");
+        assert!(
+            !pins.exists() || std::fs::read_dir(pins).unwrap().next().is_none(),
+            "withdrawal regression must be refused before a restore marker or page swap"
+        );
     }
 
     #[test]
@@ -10324,6 +6668,56 @@ mod tests {
         assert!(
             recovered.get_segment_by_id("target-only").unwrap().is_none(),
             "the regressive target must be rejected and the original floor published"
+        );
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupted_recovery_rejects_a_pre_withdrawal_target_and_restores_the_revoked_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let mut live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("interrupted-withdrawal", "interrupted-withdrawal.wav", "private recording"))
+            .unwrap();
+        let content_hash = "d".repeat(64);
+        live.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash = ?1 WHERE id = 'interrupted-withdrawal'",
+                [&content_hash],
+            )
+            .unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 2_500).unwrap().unwrap();
+
+        assert_eq!(live.revoke_recording("interrupted-withdrawal.wav").unwrap(), 1);
+        let original_pin =
+            crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "withdrawal-floor", 3, 2_600).unwrap();
+
+        // Model a process death after the old target pages were swapped but before required state and
+        // the durable marker completed.  Startup recovery must compare against the original pin, not
+        // trust the now-unrevoked live pages.
+        let staged_target = crate::db::Database::stage_restore_source(target.join("cortex-speech.db")).unwrap();
+        live.commit_staged_restore(&staged_target).unwrap();
+        assert!(!live.rights_for_segment("interrupted-withdrawal").unwrap().is_revoked());
+        drop(staged_target);
+        drop(live);
+
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: snapshot_selector(&target, false),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            completed_selector: None,
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(
+            recovered.rights_for_segment("interrupted-withdrawal").unwrap().is_revoked(),
+            "startup fallback must republish the original withdrawal authority"
         );
         assert!(load_named_restore_pending(data_dir).unwrap().is_none());
     }

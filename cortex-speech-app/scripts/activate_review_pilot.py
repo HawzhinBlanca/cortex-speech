@@ -37,7 +37,7 @@ import time
 import uuid
 from pathlib import Path
 
-from check_database_integrity import DEFAULT_MIGRATIONS, source_migrations
+from check_database_integrity import DEFAULT_MIGRATIONS, latest_source_schema, source_migrations
 from check_reviewer_links_live import strict_json_loads, validate_saved_session_shape
 from pilot_focus_contract import (
     VOICE_FOCUS_FILE,
@@ -66,7 +66,9 @@ HIDDEN_QC_PER_REVIEWER = 2
 TOTAL_HIDDEN_QC = len(REVIEWERS) * HIDDEN_QC_PER_REVIEWER
 MAX_COMPENSATED_UI_ACTIONS = TOTAL_CAP + TOTAL_HIDDEN_QC
 COUCH_PORT = 8737
-REQUIRED_SCHEMA = 66
+# Derive this from the append-only Rust catalog. A copied integer silently drifted when v67 was
+# added and made every otherwise-current pilot activation fail with a contradictory `schema 67/66`.
+REQUIRED_SCHEMA = latest_source_schema(DEFAULT_MIGRATIONS)
 
 
 def default_data_dir() -> Path:

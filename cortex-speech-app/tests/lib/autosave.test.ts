@@ -184,7 +184,7 @@ describe('autosave controller', () => {
     vi.useRealTimers();
   });
 
-  // pendingId() is the guard SIX App.svelte call sites rely on to scope a cancel to one segment
+  // pendingId() is the guard Workstation.svelte call sites rely on to scope a cancel to one segment
   // before delete/re-transcribe — so a debounced flush can't resurrect a deleted row (via
   // update_segment's insert-on-conflict) or clobber a fresh machine transcript. A regression that
   // returns null while an edit is queued (or a stale id after cancel/flush/save) silently disables

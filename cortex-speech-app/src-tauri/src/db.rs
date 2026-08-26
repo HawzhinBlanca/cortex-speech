@@ -19,9 +19,9 @@ use base64::Engine as _;
 use rusqlite::{backup, params, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use unicode_normalization::UnicodeNormalization;
 
 /// One row of the `jobs` table as read: (id, kind, state, progress, completed, total, error_code).
@@ -217,6 +217,8 @@ struct DesktopReplayEffect {
     prior_revision: i64,
     decision_revision: i64,
     prior_verdict_transcript: Option<String>,
+    desktop_review_contract_version: Option<i64>,
+    playback_authority_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -506,6 +508,38 @@ pub(crate) fn desktop_review_v1_payload_hash(
     base_revision: i64,
     decision: &str,
     corrected_transcript: Option<&str>,
+    playback_receipt_id: &str,
+) -> String {
+    fn framed(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+
+    let corrected = corrected_transcript.map(|text| to_nfc(text.trim())).filter(|text| !text.is_empty());
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-desktop-review-ipc-v1\0");
+    framed(&mut hash, segment_id.as_bytes());
+    hash.update(base_revision.to_be_bytes());
+    framed(&mut hash, decision.as_bytes());
+    framed(&mut hash, playback_receipt_id.as_bytes());
+    match corrected.as_deref() {
+        Some(text) => {
+            hash.update([1]);
+            framed(&mut hash, text.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Historical typed-desktop digest used only to validate/read effects written before policy 4
+/// persisted the exact authorizing receipt. New writes and new replays must use
+/// `desktop_review_v1_payload_hash`, which includes that immutable authority ID.
+fn legacy_desktop_review_v1_payload_hash(
+    segment_id: &str,
+    base_revision: i64,
+    decision: &str,
+    corrected_transcript: Option<&str>,
 ) -> String {
     fn framed(hash: &mut Sha256, value: &[u8]) {
         hash.update((value.len() as u64).to_be_bytes());
@@ -690,6 +724,18 @@ struct SegmentPageKey {
     agreement: f64,
 }
 
+/// One immutable description of a segment-page read. Keeping the scope together prevents callers
+/// from accidentally swapping adjacent filter/cursor arguments as this query gains new modes.
+struct SegmentPageQuery<'a> {
+    verified: Option<bool>,
+    text_query: Option<&'a str>,
+    sort: &'a str,
+    limit: usize,
+    cursor: Option<&'a str>,
+    focus: Option<&'a std::collections::HashSet<String>>,
+    escalation_only: bool,
+}
+
 /// Rights attached to one source RECORDING (migration v49, deep-audit #6).
 ///
 /// A voice recording is Article 9 biometric data: the lawful basis, the permitted use and the ability
@@ -806,6 +852,19 @@ pub struct SegmentHypothesis {
     pub confidence: Option<f64>,
 }
 
+/// Exact database authority captured before one already-imported segment is transcribed.
+///
+/// Champion inference runs outside SQLite and can take minutes. The decoded-PCM lease held by the
+/// caller freezes the source file itself; this snapshot supplies the other half of that boundary so
+/// the final transaction can prove the segment id still names the same path, source span, duration,
+/// PCM identity and review revision that were selected before inference began.
+#[derive(Debug, Clone)]
+pub(crate) struct ChampionTranscriptionSourceSnapshot {
+    pub(crate) segment: SpeechSegment,
+    pub(crate) review_revision: i64,
+    pub(crate) audio_content_hash: Option<String>,
+}
+
 /// A declaration that a source recording was PROCESSED before it was ever imported.
 ///
 /// The absence of a record means one thing only: nothing has claimed this recording was processed.
@@ -841,6 +900,12 @@ pub struct SourceTranscriptRecord {
 pub struct Database {
     conn: Connection,
     path: String,
+    /// Process-local active-time authority for unfinalized policy-4 sessions. These entries are
+    /// intentionally not durable: after a restart an unfinalized renderer counter cannot mint proof,
+    /// while an already-durable exact receipt remains replayable from SQLite.
+    playback_live_sessions: Mutex<HashMap<String, u64>>,
+    #[cfg(test)]
+    playback_test_clock: Mutex<Option<(i64, u64)>>,
 }
 
 type SchemaObjectContract = (String, String, String, String);
@@ -897,6 +962,225 @@ fn expected_schema_contract() -> AppResult<&'static Vec<SchemaObjectContract>> {
 pub(crate) fn validate_current_schema_contract(conn: &Connection) -> AppResult<()> {
     let expected = expected_schema_contract()?;
     validate_schema_contract_against(conn, expected)
+}
+
+/// Every finalized policy-4 receipt, and every desktop decision that consumed one, must retain exact
+/// immutable authority. Schema/FK checks prove object shape and target existence; this semantic pass
+/// additionally re-derives interval coverage/hash and the decision operation digest. It runs at
+/// startup and on staged restores, so a trigger-disabled or externally edited database fails closed.
+fn validate_policy4_effect_authority(conn: &Connection) -> AppResult<()> {
+    let schema_version: i64 =
+        conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| row.get(0))?;
+    if schema_version < 67 {
+        return Ok(());
+    }
+
+    let operation_namespace_collisions: i64 = conn.query_row(
+        "SELECT COUNT(*)
+           FROM independent_review_decisions independent
+          WHERE EXISTS (
+                    SELECT 1 FROM review_events canonical
+                     WHERE canonical.operation_id=independent.operation_id
+                )
+             OR EXISTS (
+                    SELECT 1 FROM human_decision_effect_events effect
+                     WHERE effect.operation_id=independent.operation_id
+                )",
+        [],
+        |row| row.get(0),
+    )?;
+    if operation_namespace_collisions != 0 {
+        return Err(AppError::Other(format!(
+            "E_REVIEW_OPERATION_NAMESPACE_COLLISION: database contains {operation_namespace_collisions} operation UUID(s) bound to both canonical and independent review truth"
+        )));
+    }
+
+    // A reviewer may listen and finalize a receipt, then close the app before deciding. Those
+    // unconsumed receipts are still immutable evidence and must receive the same startup/restore
+    // semantic validation as effect-bound receipts; otherwise a shaped but forged interval digest
+    // can sit undetected until a later decision consumes it.
+    let finalized_receipts = {
+        let mut statement = conn.prepare(
+            "SELECT id, segment_id, segment_revision, authority_session_id
+               FROM playback_receipts
+              WHERE policy_version=?1
+              ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([DESKTOP_PLAYBACK_POLICY_VERSION], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let mut validated_policy4_authorities = HashSet::with_capacity(finalized_receipts.len());
+    for (receipt_id, segment_id, revision, authority_id) in finalized_receipts {
+        let Some(authority_id) = authority_id else {
+            return Err(AppError::Other(format!(
+                "policy-4 playback receipt {receipt_id} has no exact authority session"
+            )));
+        };
+        if !has_sufficient_historical_desktop_playback_authority_v4_on(conn, &segment_id, revision, &authority_id)? {
+            return Err(AppError::Other(format!(
+                "policy-4 playback receipt {receipt_id} does not match its exact interval authority"
+            )));
+        }
+        validated_policy4_authorities.insert(authority_id);
+    }
+
+    let malformed: i64 = conn.query_row(
+        "SELECT COUNT(*)
+           FROM human_decision_effect_events effect
+          WHERE (effect.desktop_review_contract_version IS NOT NULL
+                  OR effect.playback_authority_session_id IS NOT NULL)
+            AND NOT (
+                 (effect.desktop_review_contract_version=1
+                  AND effect.playback_authority_session_id IS NOT NULL
+                  AND effect.source='desktop'
+                  AND effect.reviewer IS NULL
+                  AND effect.operation_id IS NOT NULL
+                  AND effect.operation_payload_hash IS NOT NULL)
+                 OR
+                 (effect.desktop_review_contract_version IS NULL
+                  AND effect.playback_authority_session_id IS NOT NULL
+                  AND effect.source='couch'
+                  AND effect.reviewer IS NOT NULL
+                  AND effect.review_event_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM desktop_playback_sessions_v4 session
+                       WHERE session.playback_receipt_id=effect.playback_authority_session_id
+                         AND session.surface='couch'
+                         AND session.reviewer=effect.reviewer COLLATE NOCASE
+                         AND session.segment_id=effect.segment_id
+                         AND session.segment_revision=effect.prior_revision
+                  ))
+            )",
+        [],
+        |row| row.get(0),
+    )?;
+    if malformed != 0 {
+        return Err(AppError::Other(format!("policy-4 decision ledger has {malformed} malformed authority row(s)")));
+    }
+
+    let malformed_consumptions: i64 = conn.query_row(
+        "SELECT COUNT(*)
+           FROM playback_authority_consumptions_v4 consumption
+           LEFT JOIN desktop_playback_sessions_v4 session
+             ON session.playback_receipt_id=consumption.playback_receipt_id
+            AND session.surface='couch'
+           LEFT JOIN playback_receipts receipt
+             ON receipt.authority_session_id=session.playback_receipt_id
+            AND receipt.policy_version=4
+          WHERE session.playback_receipt_id IS NULL
+             OR receipt.id IS NULL
+             OR session.reviewer<>consumption.reviewer COLLATE NOCASE
+             OR session.segment_id<>consumption.segment_id
+             OR NOT (
+                 (consumption.namespace='canonical' AND EXISTS (
+                    SELECT 1 FROM human_decision_effect_events effect
+                     WHERE effect.playback_authority_session_id=consumption.playback_receipt_id
+                       AND effect.segment_id=consumption.segment_id
+                       AND effect.reviewer=consumption.reviewer COLLATE NOCASE
+                 ))
+                 OR (consumption.namespace='spot_check' AND EXISTS (
+                    SELECT 1 FROM review_events event
+                     WHERE event.operation_id=consumption.operation_id
+                       AND event.segment_id=consumption.segment_id
+                       AND event.reviewer=consumption.reviewer COLLATE NOCASE
+                       AND event.source='couch_spot_check'
+                 ))
+                 OR (consumption.namespace='independent' AND EXISTS (
+                    SELECT 1 FROM independent_review_decisions decision
+                     WHERE decision.operation_id=consumption.operation_id
+                       AND decision.segment_id=consumption.segment_id
+                       AND decision.reviewer=consumption.reviewer COLLATE NOCASE
+                 ))
+             )",
+        [],
+        |row| row.get(0),
+    )?;
+    if malformed_consumptions != 0 {
+        return Err(AppError::Other(format!(
+            "policy-4 Couch playback ledger has {malformed_consumptions} orphaned or mismatched consumption row(s)"
+        )));
+    }
+
+    let mut statement = conn.prepare(
+        "SELECT effect.id, effect.segment_id, effect.prior_revision, effect.requested_action,
+                effect.requested_transcript, effect.operation_payload_hash,
+                effect.playback_authority_session_id,
+                session.audio_content_hash, session.source_start_ms, session.source_end_ms,
+                receipt.authority_session_id
+           FROM human_decision_effect_events effect
+           LEFT JOIN desktop_playback_sessions_v4 session
+             ON session.playback_receipt_id=effect.playback_authority_session_id
+           LEFT JOIN playback_receipts receipt
+             ON receipt.authority_session_id=session.playback_receipt_id
+            AND receipt.policy_version=4
+            AND receipt.segment_id=effect.segment_id
+            AND receipt.segment_revision=effect.prior_revision
+            AND receipt.audio_fingerprint=session.audio_content_hash
+          WHERE effect.desktop_review_contract_version=1",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (
+        effect_id,
+        segment_id,
+        revision,
+        action,
+        transcript,
+        stored_hash,
+        authority_id,
+        _content_hash,
+        _start,
+        _end,
+        receipt_authority_id,
+    ) in rows
+    {
+        let (Some(_content_hash), Some(_start), Some(_end), Some(receipt_authority_id)) =
+            (_content_hash, _start, _end, receipt_authority_id)
+        else {
+            return Err(AppError::Other(format!(
+                "policy-4 desktop effect {effect_id} has no matching exact playback receipt"
+            )));
+        };
+        if receipt_authority_id != authority_id {
+            return Err(AppError::Other(format!(
+                "policy-4 desktop effect {effect_id} is joined to the wrong playback receipt"
+            )));
+        }
+        let expected_hash =
+            desktop_review_v1_payload_hash(&segment_id, revision, &action, transcript.as_deref(), &authority_id);
+        if stored_hash != expected_hash || !validated_policy4_authorities.contains(&authority_id) {
+            return Err(AppError::Other(format!(
+                "policy-4 desktop effect {effect_id} does not match its exact sufficient receipt"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate an exact historical schema prefix without asking that database to satisfy migrations
@@ -967,6 +1251,15 @@ fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str> {
 /// Bump when the sufficiency RULE changes. Stored on every receipt so a row always says which rule
 /// it satisfied, instead of being re-judged later under one it never met.
 pub const PLAYBACK_POLICY_VERSION: i64 = 3;
+/// Desktop policy 4 replaces the renderer-minted cumulative counter with a server-issued media
+/// session and an exact, canonical interval union.  Policy 3 remains the deployed Couch contract;
+/// desktop review authorization is required to use this stricter policy.
+pub const DESKTOP_PLAYBACK_POLICY_VERSION: i64 = 4;
+const DESKTOP_PLAYBACK_SESSION_TTL_MS: i64 = 30 * 60 * 1_000;
+const MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS: i64 = 64;
+const MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS_PER_SEGMENT: i64 = 2;
+const DESKTOP_PLAYBACK_MAX_RATE: i64 = 2;
+const MAX_DESKTOP_PLAYBACK_INTERVALS: usize = 4_096;
 
 /// Canonical decoded-PCM identity written by the v51 backfill/import path.
 ///
@@ -997,6 +1290,8 @@ pub(crate) fn is_canonical_audio_content_hash(value: &str) -> bool {
 /// Twelve samples from ONE device is a thin basis for a calibrated number. Revisit once the pilot
 /// has 20+ decisions across both reviewers; a length-aware rule (ratio OR a fixed unheard-tail
 /// allowance) is the likelier long-run answer than any single ratio.
+const MIN_PLAYBACK_COVERAGE_NUMERATOR: i64 = 85;
+const MIN_PLAYBACK_COVERAGE_DENOMINATOR: i64 = 100;
 pub const MIN_PLAYBACK_COVERAGE: f64 = 0.85;
 pub const MAX_SOURCE_SPAN_DURATION_DELTA_MS: i64 = 1;
 
@@ -1020,6 +1315,7 @@ pub struct PlaybackReceipt {
 /// Untrusted playback timing reported by a client. Review revision, audio identity, canonical source
 /// span and coverage denominator are deliberately absent; only the database may resolve them.
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct PlaybackReceiptObservation {
     pub(crate) segment_id: String,
     pub(crate) reviewer: Option<String>,
@@ -1027,6 +1323,72 @@ pub(crate) struct PlaybackReceiptObservation {
     pub(crate) started_at_ms: i64,
     pub(crate) played_ms: i64,
     pub(crate) claimed_clip_duration_ms: i64,
+}
+
+/// One clip-relative interval the media element traversed continuously.  It uses inclusive start and
+/// exclusive end coordinates, in whole milliseconds, and arrives only at the policy-4 finalization
+/// boundary.  The database revalidates ordering, bounds, overlap, wall-clock plausibility and sum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopPlaybackInterval {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopPlaybackSession {
+    pub playback_receipt_id: String,
+    pub segment_id: String,
+    pub segment_revision: i64,
+    pub clip_duration_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct TechnicalUnusableSourceSnapshot {
+    pub(crate) segment: SpeechSegment,
+    pub(crate) review_revision: i64,
+    pub(crate) source_path_sha256: String,
+    pub(crate) audio_content_hash: Option<String>,
+}
+
+struct DesktopPlaybackSegmentSnapshot {
+    audio_path: String,
+    review_revision: i64,
+    audio_content_hash: Option<String>,
+    duration_ms: i64,
+    alignment_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesktopPlaybackReceipt {
+    pub playback_receipt_id: String,
+    pub segment_id: String,
+    pub segment_revision: i64,
+    pub unique_played_ms: i64,
+    pub clip_duration_ms: i64,
+    pub coverage_ratio: f64,
+}
+
+/// Exact server-owned coordinates of one unfinalized Couch media attempt. The HTTP layer keeps this
+/// object only in authenticated process memory; the database accepts it at finalization after the
+/// server monotonic-time and canonical interval checks have passed, then re-resolves every mutable
+/// source coordinate in the same transaction that publishes policy-4 authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CouchPlaybackAttemptAuthority {
+    pub(crate) playback_receipt_id: String,
+    pub(crate) media_grant_id: String,
+    pub(crate) client_attempt_id: String,
+    pub(crate) session_binding_sha256: String,
+    pub(crate) reviewer: String,
+    pub(crate) segment_id: String,
+    pub(crate) segment_revision: i64,
+    pub(crate) audio_content_hash: String,
+    pub(crate) source_path: PathBuf,
+    pub(crate) clip_duration_ms: i64,
+    pub(crate) source_start_ms: i64,
+    pub(crate) source_end_ms: i64,
+    pub(crate) issued_at_ms: i64,
+    pub(crate) expires_at_ms: i64,
 }
 
 /// Server-owned playback identity that must still be valid at the instant a paid review write
@@ -1039,6 +1401,12 @@ pub(crate) struct PlaybackDecisionProof {
     pub(crate) audio_content_hash: String,
     pub(crate) source_start_ms: i64,
     pub(crate) source_end_ms: i64,
+    /// Present only for desktop policy-4 evidence.  The final decision transaction rechecks this
+    /// exact receipt rather than accepting another receipt that happens to match the same clip.
+    pub(crate) authority_session_id: Option<String>,
+    /// Immutable imported-source bytes held from proof resolution through the SQLite commit. Policy-3
+    /// phone evidence has no desktop source lease; policy-4 always carries one.
+    pub(crate) source_lease: Option<crate::media::VerifiedMediaSourceLease>,
 }
 
 pub(crate) fn canonical_source_span(alignment_json: Option<&str>) -> Option<(i64, i64)> {
@@ -1069,6 +1437,118 @@ fn validate_playback_receipt_nonnegative_fields(receipt: &PlaybackReceipt) -> Ap
         return Err(AppError::Validation("cannot record playback evidence with negative played media time".into()));
     }
     Ok(())
+}
+
+fn playback_server_now_ms() -> AppResult<i64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| AppError::Other(format!("system clock is before the Unix epoch: {error}")))?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| AppError::Other("system clock millisecond value overflowed i64".into()))
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn QueryUnbiasedInterruptTimePrecise(unbiased_time: *mut u64);
+}
+
+/// Active workstation time in Windows 100-nanosecond units. Unlike wall time and
+/// `QueryPerformanceCounter`, QueryUnbiasedInterruptTimePrecise excludes sleep/hibernate, so changing
+/// the clock or suspending the workstation cannot manufacture listening budget. Windows 11 is the
+/// only supported product platform. The portable fallback exists solely for developer/test builds.
+#[cfg(windows)]
+fn playback_active_now_100ns() -> u64 {
+    let mut ticks = 0_u64;
+    // SAFETY: Windows 11 guarantees this function and the pointer targets one initialized u64 owned
+    // by this stack frame. The API returns no borrowed data and writes exactly one ULONGLONG.
+    unsafe { QueryUnbiasedInterruptTimePrecise(&mut ticks) };
+    ticks
+}
+
+#[cfg(not(windows))]
+fn playback_active_now_100ns() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed().as_nanos() / 100;
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
+
+fn canonical_grant_source_path_sha256(path: &Path) -> AppResult<String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        AppError::Validation(format!("playback media grant source is missing or unreadable: {error}"))
+    })?;
+    let mut value = canonical.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.make_ascii_lowercase();
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-desktop-playback-grant-path-v1\0");
+    hash.update((value.len() as u64).to_le_bytes());
+    hash.update(value.as_bytes());
+    Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Stable path identity for a source that may currently be missing or unreadable. Imported paths are
+/// canonical while present; the lexical absolute fallback preserves that identity when the very
+/// failure being audited prevents `canonicalize` from opening the target.
+pub(crate) fn technical_unusable_source_path_sha256(path: &Path) -> AppResult<String> {
+    let canonical = std::fs::canonicalize(path).or_else(|_| std::path::absolute(path))?;
+    let mut value = canonical.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.make_ascii_lowercase();
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-technical-unusable-source-path-v1\0");
+    hash.update((value.len() as u64).to_le_bytes());
+    hash.update(value.as_bytes());
+    Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn validate_desktop_playback_intervals(
+    intervals: &[DesktopPlaybackInterval],
+    clip_duration_ms: i64,
+) -> AppResult<(i64, String)> {
+    if intervals.is_empty() {
+        return Err(AppError::Validation(
+            "E_NO_PLAYBACK_EVIDENCE: a desktop playback session contains no observed media interval".into(),
+        ));
+    }
+    if intervals.len() > MAX_DESKTOP_PLAYBACK_INTERVALS {
+        return Err(AppError::Validation(format!(
+            "desktop playback evidence exceeds the {MAX_DESKTOP_PLAYBACK_INTERVALS}-interval safety bound"
+        )));
+    }
+    if clip_duration_ms <= 0 {
+        return Err(AppError::Validation("desktop playback evidence has no positive server clip duration".into()));
+    }
+
+    let mut unique_ms = 0_i64;
+    let mut previous_end: Option<i64> = None;
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-desktop-playback-interval-union-v1\0");
+    hash.update((intervals.len() as u64).to_le_bytes());
+    for interval in intervals {
+        if interval.start_ms < 0 || interval.end_ms <= interval.start_ms || interval.end_ms > clip_duration_ms {
+            return Err(AppError::Validation(
+                "desktop playback evidence contains an invalid or out-of-bounds interval".into(),
+            ));
+        }
+        if previous_end.is_some_and(|end| interval.start_ms <= end) {
+            return Err(AppError::Validation(
+                "desktop playback intervals must be sorted, non-overlapping, and non-adjacent".into(),
+            ));
+        }
+        unique_ms = unique_ms
+            .checked_add(interval.end_ms - interval.start_ms)
+            .ok_or_else(|| AppError::Validation("desktop playback interval sum overflowed".into()))?;
+        previous_end = Some(interval.end_ms);
+        hash.update(interval.start_ms.to_le_bytes());
+        hash.update(interval.end_ms.to_le_bytes());
+    }
+    if unique_ms > clip_duration_ms {
+        return Err(AppError::Validation("desktop playback interval union exceeds the server clip duration".into()));
+    }
+    Ok((unique_ms, hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()))
 }
 
 pub(crate) const PLAYBACK_EVIDENCE_CHANGED: &str = "E_PLAYBACK_EVIDENCE_CHANGED";
@@ -1138,6 +1618,294 @@ fn has_sufficient_playback_evidence_on(
     Ok(sufficient == 1)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn has_sufficient_desktop_playback_evidence_v4_on(
+    conn: &Connection,
+    segment_id: &str,
+    revision: i64,
+    content_hash: &str,
+    source_start_ms: i64,
+    source_end_ms: i64,
+    reviewer: Option<&str>,
+    playback_receipt_id: &str,
+) -> AppResult<bool> {
+    if uuid::Uuid::parse_str(playback_receipt_id).is_err()
+        || !is_canonical_audio_content_hash(content_hash)
+        || source_start_ms < 0
+        || source_end_ms <= source_start_ms
+    {
+        return Ok(false);
+    }
+    let sufficient: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM playback_receipts receipt
+             JOIN desktop_playback_sessions_v4 session
+               ON session.playback_receipt_id=receipt.authority_session_id
+             JOIN speech_segments segment ON segment.id=receipt.segment_id
+            WHERE receipt.authority_session_id=?1
+              AND receipt.policy_version=?2
+              AND receipt.segment_id=?3
+              AND receipt.segment_revision=?4
+              AND receipt.audio_fingerprint=?5
+              AND receipt.reviewer IS ?6
+              AND receipt.source_start_ms=?7
+              AND receipt.source_end_ms=?8
+              AND receipt.clip_duration_ms=segment.duration_ms
+              AND receipt.played_ms=(
+                  SELECT COALESCE(SUM(interval.end_ms-interval.start_ms),0)
+                    FROM desktop_playback_intervals_v4 interval
+                   WHERE interval.playback_receipt_id=receipt.authority_session_id
+              )
+              AND MIN(1.0,CAST(receipt.played_ms AS REAL)/CAST(receipt.clip_duration_ms AS REAL))>=?9
+              AND session.segment_id=segment.id
+              AND session.segment_revision=COALESCE(segment.review_revision,0)
+              AND session.audio_content_hash=segment.audio_content_hash
+              AND session.source_start_ms=json_extract(segment.alignment_json,'$.source_start_ms')
+              AND session.source_end_ms=json_extract(segment.alignment_json,'$.source_end_ms')
+         )",
+        params![
+            playback_receipt_id,
+            DESKTOP_PLAYBACK_POLICY_VERSION,
+            segment_id,
+            revision,
+            content_hash,
+            reviewer,
+            source_start_ms,
+            source_end_ms,
+            MIN_PLAYBACK_COVERAGE,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(sufficient == 1)
+}
+
+/// Consume one finalized Couch receipt exactly once across every judgement namespace. This must be
+/// called inside the same SQLite transaction that publishes the corresponding canonical, spot-check,
+/// or independent decision. An exact same-operation race is harmless; any different operation,
+/// reviewer, segment, or namespace is a hard replay conflict.
+pub(crate) fn consume_couch_playback_authority_on(
+    conn: &Connection,
+    playback_receipt_id: &str,
+    namespace: &str,
+    operation_id: &str,
+    reviewer: &str,
+    segment_id: &str,
+    created_at_ms: i64,
+) -> AppResult<()> {
+    if !matches!(namespace, "canonical" | "spot_check" | "independent")
+        || uuid::Uuid::parse_str(playback_receipt_id).is_err()
+        || uuid::Uuid::parse_str(operation_id).is_err()
+        || reviewer.trim().is_empty()
+        || segment_id.trim().is_empty()
+        || created_at_ms <= 0
+    {
+        return Err(AppError::Validation("Couch playback consumption identity is invalid".into()));
+    }
+    type Existing = (String, String, String, String);
+    let existing: Option<Existing> = conn
+        .query_row(
+            "SELECT namespace,operation_id,reviewer,segment_id
+               FROM playback_authority_consumptions_v4
+              WHERE playback_receipt_id=?1 OR operation_id=?2",
+            params![playback_receipt_id, operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if let Some((stored_namespace, stored_operation, stored_reviewer, stored_segment)) = existing {
+        if stored_namespace == namespace
+            && stored_operation == operation_id
+            && stored_reviewer.eq_ignore_ascii_case(reviewer)
+            && stored_segment == segment_id
+        {
+            return Ok(());
+        }
+        return Err(AppError::Validation(
+            "E_PLAYBACK_RECEIPT_CONSUMED: policy-4 Couch playback authority was already used by another human operation"
+                .into(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO playback_authority_consumptions_v4
+            (playback_receipt_id,namespace,operation_id,reviewer,segment_id,created_at_ms)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![playback_receipt_id, namespace, operation_id, reviewer, segment_id, created_at_ms],
+    )?;
+    Ok(())
+}
+
+/// Re-derive one historical policy-4 authority without consulting the mutable current segment row.
+/// A successful decision advances `speech_segments.review_revision`, so the live precommit predicate
+/// above is intentionally unsuitable for startup/restore validation. Historical proof instead binds
+/// the immutable effect's prior revision to its immutable session, receipt and exact interval union.
+fn has_sufficient_historical_desktop_playback_authority_v4_on(
+    conn: &Connection,
+    segment_id: &str,
+    revision: i64,
+    playback_receipt_id: &str,
+) -> AppResult<bool> {
+    type HistoricalAuthority = (
+        String,
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        f64,
+        i64,
+        i64,
+        String,
+    );
+    let authority: Option<HistoricalAuthority> = conn
+        .query_row(
+            "SELECT session.segment_id, session.segment_revision, session.audio_content_hash,
+                    session.reviewer, session.surface, session.session_binding_sha256,
+                    session.clip_duration_ms, session.source_start_ms,
+                    session.source_end_ms, session.issued_at_ms,
+                    receipt.segment_id, receipt.segment_revision, receipt.audio_fingerprint,
+                    receipt.reviewer, receipt.session_id, receipt.started_at_ms, receipt.played_ms,
+                    receipt.clip_duration_ms, receipt.coverage_ratio, receipt.source_start_ms,
+                    receipt.source_end_ms, receipt.interval_union_sha256
+               FROM desktop_playback_sessions_v4 session
+               JOIN playback_receipts receipt
+                 ON receipt.authority_session_id=session.playback_receipt_id
+                AND receipt.policy_version=?2
+              WHERE session.playback_receipt_id=?1",
+            params![playback_receipt_id, DESKTOP_PLAYBACK_POLICY_VERSION],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                    row.get(21)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        session_segment,
+        session_revision,
+        content_hash,
+        session_reviewer,
+        surface,
+        session_binding_sha256,
+        session_duration,
+        session_start,
+        session_end,
+        issued_at_ms,
+        receipt_segment,
+        receipt_revision,
+        receipt_content_hash,
+        receipt_reviewer,
+        receipt_session_id,
+        receipt_started_at_ms,
+        receipt_played_ms,
+        receipt_duration,
+        receipt_coverage,
+        receipt_start,
+        receipt_end,
+        stored_interval_hash,
+    )) = authority
+    else {
+        return Ok(false);
+    };
+    let session_identity_is_valid = match surface.as_str() {
+        "desktop" => session_reviewer.is_none() && receipt_reviewer.is_none() && session_binding_sha256.is_none(),
+        "couch" => {
+            session_reviewer.as_deref().is_some_and(|reviewer| !reviewer.trim().is_empty() && reviewer.len() <= 100)
+                && receipt_reviewer == session_reviewer
+                && session_binding_sha256.as_deref().is_some_and(is_canonical_audio_content_hash)
+        }
+        _ => false,
+    };
+    if session_segment != segment_id
+        || receipt_segment != segment_id
+        || session_revision != revision
+        || receipt_revision != revision
+        || !is_canonical_audio_content_hash(&content_hash)
+        || receipt_content_hash != content_hash
+        || !session_identity_is_valid
+        || receipt_session_id.as_deref() != Some(playback_receipt_id)
+        || session_duration != receipt_duration
+        || !source_span_matches_duration(session_start, session_end, session_duration)
+        || receipt_start != session_start
+        || receipt_end != session_end
+        || receipt_started_at_ms != issued_at_ms
+    {
+        return Ok(false);
+    }
+
+    let interval_rows = {
+        let mut statement = conn.prepare(
+            "SELECT ordinal, start_ms, end_ms
+               FROM desktop_playback_intervals_v4
+              WHERE playback_receipt_id=?1
+              ORDER BY ordinal",
+        )?;
+        let rows = statement
+            .query_map([playback_receipt_id], |row| {
+                Ok((row.get::<_, i64>(0)?, DesktopPlaybackInterval { start_ms: row.get(1)?, end_ms: row.get(2)? }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    if interval_rows
+        .iter()
+        .enumerate()
+        .any(|(index, (ordinal, _))| *ordinal != i64::try_from(index).unwrap_or(i64::MAX))
+    {
+        return Ok(false);
+    }
+    let intervals = interval_rows.into_iter().map(|(_, interval)| interval).collect::<Vec<_>>();
+    let (derived_played_ms, derived_interval_hash) =
+        match validate_desktop_playback_intervals(&intervals, session_duration) {
+            Ok(value) => value,
+            Err(_) => return Ok(false),
+        };
+    let required_played_ms = session_duration
+        .checked_mul(MIN_PLAYBACK_COVERAGE_NUMERATOR)
+        .and_then(|value| value.checked_add(MIN_PLAYBACK_COVERAGE_DENOMINATOR - 1))
+        .map(|value| value / MIN_PLAYBACK_COVERAGE_DENOMINATOR);
+    let Some(required_played_ms) = required_played_ms else {
+        return Ok(false);
+    };
+    let derived_coverage = derived_played_ms as f64 / session_duration as f64;
+    Ok(derived_played_ms == receipt_played_ms
+        && derived_played_ms >= required_played_ms
+        && derived_interval_hash == stored_interval_hash
+        && receipt_coverage.is_finite()
+        && (receipt_coverage - derived_coverage).abs() <= 0.000000001)
+}
+
 /// Re-read the exact hidden-check answer from the transaction snapshot using the one canonical
 /// corpus policy implementation. Repeating that policy as SQL would eventually drift from
 /// `quality::human_verified_text` / `is_human_rejected` and grade a reviewer against a key that the
@@ -1165,7 +1933,7 @@ fn current_hidden_answer_key_on(conn: &Connection, segment_id: &str) -> AppResul
     let Some(segment) = segment else {
         return Ok(None);
     };
-    if crate::quality::is_human_rejected(&segment) {
+    if crate::quality::is_excluded_from_exports(&segment) {
         return Ok(None);
     }
     Ok(crate::quality::human_verified_text(&segment).map(str::to_string))
@@ -1517,13 +2285,275 @@ pub(crate) fn rejected_transcript_for_learning(corrected: &str, candidates: &[Op
 }
 
 impl Database {
+    /// Review operation UUIDs are a single truth namespace even though the legacy schema stores
+    /// canonical and blinded-second-pass decisions in separate tables.  Every writer that can
+    /// publish canonical truth holds BEGIN IMMEDIATE before calling this helper; the independent
+    /// writer takes the same reservation and performs the symmetric check.  That closes both race
+    /// directions without rewriting immutable migrations 1-65.
+    fn require_canonical_operation_namespace_on(conn: &Connection, operation_id: &str) -> AppResult<()> {
+        let independent_collision: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM independent_review_decisions WHERE operation_id=?1
+             )",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        if independent_collision {
+            return Err(AppError::Validation(
+                "E_REVIEW_OPERATION_NAMESPACE_COLLISION: operation UUID is already bound to independent review truth"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn lock_playback_live_sessions(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.playback_live_sessions.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned policy-4 active-time ledger");
+            poisoned.into_inner()
+        })
+    }
+
+    fn playback_clock_now(&self) -> AppResult<(i64, u64)> {
+        #[cfg(test)]
+        if let Some(clock) = *self.playback_test_clock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+            return Ok(clock);
+        }
+        Ok((playback_server_now_ms()?.max(1), playback_active_now_100ns()))
+    }
+
+    fn live_playback_elapsed_ms(&self, playback_receipt_id: &str, active_now_100ns: u64) -> AppResult<Option<i64>> {
+        let issued = self.lock_playback_live_sessions().get(playback_receipt_id).copied();
+        let Some(issued) = issued else { return Ok(None) };
+        let elapsed_100ns = active_now_100ns.checked_sub(issued).ok_or_else(|| {
+            AppError::Validation(
+                "E_PLAYBACK_ACTIVE_CLOCK_REGRESSED: the workstation active-time clock regressed; reload the clip"
+                    .into(),
+            )
+        })?;
+        let elapsed_ms = elapsed_100ns / 10_000;
+        Ok(Some(i64::try_from(elapsed_ms).unwrap_or(i64::MAX)))
+    }
+
+    fn active_playback_session_ids(&self, active_now_100ns: u64) -> HashSet<String> {
+        let ttl_100ns = u64::try_from(DESKTOP_PLAYBACK_SESSION_TTL_MS).unwrap_or(u64::MAX).saturating_mul(10_000);
+        let mut sessions = self.lock_playback_live_sessions();
+        sessions.retain(|_, issued| {
+            active_now_100ns
+                .checked_sub(*issued)
+                .map(|elapsed| elapsed <= ttl_100ns)
+                // A regressing platform clock is an error at finalization, not permission to delete
+                // a potentially-live attempt underneath it.
+                .unwrap_or(true)
+        });
+        sessions.keys().cloned().collect()
+    }
+
+    fn prune_abandoned_playback_sessions_on(
+        tx: &rusqlite::Transaction<'_>,
+        active_session_ids: &HashSet<String>,
+    ) -> AppResult<()> {
+        let abandoned = {
+            let mut statement = tx.prepare(
+                "SELECT session.playback_receipt_id
+                   FROM desktop_playback_sessions_v4 session
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM playback_receipts receipt
+                         WHERE receipt.authority_session_id=session.playback_receipt_id
+                  )",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for playback_receipt_id in abandoned {
+            if active_session_ids.contains(&playback_receipt_id) {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM desktop_playback_intervals_v4 WHERE playback_receipt_id=?1",
+                [&playback_receipt_id],
+            )?;
+            tx.execute(
+                "DELETE FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?1",
+                [&playback_receipt_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove one never-finalized playback authority while its exact session row is still the only
+    /// durable state.  A receipt makes the authority immutable and therefore non-cancellable.
+    /// `expected_client_attempt_id` is required at the renderer-facing boundary so a stale component
+    /// cannot retire a newer component's session even if it somehow retained the receipt UUID.
+    fn retire_unfinalized_playback_session_on(
+        tx: &rusqlite::Transaction<'_>,
+        playback_receipt_id: &str,
+        expected_client_attempt_id: Option<&str>,
+    ) -> AppResult<bool> {
+        let stored_attempt: Option<String> = tx
+            .query_row(
+                "SELECT client_attempt_id
+                   FROM desktop_playback_sessions_v4
+                  WHERE playback_receipt_id=?1",
+                [playback_receipt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored_attempt) = stored_attempt else {
+            // Exact cancellation is idempotent. After the first successful retirement there is no
+            // durable authority left to mutate, so the replay is a safe no-op.
+            return Ok(false);
+        };
+        if expected_client_attempt_id.is_some_and(|expected| expected != stored_attempt) {
+            return Err(AppError::Validation(
+                "E_PLAYBACK_CANCEL_IDENTITY_MISMATCH: playback authority belongs to a different client attempt".into(),
+            ));
+        }
+        let finalized: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM playback_receipts
+                  WHERE authority_session_id=?1 AND policy_version=?2
+             )",
+            params![playback_receipt_id, DESKTOP_PLAYBACK_POLICY_VERSION],
+            |row| row.get(0),
+        )?;
+        if finalized {
+            return Err(AppError::Validation(
+                "E_PLAYBACK_SESSION_FINALIZED: finalized playback authority is immutable and cannot be cancelled"
+                    .into(),
+            ));
+        }
+
+        // Intervals are normally inserted atomically with the receipt, but deleting them first keeps
+        // cleanup correct for an interrupted developer/staged database without weakening finalized
+        // evidence (the immutable trigger and receipt check above both fail closed).
+        tx.execute("DELETE FROM desktop_playback_intervals_v4 WHERE playback_receipt_id=?1", [playback_receipt_id])?;
+        let deleted = tx.execute(
+            "DELETE FROM desktop_playback_sessions_v4
+              WHERE playback_receipt_id=?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM playback_receipts receipt
+                     WHERE receipt.authority_session_id=desktop_playback_sessions_v4.playback_receipt_id
+                       AND receipt.policy_version=?2
+                )",
+            params![playback_receipt_id, DESKTOP_PLAYBACK_POLICY_VERSION],
+        )?;
+        if deleted != 1 {
+            return Err(AppError::Other(
+                "playback cancellation lost its exact unfinalized session inside the write transaction".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Select the oldest unfinalized authorities that must be retired to make room for one new
+    /// attempt. This is the server-side safety net for a lost renderer cancellation: ordinary N/P
+    /// browsing can never consume all 64 slots for 30 minutes. Finalized receipts are excluded and
+    /// therefore remain immutable regardless of capacity pressure.
+    fn playback_sessions_to_reclaim_on(tx: &rusqlite::Transaction<'_>, segment_id: &str) -> AppResult<Vec<String>> {
+        fn unfinalized_ids(tx: &rusqlite::Transaction<'_>, segment_id: Option<&str>) -> AppResult<Vec<String>> {
+            let sql = if segment_id.is_some() {
+                "SELECT session.playback_receipt_id
+                   FROM desktop_playback_sessions_v4 session
+                  WHERE session.segment_id=?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM playback_receipts receipt
+                         WHERE receipt.authority_session_id=session.playback_receipt_id
+                    )
+                  ORDER BY session.issued_at_ms, session.playback_receipt_id"
+            } else {
+                "SELECT session.playback_receipt_id
+                   FROM desktop_playback_sessions_v4 session
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM playback_receipts receipt
+                         WHERE receipt.authority_session_id=session.playback_receipt_id
+                    )
+                  ORDER BY session.issued_at_ms, session.playback_receipt_id"
+            };
+            let mut statement = tx.prepare(sql)?;
+            if let Some(value) = segment_id {
+                Ok(statement.query_map([value], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?)
+            } else {
+                Ok(statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?)
+            }
+        }
+
+        let mut reclaimed = Vec::new();
+        let per_segment = unfinalized_ids(tx, Some(segment_id))?;
+        let keep_before_insert =
+            usize::try_from(MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS_PER_SEGMENT - 1).unwrap_or_default();
+        let per_segment_excess = per_segment.len().saturating_sub(keep_before_insert);
+        for playback_receipt_id in per_segment.into_iter().take(per_segment_excess) {
+            if Self::retire_unfinalized_playback_session_on(tx, &playback_receipt_id, None)? {
+                reclaimed.push(playback_receipt_id);
+            }
+        }
+
+        let global = unfinalized_ids(tx, None)?;
+        let keep_before_insert = usize::try_from(MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS - 1).unwrap_or_default();
+        let global_excess = global.len().saturating_sub(keep_before_insert);
+        for playback_receipt_id in global.into_iter().take(global_excess) {
+            if Self::retire_unfinalized_playback_session_on(tx, &playback_receipt_id, None)? {
+                reclaimed.push(playback_receipt_id);
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Idempotently retire the exact renderer attempt only while it has no immutable receipt. A
+    /// component teardown may race a successful finalization; in that ordering cancellation refuses
+    /// to touch the receipt and the caller can still replay/commit it normally.
+    pub fn cancel_desktop_playback_session_v1(
+        &self,
+        playback_receipt_id: &str,
+        client_attempt_id: &str,
+    ) -> AppResult<bool> {
+        validate_operation_uuid(playback_receipt_id)?;
+        validate_operation_uuid(client_attempt_id)?;
+        let retired = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let retired =
+                Self::retire_unfinalized_playback_session_on(&tx, playback_receipt_id, Some(client_attempt_id))?;
+            if retired {
+                tx.commit()?;
+            } else {
+                tx.rollback()?;
+            }
+            Ok(retired)
+        })?;
+        if retired {
+            self.lock_playback_live_sessions().remove(playback_receipt_id);
+            self.track_write()?;
+        }
+        Ok(retired)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_playback_test_clock(&self, wall_ms: i64, active_ms: u64) {
+        *self.playback_test_clock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((wall_ms.max(1), active_ms.saturating_mul(10_000)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_playback_test_clock(&self) {
+        *self.playback_test_clock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
     pub(crate) fn with_full_sync<T>(&self, operation: impl FnOnce() -> AppResult<T>) -> AppResult<T> {
         self.conn.execute_batch("PRAGMA synchronous=FULL;")?;
         let result = operation();
         let reset = self.conn.execute_batch("PRAGMA synchronous=NORMAL;");
         match result {
             Ok(value) => {
-                reset?;
+                // The closure may already have committed durable truth. A failure to relax the
+                // connection back to NORMAL cannot turn that commit into an error response: doing
+                // so creates an ambiguous lost-response state and falsely tells the renderer the
+                // write failed. Remaining at FULL is conservative (slower, never less durable).
+                if let Err(reset_error) = reset {
+                    tracing::error!(
+                        "durable FULL-sync operation committed, but SQLite synchronous=NORMAL could not be restored; keeping the conservative connection mode: {reset_error}"
+                    );
+                }
                 Ok(value)
             }
             Err(error) => {
@@ -1577,7 +2607,13 @@ impl Database {
              PRAGMA cache_size=-64000;
              PRAGMA busy_timeout=10000;",
         )?;
-        Ok(Self { conn, path: path.to_string() })
+        Ok(Self {
+            conn,
+            path: path.to_string(),
+            playback_live_sessions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            playback_test_clock: Mutex::new(None),
+        })
     }
 
     /// Open the live SQLite/WAL path with query-only authority and one stable read transaction.
@@ -1595,7 +2631,13 @@ impl Database {
              PRAGMA busy_timeout=10000;
              BEGIN DEFERRED;",
         )?;
-        Ok(Self { conn, path: path.to_string() })
+        Ok(Self {
+            conn,
+            path: path.to_string(),
+            playback_live_sessions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            playback_test_clock: Mutex::new(None),
+        })
     }
 
     /// Take a WAL-consistent, detached in-memory snapshot of an existing database without acquiring
@@ -1619,7 +2661,13 @@ impl Database {
              PRAGMA cache_size=-64000;
              PRAGMA busy_timeout=10000;",
         )?;
-        Ok(Self { conn, path: path.to_string() })
+        Ok(Self {
+            conn,
+            path: path.to_string(),
+            playback_live_sessions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            playback_test_clock: Mutex::new(None),
+        })
     }
 
     /// Open the database with a retry policy for corruption.
@@ -1752,7 +2800,16 @@ impl Database {
         if enforce_schema_contract {
             validate_current_schema_contract(&self.conn)?;
         }
+        validate_policy4_effect_authority(&self.conn)?;
         Ok(())
+    }
+
+    /// Re-run the complete policy-4 receipt/session/interval/consumption/effect proof at a restore
+    /// boundary. Staged restore initialization already calls this validator; exposing the same
+    /// read-only authority here lets higher-level cross-ledger checks fail closed after any
+    /// characterization mutation without copying or weakening the canonical proof.
+    pub(crate) fn validate_policy4_restore_authority(&self) -> AppResult<()> {
+        validate_policy4_effect_authority(&self.conn)
     }
 
     pub(crate) fn cleanup_savepoint_after_error(&self, savepoint: &str) {
@@ -1795,6 +2852,8 @@ impl Database {
                 )));
             }
             self.upsert_machine_segment_row(seg)?;
+            #[cfg(test)]
+            self.materialize_couch_fixture_audio_identity(seg)?;
             self.track_write()?;
             return Ok(());
         }
@@ -1848,7 +2907,33 @@ impl Database {
                 seg.vad_backend,
             ],
         )?;
+        #[cfg(test)]
+        self.materialize_couch_fixture_audio_identity(seg)?;
         self.track_write()?;
+        Ok(())
+    }
+
+    /// Couch endpoint tests create real WAVs but bypass the importer that normally owns canonical
+    /// decoded-PCM identity. Only databases carrying that suite's TEMP trigger enter this branch;
+    /// production builds do not compile it, and unrelated database tests retain their exact fixtures.
+    #[cfg(test)]
+    fn materialize_couch_fixture_audio_identity(&self, segment: &SpeechSegment) -> AppResult<()> {
+        let is_couch_fixture: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_temp_master
+                  WHERE type='trigger' AND name='fixture_audio_content_hash'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if is_couch_fixture == 0 || !Path::new(&segment.audio_path).is_file() {
+            return Ok(());
+        }
+        let content_hash = crate::export_bundle::current_canonical_pcm_blake3(Path::new(&segment.audio_path))?;
+        self.conn.execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1 AND audio_content_hash IS NOT ?2",
+            params![segment.id, content_hash],
+        )?;
         Ok(())
     }
 
@@ -2547,6 +3632,50 @@ impl Database {
         }
     }
 
+    /// Publish one non-champion import file and bind recording identity only to the rows from this
+    /// source operation. Older rows that happen to spell the same path are never rewritten.
+    pub(crate) fn insert_segments_with_audio_identity_batch(
+        &self,
+        segments: &[SpeechSegment],
+        identity: &AudioIdentity,
+    ) -> AppResult<()> {
+        if segments.is_empty() {
+            return Err(AppError::Validation("No import segments to publish".into()));
+        }
+        if identity.spectral == 0 {
+            return Err(AppError::Validation(
+                "Import recording identity has an unusable zero spectral fingerprint".into(),
+            ));
+        }
+        let audio_path = segments[0].audio_path.as_str();
+        if segments.iter().any(|segment| segment.audio_path != audio_path) {
+            return Err(AppError::Validation(
+                "One import identity publication may contain segments from only one source file".into(),
+            ));
+        }
+        let segment_ids: Vec<String> = segments.iter().map(|segment| segment.id.clone()).collect();
+
+        self.conn.execute("SAVEPOINT import_identity_publish", [])?;
+        let result = (|| -> AppResult<()> {
+            // The insert obtains SQLite's writer lock before the compatibility check. No independent
+            // importer can change the source identity between that check and the scoped update.
+            self.insert_segments_batch(segments)?;
+            self.set_audio_identity_for_segments(audio_path, &segment_ids, identity)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("import_identity_publish")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("import_identity_publish");
+                Err(error)
+            }
+        }
+    }
+
     /// Publish one fully champion-drafted import file as a single durable unit.
     ///
     /// Import inference happens before this boundary. Consequently no placeholder or partially
@@ -2625,7 +3754,8 @@ impl Database {
             drop(insert);
             drop(delete);
             if let Some(identity) = identity.filter(|identity| identity.spectral != 0) {
-                self.set_audio_identity(audio_path, identity)?;
+                let segment_ids: Vec<String> = segments.iter().map(|segment| segment.id.clone()).collect();
+                self.set_audio_identity_for_segments(audio_path, &segment_ids, identity)?;
             }
             Ok(())
         })();
@@ -2911,6 +4041,7 @@ impl Database {
     ///
     /// Transcript/provenance replacement and stale-hypothesis cleanup share one savepoint. If deleting
     /// or inserting the sole champion hypothesis fails, the transcript update is rolled back too.
+    #[cfg(test)]
     pub fn commit_champion_transcript_if_unreviewed(
         &self,
         champion: &SegmentHypothesis,
@@ -2918,6 +4049,47 @@ impl Database {
         normalized_transcript: Option<&str>,
         confidence_source: Option<&str>,
         cloud_call: bool,
+    ) -> AppResult<bool> {
+        self.commit_champion_transcript_inner(
+            champion,
+            expected_deployment_sha256,
+            normalized_transcript,
+            confidence_source,
+            cloud_call,
+            None,
+        )
+    }
+
+    /// Commit a champion result only while the exact source/revision selected before inference is
+    /// still authoritative. Production re-transcription callers must keep the matching decoded-PCM
+    /// source lease alive until this method returns.
+    pub(crate) fn commit_bound_champion_transcript_if_unreviewed(
+        &self,
+        champion: &SegmentHypothesis,
+        expected_deployment_sha256: Option<&str>,
+        normalized_transcript: Option<&str>,
+        confidence_source: Option<&str>,
+        cloud_call: bool,
+        expected_source: &ChampionTranscriptionSourceSnapshot,
+    ) -> AppResult<bool> {
+        self.commit_champion_transcript_inner(
+            champion,
+            expected_deployment_sha256,
+            normalized_transcript,
+            confidence_source,
+            cloud_call,
+            Some(expected_source),
+        )
+    }
+
+    fn commit_champion_transcript_inner(
+        &self,
+        champion: &SegmentHypothesis,
+        expected_deployment_sha256: Option<&str>,
+        normalized_transcript: Option<&str>,
+        confidence_source: Option<&str>,
+        cloud_call: bool,
+        expected_source: Option<&ChampionTranscriptionSourceSnapshot>,
     ) -> AppResult<bool> {
         crate::validation::input::validate_identifier(&champion.segment_id).map_err(AppError::Validation)?;
         crate::validation::input::validate_identifier(&champion.model_id).map_err(AppError::Validation)?;
@@ -2956,41 +4128,92 @@ impl Database {
                     )));
                 }
             }
-            let rows_changed = self.conn.execute(
-                "UPDATE speech_segments
-                 SET raw_transcript        = ?2,
-                     normalized_transcript = ?3,
-                     confidence            = ?4,
-                     confidence_source     = COALESCE(?5, 'unknown'),
-                     model_version_id      = ?6,
-                     cloud_call            = ?7,
-                     updated_at            = datetime('now')
-                 WHERE id = ?1
-                   AND verified = 0
-                   AND (human_decision IS NULL OR human_decision = '')
-                   AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
-                params![
-                    champion.segment_id,
-                    transcript_nfc,
-                    normalized_nfc,
-                    champion.confidence,
-                    confidence_source,
-                    champion.model_id,
-                    cloud_call as i32,
-                ],
-            )?;
+            let rows_changed = if let Some(source) = expected_source {
+                if source.segment.id != champion.segment_id {
+                    return Err(AppError::Validation(
+                        "E_TRANSCRIPTION_SOURCE_MISMATCH: champion segment id does not match its bound source snapshot"
+                            .into(),
+                    ));
+                }
+                self.conn.execute(
+                    "UPDATE speech_segments
+                     SET raw_transcript        = ?2,
+                         normalized_transcript = ?3,
+                         confidence            = ?4,
+                         confidence_source     = COALESCE(?5, 'unknown'),
+                         model_version_id      = ?6,
+                         cloud_call            = ?7,
+                         updated_at            = datetime('now')
+                     WHERE id = ?1
+                       AND verified = 0
+                       AND (human_decision IS NULL OR human_decision = '')
+                       AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))
+                       AND review_revision = ?8
+                       AND audio_path = ?9
+                       AND alignment_json IS ?10
+                       AND duration_ms = ?11
+                       AND audio_content_hash IS ?12",
+                    params![
+                        champion.segment_id,
+                        transcript_nfc,
+                        normalized_nfc,
+                        champion.confidence,
+                        confidence_source,
+                        champion.model_id,
+                        cloud_call as i32,
+                        source.review_revision,
+                        source.segment.audio_path,
+                        source.segment.alignment_json,
+                        source.segment.duration_ms,
+                        source.audio_content_hash,
+                    ],
+                )?
+            } else {
+                self.conn.execute(
+                    "UPDATE speech_segments
+                     SET raw_transcript        = ?2,
+                         normalized_transcript = ?3,
+                         confidence            = ?4,
+                         confidence_source     = COALESCE(?5, 'unknown'),
+                         model_version_id      = ?6,
+                         cloud_call            = ?7,
+                         updated_at            = datetime('now')
+                     WHERE id = ?1
+                       AND verified = 0
+                       AND (human_decision IS NULL OR human_decision = '')
+                       AND (verdict IS NULL OR verdict NOT IN ('human_accept','human_edit','human_reject'))",
+                    params![
+                        champion.segment_id,
+                        transcript_nfc,
+                        normalized_nfc,
+                        champion.confidence,
+                        confidence_source,
+                        champion.model_id,
+                        cloud_call as i32,
+                    ],
+                )?
+            };
 
             if rows_changed == 0 {
-                let exists: bool = self.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM speech_segments WHERE id = ?1)",
-                    params![champion.segment_id],
-                    |row| row.get(0),
-                )?;
-                if !exists {
+                let current = Self::decision_snapshot_on(&self.conn, &champion.segment_id)?;
+                let Some((current_segment, current_revision, current_audio_content_hash)) = current else {
                     return Err(AppError::Validation(format!(
                         "Cannot commit champion transcript: segment '{}' does not exist",
                         champion.segment_id
                     )));
+                };
+                if let Some(source) = expected_source {
+                    let source_unchanged = current_revision == source.review_revision
+                        && current_segment.audio_path == source.segment.audio_path
+                        && current_segment.alignment_json == source.segment.alignment_json
+                        && current_segment.duration_ms == source.segment.duration_ms
+                        && current_audio_content_hash == source.audio_content_hash;
+                    if !source_unchanged {
+                        return Err(AppError::Validation(format!(
+                            "E_TRANSCRIPTION_SOURCE_CHANGED: segment '{}' no longer names the source/revision selected before inference; no transcript or hypothesis was written",
+                            champion.segment_id
+                        )));
+                    }
                 }
                 return Ok(false);
             }
@@ -3212,6 +4435,19 @@ impl Database {
         }
     }
 
+    /// Read every identity used by a bound champion transcription in one statement. A separate
+    /// segment read followed by an audio-hash read can manufacture a snapshot that never existed
+    /// when another writer changes the row between those statements.
+    pub(crate) fn champion_transcription_source_snapshot(
+        &self,
+        id: &str,
+    ) -> AppResult<Option<ChampionTranscriptionSourceSnapshot>> {
+        let Some((segment, review_revision, audio_content_hash)) = Self::decision_snapshot_on(&self.conn, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(ChampionTranscriptionSourceSnapshot { segment, review_revision, audio_content_hash }))
+    }
+
     fn decision_snapshot_on(conn: &Connection, id: &str) -> AppResult<Option<(SpeechSegment, i64, Option<String>)>> {
         let query = format!(
             "SELECT {SEGMENT_SELECT_COLUMNS}, review_revision, audio_content_hash
@@ -3224,6 +4460,20 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// One-statement source/revision snapshot used before a technical audio failure probe. The final
+    /// write rechecks all three identities under `BEGIN IMMEDIATE`; callers never pair a segment row
+    /// from one instant with an audio epoch from another.
+    pub(crate) fn technical_unusable_source_snapshot(
+        &self,
+        id: &str,
+    ) -> AppResult<Option<TechnicalUnusableSourceSnapshot>> {
+        let Some((segment, review_revision, audio_content_hash)) = Self::decision_snapshot_on(&self.conn, id)? else {
+            return Ok(None);
+        };
+        let source_path_sha256 = technical_unusable_source_path_sha256(Path::new(&segment.audio_path))?;
+        Ok(Some(TechnicalUnusableSourceSnapshot { segment, review_revision, source_path_sha256, audio_content_hash }))
     }
 
     /// A review flag owns only verdict/rationale/escalation.  Before it snapshots those fields, the
@@ -3595,7 +4845,8 @@ impl Database {
                         decision_transcript, decision_annotated_transcript, decision_verified,
                         decision_corrected_at, decision_rationale, requested_action, requested_transcript,
                         requested_timestamp_ms, prior_revision, decision_revision,
-                        prior_verdict_transcript
+                        prior_verdict_transcript, desktop_review_contract_version,
+                        playback_authority_session_id
                    FROM human_decision_effect_events
                   WHERE operation_id = ?1",
                 params![operation_id],
@@ -3618,6 +4869,8 @@ impl Database {
                         prior_revision: row.get(14)?,
                         decision_revision: row.get(15)?,
                         prior_verdict_transcript: row.get(16)?,
+                        desktop_review_contract_version: row.get(17)?,
+                        playback_authority_session_id: row.get(18)?,
                     })
                 },
             )
@@ -3631,16 +4884,33 @@ impl Database {
             effect.requested_transcript.as_deref(),
             Some(effect.requested_timestamp_ms),
         );
-        let typed_payload_hash = desktop_review_v1_payload_hash(
-            &effect.segment_id,
-            effect.prior_revision,
-            &effect.requested_action,
-            effect.requested_transcript.as_deref(),
-        );
+        let typed_payload_hash = effect.playback_authority_session_id.as_deref().map(|authority_id| {
+            desktop_review_v1_payload_hash(
+                &effect.segment_id,
+                effect.prior_revision,
+                &effect.requested_action,
+                effect.requested_transcript.as_deref(),
+                authority_id,
+            )
+        });
+        let stored_payload_is_canonical = match effect.desktop_review_contract_version {
+            Some(1) => typed_payload_hash.as_deref() == Some(effect.operation_payload_hash.as_str()),
+            // Historical desktop-v1 effects predate exact authority persistence. Keep them readable
+            // and replayable only by their historical digest; every new typed effect is version 1.
+            None => {
+                legacy_payload_hash == effect.operation_payload_hash
+                    || legacy_desktop_review_v1_payload_hash(
+                        &effect.segment_id,
+                        effect.prior_revision,
+                        &effect.requested_action,
+                        effect.requested_transcript.as_deref(),
+                    ) == effect.operation_payload_hash
+            }
+            Some(_) => false,
+        };
         if effect.segment_id != segment_id
             || effect.operation_payload_hash != operation_payload_hash
-            || (legacy_payload_hash != effect.operation_payload_hash
-                && typed_payload_hash != effect.operation_payload_hash)
+            || !stored_payload_is_canonical
         {
             return Err(AppError::Validation(
                 "desktop decision operation UUID was already used for a different canonical payload".into(),
@@ -3708,6 +4978,7 @@ impl Database {
     /// Lost-response preflight for the desktop IPC. It deliberately runs before playback/revision
     /// lookup: a committed decision advanced the row, so fresh evidence for the old revision no
     /// longer exists. The same check is repeated under BEGIN IMMEDIATE in the writer for races.
+    #[cfg(test)]
     pub(crate) fn replay_desktop_human_decision(
         &self,
         segment_id: &str,
@@ -3736,6 +5007,7 @@ impl Database {
         base_revision: i64,
         decision: &str,
         corrected_transcript: Option<&str>,
+        playback_receipt_id: &str,
         operation_id: &str,
     ) -> AppResult<Option<HumanDecisionCommit>> {
         validate_operation_uuid(operation_id)?;
@@ -3743,8 +5015,13 @@ impl Database {
             return Err(AppError::Validation("human decision revision must be non-negative".into()));
         }
         human_verdict_for_decision(decision)?;
-        let operation_payload_hash =
-            desktop_review_v1_payload_hash(segment_id, base_revision, decision, corrected_transcript);
+        let operation_payload_hash = desktop_review_v1_payload_hash(
+            segment_id,
+            base_revision,
+            decision,
+            corrected_transcript,
+            playback_receipt_id,
+        );
         let (commit, cleared_draft) = self.with_full_sync(|| {
             let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
             let Some(commit) =
@@ -4092,7 +5369,7 @@ impl Database {
             }
 
             // A hidden quality check must be blind. The append-only event log—not reviewed_by on
-            // the mutable segment row—is the durable evidence that this reviewer has heard a clip.
+            // the mutable segment row—is the durable evidence that this reviewer encountered a clip.
             // Allow only this pilot's own post-baseline hidden result (or its legacy skip path) when
             // rehydrating a completed reservation; any ordinary or older encounter makes the key
             // ineligible forever for this reviewer. Validate inside the same IMMEDIATE transaction
@@ -4415,6 +5692,9 @@ impl Database {
             } else {
                 self.conn.unchecked_transaction()?
             };
+            if let Some((operation_id, _)) = operation {
+                Self::require_canonical_operation_namespace_on(&tx, operation_id)?;
+            }
             // Resolve the stored reviewer spelling while proving the exact policy+baseline grant.
             // This also prevents a case-only re-pair from bypassing spot_checks' binary reviewer PK.
             let effective_reviewer = if let Some((policy_sha256, after_review_event_id)) = pilot_namespace {
@@ -4451,23 +5731,55 @@ impl Database {
             if enforce_production_proof && action != "skip" && playback.is_none() {
                 tx.rollback()?;
                 return Err(AppError::Validation(
-                    "E_NO_PLAYBACK_EVIDENCE: a hidden judgement must be bound to the clip that reviewer heard".into(),
+                    "E_NO_PLAYBACK_EVIDENCE: a hidden judgement must be bound to verified canonical-media traversal for that clip".into(),
                 ));
             }
             if let Some(proof) = playback {
-                if !has_sufficient_playback_evidence_on(
-                    &tx,
-                    segment_id,
-                    proof.segment_revision,
-                    &proof.audio_content_hash,
-                    proof.source_start_ms,
-                    proof.source_end_ms,
-                    Some(reviewer),
-                )? {
+                let sufficient = if let Some(authority_id) = proof.authority_session_id.as_deref() {
+                    has_sufficient_desktop_playback_evidence_v4_on(
+                        &tx,
+                        segment_id,
+                        proof.segment_revision,
+                        &proof.audio_content_hash,
+                        proof.source_start_ms,
+                        proof.source_end_ms,
+                        Some(reviewer),
+                        authority_id,
+                    )?
+                } else {
+                    has_sufficient_playback_evidence_on(
+                        &tx,
+                        segment_id,
+                        proof.segment_revision,
+                        &proof.audio_content_hash,
+                        proof.source_start_ms,
+                        proof.source_end_ms,
+                        Some(reviewer),
+                    )?
+                };
+                if !sufficient {
                     tx.rollback()?;
                     return Err(AppError::Validation(format!(
                         "{PLAYBACK_EVIDENCE_CHANGED}: clip identity or playback proof changed while the hidden check was being saved"
                     )));
+                }
+                if let Some(authority_id) = proof.authority_session_id.as_deref() {
+                    let (operation_id, _) = operation.ok_or_else(|| {
+                        AppError::Validation("policy-4 hidden check has no exact operation identity".into())
+                    })?;
+                    consume_couch_playback_authority_on(
+                        &tx,
+                        authority_id,
+                        "spot_check",
+                        operation_id,
+                        reviewer,
+                        segment_id,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_millis() as i64)
+                            .unwrap_or(1)
+                            .max(1),
+                    )?;
                 }
             }
             // The answer key was obtained before this write transaction. An owner correction or
@@ -4521,8 +5833,7 @@ impl Database {
                          playback_guard_version)
                      VALUES (?1, ?2, ?3, ?3, 'couch_spot_check', ?4,
                              (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?5, ?6, ?7, ?8,
-                             ?9, ?10, ?11,
-                             'content-hash-raw-counter-v3')",
+                              ?9, ?10, ?11, ?12)",
                     params![
                         segment_id,
                         effective_reviewer,
@@ -4535,6 +5846,11 @@ impl Database {
                         served_transcript,
                         served_revision,
                         crate::GIT_SHA,
+                        if playback.and_then(|proof| proof.authority_session_id.as_ref()).is_some() {
+                            "interval-authority-v4"
+                        } else {
+                            "content-hash-raw-counter-v3"
+                        },
                     ],
                 )?;
                 let event_id = tx.last_insert_rowid();
@@ -4691,6 +6007,9 @@ impl Database {
         let (requested_action, requested_transcript) = request.unwrap_or((action, ""));
         self.with_full_sync(|| {
             let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            if let Some((operation_id, _)) = operation {
+                Self::require_canonical_operation_namespace_on(&tx, operation_id)?;
+            }
             if let Some(limit) = action_limit {
                 enforce_review_action_limit_on(&tx, reviewer, limit)?;
             }
@@ -5381,9 +6700,45 @@ impl Database {
         cursor: Option<&str>,
         focus: Option<&std::collections::HashSet<String>>,
     ) -> AppResult<SegmentsPage> {
+        self.get_segments_page_scoped(SegmentPageQuery {
+            verified,
+            text_query,
+            sort,
+            limit,
+            cursor,
+            focus,
+            escalation_only: false,
+        })
+    }
+
+    /// Versioned, keyset-paginated escalation queue for the desktop review contract.
+    ///
+    /// Unlike the general library page, escalation rows carry their complete alignment/evidence
+    /// payload because the inbox immediately authorizes clip-bounded playback from the returned row.
+    /// The row and review revision still originate in one SQLite result row.
+    pub fn get_escalation_review_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        focus: Option<&std::collections::HashSet<String>>,
+    ) -> AppResult<SegmentsPage> {
+        self.get_segments_page_scoped(SegmentPageQuery {
+            verified: None,
+            text_query: None,
+            sort: "suspectFirst",
+            limit,
+            cursor,
+            focus,
+            escalation_only: true,
+        })
+    }
+
+    fn get_segments_page_scoped(&self, query: SegmentPageQuery<'_>) -> AppResult<SegmentsPage> {
+        let SegmentPageQuery { verified, text_query, sort, limit, cursor, focus, escalation_only } = query;
         let limit = limit.clamp(1, 500);
         let sort = canonical_segment_sort(sort);
-        let scope = segment_page_scope(verified, text_query, focus);
+        let base_scope = segment_page_scope(verified, text_query, focus);
+        let scope = if escalation_only { format!("escalation:{base_scope}") } else { base_scope };
         let decoded_cursor = cursor.map(decode_segment_cursor).transpose()?;
         if let Some(ref cursor) = decoded_cursor {
             if cursor.sort != sort || cursor.scope != scope {
@@ -5431,6 +6786,10 @@ impl Database {
                 .map_err(|e| AppError::Validation(format!("Could not encode voice-focus ids: {e}")))?;
             bind_values.push(Value::Text(ids_json));
             where_parts.push(format!("id IN (SELECT value FROM json_each(?{}))", bind_values.len()));
+        }
+        if escalation_only {
+            where_parts.push("escalated = 1".to_string());
+            where_parts.push("(human_decision IS NULL OR human_decision = '')".to_string());
         }
         let total = if let Some(ref cursor) = decoded_cursor {
             cursor.total
@@ -5526,8 +6885,9 @@ impl Database {
         let where_sql = format!(" WHERE {}", where_parts.join(" AND "));
         bind_values.push(Value::Integer(limit as i64));
         let limit_idx = bind_values.len();
+        let select_columns = if escalation_only { SEGMENT_SELECT_COLUMNS } else { SEGMENT_LIST_SELECT_COLUMNS };
         let page_sql = format!(
-            "SELECT {SEGMENT_LIST_SELECT_COLUMNS}, review_revision FROM speech_segments{where_sql} ORDER BY {order_sql} LIMIT ?{limit_idx}"
+            "SELECT {select_columns}, review_revision FROM speech_segments{where_sql} ORDER BY {order_sql} LIMIT ?{limit_idx}"
         );
         let mut stmt = self.conn.prepare(&page_sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
@@ -6050,6 +7410,104 @@ impl Database {
         }
     }
 
+    /// Atomically replace one crashed import journal with the journal that will own its resume.
+    ///
+    /// The old implementation deleted the crashed journal in the command handler, then created the
+    /// successor only after the background worker entered `import_directory_with_agent_run_id`. A
+    /// process kill in that gap left already-published segments with no durable resume authority. This
+    /// transaction keeps the old job visible until the successor row *and* its completed-file set are
+    /// committed. SQLite rolls the whole handoff back on any failure or process death, so observers see
+    /// either the exact old journal or the exact successor, never zero (or two) running journals.
+    pub fn handoff_import_job_for_resume(&self, prior_job_id: &str) -> AppResult<String> {
+        crate::validation::input::validate_identifier(prior_job_id).map_err(AppError::Validation)?;
+        let successor_id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute("SAVEPOINT import_job_resume_handoff", [])?;
+        let result: AppResult<()> = (|| {
+            let prior_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM import_jobs WHERE id = ?1 AND status = 'running')",
+                params![prior_job_id],
+                |row| row.get(0),
+            )?;
+            if !prior_exists {
+                return Err(AppError::Validation(format!(
+                    "Interrupted import journal '{prior_job_id}' is no longer the active resumable job"
+                )));
+            }
+
+            // Retire every stale running row in the same transaction. Single-flight import admission
+            // means `prior_job_id` should be the only one; handling legacy duplicates here restores the
+            // stronger invariant instead of selecting one nondeterministically.
+            self.conn.execute(
+                "UPDATE import_jobs SET status = 'abandoned', updated_at = datetime('now') WHERE status = 'running'",
+                [],
+            )?;
+            let inserted = self.conn.execute(
+                "INSERT INTO import_jobs (id, dir, total_files, status)
+                 SELECT ?1, dir, total_files, 'running' FROM import_jobs WHERE id = ?2",
+                params![successor_id, prior_job_id],
+            )?;
+            if inserted != 1 {
+                return Err(AppError::Other(format!(
+                    "Interrupted import journal '{prior_job_id}' disappeared during resume handoff"
+                )));
+            }
+            self.conn.execute(
+                "INSERT INTO import_job_files (job_id, path)
+                 SELECT ?1, path FROM import_job_files WHERE job_id = ?2",
+                params![successor_id, prior_job_id],
+            )?;
+
+            let running: i64 =
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM import_jobs WHERE status = 'running'", [], |row| row.get(0))?;
+            if running != 1 {
+                return Err(AppError::Other(format!(
+                    "Resume journal handoff produced {running} running jobs instead of exactly one"
+                )));
+            }
+
+            // Same bounded retention contract as `begin_import_job`, after the successor has copied
+            // the old file set. The old row may now be pruned without erasing resume progress.
+            self.conn.execute(
+                "DELETE FROM import_jobs WHERE status != 'running' AND id NOT IN (
+                     SELECT id FROM import_jobs WHERE status != 'running'
+                     ORDER BY datetime(created_at) DESC, id DESC LIMIT 50
+                 )",
+                [],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("import_job_resume_handoff")?;
+                Ok(successor_id)
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("import_job_resume_handoff");
+                Err(error)
+            }
+        }
+    }
+
+    /// Admit the already-claimed resume journal at worker entry before any audio can be decoded or
+    /// segment row can publish. The compare-and-update proves the worker still owns the exact running
+    /// journal and refreshes its total for the directory as it exists on this attempt.
+    pub fn continue_import_job(&self, job_id: &str, dir: &str, total_files: usize) -> AppResult<()> {
+        crate::validation::input::validate_identifier(job_id).map_err(AppError::Validation)?;
+        let updated = self.conn.execute(
+            "UPDATE import_jobs
+                SET total_files = ?3, updated_at = datetime('now')
+              WHERE id = ?1 AND dir = ?2 AND status = 'running'",
+            params![job_id, dir, total_files as i64],
+        )?;
+        if updated != 1 {
+            return Err(AppError::Validation(format!(
+                "Resume worker does not own running import journal '{job_id}' for '{dir}'"
+            )));
+        }
+        Ok(())
+    }
+
     /// Record that `path` finished processing in job `job_id` (idempotent).
     pub fn mark_import_file_done(&self, job_id: &str, path: &str) -> AppResult<()> {
         self.conn
@@ -6549,10 +8007,102 @@ impl Database {
     /// `spectral as i64` is a bit-cast, not a numeric conversion — SQLite integers are i64 and the
     /// value is a u64, so the top bit round-trips only because both directions cast rather than
     /// convert. `load_audio_identities` casts back the same way.
+    fn ensure_audio_identity_compatible(&self, audio_path: &str, identity: &AudioIdentity) -> AppResult<()> {
+        let alias_key = audio_path.replace('/', "\\").to_lowercase();
+        let conflict: Option<(String, Option<i64>, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, audio_fingerprint, audio_content_hash
+                   FROM speech_segments
+                  WHERE LOWER(REPLACE(audio_path, '/', CHAR(92))) = ?1
+                    AND audio_content_hash IS NOT NULL
+                    AND (audio_content_hash <> ?2
+                         OR (audio_fingerprint IS NOT NULL AND audio_fingerprint <> ?3))
+                  ORDER BY rowid
+                  LIMIT 1",
+                params![alias_key, identity.content, identity.spectral as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((segment_id, prior_spectral, prior_content)) = conflict {
+            return Err(AppError::Validation(format!(
+                "SOURCE_IDENTITY_DRIFT: source path aliases already belong to segment '{segment_id}' with recording identity {prior_content}/{prior_spectral:?}; refusing to bind replacement bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bind identity to exactly the segments published by one source operation.
+    ///
+    /// The compatibility check includes Windows case/separator aliases. It runs after the containing
+    /// publication has obtained the SQLite writer lock, so a changed file at the same logical path
+    /// rolls the new rows back instead of rebinding any older machine or human-owned segment.
+    fn set_audio_identity_for_segments(
+        &self,
+        audio_path: &str,
+        segment_ids: &[String],
+        identity: &AudioIdentity,
+    ) -> AppResult<usize> {
+        if segment_ids.is_empty() {
+            return Err(AppError::Validation("No source-operation segments supplied for audio identity".into()));
+        }
+        self.ensure_audio_identity_compatible(audio_path, identity)?;
+
+        let mut seen = HashSet::with_capacity(segment_ids.len());
+        let mut updated = 0usize;
+        for segment_id in segment_ids {
+            if !seen.insert(segment_id.as_str()) {
+                return Err(AppError::Validation(format!(
+                    "Duplicate segment '{segment_id}' in one audio-identity publication"
+                )));
+            }
+            let current: Option<(String, Option<i64>, Option<String>)> = self
+                .conn
+                .query_row(
+                    "SELECT audio_path, audio_fingerprint, audio_content_hash
+                       FROM speech_segments WHERE id = ?1",
+                    [segment_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((stored_path, stored_spectral, stored_content)) = current else {
+                return Err(AppError::Validation(format!("Audio-identity publication lost segment '{segment_id}'")));
+            };
+            if stored_path != audio_path {
+                return Err(AppError::Validation(format!(
+                    "Audio-identity publication segment '{segment_id}' belongs to another source path"
+                )));
+            }
+            if stored_spectral == Some(identity.spectral as i64)
+                && stored_content.as_deref() == Some(identity.content.as_str())
+            {
+                continue;
+            }
+            let changed = self.conn.execute(
+                "UPDATE speech_segments
+                    SET audio_fingerprint = ?2, audio_content_hash = ?3
+                  WHERE id = ?1 AND audio_path = ?4",
+                params![segment_id, identity.spectral as i64, identity.content, audio_path],
+            )?;
+            if changed != 1 {
+                return Err(AppError::Validation(format!(
+                    "Audio-identity publication could not bind exact segment '{segment_id}'"
+                )));
+            }
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    /// Legacy path-wide identity backfill. Existing non-null identity is immutable: changed bytes at
+    /// the same logical Windows path must never rewrite earlier segment authority. New import
+    /// publication uses `set_audio_identity_for_segments` instead of this compatibility API.
     pub fn set_audio_identity(&self, audio_path: &str, identity: &AudioIdentity) -> AppResult<usize> {
+        self.ensure_audio_identity_compatible(audio_path, identity)?;
         Ok(self.conn.execute(
             "UPDATE speech_segments SET audio_fingerprint = ?2, audio_content_hash = ?3
-              WHERE audio_path = ?1",
+              WHERE audio_path = ?1
+                AND (audio_content_hash IS NULL OR audio_content_hash = ?3)",
             params![audio_path, identity.spectral as i64, identity.content],
         )?)
     }
@@ -6582,6 +8132,54 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Load the complete cross-run dedup inventory from one stable SQLite read snapshot.
+    ///
+    /// The legacy [`load_audio_identities`](Self::load_audio_identities) API intentionally omits rows
+    /// whose spectral bucket is NULL. That is useful to callers which can tolerate legacy rows, but it
+    /// is not enough for the production import admission gate: an omitted row is exactly an existing
+    /// recording which the in-memory index cannot reject on a later import. Count every distinct
+    /// recording with either identity tier missing or unusable, then load the usable rows in the SAME
+    /// transaction so startup cannot certify one database generation and rehydrate another. A zero
+    /// spectral key is unusable because `AudioFingerprint::rehydrate` deliberately skips it; a hash
+    /// outside the canonical 64-character lowercase-hex form can never match a newly decoded recording.
+    pub fn load_audio_identity_inventory(&self) -> AppResult<(Vec<StoredAudioIdentity>, usize)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let incomplete_recordings = tx.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT audio_path
+                   FROM speech_segments
+                  GROUP BY audio_path
+                 HAVING SUM(
+                     CASE WHEN audio_fingerprint IS NULL
+                                OR audio_fingerprint = 0
+                                OR audio_content_hash IS NULL
+                                OR LENGTH(audio_content_hash) <> 64
+                                OR audio_content_hash GLOB '*[^0-9a-f]*'
+                          THEN 1 ELSE 0 END
+                 ) > 0
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let identities = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT audio_fingerprint, audio_content_hash, audio_path
+                   FROM speech_segments
+                  WHERE audio_fingerprint IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(StoredAudioIdentity {
+                    spectral: row.get::<_, i64>(0)? as u64,
+                    content: row.get::<_, Option<String>>(1)?,
+                    audio_path: row.get::<_, String>(2)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok((identities, incomplete_recordings.max(0) as usize))
     }
 
     pub fn revoke_recording(&self, audio_path: &str) -> AppResult<usize> {
@@ -7768,6 +9366,11 @@ impl Database {
         if rationale.is_empty() {
             return Err(AppError::Validation("review flag rationale must not be blank".into()));
         }
+        if rationale.starts_with(crate::quality::TECHNICAL_UNUSABLE_RATIONALE_PREFIX) {
+            return Err(AppError::Validation(
+                "technical-unusable rationale namespace is reserved for mark_segment_unusable_v1".into(),
+            ));
+        }
         validate_operation_uuid(operation_id)?;
         let commit = self.with_full_sync(|| {
             let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -7846,6 +9449,12 @@ impl Database {
             }
             let (prior, prior_revision, _) = Self::decision_snapshot_on(&tx, segment_id)?
                 .ok_or_else(|| AppError::Validation("cannot flag an unknown segment".into()))?;
+            if crate::quality::is_technically_unusable(&prior) {
+                return Err(AppError::Validation(
+                    "cannot replace a durable technical-unusable marker with a generic review flag; undo its exact effect first"
+                        .into(),
+                ));
+            }
             if prior.human_decision.as_deref().is_some_and(|value| !value.trim().is_empty()) {
                 return Err(AppError::Validation("cannot flag a segment that already has a human decision".into()));
             }
@@ -7906,6 +9515,293 @@ impl Database {
         self.track_write()?;
         Ok(commit)
     }
+
+    fn replay_technical_unusable_on(
+        conn: &Connection,
+        segment_id: &str,
+        base_revision: i64,
+        reason: &str,
+        operation_id: &str,
+    ) -> AppResult<Option<HumanFlagCommit>> {
+        let replay = conn
+            .query_row(
+                "SELECT id, segment_id, prior_revision, flag_revision, flag_rationale
+                   FROM review_flag_effect_events
+                  WHERE operation_id = ?1",
+                params![operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((effect_event_id, replay_segment_id, prior_revision, flag_revision, replay_rationale)) = replay else {
+            return Ok(None);
+        };
+        if replay_segment_id != segment_id
+            || prior_revision != base_revision
+            || crate::quality::technical_unusable_reason_from_rationale(Some(&replay_rationale)) != Some(reason)
+        {
+            return Err(AppError::Validation(
+                "technical-unusable operation UUID was already used for a different request".into(),
+            ));
+        }
+        let current = Self::decision_snapshot_on(conn, segment_id)?
+            .ok_or_else(|| AppError::Validation("technical-unusable replay segment no longer exists".into()))?;
+        let reversed: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM review_flag_effect_reversals
+                  WHERE flag_effect_event_id = ?1
+             )",
+            params![effect_event_id],
+            |row| row.get(0),
+        )?;
+        let later_review_mutation: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM review_flag_effect_events newer
+                  WHERE newer.segment_id = ?1
+                    AND newer.flag_revision > ?2
+                 UNION ALL
+                 SELECT 1
+                   FROM human_decision_effect_events decision
+                  WHERE decision.segment_id = ?1
+                    AND decision.decision_revision > ?2
+             )",
+            params![segment_id, flag_revision],
+            |row| row.get(0),
+        )?;
+        if reversed
+            || later_review_mutation
+            || current.1 < flag_revision
+            || current.0.verdict.as_deref() != Some("escalated")
+            || current.0.rationale.as_deref() != Some(replay_rationale.as_str())
+            || !current.0.escalated
+            || current.0.human_decision.as_deref().is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(AppError::Validation(
+                "technical-unusable operation was committed, but its exact post-state is no longer current".into(),
+            ));
+        }
+        // A draft autosave can race just behind the first committed action, or be retried by a
+        // renderer that lost the success response. Re-delete only the original revision's stale
+        // draft; a draft for the committed/newer revision is never touched.
+        conn.execute(
+            "DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2",
+            params![segment_id, base_revision],
+        )?;
+        Ok(Some(HumanFlagCommit {
+            effect_event_id,
+            segment_id: replay_segment_id,
+            prior_revision,
+            flag_revision,
+            segment: current.0,
+        }))
+    }
+
+    /// Resolve an exact response-loss retry before probing the mutable source again. A file may have
+    /// been repaired after the original durable failure; that must not make the same operation UUID
+    /// ambiguous or create a second effect.
+    pub(crate) fn replay_segment_technically_unusable(
+        &self,
+        segment_id: &str,
+        base_revision: i64,
+        reason: &str,
+        operation_id: &str,
+    ) -> AppResult<Option<HumanFlagCommit>> {
+        if base_revision < 0 {
+            return Err(AppError::Validation("technical-unusable base revision must be non-negative".into()));
+        }
+        if !crate::quality::is_supported_technical_unusable_reason(reason) {
+            return Err(AppError::Validation(
+                "technical-unusable reason is not one of the supported structured codes".into(),
+            ));
+        }
+        validate_operation_uuid(operation_id)?;
+        let replay = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            let replay = Self::replay_technical_unusable_on(&tx, segment_id, base_revision, reason, operation_id)?;
+            if replay.is_some() {
+                tx.commit()?;
+            } else {
+                tx.rollback()?;
+            }
+            Ok(replay)
+        })?;
+        if replay.is_some() {
+            self.track_write()?;
+        }
+        Ok(replay)
+    }
+
+    /// Durably classify a clip as technically unusable without creating human transcript truth.
+    ///
+    /// The existing immutable review-flag effect graph is sufficient authority: its prior snapshot,
+    /// operation UUID, revision edge and exact inverse make this action auditable and reversible. A
+    /// reserved structured rationale distinguishes the technical fact from a free-form human flag.
+    /// No playback receipt, human decision, compensation entry, transcript or verification field is
+    /// read or written here.
+    pub(crate) fn mark_segment_technically_unusable_after_verified_failure(
+        &self,
+        segment_id: &str,
+        base_revision: i64,
+        reason: &str,
+        expected_source_path_sha256: &str,
+        expected_audio_content_hash: Option<&str>,
+        operation_id: &str,
+    ) -> AppResult<HumanFlagCommit> {
+        if base_revision < 0 {
+            return Err(AppError::Validation("technical-unusable base revision must be non-negative".into()));
+        }
+        // Absence is not a leaseable filesystem object. The supported desktop store rejects this
+        // before probing; keep the persistence boundary fail-closed as well so a future internal
+        // caller cannot reintroduce the negative-entry TOCTOU by bypassing that store.
+        if reason == "missingFile" {
+            return Err(AppError::Validation("E_TECHNICAL_UNUSABLE_MISSING_FILE_UNLEASEABLE".into()));
+        }
+        if crate::quality::canonical_technical_unusable_rationale(
+            reason,
+            expected_source_path_sha256,
+            expected_audio_content_hash,
+            base_revision,
+        )
+        .is_none()
+        {
+            return Err(AppError::Validation("technical-unusable source identity or reason is not canonical".into()));
+        }
+        validate_operation_uuid(operation_id)?;
+
+        let commit = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(replay) = Self::replay_technical_unusable_on(
+                &tx,
+                segment_id,
+                base_revision,
+                reason,
+                operation_id,
+            )? {
+                tx.commit()?;
+                return Ok(replay);
+            }
+
+            let (prior, current_revision, current_audio_content_hash) = Self::decision_snapshot_on(&tx, segment_id)?
+                .ok_or_else(|| {
+                AppError::Validation("E_TECHNICAL_UNUSABLE_SEGMENT_NOT_FOUND".into())
+            })?;
+            if current_revision != base_revision {
+                return Err(AppError::Validation(format!(
+                    "E_STALE_TECHNICAL_UNUSABLE_REVISION:{current_revision}"
+                )));
+            }
+            let current_source_path_sha256 =
+                technical_unusable_source_path_sha256(Path::new(&prior.audio_path))?;
+            if current_source_path_sha256 != expected_source_path_sha256
+                || current_audio_content_hash.as_deref() != expected_audio_content_hash
+            {
+                return Err(AppError::Validation("E_TECHNICAL_UNUSABLE_SOURCE_CHANGED".into()));
+            }
+            let rationale = crate::quality::canonical_technical_unusable_rationale(
+                reason,
+                &current_source_path_sha256,
+                current_audio_content_hash.as_deref(),
+                current_revision,
+            )
+            .ok_or_else(|| AppError::Other("technical-unusable source snapshot was not canonical".into()))?;
+            if prior.human_decision.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+                return Err(AppError::Validation("E_TECHNICAL_UNUSABLE_ALREADY_HUMAN_REVIEWED".into()));
+            }
+            if crate::quality::is_technically_unusable(&prior) {
+                return Err(AppError::Validation(
+                    "segment already has a different active technical-unusable effect".into(),
+                ));
+            }
+            if !Self::flag_human_baseline_is_authorized_on(&tx, &prior)? {
+                return Err(AppError::Validation(
+                    "technical-unusable mark refused: the segment carries human review fields with no immutable authority"
+                        .into(),
+                ));
+            }
+
+            let changed = tx.execute(
+                "UPDATE speech_segments
+                    SET verdict = 'escalated', rationale = ?2, escalated = 1,
+                        updated_at = datetime('now')
+                  WHERE id = ?1 AND review_revision = ?3
+                    AND (human_decision IS NULL OR human_decision = '')",
+                params![segment_id, rationale, base_revision],
+            )?;
+            if changed != 1 {
+                let current_revision = tx
+                    .query_row(
+                        "SELECT review_revision FROM speech_segments WHERE id = ?1",
+                        params![segment_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                return Err(match current_revision {
+                    Some(revision) => {
+                        AppError::Validation(format!("E_STALE_TECHNICAL_UNUSABLE_REVISION:{revision}"))
+                    }
+                    None => AppError::Validation("E_TECHNICAL_UNUSABLE_SEGMENT_NOT_FOUND".into()),
+                });
+            }
+            let flag_revision: i64 = tx.query_row(
+                "SELECT review_revision FROM speech_segments WHERE id = ?1",
+                params![segment_id],
+                |row| row.get(0),
+            )?;
+            if flag_revision != base_revision + 1 {
+                return Err(AppError::Other(
+                    "technical-unusable mark did not advance exactly one revision".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO review_flag_effect_events
+                    (operation_id, segment_id, prior_revision, flag_revision, prior_verdict,
+                     prior_rationale, flag_rationale, prior_escalated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    operation_id,
+                    segment_id,
+                    base_revision,
+                    flag_revision,
+                    prior.verdict,
+                    prior.rationale,
+                    rationale,
+                    prior.escalated as i32,
+                ],
+            )?;
+            let effect_event_id = tx.last_insert_rowid();
+
+            // A successful queue-terminal action clears only the draft bound to the exact state the
+            // renderer marked. It cannot erase a draft for a later revision, and a failed transaction
+            // leaves the draft intact.
+            tx.execute(
+                "DELETE FROM review_drafts WHERE segment_id = ?1 AND base_revision = ?2",
+                params![segment_id, base_revision],
+            )?;
+
+            let segment = Self::decision_snapshot_on(&tx, segment_id)?
+                .ok_or_else(|| AppError::Other("segment disappeared inside technical-unusable transaction".into()))?
+                .0;
+            tx.commit()?;
+            Ok(HumanFlagCommit {
+                effect_event_id,
+                segment_id: segment_id.to_string(),
+                prior_revision: base_revision,
+                flag_revision,
+                segment,
+            })
+        })?;
+        self.track_write()?;
+        Ok(commit)
+    }
+
     pub fn undo_review_flag(&self, effect_event_id: i64, operation_id: &str) -> AppResult<HumanFlagUndoOutcome> {
         if effect_event_id <= 0 {
             return Err(AppError::Validation("review flag effect id must be positive".into()));
@@ -8288,6 +10184,7 @@ impl Database {
     /// Finalize a desktop adjudication only while the exact anonymous playback proof remains valid.
     /// The useful preflight error is produced by the command layer; this is the authority check,
     /// repeated under the same IMMEDIATE transaction and revision CAS as the decision itself.
+    #[cfg(test)]
     pub(crate) fn finalize_human_review_with_playback(
         &self,
         segment_id: &str,
@@ -8334,8 +10231,16 @@ impl Database {
         operation_id: &str,
     ) -> AppResult<HumanDecisionCommit> {
         validate_operation_uuid(operation_id)?;
-        let operation_payload_hash =
-            desktop_review_v1_payload_hash(segment_id, base_revision, decision, corrected_transcript);
+        let playback_authority_session_id = playback.authority_session_id.as_deref().ok_or_else(|| {
+            AppError::Validation("typed desktop review requires an exact policy-4 playback authority".into())
+        })?;
+        let operation_payload_hash = desktop_review_v1_payload_hash(
+            segment_id,
+            base_revision,
+            decision,
+            corrected_transcript,
+            playback_authority_session_id,
+        );
         match self.record_human_decision_by_with_finalize(
             segment_id,
             decision,
@@ -8573,6 +10478,35 @@ impl Database {
         }
     }
 
+    /// Resolve the one canonical decoded-PCM identity recorded for an imported source.
+    ///
+    /// Every segment cut from one recording must carry the same source-level content hash.  Media
+    /// playback uses this stricter source query before it copies bytes into the WebView cache; a
+    /// missing or conflicting identity cannot be turned into a playback capability.  Keeping this
+    /// query behind `Database` also prevents the media/IPC layers from escaping a raw connection.
+    pub(crate) fn source_audio_content_hash(&self, audio_path: &str) -> AppResult<Option<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT TRIM(audio_content_hash)
+               FROM speech_segments
+              WHERE audio_path=?1
+                AND audio_content_hash IS NOT NULL
+                AND TRIM(audio_content_hash)<>''
+              ORDER BY TRIM(audio_content_hash)",
+        )?;
+        let hashes =
+            statement.query_map([audio_path], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        match hashes.as_slice() {
+            [] => Ok(None),
+            [hash] if is_canonical_audio_content_hash(hash) => Ok(Some(hash.clone())),
+            [..] if hashes.len() > 1 => Err(AppError::Validation(format!(
+                "imported source {audio_path} has conflicting canonical audio identities"
+            ))),
+            _ => Err(AppError::Validation(format!(
+                "imported source {audio_path} has a non-canonical audio content hash"
+            ))),
+        }
+    }
+
     pub(crate) fn segment_source_span(&self, segment_id: &str) -> AppResult<Option<(i64, i64)>> {
         use rusqlite::OptionalExtension;
         let alignment = self
@@ -8585,14 +10519,16 @@ impl Database {
         Ok(canonical_source_span(alignment.as_deref()))
     }
 
-    /// Refuse a gold-minting verdict that has no proof the reviewer heard THIS clip.
+    /// Refuse a gold-minting verdict unless the authorized renderer recorded enough canonical-media
+    /// traversal for THIS exact clip identity.
     ///
     /// The enforcement point is here, not in a renderer: a decision surface can be reloaded, scripted
     /// or replayed offline, so "the button was disabled" is a usability property, never a guarantee.
-    /// This is the guarantee.
+    /// The backend guarantee is deliberately narrower: it proves bounded media traversal, not human
+    /// attention, audibility, comprehension, or truthfulness.
     ///
     /// `reject` is included deliberately. Marking a clip bad is a judgement about the AUDIO, and a
-    /// reviewer who never heard it cannot make it — a wrongly rejected clip is silently dropped from
+    /// reviewer who never traversed it cannot make it — a wrongly rejected clip is silently dropped from
     /// the corpus, which is the most expensive mistake available and the hardest to notice later.
     /// `skip` never reaches here: it writes no verdict at all.
     pub fn require_playback_evidence(
@@ -8606,12 +10542,1034 @@ impl Database {
             return Ok(());
         }
         Err(AppError::Validation(format!(
-            "E_NO_PLAYBACK_EVIDENCE: no receipt shows this reviewer heard at least {:.0}% of segment              {segment_id} at revision {revision}. A verdict on an unheard clip is a guess, not a label.",
+            "E_NO_PLAYBACK_EVIDENCE: no receipt records at least {:.0}% canonical-media traversal for segment {segment_id} at revision {revision}. Reload the clip and play it before deciding.",
             MIN_PLAYBACK_COVERAGE * 100.0
         )))
     }
 
+    /// Issue a short-lived desktop playback authority only after the live media grant is proven to
+    /// resolve to this segment's imported source.  The returned UUID is intentionally not evidence by
+    /// itself: it can authorize a receipt only after [`Self::finalize_desktop_playback_session_v1`]
+    /// stores a plausible exact interval union against the same immutable clip identity. This is an
+    /// integrity/replay boundary for the signed desktop renderer, not a claim that software can prove
+    /// human attention or defeat a fully compromised renderer.
+    // Every argument is a separately validated authority coordinate. Collapsing them into an
+    // unvalidated bag would make cross-source/revision mix-ups easier at this database boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_desktop_playback_session_v1(
+        &self,
+        segment_id: &str,
+        expected_revision: i64,
+        media_grant_id: &str,
+        client_attempt_id: &str,
+        grant_source_path: &Path,
+        grant_audio_content_hash: &str,
+        reviewer: Option<&str>,
+    ) -> AppResult<DesktopPlaybackSession> {
+        if expected_revision < 0 {
+            return Err(AppError::Validation("desktop playback expected revision must be non-negative".into()));
+        }
+        uuid::Uuid::parse_str(media_grant_id)
+            .map_err(|_| AppError::Validation("desktop playback media-grant identity is invalid".into()))?;
+        let parsed_attempt = uuid::Uuid::parse_str(client_attempt_id)
+            .map_err(|_| AppError::Validation("desktop playback client-attempt identity is invalid".into()))?;
+        if parsed_attempt.hyphenated().to_string() != client_attempt_id {
+            return Err(AppError::Validation(
+                "desktop playback client-attempt identity must be a lowercase hyphenated UUID".into(),
+            ));
+        }
+        let grant_source_path_sha256 = canonical_grant_source_path_sha256(grant_source_path)?;
+        let playback_receipt_id = uuid::Uuid::new_v4().to_string();
+        let (issued_at_ms, issued_active_100ns) = self.playback_clock_now()?;
+        let expires_at_ms = issued_at_ms
+            .checked_add(DESKTOP_PLAYBACK_SESSION_TTL_MS)
+            .ok_or_else(|| AppError::Other("desktop playback session expiry overflowed".into()))?;
+        let active_session_ids = self.active_playback_session_ids(issued_active_100ns);
+
+        let (session, wrote, reclaimed_session_ids) = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            Self::prune_abandoned_playback_sessions_on(&tx, &active_session_ids)?;
+            let row: Option<DesktopPlaybackSegmentSnapshot> = tx
+                .query_row(
+                    "SELECT audio_path, COALESCE(review_revision,0),
+                            NULLIF(TRIM(COALESCE(audio_content_hash,'')),''),
+                            COALESCE(duration_ms,0), alignment_json
+                       FROM speech_segments WHERE id=?1",
+                    [segment_id],
+                    |row| {
+                        Ok(DesktopPlaybackSegmentSnapshot {
+                            audio_path: row.get(0)?,
+                            review_revision: row.get(1)?,
+                            audio_content_hash: row.get(2)?,
+                            duration_ms: row.get(3)?,
+                            alignment_json: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(row) = row else {
+                return Err(AppError::Validation(format!(
+                    "cannot start desktop playback for unknown segment {segment_id}"
+                )));
+            };
+            let DesktopPlaybackSegmentSnapshot {
+                audio_path,
+                review_revision: segment_revision,
+                audio_content_hash,
+                duration_ms: clip_duration_ms,
+                alignment_json,
+            } = row;
+            if segment_revision != expected_revision {
+                return Err(AppError::Validation(format!(
+                    "E_PLAYBACK_REVISION_CHANGED: clip revision is {segment_revision}, not requested revision {expected_revision}"
+                )));
+            }
+            let segment_source_hash = canonical_grant_source_path_sha256(Path::new(&audio_path))?;
+            if segment_source_hash != grant_source_path_sha256 {
+                return Err(AppError::Validation(
+                    "desktop playback media grant belongs to a different imported source".into(),
+                ));
+            }
+            let audio_content_hash = audio_content_hash.ok_or_else(|| {
+                AppError::Validation(format!(
+                    "cannot start desktop playback for segment {segment_id} without a server-derived audio content hash"
+                ))
+            })?;
+            if !is_canonical_audio_content_hash(&audio_content_hash) {
+                return Err(AppError::Validation(format!(
+                    "cannot start desktop playback for segment {segment_id} with a non-canonical audio content hash"
+                )));
+            }
+            if audio_content_hash != grant_audio_content_hash {
+                return Err(AppError::Validation(
+                    "desktop playback media grant carries different audio bytes than this imported source".into(),
+                ));
+            }
+            let (source_start_ms, source_end_ms) = canonical_source_span(alignment_json.as_deref()).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "cannot start desktop playback for segment {segment_id} without a canonical source span"
+                ))
+            })?;
+            if !source_span_matches_duration(source_start_ms, source_end_ms, clip_duration_ms) {
+                return Err(AppError::Validation(format!(
+                    "cannot start desktop playback for segment {segment_id} whose source span disagrees with decoded duration"
+                )));
+            }
+            type ExistingAttempt = (String, String, String, String, i64, String, Option<String>, i64, i64, i64, i64);
+            let existing: Option<ExistingAttempt> = tx
+                .query_row(
+                    "SELECT playback_receipt_id, media_grant_id, grant_source_path_sha256,
+                            segment_id, segment_revision, audio_content_hash, reviewer,
+                            clip_duration_ms, source_start_ms, source_end_ms, expires_at_ms
+                       FROM desktop_playback_sessions_v4 WHERE client_attempt_id=?1",
+                    [client_attempt_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((
+                existing_receipt_id,
+                existing_grant_id,
+                existing_source_hash,
+                existing_segment_id,
+                existing_revision,
+                existing_content_hash,
+                existing_reviewer,
+                existing_duration_ms,
+                existing_start_ms,
+                existing_end_ms,
+                existing_expires_at_ms,
+            )) = existing
+            {
+                if existing_grant_id != media_grant_id
+                    || existing_source_hash != grant_source_path_sha256
+                    || existing_segment_id != segment_id
+                    || existing_revision != segment_revision
+                    || existing_content_hash != audio_content_hash
+                    || existing_reviewer.as_deref() != reviewer
+                    || existing_duration_ms != clip_duration_ms
+                    || existing_start_ms != source_start_ms
+                    || existing_end_ms != source_end_ms
+                {
+                    return Err(AppError::Validation(
+                        "desktop playback client-attempt UUID was already used for a different exact request".into(),
+                    ));
+                }
+                tx.rollback()?;
+                return Ok((
+                    DesktopPlaybackSession {
+                        playback_receipt_id: existing_receipt_id,
+                        segment_id: existing_segment_id,
+                        segment_revision: existing_revision,
+                        clip_duration_ms: existing_duration_ms,
+                        expires_at_ms: existing_expires_at_ms,
+                    },
+                    false,
+                    Vec::new(),
+                ));
+            }
+
+            // Renderer teardown normally cancels the superseded authority. If that best-effort IPC
+            // was lost, reclaim only the oldest never-finalized rows needed to admit this request.
+            // This prevents ordinary browsing from turning the 64/2 abuse bounds into a 30-minute
+            // workstation lockout while preserving every immutable receipt and consumed effect.
+            let reclaimed_session_ids = Self::playback_sessions_to_reclaim_on(&tx, segment_id)?;
+
+            let (live_total, live_for_segment): (i64, i64) = tx.query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM desktop_playback_sessions_v4 session
+                       WHERE NOT EXISTS (SELECT 1 FROM playback_receipts receipt
+                                          WHERE receipt.authority_session_id=session.playback_receipt_id)),
+                     (SELECT COUNT(*) FROM desktop_playback_sessions_v4 session
+                       WHERE session.segment_id=?1
+                         AND NOT EXISTS (SELECT 1 FROM playback_receipts receipt
+                                          WHERE receipt.authority_session_id=session.playback_receipt_id))",
+                [segment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if live_total >= MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS
+                || live_for_segment >= MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS_PER_SEGMENT
+            {
+                return Err(AppError::Validation(
+                    "E_PLAYBACK_SESSION_LIMIT: too many live playback attempts; finish or reload an existing clip"
+                        .into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO desktop_playback_sessions_v4
+                    (playback_receipt_id, media_grant_id, client_attempt_id, surface,
+                     session_binding_sha256, grant_source_path_sha256,
+                     segment_id, segment_revision, audio_content_hash, reviewer,
+                     clip_duration_ms, source_start_ms, source_end_ms, issued_at_ms, expires_at_ms)
+                 VALUES (?1,?2,?3,'desktop',NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    playback_receipt_id,
+                    media_grant_id,
+                    client_attempt_id,
+                    grant_source_path_sha256,
+                    segment_id,
+                    segment_revision,
+                    audio_content_hash,
+                    reviewer,
+                    clip_duration_ms,
+                    source_start_ms,
+                    source_end_ms,
+                    issued_at_ms,
+                    expires_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok((
+                DesktopPlaybackSession {
+                    playback_receipt_id: playback_receipt_id.clone(),
+                    segment_id: segment_id.to_string(),
+                    segment_revision,
+                    clip_duration_ms,
+                    expires_at_ms,
+                },
+                true,
+                reclaimed_session_ids,
+            ))
+        })?;
+        if !reclaimed_session_ids.is_empty() {
+            let mut live_sessions = self.lock_playback_live_sessions();
+            for reclaimed in reclaimed_session_ids {
+                live_sessions.remove(&reclaimed);
+            }
+        }
+        if wrote {
+            self.lock_playback_live_sessions().insert(playback_receipt_id, issued_active_100ns);
+            self.track_write()?;
+        }
+        Ok(session)
+    }
+
+    /// Convert one server-issued desktop playback session into immutable policy-4 evidence.  This is
+    /// the only production writer for policy 4. It refuses instant counter inflation by capping unique
+    /// media time at the application's maximum 2x rate relative to Windows active time (wall-clock
+    /// changes and workstation suspend contribute nothing), and stores every canonical interval so the
+    /// receipt's scalar can be independently re-derived.
+    pub fn finalize_desktop_playback_session_v1(
+        &self,
+        playback_receipt_id: &str,
+        media_grant_id: &str,
+        grant_source_path: &Path,
+        grant_audio_content_hash: &str,
+        intervals: &[DesktopPlaybackInterval],
+    ) -> AppResult<DesktopPlaybackReceipt> {
+        uuid::Uuid::parse_str(playback_receipt_id)
+            .map_err(|_| AppError::Validation("desktop playback receipt identity is invalid".into()))?;
+        uuid::Uuid::parse_str(media_grant_id)
+            .map_err(|_| AppError::Validation("desktop playback media-grant identity is invalid".into()))?;
+        let grant_source_path_sha256 = canonical_grant_source_path_sha256(grant_source_path)?;
+        let (observed_at_ms, observed_active_100ns) = self.playback_clock_now()?;
+        let live_elapsed_ms = self.live_playback_elapsed_ms(playback_receipt_id, observed_active_100ns)?;
+
+        let (receipt, wrote) = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            type SessionRow = (String, String, String, i64, String, Option<String>, i64, i64, i64, i64, i64);
+            let session: Option<SessionRow> = tx
+                .query_row(
+                    "SELECT media_grant_id, grant_source_path_sha256, segment_id, segment_revision,
+                            audio_content_hash, reviewer, clip_duration_ms, source_start_ms,
+                            source_end_ms, issued_at_ms, expires_at_ms
+                       FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?1",
+                    [playback_receipt_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
+                            row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                stored_grant_id,
+                stored_source_hash,
+                segment_id,
+                segment_revision,
+                audio_content_hash,
+                reviewer,
+                clip_duration_ms,
+                source_start_ms,
+                source_end_ms,
+                issued_at_ms,
+                _expires_at_ms,
+            )) = session
+            else {
+                return Err(AppError::Validation("desktop playback session is missing or was never issued".into()));
+            };
+            if stored_grant_id != media_grant_id
+                || stored_source_hash != grant_source_path_sha256
+                || audio_content_hash != grant_audio_content_hash
+            {
+                return Err(AppError::Validation(
+                    "desktop playback session no longer matches its live immutable media grant".into(),
+                ));
+            }
+
+            let (unique_played_ms, interval_union_sha256) =
+                validate_desktop_playback_intervals(intervals, clip_duration_ms)?;
+            let coverage_ratio = (unique_played_ms as f64 / clip_duration_ms as f64).min(1.0);
+
+            let replay: Option<(i64, i64, f64, String)> = tx
+                .query_row(
+                    "SELECT segment_revision, played_ms, coverage_ratio, interval_union_sha256
+                       FROM playback_receipts
+                      WHERE authority_session_id=?1 AND policy_version=?2",
+                    params![playback_receipt_id, DESKTOP_PLAYBACK_POLICY_VERSION],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if let Some((stored_revision, stored_played_ms, stored_coverage, stored_union_sha256)) = replay {
+                if stored_revision != segment_revision
+                    || stored_played_ms != unique_played_ms
+                    || stored_union_sha256 != interval_union_sha256
+                {
+                    return Err(AppError::Validation(
+                        "desktop playback receipt replay carries a different interval union".into(),
+                    ));
+                }
+                tx.rollback()?;
+                return Ok((
+                    DesktopPlaybackReceipt {
+                        playback_receipt_id: playback_receipt_id.to_string(),
+                        segment_id,
+                        segment_revision,
+                        unique_played_ms,
+                        clip_duration_ms,
+                        coverage_ratio: stored_coverage,
+                    },
+                    false,
+                ));
+            }
+
+            let required_unique_played_ms = clip_duration_ms
+                .checked_mul(MIN_PLAYBACK_COVERAGE_NUMERATOR)
+                .and_then(|value| value.checked_add(MIN_PLAYBACK_COVERAGE_DENOMINATOR - 1))
+                .map(|value| value / MIN_PLAYBACK_COVERAGE_DENOMINATOR)
+                .ok_or_else(|| AppError::Validation("desktop playback coverage threshold overflowed".into()))?;
+            if unique_played_ms < required_unique_played_ms {
+                return Err(AppError::Validation(format!(
+                    "E_PLAYBACK_COVERAGE_INSUFFICIENT: {unique_played_ms} ms is below the required {required_unique_played_ms} ms for this exact server clip duration"
+                )));
+            }
+
+            let elapsed_ms = live_elapsed_ms.ok_or_else(|| {
+                AppError::Validation("desktop playback session has no live active-time authority; reload the clip".into())
+            })?;
+            if elapsed_ms > DESKTOP_PLAYBACK_SESSION_TTL_MS {
+                return Err(AppError::Validation("desktop playback session expired; reload the clip".into()));
+            }
+            // Active time is minted in this process from QueryUnbiasedInterruptTimePrecise. The former
+            // 250 ms grace was doubled with playback rate and let a 400 ms clip mint 85% immediately.
+            // Exact lost-response replay is handled above and needs no grace or process-local clock.
+            let maximum_plausible_ms = elapsed_ms
+                .checked_mul(DESKTOP_PLAYBACK_MAX_RATE)
+                .unwrap_or(i64::MAX)
+                .min(clip_duration_ms);
+            if unique_played_ms > maximum_plausible_ms {
+                return Err(AppError::Validation(format!(
+                    "E_PLAYBACK_TIME_IMPLAUSIBLE: {unique_played_ms} ms of unique media cannot be traversed in {elapsed_ms} ms at the app's maximum playback rate"
+                )));
+            }
+
+            let current_audio_path: Option<String> = tx
+                .query_row(
+                    "SELECT segment.audio_path FROM speech_segments segment
+                      WHERE segment.id=?1
+                        AND COALESCE(segment.review_revision,0)=?2
+                        AND segment.audio_content_hash=?3
+                        AND segment.duration_ms=?4
+                        AND json_valid(segment.alignment_json)
+                        AND json_extract(segment.alignment_json,'$.source_start_ms')=?5
+                        AND json_extract(segment.alignment_json,'$.source_end_ms')=?6",
+                params![
+                    segment_id,
+                    segment_revision,
+                    audio_content_hash,
+                    clip_duration_ms,
+                    source_start_ms,
+                    source_end_ms,
+                ],
+                |row| row.get(0),
+                )
+                .optional()?;
+            let current_source_matches = current_audio_path
+                .as_deref()
+                .map(Path::new)
+                .map(canonical_grant_source_path_sha256)
+                .transpose()?
+                .is_some_and(|current| current == stored_source_hash);
+            if !current_source_matches {
+                return Err(AppError::Validation(format!(
+                    "{PLAYBACK_EVIDENCE_CHANGED}: clip source, identity, or revision changed after the desktop playback session began"
+                )));
+            }
+
+            for (ordinal, interval) in intervals.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO desktop_playback_intervals_v4
+                        (playback_receipt_id, ordinal, start_ms, end_ms, observed_at_ms)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![playback_receipt_id, ordinal as i64, interval.start_ms, interval.end_ms, observed_at_ms],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO playback_receipts
+                    (segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                     started_at_ms, played_ms, clip_duration_ms, coverage_ratio, policy_version,
+                     source_start_ms, source_end_ms, authority_session_id, interval_union_sha256)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    segment_id,
+                    segment_revision,
+                    audio_content_hash,
+                    reviewer,
+                    playback_receipt_id,
+                    issued_at_ms,
+                    unique_played_ms,
+                    clip_duration_ms,
+                    coverage_ratio,
+                    DESKTOP_PLAYBACK_POLICY_VERSION,
+                    source_start_ms,
+                    source_end_ms,
+                    playback_receipt_id,
+                    interval_union_sha256,
+                ],
+            )?;
+            tx.commit()?;
+            Ok((
+                DesktopPlaybackReceipt {
+                    playback_receipt_id: playback_receipt_id.to_string(),
+                    segment_id,
+                    segment_revision,
+                    unique_played_ms,
+                    clip_duration_ms,
+                    coverage_ratio,
+                },
+                true,
+            ))
+        })?;
+        if wrote {
+            self.lock_playback_live_sessions().remove(playback_receipt_id);
+            self.track_write()?;
+        }
+        Ok(receipt)
+    }
+
+    /// Recover an already-finalized exact receipt without depending on its now-ephemeral media grant.
+    /// This path cannot mint evidence: it returns `Some` only when the immutable policy-4 row already
+    /// exists and the caller presents the identical canonical interval union. It is used after a lost
+    /// response or workstation suspend, when the 30-minute cache lease may legitimately have expired.
+    pub fn replay_finalized_desktop_playback_receipt_v1(
+        &self,
+        playback_receipt_id: &str,
+        media_grant_id: &str,
+        intervals: &[DesktopPlaybackInterval],
+    ) -> AppResult<Option<DesktopPlaybackReceipt>> {
+        use rusqlite::OptionalExtension;
+        if uuid::Uuid::parse_str(playback_receipt_id).is_err() {
+            return Err(AppError::Validation("desktop playback receipt identity is invalid".into()));
+        }
+        if uuid::Uuid::parse_str(media_grant_id).is_err() {
+            return Err(AppError::Validation("desktop playback media-grant identity is invalid".into()));
+        }
+        type ReplayRow = (String, String, i64, i64, i64, f64, String);
+        let replay: Option<ReplayRow> = self
+            .conn
+            .query_row(
+                "SELECT session.media_grant_id, session.segment_id, session.segment_revision, receipt.played_ms,
+                        session.clip_duration_ms, receipt.coverage_ratio,
+                        receipt.interval_union_sha256
+                   FROM desktop_playback_sessions_v4 session
+                   JOIN playback_receipts receipt
+                     ON receipt.authority_session_id=session.playback_receipt_id
+                    AND receipt.policy_version=?2
+                    AND receipt.segment_id=session.segment_id
+                    AND receipt.segment_revision=session.segment_revision
+                    AND receipt.clip_duration_ms=session.clip_duration_ms
+                  WHERE session.playback_receipt_id=?1",
+                params![playback_receipt_id, DESKTOP_PLAYBACK_POLICY_VERSION],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .optional()?;
+        let Some((
+            stored_grant_id,
+            segment_id,
+            segment_revision,
+            stored_played_ms,
+            clip_duration_ms,
+            coverage_ratio,
+            stored_hash,
+        )) = replay
+        else {
+            return Ok(None);
+        };
+        if stored_grant_id != media_grant_id {
+            return Err(AppError::Validation(
+                "desktop playback receipt replay belongs to a different media grant".into(),
+            ));
+        }
+        let (unique_played_ms, interval_union_sha256) =
+            validate_desktop_playback_intervals(intervals, clip_duration_ms)?;
+        if unique_played_ms != stored_played_ms || interval_union_sha256 != stored_hash {
+            return Err(AppError::Validation(
+                "desktop playback receipt replay carries a different interval union".into(),
+            ));
+        }
+        Ok(Some(DesktopPlaybackReceipt {
+            playback_receipt_id: playback_receipt_id.to_string(),
+            segment_id,
+            segment_revision,
+            unique_played_ms,
+            clip_duration_ms,
+            coverage_ratio,
+        }))
+    }
+
+    /// Finalize one authenticated Couch attempt into the same immutable policy-4 interval authority
+    /// used by the desktop. The browser supplies only canonical clip-relative intervals; reviewer,
+    /// cookie-session binding, clip revision/hash/span/duration and source path all originate in the
+    /// server-issued in-memory attempt and are re-resolved here under BEGIN IMMEDIATE.
+    pub(crate) fn finalize_couch_playback_attempt_v1(
+        &self,
+        attempt: &CouchPlaybackAttemptAuthority,
+        intervals: &[DesktopPlaybackInterval],
+        server_monotonic_elapsed_ms: i64,
+    ) -> AppResult<DesktopPlaybackReceipt> {
+        for (value, label) in [
+            (&attempt.playback_receipt_id, "Couch playback receipt"),
+            (&attempt.media_grant_id, "Couch playback media grant"),
+            (&attempt.client_attempt_id, "Couch playback client attempt"),
+        ] {
+            let parsed = uuid::Uuid::parse_str(value)
+                .map_err(|_| AppError::Validation(format!("{label} identity is invalid")))?;
+            if parsed.hyphenated().to_string() != *value {
+                return Err(AppError::Validation(format!("{label} identity must be a lowercase hyphenated UUID")));
+            }
+        }
+        if attempt.session_binding_sha256.len() != 64
+            || !attempt
+                .session_binding_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || attempt.reviewer.trim().is_empty()
+            || attempt.segment_revision < 0
+            || !is_canonical_audio_content_hash(&attempt.audio_content_hash)
+            || !source_span_matches_duration(attempt.source_start_ms, attempt.source_end_ms, attempt.clip_duration_ms)
+            || attempt.issued_at_ms <= 0
+            || attempt.expires_at_ms <= attempt.issued_at_ms
+            || server_monotonic_elapsed_ms < 0
+        {
+            return Err(AppError::Validation("Couch playback attempt authority is malformed".into()));
+        }
+        let grant_source_path_sha256 = canonical_grant_source_path_sha256(&attempt.source_path)?;
+        let source_lease = crate::media::verify_current_source_lease(&attempt.source_path, &attempt.audio_content_hash)
+            .map_err(|error| AppError::Validation(format!("{PLAYBACK_EVIDENCE_CHANGED}: {error}")))?;
+        let (unique_played_ms, interval_union_sha256) =
+            validate_desktop_playback_intervals(intervals, attempt.clip_duration_ms)?;
+        if unique_played_ms
+            .checked_mul(MIN_PLAYBACK_COVERAGE_DENOMINATOR)
+            .ok_or_else(|| AppError::Validation("Couch playback coverage overflowed".into()))?
+            < attempt
+                .clip_duration_ms
+                .checked_mul(MIN_PLAYBACK_COVERAGE_NUMERATOR)
+                .ok_or_else(|| AppError::Validation("Couch playback duration overflowed".into()))?
+        {
+            return Err(AppError::Validation(format!(
+                "E_NO_PLAYBACK_EVIDENCE: renderer-reported playback traversal covers less than {:.0}% of this clip",
+                MIN_PLAYBACK_COVERAGE * 100.0
+            )));
+        }
+        let maximum_plausible_ms = server_monotonic_elapsed_ms
+            .checked_mul(DESKTOP_PLAYBACK_MAX_RATE)
+            .unwrap_or(i64::MAX)
+            .min(attempt.clip_duration_ms);
+        if unique_played_ms > maximum_plausible_ms {
+            return Err(AppError::Validation(format!(
+                "E_PLAYBACK_TIME_IMPLAUSIBLE: {unique_played_ms} ms of renderer traversal cannot occur in {server_monotonic_elapsed_ms} ms at the maximum playback rate"
+            )));
+        }
+        let observed_at_ms = playback_server_now_ms()?.max(1);
+        let coverage_ratio = (unique_played_ms as f64 / attempt.clip_duration_ms as f64).min(1.0);
+
+        let (receipt, wrote) = self.with_full_sync(|| {
+            let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            type ReplayRow = (String, String, String, String, String, i64, i64, f64, String);
+            let replay: Option<ReplayRow> = tx
+                .query_row(
+                    "SELECT session.media_grant_id, session.client_attempt_id,
+                            session.session_binding_sha256, session.reviewer, session.segment_id,
+                            session.segment_revision, receipt.played_ms, receipt.coverage_ratio,
+                            receipt.interval_union_sha256
+                       FROM desktop_playback_sessions_v4 session
+                       JOIN playback_receipts receipt
+                         ON receipt.authority_session_id=session.playback_receipt_id
+                        AND receipt.policy_version=?2
+                      WHERE session.playback_receipt_id=?1 AND session.surface='couch'",
+                    params![attempt.playback_receipt_id, DESKTOP_PLAYBACK_POLICY_VERSION],
+                    |row| {
+                        Ok((
+                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                            row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((
+                media_grant_id,
+                client_attempt_id,
+                session_binding_sha256,
+                reviewer,
+                segment_id,
+                segment_revision,
+                stored_played_ms,
+                stored_coverage_ratio,
+                stored_interval_hash,
+            )) = replay
+            {
+                if media_grant_id != attempt.media_grant_id
+                    || client_attempt_id != attempt.client_attempt_id
+                    || session_binding_sha256 != attempt.session_binding_sha256
+                    || !reviewer.eq_ignore_ascii_case(&attempt.reviewer)
+                    || segment_id != attempt.segment_id
+                    || segment_revision != attempt.segment_revision
+                    || stored_played_ms != unique_played_ms
+                    || stored_interval_hash != interval_union_sha256
+                {
+                    return Err(AppError::Validation(
+                        "Couch playback finalization replay changed its exact authority or interval union".into(),
+                    ));
+                }
+                tx.rollback()?;
+                return Ok((
+                    DesktopPlaybackReceipt {
+                        playback_receipt_id: attempt.playback_receipt_id.clone(),
+                        segment_id,
+                        segment_revision,
+                        unique_played_ms,
+                        clip_duration_ms: attempt.clip_duration_ms,
+                        coverage_ratio: stored_coverage_ratio,
+                    },
+                    false,
+                ));
+            }
+
+            let conflicting_attempt: Option<(String, String, String, i64)> = tx
+                .query_row(
+                    "SELECT playback_receipt_id, session_binding_sha256, segment_id, segment_revision
+                       FROM desktop_playback_sessions_v4 WHERE client_attempt_id=?1",
+                    [attempt.client_attempt_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if conflicting_attempt.is_some() {
+                return Err(AppError::Validation(
+                    "Couch playback client-attempt UUID was already bound to a different request".into(),
+                ));
+            }
+
+            let current: Option<(String, i64, String, i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT audio_path, COALESCE(review_revision,0), audio_content_hash,
+                            duration_ms, alignment_json
+                       FROM speech_segments WHERE id=?1",
+                    [attempt.segment_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .optional()?;
+            let Some((audio_path, revision, content_hash, duration_ms, alignment_json)) = current else {
+                return Err(AppError::Validation(format!(
+                    "{PLAYBACK_EVIDENCE_CHANGED}: Couch playback segment disappeared before finalization"
+                )));
+            };
+            let current_span = canonical_source_span(alignment_json.as_deref());
+            if revision != attempt.segment_revision
+                || content_hash != attempt.audio_content_hash
+                || duration_ms != attempt.clip_duration_ms
+                || current_span != Some((attempt.source_start_ms, attempt.source_end_ms))
+                || canonical_grant_source_path_sha256(Path::new(&audio_path))? != grant_source_path_sha256
+                || source_lease.source_path != std::fs::canonicalize(Path::new(&audio_path))?
+            {
+                return Err(AppError::Validation(format!(
+                    "{PLAYBACK_EVIDENCE_CHANGED}: clip source, identity, revision, duration, or span changed before Couch playback finalization"
+                )));
+            }
+
+            tx.execute(
+                "INSERT INTO desktop_playback_sessions_v4
+                    (playback_receipt_id,media_grant_id,client_attempt_id,surface,
+                     session_binding_sha256,grant_source_path_sha256,segment_id,segment_revision,
+                     audio_content_hash,reviewer,clip_duration_ms,source_start_ms,source_end_ms,
+                     issued_at_ms,expires_at_ms)
+                 VALUES (?1,?2,?3,'couch',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    attempt.playback_receipt_id,
+                    attempt.media_grant_id,
+                    attempt.client_attempt_id,
+                    attempt.session_binding_sha256,
+                    grant_source_path_sha256,
+                    attempt.segment_id,
+                    attempt.segment_revision,
+                    attempt.audio_content_hash,
+                    attempt.reviewer,
+                    attempt.clip_duration_ms,
+                    attempt.source_start_ms,
+                    attempt.source_end_ms,
+                    attempt.issued_at_ms,
+                    attempt.expires_at_ms,
+                ],
+            )?;
+            for (ordinal, interval) in intervals.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO desktop_playback_intervals_v4
+                        (playback_receipt_id,ordinal,start_ms,end_ms,observed_at_ms)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        attempt.playback_receipt_id,
+                        ordinal as i64,
+                        interval.start_ms,
+                        interval.end_ms,
+                        observed_at_ms,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO playback_receipts
+                    (segment_id,segment_revision,audio_fingerprint,reviewer,session_id,
+                     started_at_ms,played_ms,clip_duration_ms,coverage_ratio,policy_version,
+                     source_start_ms,source_end_ms,authority_session_id,interval_union_sha256)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    attempt.segment_id,
+                    attempt.segment_revision,
+                    attempt.audio_content_hash,
+                    attempt.reviewer,
+                    attempt.playback_receipt_id,
+                    attempt.issued_at_ms,
+                    unique_played_ms,
+                    attempt.clip_duration_ms,
+                    coverage_ratio,
+                    DESKTOP_PLAYBACK_POLICY_VERSION,
+                    attempt.source_start_ms,
+                    attempt.source_end_ms,
+                    attempt.playback_receipt_id,
+                    interval_union_sha256,
+                ],
+            )?;
+            tx.commit()?;
+            Ok((
+                DesktopPlaybackReceipt {
+                    playback_receipt_id: attempt.playback_receipt_id.clone(),
+                    segment_id: attempt.segment_id.clone(),
+                    segment_revision: attempt.segment_revision,
+                    unique_played_ms,
+                    clip_duration_ms: attempt.clip_duration_ms,
+                    coverage_ratio,
+                },
+                true,
+            ))
+        })?;
+        if wrote {
+            self.track_write()?;
+        }
+        Ok(receipt)
+    }
+
+    /// Idempotent response-loss recovery for a finalized Couch receipt. This cannot mint evidence:
+    /// every authority coordinate and the interval-union digest must already exist durably.
+    pub(crate) fn replay_finalized_couch_playback_receipt_v1(
+        &self,
+        playback_receipt_id: &str,
+        client_attempt_id: &str,
+        session_binding_sha256: &str,
+        reviewer: &str,
+        intervals: &[DesktopPlaybackInterval],
+    ) -> AppResult<Option<DesktopPlaybackReceipt>> {
+        if uuid::Uuid::parse_str(playback_receipt_id).is_err() || uuid::Uuid::parse_str(client_attempt_id).is_err() {
+            return Err(AppError::Validation("Couch playback replay identity is invalid".into()));
+        }
+        type Replay = (String, i64, i64, i64, f64, String);
+        let replay: Option<Replay> = self
+            .conn
+            .query_row(
+                "SELECT session.segment_id,session.segment_revision,session.clip_duration_ms,
+                        receipt.played_ms,receipt.coverage_ratio,receipt.interval_union_sha256
+                   FROM desktop_playback_sessions_v4 session
+                   JOIN playback_receipts receipt
+                     ON receipt.authority_session_id=session.playback_receipt_id
+                    AND receipt.policy_version=?6
+                  WHERE session.playback_receipt_id=?1
+                    AND session.client_attempt_id=?2
+                    AND session.surface=?5
+                    AND session.session_binding_sha256=?3
+                    AND session.reviewer=?4 COLLATE NOCASE",
+                params![
+                    playback_receipt_id,
+                    client_attempt_id,
+                    session_binding_sha256,
+                    reviewer,
+                    "couch",
+                    DESKTOP_PLAYBACK_POLICY_VERSION,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?;
+        let Some((segment_id, segment_revision, clip_duration_ms, stored_played_ms, coverage_ratio, stored_hash)) =
+            replay
+        else {
+            return Ok(None);
+        };
+        let (unique_played_ms, supplied_hash) = validate_desktop_playback_intervals(intervals, clip_duration_ms)?;
+        if unique_played_ms != stored_played_ms || supplied_hash != stored_hash {
+            return Err(AppError::Validation(
+                "Couch playback receipt replay carries a different interval union".into(),
+            ));
+        }
+        Ok(Some(DesktopPlaybackReceipt {
+            playback_receipt_id: playback_receipt_id.to_string(),
+            segment_id,
+            segment_revision,
+            unique_played_ms,
+            clip_duration_ms,
+            coverage_ratio,
+        }))
+    }
+
+    pub(crate) fn couch_playback_proof_v4(
+        &self,
+        segment_id: &str,
+        revision: i64,
+        content_hash: &str,
+        reviewer: &str,
+        session_binding_sha256: &str,
+        playback_receipt_id: &str,
+    ) -> AppResult<Option<PlaybackDecisionProof>> {
+        if uuid::Uuid::parse_str(playback_receipt_id).is_err()
+            || !is_canonical_audio_content_hash(content_hash)
+            || session_binding_sha256.len() != 64
+        {
+            return Ok(None);
+        }
+        let binding: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT segment.audio_path,session.grant_source_path_sha256
+                   FROM desktop_playback_sessions_v4 session
+                   JOIN speech_segments segment ON segment.id=session.segment_id
+                  WHERE session.playback_receipt_id=?1
+                    AND session.surface='couch'
+                    AND session.session_binding_sha256=?2
+                    AND session.reviewer=?3 COLLATE NOCASE
+                    AND session.segment_id=?4
+                    AND session.segment_revision=?5
+                    AND session.audio_content_hash=?6",
+                params![playback_receipt_id, session_binding_sha256, reviewer, segment_id, revision, content_hash,],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((audio_path, issued_source_hash)) = binding else {
+            return Ok(None);
+        };
+        if canonical_grant_source_path_sha256(Path::new(&audio_path))? != issued_source_hash {
+            return Ok(None);
+        }
+        let source_lease = crate::media::verify_current_source_lease(Path::new(&audio_path), content_hash)
+            .map_err(|error| AppError::Validation(format!("{PLAYBACK_EVIDENCE_CHANGED}: {error}")))?;
+        let Some((source_start_ms, source_end_ms)) = self.segment_source_span(segment_id)? else {
+            return Ok(None);
+        };
+        let sufficient = has_sufficient_desktop_playback_evidence_v4_on(
+            &self.conn,
+            segment_id,
+            revision,
+            content_hash,
+            source_start_ms,
+            source_end_ms,
+            Some(reviewer),
+            playback_receipt_id,
+        )?;
+        Ok(sufficient.then_some(PlaybackDecisionProof {
+            segment_revision: revision,
+            audio_content_hash: content_hash.to_string(),
+            source_start_ms,
+            source_end_ms,
+            authority_session_id: Some(playback_receipt_id.to_string()),
+            source_lease: Some(source_lease),
+        }))
+    }
+
+    pub(crate) fn desktop_playback_proof_v4(
+        &self,
+        segment_id: &str,
+        revision: i64,
+        content_hash: &str,
+        playback_receipt_id: &str,
+        source_lease: Option<crate::media::VerifiedMediaSourceLease>,
+    ) -> AppResult<Option<PlaybackDecisionProof>> {
+        if uuid::Uuid::parse_str(playback_receipt_id).is_err() || !is_canonical_audio_content_hash(content_hash) {
+            return Ok(None);
+        }
+        let source_binding: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT segment.audio_path, session.grant_source_path_sha256
+                   FROM desktop_playback_sessions_v4 session
+                   JOIN speech_segments segment ON segment.id=session.segment_id
+                  WHERE session.playback_receipt_id=?1 AND segment.id=?2",
+                params![playback_receipt_id, segment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((current_audio_path, issued_source_hash)) = source_binding else {
+            return Ok(None);
+        };
+        if canonical_grant_source_path_sha256(Path::new(&current_audio_path))? != issued_source_hash {
+            return Ok(None);
+        }
+        let source_lease = match source_lease {
+            Some(lease)
+                if lease.audio_content_hash == content_hash
+                    && canonical_grant_source_path_sha256(&lease.source_path)? == issued_source_hash =>
+            {
+                lease
+            }
+            Some(_) => return Ok(None),
+            None => crate::media::verify_current_source_lease(Path::new(&current_audio_path), content_hash)
+                .map_err(|error| AppError::Validation(format!("{PLAYBACK_EVIDENCE_CHANGED}: {error}")))?,
+        };
+        let Some((source_start_ms, source_end_ms)) = self.segment_source_span(segment_id)? else {
+            return Ok(None);
+        };
+        let sufficient = has_sufficient_desktop_playback_evidence_v4_on(
+            &self.conn,
+            segment_id,
+            revision,
+            content_hash,
+            source_start_ms,
+            source_end_ms,
+            None,
+            playback_receipt_id,
+        )?;
+        Ok(sufficient.then_some(PlaybackDecisionProof {
+            segment_revision: revision,
+            audio_content_hash: content_hash.to_string(),
+            source_start_ms,
+            source_end_ms,
+            authority_session_id: Some(playback_receipt_id.to_string()),
+            source_lease: Some(source_lease),
+        }))
+    }
+
+    pub(crate) fn desktop_playback_media_grant_id(&self, playback_receipt_id: &str) -> AppResult<Option<String>> {
+        if uuid::Uuid::parse_str(playback_receipt_id).is_err() {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT session.media_grant_id
+                   FROM desktop_playback_sessions_v4 session
+                   JOIN playback_receipts receipt
+                     ON receipt.authority_session_id=session.playback_receipt_id
+                    AND receipt.policy_version=?2
+                  WHERE session.playback_receipt_id=?1",
+                params![playback_receipt_id, DESKTOP_PLAYBACK_POLICY_VERSION],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn desktop_playback_recovery_source_identity(
+        &self,
+        segment_id: &str,
+        revision: i64,
+        playback_receipt_id: &str,
+    ) -> AppResult<Option<(PathBuf, String)>> {
+        let row: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT segment.audio_path, segment.audio_content_hash, session.grant_source_path_sha256
+                   FROM desktop_playback_sessions_v4 session
+                   JOIN playback_receipts receipt
+                     ON receipt.authority_session_id=session.playback_receipt_id
+                    AND receipt.policy_version=?4
+                   JOIN speech_segments segment ON segment.id=session.segment_id
+                  WHERE session.playback_receipt_id=?1
+                    AND segment.id=?2
+                    AND COALESCE(segment.review_revision,0)=?3
+                    AND segment.audio_content_hash=session.audio_content_hash
+                    AND receipt.segment_revision=?3",
+                params![playback_receipt_id, segment_id, revision, DESKTOP_PLAYBACK_POLICY_VERSION],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((audio_path, audio_content_hash, issued_source_hash)) = row else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(audio_path);
+        if canonical_grant_source_path_sha256(&path)? != issued_source_hash {
+            return Ok(None);
+        }
+        Ok(Some((path, audio_content_hash)))
+    }
+
     /// Record an untrusted client observation without making the caller invent server-owned identity.
+    #[cfg(test)]
     pub(crate) fn record_playback_observation(&self, observation: PlaybackReceiptObservation) -> AppResult<()> {
         self.record_playback_receipt(&PlaybackReceipt {
             segment_id: observation.segment_id,
@@ -8627,10 +11585,11 @@ impl Database {
         })
     }
 
-    /// A reviewer's own record that they HEARD this exact clip at this exact revision.
+    /// A renderer-originated record of canonical media traversal for this exact clip revision.
     ///
     /// `played_ms` is cumulative MEDIA time advanced, never wall-clock and never a `play()` call —
-    /// download, metadata load and an autoplay attempt all prove nothing about listening.
+    /// download, metadata load and an autoplay attempt do not establish media traversal. Even a valid
+    /// receipt does not prove human attention or comprehension.
     ///
     /// EVERY identity field is resolved HERE, from the row — revision, decoded-PCM content hash, and the
     /// coverage denominator alike. The struct's values for those three are treated as claims and
@@ -8822,20 +11781,20 @@ impl Database {
         Ok(())
     }
 
-    /// Is there evidence this reviewer heard ENOUGH of the CURRENT clip to judge it?
+    /// Is there sufficient renderer-reported canonical-media traversal for the CURRENT clip identity?
     ///
     /// Deliberately strict about identity, not just quantity:
     ///   * the receipt must name this segment AND the revision being decided — a correction changes
     ///     the text under judgement, so the previous listen does not carry over;
     ///   * it must name the decoded-PCM CONTENT HASH now on file, so a receipt cannot be replayed against a
     ///     different clip or survive the audio being swapped underneath it;
-    ///   * coverage is cumulative media time, so a paused, seeked or replayed listen still counts
-    ///     honestly and a download does not count at all.
+    ///   * coverage is cumulative media time, so paused, seeked or replayed traversal remains exact
+    ///     and a download does not count at all.
     ///
-    /// `reviewer` is part of the evidence's identity: listening is PERSONAL.
+    /// `reviewer` is part of the evidence's identity: renderer evidence is not transferable.
     ///
     /// Found by the hunt: matching on segment+revision+content-hash alone let reviewer A's full
-    /// listen evidence reviewer B's blind verdict (a clip A heard and skipped goes to B's queue
+    /// traversal evidence authorize reviewer B's blind verdict (a clip A encountered and skipped goes to B's queue
     /// with A's receipt still valid for it). `None` matches only anonymous (desktop-minted)
     /// receipts, never a named phone receipt, and vice versa: SQL `IS` treats NULL as its own
     /// identity.
@@ -8925,8 +11884,18 @@ impl Database {
         if audit_source.is_none() && audit_operation.is_some() && timestamp_ms.is_none() {
             let typed_payload_is_exact =
                 expected_revision.zip(audit_operation).is_some_and(|(revision, (_, supplied_hash))| {
-                    supplied_hash
-                        == desktop_review_v1_payload_hash(segment_id, revision, decision, corrected_transcript)
+                    required_playback.and_then(|playback| playback.authority_session_id.as_deref()).is_some_and(
+                        |authority_id| {
+                            supplied_hash
+                                == desktop_review_v1_payload_hash(
+                                    segment_id,
+                                    revision,
+                                    decision,
+                                    corrected_transcript,
+                                    authority_id,
+                                )
+                        },
+                    )
                 });
             if !typed_payload_is_exact {
                 return Err(AppError::Validation(
@@ -8997,6 +11966,7 @@ impl Database {
         // authoritative for an irreversible human decision.
         let (commit, wrote) = self.with_full_sync(|| {
             let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            Self::require_canonical_operation_namespace_on(&tx, operation_id)?;
             if supplied_desktop_operation {
                 if let Some(commit) =
                     Self::desktop_human_decision_replay_on(&tx, operation_id, operation_payload_hash, segment_id)?
@@ -9026,6 +11996,96 @@ impl Database {
                 tx.rollback()?;
                 return Ok((None, false));
             }
+            // The legacy phone writers exist only in the test build. Keep their broad historical
+            // characterization useful without weakening the production boundary: synthesize a
+            // structurally exact policy-4 Couch authority inside THIS SAME transaction. A failing
+            // CAS/effect/ledger assertion rolls the fixture authority back with the decision. Real
+            // production callers can reach this function only through the playback-proof-bearing
+            // writer below, and the adversarial Couch endpoint tests exercise that path directly.
+            #[cfg(test)]
+            let synthetic_playback = if audit_source == Some("couch") && required_playback.is_none() {
+                let reviewer = annotator
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| AppError::Validation("test Couch authority has no reviewer".into()))?;
+                let audio_content_hash =
+                    stored_content_hash.clone().filter(|value| is_canonical_audio_content_hash(value)).ok_or_else(
+                        || AppError::Validation("test Couch authority has no canonical audio identity".into()),
+                    )?;
+                let (source_start_ms, source_end_ms) = canonical_source_span(prior.alignment_json.as_deref())
+                    .ok_or_else(|| AppError::Validation("test Couch authority has no canonical source span".into()))?;
+                if !source_span_matches_duration(source_start_ms, source_end_ms, prior.duration_ms) {
+                    return Err(AppError::Validation("test Couch authority span disagrees with duration".into()));
+                }
+                let playback_receipt_id = uuid::Uuid::new_v4().to_string();
+                let issued_at_ms = 1_i64;
+                let synthetic_source_hash = "e".repeat(64);
+                let (_, interval_union_sha256) = validate_desktop_playback_intervals(
+                    &[DesktopPlaybackInterval { start_ms: 0, end_ms: prior.duration_ms }],
+                    prior.duration_ms,
+                )?;
+                tx.execute(
+                    "INSERT INTO desktop_playback_sessions_v4
+                        (playback_receipt_id,media_grant_id,client_attempt_id,surface,
+                         session_binding_sha256,grant_source_path_sha256,segment_id,segment_revision,
+                         audio_content_hash,reviewer,clip_duration_ms,source_start_ms,source_end_ms,
+                         issued_at_ms,expires_at_ms)
+                     VALUES (?1,?2,?3,'couch',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![
+                        playback_receipt_id,
+                        uuid::Uuid::new_v4().to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        "f".repeat(64),
+                        synthetic_source_hash,
+                        segment_id,
+                        prior_revision,
+                        audio_content_hash,
+                        reviewer,
+                        prior.duration_ms,
+                        source_start_ms,
+                        source_end_ms,
+                        issued_at_ms,
+                        issued_at_ms + 60_000,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO desktop_playback_intervals_v4
+                        (playback_receipt_id,ordinal,start_ms,end_ms,observed_at_ms)
+                     VALUES (?1,0,0,?2,?3)",
+                    params![playback_receipt_id, prior.duration_ms, issued_at_ms],
+                )?;
+                tx.execute(
+                    "INSERT INTO playback_receipts
+                        (segment_id,segment_revision,audio_fingerprint,reviewer,session_id,
+                         started_at_ms,played_ms,clip_duration_ms,coverage_ratio,policy_version,
+                         source_start_ms,source_end_ms,authority_session_id,interval_union_sha256)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?7,1.0,4,?8,?9,?5,?10)",
+                    params![
+                        segment_id,
+                        prior_revision,
+                        audio_content_hash,
+                        reviewer,
+                        playback_receipt_id,
+                        issued_at_ms,
+                        prior.duration_ms,
+                        source_start_ms,
+                        source_end_ms,
+                        interval_union_sha256,
+                    ],
+                )?;
+                Some(PlaybackDecisionProof {
+                    segment_revision: prior_revision,
+                    audio_content_hash,
+                    source_start_ms,
+                    source_end_ms,
+                    authority_session_id: Some(playback_receipt_id),
+                    source_lease: None,
+                })
+            } else {
+                None
+            };
+            #[cfg(not(test))]
+            let synthetic_playback: Option<PlaybackDecisionProof> = None;
+            let required_playback = required_playback.or(synthetic_playback.as_ref());
             if let Some(limit) = decision_limit {
                 let Some(reviewer) = annotator else {
                     return Err(AppError::Validation("controlled-review decision has no reviewer".into()));
@@ -9042,17 +12102,85 @@ impl Database {
                     tx.rollback()?;
                     return Ok((None, false));
                 }
-                if !has_sufficient_playback_evidence_on(
-                    &tx,
-                    segment_id,
-                    proof.segment_revision,
-                    &proof.audio_content_hash,
-                    proof.source_start_ms,
-                    proof.source_end_ms,
-                    annotator,
-                )? {
+                let evidence_is_sufficient = if let Some(playback_receipt_id) = proof.authority_session_id.as_deref() {
+                    let issued_source_hash: Option<String> = tx
+                        .query_row(
+                            "SELECT grant_source_path_sha256
+                               FROM desktop_playback_sessions_v4
+                              WHERE playback_receipt_id=?1 AND segment_id=?2",
+                            params![playback_receipt_id, segment_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let synthetic_authority = synthetic_playback.as_ref().is_some_and(|synthetic| {
+                        synthetic.authority_session_id.as_deref() == Some(playback_receipt_id)
+                    });
+                    let current_source_hash = if synthetic_authority {
+                        issued_source_hash
+                            .clone()
+                            .ok_or_else(|| AppError::Validation("test Couch authority has no source identity".into()))?
+                    } else {
+                        canonical_grant_source_path_sha256(Path::new(&prior.audio_path))?
+                    };
+                    let leased_source_matches = synthetic_authority
+                        || proof.source_lease.as_ref().is_some_and(|lease| {
+                            lease.audio_content_hash == proof.audio_content_hash
+                                && canonical_grant_source_path_sha256(&lease.source_path)
+                                    .is_ok_and(|lease_hash| lease_hash == current_source_hash)
+                        });
+                    if issued_source_hash.as_deref() != Some(current_source_hash.as_str()) || !leased_source_matches {
+                        tx.rollback()?;
+                        return Ok((None, false));
+                    }
+                    has_sufficient_desktop_playback_evidence_v4_on(
+                        &tx,
+                        segment_id,
+                        proof.segment_revision,
+                        &proof.audio_content_hash,
+                        proof.source_start_ms,
+                        proof.source_end_ms,
+                        annotator,
+                        playback_receipt_id,
+                    )?
+                } else {
+                    has_sufficient_playback_evidence_on(
+                        &tx,
+                        segment_id,
+                        proof.segment_revision,
+                        &proof.audio_content_hash,
+                        proof.source_start_ms,
+                        proof.source_end_ms,
+                        annotator,
+                    )?
+                };
+                if !evidence_is_sufficient {
                     tx.rollback()?;
                     return Ok((None, false));
+                }
+                if audit_source == Some("couch") {
+                    let reviewer = annotator.ok_or_else(|| {
+                        AppError::Validation("Couch policy-4 playback consumption has no reviewer".into())
+                    })?;
+                    let authority_id = proof.authority_session_id.as_deref().ok_or_else(|| {
+                        AppError::Validation(
+                            "E_NO_PLAYBACK_EVIDENCE: Couch verdicts require one exact policy-4 authority".into(),
+                        )
+                    })?;
+                    consume_couch_playback_authority_on(
+                        &tx,
+                        authority_id,
+                        "canonical",
+                        operation_id,
+                        reviewer,
+                        segment_id,
+                        timestamp_ms.unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|duration| duration.as_millis() as i64)
+                                .unwrap_or(1)
+                                .max(1)
+                        }),
+                    )?;
                 }
             }
 
@@ -9222,8 +12350,7 @@ impl Database {
                      playback_guard_version)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6,
                          (SELECT duration_ms FROM speech_segments WHERE id = ?1), ?7, ?8, ?9, ?10,
-                         ?11, ?12, ?13,
-                         'content-hash-raw-counter-v3')",
+                          ?11, ?12, ?13, ?14)",
                     params![
                         segment_id,
                         who,
@@ -9238,6 +12365,11 @@ impl Database {
                         &served_transcript,
                         prior_revision,
                         crate::GIT_SHA,
+                        if required_playback.and_then(|proof| proof.authority_session_id.as_ref()).is_some() {
+                            "interval-authority-v4"
+                        } else {
+                            "content-hash-raw-counter-v3"
+                        },
                     ],
                 )?;
                 let event_id = tx.last_insert_rowid();
@@ -9261,6 +12393,15 @@ impl Database {
             let effect_requested_action = (effect_source == "desktop").then_some(requested_action.as_str());
             let effect_requested_transcript =
                 (effect_source == "desktop").then_some(desktop_requested_transcript.as_deref()).flatten();
+            let desktop_review_contract_version = review_draft_revision.is_some().then_some(1_i64);
+            let playback_authority_session_id =
+                if desktop_review_contract_version == Some(1) || effect_source == "couch" {
+                    Some(required_playback.and_then(|playback| playback.authority_session_id.as_deref()).ok_or_else(
+                        || AppError::Validation("review effect has no exact policy-4 playback authority".into()),
+                    )?)
+                } else {
+                    None
+                };
             tx.execute(
                 "INSERT INTO human_decision_effect_events
                  (review_event_id, segment_id, reviewer, source, operation_id,
@@ -9269,9 +12410,11 @@ impl Database {
                   decision_rationale, requested_action, requested_transcript, requested_timestamp_ms, prior_revision,
                   decision_revision, prior_verified, prior_annotated_transcript, prior_verdict,
                   prior_verdict_transcript, prior_rationale, prior_escalated, prior_human_decision,
-                  prior_corrected_at, prior_reviewed_by)
+                  prior_corrected_at, prior_reviewed_by, desktop_review_contract_version,
+                  playback_authority_session_id)
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                      ?28, ?29)",
                 params![
                     review_event_id,
                     segment_id,
@@ -9300,6 +12443,8 @@ impl Database {
                     prior.human_decision,
                     prior.corrected_at,
                     prior.reviewed_by,
+                    desktop_review_contract_version,
+                    playback_authority_session_id,
                 ],
             )?;
             let effect_event_id = tx.last_insert_rowid();

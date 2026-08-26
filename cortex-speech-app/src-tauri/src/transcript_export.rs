@@ -196,14 +196,10 @@ fn ensure_single_source_for_subtitles(cues: &[Cue], format: TranscriptFormat) ->
 /// Read the exportable segments and write the transcript/subtitle file atomically.
 pub fn export_transcript(db: &Database, path: &std::path::Path, format: TranscriptFormat) -> AppResult<()> {
     crate::review_campaign::require_export_unblocked(db, "transcript export")?;
-    // Include gold/holdout (the owner wants THEIR transcripts — this is not a training artifact), but
-    // drop human-rejected clips and not-yet-transcribed placeholders: the same "not real output"
-    // filter the dataset export uses, minus the training-leakage holdout exclusion.
-    let segments: Vec<SpeechSegment> = db
-        .get_segments(None)?
-        .into_iter()
-        .filter(|s| !quality::is_human_rejected(s) && !quality::is_effective_placeholder(s))
-        .collect();
+    // Include eval holdouts (the owner wants THEIR transcripts — this is not a training artifact),
+    // while still applying every universal export exclusion at the shared DB-aware root. In
+    // particular, withdrawn consent must block TXT/SRT/VTT just as it blocks dataset/audio exports.
+    let segments = export::exclude_unexportable_segments_including_holdouts(db, db.get_segments(None)?)?;
     let cues = build_cues(&segments);
     // Fail closed BEFORE writing: a multi-source subtitle file would ship broken (resetting) timings.
     ensure_single_source_for_subtitles(&cues, format)?;
@@ -332,5 +328,76 @@ mod tests {
         let cues = build_cues(&[seg("a", "f.wav", "   ", 0, 1000), seg("b", "f.wav", "real", 1000, 2000)]);
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].text, "real");
+    }
+
+    #[test]
+    fn transcript_export_excludes_a_durable_technical_unusable_mark() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        for (id, text) in [("keep-transcript", "دەقی باش"), ("drop-unreadable", "دەقی نەنێردراو")] {
+            db.insert_segment(&SpeechSegment {
+                id: id.into(),
+                audio_path: format!("/{id}.wav"),
+                raw_transcript: text.into(),
+                duration_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let base_revision = db.segment_review_revision("drop-unreadable").unwrap().unwrap();
+        let source = db.technical_unusable_source_snapshot("drop-unreadable").unwrap().unwrap();
+        db.mark_segment_technically_unusable_after_verified_failure(
+            "drop-unreadable",
+            base_revision,
+            "decodeFailed",
+            &source.source_path_sha256,
+            source.audio_content_hash.as_deref(),
+            "00000000-0000-4000-8000-000000000924",
+        )
+        .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("transcript.txt");
+        export_transcript(&db, &output, TranscriptFormat::Txt).unwrap();
+        let text = std::fs::read_to_string(output).unwrap();
+        assert!(text.contains("دەقی باش"));
+        assert!(!text.contains("دەقی نەنێردراو"), "technical-unusable text escaped transcript export");
+    }
+
+    #[test]
+    fn every_transcript_format_excludes_withdrawn_recording_rights() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        for (id, path, text) in
+            [("keep-rights", "/kept.wav", "دەقی ڕێگەپێدراو"), ("drop-revoked", "/revoked.wav", "دەقی هەڵوەشاوە")]
+        {
+            db.insert_segment(&SpeechSegment {
+                id: id.into(),
+                audio_path: path.into(),
+                raw_transcript: text.into(),
+                duration_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        assert_eq!(db.revoke_recording("/revoked.wav").unwrap(), 1, "fixture revokes exactly one recording");
+        assert!(
+            db.rights_for_segment("drop-revoked").unwrap().is_revoked(),
+            "fixture precondition: revoked rights must be durable before export"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        for (format, extension) in
+            [(TranscriptFormat::Txt, "txt"), (TranscriptFormat::Srt, "srt"), (TranscriptFormat::Vtt, "vtt")]
+        {
+            let output = temp.path().join(format!("transcript.{extension}"));
+            export_transcript(&db, &output, format).unwrap();
+            let body = std::fs::read_to_string(&output).unwrap();
+            assert!(body.contains("دەقی ڕێگەپێدراو"), "kept text missing from {extension}: {body:?}");
+            assert!(
+                !body.contains("دەقی هەڵوەشاوە"),
+                "withdrawn-consent text escaped {extension} transcript export: {body:?}"
+            );
+        }
     }
 }

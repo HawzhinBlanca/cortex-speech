@@ -19,12 +19,16 @@
  * protections; the policy now checks both.
  */
 const { execFileSync, execSync } = require('child_process');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
 /** The production profile this must never touch. */
 const PROD_PROFILE = process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech') : null;
+const DISPOSABLE_PREFIX = 'cortex-e2e-';
+const DISPOSABLE_SENTINEL = '.cortex-e2e-disposable.json';
+const DISPOSABLE_PURPOSE = 'cortex-e2e-disposable-profile';
 const normPath = (p) =>
   path
     .resolve(p)
@@ -32,29 +36,80 @@ const normPath = (p) =>
     .toLowerCase();
 
 /**
- * Resolve the profile this run may use, refusing the production one outright.
+ * Mint the only kind of profile a destructive harness may use.
  *
- * A caller-supplied `CORTEX_APP_DATA_DIR` is honoured (so a post-mortem can point a run at a kept
- * profile) but is validated the same way: naming the real library explicitly is not permission, it is
- * the mistake this refuses.
+ * Caller-supplied paths are never accepted here. A path check against the default `%APPDATA%`
+ * profile is not containment: the owner may relocate the production library, and a junction can
+ * make an apparently harmless path resolve to it. The harness therefore creates a fresh, canonical
+ * child of the temp root, writes an unguessable run-bound sentinel, then asks `clear_db.py` to create
+ * the matching marker inside a brand-new SQLite database. Destructive setup independently verifies
+ * both pieces before it can back up or delete a row.
  */
 function resolveDisposableProfile(harness) {
   const supplied = process.env.CORTEX_APP_DATA_DIR;
   if (supplied) {
-    if (
-      PROD_PROFILE &&
-      (normPath(supplied) === normPath(PROD_PROFILE) ||
-        normPath(supplied).startsWith(normPath(PROD_PROFILE) + path.sep))
-    ) {
-      console.error(
-        `REFUSED: CORTEX_APP_DATA_DIR points at the REAL profile (${PROD_PROFILE}). ` +
-          `${harness} must never run against the production library — use a disposable directory.`,
-      );
-      process.exit(1);
-    }
-    return { dataDir: supplied, ours: false };
+    console.error(
+      `REFUSED: caller-supplied CORTEX_APP_DATA_DIR (${supplied}) is not a harness-minted profile. ` +
+        `${harness} creates its own disposable directory; relocated profiles and path aliases are never accepted.`,
+    );
+    process.exit(1);
   }
-  return { dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-e2e-')), ours: true };
+  if (!/^[A-Za-z0-9_.-]{1,80}$/.test(harness)) {
+    throw new Error(`invalid disposable-profile harness identity: ${harness}`);
+  }
+
+  const tempRoot = fs.realpathSync.native(os.tmpdir());
+  const dataDir = fs.mkdtempSync(path.join(tempRoot, DISPOSABLE_PREFIX));
+  const canonicalDataDir = fs.realpathSync.native(dataDir);
+  if (
+    normPath(path.dirname(canonicalDataDir)) !== normPath(tempRoot) ||
+    !path.basename(canonicalDataDir).startsWith(DISPOSABLE_PREFIX)
+  ) {
+    throw new Error(`REFUSED: minted profile escaped the canonical temp root (${canonicalDataDir})`);
+  }
+
+  const profileToken = crypto.randomBytes(32).toString('hex');
+  const sqliteApplicationId = (Number.parseInt(profileToken.slice(0, 8), 16) & 0x7fffffff) || 1;
+  const sentinel = {
+    schema: 1,
+    purpose: DISPOSABLE_PURPOSE,
+    profileToken,
+    sqliteApplicationId,
+    harness,
+    canonicalProfile: canonicalDataDir,
+    createdAtUtc: new Date().toISOString(),
+  };
+  const sentinelPath = path.join(canonicalDataDir, DISPOSABLE_SENTINEL);
+  const sentinelFd = fs.openSync(sentinelPath, 'wx', 0o600);
+  try {
+    fs.writeFileSync(sentinelFd, JSON.stringify(sentinel) + '\n', 'utf8');
+    fs.fsyncSync(sentinelFd);
+  } finally {
+    fs.closeSync(sentinelFd);
+  }
+
+  try {
+    execFileSync(process.env.PYTHON || 'python', [path.join(__dirname, 'clear_db.py'), '--initialize-test-profile'], {
+      stdio: 'pipe',
+      env: {
+        ...process.env,
+        CORTEX_APP_DATA_DIR: canonicalDataDir,
+        CORTEX_TEST_PROFILE_TOKEN: profileToken,
+        CORTEX_TEST_PROFILE_HARNESS: harness,
+      },
+    });
+  } catch (e) {
+    const detail = e && e.stderr ? e.stderr.toString().trim() : e.message;
+    throw new Error(`could not initialize the disposable SQLite profile marker: ${detail}`);
+  }
+
+  return {
+    dataDir: canonicalDataDir,
+    ours: true,
+    profileToken,
+    profileHarness: harness,
+    sentinelPath,
+  };
 }
 
 /**

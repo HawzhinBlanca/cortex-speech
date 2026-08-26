@@ -1,5 +1,5 @@
-import { invoke } from '@tauri-apps/api/core';
 import { writable } from 'svelte/store';
+import { canRedo, canUndo, redo, undo } from '../commands';
 import { isTauriRuntime } from '../runtime';
 
 export interface HistoryState {
@@ -26,11 +26,8 @@ function createHistoryStore() {
     }
 
     try {
-      const [canUndo, canRedo] = await Promise.all([
-        invoke<boolean>('can_undo'),
-        invoke<boolean>('can_redo'),
-      ]);
-      store.update((s) => ({ ...s, canUndo, canRedo }));
+      const [undoAvailable, redoAvailable] = await Promise.all([canUndo(), canRedo()]);
+      store.update((s) => ({ ...s, canUndo: undoAvailable, canRedo: redoAvailable }));
     } catch {
       store.update((s) => ({ ...s, canUndo: false, canRedo: false }));
     }
@@ -46,7 +43,7 @@ function createHistoryStore() {
 
       store.update((s) => ({ ...s, processing: true }));
       try {
-        const description = await invoke<string | null>('undo');
+        const description = await undo();
         await refresh();
         return description;
       } finally {
@@ -61,7 +58,7 @@ function createHistoryStore() {
 
       store.update((s) => ({ ...s, processing: true }));
       try {
-        const description = await invoke<string | null>('redo');
+        const description = await redo();
         await refresh();
         return description;
       } finally {

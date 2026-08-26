@@ -114,6 +114,12 @@ export async function installTauriMock(page: Page): Promise<void> {
           searchQuery?: string;
           sortOrder?: string;
           id?: string;
+          audioPath?: string;
+          segmentId?: string;
+          expectedRevision?: number;
+          clientAttemptId?: string;
+          playbackReceiptId?: string;
+          intervals?: Array<{ startMs?: number; endMs?: number }>;
         },
       ) => {
         switch (cmd) {
@@ -175,11 +181,41 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'get_dataset_certificate':
             return mockCertificate;
           case 'register_media_asset':
-            return { id: 'e2e-audio-grant' };
+          case 'register_review_media_asset':
+            return {
+              id: 'e2e-audio-grant',
+              path: String(args?.audioPath ?? ''),
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            };
           case 'get_media_asset_url':
             // Valid empty WAV. Keeping playback on a data URL exercises the successful grant path
             // without leaking test requests to the Vite server or flooding logs with expected 404s.
             return 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+          case 'begin_desktop_playback_session_v1':
+            return {
+              playbackReceiptId: crypto.randomUUID(),
+              segmentId: String(args?.segmentId ?? mockSegment.id),
+              segmentRevision: Number(args?.expectedRevision ?? 0),
+              clipDurationMs: mockSegment.durationMs,
+              expiresAtMs: Date.now() + 30 * 60_000,
+            };
+          case 'finalize_desktop_playback_session_v1': {
+            const uniquePlayedMs = (args?.intervals ?? []).reduce(
+              (total, interval) =>
+                total + Math.max(0, Number(interval.endMs ?? 0) - Number(interval.startMs ?? 0)),
+              0,
+            );
+            return {
+              playbackReceiptId: String(args?.playbackReceiptId ?? ''),
+              segmentId: String(args?.segmentId ?? mockSegment.id),
+              segmentRevision: Number(args?.expectedRevision ?? 0),
+              uniquePlayedMs,
+              clipDurationMs: mockSegment.durationMs,
+              coverageRatio: Math.min(1, uniquePlayedMs / mockSegment.durationMs),
+            };
+          }
+          case 'cancel_desktop_playback_session_v1':
+            return true;
           case 'get_waveform':
             return [0.1, 0.35, 0.8, 0.4, 0.15];
           case 'get_audio_duration':

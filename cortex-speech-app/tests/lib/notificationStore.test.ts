@@ -32,6 +32,28 @@ describe('notificationStore', () => {
     expect(state[0].type).toBe('error');
   });
 
+  it('fails closed on backend prose while retaining typed recovery metadata', () => {
+    notifications.error('Save failed', {
+      cause: {
+        schema: 1,
+        code: 'WRITE_FAILED',
+        message: 'SQL failed at C:\\private\\library.db',
+        retryable: true,
+        suggestedAction: 'retry',
+        operationId: '018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10',
+      },
+    });
+    const notification = get(notifications)[0];
+    expect(notification.detail).toBe('WRITE_FAILED · 018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10');
+    expect(notification.retryable).toBe(true);
+    expect(notification.suggestedAction).toBe('retry');
+    expect(JSON.stringify(notification)).not.toMatch(/SQL|private|library\.db/);
+
+    notifications.clear();
+    notifications.error('Save failed', { detail: 'stack: C:\\private\\library.db' });
+    expect(get(notifications)[0].detail).toBeUndefined();
+  });
+
   it('adds warning notification', () => {
     notifications.warning('warning!');
     const state = get(notifications);

@@ -149,22 +149,32 @@ pub(crate) fn inspect_snapshot_restore_plan(
 pub(crate) fn prepare_named_restore_artifacts<F>(
     snapshot_dir: &Path,
     source: &Path,
-    before_final_verify: F,
+    after_private_capture: F,
 ) -> Result<(SnapshotRestorePlan, crate::db::Database), String>
 where
     F: FnOnce(),
 {
-    let manifest_verified = crate::snapshot::verify_snapshot_manifest_for_restore(snapshot_dir)?;
-    let plan = inspect_snapshot_restore_plan(snapshot_dir, source, manifest_verified)?;
-    let staged = crate::db::Database::stage_restore_source(source).map_err(|error| error.to_string())?;
-    before_final_verify();
-    // Re-hash after BOTH config-plan capture and DB staging. From this point onward commit uses only
-    // owned plan bytes + the staged in-memory DB, so a promoted-source mutation cannot cross the
-    // manifest boundary or create a mixed DB/config generation.
-    let reverified = crate::snapshot::verify_snapshot_manifest_for_restore(snapshot_dir)?;
-    if reverified != manifest_verified {
-        return Err("snapshot manifest presence changed during restore preflight".to_string());
+    let expected_source = snapshot_dir.join("cortex-speech.db");
+    if source != expected_source {
+        return Err(format!(
+            "named restore database {} is not the database declared by snapshot {}",
+            source.display(),
+            snapshot_dir.display()
+        ));
     }
+
+    // Capture every source artifact through the same stream that computes its digest. The injected
+    // boundary runs only after that private copy exists; a whole-tree, DB-only, config-only or
+    // in-place byte swap is detected by the typed generation digest before anything is parsed.
+    let image = crate::snapshot::VerifiedSnapshotImage::capture(snapshot_dir, after_private_capture)?;
+    image.verify_owned_digest()?;
+
+    // These are the only parse/stage paths. Neither config planning nor SQLite migration opens the
+    // mutable promoted source again, so a later path replacement cannot mix generations.
+    let plan = inspect_snapshot_restore_plan(image.root(), &image.database_path(), image.manifest_verified())?;
+    image.verify_owned_digest()?;
+    let staged = crate::db::Database::stage_restore_source(image.database_path()).map_err(|error| error.to_string())?;
+    image.verify_owned_digest()?;
     Ok((plan, staged))
 }
 
@@ -541,6 +551,136 @@ pub(crate) fn install_snapshot_restore_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restore_segment(id: &str, transcript: &str) -> crate::db::SpeechSegment {
+        crate::db::SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("C:/snapshot/{id}.wav"),
+            raw_transcript: transcript.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn snapshot_fixture(
+        parent: &Path,
+        name: &str,
+        segment_id: &str,
+        transcript: &str,
+        vad_threshold: f32,
+        timestamp: u64,
+    ) -> PathBuf {
+        let data_dir = parent.join(name);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        AppSettings { vad_threshold, ..AppSettings::default() }.save(&data_dir.join("settings.json")).unwrap();
+        let database_path = data_dir.join("cortex-speech.db");
+        let database = crate::db::Database::open(database_path.to_string_lossy().as_ref()).unwrap();
+        database.initialize().unwrap();
+        database.insert_segment(&restore_segment(segment_id, transcript)).unwrap();
+        let snapshot = crate::snapshot::take_snapshot_at(&database, &data_dir, 5, timestamp).unwrap().unwrap();
+        drop(database);
+        snapshot
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SnapshotSwap {
+        WholeValidGeneration,
+        DatabaseOnly,
+        ConfigOnly,
+        BytesAfterCaptureBeforeParse,
+    }
+
+    fn assert_snapshot_swap_refused_without_live_mutation(kind: SnapshotSwap) {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = snapshot_fixture(temp.path(), "selected", "selected", "selected truth", 0.61, 1001);
+        let replacement = snapshot_fixture(temp.path(), "replacement", "replacement", "replacement truth", 0.77, 2002);
+
+        let live_dir = temp.path().join("live");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        AppSettings { vad_threshold: 0.55, ..AppSettings::default() }.save(&live_dir.join("settings.json")).unwrap();
+        let live_database_path = live_dir.join("cortex-speech.db");
+        let live_database = crate::db::Database::open(live_database_path.to_string_lossy().as_ref()).unwrap();
+        live_database.initialize().unwrap();
+        live_database.insert_segment(&restore_segment("live", "live truth")).unwrap();
+        drop(live_database);
+        let live_database_before = std::fs::read(&live_database_path).unwrap();
+        let live_settings_before = std::fs::read(live_dir.join("settings.json")).unwrap();
+
+        let selected_db = selected.join("cortex-speech.db");
+        let hook_selected = selected.clone();
+        let hook_replacement = replacement.clone();
+        let error = prepare_named_restore_artifacts(&selected, &selected_db, move || match kind {
+            SnapshotSwap::WholeValidGeneration => {
+                let displaced = hook_selected.with_file_name("snapshot_1001.displaced");
+                std::fs::rename(&hook_selected, displaced).unwrap();
+                std::fs::rename(&hook_replacement, &hook_selected).unwrap();
+            }
+            SnapshotSwap::DatabaseOnly => {
+                std::fs::copy(hook_replacement.join("cortex-speech.db"), hook_selected.join("cortex-speech.db"))
+                    .unwrap();
+            }
+            SnapshotSwap::ConfigOnly => {
+                std::fs::copy(hook_replacement.join("settings.json"), hook_selected.join("settings.json")).unwrap();
+            }
+            SnapshotSwap::BytesAfterCaptureBeforeParse => {
+                std::fs::write(hook_selected.join("settings.json"), b"tampered after exact-byte capture").unwrap();
+            }
+        })
+        .err()
+        .expect("a selected snapshot generation swap must fail closed");
+
+        assert!(error.contains("generation digest mismatch"), "{kind:?}: {error}");
+        assert_eq!(std::fs::read(&live_database_path).unwrap(), live_database_before, "{kind:?}: live DB changed");
+        assert_eq!(
+            std::fs::read(live_dir.join("settings.json")).unwrap(),
+            live_settings_before,
+            "{kind:?}: live settings changed"
+        );
+        let live = crate::db::Database::open(live_database_path.to_string_lossy().as_ref()).unwrap();
+        assert!(live.get_segment_by_id("live").unwrap().is_some(), "{kind:?}: live truth disappeared");
+        assert!(live.get_segment_by_id("selected").unwrap().is_none(), "{kind:?}: selected truth leaked live");
+        assert!(live.get_segment_by_id("replacement").unwrap().is_none(), "{kind:?}: replacement truth leaked live");
+    }
+
+    #[test]
+    fn immutable_snapshot_image_stages_one_exact_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = snapshot_fixture(temp.path(), "selected", "selected", "selected truth", 0.61, 1001);
+        let selected_db = selected.join("cortex-speech.db");
+        let (plan, staged) = prepare_named_restore_artifacts(&selected, &selected_db, || {}).unwrap();
+
+        assert!(staged.get_segment_by_id("selected").unwrap().is_some());
+        let settings_action = plan
+            .optional
+            .iter()
+            .find(|(state, _)| state.live_file == "settings.json")
+            .map(|(_, action)| action)
+            .unwrap();
+        let crate::snapshot::OptionalSnapshotRestore::Install(bytes) = settings_action else {
+            panic!("settings must be owned by the private snapshot plan");
+        };
+        let settings = AppSettings::parse_recovery_bytes(bytes).unwrap();
+        assert_eq!(settings.vad_threshold, 0.61);
+    }
+
+    #[test]
+    fn whole_valid_snapshot_generation_swap_is_refused_before_live_mutation() {
+        assert_snapshot_swap_refused_without_live_mutation(SnapshotSwap::WholeValidGeneration);
+    }
+
+    #[test]
+    fn database_only_snapshot_generation_swap_is_refused_before_live_mutation() {
+        assert_snapshot_swap_refused_without_live_mutation(SnapshotSwap::DatabaseOnly);
+    }
+
+    #[test]
+    fn config_only_snapshot_generation_swap_is_refused_before_live_mutation() {
+        assert_snapshot_swap_refused_without_live_mutation(SnapshotSwap::ConfigOnly);
+    }
+
+    #[test]
+    fn bytes_changed_after_capture_before_parse_are_refused_before_live_mutation() {
+        assert_snapshot_swap_refused_without_live_mutation(SnapshotSwap::BytesAfterCaptureBeforeParse);
+    }
 
     #[test]
     fn admission_is_published_before_the_writer_fence_and_released_on_refusal() {

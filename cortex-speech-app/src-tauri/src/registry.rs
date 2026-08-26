@@ -226,7 +226,13 @@ const LEGACY_BASE_SHA256: &str = "1b29a4045ddfbe9125e6c9d465d5bc29063eea256ace37
 const LEGACY_ADAPTER_SHA256: &str = "c348ade8a8160319e7e6f070addb3c7b066b70716390e8f4ae548c7db7af3750";
 const LEGACY_ADAPTER_CONFIG_SHA256: &str = "4b870f13ec88f4ca19cc3bdded779ec03090077a82e0381412fb80cc420ce331";
 const LEGACY_TOKENIZER_SHA256: &str = "8aa11a1092142ef472537476ef6e76541123e2f0d789b79f3ebd119008240b1e";
-const LEGACY_MEASUREMENT_EVIDENCE_SHA256: &str = "6133abb5684f1f9856c99b4765cfea66e084ba4acd72ece649e316c467fee68e";
+const LEGACY_MEASUREMENT_EVIDENCE_SHA256: &str = "14793b6f9c4f67c9a08989e54212be85b56ddda06036e6ffd69e8d0f76416f88";
+// Existing owner deployments were sealed before the historical N=922 evidence document gained its
+// explicit duplication-weighted/non-primary warning. The model bytes and measured run did not
+// change, so retain that one exact predecessor identity for upgrade compatibility; no arbitrary
+// evidence hash is accepted.
+const LEGACY_MEASUREMENT_EVIDENCE_SHA256_PRE_LABEL: &str =
+    "6133abb5684f1f9856c99b4765cfea66e084ba4acd72ece649e316c467fee68e";
 const LEGACY_MODEL_ID: &str = "omniasr-7b-legacy-c348ade8a816";
 
 /// One-time, atomic admission of the measured incumbent that predates flywheel lineage. Every
@@ -250,7 +256,10 @@ pub fn bootstrap_verified_legacy_deployment(
         || manifest.adapter.sha256 != LEGACY_ADAPTER_SHA256
         || manifest.adapter_config.sha256 != LEGACY_ADAPTER_CONFIG_SHA256
         || manifest.tokenizer.sha256 != LEGACY_TOKENIZER_SHA256
-        || measurement_evidence_sha256 != LEGACY_MEASUREMENT_EVIDENCE_SHA256
+        || !matches!(
+            measurement_evidence_sha256.as_str(),
+            LEGACY_MEASUREMENT_EVIDENCE_SHA256 | LEGACY_MEASUREMENT_EVIDENCE_SHA256_PRE_LABEL
+        )
         || training_provenance != "unverifiable"
     {
         return Err(AppError::Validation(
@@ -817,6 +826,21 @@ mod tests {
         record.manifest.adapter_config.sha256 = "0".repeat(64);
         assert!(bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").is_err());
         assert!(list_model_versions(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_bootstrap_accepts_only_the_exact_pre_label_evidence_identity_for_upgrade_compatibility() {
+        let db = open();
+        let (_dir, mut record) = test_legacy_record();
+        let DeploymentProvenance::LegacyBootstrap { measurement_evidence_sha256, .. } = &mut record.manifest.provenance
+        else {
+            panic!("legacy fixture lost its provenance kind");
+        };
+        *measurement_evidence_sha256 = LEGACY_MEASUREMENT_EVIDENCE_SHA256_PRE_LABEL.into();
+
+        let champion = bootstrap_verified_legacy_deployment(&db, &record, "Apache-2.0").unwrap();
+        assert_eq!(champion.id, LEGACY_MODEL_ID);
+        assert_eq!(list_model_versions(&db).unwrap().len(), 1);
     }
 
     #[test]

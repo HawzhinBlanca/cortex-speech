@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::wer::{char_edit_distance, word_edit_distance};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,9 @@ pub struct GoldSegment {
     /// When true this segment is never used for DPO fine-tuning updates.
     pub is_holdout: bool,
     pub created_at: Option<String>,
+    /// Blake3 of the canonical decoded 16 kHz mono PCM (sample rate mixed first). `None` is legacy
+    /// incomplete authority and is refused by every closed-loop eval/audio export boundary.
+    pub audio_content_hash: Option<String>,
 }
 
 /// Input payload for bulk-importing gold clips.
@@ -34,6 +37,39 @@ pub struct GoldSegmentInput {
 
 fn default_true() -> bool {
     true
+}
+
+fn required_gold_audio_content_hash(gold: &GoldSegment) -> AppResult<&str> {
+    let hash = gold.audio_content_hash.as_deref().ok_or_else(|| {
+        AppError::Validation(format!(
+            "gold segment {} has no canonical audio-content authority; re-import the gold clip before evaluation/export",
+            gold.id
+        ))
+    })?;
+    if !crate::db::is_canonical_audio_content_hash(hash) {
+        return Err(AppError::Validation(format!(
+            "gold segment {} has an invalid canonical audio-content hash",
+            gold.id
+        )));
+    }
+    Ok(hash)
+}
+
+/// Hash a source through the same streaming 16 kHz mono decode used by long-form import. This is the
+/// durable identity stored for gold rows and segment rows, so a lossless re-container remains the
+/// same speech while a same-path replacement cannot inherit the old reference.
+fn canonical_audio_content_hash(path: &std::path::Path) -> AppResult<String> {
+    let mut identity = crate::fingerprint::StreamingIdentity::new();
+    let mut samples = 0usize;
+    crate::audio::decode_pcm_windows(path, 30_000, |window| {
+        samples = samples.saturating_add(window.pcm.len());
+        identity.push(&window.pcm, window.sample_rate);
+        Ok(())
+    })?;
+    if samples == 0 {
+        return Err(AppError::Validation(format!("audio decoded to zero canonical samples: {}", path.display())));
+    }
+    Ok(identity.finish().content)
 }
 
 /// A per-model WER/CER snapshot against the gold set.
@@ -81,6 +117,30 @@ pub struct EvalRunResult {
 /// aggregates. We therefore replace any existing gold row(s) for the same `audio_path` inside one
 /// transaction, so a partial failure never drops the old row without writing the new one.
 pub fn import_gold_segments(db: &Database, inputs: Vec<GoldSegmentInput>) -> AppResult<usize> {
+    // Capture canonical authority before opening the replacement transaction. Legacy/offline gold
+    // metadata may still be registered while its drive is unavailable, but that state is explicit
+    // (`audio_content_hash = NULL`) and every closed-loop eval/audio export below refuses it. It can
+    // never be scored or materialized as if a mutable path were authority.
+    let prepared: Vec<(&GoldSegmentInput, Option<String>)> = inputs
+        .iter()
+        .map(|input| {
+            if input.reference.trim().is_empty() {
+                return Err(AppError::Validation(format!("gold reference is empty for {}", input.audio_path)));
+            }
+            let hash = match canonical_audio_content_hash(std::path::Path::new(&input.audio_path)) {
+                Ok(hash) => Some(hash),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %input.audio_path,
+                        %error,
+                        "gold metadata registered without audio authority; evaluation/export will remain blocked"
+                    );
+                    None
+                }
+            };
+            Ok((input, hash))
+        })
+        .collect::<AppResult<_>>()?;
     let conn = db.connection();
     let tx = conn.unchecked_transaction()?;
     let mut count = 0usize;
@@ -90,14 +150,9 @@ pub fn import_gold_segments(db: &Database, inputs: Vec<GoldSegmentInput>) -> App
             "INSERT INTO gold_segments (id, audio_path, reference, is_holdout, audio_content_hash)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        for inp in &inputs {
+        for (inp, content_hash) in &prepared {
             delete_stmt.execute(params![inp.audio_path])?;
             let id = Uuid::new_v4().to_string();
-            // Persist the audio content hash NOW — the file is present when the user marks it gold — so
-            // holdout exclusion no longer depends on the file still existing at export time (fail-closed).
-            let content_hash = crate::pipeline::source_audio_identity(std::path::Path::new(&inp.audio_path))
-                .ok()
-                .map(|identity| identity.content_hash);
             insert_stmt.execute(params![id, inp.audio_path, inp.reference, inp.is_holdout as i32, content_hash])?;
             count += 1;
         }
@@ -245,15 +300,675 @@ struct GoldManifestRow<'a> {
 
 /// Write a 16 kHz mono 16-bit PCM WAV clip.
 fn write_wav_16k_mono(path: &std::path::Path, pcm: &[i16], sample_rate: u32) -> AppResult<()> {
-    let spec =
-        hound::WavSpec { channels: 1, sample_rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
-    let mut writer = hound::WavWriter::create(path, spec)
-        .map_err(|e| crate::error::AppError::Other(format!("gold clip WAV create: {e}")))?;
-    for &s in pcm {
-        writer.write_sample(s).map_err(|e| crate::error::AppError::Other(format!("gold clip WAV write: {e}")))?;
+    crate::export::write_wav_atomic(path, sample_rate, pcm)
+}
+
+/// Stream one gold source into a private WAV, hash the exact PCM sent to that writer, and publish the
+/// WAV only after it matches the stored gold authority. This simultaneously bounds memory for long
+/// gold recordings and closes same-path replacement/TOCTOU gaps for both model evaluation and export.
+fn materialize_verified_gold_wav(gold: &GoldSegment, output_path: &std::path::Path) -> AppResult<f64> {
+    let expected = required_gold_audio_content_hash(gold)?.to_string();
+    let parent = output_path.parent().ok_or_else(|| {
+        AppError::Validation(format!("gold materialization path has no parent: {}", output_path.display()))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let name = output_path.file_name().and_then(|value| value.to_str()).unwrap_or("gold.wav");
+    let temporary = parent.join(format!(".{name}.cortex-verified-{}.tmp", Uuid::new_v4().simple()));
+
+    crate::atomic_file::remove_file_on_error(
+        &temporary,
+        (|| -> AppResult<f64> {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: crate::audio::TARGET_SAMPLE_RATE,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&temporary, spec)
+                .map_err(|error| AppError::Other(format!("cannot create verified gold WAV: {error}")))?;
+            let mut identity = crate::fingerprint::StreamingIdentity::new();
+            let mut sample_count = 0usize;
+            crate::audio::decode_pcm_windows(&gold.audio_path, 30_000, |window| {
+                identity.push(&window.pcm, window.sample_rate);
+                sample_count = sample_count.saturating_add(window.pcm.len());
+                for sample in window.pcm {
+                    writer
+                        .write_sample(sample)
+                        .map_err(|error| AppError::Other(format!("cannot write verified gold WAV sample: {error}")))?;
+                }
+                Ok(())
+            })?;
+            writer
+                .finalize()
+                .map_err(|error| AppError::Other(format!("cannot finalize verified gold WAV: {error}")))?;
+            if sample_count == 0 {
+                return Err(AppError::Validation(format!(
+                    "gold segment {} decoded to zero canonical samples",
+                    gold.id
+                )));
+            }
+            let actual = identity.finish().content;
+            if actual != expected {
+                return Err(AppError::Validation(format!(
+                    "gold segment {} source no longer matches its stored canonical PCM identity; refusing to pair current bytes with the prior reference",
+                    gold.id
+                )));
+            }
+            crate::atomic_file::replace_file(&temporary, output_path)?;
+            Ok(sample_count as f64 / crate::audio::TARGET_SAMPLE_RATE as f64)
+        })(),
+    )
+}
+
+struct GoldEvalScratch(std::path::PathBuf);
+
+impl GoldEvalScratch {
+    fn create() -> AppResult<Self> {
+        let path =
+            std::env::temp_dir().join(format!("cortex-gold-eval-{}-{}", std::process::id(), Uuid::new_v4().simple()));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
     }
-    writer.finalize().map_err(|e| crate::error::AppError::Other(format!("gold clip WAV finalize: {e}")))?;
+}
+
+impl Drop for GoldEvalScratch {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            tracing::warn!(path = %self.0.display(), %error, "could not remove private gold-eval scratch directory");
+        }
+    }
+}
+
+/// Decode all requested spans in one full streaming pass and return the canonical identity of the
+/// exact windows that produced them. Callers stage `on_clip` output privately, compare this hash to
+/// every segment's stored authority, and only then promote the clips.
+fn decode_finetune_clips_with_identity<F>(
+    audio_path: &str,
+    spans: &[crate::commands::ClipSpan],
+    mut on_clip: F,
+) -> AppResult<String>
+where
+    F: FnMut(&str, Vec<i16>) -> AppResult<()>,
+{
+    if spans.is_empty() {
+        return Err(AppError::Validation("fine-tune identity decode received no spans".to_string()));
+    }
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by_key(|&index| (spans[index].start_ms, index));
+    let mut next = 0usize;
+    let mut open: Vec<(usize, Vec<i16>)> = Vec::new();
+    let mut rate = crate::audio::TARGET_SAMPLE_RATE;
+    let mut identity = crate::fingerprint::StreamingIdentity::new();
+    let mut source_samples = 0usize;
+
+    let finish = |index: usize, pcm: Vec<i16>, rate: u32, on_clip: &mut F| -> AppResult<()> {
+        let (_rate, pcm16) = crate::audio::ensure_pcm_16khz(rate, pcm)?;
+        on_clip(&spans[index].segment_id, pcm16)
+    };
+
+    crate::audio::decode_pcm_windows(audio_path, 30_000, |window| {
+        rate = window.sample_rate.max(1);
+        identity.push(&window.pcm, rate);
+        source_samples = source_samples.saturating_add(window.pcm.len());
+        let window_start = window.offset_ms;
+        let duration_ms = (window.pcm.len() as i64 * 1000) / i64::from(rate);
+        let window_end = window_start.saturating_add(duration_ms);
+
+        while next < order.len() && spans[order[next]].start_ms < window_end {
+            open.push((order[next], Vec::new()));
+            next += 1;
+        }
+        for (index, accumulated) in &mut open {
+            let span = &spans[*index];
+            if window_end > span.start_ms && window_start < span.end_ms {
+                let start_ms = (span.start_ms.max(window_start) - window_start).max(0);
+                let end_ms = (span.end_ms.min(window_end) - window_start).max(0);
+                let start = ((start_ms * i64::from(rate)) / 1000) as usize;
+                let end = (((end_ms * i64::from(rate)) / 1000) as usize).min(window.pcm.len());
+                if end > start {
+                    accumulated.extend_from_slice(&window.pcm[start..end]);
+                }
+            }
+        }
+        let mut still_open = Vec::with_capacity(open.len());
+        for (index, accumulated) in open.drain(..) {
+            if spans[index].end_ms <= window_end {
+                finish(index, accumulated, rate, &mut on_clip)?;
+            } else {
+                still_open.push((index, accumulated));
+            }
+        }
+        open = still_open;
+        Ok(())
+    })?;
+
+    if source_samples == 0 {
+        return Err(AppError::Validation(format!("fine-tune source decoded to zero samples: {audio_path}")));
+    }
+    for (index, accumulated) in std::mem::take(&mut open) {
+        finish(index, accumulated, rate, &mut on_clip)?;
+    }
+    for &index in &order[next..] {
+        finish(index, Vec::new(), rate, &mut on_clip)?;
+    }
+    Ok(identity.finish().content)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportPublishPoint {
+    StagedAndSynced,
+    PreviousGenerationMoved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportArtifactDigest {
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportGenerationDigest {
+    directories: std::collections::BTreeSet<std::path::PathBuf>,
+    files: std::collections::BTreeMap<std::path::PathBuf, ExportArtifactDigest>,
+}
+
+fn hash_export_artifact(path: &std::path::Path) -> AppResult<ExportArtifactDigest> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AppError::Validation(format!(
+            "export staging artifact must be a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| AppError::Validation(format!("export artifact is too large: {}", path.display())))?;
+    }
+    let sha256 = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(ExportArtifactDigest { size_bytes, sha256 })
+}
+
+fn collect_export_generation(
+    root: &std::path::Path,
+    directory: &std::path::Path,
+    digest: &mut ExportGenerationDigest,
+) -> AppResult<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::Validation(format!(
+                "export staging tree may not contain symlinks: {}",
+                path.display()
+            )));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| AppError::Validation("export staging artifact escaped its private root".to_string()))?
+            .to_path_buf();
+        if metadata.is_dir() {
+            if !digest.directories.insert(relative) {
+                return Err(AppError::Validation("duplicate export staging directory identity".to_string()));
+            }
+            collect_export_generation(root, &path, digest)?;
+        } else if metadata.is_file() {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let numbered_temporary = name.rfind(".tmp-").is_some_and(|index| {
+                let tail = &name[index + ".tmp-".len()..];
+                !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit() || byte == b'-')
+            });
+            if name.ends_with(".tmp")
+                || numbered_temporary
+                || name.contains(".cortex-wav-")
+                || name.contains(".cortex-ledger-")
+            {
+                return Err(AppError::Validation(format!(
+                    "export staging tree contains an unpublished temporary artifact: {}",
+                    path.display()
+                )));
+            }
+            let artifact = hash_export_artifact(&path)?;
+            if digest.files.insert(relative, artifact).is_some() {
+                return Err(AppError::Validation("duplicate export staging artifact identity".to_string()));
+            }
+        } else {
+            return Err(AppError::Validation(format!(
+                "export staging tree contains a non-file artifact: {}",
+                path.display()
+            )));
+        }
+    }
     Ok(())
+}
+
+fn export_generation_digest(root: &std::path::Path) -> AppResult<ExportGenerationDigest> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::Validation("export staging root must be a regular non-symlink directory".to_string()));
+    }
+    let mut digest = ExportGenerationDigest {
+        directories: std::collections::BTreeSet::new(),
+        files: std::collections::BTreeMap::new(),
+    };
+    collect_export_generation(root, root, &mut digest)?;
+    Ok(digest)
+}
+
+fn verify_sealed_export_generation(root: &std::path::Path) -> AppResult<bool> {
+    let digest = export_generation_digest(root)?;
+    if digest.files.is_empty() && digest.directories.is_empty() {
+        return Ok(false);
+    }
+    let sums_relative = std::path::PathBuf::from("SHA256SUMS");
+    if !digest.files.contains_key(&sums_relative) {
+        return Err(AppError::Validation(format!(
+            "existing export generation is non-empty but has no SHA256SUMS: {}",
+            root.display()
+        )));
+    }
+    let sums = std::fs::read_to_string(root.join(&sums_relative))?;
+    let mut declared = std::collections::BTreeMap::new();
+    for (line_number, line) in sums.lines().enumerate() {
+        let (sha256, relative) = line.split_once("  ").ok_or_else(|| {
+            AppError::Validation(format!("invalid SHA256SUMS line {} in {}", line_number + 1, root.display()))
+        })?;
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AppError::Validation(format!(
+                "invalid SHA-256 at SHA256SUMS line {} in {}",
+                line_number + 1,
+                root.display()
+            )));
+        }
+        let relative = std::path::PathBuf::from(relative);
+        if relative.as_os_str().is_empty()
+            || !relative.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+            || relative == sums_relative
+        {
+            return Err(AppError::Validation(format!(
+                "unsafe artifact path at SHA256SUMS line {} in {}",
+                line_number + 1,
+                root.display()
+            )));
+        }
+        if declared.insert(relative, sha256.to_ascii_lowercase()).is_some() {
+            return Err(AppError::Validation(format!(
+                "duplicate artifact at SHA256SUMS line {} in {}",
+                line_number + 1,
+                root.display()
+            )));
+        }
+    }
+    let mut actual = digest.files;
+    actual.remove(&sums_relative);
+    if actual.len() != declared.len()
+        || actual.iter().any(|(relative, artifact)| declared.get(relative) != Some(&artifact.sha256))
+    {
+        return Err(AppError::Validation(format!(
+            "export generation inventory does not match SHA256SUMS: {}",
+            root.display()
+        )));
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "windows")]
+fn sync_export_directory(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let directory = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        // NTFS commonly refuses FlushFileBuffers on directory handles even with
+        // FILE_FLAG_BACKUP_SEMANTICS. Every file is flushed separately and directory renames use
+        // MoveFileExW(MOVEFILE_WRITE_THROUGH), which is the Windows durability boundary.
+        Err(error)
+            if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sync_export_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn sync_export_tree(directory: &std::path::Path) -> AppResult<()> {
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::Validation(format!(
+            "export staging directory is not a regular directory: {}",
+            directory.display()
+        )));
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::Validation(format!(
+                "export staging tree may not contain symlinks: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            sync_export_tree(&path)?;
+        } else if metadata.is_file() {
+            std::fs::OpenOptions::new().write(true).open(&path)?.sync_all()?;
+        } else {
+            return Err(AppError::Validation(format!(
+                "export staging tree contains a non-file artifact: {}",
+                path.display()
+            )));
+        }
+    }
+    sync_export_directory(directory).map_err(AppError::Io)
+}
+
+#[cfg(target_os = "windows")]
+fn rename_export_directory(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and remain live for the call. The caller always uses
+    // same-parent, non-overlapping private directory names, so MoveFileExW performs one filesystem
+    // rename and WRITE_THROUGH makes that metadata transition durable before it returns.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn rename_export_directory(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[derive(Debug)]
+struct ExportTargetLayout {
+    parent: std::path::PathBuf,
+    stage_prefix: String,
+    backup_prefix: String,
+}
+
+fn export_target_layout(output_dir: &std::path::Path) -> AppResult<ExportTargetLayout> {
+    let parent = output_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    std::fs::create_dir_all(&parent)?;
+    let output_name = output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| AppError::Validation("export target must have a UTF-8 directory name".to_string()))?
+        .to_string();
+    Ok(ExportTargetLayout {
+        parent,
+        stage_prefix: format!(".{output_name}.cortex-export-stage-"),
+        backup_prefix: format!(".{output_name}.cortex-export-backup-"),
+    })
+}
+
+fn validate_export_target(output_dir: &std::path::Path) -> AppResult<()> {
+    match std::fs::symlink_metadata(output_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(AppError::Validation(format!(
+            "export target must be an absent or regular non-symlink directory: {}",
+            output_dir.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Io(error)),
+    }
+}
+
+fn cleanup_private_export_directory(path: &std::path::Path, parent: &std::path::Path, prefix: &str) {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not inspect private export directory for cleanup");
+            return;
+        }
+    };
+    let safe_name = path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(prefix));
+    let safe_parent = path
+        .canonicalize()
+        .ok()
+        .zip(parent.canonicalize().ok())
+        .is_some_and(|(resolved, resolved_parent)| resolved.parent() == Some(resolved_parent.as_path()));
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !safe_name || !safe_parent {
+        tracing::error!(path = %path.display(), "refusing unsafe private export directory cleanup");
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        tracing::warn!(path = %path.display(), %error, "could not remove private export directory");
+    }
+}
+
+struct ExportStageGuard<'a> {
+    path: std::path::PathBuf,
+    parent: &'a std::path::Path,
+    prefix: &'a str,
+}
+
+impl Drop for ExportStageGuard<'_> {
+    fn drop(&mut self) {
+        cleanup_private_export_directory(&self.path, self.parent, self.prefix);
+    }
+}
+
+fn recover_interrupted_export_publication(
+    output_dir: &std::path::Path,
+    layout: &ExportTargetLayout,
+) -> AppResult<bool> {
+    if output_dir.exists() {
+        return Ok(false);
+    }
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(&layout.parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|name| name.starts_with(&layout.backup_prefix)) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        match verify_sealed_export_generation(&entry.path()) {
+            Ok(true) | Ok(false) => {}
+            Err(error) => {
+                tracing::error!(path = %entry.path().display(), %error, "refusing invalid interrupted-export backup");
+                continue;
+            }
+        }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().map_or(true, |(best, _)| modified >= *best) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+    let Some((_, backup)) = newest else {
+        return Ok(false);
+    };
+    rename_export_directory(&backup, output_dir)?;
+    sync_export_directory(&layout.parent)?;
+    tracing::warn!(
+        output = %output_dir.display(),
+        backup = %backup.display(),
+        "recovered complete export generation after interrupted directory swap"
+    );
+    Ok(true)
+}
+
+fn restore_export_backup(
+    output_dir: &std::path::Path,
+    backup: &std::path::Path,
+    parent: &std::path::Path,
+) -> AppResult<()> {
+    if output_dir.exists() {
+        return Err(AppError::Other(format!(
+            "cannot restore export backup because target was concurrently recreated: {}",
+            output_dir.display()
+        )));
+    }
+    rename_export_directory(backup, output_dir)?;
+    sync_export_directory(parent)?;
+    Ok(())
+}
+
+fn publish_export_generation<T, Build, Hook>(output_dir: &std::path::Path, build: Build, mut hook: Hook) -> AppResult<T>
+where
+    Build: FnOnce(&std::path::Path) -> AppResult<T>,
+    Hook: FnMut(ExportPublishPoint, &std::path::Path, Option<&std::path::Path>) -> AppResult<()>,
+{
+    let layout = export_target_layout(output_dir)?;
+    recover_interrupted_export_publication(output_dir, &layout)?;
+    validate_export_target(output_dir)?;
+    let predecessor = if output_dir.exists() {
+        verify_sealed_export_generation(output_dir)?;
+        Some(export_generation_digest(output_dir)?)
+    } else {
+        None
+    };
+
+    let stage_path = layout.parent.join(format!("{}{}", layout.stage_prefix, Uuid::new_v4().simple()));
+    std::fs::create_dir(&stage_path)?;
+    let stage = ExportStageGuard { path: stage_path, parent: &layout.parent, prefix: &layout.stage_prefix };
+    let result = build(&stage.path)?;
+    sync_export_tree(&stage.path)?;
+    if !verify_sealed_export_generation(&stage.path)? {
+        return Err(AppError::Other("export builder produced no sealed generation".to_string()));
+    }
+    let sealed_digest = export_generation_digest(&stage.path)?;
+    hook(ExportPublishPoint::StagedAndSynced, &stage.path, None)?;
+    if export_generation_digest(&stage.path)? != sealed_digest {
+        return Err(AppError::Other(
+            "private export generation changed after it was sealed; publication refused".to_string(),
+        ));
+    }
+
+    // Revalidate at the actual commit boundary. Existing complete output is moved, never edited;
+    // an interruption between the two same-parent renames therefore leaves that exact generation
+    // recoverable at a typed private backup path rather than mixing old and new artifacts.
+    validate_export_target(output_dir)?;
+    let output_exists = output_dir.exists();
+    if output_exists != predecessor.is_some() {
+        return Err(AppError::Other(
+            "export target generation appeared or disappeared during private staging; publication refused".to_string(),
+        ));
+    }
+    let backup_path = if let Some(expected_predecessor) = predecessor {
+        // A non-empty predecessor must itself be one complete checksummed generation. Empty picker
+        // directories are allowed and represent "no generation"; arbitrary mixed legacy files are
+        // never blessed as the rollback authority for an atomic swap.
+        verify_sealed_export_generation(output_dir)?;
+        if export_generation_digest(output_dir)? != expected_predecessor {
+            return Err(AppError::Other(
+                "export target generation changed during private staging; publication refused".to_string(),
+            ));
+        }
+        let backup = layout.parent.join(format!("{}{}", layout.backup_prefix, Uuid::new_v4().simple()));
+        rename_export_directory(output_dir, &backup)?;
+        if let Err(error) = sync_export_directory(&layout.parent) {
+            let restore = restore_export_backup(output_dir, &backup, &layout.parent);
+            return match restore {
+                Ok(()) => Err(AppError::Io(error)),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "export directory fsync failed after preserving the old generation ({error}); backup restore also failed: {restore_error}"
+                ))),
+            };
+        }
+        if let Err(error) = hook(ExportPublishPoint::PreviousGenerationMoved, &stage.path, Some(&backup)) {
+            let message = error.to_string();
+            return match restore_export_backup(output_dir, &backup, &layout.parent) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "{message}; previous export generation remains at {} because rollback failed: {restore_error}",
+                    backup.display()
+                ))),
+            };
+        }
+        if export_generation_digest(&stage.path)? != sealed_digest {
+            let error = AppError::Other(
+                "private export generation changed before atomic promotion; publication refused".to_string(),
+            );
+            return match restore_export_backup(output_dir, &backup, &layout.parent) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "{error}; previous export generation remains at {} because rollback failed: {restore_error}",
+                    backup.display()
+                ))),
+            };
+        }
+        Some(backup)
+    } else {
+        if export_generation_digest(&stage.path)? != sealed_digest {
+            return Err(AppError::Other(
+                "private export generation changed before atomic promotion; publication refused".to_string(),
+            ));
+        }
+        None
+    };
+
+    if let Err(error) = rename_export_directory(&stage.path, output_dir) {
+        if let Some(backup) = backup_path.as_deref() {
+            let restore = restore_export_backup(output_dir, backup, &layout.parent);
+            return match restore {
+                Ok(()) => Err(AppError::Io(error)),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "new export promotion failed ({error}); previous generation remains at {} because rollback failed: {restore_error}",
+                    backup.display()
+                ))),
+            };
+        }
+        return Err(AppError::Io(error));
+    }
+    sync_export_directory(&layout.parent)?;
+
+    if let Some(backup) = backup_path {
+        cleanup_private_export_directory(&backup, &layout.parent, &layout.backup_prefix);
+        if let Err(error) = sync_export_directory(&layout.parent) {
+            tracing::warn!(%error, "new export is durable but obsolete backup cleanup could not be fsynced");
+        }
+    }
+    Ok(result)
+}
+
+fn safe_export_clip_id(id: &str) -> AppResult<&str> {
+    if id.is_empty()
+        || matches!(id, "." | "..")
+        || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(AppError::Validation(format!(
+            "segment id cannot be represented as a contained export clip name: {id:?}"
+        )));
+    }
+    Ok(id)
 }
 
 /// M2.7 / P1.6: export the gold set as a portable eval set — a `manifest.jsonl` (one
@@ -261,8 +976,27 @@ fn write_wav_16k_mono(path: &std::path::Path, pcm: &[i16], sample_rate: u32) -> 
 /// 16 kHz mono WAV per row under `clips/`. This is what the engine benchmark scores against; the
 /// `is_holdout` flag is carried through so a downstream TRAINING pack can exclude it (holdout is a
 /// train-time exclusion, not an eval-time one — the eval set deliberately includes it). Gold whose
-/// source audio can no longer be decoded is skipped so the set stays self-consistent.
+/// Every source is materialized from canonical PCM and must still match the hash captured when the
+/// gold reference was created. Missing, corrupt, or replaced audio aborts the atomic generation;
+/// silently shrinking the benchmark would change the yardstick while preserving its name.
 pub fn export_gold_eval_set(db: &Database, out_dir: &std::path::Path) -> AppResult<GoldEvalExport> {
+    export_gold_eval_set_with_publish_hook(db, out_dir, |_, _, _| Ok(()))
+}
+
+fn export_gold_eval_set_with_publish_hook<Hook>(
+    db: &Database,
+    out_dir: &std::path::Path,
+    hook: Hook,
+) -> AppResult<GoldEvalExport>
+where
+    Hook: FnMut(ExportPublishPoint, &std::path::Path, Option<&std::path::Path>) -> AppResult<()>,
+{
+    let mut result = publish_export_generation(out_dir, |stage| export_gold_eval_set_inner(db, stage), hook)?;
+    result.manifest_path = out_dir.join("manifest.jsonl").to_string_lossy().into_owned();
+    Ok(result)
+}
+
+fn export_gold_eval_set_inner(db: &Database, out_dir: &std::path::Path) -> AppResult<GoldEvalExport> {
     crate::review_campaign::require_export_unblocked(db, "gold evaluation export")?;
     use std::io::Write as _;
     let gold = list_gold_segments(db)?;
@@ -274,27 +1008,16 @@ pub fn export_gold_eval_set(db: &Database, out_dir: &std::path::Path) -> AppResu
         std::io::BufWriter::new(std::fs::File::create(&manifest_path).map_err(crate::error::AppError::Io)?);
 
     let mut exported = 0usize;
-    let mut skipped = 0usize;
+    let skipped = 0usize;
     for g in &gold {
-        let (sample_rate, pcm) = match crate::audio::decode_to_pcm(&g.audio_path) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::warn!("gold eval-set: skipping {} (source undecodable): {error}", g.id);
-                skipped += 1;
-                continue;
-            }
-        };
-        let clip_rel = format!("clips/{}.wav", g.id);
-        if let Err(error) = write_wav_16k_mono(&clips_dir.join(format!("{}.wav", g.id)), &pcm, sample_rate) {
-            tracing::warn!("gold eval-set: skipping {} (clip write failed): {error}", g.id);
-            skipped += 1;
-            continue;
-        }
+        let clip_id = safe_export_clip_id(&g.id)?;
+        let clip_rel = format!("clips/{clip_id}.wav");
+        let duration_seconds = materialize_verified_gold_wav(g, &clips_dir.join(format!("{clip_id}.wav")))?;
         let row = GoldManifestRow {
             audio_path: clip_rel,
             sentence: &g.reference,
             is_holdout: g.is_holdout,
-            duration_seconds: pcm.len() as f64 / sample_rate as f64,
+            duration_seconds,
         };
         let line = serde_json::to_string(&row)
             .map_err(|e| crate::error::AppError::Other(format!("gold manifest serialize: {e}")))?;
@@ -401,6 +1124,124 @@ pub fn export_finetune_pack(
     out_dir: &std::path::Path,
     corpus_ledger_path: Option<&std::path::Path>,
 ) -> AppResult<FinetunePackResult> {
+    export_finetune_pack_with_publish_hook(db, out_dir, corpus_ledger_path, |_, _, _| Ok(()))
+}
+
+struct FinetunePackBuild {
+    result: FinetunePackResult,
+    corpus_ledger_line: String,
+}
+
+fn safe_nested_ledger_relative_path(
+    output_dir: &std::path::Path,
+    ledger: &std::path::Path,
+) -> AppResult<Option<std::path::PathBuf>> {
+    let Ok(relative) = ledger.strip_prefix(output_dir) else {
+        return Ok(None);
+    };
+    if relative.as_os_str().is_empty()
+        || !relative.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+        || relative.to_string_lossy().chars().any(|character| matches!(character, '\r' | '\n'))
+    {
+        return Err(AppError::Validation(
+            "corpus ledger inside an export must be a contained regular file path".to_string(),
+        ));
+    }
+    let reserved = [
+        std::path::Path::new("finetune_manifest.jsonl"),
+        std::path::Path::new("pack_provenance.json"),
+        std::path::Path::new("SHA256SUMS"),
+    ];
+    if reserved.contains(&relative) || relative.starts_with("clips") {
+        return Err(AppError::Validation("corpus ledger path collides with a fine-tune pack artifact".to_string()));
+    }
+    Ok(Some(relative.to_path_buf()))
+}
+
+fn write_corpus_ledger_generation(path: &std::path::Path, previous: &[u8], line: &str) -> AppResult<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| AppError::Validation("corpus ledger must have a parent directory".to_string()))?;
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Validation("corpus ledger must have a UTF-8 file name".to_string()))?;
+    let temporary = parent.join(format!(".{name}.cortex-ledger-{}.tmp", Uuid::new_v4().simple()));
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary)?;
+        file.write_all(previous)?;
+        if !previous.is_empty() && !previous.ends_with(b"\n") {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        crate::atomic_file::replace_file(&temporary, path)?;
+        Ok::<_, std::io::Error>(())
+    })()
+    .map_err(AppError::Io);
+    if write_result.is_err() {
+        match std::fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %temporary.display(), %error, "could not remove failed corpus-ledger staging file")
+            }
+        }
+    }
+    write_result
+}
+
+fn append_corpus_ledger_line(path: &std::path::Path, line: &str) -> AppResult<()> {
+    crate::atomic_file::recover_interrupted_replace(path)?;
+    let previous = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(AppError::Io(error)),
+    };
+    write_corpus_ledger_generation(path, &previous, line)
+}
+
+fn export_finetune_pack_with_publish_hook<Hook>(
+    db: &Database,
+    out_dir: &std::path::Path,
+    corpus_ledger_path: Option<&std::path::Path>,
+    hook: Hook,
+) -> AppResult<FinetunePackResult>
+where
+    Hook: FnMut(ExportPublishPoint, &std::path::Path, Option<&std::path::Path>) -> AppResult<()>,
+{
+    let nested_ledger =
+        corpus_ledger_path.map(|ledger| safe_nested_ledger_relative_path(out_dir, ledger)).transpose()?.flatten();
+    let mut build = publish_export_generation(
+        out_dir,
+        |stage| {
+            let built = export_finetune_pack_inner(db, stage)?;
+            if let (Some(ledger), Some(relative)) = (corpus_ledger_path, nested_ledger.as_deref()) {
+                let previous = match std::fs::read(ledger) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) => return Err(AppError::Io(error)),
+                };
+                write_corpus_ledger_generation(&stage.join(relative), &previous, &built.corpus_ledger_line)?;
+            }
+            crate::export::write_sha256sums(stage)?;
+            Ok(built)
+        },
+        hook,
+    )?;
+    build.result.manifest_path = out_dir.join("finetune_manifest.jsonl").to_string_lossy().into_owned();
+    if let Some(ledger) = corpus_ledger_path.filter(|_| nested_ledger.is_none()) {
+        append_corpus_ledger_line(ledger, &build.corpus_ledger_line)?;
+    }
+    Ok(build.result)
+}
+
+fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppResult<FinetunePackBuild> {
     crate::review_campaign::require_export_unblocked(db, "fine-tune training export")?;
     use std::io::Write as _;
     let verified = db.get_segments(Some(true))?;
@@ -495,6 +1336,7 @@ pub fn export_finetune_pack(
     // away.
     let mut planned: Vec<(&crate::db::SpeechSegment, &crate::quality::TrainingGradeReport, String)> = Vec::new();
     for (seg, report) in graded.iter().filter(|(_, report)| report.training_ready) {
+        safe_export_clip_id(&seg.id)?;
         // Canonical Sorani orthography for the SHIPPED sentence — ك/ک, ي/ی, ه/ھ variants unified so
         // the retrain corpus has one label per grapheme (mixed forms inflate the CTC label space).
         let sentence = crate::normalizer::canonical_training_text(&report.transcript);
@@ -513,10 +1355,9 @@ pub fn export_finetune_pack(
         planned.push((seg, report, sentence));
     }
 
-    // PASS 2 — decode, GROUPED BY SOURCE RECORDING (2026-08-18). One walk per recording, not one per
-    // clip: see `commands::decode_finetuned_clips_16k` for the measurement that forced this. The
-    // clips written here are byte-identical to the per-clip decoder's, so the manifest hash — the
-    // snapshot id — is unchanged by the grouping.
+    // PASS 2 — decode, GROUPED BY SOURCE RECORDING. One full streaming walk per recording both cuts
+    // every clip and computes the exact canonical identity; clips stay private until that identity
+    // matches stored authority. This preserves linear decode cost without trusting a mutable path.
     let mut by_source: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
     for (index, (seg, _, _)) in planned.iter().enumerate() {
         by_source.entry(seg.audio_path.as_str()).or_default().push(index);
@@ -556,37 +1397,62 @@ pub fn export_finetune_pack(
             }
         }
 
-        // A failed WRITE is fatal to the export (a full disk must not read as "some clips skipped"),
-        // while a failed DECODE skips that source's rows and says so.
-        let mut write_failure: Option<crate::error::AppError> = None;
-        let decoded = crate::commands::decode_finetuned_clips_16k(source, &spans, |segment_id, pcm| {
+        if spans.is_empty() {
+            continue;
+        }
+        let mut expected_content_hash: Option<String> = None;
+        for span in &spans {
+            let expected =
+                crate::export::required_segment_audio_content_hash(db, &span.segment_id, "fine-tune audio export")?;
+            if let Some(first) = expected_content_hash.as_deref() {
+                if first != expected {
+                    return Err(AppError::Validation(format!(
+                        "fine-tune audio export: source {source} has inconsistent stored PCM identities across its segments"
+                    )));
+                }
+            } else {
+                expected_content_hash = Some(expected);
+            }
+        }
+        let expected_content_hash = expected_content_hash.ok_or_else(|| {
+            AppError::Validation(format!("fine-tune audio export: source {source} has no identity-bearing spans"))
+        })?;
+
+        // Clip files stay in a private per-source directory until the SAME streaming decode that
+        // produced them reaches EOF and its canonical hash matches every segment's stored authority.
+        let pending_dir = clips_dir.join(format!(".pending-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir(&pending_dir)?;
+        let mut pending_durations: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let decoded = decode_finetune_clips_with_identity(source, &spans, |segment_id, pcm| {
             if pcm.is_empty() {
                 tracing::warn!("finetune pack: skipping {segment_id} (clip undecodable)");
                 return Ok(());
             }
             let duration = pcm.len() as f64 / crate::audio::TARGET_SAMPLE_RATE as f64;
-            match write_wav_16k_mono(
-                &clips_dir.join(format!("{segment_id}.wav")),
-                &pcm,
-                crate::audio::TARGET_SAMPLE_RATE,
-            ) {
-                Ok(()) => {
-                    clip_durations.insert(segment_id.to_string(), duration);
-                    Ok(())
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    write_failure = Some(error);
-                    Err(message)
-                }
-            }
+            write_wav_16k_mono(&pending_dir.join(format!("{segment_id}.wav")), &pcm, crate::audio::TARGET_SAMPLE_RATE)?;
+            pending_durations.insert(segment_id.to_string(), duration);
+            Ok(())
         });
-        if let Some(error) = write_failure {
-            return Err(error);
+        let actual_content_hash = match decoded {
+            Ok(hash) => hash,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&pending_dir);
+                return Err(error);
+            }
+        };
+        if actual_content_hash != expected_content_hash {
+            let _ = std::fs::remove_dir_all(&pending_dir);
+            return Err(AppError::Validation(format!(
+                "fine-tune audio export: source {source} no longer matches its stored canonical PCM identity; no clips from it were published"
+            )));
         }
-        if let Err(reason) = decoded {
-            tracing::warn!("finetune pack: source {source} failed to decode ({reason}) — its rows are skipped");
+        for (segment_id, duration) in pending_durations {
+            let pending = pending_dir.join(format!("{segment_id}.wav"));
+            let published = clips_dir.join(format!("{segment_id}.wav"));
+            crate::atomic_file::replace_file(&pending, &published)?;
+            clip_durations.insert(segment_id, duration);
         }
+        std::fs::remove_dir(&pending_dir)?;
     }
 
     // PASS 3 — write the manifest in PASS 1's order. A planned row with no clip on disk was skipped
@@ -673,30 +1539,23 @@ pub fn export_finetune_pack(
     let provenance_text = serde_json::to_string_pretty(&provenance)
         .map_err(|e| crate::error::AppError::Other(format!("pack provenance serialize: {e}")))?;
     std::fs::write(out_dir.join("pack_provenance.json"), &provenance_text).map_err(crate::error::AppError::Io)?;
-    // Integrity over EVERY pack file (clips included), written last so it also covers the provenance
-    // record: manifestSha256 alone pins the rows but not the audio bytes — a truncated/partially-
-    // copied WAV was undetectable while the manifest SHA stayed green (true-10 audit 2026-07-09).
-    crate::export::write_sha256sums(out_dir)?;
-    if let Some(ledger) = corpus_ledger_path {
-        use std::io::Write as _;
-        let line = serde_json::to_string(&provenance)
-            .map_err(|e| crate::error::AppError::Other(format!("corpus ledger serialize: {e}")))?;
-        let mut file =
-            std::fs::OpenOptions::new().create(true).append(true).open(ledger).map_err(crate::error::AppError::Io)?;
-        writeln!(file, "{line}").map_err(crate::error::AppError::Io)?;
-    }
+    let corpus_ledger_line = serde_json::to_string(&provenance)
+        .map_err(|e| crate::error::AppError::Other(format!("corpus ledger serialize: {e}")))?;
 
-    Ok(FinetunePackResult {
-        manifest_path: manifest_path.to_string_lossy().into_owned(),
-        manifest_sha256,
-        total_verified,
-        excluded_unexportable,
-        excluded_not_training_ready,
-        emitted,
-        skipped,
-        emitted_without_human_decision,
-        snapshot_id,
-        newly_sealed,
+    Ok(FinetunePackBuild {
+        result: FinetunePackResult {
+            manifest_path: manifest_path.to_string_lossy().into_owned(),
+            manifest_sha256,
+            total_verified,
+            excluded_unexportable,
+            excluded_not_training_ready,
+            emitted,
+            skipped,
+            emitted_without_human_decision,
+            snapshot_id,
+            newly_sealed,
+        },
+        corpus_ledger_line,
     })
 }
 
@@ -704,7 +1563,7 @@ pub fn export_finetune_pack(
 pub fn list_gold_segments(db: &Database) -> AppResult<Vec<GoldSegment>> {
     let conn = db.connection();
     let mut stmt = conn.prepare(
-        "SELECT id, audio_path, reference, is_holdout, created_at
+        "SELECT id, audio_path, reference, is_holdout, created_at, audio_content_hash
          FROM gold_segments ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -714,6 +1573,7 @@ pub fn list_gold_segments(db: &Database) -> AppResult<Vec<GoldSegment>> {
             reference: row.get(2)?,
             is_holdout: row.get::<_, i32>(3)? != 0,
             created_at: row.get(4)?,
+            audio_content_hash: row.get(5)?,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1110,9 +1970,20 @@ where
     F: FnMut(&GoldSegment) -> AppResult<String>,
 {
     let gold = list_gold_segments(db)?;
+    let scratch = GoldEvalScratch::create()?;
     let mut hypotheses: Vec<(String, String)> = Vec::with_capacity(gold.len());
     for seg in &gold {
-        let hyp = transcribe(seg).map_err(|e| {
+        let clip_id = safe_export_clip_id(&seg.id)?;
+        let verified_path = scratch.0.join(format!("{clip_id}.wav"));
+        materialize_verified_gold_wav(seg, &verified_path).map_err(|error| {
+            AppError::Other(format!(
+                "Gold eval halted: audio authority failed for {} ({}): {error}. No eval row was written.",
+                seg.id, seg.audio_path
+            ))
+        })?;
+        let mut verified = seg.clone();
+        verified.audio_path = verified_path.to_string_lossy().into_owned();
+        let hyp = transcribe(&verified).map_err(|e| {
             crate::error::AppError::Other(format!(
                 "Gold eval halted: transcription failed for {} ({}): {e}. No eval row was written — a \
                  CER scored on the clips that happened to survive is not this model's CER.",
@@ -1135,31 +2006,14 @@ where
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelQualityLift {
+    /// Number of scoreable triples. References that normalize to an empty string are excluded from
+    /// this count, every aggregate, and every bootstrap replicate.
     pub n: usize,
     pub raw_micro_cer: f64,
     pub jury_micro_cer: f64,
     pub cer_lift: f64,
     pub lift_ci_low: f64,
     pub lift_ci_high: f64,
-    /// Scored rows whose reference is CHARACTER-IDENTICAL to the jury hypothesis, so their jury
-    /// distance is zero no matter what the jury did.
-    ///
-    /// This is the honest limit of the whole metric, and it is structural rather than situational.
-    ///
-    /// CORRECTED 2026-08-04. The first version of this doc blamed ACCEPTING a clip ("an accept copies
-    /// the jury's output into the reference"). That was wrong. `corrections.rs` is the single source of
-    /// truth on the column's meaning: *"verdict_transcript ... is the human's ANSWER (the
-    /// reference/target the evidence is scored AGAINST), never the model draft"*. `load_lift_triples`
-    /// passes that column as the JURY hypothesis, so this metric compares the human's answer with the
-    /// human's answer — for every decided row, regardless of what the reviewer did.
-    ///
-    /// Measured on the owner's library: 39 of 39 scored rows self-referential, INCLUDING 34 of the 35
-    /// clips the reviewer edited. Editing cannot make it measurable; the advice that it would was wrong.
-    ///
-    /// The post-jury text is not persisted anywhere — `segment_hypotheses` stores per-ENGINE drafts, not
-    /// the jury's consensus — so a raw-vs-post-jury lift cannot be computed from what this schema keeps.
-    /// Callers MUST NOT present the jury figure when this equals `n`, which on real data is always.
-    pub self_referential_n: usize,
 }
 
 /// Compute the label-quality lift over `(reference, raw_hyp, jury_hyp)` triples. CER flows through
@@ -1171,16 +2025,18 @@ pub fn compute_label_quality_lift(
     bootstrap_samples: usize,
     seed: u64,
 ) -> LabelQualityLift {
-    let n = triples.len();
     // (ref_char_len, raw_char_dist, jury_char_dist) per segment — ref_len is shared (same reference).
+    // A reference that normalizes to empty has no unit to score. Filter it before assigning `n` or
+    // sampling so the displayed sample size and confidence interval describe exactly the scored rows.
     let per: Vec<(usize, usize, usize)> = triples
         .iter()
-        .map(|(reference, raw, jury)| {
+        .filter_map(|(reference, raw, jury)| {
             let dr = char_edit_distance(reference, raw);
             let dj = char_edit_distance(reference, jury);
-            (dr.ref_len, dr.distance, dj.distance)
+            (dr.ref_len > 0).then_some((dr.ref_len, dr.distance, dj.distance))
         })
         .collect();
+    let n = per.len();
 
     let micro = |indices: &[usize]| -> (f64, f64) {
         let mut ref_chars = 0usize;
@@ -1188,15 +2044,6 @@ pub fn compute_label_quality_lift(
         let mut jury_d = 0usize;
         for &i in indices {
             let (rl, rd, jd) = per[i];
-            // A reference that normalizes to EMPTY (ref_len == 0) has no unit to score against — its raw/jury
-            // char distances are pure insertions (char_edit_distance returns them as an "honest insertion
-            // count for micro aggregation"). Exclude such a row from BOTH numerator and denominator, matching
-            // every other micro site (run_gold_eval, load_eval_run_and_recompute, scorecard, significance).
-            // Guarding only the grand-total ref_chars==0 let a single empty-ref row's insertions over a zero
-            // denominator peg both engines' micro-CER (and the bootstrap CI) to a fabricated 1.0.
-            if rl == 0 {
-                continue;
-            }
             ref_chars += rl;
             raw_d += rd;
             jury_d += jd;
@@ -1211,12 +2058,6 @@ pub fn compute_label_quality_lift(
     let all: Vec<usize> = (0..n).collect();
     let (raw_micro_cer, jury_micro_cer) = micro(&all);
     let cer_lift = raw_micro_cer - jury_micro_cer;
-
-    // Counted over the SCORED rows only (`rl > 0`), matching `micro`'s own exclusion of empty
-    // references — a row that contributes to neither numerator nor denominator cannot be evidence for
-    // or against the jury either. A zero jury distance here means the reference and the jury verdict
-    // are the same characters, which is what an "accept" produces.
-    let self_referential_n = per.iter().filter(|&&(rl, _, jd)| rl > 0 && jd == 0).count();
 
     let mut lifts: Vec<f64> = Vec::with_capacity(bootstrap_samples);
     if n > 0 && bootstrap_samples > 0 {
@@ -1250,20 +2091,16 @@ pub fn compute_label_quality_lift(
         cer_lift,
         lift_ci_low: percentile(0.025),
         lift_ci_high: percentile(0.975),
-        self_referential_n,
     }
 }
 
 /// Load `(reference, raw, jury)` triples for the label-quality lift from human-verified segments:
 /// the human's correction (`annotated_transcript`) is the ground-truth reference, `raw_transcript`
-/// is the raw ASR hypothesis, and `verdict_transcript` is the post-jury label. Only segments that
+/// is the raw ASR hypothesis, and `jury_transcript` is the independent post-jury machine label. Only segments that
 /// carry all three (non-empty) are included — a real measured lift needs ground truth + both hyps.
-/// NOTE (2026-08-04): the third column, `verdict_transcript`, is documented in `corrections.rs` as
-/// "the human's ANSWER ... never the model draft". It is therefore NOT an independent jury hypothesis,
-/// and the lift computed from these triples compares the human's answer with itself on every decided
-/// row. The metric is retained (and the UI withholds it) rather than silently deleted, because the
-/// honest fix is to persist the jury's verdict separately from the human's — a schema decision, not a
-/// calculation change.
+/// `jury_transcript` is persisted when the jury writes its verdict and is not overwritten by the
+/// later human decision. Exact jury/reference matches are therefore valid zero-error observations,
+/// not evidence that the metric scored a value against itself.
 pub fn load_lift_triples(db: &Database) -> AppResult<Vec<(String, String, String)>> {
     let conn = db.connection();
     let mut stmt = conn.prepare(
@@ -1304,6 +2141,25 @@ pub fn load_lift_triples(db: &Database) -> AppResult<Vec<(String, String, String
 mod tests {
     use super::*;
 
+    fn export_finetune_pack(
+        db: &Database,
+        out_dir: &std::path::Path,
+        corpus_ledger_path: Option<&std::path::Path>,
+    ) -> AppResult<FinetunePackResult> {
+        for segment in db.get_segments(None)? {
+            if db.segment_audio_content_hash(&segment.id)?.is_none() {
+                if let Ok((sample_rate, pcm)) = crate::audio::decode_to_pcm(&segment.audio_path) {
+                    let content_hash = crate::fingerprint::AudioFingerprint::content_hash(&pcm, sample_rate);
+                    db.connection().execute(
+                        "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+                        params![segment.id, content_hash],
+                    )?;
+                }
+            }
+        }
+        super::export_finetune_pack(db, out_dir, corpus_ledger_path)
+    }
+
     #[test]
     fn label_quality_lift_rewards_jury_corrections() {
         // Raw ASR is wrong; the jury restores the reference -> positive lift, jury CER 0.
@@ -1317,39 +2173,29 @@ mod tests {
         assert!(lift.jury_micro_cer.abs() < 1e-9, "jury matches reference: {}", lift.jury_micro_cer);
         assert!(lift.cer_lift > 0.0, "jury improved labels: lift={}", lift.cer_lift);
         assert!(lift.lift_ci_low <= lift.lift_ci_high, "CI bounds ordered");
-        // ...and BOTH rows are self-referential, which is the honest reading of the three lines
-        // above. This test was written as "the jury restores the reference", but a reference that
-        // equals the jury hypothesis is what an ACCEPT produces, and it forces jury CER to 0
-        // whatever the jury did. Asserting it here so the fixture cannot be mistaken for evidence
-        // that a zero jury CER means a good jury.
-        assert_eq!(lift.self_referential_n, 2, "reference == jury on both rows");
     }
 
     #[test]
-    fn label_quality_lift_counts_rows_that_scored_the_jury_against_itself() {
-        // The shape measured on the owner's library on 2026-08-03: every scored row had the human's
-        // confirmed transcript character-identical to the jury verdict, because accepting a clip
-        // copies the jury's output into the reference. Jury CER is then 0 by construction, and
-        // `cer_lift = raw - 0` is the raw ASR error wearing the jury's name.
+    fn label_quality_lift_treats_independent_exact_jury_matches_as_valid_evidence() {
+        // `load_lift_triples` reads the independently persisted `jury_transcript`, not the later
+        // human-owned verdict text. An exact jury/reference match is therefore a genuine correct
+        // prediction and must not be hidden or mislabeled as self-reference.
         let accepted = ("hello world".to_string(), "hello word".to_string(), "hello world".to_string());
-        // An EDIT is the only independent evidence: the human wrote something the jury did not.
         let edited = ("good morning".to_string(), "gud mrning".to_string(), "good mrning".to_string());
 
-        let all_accepts = compute_label_quality_lift(&[accepted.clone(), accepted.clone()], 50, 3);
-        assert_eq!(all_accepts.n, 2);
-        assert_eq!(all_accepts.self_referential_n, all_accepts.n, "nothing here measures the jury");
-        assert!(all_accepts.jury_micro_cer.abs() < 1e-9, "forced to zero, not measured");
+        let exact_matches = compute_label_quality_lift(&[accepted.clone(), accepted], 50, 3);
+        assert_eq!(exact_matches.n, 2);
+        assert!(exact_matches.jury_micro_cer.abs() < 1e-9, "independent jury matched both references");
+        assert!(exact_matches.cer_lift > 0.0, "the independently correct jury improved over raw ASR");
 
-        let mixed = compute_label_quality_lift(&[accepted, edited], 50, 3);
-        assert_eq!(mixed.n, 2);
-        assert_eq!(mixed.self_referential_n, 1, "only the accepted row is self-referential");
-        assert!(mixed.jury_micro_cer > 0.0, "the edited row lets the jury actually be wrong");
+        let wrong_jury = compute_label_quality_lift(&[edited], 50, 3);
+        assert_eq!(wrong_jury.n, 1);
+        assert!(wrong_jury.jury_micro_cer > 0.0, "a wrong independent jury prediction remains measurable");
 
-        // Empty references are excluded from scoring, so they cannot be counted as evidence either.
+        // Empty-normalizing references are absent from both the score and its reported N.
         let empty_ref = (String::new(), "x".to_string(), String::new());
         let with_empty = compute_label_quality_lift(&[empty_ref], 0, 1);
-        assert_eq!(with_empty.n, 1, "the row is still reported in n");
-        assert_eq!(with_empty.self_referential_n, 0, "an unscored row is not self-referential evidence");
+        assert_eq!(with_empty.n, 0, "unscored rows must not inflate the evidence count");
     }
 
     #[test]
@@ -1382,6 +2228,8 @@ mod tests {
         let empty_ref = (diacritics_only.to_string(), "x y z".to_string(), "a b c".to_string());
         let lift = compute_label_quality_lift(&[good, empty_ref], 0, 1);
 
+        assert_eq!(lift.n, 1, "N must describe the one scoreable row, not both inputs");
+
         assert!(
             lift.raw_micro_cer < 1e-9,
             "empty-ref insertions must not inflate raw micro-CER: {}",
@@ -1398,6 +2246,134 @@ mod tests {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         db
+    }
+
+    fn write_export_test_wav(path: &std::path::Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for index in 0..16_000i32 {
+            writer.write_sample(((index % 100) - 50) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn seed_gold_export_database(database_path: &std::path::Path, audio_path: &std::path::Path) {
+        let database = Database::open(database_path.to_string_lossy().as_ref()).unwrap();
+        database.initialize().unwrap();
+        import_gold_segments(
+            &database,
+            vec![GoldSegmentInput {
+                audio_path: audio_path.to_string_lossy().to_string(),
+                reference: "old gold truth".to_string(),
+                is_holdout: true,
+            }],
+        )
+        .unwrap();
+    }
+
+    fn seed_finetune_export_database(database_path: &std::path::Path, audio_path: &std::path::Path) {
+        let database = Database::open(database_path.to_string_lossy().as_ref()).unwrap();
+        database.initialize().unwrap();
+        database
+            .insert_segment(&crate::db::SpeechSegment {
+                id: "finetune-kill-fixture".to_string(),
+                audio_path: audio_path.to_string_lossy().to_string(),
+                raw_transcript: "old fine tune truth".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        database.update_verified_for_test("finetune-kill-fixture", true).unwrap();
+        database.record_human_decision("finetune-kill-fixture", "accept", None, None).unwrap();
+    }
+
+    fn wait_forever_after_marker(marker: &std::path::Path) -> AppResult<()> {
+        use std::io::Write as _;
+
+        let mut file = std::fs::File::create(marker)?;
+        file.write_all(b"ready")?;
+        file.sync_all()?;
+        loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn export_publication_process_kill_worker() {
+        let Ok(kind) = std::env::var("CORTEX_TEST_EXPORT_KILL_WORKER") else {
+            return;
+        };
+        let database_path = std::path::PathBuf::from(std::env::var_os("CORTEX_TEST_EXPORT_DB").unwrap());
+        let output_dir = std::path::PathBuf::from(std::env::var_os("CORTEX_TEST_EXPORT_OUT").unwrap());
+        let marker = std::path::PathBuf::from(std::env::var_os("CORTEX_TEST_EXPORT_MARKER").unwrap());
+        let stop_at = std::env::var("CORTEX_TEST_EXPORT_POINT").unwrap();
+        let database = Database::open(database_path.to_string_lossy().as_ref()).unwrap();
+        let hook = |point: ExportPublishPoint, _: &std::path::Path, _: Option<&std::path::Path>| {
+            let matches = matches!(
+                (stop_at.as_str(), point),
+                ("staged", ExportPublishPoint::StagedAndSynced)
+                    | ("moved", ExportPublishPoint::PreviousGenerationMoved)
+            );
+            if matches {
+                wait_forever_after_marker(&marker)?;
+            }
+            Ok(())
+        };
+        match kind.as_str() {
+            "gold" => {
+                export_gold_eval_set_with_publish_hook(&database, &output_dir, hook).unwrap();
+            }
+            "finetune" => {
+                export_finetune_pack_with_publish_hook(&database, &output_dir, None, hook).unwrap();
+            }
+            other => panic!("unknown export kill worker kind: {other}"),
+        }
+        panic!("export kill worker passed its requested stop point without blocking");
+    }
+
+    fn kill_export_worker_at(
+        kind: &str,
+        point: &str,
+        database_path: &std::path::Path,
+        output_dir: &std::path::Path,
+        marker: &std::path::Path,
+    ) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("eval::tests::export_publication_process_kill_worker")
+            .arg("--test-threads=1")
+            .env("CORTEX_TEST_EXPORT_KILL_WORKER", kind)
+            .env("CORTEX_TEST_EXPORT_POINT", point)
+            .env("CORTEX_TEST_EXPORT_DB", database_path)
+            .env("CORTEX_TEST_EXPORT_OUT", output_dir)
+            .env("CORTEX_TEST_EXPORT_MARKER", marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if marker.is_file() {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("export kill worker exited before its marker: {status}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("export kill worker did not reach {point} within 20 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "a forcibly terminated export worker cannot report success");
     }
 
     #[test]
@@ -1669,8 +2645,9 @@ mod tests {
     }
 
     #[test]
-    fn export_gold_eval_set_skips_undecodable_source() {
-        // A gold row whose source can't be decoded is skipped so the eval set stays self-consistent.
+    fn export_gold_eval_set_hard_stops_on_unbound_source() {
+        // Silently shrinking the benchmark changes the yardstick. A path-only legacy row must stop
+        // the atomic generation and remain explicitly incomplete.
         let db = open_mem_db();
         import_gold_segments(
             &db,
@@ -1681,13 +2658,241 @@ mod tests {
             }],
         )
         .unwrap();
-        let out = tempfile::TempDir::new().unwrap();
-        let export = export_gold_eval_set(&db, out.path()).unwrap();
-        assert_eq!(export.total_gold, 1);
-        assert_eq!(export.exported, 0);
-        assert_eq!(export.skipped, 1);
-        let manifest = std::fs::read_to_string(out.path().join("manifest.jsonl")).unwrap();
-        assert!(manifest.trim().is_empty(), "no row for a skipped clip");
+        let root = tempfile::TempDir::new().unwrap();
+        let out = root.path().join("gold-out");
+        let error = export_gold_eval_set(&db, &out).unwrap_err();
+        assert!(error.to_string().contains("no canonical audio-content authority"));
+        assert!(!out.exists(), "no partial benchmark generation may be published");
+    }
+
+    #[test]
+    fn gold_export_rejects_same_path_audio_replacement() {
+        let db = open_mem_db();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let wav_path = tmp.path().join("gold-source.wav");
+        write_export_test_wav(&wav_path);
+        import_gold_segments(
+            &db,
+            vec![GoldSegmentInput {
+                audio_path: wav_path.to_string_lossy().into_owned(),
+                reference: "ڕاستی".to_string(),
+                is_holdout: true,
+            }],
+        )
+        .unwrap();
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for index in 0..16000i32 {
+            writer.write_sample(((index % 503) - 251) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let out = tmp.path().join("gold-out");
+        let error = export_gold_eval_set(&db, &out).unwrap_err();
+        assert!(error.to_string().contains("stored canonical PCM identity"));
+        assert!(!out.exists(), "the failed atomic generation must not publish a partial benchmark");
+    }
+
+    #[test]
+    fn gold_export_refuses_a_mutated_staged_generation_and_preserves_the_old_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("gold.db");
+        let audio_path = root.path().join("gold.wav");
+        write_export_test_wav(&audio_path);
+        seed_gold_export_database(&database_path, &audio_path);
+        let database = Database::open(database_path.to_string_lossy().as_ref()).unwrap();
+        let output = root.path().join("gold-export");
+        export_gold_eval_set(&database, &output).unwrap();
+        let old_generation = export_generation_digest(&output).unwrap();
+        database.connection().execute("UPDATE gold_segments SET reference = 'new gold truth'", []).unwrap();
+
+        let error = export_gold_eval_set_with_publish_hook(&database, &output, |point, stage, _| {
+            if point == ExportPublishPoint::StagedAndSynced {
+                use std::io::Write as _;
+                let mut manifest = std::fs::OpenOptions::new().append(true).open(stage.join("manifest.jsonl"))?;
+                manifest.write_all(b"tampered after seal\n")?;
+                manifest.sync_all()?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed after it was sealed"), "unexpected refusal: {error}");
+        assert_eq!(
+            export_generation_digest(&output).unwrap(),
+            old_generation,
+            "a private-stage mutation must not alter one byte or artifact of the published generation"
+        );
+    }
+
+    #[test]
+    fn successful_gold_reexport_replaces_the_whole_generation_without_stale_clips() {
+        let root = tempfile::tempdir().unwrap();
+        let first_audio = root.path().join("first.wav");
+        let second_audio = root.path().join("second.wav");
+        write_export_test_wav(&first_audio);
+        write_export_test_wav(&second_audio);
+        let database = open_mem_db();
+        import_gold_segments(
+            &database,
+            vec![
+                GoldSegmentInput {
+                    audio_path: first_audio.to_string_lossy().to_string(),
+                    reference: "keep this row".to_string(),
+                    is_holdout: true,
+                },
+                GoldSegmentInput {
+                    audio_path: second_audio.to_string_lossy().to_string(),
+                    reference: "remove this row".to_string(),
+                    is_holdout: true,
+                },
+            ],
+        )
+        .unwrap();
+        let output = root.path().join("gold-reexport");
+        export_gold_eval_set(&database, &output).unwrap();
+        assert_eq!(std::fs::read_dir(output.join("clips")).unwrap().count(), 2);
+
+        database.connection().execute("DELETE FROM gold_segments WHERE reference = 'remove this row'", []).unwrap();
+        export_gold_eval_set(&database, &output).unwrap();
+
+        let manifest = std::fs::read_to_string(output.join("manifest.jsonl")).unwrap();
+        assert!(manifest.contains("keep this row"));
+        assert!(!manifest.contains("remove this row"));
+        assert_eq!(
+            std::fs::read_dir(output.join("clips")).unwrap().count(),
+            1,
+            "a smaller re-export must not inherit an orphan clip from the old generation"
+        );
+        assert!(verify_sealed_export_generation(&output).unwrap());
+    }
+
+    #[test]
+    fn finetune_export_rejects_same_path_audio_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let audio_path = root.path().join("finetune-source.wav");
+        write_export_test_wav(&audio_path);
+        let database = open_mem_db();
+        let segment = crate::db::SpeechSegment {
+            id: "finetune-source-drift".to_string(),
+            audio_path: audio_path.to_string_lossy().into_owned(),
+            raw_transcript: "دەقی مرۆڤ".to_string(),
+            verified: true,
+            human_decision: Some("accept".to_string()),
+            duration_ms: 1000,
+            ..Default::default()
+        };
+        database.insert_legacy_segment_fixture(&segment).unwrap();
+        let (sample_rate, pcm) = crate::audio::decode_to_pcm(&audio_path).unwrap();
+        let original_hash = crate::fingerprint::AudioFingerprint::content_hash(&pcm, sample_rate);
+        database
+            .connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+                params![segment.id, original_hash],
+            )
+            .unwrap();
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio_path, spec).unwrap();
+        for index in 0..16000i32 {
+            writer.write_sample(((index % 601) - 300) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let output = root.path().join("finetune-out");
+        let error = super::export_finetune_pack(&database, &output, None).unwrap_err();
+        assert!(error.to_string().contains("stored canonical PCM identity"));
+        assert!(!output.exists(), "stale source authority must not publish a partial fine-tune pack");
+    }
+
+    #[test]
+    fn finetune_export_fault_after_old_generation_move_rolls_back_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("finetune.db");
+        let audio_path = root.path().join("finetune.wav");
+        write_export_test_wav(&audio_path);
+        seed_finetune_export_database(&database_path, &audio_path);
+        let database = Database::open(database_path.to_string_lossy().as_ref()).unwrap();
+        let output = root.path().join("finetune-export");
+        export_finetune_pack(&database, &output, None).unwrap();
+        let old_generation = export_generation_digest(&output).unwrap();
+
+        let error = export_finetune_pack_with_publish_hook(&database, &output, None, |point, _, _| {
+            if point == ExportPublishPoint::PreviousGenerationMoved {
+                return Err(AppError::Other("injected failure after old-generation rename".to_string()));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected failure"));
+        assert_eq!(
+            export_generation_digest(&output).unwrap(),
+            old_generation,
+            "an in-process failure between directory renames must restore the exact old generation"
+        );
+    }
+
+    #[test]
+    fn gold_export_process_kill_before_promotion_leaves_no_public_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("gold-kill.db");
+        let audio_path = root.path().join("gold-kill.wav");
+        write_export_test_wav(&audio_path);
+        seed_gold_export_database(&database_path, &audio_path);
+        let output = root.path().join("gold-kill-export");
+        let marker = root.path().join("gold-kill.marker");
+
+        kill_export_worker_at("gold", "staged", &database_path, &output, &marker);
+
+        assert!(!output.exists(), "a killed pre-promotion export must not expose a partial final directory");
+    }
+
+    #[test]
+    fn finetune_export_process_kill_during_swap_preserves_a_recoverable_old_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let database_path = root.path().join("finetune-kill.db");
+        let audio_path = root.path().join("finetune-kill.wav");
+        write_export_test_wav(&audio_path);
+        seed_finetune_export_database(&database_path, &audio_path);
+        let output = root.path().join("finetune-kill-export");
+        {
+            let database = Database::open(database_path.to_string_lossy().as_ref()).unwrap();
+            export_finetune_pack(&database, &output, None).unwrap();
+        }
+        let old_generation = export_generation_digest(&output).unwrap();
+        let marker = root.path().join("finetune-kill.marker");
+
+        kill_export_worker_at("finetune", "moved", &database_path, &output, &marker);
+
+        assert!(!output.exists(), "the canonical target is never a half-old/half-new directory");
+        let layout = export_target_layout(&output).unwrap();
+        let backups: Vec<std::path::PathBuf> = std::fs::read_dir(&layout.parent)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_str().is_some_and(|name| name.starts_with(&layout.backup_prefix)))
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(backups.len(), 1, "one exact old generation must survive the killed swap");
+        assert_eq!(export_generation_digest(&backups[0]).unwrap(), old_generation);
+        assert!(recover_interrupted_export_publication(&output, &layout).unwrap());
+        assert_eq!(
+            export_generation_digest(&output).unwrap(),
+            old_generation,
+            "startup preflight must put the exact old generation back at the canonical path"
+        );
     }
 
     #[test]
@@ -2015,14 +3220,13 @@ mod tests {
         // `train` on its own, so every remaining group is forced into validation/test — and with
         // basename grouping the two twins are two groups, so they are forced APART.
         let mut ids_by_group: Vec<(String, Vec<String>)> = Vec::new();
-        for (name, hash, chunks) in
-            [("dominant.wav", "h-dom", 40), ("twin_a.wav", "same-content", 1), ("twin_b.wav", "same-content", 1)]
-        {
+        for (name, chunks) in [("dominant.wav", 40), ("twin_a.wav", 1), ("twin_b.wav", 1)] {
             let wav = tmp.path().join(name);
             let mut w = hound::WavWriter::create(&wav, spec).unwrap();
             // Long enough for every chunk this file will be cut into (16 kHz, 1 s per chunk).
-            for i in 0..(16000 * (chunks + 1)) {
-                w.write_sample(((i % 100) - 50) as i16).unwrap();
+            let samples: Vec<i16> = (0..(16000 * (chunks + 1))).map(|i| ((i % 100) - 50) as i16).collect();
+            for &sample in &samples {
+                w.write_sample(sample).unwrap();
             }
             w.finalize().unwrap();
             let path = wav.to_string_lossy().to_string();
@@ -2047,9 +3251,12 @@ mod tests {
                 ids.push(id);
             }
             // The identity that survives a re-encode (v51). The twins share theirs.
-            db.set_audio_identity(&path, &crate::fingerprint::AudioIdentity { spectral: 1, content: hash.to_string() })
-                .unwrap();
-            ids_by_group.push((hash.to_string(), ids));
+            let identity = crate::fingerprint::AudioIdentity {
+                spectral: crate::fingerprint::AudioFingerprint::fingerprint(&samples, spec.sample_rate),
+                content: canonical_audio_content_hash(&wav).unwrap(),
+            };
+            db.set_audio_identity(&path, &identity).unwrap();
+            ids_by_group.push((identity.content, ids));
         }
 
         let out = tempfile::TempDir::new().unwrap();
@@ -2530,14 +3737,23 @@ mod tests {
     #[test]
     fn run_gold_eval_with_transcriber_runs_per_segment_and_scores() {
         let db = open_mem_db();
+        let audio = tempfile::tempdir().unwrap();
+        let first = audio.path().join("a.wav");
+        let second = audio.path().join("b.wav");
+        write_export_test_wav(&first);
+        write_export_test_wav(&second);
         import_gold_segments(
             &db,
             vec![
                 GoldSegmentInput {
-                    audio_path: "/tmp/a.wav".into(), reference: "کوردستان".into(), is_holdout: true
+                    audio_path: first.to_string_lossy().into_owned(),
+                    reference: "کوردستان".into(),
+                    is_holdout: true,
                 },
                 GoldSegmentInput {
-                    audio_path: "/tmp/b.wav".into(), reference: "ئەمە دەنگە".into(), is_holdout: true
+                    audio_path: second.to_string_lossy().into_owned(),
+                    reference: "ئەمە دەنگە".into(),
+                    is_holdout: true,
                 },
             ],
         )
@@ -2563,14 +3779,64 @@ mod tests {
     }
 
     #[test]
+    fn closed_loop_gold_eval_rejects_same_path_audio_replacement_before_transcription() {
+        let db = open_mem_db();
+        let audio = tempfile::tempdir().unwrap();
+        let source = audio.path().join("gold.wav");
+        write_export_test_wav(&source);
+        import_gold_segments(
+            &db,
+            vec![GoldSegmentInput {
+                audio_path: source.to_string_lossy().into_owned(),
+                reference: "ڕاستی".to_string(),
+                is_holdout: true,
+            }],
+        )
+        .unwrap();
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+        for index in 0..16000i32 {
+            writer.write_sample(((index % 701) - 350) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut calls = 0usize;
+        let error = run_gold_eval_with_transcriber(&db, "candidate", |_| {
+            calls += 1;
+            Ok("must not run".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 0, "stale gold bytes must be rejected before reaching the model");
+        assert!(error.to_string().contains("stored canonical PCM identity"));
+        assert!(list_eval_runs(&db).unwrap().is_empty());
+    }
+
+    #[test]
     fn run_gold_eval_with_transcriber_halts_on_the_first_failure_without_writing_a_row() {
         let db = open_mem_db();
+        let audio = tempfile::tempdir().unwrap();
+        let first = audio.path().join("first.wav");
+        let second = audio.path().join("second.wav");
+        write_export_test_wav(&first);
+        write_export_test_wav(&second);
         import_gold_segments(
             &db,
             vec![
-                GoldSegmentInput { audio_path: "/missing.wav".into(), reference: "ئەمە".into(), is_holdout: true },
                 GoldSegmentInput {
-                    audio_path: "/tmp/ok.wav".into(), reference: "کوردستان".into(), is_holdout: true
+                    audio_path: first.to_string_lossy().into_owned(),
+                    reference: "ئەمە".into(),
+                    is_holdout: true,
+                },
+                GoldSegmentInput {
+                    audio_path: second.to_string_lossy().into_owned(),
+                    reference: "کوردستان".into(),
+                    is_holdout: true,
                 },
             ],
         )
@@ -2580,11 +3846,11 @@ mod tests {
         // second-resolution `created_at`, so two rows imported in the same test tick have no defined
         // order and keying the failure on a path would flake.
         let mut calls = 0usize;
-        let mut failed_path = String::new();
+        let mut failed_id = String::new();
         let err = run_gold_eval_with_transcriber(&db, "partial-asr", |seg| {
             calls += 1;
             if calls == 1 {
-                failed_path = seg.audio_path.clone();
+                failed_id = seg.id.clone();
                 Err(crate::error::AppError::Other("decode failed".into()))
             } else {
                 Ok("کوردستان".to_string())
@@ -2594,7 +3860,7 @@ mod tests {
 
         // The message must name the clip and the cause, so the halt is actionable rather than a tally.
         let msg = err.to_string();
-        assert!(msg.contains(&failed_path), "halt must name the failing clip: {msg}");
+        assert!(msg.contains(&failed_id), "halt must name the failing clip: {msg}");
         assert!(msg.contains("decode failed"), "halt must carry the underlying cause: {msg}");
         assert_eq!(calls, 1, "the run stops at the FIRST failure; it does not keep transcribing");
 

@@ -30,6 +30,8 @@ def test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies
         "self.runtime.open_read()?.find_interrupted_import_job()",
         'self.lock("discard_interrupted_import").discard_import_job(job_id)',
         'self.lock("begin_import").begin_import_job(directory, total_files)',
+        'self.lock("handoff_import_for_resume").handoff_import_job_for_resume(prior_job_id)',
+        'self.lock("continue_import").continue_import_job(job_id, directory, total_files)',
         'self.lock("mark_import_file_done").mark_import_file_done(job_id, path)',
         'self.lock("complete_import").complete_import_job(job_id)',
         "self.runtime.open_read()?.list_recent_jobs(limit)",
@@ -72,6 +74,18 @@ def test_commands_delegate_without_raw_database_authority() -> None:
         if required not in discard:
             raise AssertionError(f"discard_interrupted_import lost validation: {required}")
 
+    resume = command(source, signatures["resume_interrupted_import"])
+    for forbidden in ("discard_interrupted_import(&job.id)", "discard_import_job(&job.id)"):
+        if forbidden in resume:
+            raise AssertionError("resume erased the sole recovery journal before successor publication")
+    claim = resume.find("state.try_start_import()")
+    handoff = resume.find(".handoff_import_for_resume(&job.id)")
+    spawn = resume.find("std::thread::Builder::new()")
+    if min(claim, handoff, spawn) < 0 or not claim < handoff < spawn:
+        raise AssertionError("resume must claim single-flight, atomically publish the successor journal, then spawn")
+    if "state.finish_import();" not in resume or "Durable import journal" not in resume:
+        raise AssertionError("resume worker-spawn failure must release memory state while retaining durable authority")
+
     exports = read("commands/export.rs")
     export_signatures = {
         "export_dataset": "pub async fn export_dataset(",
@@ -107,7 +121,10 @@ def test_pipeline_import_journal_is_store_owned_and_fail_closed() -> None:
         "database_runtime: Arc<Mutex<Option<crate::database_runtime::DatabaseRuntime>>>",
         "pub(crate) fn new_with_runtime(",
         "let import_jobs = self.import_job_store()?;",
-        "let job_id = import_jobs.begin_import(",
+        "import_jobs.begin_import(&dir_text, total)",
+        "import_jobs.continue_import(job_id, &dir_text, total)",
+        "A claimed resume journal requires resume authority",
+        "Could not admit the claimed durable resume journal before audio work",
         "import_jobs.mark_import_file_done(&job_id, &file_path_str)",
         "import_jobs.complete_import(&job_id)",
         "Could not create the durable import recovery journal",

@@ -15,8 +15,16 @@ def command(source: str, signature: str) -> str:
     start = source.find(signature)
     if start < 0:
         raise AssertionError(f"missing command boundary `{signature}`")
-    end = source.find("\n#[tauri::command]", start + len(signature))
-    return source[start:] if end < 0 else source[start:end]
+    candidates = [
+        boundary
+        for boundary in (
+            source.find("\n#[tauri::command]", start + len(signature)),
+            source.find("\n#[cfg(test)]", start + len(signature)),
+        )
+        if boundary >= 0
+    ]
+    end = min(candidates) if candidates else len(source)
+    return source[start:end]
 
 
 def test_store_is_backend_only_and_serializes_each_effect_write() -> None:
@@ -45,10 +53,12 @@ def test_store_is_backend_only_and_serializes_each_effect_write() -> None:
 
 
 def test_migrated_commands_validate_then_delegate_without_raw_database_authority() -> None:
-    commands = read("commands/segments_write.rs").split("#[cfg(test)]", 1)[0]
+    # `#[cfg(test)]` is also used on individual characterization helpers before later production
+    # commands, so truncating at the first occurrence can silently stop auditing the real surface.
+    # Extract each exact `pub fn` command body from the complete file instead.
+    commands = read("commands/segments_write.rs")
     expectations = {
-        "record_human_decision": "record_human_decision_on(",
-        "commit_review_v1": "commit_review_v1_on(",
+        "commit_review_v1": "commit_review_v1_on_with_source_lease(",
         "undo_human_decision": ".undo_human_decision(",
         "record_review_flag": ".record_flag(",
         "undo_review_flag": ".undo_flag(",
@@ -61,6 +71,13 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
         for forbidden in ("state.lock_db()", "crate::db::Database", ".connection()"):
             if forbidden in body:
                 raise AssertionError(f"{name} regained raw database authority: {forbidden}")
+
+    retired = command(commands, "pub fn record_human_decision(")
+    for required in ("retired_legacy_decision_error()", "TYPED_REVIEW_REQUIRED"):
+        if required not in retired and required not in commands:
+            raise AssertionError(f"retired record_human_decision lost its fail-closed marker: {required}")
+    if ".review_writes()" in retired or "record_human_decision_on(" in retired:
+        raise AssertionError("retired record_human_decision must not retain a mutation path")
 
     flag = command(commands, "pub fn record_review_flag(")
     for required in ("validate::validate_identifier(&segment_id)", "validate::validate_text(&rationale"):

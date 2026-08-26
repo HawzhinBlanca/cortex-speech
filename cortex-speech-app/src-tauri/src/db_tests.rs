@@ -22,7 +22,7 @@ fn detached_read_snapshot_cannot_mutate_its_source_database() {
         db.initialize().unwrap();
     }
     let snapshot = Database::open_detached_read_snapshot(path.to_str().unwrap()).unwrap();
-    assert_eq!(crate::migrations::validate_applied_history(snapshot.connection()).unwrap(), 66);
+    assert_eq!(crate::migrations::validate_applied_history(snapshot.connection()).unwrap(), 67);
     snapshot.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).unwrap();
     assert_eq!(snapshot.integrity_check().unwrap(), "ok", "FTS5 validation runs on the writable private copy");
     drop(snapshot);
@@ -43,7 +43,7 @@ fn direct_read_only_connection_measures_the_source_but_cannot_write_it() {
         db.initialize().unwrap();
     }
     let reader = Database::open_read_only(path.to_str().unwrap()).unwrap();
-    assert_eq!(crate::migrations::validate_applied_history(reader.connection()).unwrap(), 66);
+    assert_eq!(crate::migrations::validate_applied_history(reader.connection()).unwrap(), 67);
     assert!(reader.connection().execute("INSERT INTO settings(key,value) VALUES('must-not-write','x')", []).is_err());
     drop(reader);
 
@@ -148,7 +148,102 @@ fn full_playback_proof(db: &Database, segment_id: &str, reviewer: &str) -> Playb
         source_end_ms: None,
     };
     assert!(db.record_playback_receipt_if_at_revision(&receipt, segment_revision).unwrap());
-    PlaybackDecisionProof { segment_revision, audio_content_hash, source_start_ms, source_end_ms }
+    PlaybackDecisionProof {
+        segment_revision,
+        audio_content_hash,
+        source_start_ms,
+        source_end_ms,
+        authority_session_id: None,
+        source_lease: None,
+    }
+}
+
+/// Real policy-4 Couch evidence for tests that exercise the production proof-bearing writer. The
+/// temporary source stays alive through the decision transaction so the verified source lease can
+/// be rechecked instead of relying on the legacy policy-3 test fixture above.
+struct CanonicalPolicy4Playback {
+    proof: PlaybackDecisionProof,
+    _source: tempfile::TempDir,
+}
+
+impl std::ops::Deref for CanonicalPolicy4Playback {
+    type Target = PlaybackDecisionProof;
+
+    fn deref(&self) -> &Self::Target {
+        &self.proof
+    }
+}
+
+fn canonical_policy4_phone_playback(db: &Database, segment_id: &str, reviewer: &str) -> CanonicalPolicy4Playback {
+    let duration_ms: i64 = db
+        .connection()
+        .query_row("SELECT duration_ms FROM speech_segments WHERE id=?1", [segment_id], |row| row.get(0))
+        .unwrap();
+    assert!(duration_ms > 0, "a policy-4 playback fixture needs a positive clip duration");
+
+    let source = tempfile::tempdir().unwrap();
+    let source_path = source.path().join("canonical-policy4.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&source_path, spec).unwrap();
+    for sample in 0..duration_ms * 16 {
+        writer.write_sample::<i16>(((sample % 257) - 128) as i16).unwrap();
+    }
+    writer.finalize().unwrap();
+    let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&source_path).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET audio_path=?2,
+                    audio_content_hash=?3,
+                    alignment_json=json_object('source_start_ms', 0, 'source_end_ms', ?4)
+              WHERE id=?1",
+            params![segment_id, source_path.to_string_lossy(), content_hash, duration_ms],
+        )
+        .unwrap();
+
+    let segment_revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+    let session_binding_sha256 = "c".repeat(64);
+    let issued_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let authority = CouchPlaybackAttemptAuthority {
+        playback_receipt_id: uuid::Uuid::new_v4().to_string(),
+        media_grant_id: uuid::Uuid::new_v4().to_string(),
+        client_attempt_id: uuid::Uuid::new_v4().to_string(),
+        session_binding_sha256: session_binding_sha256.clone(),
+        reviewer: reviewer.to_string(),
+        segment_id: segment_id.to_string(),
+        segment_revision,
+        audio_content_hash: content_hash.clone(),
+        source_path,
+        clip_duration_ms: duration_ms,
+        source_start_ms: 0,
+        source_end_ms: duration_ms,
+        issued_at_ms,
+        expires_at_ms: issued_at_ms + 60_000,
+    };
+    let receipt = db
+        .finalize_couch_playback_attempt_v1(
+            &authority,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: duration_ms }],
+            duration_ms,
+        )
+        .unwrap();
+    let proof = db
+        .couch_playback_proof_v4(
+            segment_id,
+            segment_revision,
+            &content_hash,
+            reviewer,
+            &session_binding_sha256,
+            &receipt.playback_receipt_id,
+        )
+        .unwrap()
+        .expect("canonical policy-4 receipt must resolve to its exact source lease");
+    CanonicalPolicy4Playback { proof, _source: source }
 }
 
 fn latest_human_effect_id(db: &Database, segment_id: &str) -> i64 {
@@ -1084,7 +1179,7 @@ fn reviewed_rows_refuse_whole_row_and_asr_upserts_and_preserve_attribution() {
     db.insert_segment(&make_segment("rt-1", "/rt-1.wav")).unwrap();
     record_test_phone_decision(&db, "rt-1", "accept", None, "Sara");
 
-    // Policy-3 reviewed rows are no longer restored by renderer-owned whole-row snapshots. Even an
+    // Paid reviewed rows are no longer restored by renderer-owned whole-row snapshots. Even an
     // apparently identical UPSERT names immutable audio fields in its UPDATE clause, so it must be
     // refused rather than reopening a clobber path around exact effect-based Undo.
     let snapshot = db.get_segment_by_id("rt-1").unwrap().unwrap();
@@ -1092,7 +1187,7 @@ fn reviewed_rows_refuse_whole_row_and_asr_upserts_and_preserve_attribution() {
     let error = db.insert_segment_full(&snapshot).unwrap_err();
     assert!(
         error.to_string().contains("review-owned field")
-            || error.to_string().contains("paid policy-3 source identity is immutable"),
+            || error.to_string().contains("paid policy-4 source identity is immutable"),
         "{error}"
     );
     assert_eq!(
@@ -1106,7 +1201,7 @@ fn reviewed_rows_refuse_whole_row_and_asr_upserts_and_preserve_attribution() {
     let mut asr_only = make_segment("rt-1", "/rt-1.wav");
     asr_only.raw_transcript = "re-decoded".to_string();
     let asr_error = db.insert_segment(&asr_only).unwrap_err();
-    assert!(asr_error.to_string().contains("paid policy-3 source identity is immutable"), "{asr_error}");
+    assert!(asr_error.to_string().contains("paid policy-4 source identity is immutable"), "{asr_error}");
     assert_eq!(
         db.get_segment_by_id("rt-1").unwrap().unwrap().reviewed_by.as_deref(),
         Some("Sara"),
@@ -1448,6 +1543,91 @@ fn champion_commit_atomically_updates_transcript_provenance_and_sole_hypothesis(
         })
         .unwrap();
     assert_eq!(hypothesis_version, "omniasr-wsl-7b");
+}
+
+#[test]
+fn bound_champion_commit_refuses_cross_segment_and_source_drift_without_side_effects() {
+    let db = make_db();
+    let alignment_a = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#;
+    let alignment_b = r#"{"source_start_ms":1000,"source_end_ms":2000,"chunk_index":1,"chunk_count":2}"#;
+    let mut segment_a = make_segment("bound-a", "/recording-a.wav");
+    segment_a.raw_transcript = "incumbent a".into();
+    segment_a.alignment_json = Some(alignment_a.into());
+    let mut segment_b = make_segment("bound-b", "/recording-b.wav");
+    segment_b.raw_transcript = "incumbent b".into();
+    segment_b.alignment_json = Some(alignment_b.into());
+    db.insert_segments_batch(&[segment_a.clone(), segment_b.clone()]).unwrap();
+    let hash_a = "a".repeat(64);
+    let hash_b = "b".repeat(64);
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=CASE id WHEN 'bound-a' THEN ?1 ELSE ?2 END
+             WHERE id IN ('bound-a','bound-b')",
+            rusqlite::params![hash_a, hash_b],
+        )
+        .unwrap();
+    for (id, transcript) in [("bound-a", "prior vote a"), ("bound-b", "prior vote b")] {
+        db.insert_hypothesis(&SegmentHypothesis {
+            segment_id: id.into(),
+            model_id: "prior-model".into(),
+            transcript: transcript.into(),
+            confidence: Some(0.2),
+        })
+        .unwrap();
+    }
+
+    let snapshot_a = db.champion_transcription_source_snapshot("bound-a").unwrap().unwrap();
+    let wrong_segment = SegmentHypothesis {
+        segment_id: "bound-b".into(),
+        model_id: "omniasr-wsl-7b".into(),
+        transcript: "audio from a must never land on b".into(),
+        confidence: Some(0.99),
+    };
+    let error = db
+        .commit_bound_champion_transcript_if_unreviewed(
+            &wrong_segment,
+            None,
+            None,
+            Some("external_provider"),
+            false,
+            &snapshot_a,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("E_TRANSCRIPTION_SOURCE_MISMATCH"), "{error}");
+
+    // Simulate an authoritative relink/source-epoch change while inference for A is in flight.
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+             SET audio_path='/replacement.wav', alignment_json=?2, audio_content_hash=?3
+             WHERE id=?1",
+            rusqlite::params!["bound-a", alignment_b, "c".repeat(64)],
+        )
+        .unwrap();
+    let stale_a = SegmentHypothesis {
+        segment_id: "bound-a".into(),
+        model_id: "omniasr-wsl-7b".into(),
+        transcript: "stale a result".into(),
+        confidence: Some(0.99),
+    };
+    let error = db
+        .commit_bound_champion_transcript_if_unreviewed(
+            &stale_a,
+            None,
+            None,
+            Some("external_provider"),
+            false,
+            &snapshot_a,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("E_TRANSCRIPTION_SOURCE_CHANGED"), "{error}");
+
+    let stored_a = db.get_segment_by_id("bound-a").unwrap().unwrap();
+    let stored_b = db.get_segment_by_id("bound-b").unwrap().unwrap();
+    assert_eq!(stored_a.raw_transcript, "incumbent a");
+    assert_eq!(stored_b.raw_transcript, "incumbent b");
+    assert_eq!(db.get_hypotheses_for_segment("bound-a").unwrap()[0].transcript, "prior vote a");
+    assert_eq!(db.get_hypotheses_for_segment("bound-b").unwrap()[0].transcript, "prior vote b");
 }
 
 #[test]
@@ -1874,6 +2054,38 @@ fn exact_review_flag_effect_undo_is_idempotent_and_conflict_safe() {
 }
 
 #[test]
+fn generic_review_flags_cannot_forge_or_overwrite_the_technical_unusable_namespace() {
+    let db = make_db();
+    db.insert_segment(&make_segment("reserved-technical-flag", "/reserved.wav")).unwrap();
+    let forged = db
+        .record_review_flag(
+            "reserved-technical-flag",
+            "technical_unusable:v1:decodeFailed",
+            "00000000-0000-4000-8000-000000000921",
+        )
+        .expect_err("free-form flags must not mint a structured technical exclusion");
+    assert!(forged.to_string().contains("namespace is reserved"), "{forged}");
+
+    let base_revision = db.segment_review_revision("reserved-technical-flag").unwrap().unwrap();
+    let source = db.technical_unusable_source_snapshot("reserved-technical-flag").unwrap().unwrap();
+    db.mark_segment_technically_unusable_after_verified_failure(
+        "reserved-technical-flag",
+        base_revision,
+        "permissionDenied",
+        &source.source_path_sha256,
+        source.audio_content_hash.as_deref(),
+        "00000000-0000-4000-8000-000000000922",
+    )
+    .unwrap();
+    let overwrite = db
+        .record_review_flag("reserved-technical-flag", "generic concern", "00000000-0000-4000-8000-000000000923")
+        .expect_err("a generic flag must not remove an active technical export exclusion");
+    assert!(overwrite.to_string().contains("undo its exact effect first"), "{overwrite}");
+    let row = db.get_segment_by_id("reserved-technical-flag").unwrap().unwrap();
+    assert_eq!(crate::quality::technical_unusable_reason(&row), Some("permissionDenied"));
+}
+
+#[test]
 fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
     let forged = make_db();
     forged.insert_segment(&make_segment("flag-unbound", "/flag-unbound.wav")).unwrap();
@@ -1943,12 +2155,12 @@ fn review_flag_requires_clean_or_immutable_legacy_human_baseline() {
     }
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+    assert_eq!(crate::migrations::rollback(&legacy, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
     let mut legacy_reviewed = make_segment("flag-legacy", "/flag-legacy.wav");
     legacy_reviewed.verified = true;
     legacy_reviewed.annotated_transcript = Some("immutable legacy truth".into());
     legacy.insert_segment_full(&legacy_reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
     let commit = legacy
         .record_review_flag("flag-legacy", "legacy row needs adjudication", "00000000-0000-4000-8000-000000000904")
         .expect("an exact immutable pre-v60 reviewed baseline remains flaggable");
@@ -3254,7 +3466,7 @@ fn restore_stages_pending_migrations_and_foreign_keys_before_overwriting_live_da
     {
         let candidate = Database::open(migration_fail_path.to_str().unwrap()).unwrap();
         candidate.initialize().unwrap();
-        assert_eq!(crate::migrations::rollback(&candidate, 9).unwrap(), vec![66, 65, 64, 63, 62, 61, 60, 59, 58]);
+        assert_eq!(crate::migrations::rollback(&candidate, 10).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59, 58]);
         candidate
             .connection()
             .execute_batch(
@@ -3595,6 +3807,83 @@ fn begin_import_job_reaps_prior_running_crashes() {
     let found = db.find_interrupted_import_job().unwrap().unwrap();
     assert_eq!(found.id, fresh, "the interruption is the fresh import, never the reaped crash");
     assert_eq!(found.dir, "C:/audio/second");
+}
+
+#[test]
+fn resume_handoff_copy_failure_rolls_back_to_the_original_running_journal() {
+    // Deterministic equivalent of a kill after the in-process resume claim and during successor
+    // construction: fail the completed-path copy after the transaction has retired the old row and
+    // inserted the new one. The savepoint must restore the exact old journal, not leave zero authority.
+    let db = make_db();
+    let crashed = db.begin_import_job("C:/audio", 2).unwrap();
+    db.mark_import_file_done(&crashed, "C:/audio/a.wav").unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_resume_journal_copy
+             BEFORE INSERT ON import_job_files
+             WHEN EXISTS (
+                 SELECT 1 FROM import_jobs WHERE id = NEW.job_id AND status = 'running'
+             )
+             BEGIN SELECT RAISE(ABORT, 'injected successor copy failure'); END;",
+        )
+        .unwrap();
+
+    let error = db.handoff_import_job_for_resume(&crashed).unwrap_err();
+    assert!(error.to_string().contains("successor copy failure"), "unexpected fault: {error}");
+
+    let recovered = db.find_interrupted_import_job().unwrap().expect("the original journal must survive");
+    assert_eq!(recovered.id, crashed);
+    assert_eq!(recovered.completed_paths, vec!["C:/audio/a.wav"]);
+    let running: i64 = db
+        .connection()
+        .query_row("SELECT COUNT(*) FROM import_jobs WHERE status = 'running'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(running, 1, "a failed handoff must retain exactly one resumable journal");
+}
+
+#[test]
+fn resume_handoff_survives_a_kill_before_worker_entry_without_duplicate_progress() {
+    // Close and reopen immediately after the atomic handoff, before `continue_import_job` models the
+    // worker entry. This is the exact process-kill seam that used to erase the old journal in the
+    // command handler before the worker created its replacement.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("resume-kill.db");
+    let successor;
+    {
+        let db = Database::open(path.to_string_lossy().as_ref()).unwrap();
+        db.initialize().unwrap();
+        let crashed = db.begin_import_job("C:/audio", 3).unwrap();
+        db.mark_import_file_done(&crashed, "C:/audio/a.wav").unwrap();
+        db.mark_import_file_done(&crashed, "C:/audio/b.wav").unwrap();
+        successor = db.handoff_import_job_for_resume(&crashed).unwrap();
+
+        let claimed = db.find_interrupted_import_job().unwrap().expect("successor is durable before spawn");
+        assert_eq!(claimed.id, successor);
+        assert_eq!(claimed.completed_paths.len(), 2);
+        let running: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM import_jobs WHERE status = 'running'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(running, 1);
+    }
+
+    let reopened = Database::open(path.to_string_lossy().as_ref()).unwrap();
+    let before_worker = reopened.find_interrupted_import_job().unwrap().expect("kill left a resumable successor");
+    assert_eq!(before_worker.id, successor);
+    assert_eq!(
+        before_worker.completed_paths.iter().collect::<std::collections::HashSet<_>>().len(),
+        2,
+        "successor copy must not duplicate completed paths"
+    );
+
+    reopened.continue_import_job(&successor, "C:/audio", 4).unwrap();
+    // Re-journaling an adopted file is idempotent, which is the no-duplicate resume path used after
+    // source/champion authority independently proves that its segment rows should be skipped.
+    reopened.mark_import_file_done(&successor, "C:/audio/a.wav").unwrap();
+    let admitted = reopened.find_interrupted_import_job().unwrap().unwrap();
+    assert_eq!(admitted.id, successor);
+    assert_eq!(admitted.total_files, 4);
+    assert_eq!(admitted.completed_paths.len(), 2, "worker entry/re-journal must not duplicate progress rows");
 }
 
 #[test]
@@ -4171,6 +4460,91 @@ fn audio_fingerprint_round_trips_through_sqlite_including_the_high_bit() {
     // The untouched recording stays NULL and is simply absent — not defaulted to 0, which register
     // deliberately refuses to store as a bucket key.
     assert!(!loaded.iter().any(|r| r.audio_path == "/audio/other.wav"), "a NULL fingerprint must not appear");
+}
+
+#[test]
+fn scoped_audio_identity_publication_refuses_same_path_replacement_and_rolls_back_new_rows() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let audio_path = r"C:\Audio\voice.wav";
+    db.insert_segment(&SpeechSegment {
+        id: "older".into(),
+        audio_path: audio_path.into(),
+        raw_transcript: "older transcript".into(),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    let older_identity = crate::fingerprint::AudioIdentity { spectral: 11, content: "a".repeat(64) };
+    db.set_audio_identity(audio_path, &older_identity).unwrap();
+
+    let replacement = SpeechSegment {
+        id: "replacement".into(),
+        audio_path: audio_path.into(),
+        raw_transcript: "replacement transcript".into(),
+        ..SpeechSegment::default()
+    };
+    let replacement_identity = crate::fingerprint::AudioIdentity { spectral: 22, content: "b".repeat(64) };
+    let error = db.insert_segments_with_audio_identity_batch(&[replacement], &replacement_identity).unwrap_err();
+    assert!(error.to_string().contains("SOURCE_IDENTITY_DRIFT"), "unexpected refusal: {error}");
+    assert!(db.get_segment_by_id("replacement").unwrap().is_none(), "the conflicting publication must roll back");
+    assert_eq!(
+        db.segment_audio_content_hash("older").unwrap().as_deref(),
+        Some(older_identity.content.as_str()),
+        "the older segment must retain its original byte identity"
+    );
+
+    let direct_error = db.set_audio_identity(audio_path, &replacement_identity).unwrap_err();
+    assert!(direct_error.to_string().contains("SOURCE_IDENTITY_DRIFT"));
+    assert_eq!(db.segment_audio_content_hash("older").unwrap().as_deref(), Some(older_identity.content.as_str()));
+}
+
+#[test]
+fn scoped_audio_identity_never_rebinds_human_rows_and_allows_unchanged_replay() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let stored_path = r"C:\Audio\Human.wav";
+    let identity = crate::fingerprint::AudioIdentity { spectral: 33, content: "c".repeat(64) };
+    db.insert_segment(&SpeechSegment {
+        id: "human".into(),
+        audio_path: stored_path.into(),
+        raw_transcript: "human baseline".into(),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    db.set_audio_identity(stored_path, &identity).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET verified = 1, human_decision = 'accept', reviewed_by = 'owner'
+              WHERE id = 'human'",
+            [],
+        )
+        .unwrap();
+
+    let alias_path = r"c:/audio/HUMAN.wav";
+    let changed = SpeechSegment {
+        id: "changed-alias".into(),
+        audio_path: alias_path.into(),
+        raw_transcript: "new bytes".into(),
+        ..SpeechSegment::default()
+    };
+    let changed_identity = crate::fingerprint::AudioIdentity { spectral: 44, content: "d".repeat(64) };
+    let error = db.insert_segments_with_audio_identity_batch(&[changed], &changed_identity).unwrap_err();
+    assert!(error.to_string().contains("SOURCE_IDENTITY_DRIFT"), "case/separator alias must conflict: {error}");
+    assert!(db.get_segment_by_id("changed-alias").unwrap().is_none());
+
+    let unchanged = SpeechSegment {
+        id: "unchanged-replay".into(),
+        audio_path: stored_path.into(),
+        raw_transcript: "same recording, new source operation".into(),
+        ..SpeechSegment::default()
+    };
+    db.insert_segments_with_audio_identity_batch(&[unchanged], &identity).unwrap();
+    let retained = db.get_segment_by_id("human").unwrap().unwrap();
+    assert!(retained.verified);
+    assert_eq!(retained.human_decision.as_deref(), Some("accept"));
+    assert_eq!(db.segment_audio_content_hash("human").unwrap().as_deref(), Some(identity.content.as_str()));
+    assert_eq!(db.segment_audio_content_hash("unchanged-replay").unwrap().as_deref(), Some(identity.content.as_str()));
 }
 
 /// The streamed active-learning queue must rank identically to collect-then-sort.
@@ -5088,7 +5462,7 @@ fn a_short_source_span_can_never_mint_compensation_for_a_ten_times_longer_durati
             &review_operation_payload_hash("pay-duration-drift", "edit", "human truth", "Sara"),
         )
         .unwrap_err();
-    assert!(error.to_string().contains("source span disagrees with decoded duration"), "{error}");
+    assert!(error.to_string().contains("Couch authority span disagrees with duration"), "{error}");
     let row = db.get_segment_by_id("pay-duration-drift").unwrap().unwrap();
     assert!(row.human_decision.is_none() && !row.verified, "failed pay identity must roll back the decision");
     for table in ["review_events", "review_compensation_ledger", "human_decision_effect_events"] {
@@ -5240,7 +5614,7 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
         ensure_test_audio_content_hash(&db, id);
     }
     let limit = ReviewDecisionLimit::new(0, 2, vec![("Sara".into(), 1), ("Hemn".into(), 1)]).unwrap();
-    let sara_proof = full_playback_proof(&db, "pilot-sara-1", "Sara");
+    let sara_proof = canonical_policy4_phone_playback(&db, "pilot-sara-1", "Sara");
     let sara_revision = sara_proof.segment_revision;
     db.record_phone_human_decision_by_at_revision_with_operation_limit(
         "pilot-sara-1",
@@ -5258,7 +5632,7 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
     .unwrap()
     .unwrap();
 
-    let refused_proof = full_playback_proof(&db, "pilot-sara-2", "Sara");
+    let refused_proof = canonical_policy4_phone_playback(&db, "pilot-sara-2", "Sara");
     let refused_revision = refused_proof.segment_revision;
     let refused = db
         .record_phone_human_decision_by_at_revision_with_operation_limit(
@@ -5293,7 +5667,7 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
         Some(&limit),
     )
     .unwrap();
-    let hemn_proof = full_playback_proof(&db, "pilot-hemn-2", "Hemn");
+    let hemn_proof = canonical_policy4_phone_playback(&db, "pilot-hemn-2", "Hemn");
     let hemn_revision = hemn_proof.segment_revision;
     let refused = db
         .record_phone_human_decision_by_at_revision_with_operation_limit(
@@ -5331,9 +5705,9 @@ fn controlled_review_action_cap_is_atomic_for_verdict_skip_event_and_compensatio
 fn paid_corpus_write_rechecks_a_trigger_disabled_missing_playback_receipt_inside_its_transaction() {
     let db = make_db();
     db.insert_segment(&make_segment("corpus-proof", "/corpus-proof.wav")).unwrap();
-    let stale = full_playback_proof(&db, "corpus-proof", "Sara");
+    let stale = canonical_policy4_phone_playback(&db, "corpus-proof", "Sara");
     let revision = stale.segment_revision;
-    db.connection().execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_delete", []).unwrap();
+    db.connection().execute("DROP TRIGGER playback_receipts_v67_policy4_immutable_delete", []).unwrap();
     db.connection().execute("DELETE FROM playback_receipts WHERE segment_id='corpus-proof'", []).unwrap();
 
     let refused = db
@@ -5367,14 +5741,14 @@ fn paid_corpus_write_rechecks_a_trigger_disabled_missing_playback_receipt_inside
         .unwrap();
     assert_eq!(empty, (0, 0, 0, 0), "verdict, event, ledger, and operation receipt must all stay absent");
 
-    let current = full_playback_proof(&db, "corpus-proof", "Sara");
+    let current = canonical_policy4_phone_playback(&db, "corpus-proof", "Sara");
     let committed = db
         .record_phone_human_decision_by_at_revision_with_operation_limit(
             "corpus-proof",
             "accept",
             Some("test"),
             "Sara",
-            revision,
+            current.segment_revision,
             &current,
             "923e4567-e89b-42d3-a456-426614174002",
             &review_operation_payload_hash("corpus-proof", "accept", "test", "Sara"),
@@ -5393,29 +5767,21 @@ fn controlled_review_cap_serializes_the_last_slot_across_database_connections() 
     let path_text = path.to_string_lossy().to_string();
     let setup = Database::open(&path_text).unwrap();
     setup.initialize().unwrap();
+    let mut playback = Vec::new();
     for id in ["pilot-race-a", "pilot-race-b"] {
         setup.insert_segment(&make_segment(id, &format!("/{id}.wav"))).unwrap();
-        full_playback_proof(&setup, id, "Sara");
+        playback.push((id, canonical_policy4_phone_playback(&setup, id, "Sara")));
     }
     drop(setup);
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let mut workers = Vec::new();
-    for (index, id) in ["pilot-race-a", "pilot-race-b"].into_iter().enumerate() {
+    for (index, (id, proof)) in playback.into_iter().enumerate() {
         let barrier = barrier.clone();
         let path_text = path_text.clone();
         workers.push(std::thread::spawn(move || {
             let db = Database::open(&path_text).unwrap();
-            let revision = db.segment_review_revision(id).unwrap().unwrap();
-            let proof = PlaybackDecisionProof {
-                segment_revision: revision,
-                audio_content_hash: db
-                    .segment_audio_content_hash(id)
-                    .unwrap()
-                    .expect("fixture has exact audio content hash"),
-                source_start_ms: db.segment_source_span(id).unwrap().unwrap().0,
-                source_end_ms: db.segment_source_span(id).unwrap().unwrap().1,
-            };
+            let revision = proof.segment_revision;
             let limit = ReviewDecisionLimit::new(0, 1, vec![("Sara".into(), 1)]).unwrap();
             barrier.wait();
             db.record_phone_human_decision_by_at_revision_with_operation_limit(
@@ -5834,9 +6200,9 @@ fn pilot_hidden_key_reservation_serializes_the_final_two_slots_across_connection
 }
 
 #[test]
-fn schema_v58_upgrades_through_v66_without_reinterpreting_live_baseline_863() {
+fn schema_v58_upgrades_through_v67_without_reinterpreting_live_baseline_863() {
     let db = make_db();
-    assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![66, 65, 64, 63, 62, 61, 60, 59]);
+    assert_eq!(crate::migrations::rollback(&db, 9).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60, 59]);
     db.connection()
         .execute(
             "INSERT INTO review_events
@@ -5845,7 +6211,7 @@ fn schema_v58_upgrades_through_v66_without_reinterpreting_live_baseline_863() {
             [],
         )
         .unwrap();
-    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66]);
+    assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![59, 60, 61, 62, 63, 64, 65, 66, 67]);
     let policy = "8".repeat(64);
     assert_eq!(
         db.reserve_review_pilot_hidden_keys(&policy, 863, "Sara", &["baseline-863-hidden".into()], 2).unwrap(),
@@ -5941,7 +6307,7 @@ fn phone_undo_refuses_a_shadowed_canonical_alias_entitlement_then_unwinds_latest
         .execute("UPDATE speech_segments SET alignment_json = ?1 WHERE id = 'alias-b'", [shared_alignment])
         .unwrap();
 
-    let proof_a = full_playback_proof(&db, "alias-a", "Sara");
+    let proof_a = canonical_policy4_phone_playback(&db, "alias-a", "Sara");
     let op_a = "00000000-0000-4000-8000-000000000401";
     let commit_a = db
         .record_phone_human_decision_by_at_revision_with_operation_limit(
@@ -5960,7 +6326,7 @@ fn phone_undo_refuses_a_shadowed_canonical_alias_entitlement_then_unwinds_latest
         .unwrap()
         .unwrap();
 
-    let proof_b = full_playback_proof(&db, "alias-b", "Sara");
+    let proof_b = canonical_policy4_phone_playback(&db, "alias-b", "Sara");
     let op_b = "00000000-0000-4000-8000-000000000402";
     let commit_b = db
         .record_phone_human_decision_by_at_revision_with_operation_limit(
@@ -6100,15 +6466,36 @@ fn undo_of_a_redecision_reverses_only_that_decisions_delta() {
 #[test]
 fn paid_audio_identity_is_immutable_and_effect_bound_segment_deletion_is_refused() {
     let db = make_db();
+    db.insert_segment(&make_segment("pay-delete-control", "/pay-delete-control.wav")).unwrap();
+    assert_eq!(
+        db.connection()
+            .execute("UPDATE speech_segments SET duration_ms=1234 WHERE id='pay-delete-control'", [])
+            .unwrap(),
+        1,
+        "an authority-free row must remain repairable"
+    );
+
     let mut segment = make_segment("pay-delete", "/pay-delete.wav");
     segment.duration_ms = 1_234;
     segment.raw_transcript = "هەڵە".into();
     db.insert_segment(&segment).unwrap();
-    ensure_test_audio_content_hash(&db, "pay-delete");
-    let revision = db.segment_review_revision("pay-delete").unwrap().unwrap();
-    db.record_phone_human_decision_by_at_revision("pay-delete", "edit", Some("ڕاست"), "Sara", revision)
-        .unwrap()
-        .unwrap();
+    let playback = canonical_policy4_phone_playback(&db, "pay-delete", "Sara");
+    let revision = playback.segment_revision;
+    db.record_phone_human_decision_by_at_revision_with_operation_limit(
+        "pay-delete",
+        "edit",
+        Some("ڕاست"),
+        "Sara",
+        revision,
+        &playback,
+        "00000000-0000-4000-8000-000000000501",
+        &review_operation_payload_hash("pay-delete", "edit", "ڕاست", "Sara"),
+        "edit",
+        "ڕاست",
+        None,
+    )
+    .unwrap()
+    .unwrap();
     let earned = 1_234 * 5_000;
     let summary = db.review_compensation_summary("Sara").unwrap();
     assert_eq!(summary.earned_micro_iqd, earned);
@@ -6118,7 +6505,7 @@ fn paid_audio_identity_is_immutable_and_effect_bound_segment_deletion_is_refused
         .connection()
         .execute("UPDATE speech_segments SET duration_ms = 999999 WHERE id = 'pay-delete'", [])
         .unwrap_err();
-    assert!(mutation.to_string().contains("paid policy-3 source identity is immutable"), "{mutation}");
+    assert!(mutation.to_string().contains("paid policy-4 source identity is immutable"), "{mutation}");
     assert_eq!(db.get_segment_by_id("pay-delete").unwrap().unwrap().duration_ms, 1_234);
     assert_eq!(
         db.review_compensation_summary("Sara").unwrap().earned_micro_iqd,
@@ -6204,7 +6591,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     assert_refused(&db, "delete-spot");
 
     let legacy = make_db();
-    assert_eq!(crate::migrations::rollback(&legacy, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+    assert_eq!(crate::migrations::rollback(&legacy, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
     let mut reviewed = make_segment("delete-legacy", "/delete-legacy.wav");
     reviewed.verified = true;
     reviewed.human_decision = Some("accept".into());
@@ -6212,7 +6599,7 @@ fn deletion_is_allowed_only_for_authority_free_segments() {
     reviewed.verdict_transcript = Some("legacy truth".into());
     reviewed.annotated_transcript = Some("legacy truth".into());
     legacy.insert_segment_full(&reviewed).unwrap();
-    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+    assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
     assert_refused(&legacy, "delete-legacy");
 
     db.insert_segment(&make_segment("delete-batch-clean", "/delete-batch-clean.wav")).unwrap();
@@ -6423,6 +6810,57 @@ fn segment_page_cursor_is_opaque_versioned_and_scope_bound() {
     assert!(db.get_segments_page(None, None, "oldest", 1, Some(cursor)).is_err());
     assert!(db.get_segments_page(Some(true), None, "newest", 1, Some(cursor)).is_err());
     assert!(db.get_segments_page(None, None, "newest", 1, Some("not_a_cursor")).is_err());
+}
+
+#[test]
+fn escalation_review_pages_are_versioned_complete_filtered_and_cursor_bound() {
+    let db = make_db();
+    for (index, id) in ["e1", "e2", "e3", "e4", "pending", "decided"].iter().enumerate() {
+        let mut segment = make_segment(id, &format!("/{id}.wav"));
+        segment.alignment_json = Some(format!(
+            r#"{{"source_start_ms":{},"source_end_ms":{},"chunk_index":0,"chunk_count":1}}"#,
+            index * 1_000,
+            (index + 1) * 1_000
+        ));
+        db.insert_segment(&segment).unwrap();
+    }
+    for (index, id) in ["e1", "e2", "e3", "e4", "decided"].iter().enumerate() {
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET escalated = 1, verdict = 'escalated', rationale = 'needs review',
+                        evidence_json = '{\"source\":\"test\"}', agreement_score = ?2
+                  WHERE id = ?1",
+                rusqlite::params![id, (index + 1) as f64 / 10.0],
+            )
+            .unwrap();
+    }
+    db.connection().execute("UPDATE speech_segments SET human_decision = 'accept' WHERE id = 'decided'", []).unwrap();
+    db.connection().execute("UPDATE speech_segments SET verified = 1 WHERE id = 'e4'", []).unwrap();
+
+    let first = db.get_escalation_review_page(2, None, None).unwrap();
+    assert_eq!(
+        first.total, 4,
+        "pending and already-decided rows are outside escalation scope; escalation itself remains authoritative even on a legacy verified row"
+    );
+    assert_eq!(first.items.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["e1", "e2"]);
+    assert!(first.items.iter().all(|row| row.alignment_json.is_some() && row.evidence_json.is_some()));
+    assert!(first.items.iter().all(|row| first.revisions.contains_key(&row.id)));
+
+    let cursor = first.next_cursor.as_deref().expect("four rows require a continuation");
+    let second = db.get_escalation_review_page(2, Some(cursor), None).unwrap();
+    assert_eq!(second.items.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["e3", "e4"]);
+    assert!(second.next_cursor.is_none());
+    assert!(
+        db.get_segments_page(Some(false), None, "suspectFirst", 2, Some(cursor)).is_err(),
+        "an escalation cursor must not be redeemable against the pending/library scope"
+    );
+
+    let focus: std::collections::HashSet<String> = ["e1", "e4"].iter().map(|id| id.to_string()).collect();
+    let focused = db.get_escalation_review_page(10, None, Some(&focus)).unwrap();
+    assert_eq!(focused.total, 2);
+    assert!(focused.focus_narrowed);
+    assert_eq!(focused.items.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["e1", "e4"]);
 }
 
 #[test]
@@ -6841,11 +7279,21 @@ fn the_durability_cost_per_decision_is_measured_not_assumed() {
         seed_for_provenance(&db, &format!("perf-{i}"), "دەقی چامپیۆن");
     }
     let start = Instant::now();
+    let mut decision_seconds = Vec::with_capacity(N);
     for i in 0..N {
+        let decision_start = Instant::now();
         db.record_human_decision(&format!("perf-{i}"), "accept", Some("دەقی چامپیۆن"), None).unwrap();
+        decision_seconds.push(decision_start.elapsed().as_secs_f64());
     }
     let per_decision = start.elapsed().as_secs_f64() / N as f64;
-    println!("MEASURED: {:.1} ms per durable human decision (n={N})", per_decision * 1000.0);
+    decision_seconds.sort_by(f64::total_cmp);
+    let p95_index = (N * 95).div_ceil(100).saturating_sub(1);
+    let p95 = decision_seconds[p95_index];
+    println!(
+        "MEASURED: mean {:.1} ms, P95 {:.1} ms per durable human decision (n={N})",
+        per_decision * 1000.0,
+        p95 * 1000.0
+    );
     // A reviewer decides a clip every few seconds at best. Anything under a quarter second is
     // invisible to them; this bound catches an accidental fsync-per-row regression, not normal jitter.
     assert!(
@@ -6853,6 +7301,7 @@ fn the_durability_cost_per_decision_is_measured_not_assumed() {
         "a durable decision cost {:.1} ms — that is slow enough for a reviewer to feel",
         per_decision * 1000.0
     );
+    assert!(p95 <= 0.5, "durable decision P95 {:.1} ms exceeds the declared 500 ms workstation budget", p95 * 1000.0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6981,6 +7430,704 @@ fn a_noncanonical_decision_proof_is_never_an_authorization_capability() {
         .unwrap());
 }
 
+#[test]
+fn desktop_policy4_receipt_is_exact_interval_authority_and_replays_idempotently() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+    for _ in 0..6_400 {
+        writer.write_sample(700_i16).unwrap();
+    }
+    writer.finalize().unwrap();
+    let db = make_db();
+    let mut segment = make_segment("pb-policy4", source.to_str().unwrap());
+    segment.duration_ms = 400;
+    segment.alignment_json =
+        Some(r#"{"source_start_ms":0,"source_end_ms":400,"chunk_index":0,"chunk_count":1}"#.to_string());
+    db.insert_segment(&segment).unwrap();
+    let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&source).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+            rusqlite::params![segment.id, content_hash],
+        )
+        .unwrap();
+    let revision = db.segment_review_revision(&segment.id).unwrap().unwrap();
+    let media_grant_id = uuid::Uuid::new_v4().to_string();
+    let client_attempt_id = uuid::Uuid::new_v4().to_string();
+    let wrong_bytes = "b".repeat(64);
+    let wrong_binding = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &media_grant_id,
+            &client_attempt_id,
+            &source,
+            &wrong_bytes,
+            None,
+        )
+        .expect_err("a live grant for different decoded audio must not issue authority");
+    assert!(wrong_binding.to_string().contains("different audio bytes"), "{wrong_binding}");
+    let session = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &media_grant_id,
+            &client_attempt_id,
+            &source,
+            &content_hash,
+            None,
+        )
+        .expect("the live grant/source/clip identity must issue a session");
+    for _ in 0..10_000 {
+        let replayed_session = db
+            .begin_desktop_playback_session_v1(
+                &segment.id,
+                revision,
+                &media_grant_id,
+                &client_attempt_id,
+                &source,
+                &content_hash,
+                None,
+            )
+            .expect("an exact client-attempt retry must return its original session");
+        assert_eq!(replayed_session, session);
+    }
+    let issued_sessions: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM desktop_playback_sessions_v4 WHERE client_attempt_id=?1",
+            [&client_attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(issued_sessions, 1, "10,000 exact begin retries must stay one durable/live attempt");
+    let intervals = [DesktopPlaybackInterval { start_ms: 0, end_ms: 340 }];
+    // At the declared maximum 2x rate, 340 ms of unique media requires at least 170 ms of server
+    // elapsed time. The policy intentionally has zero fixed grace: otherwise short clips could mint
+    // an 85% receipt immediately. Leave margin for millisecond clock granularity on Windows CI.
+    std::thread::sleep(std::time::Duration::from_millis(220));
+    let first = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &intervals,
+        )
+        .expect("85% at a plausible server elapsed time must finalize");
+    assert_eq!(first.unique_played_ms, 340);
+    assert!((first.coverage_ratio - 0.85).abs() < f64::EPSILON);
+    let changed_grant = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &wrong_bytes,
+            &intervals,
+        )
+        .expect_err("finalization must re-check the immutable grant's decoded bytes");
+    assert!(changed_grant.to_string().contains("immutable media grant"), "{changed_grant}");
+
+    let replay = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &intervals,
+        )
+        .expect("an exact lost-response replay must return the same immutable receipt");
+    assert_eq!(replay, first);
+    let recovered_without_live_grant = db
+        .replay_finalized_desktop_playback_receipt_v1(&session.playback_receipt_id, &media_grant_id, &intervals)
+        .expect("immutable receipt recovery query succeeds")
+        .expect("an already-finalized exact union survives expiry of its media grant");
+    assert_eq!(recovered_without_live_grant, first);
+    let changed_recovery = db
+        .replay_finalized_desktop_playback_receipt_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: 341 }],
+        )
+        .expect_err("grant-free recovery still refuses an altered interval union");
+    assert!(changed_recovery.to_string().contains("different interval union"), "{changed_recovery}");
+    let changed_grant_recovery = db
+        .replay_finalized_desktop_playback_receipt_v1(
+            &session.playback_receipt_id,
+            &uuid::Uuid::new_v4().to_string(),
+            &intervals,
+        )
+        .expect_err("exact replay remains bound to the originally issued media grant identity");
+    assert!(changed_grant_recovery.to_string().contains("different media grant"), "{changed_grant_recovery}");
+    let changed_replay = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: 341 }],
+        )
+        .expect_err("one receipt identity cannot authorize a different interval union");
+    assert!(changed_replay.to_string().contains("different interval union"), "{changed_replay}");
+
+    let proof = db
+        .desktop_playback_proof_v4(
+            &segment.id,
+            session.segment_revision,
+            &content_hash,
+            &session.playback_receipt_id,
+            None,
+        )
+        .unwrap()
+        .expect("the exact policy-4 receipt must authorize its current clip");
+    let rollback_error = crate::migrations::rollback(&db, 1)
+        .expect_err("a finalized policy-4 receipt is durable evidence and cannot be downgraded away");
+    assert!(rollback_error.to_string().contains("CHECK constraint failed"), "{rollback_error}");
+    assert_eq!(crate::migrations::get_current_version(&db).unwrap(), 67);
+    assert_eq!(proof.authority_session_id.as_deref(), Some(session.playback_receipt_id.as_str()));
+    assert!(db
+        .desktop_playback_proof_v4(
+            &segment.id,
+            session.segment_revision,
+            &content_hash,
+            &uuid::Uuid::new_v4().to_string(),
+            None,
+        )
+        .unwrap()
+        .is_none());
+
+    let operation_id = "77777777-7777-4777-8777-777777777777";
+    let committed = db
+        .finalize_desktop_review_v1_with_playback(
+            &segment.id,
+            session.segment_revision,
+            "accept",
+            Some("test"),
+            &proof,
+            operation_id,
+        )
+        .expect("the decision transaction must re-check the exact receipt and commit");
+    let persisted_authority: (Option<i64>, Option<String>) = db
+        .connection()
+        .query_row(
+            "SELECT desktop_review_contract_version, playback_authority_session_id
+               FROM human_decision_effect_events WHERE id=?1",
+            [committed.effect_event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(persisted_authority.0, Some(1));
+    assert_eq!(persisted_authority.1.as_deref(), Some(session.playback_receipt_id.as_str()));
+    let changed_receipt = db
+        .replay_desktop_review_v1_and_clear_draft(
+            &segment.id,
+            session.segment_revision,
+            "accept",
+            Some("test"),
+            &uuid::Uuid::new_v4().to_string(),
+            operation_id,
+        )
+        .expect_err("the same operation UUID with a different receipt is a payload conflict");
+    assert!(changed_receipt.to_string().contains("different canonical payload"), "{changed_receipt}");
+}
+
+#[test]
+fn desktop_policy4_cancel_is_exact_idempotent_and_cannot_touch_finalized_or_consumed_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4-cancel.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&source, spec).unwrap();
+    for _ in 0..6_400 {
+        writer.write_sample(500_i16).unwrap();
+    }
+    writer.finalize().unwrap();
+    let db = make_db();
+    let mut segment = make_segment("pb-policy4-cancel", source.to_str().unwrap());
+    segment.duration_ms = 400;
+    segment.alignment_json =
+        Some(r#"{"source_start_ms":0,"source_end_ms":400,"chunk_index":0,"chunk_count":1}"#.to_string());
+    db.insert_segment(&segment).unwrap();
+    let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&source).unwrap();
+    db.connection()
+        .execute("UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1", params![segment.id, content_hash])
+        .unwrap();
+    let revision = db.segment_review_revision(&segment.id).unwrap().unwrap();
+
+    db.set_playback_test_clock(1_000_000, 10_000);
+    let cancelled_attempt_id = uuid::Uuid::new_v4().to_string();
+    let cancelled_grant_id = uuid::Uuid::new_v4().to_string();
+    let cancelled = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &cancelled_grant_id,
+            &cancelled_attempt_id,
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+
+    let wrong_attempt = db
+        .cancel_desktop_playback_session_v1(&cancelled.playback_receipt_id, &uuid::Uuid::new_v4().to_string())
+        .expect_err("a stale renderer must not cancel another attempt's exact authority");
+    assert!(wrong_attempt.to_string().contains("E_PLAYBACK_CANCEL_IDENTITY_MISMATCH"), "{wrong_attempt}");
+    assert!(db
+        .connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?1)",
+            [&cancelled.playback_receipt_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap());
+
+    assert!(db.cancel_desktop_playback_session_v1(&cancelled.playback_receipt_id, &cancelled_attempt_id).unwrap());
+    assert!(
+        !db.cancel_desktop_playback_session_v1(&cancelled.playback_receipt_id, &cancelled_attempt_id).unwrap(),
+        "an exact cancellation replay is a successful no-op"
+    );
+    let cancelled_finalize = db
+        .finalize_desktop_playback_session_v1(
+            &cancelled.playback_receipt_id,
+            &cancelled_grant_id,
+            &source,
+            &content_hash,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: 340 }],
+        )
+        .expect_err("retired authority cannot later mint a receipt");
+    assert!(cancelled_finalize.to_string().contains("missing or was never issued"), "{cancelled_finalize}");
+
+    let final_attempt_id = uuid::Uuid::new_v4().to_string();
+    let final_grant_id = uuid::Uuid::new_v4().to_string();
+    let finalized = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &final_grant_id,
+            &final_attempt_id,
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+    db.set_playback_test_clock(1_000_220, 10_220);
+    db.finalize_desktop_playback_session_v1(
+        &finalized.playback_receipt_id,
+        &final_grant_id,
+        &source,
+        &content_hash,
+        &[DesktopPlaybackInterval { start_ms: 0, end_ms: 340 }],
+    )
+    .unwrap();
+    let proof = db
+        .desktop_playback_proof_v4(&segment.id, revision, &content_hash, &finalized.playback_receipt_id, None)
+        .unwrap()
+        .unwrap();
+    let committed = db
+        .finalize_desktop_review_v1_with_playback(
+            &segment.id,
+            revision,
+            "accept",
+            Some("test"),
+            &proof,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+
+    for _ in 0..2 {
+        let immutable = db
+            .cancel_desktop_playback_session_v1(&finalized.playback_receipt_id, &final_attempt_id)
+            .expect_err("finalized and consumed evidence is never cancellable, including replay");
+        assert!(immutable.to_string().contains("E_PLAYBACK_SESSION_FINALIZED"), "{immutable}");
+    }
+    let immutable_counts: (i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT
+                 EXISTS(SELECT 1 FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?1),
+                 EXISTS(SELECT 1 FROM playback_receipts WHERE authority_session_id=?1 AND policy_version=4),
+                 EXISTS(SELECT 1 FROM human_decision_effect_events WHERE id=?2 AND playback_authority_session_id=?1)",
+            params![finalized.playback_receipt_id, committed.effect_event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(immutable_counts, (1, 1, 1));
+    db.clear_playback_test_clock();
+}
+
+#[test]
+fn desktop_policy4_lost_cancellations_cannot_exhaust_global_or_segment_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4-capacity.wav");
+    std::fs::write(&source, b"RIFF-policy4-capacity-test-source").unwrap();
+    let db = make_db();
+
+    // Simulate 65 browse-only selections whose renderer teardown never reaches the backend. The
+    // 65th issuance must reclaim one oldest never-finalized row instead of locking review for 30m.
+    for index in 0..65_i64 {
+        let segment_id = format!("pb-policy4-browse-{index:02}");
+        let mut segment = make_segment(&segment_id, source.to_str().unwrap());
+        segment.duration_ms = 1_000;
+        db.insert_segment(&segment).unwrap();
+        let content_hash = ensure_test_audio_content_hash(&db, &segment_id);
+        let revision = db.segment_review_revision(&segment_id).unwrap().unwrap();
+        db.set_playback_test_clock(1_000_000 + index, 10_000 + u64::try_from(index).unwrap());
+        db.begin_desktop_playback_session_v1(
+            &segment_id,
+            revision,
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &source,
+            &content_hash,
+            None,
+        )
+        .expect("ordinary browsing must never exhaust the global attempt bound");
+    }
+    let live_after_browse: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM desktop_playback_sessions_v4 session
+              WHERE NOT EXISTS (SELECT 1 FROM playback_receipts receipt
+                                 WHERE receipt.authority_session_id=session.playback_receipt_id)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(live_after_browse, MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS);
+
+    // A→B→A→B→A is the smaller real-world repro for the per-segment bound. The third A replaces
+    // only A's oldest never-finalized authority; B and all immutable rows remain untouched.
+    for segment_id in ["pb-policy4-revisit-a", "pb-policy4-revisit-b"] {
+        let mut segment = make_segment(segment_id, source.to_str().unwrap());
+        segment.duration_ms = 1_000;
+        db.insert_segment(&segment).unwrap();
+        ensure_test_audio_content_hash(&db, segment_id);
+    }
+    for (offset, segment_id) in [
+        "pb-policy4-revisit-a",
+        "pb-policy4-revisit-b",
+        "pb-policy4-revisit-a",
+        "pb-policy4-revisit-b",
+        "pb-policy4-revisit-a",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+        db.set_playback_test_clock(1_001_000 + offset as i64, 11_000 + offset as u64);
+        db.begin_desktop_playback_session_v1(
+            segment_id,
+            revision,
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &source,
+            TEST_AUDIO_CONTENT_HASH,
+            None,
+        )
+        .expect("revisiting a clip must replace stale unfinalized authority instead of refusing playback");
+    }
+    let (global_live, live_a, live_b): (i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM desktop_playback_sessions_v4 session
+                   WHERE NOT EXISTS (SELECT 1 FROM playback_receipts receipt
+                                      WHERE receipt.authority_session_id=session.playback_receipt_id)),
+                 (SELECT COUNT(*) FROM desktop_playback_sessions_v4 session
+                   WHERE session.segment_id='pb-policy4-revisit-a'
+                     AND NOT EXISTS (SELECT 1 FROM playback_receipts receipt
+                                      WHERE receipt.authority_session_id=session.playback_receipt_id)),
+                 (SELECT COUNT(*) FROM desktop_playback_sessions_v4 session
+                   WHERE session.segment_id='pb-policy4-revisit-b'
+                     AND NOT EXISTS (SELECT 1 FROM playback_receipts receipt
+                                      WHERE receipt.authority_session_id=session.playback_receipt_id))",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(global_live, MAX_LIVE_DESKTOP_PLAYBACK_SESSIONS);
+    assert_eq!((live_a, live_b), (2, 2));
+    db.clear_playback_test_clock();
+}
+
+#[test]
+fn desktop_policy4_rejects_instant_scalar_equivalent_inflation_without_partial_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4-long.wav");
+    std::fs::write(&source, b"RIFF-policy4-long-test-source").unwrap();
+    let db = make_db();
+    let mut segment = make_segment("pb-policy4-instant", source.to_str().unwrap());
+    segment.duration_ms = 10_000;
+    db.insert_segment(&segment).unwrap();
+    let content_hash = ensure_test_audio_content_hash(&db, &segment.id);
+    let revision = db.segment_review_revision(&segment.id).unwrap().unwrap();
+    let media_grant_id = uuid::Uuid::new_v4().to_string();
+    let client_attempt_id = uuid::Uuid::new_v4().to_string();
+    let session = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &media_grant_id,
+            &client_attempt_id,
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+
+    let error = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: 8_500 }],
+        )
+        .expect_err("8.5 seconds cannot be minted immediately from a renderer counter");
+    assert!(error.to_string().contains("E_PLAYBACK_TIME_IMPLAUSIBLE"), "{error}");
+    let counts: (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM desktop_playback_intervals_v4 WHERE playback_receipt_id=?1),
+                 (SELECT COUNT(*) FROM playback_receipts WHERE authority_session_id=?1)",
+            [&session.playback_receipt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (0, 0), "a refused forged counter must leave no partial evidence");
+}
+
+#[test]
+fn desktop_policy4_never_finalizes_a_subthreshold_receipt_at_the_one_ms_span_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4-threshold.wav");
+    std::fs::write(&source, b"RIFF-policy4-threshold-test-source").unwrap();
+    let db = make_db();
+    let mut segment = make_segment("pb-policy4-threshold", source.to_str().unwrap());
+    segment.duration_ms = 1_001;
+    segment.alignment_json =
+        Some(r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#.to_string());
+    db.insert_segment(&segment).unwrap();
+    let content_hash = ensure_test_audio_content_hash(&db, &segment.id);
+    let revision = db.segment_review_revision(&segment.id).unwrap().unwrap();
+    let media_grant_id = uuid::Uuid::new_v4().to_string();
+    let client_attempt_id = uuid::Uuid::new_v4().to_string();
+    db.set_playback_test_clock(1_000_000, 10_000);
+    let session = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &media_grant_id,
+            &client_attempt_id,
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+    assert_eq!(session.clip_duration_ms, 1_001, "the server duration is the only authority denominator");
+    db.set_playback_test_clock(1_001_000, 11_000);
+
+    let below = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: 850 }],
+        )
+        .expect_err("850/1001 is below 85% and must not create immutable evidence");
+    assert!(below.to_string().contains("E_PLAYBACK_COVERAGE_INSUFFICIENT"), "{below}");
+    let partial_rows: (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM desktop_playback_intervals_v4 WHERE playback_receipt_id=?1),
+                 (SELECT COUNT(*) FROM playback_receipts WHERE authority_session_id=?1)",
+            [&session.playback_receipt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(partial_rows, (0, 0), "a subthreshold attempt must remain extendable, not become immutable");
+
+    let exact = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: 851 }],
+        )
+        .expect("ceil(1001*85/100)=851 ms must finalize on the same still-live attempt");
+    assert_eq!(exact.unique_played_ms, 851);
+}
+
+#[test]
+fn desktop_policy4_uses_active_time_not_wall_clock_steps_or_suspend_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4-clock.wav");
+    std::fs::write(&source, b"RIFF-policy4-clock-test-source").unwrap();
+    let db = make_db();
+    let mut segment = make_segment("pb-policy4-clock", source.to_str().unwrap());
+    segment.duration_ms = 400;
+    db.insert_segment(&segment).unwrap();
+    let content_hash = ensure_test_audio_content_hash(&db, &segment.id);
+    let revision = db.segment_review_revision(&segment.id).unwrap().unwrap();
+    let media_grant_id = uuid::Uuid::new_v4().to_string();
+    let client_attempt_id = uuid::Uuid::new_v4().to_string();
+
+    db.set_playback_test_clock(1_000_000, 10_000);
+    let session = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &media_grant_id,
+            &client_attempt_id,
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+    let intervals = [DesktopPlaybackInterval { start_ms: 0, end_ms: 340 }];
+
+    // A one-day wall-clock jump (or equivalent suspend duration) contributes zero active time and
+    // cannot authorize an instant renderer counter.
+    db.set_playback_test_clock(1_000_000 + 86_400_000, 10_000);
+    let forward = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &intervals,
+        )
+        .expect_err("forward wall time without active workstation time must not mint a receipt");
+    assert!(forward.to_string().contains("E_PLAYBACK_TIME_IMPLAUSIBLE"), "{forward}");
+
+    // Moving wall time backwards must not strand honest work either. 220 ms of active time supports
+    // 340 ms of canonical media at the declared 2x maximum, independent of the audit timestamp.
+    db.set_playback_test_clock(500_000, 10_220);
+    let receipt = db
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &intervals,
+        )
+        .expect("sufficient active time remains valid across a backwards wall-clock correction");
+    assert_eq!(receipt.unique_played_ms, 340);
+    db.clear_playback_test_clock();
+}
+
+#[test]
+fn desktop_policy4_collects_expired_unfinalized_attempts_but_keeps_live_attempts() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4-gc.wav");
+    std::fs::write(&source, b"RIFF-policy4-gc-test-source").unwrap();
+    let db = make_db();
+    let mut segment = make_segment("pb-policy4-gc", source.to_str().unwrap());
+    segment.duration_ms = 1_000;
+    db.insert_segment(&segment).unwrap();
+    let content_hash = ensure_test_audio_content_hash(&db, &segment.id);
+    let revision = db.segment_review_revision(&segment.id).unwrap().unwrap();
+
+    db.set_playback_test_clock(1_000_000, 10_000);
+    let abandoned = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+    db.set_playback_test_clock(
+        1_000_000 + DESKTOP_PLAYBACK_SESSION_TTL_MS + 1,
+        10_000 + u64::try_from(DESKTOP_PLAYBACK_SESSION_TTL_MS).unwrap() + 1,
+    );
+    let current = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+    let counts: (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT
+                 EXISTS(SELECT 1 FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?1),
+                 EXISTS(SELECT 1 FROM desktop_playback_sessions_v4 WHERE playback_receipt_id=?2)",
+            rusqlite::params![abandoned.playback_receipt_id, current.playback_receipt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (0, 1), "only the expired never-finalized attempt is collectible");
+    db.clear_playback_test_clock();
+}
+
+#[test]
+fn desktop_policy4_unfinalized_renderer_counter_cannot_survive_process_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("policy4-restart.wav");
+    std::fs::write(&source, b"RIFF-policy4-restart-test-source").unwrap();
+    let database_path = directory.path().join("restart.sqlite3");
+    let db = Database::open(database_path.to_str().unwrap()).unwrap();
+    db.initialize().unwrap();
+    let mut segment = make_segment("pb-policy4-restart", source.to_str().unwrap());
+    segment.duration_ms = 400;
+    db.insert_segment(&segment).unwrap();
+    let content_hash = ensure_test_audio_content_hash(&db, &segment.id);
+    let revision = db.segment_review_revision(&segment.id).unwrap().unwrap();
+    let media_grant_id = uuid::Uuid::new_v4().to_string();
+    let client_attempt_id = uuid::Uuid::new_v4().to_string();
+    db.set_playback_test_clock(1_000_000, 10_000);
+    let session = db
+        .begin_desktop_playback_session_v1(
+            &segment.id,
+            revision,
+            &media_grant_id,
+            &client_attempt_id,
+            &source,
+            &content_hash,
+            None,
+        )
+        .unwrap();
+    drop(db);
+
+    let reopened = Database::open(database_path.to_str().unwrap()).unwrap();
+    reopened.set_playback_test_clock(1_001_000, 11_000);
+    let error = reopened
+        .finalize_desktop_playback_session_v1(
+            &session.playback_receipt_id,
+            &media_grant_id,
+            &source,
+            &content_hash,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: 340 }],
+        )
+        .expect_err("a durable session row without its process-local active-time lease cannot mint evidence");
+    assert!(error.to_string().contains("no live active-time authority"), "{error}");
+}
+
 /// Voice focus narrows the queue to the named clips and NOTHING else — and no focus is the full queue.
 #[test]
 fn voice_focus_narrows_the_pending_queue_to_exactly_the_named_clips() {
@@ -7071,8 +8218,14 @@ fn desktop_decision_retry_returns_the_original_commit_and_uuid_reuse_or_late_ret
             revision,
         )
         .unwrap());
-    let proof =
-        PlaybackDecisionProof { segment_revision: revision, audio_content_hash, source_start_ms, source_end_ms };
+    let proof = PlaybackDecisionProof {
+        segment_revision: revision,
+        audio_content_hash,
+        source_start_ms,
+        source_end_ms,
+        authority_session_id: None,
+        source_lease: None,
+    };
     let operation_id = "11111111-2222-4333-8444-555555555555";
     let first = db
         .finalize_human_review_with_playback(
@@ -7299,6 +8452,7 @@ fn a_forged_coverage_ratio_wrong_policy_or_denominator_cannot_unlock_a_verdict()
     insert_playback_segment(&db, "pb-raw-authority", 1_000);
     db.record_playback_receipt_raw(&receipt("pb-raw-authority", 1, TEST_AUDIO_CONTENT_HASH, 0, 1_000)).unwrap();
     db.connection().execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_update", []).unwrap();
+    db.connection().execute("DROP TRIGGER playback_receipts_v67_policy4_immutable_update", []).unwrap();
 
     db.connection()
         .execute("UPDATE playback_receipts SET coverage_ratio = 1.0 WHERE segment_id = 'pb-raw-authority'", [])

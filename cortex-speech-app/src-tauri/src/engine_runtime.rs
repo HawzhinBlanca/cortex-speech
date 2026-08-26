@@ -23,7 +23,7 @@ const WARMUP: Duration = Duration::from_secs(6 * 60);
 /// A non-inheritable Windows Job Object whose last-handle close terminates every contained process.
 ///
 /// The handle is deliberately process-local: `CreateJobObjectW` receives no inheritable security
-/// attributes, so the champion cannot keep its own containment handle alive.
+/// attributes, so a contained child cannot keep its own containment handle alive.
 #[cfg(target_os = "windows")]
 struct KillOnCloseJob {
     handle: windows_sys::Win32::Foundation::HANDLE,
@@ -31,20 +31,35 @@ struct KillOnCloseJob {
 
 #[cfg(target_os = "windows")]
 impl KillOnCloseJob {
-    fn new() -> Result<Self, String> {
+    fn new(process_memory_limit_bytes: Option<usize>, active_process_limit: Option<u32>) -> Result<Self, String> {
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         };
 
         // SAFETY: null security/name pointers request a private, non-inheritable unnamed job.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
-            return Err(format!("could not create champion Job Object: {}", std::io::Error::last_os_error()));
+            return Err(format!("could not create private Job Object: {}", std::io::Error::last_os_error()));
         }
         let job = Self { handle };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(memory_limit_bytes) = process_memory_limit_bytes {
+            if memory_limit_bytes == 0 {
+                return Err("could not configure a zero-byte Job Object process-memory limit".to_string());
+            }
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            limits.ProcessMemoryLimit = memory_limit_bytes;
+        }
+        if let Some(active_process_limit) = active_process_limit {
+            if active_process_limit == 0 {
+                return Err("could not configure a zero-process Job Object limit".to_string());
+            }
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = active_process_limit;
+        }
         // SAFETY: `job.handle` is live and `limits` has the exact layout/size required by this
         // information class for the duration of the call.
         let configured = unsafe {
@@ -57,7 +72,7 @@ impl KillOnCloseJob {
         };
         if configured == 0 {
             return Err(format!(
-                "could not configure champion Job Object kill-on-close: {}",
+                "could not configure Job Object containment limits: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -72,7 +87,7 @@ impl KillOnCloseJob {
         let assigned = unsafe { AssignProcessToJobObject(self.handle, child.as_raw_handle().cast()) };
         if assigned == 0 {
             return Err(format!(
-                "could not assign champion launcher pid {} to its kill-on-close Job Object: {}",
+                "could not assign contained process pid {} to its kill-on-close Job Object: {}",
                 child.id(),
                 std::io::Error::last_os_error()
             ));
@@ -97,13 +112,13 @@ impl Drop for KillOnCloseJob {
 #[cfg(target_os = "windows")]
 unsafe impl Send for KillOnCloseJob {}
 
-struct OwnedChampionProcess {
+struct ContainedChild {
     child: Child,
     #[cfg(target_os = "windows")]
     job: Option<KillOnCloseJob>,
 }
 
-impl OwnedChampionProcess {
+impl ContainedChild {
     fn id(&self) -> u32 {
         self.child.id()
     }
@@ -131,22 +146,31 @@ impl OwnedChampionProcess {
     }
 }
 
-impl Drop for OwnedChampionProcess {
+impl Drop for ContainedChild {
     fn drop(&mut self) {
         self.terminate_and_reap();
     }
 }
 
 #[cfg(target_os = "windows")]
-fn spawn_contained(mut command: Command) -> Result<OwnedChampionProcess, String> {
+fn spawn_contained(command: Command) -> Result<ContainedChild, String> {
+    spawn_contained_with_limits(command, None, None)
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_contained_with_limits(
+    mut command: Command,
+    process_memory_limit_bytes: Option<usize>,
+    active_process_limit: Option<u32>,
+) -> Result<ContainedChild, String> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
-    let job = KillOnCloseJob::new()?;
+    let job = KillOnCloseJob::new(process_memory_limit_bytes, active_process_limit)?;
     // The process must not execute even one instruction until Job assignment succeeds. In
     // particular, an assignment failure cannot race a WSL/Linux descendant into existence.
     command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
-    let mut child = command.spawn().map_err(|error| format!("could not spawn wsl for the champion server: {error}"))?;
+    let mut child = command.spawn().map_err(|error| format!("could not spawn contained process: {error}"))?;
     if let Err(assign_error) = job.assign(&child) {
         // Assignment failure is fail-closed. Reap even when kill reports that the process already
         // exited; never return with an uncontained launcher still running.
@@ -159,13 +183,13 @@ fn spawn_contained(mut command: Command) -> Result<OwnedChampionProcess, String>
     }
     if let Err(resume_error) = resume_suspended_process(&child) {
         // Now contained: closing the job is the primary cleanup, followed by root kill/reap as a
-        // bounded defensive fallback. Never retain a permanently suspended champion launcher.
+        // bounded defensive fallback. Never retain a permanently suspended contained process.
         drop(job);
         let kill_result = child.kill();
         let wait_result = child.wait();
         return Err(format!("{resume_error}; suspended launcher cleanup: kill={kill_result:?}, wait={wait_result:?}"));
     }
-    Ok(OwnedChampionProcess { child, job: Some(job) })
+    Ok(ContainedChild { child, job: Some(job) })
 }
 
 /// Resume the single primary thread of a process created with `CREATE_SUSPENDED`.
@@ -181,7 +205,7 @@ fn resume_suspended_process(child: &Child) -> Result<(), String> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(format!(
-            "could not enumerate the suspended champion launcher threads: {}",
+            "could not enumerate the suspended contained-process threads: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -190,7 +214,7 @@ fn resume_suspended_process(child: &Child) -> Result<(), String> {
         // SAFETY: `snapshot` is live and `entry.dwSize` identifies the writable structure.
         if unsafe { Thread32First(snapshot, &raw mut entry) } == 0 {
             return Err(format!(
-                "could not read the suspended champion launcher thread snapshot: {}",
+                "could not read the suspended contained-process thread snapshot: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -200,7 +224,7 @@ fn resume_suspended_process(child: &Child) -> Result<(), String> {
                 let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
                 if thread.is_null() {
                     return Err(format!(
-                        "could not open suspended champion launcher thread {}: {}",
+                        "could not open suspended contained-process thread {}: {}",
                         entry.th32ThreadID,
                         std::io::Error::last_os_error()
                     ));
@@ -211,11 +235,11 @@ fn resume_suspended_process(child: &Child) -> Result<(), String> {
                 // SAFETY: unique local ownership; close exactly once after ResumeThread.
                 unsafe { CloseHandle(thread) };
                 if let Some(error) = resume_error {
-                    return Err(format!("could not resume the champion launcher primary thread: {error}"));
+                    return Err(format!("could not resume the contained-process primary thread: {error}"));
                 }
                 if previous_suspend_count != 1 {
                     return Err(format!(
-                        "champion launcher primary thread had unexpected suspend count {previous_suspend_count}"
+                        "contained-process primary thread had unexpected suspend count {previous_suspend_count}"
                     ));
                 }
                 return Ok(());
@@ -223,7 +247,7 @@ fn resume_suspended_process(child: &Child) -> Result<(), String> {
             // SAFETY: same live snapshot and initialized writable entry as above.
             if unsafe { Thread32Next(snapshot, &raw mut entry) } == 0 {
                 return Err(format!(
-                    "suspended champion launcher pid {} had no discoverable primary thread",
+                    "suspended contained-process pid {} had no discoverable primary thread",
                     child.id()
                 ));
             }
@@ -235,13 +259,225 @@ fn resume_suspended_process(child: &Child) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn spawn_contained(mut command: Command) -> Result<OwnedChampionProcess, String> {
-    let child = command.spawn().map_err(|error| format!("could not spawn wsl for the champion server: {error}"))?;
-    Ok(OwnedChampionProcess { child })
+fn spawn_contained(command: Command) -> Result<ContainedChild, String> {
+    spawn_contained_with_limits(command, None, None)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_contained_with_limits(
+    mut command: Command,
+    _process_memory_limit_bytes: Option<usize>,
+    _active_process_limit: Option<u32>,
+) -> Result<ContainedChild, String> {
+    let child = command.spawn().map_err(|error| format!("could not spawn contained process: {error}"))?;
+    Ok(ContainedChild { child })
+}
+
+/// A small, synchronous subprocess boundary for hostile native work. On Windows the child starts
+/// suspended, is assigned to the same kill-on-close Job Object primitive used by the champion
+/// launcher, receives an optional per-process memory ceiling, and only then resumes. Retained output
+/// is bounded independently from the pipe drain so an output flood cannot allocate without limit or
+/// deadlock the parent.
+pub(crate) struct ContainedCommandSpec {
+    pub(crate) timeout: Duration,
+    pub(crate) stdin_body: Vec<u8>,
+    pub(crate) max_stdin_bytes: usize,
+    pub(crate) max_stdout_bytes: usize,
+    pub(crate) max_stderr_bytes: usize,
+    pub(crate) process_memory_limit_bytes: Option<usize>,
+    pub(crate) active_process_limit: Option<u32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ContainedCommandOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum ContainedCommandError {
+    #[error("contained command configuration is invalid: {0}")]
+    InvalidConfiguration(String),
+    #[error("contained command could not start: {0}")]
+    Spawn(String),
+    #[error("contained command exceeded its {timeout_ms} ms deadline")]
+    Timeout { timeout_ms: u128 },
+    #[error("contained command exceeded its {stream} output limit of {limit_bytes} bytes")]
+    OutputLimitExceeded { stream: &'static str, limit_bytes: usize },
+    #[error("contained command exited abnormally with {exit_code:?}")]
+    AbnormalExit { exit_code: Option<i32> },
+    #[error("contained command I/O failed: {0}")]
+    Io(String),
+}
+
+struct BoundedPipeResult {
+    retained: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_bounded_pipe(
+    mut reader: impl std::io::Read,
+    limit: usize,
+    exceeded_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<BoundedPipeResult, String> {
+    let mut retained = Vec::with_capacity(limit.min(8 * 1024));
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 4 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Ok(BoundedPipeResult { retained, exceeded });
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        if keep != read {
+            exceeded = true;
+            exceeded_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Execute one explicitly constructed command without a shell and return only bounded output.
+///
+/// This is intentionally synchronous: callers place it on the application's blocking pool. Every
+/// return path closes the Windows Job Object and reaps the root, including timeout, pipe failure,
+/// oversized output, and an abnormal exit. Non-Windows builds retain deterministic root-process
+/// timeout/output behavior, but only Windows claims descendant-tree containment.
+pub(crate) fn run_contained_command(
+    mut command: Command,
+    spec: ContainedCommandSpec,
+) -> Result<ContainedCommandOutput, ContainedCommandError> {
+    if spec.timeout.is_zero() {
+        return Err(ContainedCommandError::InvalidConfiguration("timeout must be positive".to_string()));
+    }
+    if spec.max_stdin_bytes == 0 || spec.max_stdout_bytes == 0 || spec.max_stderr_bytes == 0 {
+        return Err(ContainedCommandError::InvalidConfiguration(
+            "stdin, stdout, and stderr limits must be positive".to_string(),
+        ));
+    }
+    if spec.stdin_body.len() > spec.max_stdin_bytes {
+        return Err(ContainedCommandError::InvalidConfiguration(format!(
+            "stdin body exceeds its {} byte limit",
+            spec.max_stdin_bytes
+        )));
+    }
+    if spec.process_memory_limit_bytes == Some(0) {
+        return Err(ContainedCommandError::InvalidConfiguration("process-memory limit must be positive".to_string()));
+    }
+    if spec.active_process_limit == Some(0) {
+        return Err(ContainedCommandError::InvalidConfiguration("active-process limit must be positive".to_string()));
+    }
+
+    let deadline = std::time::Instant::now().checked_add(spec.timeout).ok_or_else(|| {
+        ContainedCommandError::InvalidConfiguration("timeout exceeds the monotonic clock".to_string())
+    })?;
+
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut owned = spawn_contained_with_limits(command, spec.process_memory_limit_bytes, spec.active_process_limit)
+        .map_err(ContainedCommandError::Spawn)?;
+    let stdin = owned
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| ContainedCommandError::Io("child stdin pipe was not created".to_string()))?;
+    let stdout = owned
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| ContainedCommandError::Io("child stdout pipe was not created".to_string()))?;
+    let stderr = owned
+        .child
+        .stderr
+        .take()
+        .ok_or_else(|| ContainedCommandError::Io("child stderr pipe was not created".to_string()))?;
+
+    let stdin_body = spec.stdin_body;
+    let stdin_writer = std::thread::Builder::new()
+        .name("contained-command-stdin".to_string())
+        .spawn(move || {
+            let mut stdin = stdin;
+            std::io::Write::write_all(&mut stdin, &stdin_body).and_then(|()| std::io::Write::flush(&mut stdin))
+        })
+        .map_err(|error| ContainedCommandError::Io(format!("could not start stdin writer: {error}")))?;
+
+    let stdout_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout_signal = std::sync::Arc::clone(&stdout_exceeded);
+    let stdout_limit = spec.max_stdout_bytes;
+    let stdout_reader = std::thread::Builder::new()
+        .name("contained-command-stdout".to_string())
+        .spawn(move || read_bounded_pipe(stdout, stdout_limit, stdout_signal))
+        .map_err(|error| ContainedCommandError::Io(format!("could not start stdout reader: {error}")))?;
+
+    let stderr_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stderr_signal = std::sync::Arc::clone(&stderr_exceeded);
+    let stderr_limit = spec.max_stderr_bytes;
+    let stderr_reader = std::thread::Builder::new()
+        .name("contained-command-stderr".to_string())
+        .spawn(move || read_bounded_pipe(stderr, stderr_limit, stderr_signal))
+        .map_err(|error| ContainedCommandError::Io(format!("could not start stderr reader: {error}")))?;
+
+    let process_outcome = loop {
+        if stdout_exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+            break Err(ContainedCommandError::OutputLimitExceeded {
+                stream: "stdout",
+                limit_bytes: spec.max_stdout_bytes,
+            });
+        }
+        if stderr_exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+            break Err(ContainedCommandError::OutputLimitExceeded {
+                stream: "stderr",
+                limit_bytes: spec.max_stderr_bytes,
+            });
+        }
+        match owned.child.try_wait() {
+            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) => {
+                break Err(ContainedCommandError::AbnormalExit { exit_code: status.code() });
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                break Err(ContainedCommandError::Timeout { timeout_ms: spec.timeout.as_millis() });
+            }
+            Err(error) => break Err(ContainedCommandError::Io(format!("could not poll child status: {error}"))),
+        }
+    };
+
+    // Close the Job Object before joining readers. This also closes pipe handles inherited by a
+    // malicious descendant, so neither join can remain wedged after the root has exited.
+    owned.terminate_and_reap();
+    let stdin_result =
+        stdin_writer.join().map_err(|_| ContainedCommandError::Io("stdin writer panicked".to_string()))?;
+    let stdout_result = stdout_reader
+        .join()
+        .map_err(|_| ContainedCommandError::Io("stdout reader panicked".to_string()))?
+        .map_err(ContainedCommandError::Io)?;
+    let stderr_result = stderr_reader
+        .join()
+        .map_err(|_| ContainedCommandError::Io("stderr reader panicked".to_string()))?
+        .map_err(ContainedCommandError::Io)?;
+
+    process_outcome?;
+    stdin_result.map_err(|error| ContainedCommandError::Io(format!("stdin write failed: {error}")))?;
+    if stdout_result.exceeded {
+        return Err(ContainedCommandError::OutputLimitExceeded {
+            stream: "stdout",
+            limit_bytes: spec.max_stdout_bytes,
+        });
+    }
+    if stderr_result.exceeded {
+        return Err(ContainedCommandError::OutputLimitExceeded {
+            stream: "stderr",
+            limit_bytes: spec.max_stderr_bytes,
+        });
+    }
+    Ok(ContainedCommandOutput { stdout: stdout_result.retained, stderr: stderr_result.retained })
 }
 
 /// The one owned launcher plus its containment handle. Global: there is exactly one champion.
-static CHILD: Mutex<Option<OwnedChampionProcess>> = Mutex::new(None);
+static CHILD: Mutex<Option<ContainedChild>> = Mutex::new(None);
 
 /// Set once by [`begin_shutdown`]. Closes the Exit-vs-tick race: a supervision tick whose probe
 /// finished just before app exit could otherwise `start_child` AFTER the Exit handler killed the
@@ -296,7 +532,7 @@ pub(crate) fn champion_operational_block_reason() -> Option<&'static str> {
     }
 }
 
-fn lock_child() -> std::sync::MutexGuard<'static, Option<OwnedChampionProcess>> {
+fn lock_child() -> std::sync::MutexGuard<'static, Option<ContainedChild>> {
     CHILD.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("Recovering poisoned champion-child lock");
         poisoned.into_inner()
@@ -959,6 +1195,237 @@ mod tests {
         assert!(parse_health_marker(&format!("{valid}\n{valid}")).is_err(), "two health markers are ambiguous");
         assert!(parse_health_marker("__HEALTH__={\"status\":\"ready\"}").is_err());
         assert!(parse_health_marker("noise only").is_err());
+    }
+
+    /// Harmless real-process fault injector for the bounded subprocess boundary. This test returns
+    /// immediately in the ordinary suite; child invocations opt into one exact role via their own
+    /// environment, never process-global mutation in the parent.
+    #[test]
+    fn contained_command_fault_helper() {
+        use std::io::{Read, Write};
+
+        let Ok(role) = std::env::var("CORTEX_CONTAINED_COMMAND_DRILL") else {
+            return;
+        };
+        if let Some(pid_file) = std::env::var_os("CORTEX_CONTAINED_COMMAND_PID_FILE") {
+            std::fs::write(pid_file, std::process::id().to_string()).expect("publish helper pid");
+        }
+        match role.as_str() {
+            "echo" => {
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input).expect("read drill input");
+                std::io::stdout().write_all(&input).expect("echo drill input");
+                std::io::stdout().flush().expect("flush drill output");
+            }
+            "hang" => loop {
+                std::thread::sleep(Duration::from_secs(60));
+            },
+            "hang-tree" => {
+                let descendant_pid_file = std::env::var_os("CORTEX_CONTAINED_COMMAND_DESC_PID_FILE")
+                    .expect("missing descendant pid-file path");
+                let mut descendant = contained_helper_command("hang");
+                descendant.env("CORTEX_CONTAINED_COMMAND_PID_FILE", descendant_pid_file);
+                // Deliberately inherit stdout/stderr. The outer runner's pipe readers can return
+                // only if Job close kills this descendant as well as its root.
+                let descendant = descendant.spawn().expect("spawn contained drill descendant");
+                // This helper is intentionally killed with its containing Windows Job; it never
+                // resumes to reap a child itself. Forgetting the wrapper keeps Clippy from implying
+                // ordinary parent-side ownership while the OS still closes the process handle when
+                // the helper process is terminated.
+                std::mem::forget(descendant);
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            "abnormal" => std::process::exit(23),
+            "oversized" => {
+                let bytes = vec![b'x'; 64 * 1024];
+                loop {
+                    std::io::stdout().write_all(&bytes).expect("flood drill output");
+                    std::io::stdout().flush().expect("flush flood drill output");
+                }
+            }
+            "allocate" => {
+                if let Some(ready_file) = std::env::var_os("CORTEX_CONTAINED_COMMAND_READY_FILE") {
+                    std::fs::write(ready_file, b"allocating").expect("publish allocator-ready marker");
+                }
+                let mut allocations = Vec::new();
+                loop {
+                    // Touch every page so the Job's committed-memory ceiling, not only virtual
+                    // address reservation, terminates or rejects this helper.
+                    allocations.push(vec![0xA5_u8; 8 * 1024 * 1024]);
+                }
+            }
+            other => panic!("unknown contained-command drill role: {other}"),
+        }
+    }
+
+    fn contained_helper_command(role: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .arg("engine_runtime::tests::contained_command_fault_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("CORTEX_CONTAINED_COMMAND_DRILL", role);
+        command
+    }
+
+    fn contained_spec(timeout: Duration) -> ContainedCommandSpec {
+        ContainedCommandSpec {
+            timeout,
+            stdin_body: b"bounded-input".to_vec(),
+            max_stdin_bytes: 1_024,
+            max_stdout_bytes: 1_024,
+            max_stderr_bytes: 1_024,
+            process_memory_limit_bytes: None,
+            active_process_limit: None,
+        }
+    }
+
+    #[test]
+    fn contained_command_round_trip_is_exact_and_bounded() {
+        let output = run_contained_command(contained_helper_command("echo"), contained_spec(Duration::from_secs(5)))
+            .expect("contained echo");
+        assert!(
+            output.stdout.windows(b"bounded-input".len()).any(|window| window == b"bounded-input"),
+            "the helper did not receive and echo the exact bounded input"
+        );
+        assert!(output.stdout.len() <= 1_024);
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn contained_command_abnormal_exit_is_not_a_success() {
+        let error = run_contained_command(contained_helper_command("abnormal"), contained_spec(Duration::from_secs(5)))
+            .expect_err("abnormal child must fail closed");
+        assert_eq!(error, ContainedCommandError::AbnormalExit { exit_code: Some(23) });
+    }
+
+    #[test]
+    fn contained_command_output_flood_is_killed_without_unbounded_retention() {
+        let started = std::time::Instant::now();
+        let error =
+            run_contained_command(contained_helper_command("oversized"), contained_spec(Duration::from_secs(5)))
+                .expect_err("output flood must fail closed");
+        assert_eq!(error, ContainedCommandError::OutputLimitExceeded { stream: "stdout", limit_bytes: 1_024 });
+        assert!(started.elapsed() < Duration::from_secs(3), "output flood was not stopped promptly");
+    }
+
+    #[test]
+    fn contained_command_timeout_reaps_the_worker() {
+        let directory = tempfile::tempdir().expect("timeout drill directory");
+        let pid_file = directory.path().join("worker.pid");
+        let mut command = contained_helper_command("hang");
+        command.env("CORTEX_CONTAINED_COMMAND_PID_FILE", &pid_file);
+        let started = std::time::Instant::now();
+        let error = run_contained_command(command, contained_spec(Duration::from_millis(250)))
+            .expect_err("hung child must time out");
+        assert_eq!(error, ContainedCommandError::Timeout { timeout_ms: 250 });
+        assert!(started.elapsed() < Duration::from_secs(3), "timeout did not bound wall-clock time");
+
+        #[cfg(target_os = "windows")]
+        if let Ok(raw_pid) = std::fs::read_to_string(&pid_file) {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+            use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+            let pid = raw_pid.trim().parse::<u32>().expect("published helper pid");
+            // SAFETY: requested access is wait-only. Failure to open means the just-killed process
+            // has already been fully removed, which also satisfies the assertion.
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if !handle.is_null() {
+                // SAFETY: `handle` is a live waitable process handle and is closed exactly once.
+                assert_eq!(unsafe { WaitForSingleObject(handle, 0) }, WAIT_OBJECT_0, "timed-out worker survived");
+                unsafe { CloseHandle(handle) };
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_contained_command_limits_fail_before_spawn() {
+        let command = Command::new("this-binary-must-never-be-resolved");
+        let error = run_contained_command(
+            command,
+            ContainedCommandSpec { timeout: Duration::ZERO, ..contained_spec(Duration::from_secs(1)) },
+        )
+        .expect_err("zero timeout is invalid");
+        assert!(matches!(error, ContainedCommandError::InvalidConfiguration(_)));
+
+        let mut oversized_input = contained_spec(Duration::from_secs(1));
+        oversized_input.stdin_body = vec![0_u8; oversized_input.max_stdin_bytes + 1];
+        let error = run_contained_command(Command::new("this-binary-must-never-be-resolved"), oversized_input)
+            .expect_err("oversized stdin must be rejected before spawn");
+        assert!(matches!(error, ContainedCommandError::InvalidConfiguration(_)));
+
+        let mut zero_processes = contained_spec(Duration::from_secs(1));
+        zero_processes.active_process_limit = Some(0);
+        let error = run_contained_command(Command::new("this-binary-must-never-be-resolved"), zero_processes)
+            .expect_err("zero active processes must be rejected before spawn");
+        assert!(matches!(error, ContainedCommandError::InvalidConfiguration(_)));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_windows_process_terminated(pid_file: &std::path::Path, role: &str) {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+        let raw_pid = std::fs::read_to_string(pid_file)
+            .unwrap_or_else(|error| panic!("{role} did not publish proof that it entered its helper role: {error}"));
+        let pid = raw_pid.trim().parse::<u32>().expect("published helper pid");
+        // SAFETY: requested access is wait-only. Failure to open means Windows has already fully
+        // removed the just-killed process, which also satisfies the assertion.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if !handle.is_null() {
+            // SAFETY: `handle` is a live waitable process handle and is closed exactly once.
+            assert_eq!(unsafe { WaitForSingleObject(handle, 0) }, WAIT_OBJECT_0, "{role} survived containment");
+            unsafe { CloseHandle(handle) };
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn contained_timeout_kills_descendants_and_releases_inherited_pipes() {
+        let directory = tempfile::tempdir().expect("process-tree drill directory");
+        let parent_pid_file = directory.path().join("parent.pid");
+        let descendant_pid_file = directory.path().join("descendant.pid");
+        let mut command = contained_helper_command("hang-tree");
+        command
+            .env("CORTEX_CONTAINED_COMMAND_PID_FILE", &parent_pid_file)
+            .env("CORTEX_CONTAINED_COMMAND_DESC_PID_FILE", &descendant_pid_file);
+
+        let started = std::time::Instant::now();
+        let error = run_contained_command(command, contained_spec(Duration::from_secs(3)))
+            .expect_err("hung process tree must time out");
+        assert_eq!(error, ContainedCommandError::Timeout { timeout_ms: 3_000 });
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "process-tree teardown or inherited pipe closure exceeded the bound"
+        );
+        assert_windows_process_terminated(&parent_pid_file, "root worker");
+        assert_windows_process_terminated(&descendant_pid_file, "descendant worker");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_process_memory_limit_terminates_an_allocating_worker() {
+        let directory = tempfile::tempdir().expect("memory-limit drill directory");
+        let pid_file = directory.path().join("allocator.pid");
+        let ready_file = directory.path().join("allocator.ready");
+        let mut command = contained_helper_command("allocate");
+        command
+            .env("CORTEX_CONTAINED_COMMAND_PID_FILE", &pid_file)
+            .env("CORTEX_CONTAINED_COMMAND_READY_FILE", &ready_file);
+        // The full Rust matrix intentionally runs many fsync/restore tests in parallel. Give this
+        // real-process drill enough scheduling budget to enter the allocator before judging the Job
+        // limit, while keeping the bound explicit and below the production worker's parent timeout.
+        let mut spec = contained_spec(Duration::from_secs(10));
+        spec.process_memory_limit_bytes = Some(128 * 1024 * 1024);
+        let error = run_contained_command(command, spec).expect_err("the memory-limited allocator must not survive");
+        assert!(ready_file.is_file(), "the helper must enter its allocator before the Job limit terminates it");
+        assert!(
+            matches!(error, ContainedCommandError::AbnormalExit { .. }),
+            "the Job memory ceiling should terminate the worker before the wall-clock deadline: {error}"
+        );
+        assert_windows_process_terminated(&pid_file, "allocating worker");
     }
 
     /// Helper process for [`windows_job_close_kills_launcher_and_descendant`]. The gate makes the

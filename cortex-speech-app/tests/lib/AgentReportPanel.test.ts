@@ -2,6 +2,7 @@ import { cleanup, render, screen } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import AgentReportPanel from '../../src/lib/AgentReportPanel.svelte';
 import { locale } from '../../src/lib/i18n';
+import { en } from '../../src/lib/i18n/en';
 import type { AgentImportReport, AgentStageEvent } from '../../src/lib/commands';
 
 function makeReport(overrides: Partial<AgentImportReport> = {}): AgentImportReport {
@@ -199,7 +200,7 @@ describe('AgentReportPanel', () => {
 
     expect(screen.getByTestId('agent-report-panel')).toBeInTheDocument();
     expect(screen.getByText('Latest Agent Run')).toBeInTheDocument();
-    expect(screen.getByText('completed')).toBeInTheDocument();
+    expect(screen.getByText(en['agentReport.status.completed'])).toBeInTheDocument();
     expect(screen.getByText('Training-ready')).toBeInTheDocument();
     expect(screen.getByTestId('agent-report-training-ready')).toHaveTextContent('1 / 50%');
     expect(screen.getAllByText('gemini-2.5-pro')).toHaveLength(4);
@@ -207,7 +208,9 @@ describe('AgentReportPanel', () => {
     expect(screen.getByTestId('agent-report-agentic-readiness')).toHaveTextContent(
       'Agentic readiness',
     );
-    expect(screen.getByTestId('agent-report-agentic-readiness')).toHaveTextContent('blocked');
+    expect(screen.getByTestId('agent-report-agentic-readiness')).toHaveTextContent(
+      en['agentReport.status.blocked'],
+    );
     expect(screen.getByTestId('agent-report-agentic-readiness')).toHaveTextContent(
       'Ready hypothesis models',
     );
@@ -228,7 +231,9 @@ describe('AgentReportPanel', () => {
     );
     expect(screen.getByTestId('agent-report-source-reference-coverage')).toHaveTextContent('1/1');
     expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('long.wav');
-    expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('needs_review');
+    expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent(
+      en['agentReport.status.needsReview'],
+    );
     expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('2 chunks');
     expect(screen.getByTestId('agent-report-long-file-dossiers')).toHaveTextContent('1 ready');
     expect(screen.getByTestId('agent-report-persisted-stage-events')).toHaveTextContent(
@@ -241,16 +246,18 @@ describe('AgentReportPanel', () => {
       'jury_adjudication',
     );
     expect(screen.getByTestId('agent-report-persisted-stage-events')).toHaveTextContent(
-      'blocked 0/2',
+      `${en['agentReport.status.blocked']} 0/2`,
     );
     expect(screen.getByTestId('agent-report-source-files')).toHaveTextContent('long__gemini.txt');
     expect(screen.getByTestId('agent-report-source-files')).toHaveTextContent('1200 chars');
     expect(screen.getByTestId('agent-report-orchestration-stages')).toHaveTextContent(
       'source_reference',
     );
-    expect(screen.getByTestId('agent-report-orchestration-stages')).toHaveTextContent('blocked');
     expect(screen.getByTestId('agent-report-orchestration-stages')).toHaveTextContent(
-      'needs_review',
+      en['agentReport.status.blocked'],
+    );
+    expect(screen.getByTestId('agent-report-orchestration-stages')).toHaveTextContent(
+      en['agentReport.status.needsReview'],
     );
     expect(screen.getByTestId('agent-report-coverage-blockers')).toHaveTextContent('seg-2');
     expect(screen.getByTestId('agent-report-coverage-blockers')).toHaveTextContent('1/2');
@@ -270,7 +277,7 @@ describe('AgentReportPanel', () => {
       },
     });
 
-    expect(screen.getByText('failed')).toBeInTheDocument();
+    expect(screen.getByText(en['agentReport.status.failed'])).toBeInTheDocument();
     expect(
       screen.getByText('Post-import jury adjudication failed after single-file import'),
     ).toBeInTheDocument();

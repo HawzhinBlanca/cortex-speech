@@ -41,8 +41,8 @@
 //! HttpOnly session cookie, and never send the pairing secret in a URL or data request.
 
 use crate::db::{
-    Database, HumanDecisionUndoOutcome, PlaybackDecisionProof, ReviewDecisionLimit, SpeechSegment,
-    HIDDEN_ANSWER_KEY_CHANGED, PLAYBACK_EVIDENCE_CHANGED, REVIEW_PILOT_LIMIT_REACHED,
+    CouchPlaybackAttemptAuthority, Database, DesktopPlaybackInterval, HumanDecisionUndoOutcome, ReviewDecisionLimit,
+    SpeechSegment, HIDDEN_ANSWER_KEY_CHANGED, PLAYBACK_EVIDENCE_CHANGED, REVIEW_PILOT_LIMIT_REACHED,
 };
 use base64::Engine as _;
 use rusqlite::OptionalExtension;
@@ -132,6 +132,17 @@ const TLS_IDENTITY_FILE: &str = "couch_tls_identity.json";
 /// pass. Reading it per request makes exposure an atomic filesystem decision with no restart race.
 const PRIVATE_PRODUCTION_MAINTENANCE_FILE: &str = "private-production-maintenance.json";
 const COUCH_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Flexible-pool observations are deliberately disabled until the owner approves an exact prospective
+/// compensation contract for that authority. This stable token is consumed by IPC/runbook callers and
+/// must remain machine-searchable; startup returns it before creating credentials, TLS material, a
+/// listener, a durable session generation, or any review/pay row.
+pub const PAY_POLICY_REQUIRED: &str = "PAY_POLICY_REQUIRED";
+/// A Couch playback attempt is intentionally short-lived and process-local until it is finalized into
+/// immutable policy-4 authority. A process restart therefore cannot turn an unobserved browser claim
+/// into evidence; the reviewer reloads and traverses the clip again.
+const COUCH_PLAYBACK_ATTEMPT_TTL: Duration = Duration::from_secs(30 * 60);
+const COUCH_PLAYBACK_POLICY_VERSION: i64 = 4;
+const LEGACY_RAW_COUNTER_REFUSAL_MARKER: &str = "PLAYBACK_EVIDENCE_V3_CONTENT_HASH_RAW_COUNTER_REFUSED";
 /// How stale a session's persisted issue time may get before a page load rewrites it. Small next to
 /// `COUCH_SESSION_TTL`, so the durable expiry tracks the in-memory one closely, and large enough that
 /// a reloading phone does not re-encrypt every session on every request (review 2026-08-20).
@@ -172,6 +183,16 @@ struct IndependentUndoEntry {
     decision_id: i64,
 }
 
+#[derive(Debug, Clone)]
+struct CouchPlaybackAttempt {
+    authority: CouchPlaybackAttemptAuthority,
+    /// Monotonic server instant at which an authorized GET/304 for this exact attempt completed.
+    /// HEAD/prefetch requests never set it. The earliest successful traversal grant wins, so range
+    /// retries and cached revalidation cannot reset the plausibility clock.
+    media_served_at: Option<Instant>,
+    expires_at: Instant,
+}
+
 /// Per-session state shared by the accept threads. One mutex: the critical sections are map lookups,
 /// held for microseconds, while the slow work (DB writes, WAV encoding) happens outside it.
 #[derive(Default)]
@@ -199,6 +220,13 @@ struct CouchState {
     /// arbitrary known id and then fetch its biometric audio. Unlike hidden-check receipts below,
     /// these are session-local because work leases themselves are session-local.
     served_work: HashSet<(String, String)>,
+    /// Unfinalized policy-4 attempts, keyed by the server-issued receipt UUID. They are inert until an
+    /// exact authorized media GET marks `media_served_at`, and disappear only after durable finalize,
+    /// explicit assignment teardown, expiry, or session revocation.
+    playback_attempts: HashMap<String, CouchPlaybackAttempt>,
+    /// Exact retry index. A browser-generated client UUID has one meaning inside one cookie session;
+    /// presenting it with different reviewer/segment/revision coordinates is a hard conflict.
+    playback_attempt_clients: HashMap<(String, String), String>,
     /// token -> reviewer name. The token is the credential; the name is what lands in the database.
     ///
     /// Lives HERE, in the state every accept thread shares, rather than in a snapshot handed to each
@@ -279,6 +307,54 @@ impl CouchState {
         self.leases.get(segment_id).map(|(who, _)| who.as_str())
     }
 
+    fn prune_playback_attempts(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .playback_attempts
+            .iter()
+            .filter(|(_, attempt)| now >= attempt.expires_at)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            if let Some(attempt) = self.playback_attempts.remove(&id) {
+                self.playback_attempt_clients
+                    .remove(&(attempt.authority.session_binding_sha256, attempt.authority.client_attempt_id));
+            }
+        }
+    }
+
+    fn remove_playback_attempt(&mut self, playback_receipt_id: &str) {
+        if let Some(attempt) = self.playback_attempts.remove(playback_receipt_id) {
+            self.playback_attempt_clients
+                .remove(&(attempt.authority.session_binding_sha256, attempt.authority.client_attempt_id));
+        }
+    }
+
+    fn remove_playback_attempts_for_assignment(&mut self, segment_id: &str, reviewer: &str) {
+        let doomed: Vec<String> = self
+            .playback_attempts
+            .iter()
+            .filter(|(_, attempt)| {
+                attempt.authority.segment_id == segment_id && same_reviewer(&attempt.authority.reviewer, reviewer)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in doomed {
+            self.remove_playback_attempt(&id);
+        }
+    }
+
+    fn remove_playback_attempts_for_session(&mut self, session_binding_sha256: &str) {
+        let doomed: Vec<String> = self
+            .playback_attempts
+            .iter()
+            .filter(|(_, attempt)| attempt.authority.session_binding_sha256 == session_binding_sha256)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in doomed {
+            self.remove_playback_attempt(&id);
+        }
+    }
+
     #[cfg(test)]
     fn inject_session_persist_failure(&self) -> bool {
         self.fail_session_persist
@@ -288,6 +364,14 @@ impl CouchState {
     fn inject_session_persist_failure(&self) -> bool {
         false
     }
+}
+
+fn couch_session_binding_sha256(token: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"cortex-couch-playback-cookie-session-v1\0");
+    hash.update((token.len() as u64).to_le_bytes());
+    hash.update(token.as_bytes());
+    hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 struct CouchHandle {
@@ -1095,6 +1179,16 @@ where
     let preflight_db = Database::open(&db_path).map_err(|e| format!("Couch Review cannot open the library: {e}"))?;
     let configured_pool = crate::review_pool::load(&preflight_db)
         .map_err(|error| format!("flexible review pool cannot start: {error}"))?;
+    if configured_pool.is_some() {
+        // Locked release policy: flexible-pool work has no owner-approved prospective compensation
+        // contract. Refuse while startup is still read-only. In particular this must precede loading
+        // remembered credentials, creating TLS material, binding the socket, writing a session file,
+        // or exposing any queue/decision route. Internal disposable pool tests call their helpers
+        // directly and remain available without turning them into a production service.
+        return Err(format!(
+            "{PAY_POLICY_REQUIRED}: external flexible-pool review is disabled until an owner-approved compensation policy is implemented"
+        ));
+    }
     // The flexible pool explicitly supersedes the old Rubar→Alle serving policy. Its historical
     // setting and any evidence remain in SQLite (and continue blocking generic export), but they no
     // longer constrain the live roster or queue once an immutable pool is active.
@@ -1487,6 +1581,12 @@ fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
     if distinct_reviewers.len() <= 1 {
         return Err("That is the only reviewer — stop Couch Review instead".to_string());
     }
+    let revoked_session_bindings: Vec<String> = st
+        .reviewers
+        .iter()
+        .filter(|(_, reviewer)| reviewer.eq_ignore_ascii_case(name))
+        .map(|(token, _)| couch_session_binding_sha256(token))
+        .collect();
     st.pairing_codes.retain(|_, reviewer| !reviewer.eq_ignore_ascii_case(name));
     st.reviewers.retain(|_, reviewer| !reviewer.eq_ignore_ascii_case(name));
     let live_sessions: HashSet<String> = st.reviewers.keys().cloned().collect();
@@ -1498,6 +1598,9 @@ fn revoke_in(state: &Mutex<CouchState>, name: &str) -> Result<(), String> {
     // later paired again, it must receive a fresh queue; retaining these would let the new session
     // renew an old id and reconstruct the revoked reviewer's object grant.
     st.served_work.retain(|(_, who)| !who.eq_ignore_ascii_case(name));
+    for binding in revoked_session_bindings {
+        st.remove_playback_attempts_for_session(&binding);
+    }
 
     // PERSIST, or say so. Dropping the token from the in-memory map denies the lost phone right now,
     // but `couch_session.json` is what `resume()` rebuilds the roster from — and `start_on_port`
@@ -2258,6 +2361,7 @@ fn handle_request(
             }) {
                 guard.session_issued.remove(&token);
                 guard.reviewers.remove(&token);
+                guard.remove_playback_attempts_for_session(&couch_session_binding_sha256(&token));
                 return None;
             }
             guard.reviewers.get(&token).cloned().map(|name| (token, name))
@@ -2329,6 +2433,7 @@ fn handle_request(
         return (err_reply(401, "unauthorized"), None);
     };
     let reviewer = reviewer.as_str();
+    let session_binding_sha256 = couch_session_binding_sha256(&token);
     if let Err(e) = COUCH_RATE_LIMITER.check(reviewer) {
         return ((429, "text/plain; charset=utf-8", e.into_bytes(), vec![]), None);
     }
@@ -2346,20 +2451,42 @@ fn handle_request(
         // non-GET/POST method used to fall through to 404 — a probe answered "no such thing" while the
         // GET beside it worked. tiny_http suppresses the body for a HEAD itself and keeps the
         // Content-Length, so the same reply is the correct answer to both.
-        (tiny_http::Method::Get | tiny_http::Method::Head, p) if p.starts_with("/api/audio/") => {
+        (audio_method @ (tiny_http::Method::Get | tiny_http::Method::Head), p) if p.starts_with("/api/audio/") => {
+            let is_head = audio_method == tiny_http::Method::Head;
             with_live_reviewer(&token, reviewer, state, || {
-                api_audio(
+                let playback_attempt = match playback_attempt_query(&url) {
+                    Ok(value) => value,
+                    Err(reply) => return reply,
+                };
+                api_audio_authenticated(
                     db,
                     p.trim_start_matches("/api/audio/"),
                     reviewer,
+                    &session_binding_sha256,
                     state,
+                    playback_attempt.as_deref(),
+                    is_head,
                     range.as_deref(),
                     if_none_match.as_deref(),
                 )
             })
         }
+        (tiny_http::Method::Post, "/api/playback/start") => match read_body(request) {
+            Ok(body) => with_live_reviewer(&token, reviewer, state, || {
+                api_playback_start(db, &body, reviewer, &session_binding_sha256, state)
+            }),
+            Err(e) => err_reply(400, &e),
+        },
+        (tiny_http::Method::Post, "/api/playback/finalize") => match read_body(request) {
+            Ok(body) => with_live_reviewer(&token, reviewer, state, || {
+                api_playback_finalize(db, &body, reviewer, &session_binding_sha256, state)
+            }),
+            Err(e) => err_reply(400, &e),
+        },
         (tiny_http::Method::Post, "/api/decision") => match read_body(request) {
-            Ok(body) => with_live_reviewer(&token, reviewer, state, || api_decision(db, &body, reviewer, state)),
+            Ok(body) => with_live_reviewer(&token, reviewer, state, || {
+                api_decision_authenticated(db, &body, reviewer, &session_binding_sha256, state)
+            }),
             Err(e) => err_reply(400, &e),
         },
         (tiny_http::Method::Post, "/api/renew") => match read_body(request) {
@@ -2494,6 +2621,7 @@ fn live_session_guard(
         if expired {
             guard.session_issued.remove(token);
             guard.reviewers.remove(token);
+            guard.remove_playback_attempts_for_session(&couch_session_binding_sha256(token));
         }
         !expired
             && guard
@@ -3342,6 +3470,7 @@ fn api_queue(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply 
     //   the total is free here — the query already walked every pending row.
     let mut payload = serde_json::json!({
         "reviewer": reviewer,
+        "playbackContractVersion": COUCH_PLAYBACK_POLICY_VERSION,
         "items": queue,
         "heldByOthers": held_by_others,
         "skippedByYou": skipped_by_you,
@@ -3460,6 +3589,7 @@ fn forget_work_audio_assignment(state: &Mutex<CouchState>, id: &str, reviewer: &
         guard.leases.remove(id);
     }
     guard.served_work.remove(&(id.to_string(), reviewer.to_string()));
+    guard.remove_playback_attempts_for_assignment(id, reviewer);
 }
 
 /// Resolve the in-memory proof that this exact reviewer was handed this exact object. A live lease
@@ -3673,16 +3803,348 @@ fn private_audio_failure(mut reply: Reply) -> Reply {
     reply
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaybackStartBody {
+    id: String,
+    #[serde(rename = "rowVersion")]
+    row_version: String,
+    #[serde(rename = "clientAttemptId")]
+    client_attempt_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaybackFinalizeBody {
+    #[serde(rename = "playbackReceiptId")]
+    playback_receipt_id: String,
+    #[serde(rename = "clientAttemptId")]
+    client_attempt_id: String,
+    intervals: Vec<PlaybackIntervalBody>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaybackIntervalBody {
+    #[serde(rename = "startMs")]
+    start_ms: i64,
+    #[serde(rename = "endMs")]
+    end_ms: i64,
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+}
+
+fn playback_attempt_query(url: &str) -> Result<Option<String>, Reply> {
+    let Some((_, query)) = url.split_once('?') else {
+        return Ok(None);
+    };
+    let mut attempt = None;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "playbackAttemptId" {
+            if attempt.is_some() || !canonical_uuid(value) {
+                return Err(private_audio_failure(err_reply(400, "invalid playback attempt identity")));
+            }
+            attempt = Some(value.to_string());
+        }
+    }
+    Ok(attempt)
+}
+
+fn api_playback_start(
+    db: &Database,
+    body: &[u8],
+    reviewer: &str,
+    session_binding_sha256: &str,
+    state: &Mutex<CouchState>,
+) -> Reply {
+    let parsed: PlaybackStartBody = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => return err_reply(400, &format!("bad json: {error}")),
+    };
+    if crate::validation::input::validate_identifier(&parsed.id).is_err() || !canonical_uuid(&parsed.client_attempt_id)
+    {
+        return err_reply(400, "invalid Couch playback start identity");
+    }
+    let Ok(expected_revision) = parsed.row_version.parse::<i64>() else {
+        return err_reply(400, "rowVersion is invalid — reload this clip");
+    };
+    let segment = match authorize_audio(db, &parsed.id, reviewer, state) {
+        Ok(segment) => segment,
+        Err(reply) => return reply,
+    };
+    let current_revision = match db.segment_review_revision(&parsed.id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return err_reply(404, "no such segment"),
+        Err(error) => return err_reply(500, &format!("playback revision lookup failed: {error}")),
+    };
+    if current_revision != expected_revision {
+        return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
+    }
+    let content_hash = match db.segment_audio_content_hash(&parsed.id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return err_reply(503, "playback identity is unavailable for this clip"),
+        Err(error) => return err_reply(500, &format!("playback identity lookup failed: {error}")),
+    };
+    let (source_start_ms, source_end_ms) = match db.segment_source_span(&parsed.id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return err_reply(503, "playback source span is unavailable for this clip"),
+        Err(error) => return err_reply(500, &format!("playback source-span lookup failed: {error}")),
+    };
+    if !crate::db::source_span_matches_duration(source_start_ms, source_end_ms, segment.duration_ms) {
+        return err_reply(503, "playback duration and source span disagree");
+    }
+    let now = Instant::now();
+    let issued_at_ms =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as i64).unwrap_or(1).max(1);
+    let expires_at_ms = issued_at_ms.saturating_add(COUCH_PLAYBACK_ATTEMPT_TTL.as_millis() as i64);
+    let expires_at = now.checked_add(COUCH_PLAYBACK_ATTEMPT_TTL).unwrap_or(now);
+    let client_key = (session_binding_sha256.to_string(), parsed.client_attempt_id.clone());
+    let mut guard = lock_state(state);
+    guard.prune_playback_attempts(now);
+    if let Some(existing_id) = guard.playback_attempt_clients.get(&client_key).cloned() {
+        let Some(existing) = guard.playback_attempts.get(&existing_id) else {
+            guard.playback_attempt_clients.remove(&client_key);
+            return err_reply(503, "playback attempt index is inconsistent — reload this clip");
+        };
+        let authority = &existing.authority;
+        if authority.reviewer != reviewer
+            || authority.segment_id != parsed.id
+            || authority.segment_revision != expected_revision
+            || authority.audio_content_hash != content_hash
+            || authority.clip_duration_ms != segment.duration_ms
+            || authority.source_start_ms != source_start_ms
+            || authority.source_end_ms != source_end_ms
+        {
+            return err_reply(409, "clientAttemptId is already bound to another exact playback request");
+        }
+        return json_reply(
+            200,
+            serde_json::json!({
+                "playbackContractVersion": COUCH_PLAYBACK_POLICY_VERSION,
+                "playbackReceiptId": authority.playback_receipt_id,
+                "clientAttemptId": authority.client_attempt_id,
+                "segmentId": authority.segment_id,
+                "segmentRevision": authority.segment_revision,
+                "clipDurationMs": authority.clip_duration_ms,
+                "expiresAtMs": authority.expires_at_ms,
+                "duplicate": true,
+            }),
+        );
+    }
+    let playback_receipt_id = uuid::Uuid::new_v4().to_string();
+    let authority = CouchPlaybackAttemptAuthority {
+        playback_receipt_id: playback_receipt_id.clone(),
+        media_grant_id: uuid::Uuid::new_v4().to_string(),
+        client_attempt_id: parsed.client_attempt_id,
+        session_binding_sha256: session_binding_sha256.to_string(),
+        reviewer: reviewer.to_string(),
+        segment_id: parsed.id,
+        segment_revision: expected_revision,
+        audio_content_hash: content_hash,
+        source_path: PathBuf::from(segment.audio_path),
+        clip_duration_ms: segment.duration_ms,
+        source_start_ms,
+        source_end_ms,
+        issued_at_ms,
+        expires_at_ms,
+    };
+    guard.playback_attempt_clients.insert(client_key, playback_receipt_id.clone());
+    guard.playback_attempts.insert(
+        playback_receipt_id.clone(),
+        CouchPlaybackAttempt { authority: authority.clone(), media_served_at: None, expires_at },
+    );
+    json_reply(
+        200,
+        serde_json::json!({
+            "playbackContractVersion": COUCH_PLAYBACK_POLICY_VERSION,
+            "playbackReceiptId": playback_receipt_id,
+            "clientAttemptId": authority.client_attempt_id,
+            "segmentId": authority.segment_id,
+            "segmentRevision": authority.segment_revision,
+            "clipDurationMs": authority.clip_duration_ms,
+            "expiresAtMs": authority.expires_at_ms,
+        }),
+    )
+}
+
+fn validate_audio_playback_attempt(
+    db: &Database,
+    id: &str,
+    reviewer: &str,
+    session_binding_sha256: &str,
+    playback_receipt_id: &str,
+    state: &Mutex<CouchState>,
+) -> Result<(), Reply> {
+    let now = Instant::now();
+    let authority = {
+        let mut guard = lock_state(state);
+        guard.prune_playback_attempts(now);
+        guard.playback_attempts.get(playback_receipt_id).map(|attempt| attempt.authority.clone())
+    }
+    .ok_or_else(|| {
+        private_audio_failure(err_reply(409, "playback attempt is missing or expired — reload this clip"))
+    })?;
+    if authority.session_binding_sha256 != session_binding_sha256
+        || !same_reviewer(&authority.reviewer, reviewer)
+        || authority.segment_id != id
+    {
+        return Err(private_audio_failure(err_reply(403, "playback attempt belongs to another session or clip")));
+    }
+    let revision = db
+        .segment_review_revision(id)
+        .map_err(|error| private_audio_failure(err_reply(500, &format!("playback revision lookup failed: {error}"))))?;
+    let content_hash = db
+        .segment_audio_content_hash(id)
+        .map_err(|error| private_audio_failure(err_reply(500, &format!("playback identity lookup failed: {error}"))))?;
+    let source_span = db
+        .segment_source_span(id)
+        .map_err(|error| private_audio_failure(err_reply(500, &format!("playback span lookup failed: {error}"))))?;
+    if revision != Some(authority.segment_revision)
+        || content_hash.as_deref() != Some(authority.audio_content_hash.as_str())
+        || source_span != Some((authority.source_start_ms, authority.source_end_ms))
+    {
+        return Err(private_audio_failure(err_reply(
+            409,
+            "playback attempt no longer matches this clip revision — reload it",
+        )));
+    }
+    Ok(())
+}
+
+fn mark_audio_playback_attempt_served(
+    playback_receipt_id: &str,
+    reviewer: &str,
+    session_binding_sha256: &str,
+    state: &Mutex<CouchState>,
+) {
+    let mut guard = lock_state(state);
+    if let Some(attempt) = guard.playback_attempts.get_mut(playback_receipt_id) {
+        if attempt.authority.session_binding_sha256 == session_binding_sha256
+            && same_reviewer(&attempt.authority.reviewer, reviewer)
+            && attempt.media_served_at.is_none()
+        {
+            attempt.media_served_at = Some(Instant::now());
+        }
+    }
+}
+
+fn playback_error_reply(error: &str) -> Reply {
+    if error.contains("E_NO_PLAYBACK_EVIDENCE") || error.contains("E_PLAYBACK_TIME_IMPLAUSIBLE") {
+        err_reply(428, error)
+    } else if error.contains(PLAYBACK_EVIDENCE_CHANGED)
+        || error.contains("different")
+        || error.contains("already bound")
+        || error.contains("replay")
+    {
+        err_reply(409, error)
+    } else if error.contains("invalid") || error.contains("malformed") || error.contains("interval") {
+        err_reply(400, error)
+    } else {
+        err_reply(500, error)
+    }
+}
+
+fn api_playback_finalize(
+    db: &Database,
+    body: &[u8],
+    reviewer: &str,
+    session_binding_sha256: &str,
+    state: &Mutex<CouchState>,
+) -> Reply {
+    let parsed: PlaybackFinalizeBody = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => return err_reply(400, &format!("bad json: {error}")),
+    };
+    if !canonical_uuid(&parsed.playback_receipt_id) || !canonical_uuid(&parsed.client_attempt_id) {
+        return err_reply(400, "invalid Couch playback finalization identity");
+    }
+    let intervals: Vec<DesktopPlaybackInterval> = parsed
+        .intervals
+        .iter()
+        .map(|interval| DesktopPlaybackInterval { start_ms: interval.start_ms, end_ms: interval.end_ms })
+        .collect();
+    match db.replay_finalized_couch_playback_receipt_v1(
+        &parsed.playback_receipt_id,
+        &parsed.client_attempt_id,
+        session_binding_sha256,
+        reviewer,
+        &intervals,
+    ) {
+        Ok(Some(receipt)) => {
+            return json_reply(
+                200,
+                serde_json::json!({
+                    "playbackContractVersion": COUCH_PLAYBACK_POLICY_VERSION,
+                    "playbackReceiptId": receipt.playback_receipt_id,
+                    "segmentId": receipt.segment_id,
+                    "segmentRevision": receipt.segment_revision,
+                    "uniqueTraversedMs": receipt.unique_played_ms,
+                    "clipDurationMs": receipt.clip_duration_ms,
+                    "coverageRatio": receipt.coverage_ratio,
+                    "duplicate": true,
+                }),
+            )
+        }
+        Ok(None) => {}
+        Err(error) => return playback_error_reply(&error.to_string()),
+    }
+    let now = Instant::now();
+    let (authority, elapsed_ms) = {
+        let mut guard = lock_state(state);
+        guard.prune_playback_attempts(now);
+        let Some(attempt) = guard.playback_attempts.get(&parsed.playback_receipt_id) else {
+            return err_reply(409, "playback attempt is missing or expired — reload and replay this clip");
+        };
+        if attempt.authority.client_attempt_id != parsed.client_attempt_id
+            || attempt.authority.session_binding_sha256 != session_binding_sha256
+            || !same_reviewer(&attempt.authority.reviewer, reviewer)
+        {
+            return err_reply(403, "playback attempt belongs to another session");
+        }
+        let Some(served_at) = attempt.media_served_at else {
+            return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: this attempt never received authorized media");
+        };
+        let elapsed = now.duration_since(served_at);
+        (attempt.authority.clone(), i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+    };
+    let receipt = match db.finalize_couch_playback_attempt_v1(&authority, &intervals, elapsed_ms) {
+        Ok(receipt) => receipt,
+        Err(error) => return playback_error_reply(&error.to_string()),
+    };
+    lock_state(state).remove_playback_attempt(&parsed.playback_receipt_id);
+    json_reply(
+        200,
+        serde_json::json!({
+            "playbackContractVersion": COUCH_PLAYBACK_POLICY_VERSION,
+            "playbackReceiptId": receipt.playback_receipt_id,
+            "segmentId": receipt.segment_id,
+            "segmentRevision": receipt.segment_revision,
+            "uniqueTraversedMs": receipt.unique_played_ms,
+            "clipDurationMs": receipt.clip_duration_ms,
+            "coverageRatio": receipt.coverage_ratio,
+        }),
+    )
+}
+
 /// Clip audio, authorization-revalidated, cache-efficient and range-capable.
 ///
 /// `private, no-cache` permits the browser to retain the biometric bytes but requires every reuse to
 /// cross this live authorization boundary. A still-authorized replay remains cheap through the ETag
 /// 304; a completed/revoked/out-of-policy assignment is refused before the validator is considered.
-fn api_audio(
+/// The arguments are the independently authenticated request authorities; grouping them into an
+/// opaque bag would make it easier to omit one during a security-sensitive call-site change.
+#[allow(clippy::too_many_arguments)]
+fn api_audio_authenticated(
     db: &Database,
     raw_id: &str,
     reviewer: &str,
+    session_binding_sha256: &str,
     state: &Mutex<CouchState>,
+    playback_receipt_id: Option<&str>,
+    is_head: bool,
     range: Option<&str>,
     if_none_match: Option<&str>,
 ) -> Reply {
@@ -3694,6 +4156,13 @@ fn api_audio(
         Ok(seg) => seg,
         Err(reply) => return private_audio_failure(reply),
     };
+    if let Some(playback_receipt_id) = playback_receipt_id {
+        if let Err(reply) =
+            validate_audio_playback_attempt(db, id, reviewer, session_binding_sha256, playback_receipt_id, state)
+        {
+            return reply;
+        }
+    }
     let etag = format!("\"{:016x}\"", audio_fingerprint(&seg));
     // Storage is private and every reuse revalidates the live cookie + assignment. `Vary: Cookie`
     // prevents a cache entry authorized for one reviewer session being selected for another; ETag
@@ -3715,6 +4184,11 @@ fn api_audio(
             c == "*" || c == etag || c.strip_prefix("W/").is_some_and(|c| c == etag)
         })
     }) {
+        if !is_head {
+            if let Some(playback_receipt_id) = playback_receipt_id {
+                mark_audio_playback_attempt_served(playback_receipt_id, reviewer, session_binding_sha256, state);
+            }
+        }
         return (304, "audio/wav", Vec::new(), base());
     }
     let bytes = match cached_audio(audio_fingerprint(&seg), &seg) {
@@ -3722,7 +4196,7 @@ fn api_audio(
         Err(e) => return private_audio_failure(err_reply(500, &e)),
     };
     let len = bytes.len();
-    match range {
+    let reply = match range {
         None => (200, "audio/wav", bytes.as_ref().clone(), base()),
         Some(spec) => match parse_range(spec, len) {
             Some((start, end)) => {
@@ -3738,7 +4212,35 @@ fn api_audio(
                 (416, "text/plain; charset=utf-8", b"range not satisfiable".to_vec(), headers)
             }
         },
+    };
+    if !is_head && matches!(reply.0, 200 | 206) {
+        if let Some(playback_receipt_id) = playback_receipt_id {
+            mark_audio_playback_attempt_served(playback_receipt_id, reviewer, session_binding_sha256, state);
+        }
     }
+    reply
+}
+
+#[cfg(test)]
+fn api_audio(
+    db: &Database,
+    raw_id: &str,
+    reviewer: &str,
+    state: &Mutex<CouchState>,
+    range: Option<&str>,
+    if_none_match: Option<&str>,
+) -> Reply {
+    api_audio_authenticated(
+        db,
+        raw_id,
+        reviewer,
+        &couch_session_binding_sha256("couch-test-session"),
+        state,
+        None,
+        false,
+        range,
+        if_none_match,
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -3907,12 +4409,11 @@ struct DecisionBody {
     /// cannot acquire it retroactively, so a pre-activation operation must reload before it can write.
     #[serde(default, rename = "pilotAfterReviewEventId")]
     pilot_after_review_event_id: Option<i64>,
-    /// Cumulative MEDIA time the page actually advanced through this clip, in ms.
-    ///
-    /// Not wall-clock, not a `play()` call, not a download — a clip can arrive, decode and sit at
-    /// 0:00 while nobody hears a word. The page only reports how much it played; the SERVER resolves
-    /// the segment's revision and decoded-PCM content hash itself, so a client cannot mint evidence naming a
-    /// clip or revision it never loaded.
+    /// Server-issued, finalized policy-4 interval authority. Required for every new non-skip verdict.
+    #[serde(default, rename = "playbackReceiptId")]
+    playback_receipt_id: Option<String>,
+    /// Legacy policy-3 scalar fields are decoded only so a completed rolling-deploy operation can be
+    /// acknowledged before fresh proof checks. They never authorize a new verdict.
     #[serde(default, rename = "heardMs")]
     heard_ms: Option<i64>,
     #[serde(default, rename = "clipDurationMs")]
@@ -3934,20 +4435,49 @@ fn decision_operation_payload_hash(segment_id: &str, action: &str, text: &str, r
     crate::db::review_operation_payload_hash(segment_id, action, text, reviewer)
 }
 
+/// Match a retried phone operation against the immutable receipt that already committed it.
+///
+/// Reviewer identity is case-insensitive throughout Couch, but the v1 payload hash deliberately
+/// preserved the reviewer's exact spelling.  A roster correction such as `Rubar` -> `rubar` after an
+/// app restart must therefore rederive the old digest with the spelling stored in the receipt, not
+/// with the current session spelling.  The stored spelling is only hash authority after we prove it
+/// denotes the currently authenticated reviewer; a different person, segment, action, or transcript
+/// remains a hard UUID-reuse conflict.
+fn operation_receipt_matches_request(
+    stored_payload_hash: &str,
+    stored_segment_id: &str,
+    stored_reviewer: &str,
+    request_segment_id: &str,
+    request_action: &str,
+    request_text: &str,
+    authenticated_reviewer: &str,
+) -> bool {
+    stored_segment_id == request_segment_id
+        && same_reviewer(stored_reviewer, authenticated_reviewer)
+        && stored_payload_hash
+            == decision_operation_payload_hash(request_segment_id, request_action, request_text, stored_reviewer)
+}
+
 fn review_operation_state(
     db: &Database,
     operation_id: &str,
-    operation_payload_hash: &str,
     segment_id: &str,
+    action: &str,
+    text: &str,
     reviewer: &str,
 ) -> crate::error::AppResult<ReviewOperationState> {
     let Some(receipt) = db.review_operation(operation_id)? else {
         return Ok(ReviewOperationState::New);
     };
-    if receipt.operation_payload_hash == operation_payload_hash
-        && receipt.segment_id == segment_id
-        && receipt.reviewer == reviewer
-    {
+    if operation_receipt_matches_request(
+        &receipt.operation_payload_hash,
+        &receipt.segment_id,
+        &receipt.reviewer,
+        segment_id,
+        action,
+        text,
+        reviewer,
+    ) {
         Ok(ReviewOperationState::ExactReplay)
     } else {
         Ok(ReviewOperationState::Reused)
@@ -3961,13 +4491,12 @@ fn review_operation_state(
 fn operation_result_after_write_failure(
     db: &Database,
     reviewer: &str,
-    segment_id: &str,
+    parsed: &DecisionBody,
     operation_id: &str,
-    operation_payload_hash: &str,
     fallback_status: u16,
     fallback_message: &str,
 ) -> Reply {
-    match review_operation_state(db, operation_id, operation_payload_hash, segment_id, reviewer) {
+    match review_operation_state(db, operation_id, &parsed.id, &parsed.action, &parsed.text, reviewer) {
         Ok(ReviewOperationState::ExactReplay) => {
             json_reply_with_accounting(200, serde_json::json!({ "ok": true, "duplicate": true }), db, reviewer)
         }
@@ -3981,6 +4510,7 @@ fn api_independent_decision(
     db: &Database,
     parsed: &DecisionBody,
     reviewer: &str,
+    session_binding_sha256: &str,
     state: &Mutex<CouchState>,
     campaign: &crate::review_campaign::SequentialReviewCampaign,
 ) -> Reply {
@@ -3993,13 +4523,27 @@ fn api_independent_decision(
     if uuid.hyphenated().to_string() != operation_id {
         return err_reply(400, "operationId must be a lowercase hyphenated UUID");
     }
-    let operation_payload_hash = decision_operation_payload_hash(&parsed.id, &parsed.action, &parsed.text, reviewer);
+    let Some(canonical_reviewer) = campaign.authorized_reviewer() else {
+        return err_reply(503, "independent review campaign has no active reviewer identity");
+    };
+    // Persist and hash the immutable campaign roster spelling. Authentication remains
+    // case-insensitive, but the schema-61 trigger deliberately compares NEW.reviewer to that exact
+    // spelling; hashing the transient cookie spelling would also make a later case-only login unable
+    // to replay the durable receipt.
+    let operation_payload_hash =
+        decision_operation_payload_hash(&parsed.id, &parsed.action, &parsed.text, canonical_reviewer);
     match crate::review_campaign::independent_operation(db, operation_id) {
         Ok(Some(receipt))
             if receipt.campaign_id == campaign.campaign_id
-                && receipt.segment_id == parsed.id
-                && receipt.reviewer.eq_ignore_ascii_case(reviewer)
-                && receipt.operation_payload_hash == operation_payload_hash =>
+                && operation_receipt_matches_request(
+                    &receipt.operation_payload_hash,
+                    &receipt.segment_id,
+                    &receipt.reviewer,
+                    &parsed.id,
+                    &parsed.action,
+                    &parsed.text,
+                    reviewer,
+                ) =>
         {
             remember_independent_undo(state, reviewer, operation_id, &receipt.segment_id, receipt.decision_id);
             forget_work_audio_assignment(state, &parsed.id, reviewer);
@@ -4082,14 +4626,18 @@ fn api_independent_decision(
         }
         other => return err_reply(400, &format!("unknown action '{other}'")),
     };
-    if parsed.heard_ms.is_some_and(|value| value < 0) || parsed.clip_duration_ms.is_some_and(|value| value < 0) {
-        return err_reply(400, "playback counters must not be negative");
-    }
-
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    let (content_hash, source_span) = if action == "skip" {
-        (None, None)
+    let (content_hash, source_span, playback_proof) = if action == "skip" {
+        (None, None, None)
     } else {
+        if parsed.heard_ms.is_some() || parsed.clip_duration_ms.is_some() {
+            return err_reply(
+                428,
+                &format!(
+                    "E_NO_PLAYBACK_EVIDENCE: {LEGACY_RAW_COUNTER_REFUSAL_MARKER}; legacy playback counters cannot authorize a verdict"
+                ),
+            );
+        }
         let content_hash = match db.segment_audio_content_hash(&parsed.id) {
             Ok(Some(value)) => value,
             Ok(None) => return err_reply(503, "playback identity is unavailable for this clip"),
@@ -4100,40 +4648,25 @@ fn api_independent_decision(
             Ok(None) => return err_reply(503, "playback source span is unavailable for this clip"),
             Err(error) => return err_reply(500, &format!("playback source-span lookup failed: {error}")),
         };
-        let Some(heard_ms) = parsed.heard_ms else {
-            return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: listen to the clip before deciding");
+        let Some(playback_receipt_id) = parsed.playback_receipt_id.as_deref() else {
+            return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: finalize this clip's playback attempt before deciding");
         };
-        let receipt = crate::db::PlaybackReceipt {
-            segment_id: parsed.id.clone(),
-            segment_revision: served_revision,
-            audio_content_hash: content_hash.clone(),
-            reviewer: Some(reviewer.to_string()),
-            session_id: None,
-            started_at_ms: now_ms,
-            played_ms: heard_ms,
-            clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0),
-            source_start_ms: None,
-            source_end_ms: None,
+        let proof = match db.couch_playback_proof_v4(
+            &parsed.id,
+            served_revision,
+            &content_hash,
+            reviewer,
+            session_binding_sha256,
+            playback_receipt_id,
+        ) {
+            Ok(Some(proof)) => proof,
+            Ok(None) => return err_reply(
+                428,
+                "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision",
+            ),
+            Err(error) => return playback_error_reply(&error.to_string()),
         };
-        match db.record_playback_receipt_if_at_revision(&receipt, served_revision) {
-            Ok(true) => {}
-            Ok(false) => return err_reply(409, "this clip changed since it was served — reload for the fresh draft"),
-            Err(error) => return err_reply(500, &format!("playback receipt not recorded: {error}")),
-        }
-        match db.has_sufficient_playback_evidence(&parsed.id, served_revision, &content_hash, Some(reviewer)) {
-            Ok(true) => {}
-            Ok(false) => {
-                return err_reply(
-                    428,
-                    &db.require_playback_evidence(&parsed.id, served_revision, &content_hash, Some(reviewer))
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
-                )
-            }
-            Err(error) => return err_reply(500, &format!("playback evidence check failed: {error}")),
-        }
-        (Some(content_hash), Some(source_span))
+        (Some(content_hash), Some(source_span), Some(proof))
     };
 
     {
@@ -4144,12 +4677,13 @@ fn api_independent_decision(
     }
     let input = crate::review_campaign::IndependentDecisionInput {
         segment_id: &parsed.id,
-        reviewer,
+        reviewer: canonical_reviewer,
         action,
         submitted_transcript: submitted_transcript.as_deref(),
         served_transcript: segment.raw_transcript.trim(),
         served_revision,
         audio_content_hash: content_hash.as_deref(),
+        playback_authority_session_id: playback_proof.as_ref().and_then(|proof| proof.authority_session_id.as_deref()),
         source_start_ms: source_span.map(|span| span.0),
         source_end_ms: source_span.map(|span| span.1),
         duration_ms: segment.duration_ms,
@@ -4167,9 +4701,15 @@ fn api_independent_decision(
         Err(error) => match crate::review_campaign::independent_operation(db, operation_id) {
             Ok(Some(receipt))
                 if receipt.campaign_id == campaign.campaign_id
-                    && receipt.segment_id == parsed.id
-                    && receipt.reviewer.eq_ignore_ascii_case(reviewer)
-                    && receipt.operation_payload_hash == operation_payload_hash =>
+                    && operation_receipt_matches_request(
+                        &receipt.operation_payload_hash,
+                        &receipt.segment_id,
+                        &receipt.reviewer,
+                        &parsed.id,
+                        &parsed.action,
+                        &parsed.text,
+                        reviewer,
+                    ) =>
             {
                 receipt.decision_id
             }
@@ -4193,6 +4733,7 @@ fn api_independent_decision(
 /// Record a second-or-later pool judgement without mutating the canonical first answer. The queue
 /// always serves the raw OmniASR-7B draft in pool mode, keeping this observation independent from the
 /// correction already stored on `speech_segments`.
+#[cfg(test)]
 fn api_pool_decision(
     db: &Database,
     parsed: &DecisionBody,
@@ -4213,9 +4754,15 @@ fn api_pool_decision(
     match crate::review_pool::operation(db, operation_id) {
         Ok(Some(receipt))
             if receipt.pool_id == pool.pool_id
-                && receipt.segment_id == parsed.id
-                && receipt.reviewer.eq_ignore_ascii_case(reviewer)
-                && receipt.operation_payload_hash == operation_payload_hash =>
+                && operation_receipt_matches_request(
+                    &receipt.operation_payload_hash,
+                    &receipt.segment_id,
+                    &receipt.reviewer,
+                    &parsed.id,
+                    &parsed.action,
+                    &parsed.text,
+                    reviewer,
+                ) =>
         {
             remember_pool_undo(state, reviewer, operation_id, &receipt.segment_id, receipt.decision_id);
             forget_work_audio_assignment(state, &parsed.id, reviewer);
@@ -4394,9 +4941,15 @@ fn api_pool_decision(
         Err(error) => match crate::review_pool::operation(db, operation_id) {
             Ok(Some(receipt))
                 if receipt.pool_id == pool.pool_id
-                    && receipt.segment_id == parsed.id
-                    && receipt.reviewer.eq_ignore_ascii_case(reviewer)
-                    && receipt.operation_payload_hash == operation_payload_hash =>
+                    && operation_receipt_matches_request(
+                        &receipt.operation_payload_hash,
+                        &receipt.segment_id,
+                        &receipt.reviewer,
+                        &parsed.id,
+                        &parsed.action,
+                        &parsed.text,
+                        reviewer,
+                    ) =>
             {
                 receipt.decision_id
             }
@@ -4421,7 +4974,13 @@ fn api_pool_decision(
 /// another reviewer currently holds.
 ///
 /// `action: "skip"` is the one path that writes NOTHING to the corpus — see the block that handles it.
-fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+fn api_decision_authenticated(
+    db: &Database,
+    body: &[u8],
+    reviewer: &str,
+    session_binding_sha256: &str,
+    state: &Mutex<CouchState>,
+) -> Reply {
     let parsed: DecisionBody = match serde_json::from_slice(body) {
         Ok(p) => p,
         Err(e) => return err_reply(400, &format!("bad json: {e}")),
@@ -4445,6 +5004,11 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
+    #[cfg(not(test))]
+    if early_pool.is_some() {
+        return err_reply(503, &format!("{PAY_POLICY_REQUIRED}: external flexible-pool decisions are disabled"));
+    }
+    #[cfg(test)]
     if let Some(pool) = early_pool.as_ref() {
         // Pool mode never mints synthetic hidden checks: every real judgement contributes to visible
         // coverage. A remembered pre-pool check on a verified clip therefore becomes an ordinary,
@@ -4476,7 +5040,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         Err(error) => return err_reply(503, &error),
     };
     if let Some(campaign) = early_campaign.as_ref().filter(|policy| policy.is_blinded_second_pass()) {
-        return api_independent_decision(db, &parsed, reviewer, state, campaign);
+        return api_independent_decision(db, &parsed, reviewer, session_binding_sha256, state, campaign);
     }
 
     // Validate and look up a supplied operation identity before consulting mutable corpus state. An
@@ -4491,7 +5055,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             return err_reply(400, "operationId must be a lowercase hyphenated UUID");
         }
         let payload_hash = decision_operation_payload_hash(&parsed.id, &parsed.action, &parsed.text, reviewer);
-        match review_operation_state(db, operation_id, &payload_hash, &parsed.id, reviewer) {
+        match review_operation_state(db, operation_id, &parsed.id, &parsed.action, &parsed.text, reviewer) {
             Ok(ReviewOperationState::ExactReplay) => {
                 let effect = match db.human_decision_effect_for_operation(operation_id) {
                     Ok(effect) => effect,
@@ -4614,6 +5178,15 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     let already_recorded =
         parsed.action != "skip" && is_repeat_of_stored_decision(&prev, reviewer, decision, text.as_deref());
     if already_recorded && prev.verified {
+        // Policy-4 pages possessed a durable operation UUID before finalization. Their exact lost-
+        // response retry was handled by `review_operation_state` above. A different UUID carrying a
+        // receipt is therefore a new operation, not the bounded legacy rolling-deploy exception;
+        // ACKing it would make a consumed playback authority appear reusable and leave the new UUID
+        // unbound for a later, different decision. Only the pre-policy-4 no-receipt outbox may use the
+        // compatibility ACK below.
+        if parsed.playback_receipt_id.is_some() {
+            return err_reply(409, "this decision already committed under a different operation identity");
+        }
         // BOUNDED ROLLING-COMPATIBILITY EXCEPTION. The immediately previous page can have committed a
         // verdict before operation UUIDs existed, lost the response, then acquire a UUID only while
         // its legacy localStorage array is upgraded. There is no truthful event to which that later
@@ -4644,7 +5217,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     // This must be before the new-write rowVersion guard so an outbox created by the previous page build
     // can drain, and before `audit` so retries cannot append another pay-shaped generic review event.
     let still_has_answer_key = prev.verified
-        && !crate::quality::is_human_rejected(&prev)
+        && !crate::quality::is_excluded_from_exports(&prev)
         && crate::quality::human_verified_text(&prev).is_some();
     if was_served_as_spot_check && still_has_answer_key {
         match db.has_spot_check_result(&parsed.id, reviewer) {
@@ -4738,7 +5311,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             if !was_served_as_spot_check {
                 (None, false, false)
             } else {
-                let answer = if crate::quality::is_human_rejected(&prev) {
+                let answer = if crate::quality::is_excluded_from_exports(&prev) {
                     None
                 } else {
                     crate::quality::human_verified_text(&prev)
@@ -4755,7 +5328,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 (None, false, false)
             } else {
                 let served_in_this_pilot = guard.pilot_spot_checks.contains(&key);
-                let answer = if crate::quality::is_human_rejected(&prev) {
+                let answer = if crate::quality::is_excluded_from_exports(&prev) {
                     None
                 } else {
                     crate::quality::human_verified_text(&prev)
@@ -4878,34 +5451,13 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         None
     };
 
-    // LISTENING EVIDENCE — minted, then ENFORCED, before anything is written.
-    //
-    // Order matters and is not obvious: the page reports its heard-time WITH the decision, so the
-    // receipt for this very submit has to be recorded before the guard can possibly pass. Checking
-    // first would refuse every decision forever. The revision and content hash are still resolved
-    // server-side, and the coverage denominator is the server's own clip length, so neither half of
-    // the ratio is the client's to assert.
-    //
-    // A `skip` is exempt and always was: it writes no verdict, no attribution and no `verified`, so
-    // there is no claim to stand behind. It is the honest answer for a clip the reviewer cannot
-    // judge, and refusing it would leave someone who could not hear a clip with no legal move at all.
-    // A receipt is still minted for it — a clip that was heard and then skipped is real evidence.
-    //
-    // A REJECT is NOT exempt (owner decision 2026-08-19, after the pilot measured four rejects in two
-    // seconds with zero playback). An accept or an edit injects text; a reject permanently removes a
-    // clip from a corpus whose size is the binding constraint. Both are verdicts, and a verdict on a
-    // clip nobody heard is a guess either way.
-    let now_ms =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    // PLAYBACK AUTHORITY. A new verdict never mints evidence from request counters. The page must first
+    // finalize a server-issued, cookie-session-bound attempt carrying a normalized interval union. This
+    // lookup acquires an immutable source lease and the decision transaction repeats the exact policy-4
+    // predicate while consuming the receipt once. Skip remains exempt because it is explicitly no verdict.
     let content_hash = match db.segment_audio_content_hash(&parsed.id) {
         Ok(Some(value)) => Some(value),
-        Ok(None) if parsed.action == "skip" => {
-            tracing::info!(
-                "skip on {} has no server-derived audio content hash; no playback receipt will be minted",
-                parsed.id
-            );
-            None
-        }
+        Ok(None) if parsed.action == "skip" => None,
         Ok(None) => {
             return err_reply(
                 503,
@@ -4914,115 +5466,43 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         }
         Err(error) => return err_reply(500, &format!("playback identity lookup failed: {error}")),
     };
-    let source_span = match db.segment_source_span(&parsed.id) {
-        Ok(Some(value)) => Some(value),
-        Ok(None) if parsed.action == "skip" => None,
-        Ok(None) => {
-            return err_reply(
-                503,
-                "playback identity is unavailable — this clip has no canonical server-derived source span",
-            )
-        }
-        Err(error) => return err_reply(500, &format!("playback source-span lookup failed: {error}")),
-    };
-    // The revision this receipt binds to is always the exact row fetched above. Every non-skip
-    // submit—including a hidden check—has just proven that it equals the served rowVersion.
     let revision = request_revision;
-    // A skip whose SERVE is already stale mints nothing at all: the skip itself still lands (it
-    // writes no verdict), but the mint below resolves identity from the CURRENT row, and listening
-    // that happened on a serve the fence can no longer verify must not become evidence bound to a
-    // row state the reviewer never saw.
-    let stale_skip = parsed.action == "skip"
-        && parsed
-            .row_version
-            .as_deref()
-            .and_then(|s| s.parse::<i64>().ok())
-            .is_some_and(|served| served != request_revision);
-    if stale_skip {
-        tracing::info!("skip on {} kept, receipt declined: the serve predates the current row", parsed.id);
-    } else if let (Some(heard_ms), Some(content_hash)) = (parsed.heard_ms, content_hash.as_ref()) {
-        let receipt = crate::db::PlaybackReceipt {
-            segment_id: parsed.id.clone(),
-            segment_revision: revision,
-            audio_content_hash: content_hash.clone(),
-            reviewer: Some(reviewer.to_string()),
-            session_id: None,
-            started_at_ms: now_ms,
-            played_ms: heard_ms,
-            clip_duration_ms: parsed.clip_duration_ms.unwrap_or(0),
-            source_start_ms: None,
-            source_end_ms: None,
-        };
-        // Atomic check-and-mint (2026-08-20 hunt): the front door's own resolution re-queried the
-        // row AFTER the fence, so a write landing in between rebound the receipt to a revision the
-        // reviewer never heard. The mint now verifies the revision in the same statement that
-        // inserts — content hash and duration are resolved from exactly the verified row.
-        match db.record_playback_receipt_if_at_revision(&receipt, revision) {
-            Ok(true) => {}
-            Ok(false) if parsed.action == "skip" => {
-                // The row moved between fetch and mint. The skip still proceeds — it writes no
-                // verdict — but WITHOUT a receipt: evidence nobody can bind to the served audio
-                // is worth less than no evidence.
-                tracing::info!("skip on {} kept, receipt declined: the row moved since the serve", parsed.id);
-            }
-            Ok(false) => {
-                // The fence firing late: same refusal, same page recovery (reload, fresh serve).
-                return err_reply(409, "this clip changed since it was served — reload for the fresh draft");
-            }
-            Err(e) => {
-                // NOT a warning to swallow any more. Under enforcement the receipt IS the reviewer's
-                // proof, so losing it silently means refusing them for the server's failure: they replay
-                // the clip, the write fails again, and nothing they can do will land. A busy database is
-                // a 500 -- which the page already holds and retries -- not a verdict about listening.
-                tracing::warn!("playback receipt not recorded for {}: {e}", parsed.id);
-                // Hold the clip for THIS reviewer before giving up on it. A 428 is a rejected request and
-                // deliberately leaves no lease, but a 500 is the server's own failure: the reviewer still
-                // has the clip open with their correction typed and now queued, and a freed clip goes to
-                // the next reviewer's batch within seconds — their replay then loses a race that never
-                // needed to happen. Same rule the decision write below follows for the same reason.
-                {
-                    let now = Instant::now();
-                    let mut guard = lock_state(state);
-                    if !guard.holder(&parsed.id, now).is_some_and(|who| who != reviewer) {
-                        guard.leases.insert(parsed.id.clone(), (reviewer.to_string(), now));
-                    }
-                }
-                return err_reply(500, &format!("playback receipt not recorded: {e}"));
-            }
+    let playback_proof = if parsed.action == "skip" {
+        None
+    } else {
+        if parsed.heard_ms.is_some() || parsed.clip_duration_ms.is_some() {
+            return err_reply(
+                428,
+                &format!(
+                    "E_NO_PLAYBACK_EVIDENCE: {LEGACY_RAW_COUNTER_REFUSAL_MARKER}; legacy playback counters cannot authorize a verdict"
+                ),
+            );
         }
-    }
-    if parsed.action != "skip" {
         let Some(content_hash) = content_hash.as_deref() else {
             return err_reply(
                 503,
                 "playback identity is unavailable — this clip has no canonical server-derived audio content hash",
             );
         };
-        match db.has_sufficient_playback_evidence(&parsed.id, revision, content_hash, Some(reviewer)) {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(
-                    "PLAYBACK_EVIDENCE_V3_CONTENT_HASH_RAW_COUNTER_REFUSED: {} by {reviewer} at revision {revision}",
-                    parsed.id
-                );
-                // 428 Precondition Required: the reviewer must do something first, and it is neither a
-                // conflict (409) nor a malformed request (400). The page holds the clip and says so; the
-                // outbox treats it as a settled answer rather than retrying what can never land.
-                return err_reply(
-                    428,
-                    &db.require_playback_evidence(&parsed.id, revision, content_hash, Some(reviewer))
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "E_NO_PLAYBACK_EVIDENCE".to_string()),
-                );
-            }
-            // NOT a verdict about the reviewer. A locked or unwell database cannot answer the
-            // question, and telling someone who listened properly that they did not is both false and
-            // unactionable — they would replay the clip and be refused again. 500 says "the server is
-            // unwell", which the page already holds and retries.
-            Err(e) => return err_reply(500, &format!("playback evidence check failed: {e}")),
+        let Some(playback_receipt_id) = parsed.playback_receipt_id.as_deref() else {
+            return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: finalize this clip's playback attempt before deciding");
+        };
+        match db.couch_playback_proof_v4(
+            &parsed.id,
+            revision,
+            content_hash,
+            reviewer,
+            session_binding_sha256,
+            playback_receipt_id,
+        ) {
+            Ok(Some(proof)) => Some(proof),
+            Ok(None) => return err_reply(
+                428,
+                "E_NO_PLAYBACK_EVIDENCE: playback authority does not match this reviewer, session, clip, or revision",
+            ),
+            Err(error) => return playback_error_reply(&error.to_string()),
         }
-    }
+    };
     // SKIP — the explicit NO-VERDICT (R4.4), handled before any of the write machinery because it
     // shares none of it.
     //
@@ -5067,9 +5547,8 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             return operation_result_after_write_failure(
                 db,
                 reviewer,
-                &parsed.id,
+                &parsed,
                 operation_id,
-                operation_payload_hash,
                 500,
                 "skip not recorded — retrying is safe",
             );
@@ -5121,14 +5600,6 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             Err(error) => return err_reply(503, &error),
         }
         let submitted = text.as_deref().unwrap_or_default();
-        let playback_proof = content_hash.as_ref().zip(source_span).filter(|_| decision != "skip").map(
-            |(value, (source_start_ms, source_end_ms))| PlaybackDecisionProof {
-                segment_revision: revision,
-                audio_content_hash: value.clone(),
-                source_start_ms,
-                source_end_ms,
-            },
-        );
         let recorded = if let Some((policy_sha256, after_review_event_id)) = pilot_namespace.as_ref() {
             db.record_pilot_spot_check_with_operation_request(
                 policy_sha256,
@@ -5173,9 +5644,8 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             return operation_result_after_write_failure(
                 db,
                 reviewer,
-                &parsed.id,
+                &parsed,
                 operation_id,
-                operation_payload_hash,
                 500,
                 "decision not recorded — retrying is safe",
             );
@@ -5225,20 +5695,8 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
     }
     // New decisions finalize in the SAME transaction that mints the DPO pair/correction memories.
     // A legacy half-written row is finalized without replaying those side effects.
-    let Some(content_hash) = content_hash else {
-        return err_reply(
-            503,
-            "playback identity is unavailable — this clip has no canonical server-derived audio content hash",
-        );
-    };
-    let Some((source_start_ms, source_end_ms)) = source_span else {
-        return err_reply(503, "playback identity is unavailable — this clip has no canonical server source span");
-    };
-    let corpus_playback_proof = PlaybackDecisionProof {
-        segment_revision: revision,
-        audio_content_hash: content_hash,
-        source_start_ms,
-        source_end_ms,
+    let Some(corpus_playback_proof) = playback_proof.as_ref() else {
+        return err_reply(428, "E_NO_PLAYBACK_EVIDENCE: canonical verdict has no policy-4 authority");
     };
     if already_recorded {
         return match db.finalize_phone_human_decision_at_revision(&parsed.id, text.as_deref(), request_revision) {
@@ -5259,7 +5717,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
         text.as_deref(),
         reviewer,
         request_revision,
-        &corpus_playback_proof,
+        corpus_playback_proof,
         operation_id,
         operation_payload_hash,
         &parsed.action,
@@ -5272,9 +5730,8 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             return operation_result_after_write_failure(
                 db,
                 reviewer,
-                &parsed.id,
+                &parsed,
                 operation_id,
-                operation_payload_hash,
                 409,
                 "this clip changed while the decision was being saved — reload for the fresh draft",
             );
@@ -5283,7 +5740,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
             // A concurrent identical request may have won the UNIQUE race. Resolve the immutable
             // effect before publishing an undo token; no row snapshot is ever reconstructed here.
             if matches!(
-                review_operation_state(db, operation_id, operation_payload_hash, &parsed.id, reviewer),
+                review_operation_state(db, operation_id, &parsed.id, &parsed.action, &parsed.text, reviewer,),
                 Ok(ReviewOperationState::ExactReplay)
             ) {
                 let effect = match db.human_decision_effect_for_operation(operation_id) {
@@ -5320,15 +5777,7 @@ fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchS
                 return err_reply(409, "controlled review pilot complete — no more review actions are authorized");
             }
             lock_state(state).in_flight_operations.remove(operation_id);
-            return operation_result_after_write_failure(
-                db,
-                reviewer,
-                &parsed.id,
-                operation_id,
-                operation_payload_hash,
-                500,
-                &error.to_string(),
-            );
+            return operation_result_after_write_failure(db, reviewer, &parsed, operation_id, 500, &error.to_string());
         }
     };
     lock_state(state).in_flight_operations.remove(operation_id);
@@ -5437,6 +5886,11 @@ fn api_pool_undo(
         db,
         reviewer,
     )
+}
+
+#[cfg(test)]
+fn api_decision(db: &Database, body: &[u8], reviewer: &str, state: &Mutex<CouchState>) -> Reply {
+    api_decision_authenticated(db, body, reviewer, &couch_session_binding_sha256("couch-test-session"), state)
 }
 
 fn api_undo(db: &Database, reviewer: &str, state: &Mutex<CouchState>) -> Reply {
@@ -5568,21 +6022,35 @@ mod tests {
     /// lock from one failed test must not cascade every later one into a meaningless panic.
     static GLOBAL_SESSION_LOCK: Mutex<()> = Mutex::new(());
 
+    // libtest runs Couch tests concurrently, and nearly all characterization fixtures intentionally
+    // reuse short ids such as `s1`. A process-global directory therefore made unrelated tests race to
+    // truncate the same `s1.wav`; Windows rejects the second open with ERROR_SHARING_VIOLATION (32).
+    // One directory per test thread preserves the useful invariant that repeated `seg("s1", ..)` calls
+    // inside one test have the same audio identity, while making parallel tests physically independent.
+    thread_local! {
+        static FIXTURE_AUDIO: tempfile::TempDir =
+            tempfile::tempdir().expect("thread-local Couch fixture audio directory");
+    }
+
     fn test_db(dir: &std::path::Path) -> (Database, String) {
         let path = dir.join("couch-test.db").to_string_lossy().to_string();
         let db = Database::open(&path).unwrap();
         db.initialize().unwrap();
-        // Tiny RIFF-only fixtures bypass the import/backfill pipeline. A TEMP trigger gives every
+        let template = dir.join("couch-fixture-template.wav");
+        write_test_wav(&template, 24_000);
+        let fixture_audio_content_hash =
+            crate::export_bundle::current_canonical_pcm_blake3(&template).expect("fixture template has PCM identity");
+        // Disposable WAV fixtures bypass the import/backfill pipeline. A TEMP trigger gives every
         // subsequently inserted fixture the same canonical decoded-PCM content hash before any
         // queue/server connection can observe it, without weakening the production schema.
         db.connection()
-            .execute_batch(
+            .execute_batch(&format!(
                 "CREATE TEMP TRIGGER fixture_audio_content_hash
                  AFTER INSERT ON speech_segments
                  WHEN NEW.audio_content_hash IS NULL
                  BEGIN
                      UPDATE speech_segments
-                        SET audio_content_hash = printf('%064x', NEW.rowid),
+                        SET audio_content_hash = '{fixture_audio_content_hash}',
                             alignment_json = COALESCE(
                                 alignment_json,
                                 json_object(
@@ -5593,8 +6061,8 @@ mod tests {
                                 )
                             )
                       WHERE id = NEW.id;
-                 END;",
-            )
+                 END;"
+            ))
             .unwrap();
         (db, path)
     }
@@ -5603,21 +6071,48 @@ mod tests {
         // A REAL file on disk, one per clip. `pending_segment_ids` refuses to serve a clip whose audio
         // has gone missing (2026-08-15), so the old shared "/audio/a.wav" placeholder would drop every
         // fixture out of the queue and leave the lease/batch tests below asserting against an empty
-        // list — passing while proving nothing. One process-wide temp dir, cleaned up on exit.
-        static AUDIO: std::sync::LazyLock<tempfile::TempDir> =
-            std::sync::LazyLock::new(|| tempfile::tempdir().expect("fixture audio dir"));
-        let path = AUDIO.path().join(format!("{id}.wav"));
-        std::fs::write(&path, b"RIFF").expect("fixture audio file");
-        SpeechSegment {
-            id: id.into(),
-            audio_path: path.to_string_lossy().into_owned(),
-            raw_transcript: raw.into(),
-            duration_ms: 1500,
-            alignment_json: Some(
-                r#"{"source_start_ms":0,"source_end_ms":1500,"chunk_index":0,"chunk_count":1}"#.into(),
-            ),
-            ..SpeechSegment::default()
-        }
+        // list — passing while proving nothing. The thread-local directory is cleaned when its test
+        // thread exits, after all values and server workers owned by that test have been joined.
+        FIXTURE_AUDIO.with(|audio| {
+            let path = audio.path().join(format!("{id}.wav"));
+            // Distinct fixture ids must not collapse into one canonical audio window. Several review/pay
+            // characterizations intentionally insert many clips with the same duration and span; giving
+            // them byte-identical PCM would make the real dedup authority correctly treat them as aliases.
+            write_test_wav_seeded(&path, 24_000, id.as_bytes());
+            SpeechSegment {
+                id: id.into(),
+                audio_path: path.to_string_lossy().into_owned(),
+                raw_transcript: raw.into(),
+                duration_ms: 1500,
+                alignment_json: Some(
+                    r#"{"source_start_ms":0,"source_end_ms":1500,"chunk_index":0,"chunk_count":1}"#.into(),
+                ),
+                ..SpeechSegment::default()
+            }
+        })
+    }
+
+    #[test]
+    fn parallel_fixture_audio_with_the_same_segment_id_has_independent_paths() {
+        const WORKERS: usize = 16;
+        let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let segment = seg("same-id", "دەقی تاقیکردنەوە");
+                    assert!(std::path::Path::new(&segment.audio_path).is_file());
+                    segment.audio_path
+                })
+            })
+            .collect();
+        let paths: HashSet<String> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(
+            paths.len(),
+            WORKERS,
+            "parallel tests using the same fixture id must never share a writable WAV path"
+        );
     }
 
     /// Existing endpoint tests model the current phone, which always persists an operation UUID and
@@ -5631,8 +6126,20 @@ mod tests {
         let action = payload.get("action").and_then(serde_json::Value::as_str).unwrap_or_default();
         let verdict = matches!(action, "accept" | "edit" | "bad");
         if payload.get("operationId").is_none() {
+            let id = payload.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let text = payload.get("text").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let digest = Sha256::digest(
+                format!("cortex-test-phone-operation-v1\0{id}\0{action}\0{text}\0{reviewer}").as_bytes(),
+            );
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
             if let Some(object) = payload.as_object_mut() {
-                object.insert("operationId".to_string(), serde_json::Value::String(uuid::Uuid::new_v4().to_string()));
+                object.insert(
+                    "operationId".to_string(),
+                    serde_json::Value::String(uuid::Uuid::from_bytes(bytes).to_string()),
+                );
             }
         }
         if verdict && payload.get("rowVersion").is_none() {
@@ -5644,6 +6151,111 @@ mod tests {
                 object.insert("rowVersion".to_string(), serde_json::Value::String(stamp));
             }
         }
+        // Compatibility for the large pre-policy-4 endpoint characterization suite. Production never
+        // enters this helper: it mints a real finalized policy-4 receipt from the fixture's real WAV,
+        // exact current revision/hash/span and the fixed test session binding. Tests of missing/forged
+        // proof call `super::api_decision_authenticated` directly and therefore do not receive it.
+        let pool_mode = lock_state(state).pool_policy.is_some();
+        let pool_requires_first_canonical = pool_mode
+            && payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| db.get_segment_by_id(id).ok().flatten())
+                .is_some_and(|segment| !segment.verified || segment.human_decision.is_none());
+        if verdict && (!pool_mode || pool_requires_first_canonical) && payload.get("playbackReceiptId").is_none() {
+            let id = payload.get("id").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+            let mut supplied_revision = payload
+                .get("rowVersion")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<i64>().ok());
+            let operation_already_committed =
+                payload.get("operationId").and_then(serde_json::Value::as_str).is_some_and(|operation_id| {
+                    db.review_operation(operation_id).ok().flatten().is_some()
+                        || crate::review_campaign::independent_operation(db, operation_id).ok().flatten().is_some()
+                });
+            if !operation_already_committed {
+                if let Ok(Some(segment)) = db.get_segment_by_id(&id) {
+                    if let Ok(actual_hash) =
+                        crate::export_bundle::current_canonical_pcm_blake3(Path::new(&segment.audio_path))
+                    {
+                        if db.segment_audio_content_hash(&id).ok().flatten().as_deref() != Some(actual_hash.as_str()) {
+                            let revision_before_fixture_hash = db.segment_review_revision(&id).ok().flatten();
+                            let _ = db.connection().execute(
+                                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                                rusqlite::params![id, actual_hash],
+                            );
+                            // A stamp captured against the disposable trigger's placeholder identity
+                            // is refreshed iff it exactly named that pre-normalization revision. A
+                            // genuinely stale stamp remains stale and continues to exercise the CAS.
+                            if supplied_revision.is_none() || supplied_revision == revision_before_fixture_hash {
+                                supplied_revision = db.segment_review_revision(&id).ok().flatten();
+                                if let (Some(revision), Some(object)) = (supplied_revision, payload.as_object_mut()) {
+                                    object.insert(
+                                        "rowVersion".to_string(),
+                                        serde_json::Value::String(revision.to_string()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                let current_revision = db.segment_review_revision(&id).ok().flatten();
+                if supplied_revision == current_revision {
+                    let content_hash = db.segment_audio_content_hash(&id).ok().flatten();
+                    let span = db.segment_source_span(&id).ok().flatten();
+                    let segment = db.get_segment_by_id(&id).ok().flatten();
+                    if let (Some(revision), Some(content_hash), Some((source_start_ms, source_end_ms)), Some(segment)) =
+                        (current_revision, content_hash, span, segment)
+                    {
+                        let issued_at_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|duration| duration.as_millis() as i64)
+                            .unwrap_or(10_000)
+                            .max(10_000);
+                        let authority = CouchPlaybackAttemptAuthority {
+                            playback_receipt_id: uuid::Uuid::new_v4().to_string(),
+                            media_grant_id: uuid::Uuid::new_v4().to_string(),
+                            client_attempt_id: uuid::Uuid::new_v4().to_string(),
+                            session_binding_sha256: couch_session_binding_sha256("couch-test-session"),
+                            reviewer: reviewer.to_string(),
+                            segment_id: id.to_string(),
+                            segment_revision: revision,
+                            audio_content_hash: content_hash,
+                            source_path: PathBuf::from(segment.audio_path),
+                            clip_duration_ms: segment.duration_ms,
+                            source_start_ms,
+                            source_end_ms,
+                            issued_at_ms,
+                            expires_at_ms: issued_at_ms + 60_000,
+                        };
+                        let covered_ms = payload
+                            .get("heardMs")
+                            .and_then(serde_json::Value::as_i64)
+                            .filter(|value| *value >= 0)
+                            .unwrap_or_else(|| ((segment.duration_ms * 9) / 10).max(1))
+                            .min(segment.duration_ms);
+                        let intervals = [DesktopPlaybackInterval { start_ms: 0, end_ms: covered_ms }];
+                        match db.finalize_couch_playback_attempt_v1(&authority, &intervals, segment.duration_ms.max(1))
+                        {
+                            Ok(receipt) => {
+                                if let Some(object) = payload.as_object_mut() {
+                                    object.insert(
+                                        "playbackReceiptId".to_string(),
+                                        serde_json::Value::String(receipt.playback_receipt_id),
+                                    );
+                                    object.remove("heardMs");
+                                    object.remove("clipDurationMs");
+                                }
+                            }
+                            Err(error) if covered_ms.saturating_mul(100) < segment.duration_ms.saturating_mul(85) => {
+                                let _ = error;
+                            }
+                            Err(error) => return playback_error_reply(&error.to_string()),
+                        }
+                    }
+                }
+            }
+        }
         if payload.get("pilotAfterReviewEventId").is_none() {
             let baseline = lock_state(state).pilot_policy.as_ref().map(|policy| policy.after_review_event_id);
             if let (Some(baseline), Some(object)) = (baseline, payload.as_object_mut()) {
@@ -5651,7 +6263,65 @@ mod tests {
             }
         }
         let encoded = payload.to_string();
-        super::api_decision(db, encoded.as_bytes(), reviewer, state)
+        super::api_decision_authenticated(
+            db,
+            encoded.as_bytes(),
+            reviewer,
+            &couch_session_binding_sha256("couch-test-session"),
+            state,
+        )
+    }
+
+    /// Give legacy HTTP queue/concurrency characterizations a real durable policy-4 receipt without
+    /// weakening the routed production handler. The dedicated live-protocol and adversarial tests
+    /// exercise start -> authorized audio -> finalize over the real server; these older tests are
+    /// about restart, leasing, throttling and exactly-once decision behavior, and reuse this explicit
+    /// test-only authority to avoid adding 750ms of wall time per fixture clip.
+    fn fixture_policy4_receipt(
+        db: &Database,
+        reviewer: &str,
+        session_token: &str,
+        id: &str,
+        row_version: &serde_json::Value,
+    ) -> String {
+        let revision = row_version
+            .as_str()
+            .and_then(|value| value.parse::<i64>().ok())
+            .or_else(|| row_version.as_i64())
+            .expect("fixture rowVersion is a canonical integer");
+        assert_eq!(db.segment_review_revision(id).unwrap(), Some(revision));
+        let segment = db.get_segment_by_id(id).unwrap().expect("fixture segment exists");
+        let audio_content_hash =
+            db.segment_audio_content_hash(id).unwrap().expect("fixture has canonical PCM identity");
+        let (source_start_ms, source_end_ms) = db.segment_source_span(id).unwrap().expect("fixture has canonical span");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(1)
+            .max(1);
+        let authority = CouchPlaybackAttemptAuthority {
+            playback_receipt_id: uuid::Uuid::new_v4().to_string(),
+            media_grant_id: uuid::Uuid::new_v4().to_string(),
+            client_attempt_id: uuid::Uuid::new_v4().to_string(),
+            session_binding_sha256: couch_session_binding_sha256(session_token),
+            reviewer: reviewer.to_string(),
+            segment_id: id.to_string(),
+            segment_revision: revision,
+            audio_content_hash,
+            source_path: PathBuf::from(segment.audio_path),
+            clip_duration_ms: segment.duration_ms,
+            source_start_ms,
+            source_end_ms,
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms + 60_000,
+        };
+        db.finalize_couch_playback_attempt_v1(
+            &authority,
+            &[DesktopPlaybackInterval { start_ms: 0, end_ms: segment.duration_ms }],
+            segment.duration_ms,
+        )
+        .expect("fixture policy-4 playback finalizes")
+        .playback_receipt_id
     }
 
     #[test]
@@ -6167,6 +6837,48 @@ mod tests {
         Mutex::new(CouchState::default())
     }
 
+    fn policy4_segment(db: &Database, id: &str, duration_ms: i64) -> SpeechSegment {
+        let mut segment = seg(id, "دەقی تاقیکردنەوە");
+        write_test_wav(Path::new(&segment.audio_path), (duration_ms as usize) * 16);
+        segment.duration_ms = duration_ms;
+        segment.alignment_json =
+            Some(format!(r#"{{"source_start_ms":0,"source_end_ms":{duration_ms},"chunk_index":0,"chunk_count":1}}"#));
+        db.insert_segment(&segment).unwrap();
+        let content_hash = crate::export_bundle::current_canonical_pcm_blake3(Path::new(&segment.audio_path)).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?2 WHERE id=?1",
+                rusqlite::params![id, content_hash],
+            )
+            .unwrap();
+        db.get_segment_by_id(id).unwrap().unwrap()
+    }
+
+    fn assign_policy4_work(state: &Mutex<CouchState>, id: &str, reviewer: &str) {
+        let mut guard = lock_state(state);
+        guard.leases.insert(id.to_string(), (reviewer.to_string(), Instant::now()));
+        guard.served_work.insert((id.to_string(), reviewer.to_string()));
+    }
+
+    fn start_policy4_attempt(
+        db: &Database,
+        state: &Mutex<CouchState>,
+        id: &str,
+        reviewer: &str,
+        binding: &str,
+        client_attempt_id: &str,
+    ) -> serde_json::Value {
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        let body = serde_json::json!({
+            "id": id,
+            "rowVersion": revision.to_string(),
+            "clientAttemptId": client_attempt_id,
+        });
+        let reply = super::api_playback_start(db, body.to_string().as_bytes(), reviewer, binding, state);
+        assert_eq!(reply.0, 200, "attempt start failed: {}", String::from_utf8_lossy(&reply.2));
+        serde_json::from_slice(&reply.2).unwrap()
+    }
+
     /// Whole-state fingerprint for read-only endpoint tests. Every mutable CouchState field is
     /// represented, including the state that is intentionally not durable (leases, undo, skips, and
     /// in-flight operations). Keep this list beside CouchState's field list when that state grows.
@@ -6180,6 +6892,8 @@ mod tests {
         in_flight_operations: HashSet<String>,
         leases: HashMap<String, (String, Instant)>,
         served_work: HashSet<(String, String)>,
+        playback_attempts: Vec<(String, String, String, String, i64, bool)>,
+        playback_attempt_clients: HashMap<(String, String), String>,
         reviewers: HashMap<String, String>,
         pairing_codes: HashMap<String, String>,
         session_issued: HashMap<String, SystemTime>,
@@ -6196,6 +6910,21 @@ mod tests {
 
     fn snapshot_couch_state(state: &Mutex<CouchState>) -> CouchStateTestSnapshot {
         let state = lock_state(state);
+        let mut playback_attempts: Vec<_> = state
+            .playback_attempts
+            .iter()
+            .map(|(receipt_id, attempt)| {
+                (
+                    receipt_id.clone(),
+                    attempt.authority.client_attempt_id.clone(),
+                    attempt.authority.reviewer.clone(),
+                    attempt.authority.segment_id.clone(),
+                    attempt.authority.segment_revision,
+                    attempt.media_served_at.is_some(),
+                )
+            })
+            .collect();
+        playback_attempts.sort();
         CouchStateTestSnapshot {
             undo: state
                 .undo
@@ -6239,6 +6968,8 @@ mod tests {
             in_flight_operations: state.in_flight_operations.clone(),
             leases: state.leases.clone(),
             served_work: state.served_work.clone(),
+            playback_attempts,
+            playback_attempt_clients: state.playback_attempt_clients.clone(),
             reviewers: state.reviewers.clone(),
             pairing_codes: state.pairing_codes.clone(),
             session_issued: state.session_issued.clone(),
@@ -6437,10 +7168,13 @@ mod tests {
         assert_eq!(queue["items"][1]["text"], "champion reviewed draft", "later reviews stay blind to Rubar's answer");
 
         let row_version = queue["items"][1]["rowVersion"].as_str().unwrap();
+        let pool_operation_id = "30000000-0000-4000-8000-000000000002";
         let decision = serde_json::json!({
+            "operationId": pool_operation_id,
             "id": "pool-reviewed",
             "action": "edit",
             "text": "Alle independent truth",
+            "reviewer": "Alle",
             "rowVersion": row_version,
             "heardMs": 1_500,
             "clipDurationMs": 1_500,
@@ -6459,6 +7193,44 @@ mod tests {
         assert!(!crate::review_pool::pending_segment_ids(&db, &pool, "Alle", None)
             .unwrap()
             .contains(&"pool-reviewed".to_string()));
+
+        let pool_decision_count = || -> i64 {
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM review_pool_decisions WHERE operation_id=?1",
+                    [pool_operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(pool_decision_count(), 1);
+        let restarted_state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-alle".into(), "alle".into())]),
+            session_store: Some((tmp.path().to_path_buf(), db.path().to_string())),
+            pool_policy: Some(pool.clone()),
+            ..CouchState::default()
+        });
+        let (code, _, replay_body, ..) = api_decision(&db, decision.to_string().as_bytes(), "alle", &restarted_state);
+        assert_eq!(code, 200, "case-only pool replay must ACK");
+        let replay: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(pool_decision_count(), 1, "pool replay must not append another observation");
+
+        let mut changed_action = decision.clone();
+        changed_action["action"] = serde_json::json!("accept");
+        let mut changed_text = decision.clone();
+        changed_text["text"] = serde_json::json!("different pool truth");
+        for (label, payload) in [("action", changed_action), ("text", changed_text)] {
+            let (code, ..) = api_decision(&db, payload.to_string().as_bytes(), "alle", &restarted_state);
+            assert_eq!(code, 409, "changed pool {label} must conflict");
+            assert_eq!(pool_decision_count(), 1);
+        }
+        let mut changed_reviewer = decision.clone();
+        changed_reviewer["reviewer"] = serde_json::json!("Hemn");
+        let changed_reviewer: DecisionBody = serde_json::from_value(changed_reviewer).unwrap();
+        let (code, ..) = api_pool_decision(&db, &changed_reviewer, "Hemn", &restarted_state, &pool);
+        assert_eq!(code, 409, "a different reviewer must not inherit the pool receipt");
+        assert_eq!(pool_decision_count(), 1);
 
         let (code, _, body, ..) = api_undo(&db, "Alle", &state);
         assert_eq!(code, 200, "pool undo failed: {}", String::from_utf8_lossy(&body));
@@ -6600,10 +7372,13 @@ mod tests {
         assert_eq!(queue["items"][0]["text"], "champion raw draft");
         assert_ne!(queue["items"][0]["text"], "Rubar corrected truth");
         let row_version = queue["items"][0]["rowVersion"].as_str().unwrap();
+        let operation_id = "40000000-0000-4000-8000-000000000002";
         let decision = serde_json::json!({
+            "operationId": operation_id,
             "id": id,
             "action": "edit",
             "text": "Alle independent truth",
+            "reviewer": "Alle",
             "rowVersion": row_version,
             "heardMs": 1_500,
             "clipDurationMs": 1_500,
@@ -6623,6 +7398,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(independent, ("Alle".into(), "Alle independent truth".into()));
+
+        let independent_count = || -> i64 {
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM independent_review_decisions WHERE operation_id=?1",
+                    [operation_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(independent_count(), 1);
+
+        // The second-pass receipt obeys the same restart/retype law as the paid canonical receipt.
+        // Rebuild the session with the current lower-case roster spelling and replay the phone's
+        // original outbox body, whose claimed reviewer spelling correctly remains `Alle`.
+        let restarted_state = Mutex::new(CouchState {
+            pairing_codes: HashMap::from([("pair-alle".into(), "alle".into())]),
+            session_store: Some((tmp.path().to_path_buf(), db.path().to_string())),
+            campaign_policy: Some(campaign.clone()),
+            ..CouchState::default()
+        });
+        let (code, _, replay_body, ..) = api_decision(&db, decision.to_string().as_bytes(), "alle", &restarted_state);
+        assert_eq!(code, 200, "case-only independent replay must ACK");
+        let replay: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(independent_count(), 1, "independent replay must not append another decision");
+
+        let mut changed_action = decision.clone();
+        changed_action["action"] = serde_json::json!("accept");
+        let mut changed_text = decision.clone();
+        changed_text["text"] = serde_json::json!("different independent truth");
+        for (label, payload) in [("action", changed_action), ("text", changed_text)] {
+            let (code, ..) = api_decision(&db, payload.to_string().as_bytes(), "alle", &restarted_state);
+            assert_eq!(code, 409, "changed independent {label} must conflict");
+            assert_eq!(independent_count(), 1);
+        }
+        let mut changed_reviewer = decision.clone();
+        changed_reviewer["reviewer"] = serde_json::json!("Hemn");
+        let changed_reviewer: DecisionBody = serde_json::from_value(changed_reviewer).unwrap();
+        let (code, ..) = api_independent_decision(
+            &db,
+            &changed_reviewer,
+            "Hemn",
+            &couch_session_binding_sha256("couch-test-session"),
+            &restarted_state,
+            &campaign,
+        );
+        assert_eq!(code, 409, "a different reviewer must not inherit the independent receipt");
+        assert_eq!(independent_count(), 1);
 
         let (code, _, body, ..) = api_undo(&db, "Alle", &state);
         assert_eq!(code, 200, "second-pass undo failed: {}", String::from_utf8_lossy(&body));
@@ -6956,8 +7780,8 @@ mod tests {
             .expect("a phone decision must leave a listening receipt");
 
         assert_eq!(segment_id, "pr1");
-        assert_eq!(played, 8_800, "the page's reported media time is recorded verbatim");
-        assert!(coverage > 0.97, "8.8s of a 9s clip is a full listen, got {coverage}");
+        assert_eq!(played, 1_500, "policy-4 records the bounded normalized interval union");
+        assert_eq!(coverage, 1.0, "the renderer traversed the complete server-sized fixture clip");
         assert_eq!(content_hash.len(), 64, "the receipt must name canonical decoded PCM");
         assert!(revision >= 0, "the revision is resolved server-side, not supplied");
 
@@ -6994,17 +7818,11 @@ mod tests {
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 428, "a tenth of a second cannot buy a verdict by relabelling the clip");
 
-        let (total, coverage): (i64, f64) = db
+        let receipt_count: i64 = db
             .connection()
-            .query_row(
-                "SELECT clip_duration_ms, coverage_ratio FROM playback_receipts WHERE segment_id = 'pr3'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .expect("the receipt is still minted — it just tells the truth about how little was heard");
-
-        assert_eq!(total, 1_500, "the receipt records the SERVER's clip length, not the claimed one");
-        assert!(coverage < 0.10, "100ms of a 1.5s clip is not a listen, got {coverage}");
+            .query_row("SELECT COUNT(*) FROM playback_receipts WHERE segment_id = 'pr3'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(receipt_count, 0, "insufficient traversal must never be finalized into reusable evidence");
 
         let revision = db.segment_review_revision("pr3").unwrap().unwrap_or(0);
         let content_hash = db.segment_audio_content_hash("pr3").unwrap().unwrap_or_default();
@@ -7021,14 +7839,16 @@ mod tests {
         db.insert_segment(&seg("negative-playback", "دەق")).unwrap();
         let state = state();
         let body = serde_json::json!({
+            "operationId": uuid::Uuid::new_v4().to_string(),
             "id": "negative-playback",
             "action": "accept",
             "text": "دەق",
             "heardMs": -1,
             "clipDurationMs": 1_500,
+            "rowVersion": db.segment_row_stamp("negative-playback").unwrap().unwrap(),
         });
 
-        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let (code, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 400, "negative media time is invalid evidence, not zero media time");
         let count: i64 = db
             .connection()
@@ -7101,6 +7921,334 @@ mod tests {
 
         let row = db.get_segment_by_id("enf2").unwrap().unwrap();
         assert!(!row.verified, "a skip still writes no verdict");
+    }
+
+    #[test]
+    fn policy4_phone_playback_authority_fails_closed_and_is_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, _) = test_db(tmp.path());
+        for id in ["p4-main", "p4-other", "p4-stale", "p4-restart", "p4-skip"] {
+            policy4_segment(&db, id, 100);
+        }
+        let state = state();
+        let reviewer = "Sara";
+        let binding = couch_session_binding_sha256("policy4-session-a");
+        let other_binding = couch_session_binding_sha256("policy4-session-b");
+        let revision = db.segment_review_revision("p4-main").unwrap().unwrap();
+        let operation = "31000000-0000-4000-8000-000000000001";
+        let base = serde_json::json!({
+            "operationId": operation,
+            "id": "p4-main",
+            "action": "accept",
+            "text": "دەقی تاقیکردنەوە",
+            "reviewer": reviewer,
+            "rowVersion": revision.to_string(),
+        });
+
+        // Absence, a fabricated legacy scalar, and a random receipt all fail through the real
+        // production endpoint without creating a receipt, verdict, pay/effect row, or consumption.
+        assign_policy4_work(&state, "p4-main", reviewer);
+        let missing = super::api_decision_authenticated(&db, base.to_string().as_bytes(), reviewer, &binding, &state);
+        assert_eq!(missing.0, 428, "a new verdict without authority must fail closed");
+        let mut scalar = base.clone();
+        scalar["operationId"] = serde_json::json!("31000000-0000-4000-8000-000000000002");
+        scalar["heardMs"] = serde_json::json!(100);
+        scalar["clipDurationMs"] = serde_json::json!(100);
+        assign_policy4_work(&state, "p4-main", reviewer);
+        assert_eq!(
+            super::api_decision_authenticated(&db, scalar.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            428,
+            "client counters are not playback authority"
+        );
+        let mut forged = base.clone();
+        forged["operationId"] = serde_json::json!("31000000-0000-4000-8000-000000000003");
+        forged["playbackReceiptId"] = serde_json::json!("31000000-0000-4000-8000-000000000099");
+        assign_policy4_work(&state, "p4-main", reviewer);
+        assert_eq!(
+            super::api_decision_authenticated(&db, forged.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            428,
+            "an unissued receipt must not authorize a verdict"
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM playback_receipts WHERE policy_version=4", [], |row| row
+                    .get(0),)
+                .unwrap(),
+            0
+        );
+
+        // Start is exact-retry safe, but finalization is impossible until this exact attempt's
+        // authenticated media GET completes. Session, reviewer and segment substitutions fail.
+        assign_policy4_work(&state, "p4-main", reviewer);
+        let attempt =
+            start_policy4_attempt(&db, &state, "p4-main", reviewer, &binding, "32000000-0000-4000-8000-000000000001");
+        let receipt = attempt["playbackReceiptId"].as_str().unwrap();
+        let exact_start_retry =
+            start_policy4_attempt(&db, &state, "p4-main", reviewer, &binding, "32000000-0000-4000-8000-000000000001");
+        assert_eq!(exact_start_retry["playbackReceiptId"], receipt);
+        assert_eq!(exact_start_retry["duplicate"], true, "an exact start retry reuses one server authority");
+        assign_policy4_work(&state, "p4-other", reviewer);
+        let rebound_start = serde_json::json!({
+            "id": "p4-other",
+            "rowVersion": db.segment_review_revision("p4-other").unwrap().unwrap().to_string(),
+            "clientAttemptId": "32000000-0000-4000-8000-000000000001",
+        });
+        assert_eq!(
+            super::api_playback_start(&db, rebound_start.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            409,
+            "one client attempt UUID cannot be rebound to another clip"
+        );
+        let finalize = |intervals: serde_json::Value, state: &Mutex<CouchState>| {
+            let body = serde_json::json!({
+                "playbackReceiptId": receipt,
+                "clientAttemptId": "32000000-0000-4000-8000-000000000001",
+                "intervals": intervals,
+            });
+            super::api_playback_finalize(&db, body.to_string().as_bytes(), reviewer, &binding, state)
+        };
+        assert_eq!(finalize(serde_json::json!([{"startMs":0,"endMs":90}]), &state).0, 428);
+        assert_eq!(
+            super::api_audio_authenticated(
+                &db,
+                "p4-main",
+                reviewer,
+                &other_binding,
+                &state,
+                Some(receipt),
+                false,
+                None,
+                None,
+            )
+            .0,
+            403,
+            "an attempt cannot cross cookie sessions"
+        );
+        assign_policy4_work(&state, "p4-other", reviewer);
+        assert_eq!(
+            super::api_audio_authenticated(
+                &db,
+                "p4-other",
+                reviewer,
+                &binding,
+                &state,
+                Some(receipt),
+                false,
+                None,
+                None,
+            )
+            .0,
+            403,
+            "an attempt cannot cross segments"
+        );
+        assert_eq!(
+            super::api_audio_authenticated(&db, "p4-main", "Hemn", &binding, &state, Some(receipt), false, None, None,)
+                .0,
+            403,
+            "an attempt cannot cross reviewers"
+        );
+        assert_eq!(
+            super::api_audio_authenticated(
+                &db,
+                "p4-main",
+                reviewer,
+                &binding,
+                &state,
+                Some(receipt),
+                false,
+                None,
+                None,
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            finalize(serde_json::json!([{"startMs":0,"endMs":100}]), &state).0,
+            428,
+            "full-duration inflation immediately after media delivery is implausible"
+        );
+        assert_eq!(
+            finalize(serde_json::json!([{"startMs":0,"endMs":60},{"startMs":50,"endMs":90}]), &state,).0,
+            400,
+            "overlapping client intervals are not canonical"
+        );
+        std::thread::sleep(Duration::from_millis(55));
+        let finalized = finalize(serde_json::json!([{"startMs":0,"endMs":90}]), &state);
+        assert_eq!(finalized.0, 200, "valid traversal failed: {}", String::from_utf8_lossy(&finalized.2));
+        let exact_replay = finalize(serde_json::json!([{"startMs":0,"endMs":90}]), &state);
+        assert_eq!(exact_replay.0, 200, "exact finalization retry must ACK");
+        assert_eq!(
+            finalize(serde_json::json!([{"startMs":0,"endMs":91}]), &state).0,
+            409,
+            "a finalized receipt cannot be rebound to different intervals"
+        );
+
+        // The finalized authority is still exact: wrong-session and wrong-segment decisions fail,
+        // then one correct operation consumes it atomically with the human effect. Its exact retry
+        // ACKs; a new operation cannot turn the same traversal into a second decision/payment.
+        let mut wrong_session = base.clone();
+        wrong_session["operationId"] = serde_json::json!("33000000-0000-4000-8000-000000000001");
+        wrong_session["playbackReceiptId"] = serde_json::json!(receipt);
+        assign_policy4_work(&state, "p4-main", reviewer);
+        assert_eq!(
+            super::api_decision_authenticated(
+                &db,
+                wrong_session.to_string().as_bytes(),
+                reviewer,
+                &other_binding,
+                &state,
+            )
+            .0,
+            428
+        );
+        let other_revision = db.segment_review_revision("p4-other").unwrap().unwrap();
+        let wrong_segment = serde_json::json!({
+            "operationId": "33000000-0000-4000-8000-000000000002",
+            "id": "p4-other", "action": "accept", "text": "دەقی تاقیکردنەوە",
+            "reviewer": reviewer, "rowVersion": other_revision.to_string(),
+            "playbackReceiptId": receipt,
+        });
+        assign_policy4_work(&state, "p4-other", reviewer);
+        assert_eq!(
+            super::api_decision_authenticated(&db, wrong_segment.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            428
+        );
+        let mut valid = base.clone();
+        valid["playbackReceiptId"] = serde_json::json!(receipt);
+        assign_policy4_work(&state, "p4-main", reviewer);
+        let committed =
+            super::api_decision_authenticated(&db, valid.to_string().as_bytes(), reviewer, &binding, &state);
+        assert_eq!(committed.0, 200, "valid receipt-bound decision failed: {}", String::from_utf8_lossy(&committed.2));
+        assert_eq!(
+            super::api_decision_authenticated(&db, valid.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            200,
+            "the exact operation retry must ACK after the receipt is consumed"
+        );
+        let mut reuse = valid.clone();
+        reuse["operationId"] = serde_json::json!("33000000-0000-4000-8000-000000000003");
+        assert_ne!(
+            super::api_decision_authenticated(&db, reuse.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            200,
+            "one playback authority must never fund a second operation"
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM playback_authority_consumptions_v4", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='p4-main'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        // Revision drift and process-memory loss both strand an unfinalized attempt; neither can be
+        // upgraded into durable evidence after the exact server authority disappears or changes.
+        assign_policy4_work(&state, "p4-stale", reviewer);
+        let stale =
+            start_policy4_attempt(&db, &state, "p4-stale", reviewer, &binding, "34000000-0000-4000-8000-000000000001");
+        let stale_receipt = stale["playbackReceiptId"].as_str().unwrap();
+        assert_eq!(
+            super::api_audio_authenticated(
+                &db,
+                "p4-stale",
+                reviewer,
+                &binding,
+                &state,
+                Some(stale_receipt),
+                false,
+                None,
+                None,
+            )
+            .0,
+            200
+        );
+        db.connection()
+            .execute("UPDATE speech_segments SET review_revision=review_revision+1 WHERE id='p4-stale'", [])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(55));
+        let stale_body = serde_json::json!({
+            "playbackReceiptId": stale_receipt,
+            "clientAttemptId": "34000000-0000-4000-8000-000000000001",
+            "intervals": [{"startMs":0,"endMs":90}],
+        });
+        assert_eq!(
+            super::api_playback_finalize(&db, stale_body.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            409
+        );
+
+        assign_policy4_work(&state, "p4-restart", reviewer);
+        let restart = start_policy4_attempt(
+            &db,
+            &state,
+            "p4-restart",
+            reviewer,
+            &binding,
+            "35000000-0000-4000-8000-000000000001",
+        );
+        let restart_receipt = restart["playbackReceiptId"].as_str().unwrap();
+        assert_eq!(
+            super::api_audio_authenticated(
+                &db,
+                "p4-restart",
+                reviewer,
+                &binding,
+                &state,
+                Some(restart_receipt),
+                false,
+                None,
+                None,
+            )
+            .0,
+            200
+        );
+        let restarted_state = Mutex::new(CouchState::default());
+        assign_policy4_work(&restarted_state, "p4-restart", reviewer);
+        let restart_body = serde_json::json!({
+            "playbackReceiptId": restart_receipt,
+            "clientAttemptId": "35000000-0000-4000-8000-000000000001",
+            "intervals": [{"startMs":0,"endMs":90}],
+        });
+        assert_eq!(
+            super::api_playback_finalize(
+                &db,
+                restart_body.to_string().as_bytes(),
+                reviewer,
+                &binding,
+                &restarted_state,
+            )
+            .0,
+            409
+        );
+
+        let skip_revision = db.segment_review_revision("p4-skip").unwrap().unwrap();
+        let skip = serde_json::json!({
+            "operationId": "36000000-0000-4000-8000-000000000001",
+            "id": "p4-skip", "action": "skip", "text": "دەقی تاقیکردنەوە",
+            "reviewer": reviewer, "rowVersion": skip_revision.to_string(),
+        });
+        assign_policy4_work(&state, "p4-skip", reviewer);
+        assert_eq!(
+            super::api_decision_authenticated(&db, skip.to_string().as_bytes(), reviewer, &binding, &state,).0,
+            200,
+            "skip is explicitly no verdict and needs no playback authority"
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM playback_authority_consumptions_v4", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            1,
+            "skip consumes no playback authority"
+        );
     }
 
     #[test]
@@ -7188,17 +8336,25 @@ mod tests {
         let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 200, "the undo itself must succeed");
 
-        // Re-decided seconds later, WITHOUT replaying a clip that was just heard end to end.
-        let body = serde_json::json!({"id": "un1", "action": "edit", "text": "ڕاستکراوەی دوو"});
+        // A new decision consumes a new policy-4 authority even immediately after exact Undo. The
+        // test compatibility wrapper supplies that second, reviewer-bound traversal explicitly.
+        let body = serde_json::json!({
+            "id": "un1", "action": "edit", "text": "ڕاستکراوەی دوو",
+            "heardMs": 1_500, "clipDurationMs": 1_500,
+        });
         let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
-        assert_eq!(code, 200, "a re-decision after undo must not demand a second listen of the same audio");
+        assert_eq!(code, 200, "a re-decision after undo lands with a fresh exact playback authority");
 
         // But SOMEBODY ELSE still has to listen for themselves.
         let (code, ..) = api_undo(&db, "Sara", &state);
         assert_eq!(code, 200);
-        let body = serde_json::json!({"id": "un1", "action": "edit", "text": "دەقی کەسی تر"});
-        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Hemn", &state);
-        assert_eq!(code, 428, "carried-forward evidence is personal; another reviewer must still listen");
+        let body = serde_json::json!({
+            "operationId": uuid::Uuid::new_v4().to_string(),
+            "id": "un1", "action": "edit", "text": "دەقی کەسی تر",
+            "rowVersion": db.segment_row_stamp("un1").unwrap().unwrap(),
+        });
+        let (code, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Hemn", &state);
+        assert_eq!(code, 428, "another reviewer has no exact personal playback authority");
     }
 
     #[test]
@@ -7248,8 +8404,12 @@ mod tests {
         db.insert_segment(&seg("pr2", "دەقی دوو")).unwrap();
         let state = state();
 
-        let body = serde_json::json!({"id": "pr2", "action": "accept", "text": "دەقی دوو"});
-        let (code, ..) = api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
+        let body = serde_json::json!({
+            "operationId": uuid::Uuid::new_v4().to_string(),
+            "id": "pr2", "action": "accept", "text": "دەقی دوو",
+            "rowVersion": db.segment_row_stamp("pr2").unwrap().unwrap(),
+        });
+        let (code, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Sara", &state);
         assert_eq!(code, 428, "a verdict that reports no listening at all must be refused outright");
 
         let receipts: i64 = db
@@ -7476,12 +8636,12 @@ mod tests {
         // nothing written to the corpus. The clip stayed pending and was swallowed again every batch.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
         let mut gold = seg("g1", "دەقی خاو");
         gold.annotated_transcript = Some("دەقی ڕاست".into());
         gold.verified = true;
         db.insert_segment(&gold).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
         let state = state();
 
         // It was handed to Sara as a check while it was still verified.
@@ -7726,6 +8886,7 @@ mod tests {
         let (db, path) = test_db(tmp.path());
         db.insert_segment(&seg("s1", "دەق یەک")).unwrap();
         let state = state();
+        assert_eq!(queue_ids(&db, "Sara", &state), vec!["s1"], "the phone must hold the served clip");
 
         let blocker = rusqlite::Connection::open(&path).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").expect("take the write lock");
@@ -8113,7 +9274,7 @@ mod tests {
     }
 
     #[test]
-    fn a_durable_operation_uuid_replays_after_restart_without_duplicate_event_or_pay() {
+    fn a_durable_operation_uuid_replays_after_restart_and_reviewer_retype_without_duplicate_event_or_pay() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, _) = test_db(tmp.path());
         db.insert_segment(&seg("operation-replay", "دەقی خاو")).unwrap();
@@ -8129,7 +9290,7 @@ mod tests {
             "clipDurationMs": 1_500,
         });
         let first_state = state();
-        assert_eq!(super::api_decision(&db, body.to_string().as_bytes(), "Sara", &first_state).0, 200);
+        assert_eq!(api_decision(&db, body.to_string().as_bytes(), "Sara", &first_state).0, 200);
 
         let counts = || -> (i64, i64, i64) {
             db.connection()
@@ -8153,18 +9314,39 @@ mod tests {
         );
 
         // A fresh CouchState models the process/session restart that defeated the former in-memory
-        // identity. The original stale rowVersion is intentional: the immutable receipt must ACK
-        // before mutable row state, leases, or undo memory are consulted.
+        // identity. The roster was also retyped from `Sara` to `sara`; session restoration binds the
+        // old cookie to that current spelling. The original stale rowVersion is intentional: the
+        // immutable receipt must ACK before mutable row state, leases, or undo memory are consulted.
         let restarted_state = state();
-        let (code, _, response, ..) = super::api_decision(&db, body.to_string().as_bytes(), "Sara", &restarted_state);
+        let (code, _, response, ..) = super::api_decision(&db, body.to_string().as_bytes(), "sara", &restarted_state);
         assert_eq!(code, 200);
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["duplicate"], true);
         assert_eq!(counts(), (1, 1, 1), "a restart replay must be side-effect free");
         let guard = lock_state(&restarted_state);
-        let undo = guard.undo.get("Sara").expect("exact replay restores the original durable undo token");
+        let undo = guard.undo.get("sara").expect("exact replay restores the original durable undo token");
         assert_eq!(undo.len(), 1, "a replay is not a second undoable act");
         assert_eq!(undo[0].effect_event_id, db.human_decision_effect_for_operation(operation_id).unwrap().unwrap().0);
+        drop(guard);
+
+        // Case-only identity drift is the sole compatibility allowance. The receipt's original
+        // spelling rederives its v1 hash, while any semantic contract change remains a 409 and cannot
+        // append another event, payment, or learning effect.
+        let mut changed_action = body.clone();
+        changed_action["action"] = serde_json::json!("accept");
+        let mut changed_text = body.clone();
+        changed_text["text"] = serde_json::json!("دەقێکی تر");
+        let mut changed_reviewer = body.clone();
+        changed_reviewer["reviewer"] = serde_json::json!("Hemn");
+        for (label, payload, authenticated_reviewer) in
+            [("action", changed_action, "sara"), ("text", changed_text, "sara"), ("reviewer", changed_reviewer, "Hemn")]
+        {
+            let (code, _, message, ..) =
+                super::api_decision(&db, payload.to_string().as_bytes(), authenticated_reviewer, &restarted_state);
+            assert_eq!(code, 409, "changing {label} while reusing the UUID must conflict");
+            assert!(String::from_utf8_lossy(&message).contains("operation UUID"));
+            assert_eq!(counts(), (1, 1, 1), "rejected {label} reuse must be side-effect free");
+        }
     }
 
     #[test]
@@ -8248,7 +9430,7 @@ mod tests {
             "heardMs": 600_000,
         });
         let state = state();
-        assert_eq!(super::api_decision(&db, base.to_string().as_bytes(), "Sara", &state).0, 200);
+        assert_eq!(api_decision(&db, base.to_string().as_bytes(), "Sara", &state).0, 200);
 
         let count = || -> (i64, i64) {
             db.connection()
@@ -8422,8 +9604,8 @@ mod tests {
     /// `is_gold` matters: without it a peer's fresh correction would qualify as an answer key.
     fn gold_seg(db: &Database, id: &str, wrong_draft: &str, human_answer: &str) {
         assert_eq!(
-            crate::migrations::rollback(db, 7).unwrap(),
-            vec![66, 65, 64, 63, 62, 61, 60],
+            crate::migrations::rollback(db, 8).unwrap(),
+            vec![67, 66, 65, 64, 63, 62, 61, 60],
             "gold test authority must be created before the v60 legacy snapshot"
         );
         let mut s = seg(id, wrong_draft);
@@ -8433,7 +9615,7 @@ mod tests {
         s.verdict = Some("human_edit".into());
         s.verdict_transcript = Some(human_answer.into());
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
     }
 
     #[test]
@@ -9672,6 +10854,104 @@ mod tests {
     }
 
     #[test]
+    fn active_flexible_pool_refuses_start_before_any_external_or_durable_mutation() {
+        let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if is_running() {
+            stop().unwrap();
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, db_path) = test_db(tmp.path());
+        let champion_id = "omniasr-7b-pay-policy-start-test";
+        crate::registry::register_candidate(
+            &db,
+            &crate::registry::NewModelVersion {
+                id: champion_id.into(),
+                family: crate::deployment::OMNIASR_7B_FAMILY.into(),
+                model_card_name: Some("pay policy start refusal champion".into()),
+                checkpoint_sha256: "d".repeat(64),
+                checkpoint_path: "/test/pay-policy-start-champion.json".into(),
+                source: "cortex-finetuned".into(),
+                license: "owner-full-rights".into(),
+            },
+        )
+        .unwrap();
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [champion_id]).unwrap();
+        let mut segment = seg("pay-policy-start-segment", "champion draft");
+        segment.model_version_id = Some(champion_id.into());
+        db.insert_segment(&segment).unwrap();
+        crate::review_pool::activate(
+            &db,
+            "37000000-0000-4000-8000-000000000001",
+            &[crate::review_pool::PoolMemberInput { segment_id: segment.id.clone(), voice_name: "Lamo".into() }],
+        )
+        .unwrap();
+
+        let data_version_before: i64 = db.connection().query_row("PRAGMA data_version", [], |row| row.get(0)).unwrap();
+        let changes_before: i64 = db.connection().query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+        let pool_before: String = db
+            .connection()
+            .query_row("SELECT pool_id FROM review_pool_registry WHERE singleton_key=1", [], |row| row.get(0))
+            .unwrap();
+        let listener_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener_probe.local_addr().unwrap().port();
+        drop(listener_probe);
+        let writer_called = std::cell::Cell::new(false);
+        let revocation_called = std::cell::Cell::new(false);
+        let result = start_on_port_with_session_lifecycle(
+            db_path,
+            vec!["Sara".into()],
+            port,
+            Some(tmp.path().to_path_buf()),
+            |_| {
+                writer_called.set(true);
+                Ok(())
+            },
+            |_| {
+                revocation_called.set(true);
+                Ok(())
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("an active flexible pool must not expose external review"),
+            Err(error) => error,
+        };
+        assert!(error.contains(PAY_POLICY_REQUIRED), "stable policy code missing from: {error}");
+        assert!(!writer_called.get(), "session persistence is downstream of the pay-policy fence");
+        assert!(!revocation_called.get(), "revocation/session lifecycle is downstream of the pay-policy fence");
+        assert!(!is_running());
+        let published = status();
+        assert!(!published.running && published.reviewers.is_empty());
+        assert!(!session_path(tmp.path()).exists());
+        assert!(!tmp.path().join(TLS_IDENTITY_FILE).exists());
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "the refused start must never bind the requested socket"
+        );
+        assert_eq!(
+            db.connection().query_row::<i64, _, _>("SELECT total_changes()", [], |row| row.get(0)).unwrap(),
+            changes_before,
+            "preflight must not write through this handle"
+        );
+        assert_eq!(
+            db.connection().query_row::<i64, _, _>("PRAGMA data_version", [], |row| row.get(0)).unwrap(),
+            data_version_before,
+            "preflight must not commit through its separate database connection"
+        );
+        assert_eq!(
+            db.connection()
+                .query_row::<String, _, _>(
+                    "SELECT pool_id FROM review_pool_registry WHERE singleton_key=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            pool_before,
+            "the immutable active-pool contract must remain byte-exact"
+        );
+    }
+
+    #[test]
     fn a_retyped_reviewer_name_keeps_the_link_the_session_and_the_outstanding_check() {
         // `normalize_reviewers` trims but PRESERVES typed casing, and the review columns are
         // COLLATE NOCASE — so "rubar" and "Rubar" are one reviewer everywhere except in the three
@@ -10652,7 +11932,7 @@ mod tests {
         // insert_segment_full so the row returns to its pre-decision snapshot losslessly.
         let tmp = tempfile::tempdir().unwrap();
         let (db, _p) = test_db(tmp.path());
-        assert_eq!(crate::migrations::rollback(&db, 7).unwrap(), vec![66, 65, 64, 63, 62, 61, 60]);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
 
         // Persist the jury columns with insert_segment_full (insert_segment would drop them).
         let mut s = seg("esc1", "دەق یەک");
@@ -10661,7 +11941,7 @@ mod tests {
         s.verified = false;
         s.is_gold = false;
         db.insert_segment_full(&s).unwrap();
-        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66]);
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
 
         let state = state();
         let body = serde_json::json!({"heardMs": 600_000,  "id": "esc1", "action": "accept", "text": "دەق یەک" });
@@ -10826,6 +12106,7 @@ mod tests {
         let join = spawn_server_loop(0, server.clone(), db_path.clone(), state.clone(), shutdown.clone()).unwrap();
         let base = format!("http://127.0.0.1:{port}");
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+        let proof_db = Database::open(&db_path).unwrap();
         let fetch = || -> Vec<serde_json::Value> {
             let q: serde_json::Value = agent
                 .get(&format!("{base}/api/queue"))
@@ -10842,9 +12123,10 @@ mod tests {
         // Decide the first five, then "reload" — a bare re-fetch, which is exactly what load() does.
         for item in first.iter().take(5) {
             let id = item["id"].as_str().unwrap();
+            let playback_receipt_id = fixture_policy4_receipt(&proof_db, "Hawzhin", "tok", id, &item["rowVersion"]);
             let body = serde_json::json!({
                 "operationId": uuid::Uuid::new_v4().to_string(),
-                "heardMs": 600_000,
+                "playbackReceiptId": playback_receipt_id,
                 "id": id,
                 "action": "accept",
                 "text": "دەقی سەرەتایی",
@@ -10906,8 +12188,10 @@ mod tests {
         drop(db);
 
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+        let proof_db = Database::open(&db_path).unwrap();
         let mut decided: Vec<String> = Vec::new();
         let operation_ids = Mutex::new(HashMap::<String, String>::new());
+        let playback_receipts = Mutex::new(HashMap::<String, String>::new());
 
         // Boot a server, hand out ONE batch, and decide only part of it — the reviewer is mid-batch.
         let boot = |db_path: String| {
@@ -10928,9 +12212,16 @@ mod tests {
                 .entry(id.to_string())
                 .or_insert_with(|| uuid::Uuid::new_v4().to_string())
                 .clone();
+            let playback_receipt_id = {
+                let mut receipts = playback_receipts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                receipts
+                    .entry(id.to_string())
+                    .or_insert_with(|| fixture_policy4_receipt(&proof_db, "Hawzhin", "tok", id, row_version))
+                    .clone()
+            };
             let body = serde_json::json!({
                 "operationId": operation_id,
-                "heardMs": 600_000,
+                "playbackReceiptId": playback_receipt_id,
                 "id": id,
                 "action": "accept",
                 "text": "دەقی سەرەتایی",
@@ -11043,6 +12334,7 @@ mod tests {
 
         let base = format!("http://127.0.0.1:{port}");
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+        let proof_db = Database::open(&db_path).unwrap();
         let mut served: Vec<String> = Vec::new();
         let mut rounds = 0usize;
         let mut throttled = 0usize;
@@ -11070,9 +12362,11 @@ mod tests {
             }
             for item in items {
                 let id = item["id"].as_str().unwrap().to_string();
+                let playback_receipt_id =
+                    fixture_policy4_receipt(&proof_db, "Hawzhin", "tok-solo", &id, &item["rowVersion"]);
                 let body = serde_json::json!({
                     "operationId": uuid::Uuid::new_v4().to_string(),
-                    "heardMs": 600_000,
+                    "playbackReceiptId": playback_receipt_id,
                     "id": id,
                     "action": "accept",
                     "text": item["text"],
@@ -11171,10 +12465,12 @@ mod tests {
         // One client thread per reviewer, all working the queue at the same time.
         let clients: Vec<_> = people
             .iter()
-            .map(|(token, _)| {
-                let (token, base) = (token.to_string(), format!("http://127.0.0.1:{port}"));
+            .map(|(token, reviewer)| {
+                let (token, reviewer, base, db_path) =
+                    (token.to_string(), reviewer.to_string(), format!("http://127.0.0.1:{port}"), db_path.clone());
                 std::thread::spawn(move || {
                     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
+                    let proof_db = Database::open(&db_path).unwrap();
                     let (mut accepted, mut throttled) = (0usize, 0usize);
                     for _round in 0..4 {
                         let queue: serde_json::Value =
@@ -11187,10 +12483,13 @@ mod tests {
                             break;
                         }
                         for item in items {
+                            let id = item["id"].as_str().unwrap().to_string();
+                            let playback_receipt_id =
+                                fixture_policy4_receipt(&proof_db, &reviewer, &token, &id, &item["rowVersion"]);
                             let body = serde_json::json!({
                                 "operationId": uuid::Uuid::new_v4().to_string(),
-                                "heardMs": 600_000,
-                                "id": item["id"],
+                                "playbackReceiptId": playback_receipt_id,
+                                "id": id,
                                 "action": "edit",
                                 "text": format!("{} ✓", item["text"].as_str().unwrap_or("x")),
                                 "rowVersion": item["rowVersion"],
@@ -11375,13 +12674,55 @@ mod tests {
             .iter()
             .find(|item| item["id"] == mine)
             .expect("the selected queue item still carries its rowVersion");
+        let client_attempt_id = uuid::Uuid::new_v4().to_string();
+        let playback: serde_json::Value = agent
+            .post(&format!("{base}/api/playback/start"))
+            .set("Cookie", &cookie_for("saratoken123"))
+            .send_string(
+                &serde_json::json!({
+                    "id": mine,
+                    "rowVersion": mine_item["rowVersion"],
+                    "clientAttemptId": client_attempt_id,
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .into_json()
+            .unwrap();
+        let playback_receipt_id = playback["playbackReceiptId"].as_str().unwrap();
+        assert_eq!(
+            agent
+                .get(&format!("{base}/api/audio/{mine}?playbackAttemptId={playback_receipt_id}"))
+                .set("Cookie", &cookie_for("saratoken123"))
+                .call()
+                .unwrap()
+                .status(),
+            200
+        );
+        // The policy permits at most 2x server-monotonic elapsed media traversal. A complete 1.5s
+        // renderer interval therefore needs at least 750ms after authorized media delivery.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let finalized: serde_json::Value = agent
+            .post(&format!("{base}/api/playback/finalize"))
+            .set("Cookie", &cookie_for("saratoken123"))
+            .send_string(
+                &serde_json::json!({
+                    "playbackReceiptId": playback_receipt_id,
+                    "clientAttemptId": client_attempt_id,
+                    "intervals": [{"startMs": 0, "endMs": 1_500}],
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .into_json()
+            .unwrap();
         let resp = agent
             .post(&format!("{base}/api/decision"))
             .set("Cookie", &cookie_for("saratoken123"))
             .send_string(
                 &serde_json::json!({
                     "operationId": uuid::Uuid::new_v4().to_string(),
-                    "heardMs": 600_000,
+                    "playbackReceiptId": finalized["playbackReceiptId"],
                     "id": mine,
                     "action": "accept",
                     "text": "دەقی تاقیکردنەوە",
@@ -11560,6 +12901,7 @@ mod tests {
             304,
             "multi-value"
         );
+        std::fs::write(&s.audio_path, b"RIFF").unwrap();
         assert_eq!(
             api_audio(&db, "s1", "Sara", &state, None, Some("\"stale\"")).0,
             500,
@@ -11571,6 +12913,10 @@ mod tests {
     /// A real, decodable 16 kHz mono WAV on disk, so the audio route can be driven end to end.
     /// symphonia decodes this in-process — no ffmpeg, nothing environment-dependent.
     fn write_test_wav(path: &std::path::Path, samples: usize) {
+        write_test_wav_seeded(path, samples, &[]);
+    }
+
+    fn write_test_wav_seeded(path: &std::path::Path, samples: usize, salt: &[u8]) {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 16_000,
@@ -11581,7 +12927,8 @@ mod tests {
         for n in 0..samples {
             // A ramp rather than silence: a wrong byte offset shows up as a wrong VALUE, so the
             // range assertions below are checking real content and not just a length.
-            w.write_sample(((n % 1000) as i16).wrapping_mul(30)).unwrap();
+            let salt_sample = salt.get(n % salt.len().max(1)).copied().unwrap_or(128) as i16 - 128;
+            w.write_sample(((n % 1000) as i16).wrapping_mul(30).wrapping_add(salt_sample)).unwrap();
         }
         w.finalize().unwrap();
     }

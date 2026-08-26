@@ -8,7 +8,7 @@ Output rows are `<wav_path>\t<reference>\t<hypothesis>` — byte-compatible with
 normalization and bootstrap) scores every engine, and the fusion experiment can consume all engines
 through one reader. Two formats or two metrics is how a model comparison starts lying.
 
-WHY A SEPARATE SCRIPT. `scorecard_7b.py` computes the champion's published 7.03% and writes only
+WHY A SEPARATE SCRIPT. `scorecard_7b.py` writes the historical duplication-weighted champion archive and only
 per-clip DISTANCES (`omni7b_results.tsv`), never the text — correct for its job, useless for fusion,
 and it is pinned by `test_scorecard_cer_consistency.py`, so widening it to also emit text would edit
 a gated artefact for a reason unrelated to its gate. This reads the same warm socket with the same

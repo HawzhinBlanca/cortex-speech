@@ -9,6 +9,8 @@ def test_audio_player_playback_failures_are_visible() -> None:
     audio_player = (REPO_ROOT / "src/lib/AudioPlayer.svelte").read_text(encoding="utf-8")
     forbidden = [
         "audioEl.play().catch(() => {});",
+        "notifications.error(message, { detail: String(cause) });",
+        "notifications.error(message, { detail: formatUnknownError(cause) });",
     ]
     present = [pattern for pattern in forbidden if pattern in audio_player]
     if present:
@@ -22,7 +24,7 @@ def test_audio_player_playback_failures_are_visible() -> None:
         # just shown, it also blocks Accept/Reject on audio nobody could hear. The pin follows the
         # rename — the requirement is unchanged, every failure still lands in visible state.
         "audioError = message;",
-        "notifications.error(message, { detail: String(cause) });",
+        "notifications.error(message, { cause });",
         "attemptPlay($t('audio.playbackFailed'));",
         "attemptPlay($t('audio.loopFailed'));",
         "audioError = $t('audio.loadFailed');",

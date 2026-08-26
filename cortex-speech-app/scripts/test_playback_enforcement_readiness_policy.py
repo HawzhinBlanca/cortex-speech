@@ -71,7 +71,7 @@ def test_source_span_duration_tolerance_matches_the_rust_constant() -> None:
 def test_runtime_and_repair_tools_never_authorize_from_the_stored_ratio() -> None:
     rust = DB_RS.read_text(encoding="utf-8")
     start = rust.index("fn has_sufficient_playback_evidence_on(")
-    end = rust.index("\n/// Re-read the exact hidden-check answer", start)
+    end = rust.index("\n/// Re-derive one historical policy-4 authority", start)
     authorization = rust[start:end]
     assert "coverage_ratio" not in authorization
     assert "played_ms" in authorization and "clip_duration_ms" in authorization

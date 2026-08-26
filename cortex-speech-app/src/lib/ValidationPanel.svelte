@@ -7,7 +7,7 @@
   import { showValidationPanel } from './stores/uiStore';
   import { notifications } from './stores/notificationStore';
   import { selectedSegmentId } from './stores/segmentStore';
-  import { t } from './i18n';
+  import { isTranslationKey, t } from './i18n';
 
   let loading = $state(true);
   let summary = $state('');
@@ -52,7 +52,7 @@
       totalSegments = result.totalSegments ?? 0;
       passed = result.passed ?? 0;
     } catch (e) {
-      notifications.error($t('validation.failed'), { detail: String(e) });
+      notifications.error($t('validation.failed'), { cause: e });
       showValidationPanel.set(false);
     } finally {
       loading = false;
@@ -73,7 +73,7 @@
       const queue = await api.getActiveLearningQueue(clampedTarget, clampedConf, clampedLimit);
       activeQueue = queue;
     } catch (e) {
-      notifications.error($t('validation.failed'), { detail: String(e) });
+      notifications.error($t('validation.failed'), { cause: e });
     } finally {
       activeQueueLoading = false;
     }
@@ -86,7 +86,7 @@
       notifications.success($t('validation.signalAnomaly.success').replace('{n}', String(count)));
       await reloadSignalAnomalySegments();
     } catch (e) {
-      notifications.error($t('validation.failed'), { detail: String(e) });
+      notifications.error($t('validation.failed'), { cause: e });
     } finally {
       signalAnomalyRunning = false;
     }
@@ -97,7 +97,7 @@
       signalAnomalySegments = await api.getSignalAnomalySegments(100);
     } catch (e) {
       console.error('Failed to load signal-anomaly segments', e);
-      notifications.error($t('validation.failed'), { detail: String(e) });
+      notifications.error($t('validation.failed'), { cause: e });
     }
   }
 
@@ -120,8 +120,7 @@
 
   function categoryLabel(category: string): string {
     const key = `validation.category.${category}`;
-    const label = $t(key);
-    return label === key ? category : label;
+    return isTranslationKey(key) ? $t(key) : category;
   }
 
   onMount(() => {
@@ -156,9 +155,9 @@
           <p class="text-xs text-cortex-400 mt-0.5">{summary}</p>
         {/if}
       </div>
-      <button class="btn-secondary !text-xs !px-2 !py-1" onclick={close} aria-label={$t('close')}
-        >✕</button
-      >
+      <button class="btn-secondary !text-xs !px-2 !py-1" onclick={close}>
+        {$t('close')}
+      </button>
     </header>
 
     <!-- Navigation Tabs -->
@@ -306,15 +305,7 @@
           {/if}
 
           {#if errors.length === 0 && warnings.length === 0}
-            <div class="flex flex-col items-center py-8 text-emerald-400 space-y-2">
-              <svg class="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="1.5"
-                  d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
-                />
-              </svg>
+            <div class="flex flex-col items-center py-8 text-emerald-400 space-y-2" role="status">
               <p class="text-sm">{$t('validation.allClear')}</p>
             </div>
           {/if}

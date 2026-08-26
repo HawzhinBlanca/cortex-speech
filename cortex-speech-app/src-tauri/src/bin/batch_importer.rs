@@ -5,42 +5,241 @@ use cortex_speech_app_lib::models::ModelManager;
 use cortex_speech_app_lib::normalizer::SoraniNormalizer;
 use cortex_speech_app_lib::pipeline::ProcessingPipeline;
 use cortex_speech_app_lib::settings::{AppSettings, AsrModelSize, LlmMode};
-use cortex_speech_app_lib::{quality, review_pool};
+use cortex_speech_app_lib::{quality, rehydrate_dedup_index, review_pool, DedupReadiness};
+use serde::{Deserialize, Serialize};
+use std::ffi::{OsStr, OsString};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-fn isolated_import_data_dir(
-    explicit: Option<std::ffi::OsString>,
-    appdata: Option<std::ffi::OsString>,
-) -> Result<PathBuf, String> {
+const STAGING_SENTINEL_NAME: &str = ".cortex-import-staging.json";
+const STAGING_PURPOSE: &str = "cortex-batch-import-staging-profile";
+const STAGING_TOKEN_ENV: &str = "CORTEX_IMPORT_STAGING_TOKEN";
+const SQLITE_DB_NAME: &str = "cortex-speech.db";
+const SQLITE_HEADER_LEN: usize = 72;
+const SENTINEL_MAX_BYTES: u64 = 8 * 1024;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportStagingSentinel {
+    schema: u32,
+    purpose: String,
+    profile_token: String,
+    sqlite_application_id: u32,
+    canonical_profile: String,
+    created_at_utc: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MintedImportStagingProfile {
+    data_dir: String,
+    profile_token: String,
+    sqlite_application_id: u32,
+    token_environment_variable: &'static str,
+}
+
+fn valid_staging_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn staging_application_id(token: &str) -> Result<u32, String> {
+    if !valid_staging_token(token) {
+        return Err(format!("{STAGING_TOKEN_ENV} is missing or malformed"));
+    }
+    let prefix = u32::from_str_radix(&token[..8], 16)
+        .map_err(|error| format!("cannot derive the staging SQLite identity: {error}"))?;
+    Ok((prefix & 0x7fff_ffff).max(1))
+}
+
+/// Read SQLite's application_id directly from the immutable main-file header. Opening an unknown
+/// database through SQLite, even read-only, may create or update SHM state; a raw header read makes
+/// every containment refusal happen before any database/WAL mutation is possible.
+fn sqlite_application_id_from_header(db_path: &Path) -> Result<u32, String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(db_path)
+        .map_err(|error| format!("cannot read the import-staging SQLite identity: {error}"))?;
+    let mut header = [0u8; SQLITE_HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("the import-staging SQLite header is missing or truncated: {error}"))?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err("the import-staging database is not a SQLite 3 file".to_string());
+    }
+    Ok(u32::from_be_bytes([header[68], header[69], header[70], header[71]]))
+}
+
+fn read_staging_sentinel(profile: &Path) -> Result<ImportStagingSentinel, String> {
+    let path = profile.join(STAGING_SENTINEL_NAME);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "CORTEX_APP_DATA_DIR is not a batch-importer-minted staging profile; live review imports are forbidden ({error})"
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("the import-staging sentinel must be a regular, non-link file".to_string());
+    }
+    if metadata.len() == 0 || metadata.len() > SENTINEL_MAX_BYTES {
+        return Err("the import-staging sentinel has an invalid size".to_string());
+    }
+    let canonical =
+        std::fs::canonicalize(&path).map_err(|error| format!("cannot resolve the import-staging sentinel: {error}"))?;
+    if canonical.parent() != Some(profile) {
+        return Err("the import-staging sentinel resolves outside its profile".to_string());
+    }
+    let bytes =
+        std::fs::read(&canonical).map_err(|error| format!("cannot read the import-staging sentinel: {error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("invalid import-staging sentinel: {error}"))
+}
+
+fn isolated_import_data_dir(explicit: Option<OsString>, supplied_token: Option<OsString>) -> Result<PathBuf, String> {
     let explicit = explicit.filter(|value| !value.is_empty()).ok_or_else(|| {
-        "CORTEX_APP_DATA_DIR is required and must point to an existing isolated staging profile; live review imports are forbidden"
+        "CORTEX_APP_DATA_DIR is required and must point to a batch-importer-minted staging profile; live review imports are forbidden"
             .to_string()
     })?;
-    let selected = std::fs::canonicalize(PathBuf::from(explicit)).map_err(|error| {
-        format!("CORTEX_APP_DATA_DIR must point to an existing isolated staging directory: {error}")
-    })?;
+    let explicit_path = PathBuf::from(explicit);
+    let explicit_metadata = std::fs::symlink_metadata(&explicit_path)
+        .map_err(|error| format!("CORTEX_APP_DATA_DIR must point to an existing minted staging directory: {error}"))?;
+    if explicit_metadata.file_type().is_symlink() {
+        return Err("CORTEX_APP_DATA_DIR must not be a symlink, junction, or path alias".to_string());
+    }
+    let selected = std::fs::canonicalize(&explicit_path)
+        .map_err(|error| format!("CORTEX_APP_DATA_DIR must resolve to a minted staging directory: {error}"))?;
     if !selected.is_dir() {
-        return Err("CORTEX_APP_DATA_DIR must point to an existing isolated staging directory".to_string());
+        return Err("CORTEX_APP_DATA_DIR must point to an existing minted staging directory".to_string());
     }
 
-    // The importer is an offline staging tool. It must never infer or overlap the mutable profile
-    // served to reviewers, even if the GUI is currently closed. Canonical paths close case, `..`,
-    // symlink, and junction aliases; rejecting ancestor overlap also keeps staging databases out of
-    // the live snapshot tree and keeps the live profile out of a staging tree.
-    let appdata = appdata
+    let token = supplied_token
+        .and_then(|value| value.into_string().ok())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "APPDATA is required to identify and protect the live review profile".to_string())?;
-    let live = std::fs::canonicalize(PathBuf::from(appdata).join("cortex-speech"))
-        .map_err(|error| format!("cannot resolve the live review profile for import isolation: {error}"))?;
-    if selected == live || selected.starts_with(&live) || live.starts_with(&selected) {
-        return Err(format!(
-            "live review imports are forbidden: CORTEX_APP_DATA_DIR must be separate from {}",
-            live.display()
-        ));
+        .ok_or_else(|| format!("{STAGING_TOKEN_ENV} is required for a minted import staging profile"))?;
+    let expected_application_id = staging_application_id(&token)?;
+    let sentinel = read_staging_sentinel(&selected)?;
+    if sentinel.schema != 1 || sentinel.purpose != STAGING_PURPOSE {
+        return Err("the import-staging sentinel schema or purpose is not supported".to_string());
+    }
+    if sentinel.profile_token != token {
+        return Err("the import-staging sentinel token does not match this importer run".to_string());
+    }
+    if sentinel.sqlite_application_id != expected_application_id {
+        return Err("the import-staging sentinel SQLite identity does not match its token".to_string());
+    }
+    if sentinel.canonical_profile != selected.to_string_lossy() {
+        return Err("the import-staging sentinel is bound to a different canonical profile".to_string());
+    }
+    if sentinel.created_at_utc.trim().is_empty() {
+        return Err("the import-staging sentinel has no creation timestamp".to_string());
+    }
+
+    let db_path = selected.join(SQLITE_DB_NAME);
+    let db_metadata = std::fs::symlink_metadata(&db_path)
+        .map_err(|error| format!("the minted import-staging database is missing: {error}"))?;
+    if db_metadata.file_type().is_symlink() || !db_metadata.is_file() {
+        return Err("the import-staging database must be a regular, non-link file".to_string());
+    }
+    let canonical_db = std::fs::canonicalize(&db_path)
+        .map_err(|error| format!("cannot resolve the minted import-staging database: {error}"))?;
+    if canonical_db.parent() != Some(selected.as_path()) {
+        return Err("the import-staging database resolves outside its profile".to_string());
+    }
+    if sqlite_application_id_from_header(&canonical_db)? != expected_application_id {
+        return Err("the SQLite database identity does not match the minted import-staging contract".to_string());
     }
     Ok(selected)
+}
+
+/// Minting is deliberately create-new only. It can never attach a staging marker to an existing
+/// profile, so a relocated production database cannot be made eligible by a typo or convenience
+/// flag. A partially minted directory has no valid sentinel and remains ineligible.
+fn mint_import_staging_profile(target: &Path) -> Result<MintedImportStagingProfile, String> {
+    let leaf = target
+        .file_name()
+        .ok_or_else(|| "--init-staging-profile requires a new child directory".to_string())?
+        .to_owned();
+    if std::fs::symlink_metadata(target).is_ok() {
+        return Err("refusing to attach an import-staging identity to an existing path".to_string());
+    }
+    let parent =
+        target.parent().ok_or_else(|| "--init-staging-profile requires a path with an existing parent".to_string())?;
+    let parent =
+        std::fs::canonicalize(parent).map_err(|error| format!("cannot resolve the staging profile parent: {error}"))?;
+    if !parent.is_dir() {
+        return Err("the staging profile parent is not a directory".to_string());
+    }
+    let target = parent.join(leaf);
+    std::fs::create_dir(&target).map_err(|error| format!("cannot create the new staging profile: {error}"))?;
+    let profile =
+        std::fs::canonicalize(&target).map_err(|error| format!("cannot resolve the new staging profile: {error}"))?;
+    if profile.parent() != Some(parent.as_path()) {
+        return Err("the new staging profile escaped its canonical parent".to_string());
+    }
+
+    let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let application_id = staging_application_id(&token)?;
+    let db_path = profile.join(SQLITE_DB_NAME);
+    let db_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&db_path)
+        .map_err(|error| format!("cannot create the staging SQLite database: {error}"))?;
+    db_file.sync_all().map_err(|error| format!("cannot fsync the new staging SQLite file: {error}"))?;
+    drop(db_file);
+
+    {
+        let connection = rusqlite::Connection::open(&db_path)
+            .map_err(|error| format!("cannot initialize the staging SQLite identity: {error}"))?;
+        connection
+            .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")
+            .map_err(|error| format!("cannot initialize staging SQLite durability: {error}"))?;
+        connection
+            .pragma_update(None, "application_id", application_id)
+            .map_err(|error| format!("cannot write the staging SQLite identity: {error}"))?;
+        let observed: u32 = connection
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .map_err(|error| format!("cannot verify the staging SQLite identity: {error}"))?;
+        if observed != application_id {
+            return Err("the staging SQLite identity did not persist".to_string());
+        }
+    }
+    OpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("cannot fsync the initialized staging SQLite database: {error}"))?;
+
+    let sentinel = ImportStagingSentinel {
+        schema: 1,
+        purpose: STAGING_PURPOSE.to_string(),
+        profile_token: token.clone(),
+        sqlite_application_id: application_id,
+        canonical_profile: profile.to_string_lossy().to_string(),
+        created_at_utc: chrono::Utc::now().to_rfc3339(),
+    };
+    let mut sentinel_bytes = serde_json::to_vec(&sentinel)
+        .map_err(|error| format!("cannot serialize the import-staging sentinel: {error}"))?;
+    sentinel_bytes.push(b'\n');
+    let sentinel_path = profile.join(STAGING_SENTINEL_NAME);
+    let mut sentinel_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&sentinel_path)
+        .map_err(|error| format!("cannot create the import-staging sentinel: {error}"))?;
+    sentinel_file
+        .write_all(&sentinel_bytes)
+        .and_then(|_| sentinel_file.flush())
+        .and_then(|_| sentinel_file.sync_all())
+        .map_err(|error| format!("cannot durably publish the import-staging sentinel: {error}"))?;
+
+    // Self-validate the fully published contract before telling the caller it can be used.
+    isolated_import_data_dir(Some(profile.as_os_str().to_owned()), Some(OsString::from(&token)))?;
+    Ok(MintedImportStagingProfile {
+        data_dir: profile.to_string_lossy().to_string(),
+        profile_token: token,
+        sqlite_application_id: application_id,
+        token_environment_variable: STAGING_TOKEN_ENV,
+    })
 }
 
 fn collect_prepared_wavs(directory: &Path) -> Result<Vec<PathBuf>, String> {
@@ -84,6 +283,121 @@ fn is_exact_champion_segment(segment: &cortex_speech_app_lib::db::SpeechSegment,
         && !quality::is_placeholder_transcript(&segment.raw_transcript)
 }
 
+fn prepared_path_alias_key(path: &str) -> String {
+    path.replace('/', "\\").to_lowercase()
+}
+
+fn prepared_stored_paths_by_alias(
+    stored_paths: impl IntoIterator<Item = String>,
+    target_dir: &str,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut by_alias = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for stored in stored_paths {
+        if let Some(walked) = rebase_onto_import_dir(&stored, target_dir) {
+            by_alias.entry(prepared_path_alias_key(&walked)).or_default().push(stored);
+        }
+    }
+    for candidates in by_alias.values_mut() {
+        candidates.sort();
+        candidates.dedup();
+    }
+    by_alias
+}
+
+fn segment_has_human_owned_fields(segment: &cortex_speech_app_lib::db::SpeechSegment) -> bool {
+    segment.verified
+        || segment.is_gold
+        || segment.human_decision.is_some()
+        || segment.reviewed_by.is_some()
+        || segment.corrected_at.is_some()
+        || segment.annotated_transcript.is_some()
+        || segment.escalated
+        || segment.verdict.as_deref().is_some_and(|verdict| {
+            verdict.starts_with("human_")
+                || matches!(verdict, "escalated" | "auto_accept" | "jury_accept" | "jury_edit")
+        })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PreparedExistingAction {
+    Fresh,
+    Reuse(Vec<String>),
+    Replace(Vec<String>),
+}
+
+/// Decide whether prepared rows are reusable only after binding them to the bytes decoded now.
+/// The stored transcript/model is not authority for a file that has been replaced in place.
+fn inspect_prepared_existing_file(
+    db: &Database,
+    file: &Path,
+    stored_paths: &[String],
+    champion_model_id: &str,
+) -> Result<PreparedExistingAction, String> {
+    if stored_paths.len() > 1 {
+        return Err(format!(
+            "PREPARED_PATH_AMBIGUITY: {} maps to multiple stored case/separator aliases {:?}; refusing a nondeterministic survivor",
+            file.display(), stored_paths
+        ));
+    }
+    let Some(stored_path) = stored_paths.first() else {
+        return Ok(PreparedExistingAction::Fresh);
+    };
+    let existing_ids = db
+        .segment_ids_for_audio_path(stored_path)
+        .map_err(|error| format!("cannot inspect existing rows for {}: {error}", file.display()))?;
+    if existing_ids.is_empty() {
+        return Err(format!(
+            "PREPARED_INVENTORY_CHANGED: stored source '{}' disappeared while admitting {}",
+            stored_path,
+            file.display()
+        ));
+    }
+    let existing = db
+        .get_segments_by_ids(&existing_ids)
+        .map_err(|error| format!("cannot read existing rows for {}: {error}", file.display()))?;
+    if existing.len() != existing_ids.len() {
+        return Err(format!(
+            "PREPARED_INVENTORY_CHANGED: read only {}/{} rows for {}; refusing partial authority",
+            existing.len(),
+            existing_ids.len(),
+            file.display()
+        ));
+    }
+
+    let (sample_rate, pcm) = cortex_speech_app_lib::audio::decode_to_pcm(file).map_err(|error| {
+        format!("cannot decode current prepared WAV {} for identity proof: {error}", file.display())
+    })?;
+    let current_content = AudioFingerprint::content_hash(&pcm, sample_rate);
+    let mut mismatched = Vec::new();
+    for segment_id in &existing_ids {
+        let stored_content = db
+            .segment_audio_content_hash(segment_id)
+            .map_err(|error| format!("cannot read source identity for segment {segment_id}: {error}"))?;
+        if stored_content.as_deref() != Some(current_content.as_str()) {
+            mismatched.push((segment_id.clone(), stored_content));
+        }
+    }
+    if !mismatched.is_empty() {
+        let ownership =
+            if existing.iter().any(segment_has_human_owned_fields) { " human-owned rows are present;" } else { "" };
+        return Err(format!(
+            "SOURCE_IDENTITY_DRIFT: {} no longer decodes to the identity stored for {:?};{ownership} refusing same-path replacement or stale transcript reuse",
+            file.display(), mismatched
+        ));
+    }
+
+    if existing.iter().all(|segment| is_exact_champion_segment(segment, champion_model_id)) {
+        return Ok(PreparedExistingAction::Reuse(existing_ids));
+    }
+    if existing.iter().any(segment_has_human_owned_fields) {
+        return Err(format!(
+            "HUMAN_SOURCE_AUTHORITY: {} has human-owned rows bound to the current audio; prepared import will not replace them",
+            file.display()
+        ));
+    }
+    Ok(PreparedExistingAction::Replace(existing_ids))
+}
+
 /// Re-base one library path onto the directory text THIS run walks; `None` when it is not a file
 /// under that directory.
 ///
@@ -125,25 +439,18 @@ fn rebase_onto_import_dir(stored: &str, target_dir: &str) -> Option<String> {
 /// owner's primary import lane — had NO cross-run duplicate detection at all: a recording already in
 /// the library, offered again under another name, was admitted silently.
 ///
-/// Best-effort like the desktop's: a failed read costs this run cross-run dedup and says so loudly
-/// rather than blocking the import. Rows predating v51 have no content hash and can never reject an
-/// import, so their count is reported separately instead of implied by silence.
-fn rehydrate_dedup_from_library(db: &Database, fingerprint: &AudioFingerprint) -> usize {
-    match db.load_audio_identities() {
-        Ok(known) => {
-            let unhashed = known.iter().filter(|row| row.content.is_none()).count();
-            let rehydrated = fingerprint.rehydrate(known);
+/// This import-only process has nothing useful to do in a degraded mode: a read fault or incomplete
+/// durable identity hard-stops before pipeline construction, decode, journal creation, or publication.
+fn rehydrate_dedup_from_library(db: &Database, fingerprint: &AudioFingerprint) -> Result<usize, String> {
+    match rehydrate_dedup_index(db, fingerprint) {
+        DedupReadiness::Ready { rehydrated_recordings } => {
+            let rehydrated = rehydrated_recordings;
             println!("Audio dedup: rehydrated {rehydrated} recording identity/identities from the library.");
-            if unhashed > 0 {
-                println!(
-                    "Audio dedup: {unhashed} recording(s) have no content hash and can never reject an import — run `backfill_fingerprints --apply`."
-                );
-            }
-            rehydrated
+            Ok(rehydrated)
         }
-        Err(error) => {
-            println!("Audio dedup: could not rehydrate identities ({error}) — within-run dedup only.");
-            0
+        DedupReadiness::Unavailable(reason) => {
+            eprintln!("Audio dedup is not authoritative ({reason:?}).");
+            Err(cortex_speech_app_lib::DEDUP_INDEX_UNAVAILABLE_MESSAGE.to_string())
         }
     }
 }
@@ -170,15 +477,11 @@ fn import_prepared_voice_parallel(
     // The library may hold this directory under a different case or separator than the one typed on
     // this run's command line, and `segment_ids_for_audio_path` matches EXACTLY. Without this map the
     // re-run finds nothing for every file and imports the whole directory a second time.
-    let mut stored_by_walked: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for stored in db
-        .audio_paths_with_segments_under(&target_text)
-        .map_err(|error| format!("cannot read what is already imported from {}: {error}", target_dir.display()))?
-    {
-        if let Some(walked) = rebase_onto_import_dir(&stored, &target_text) {
-            stored_by_walked.insert(walked, stored);
-        }
-    }
+    let stored_by_walked = prepared_stored_paths_by_alias(
+        db.audio_paths_with_segments_under(&target_text)
+            .map_err(|error| format!("cannot read what is already imported from {}: {error}", target_dir.display()))?,
+        &target_text,
+    );
 
     // ONE number for two readers. The process-wide champion gate re-reads CORTEX_7B_CONCURRENCY on
     // every acquire and defaults to a SINGLE permit, so with the variable unset the second prepared
@@ -199,36 +502,26 @@ fn import_prepared_voice_parallel(
     let mut pending = Vec::new();
     for file in files {
         let path_text = file.to_string_lossy().to_string();
-        let stored_path = stored_by_walked.get(&path_text).unwrap_or(&path_text);
-        let existing_ids = db
-            .segment_ids_for_audio_path(stored_path)
-            .map_err(|error| format!("cannot inspect existing rows for {}: {error}", file.display()))?;
-        if existing_ids.is_empty() {
-            pending.push(file);
-            continue;
+        let alias_key = prepared_path_alias_key(&path_text);
+        let candidates = stored_by_walked.get(&alias_key).map(Vec::as_slice).unwrap_or(&[]);
+        match inspect_prepared_existing_file(db, &file, candidates, &champion_model_id)? {
+            PreparedExistingAction::Fresh => pending.push(file),
+            PreparedExistingAction::Reuse(_) => {
+                db.mark_import_file_done(&job_id, &path_text)
+                    .map_err(|error| format!("cannot journal existing file {}: {error}", file.display()))?;
+                succeeded += 1;
+                println!(
+                    "Progress: {succeeded}/{total} - {} - Exact champion row and current audio identity reused",
+                    file.file_name().and_then(|name| name.to_str()).unwrap_or("unknown")
+                );
+            }
+            PreparedExistingAction::Replace(existing_ids) => {
+                // Only an identity-matching, machine-owned invalid stage can reach replacement.
+                db.delete_segments_batch(&existing_ids)
+                    .map_err(|error| format!("cannot replace invalid staged rows for {}: {error}", file.display()))?;
+                pending.push(file);
+            }
         }
-        let existing = db
-            .get_segments_by_ids(&existing_ids)
-            .map_err(|error| format!("cannot read existing rows for {}: {error}", file.display()))?;
-        if existing.len() == existing_ids.len()
-            && !existing.is_empty()
-            && existing.iter().all(|segment| is_exact_champion_segment(segment, &champion_model_id))
-        {
-            db.mark_import_file_done(&job_id, &path_text)
-                .map_err(|error| format!("cannot journal existing file {}: {error}", file.display()))?;
-            succeeded += 1;
-            println!(
-                "Progress: {succeeded}/{total} - {} - Exact champion row reused",
-                file.file_name().and_then(|name| name.to_str()).unwrap_or("unknown")
-            );
-            continue;
-        }
-
-        // Delete only the incomplete/non-canonical stage; the database's review-authority trigger
-        // refuses this operation if any human evidence exists, turning that case into a hard stop.
-        db.delete_segments_batch(&existing_ids)
-            .map_err(|error| format!("cannot replace invalid staged rows for {}: {error}", file.display()))?;
-        pending.push(file);
     }
 
     if pending.is_empty() {
@@ -310,11 +603,39 @@ fn import_prepared_voice_parallel(
     Ok((total, succeeded))
 }
 
+fn require_complete_import(total: usize, succeeded: usize, failed: usize, target_dir: &Path) -> Result<(), String> {
+    if total == 0 {
+        return Err(format!("No audio files found to import in {}", target_dir.display()));
+    }
+    if failed > 0 || succeeded != total {
+        return Err(format!(
+            "Import incomplete: {succeeded}/{total} file(s) succeeded and {failed} failed. Completed files remain durably committed for resume; fix the failure and re-run {}",
+            target_dir.display()
+        ));
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     println!("Starting Batch Importer...");
 
-    let app_data_dir = isolated_import_data_dir(std::env::var_os("CORTEX_APP_DATA_DIR"), std::env::var_os("APPDATA"))?;
+    let cli_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if cli_args.first().is_some_and(|arg| arg == OsStr::new("--init-staging-profile")) {
+        if cli_args.len() != 2 {
+            return Err("Usage: batch_importer --init-staging-profile <new-profile-directory>".into());
+        }
+        let minted = mint_import_staging_profile(Path::new(&cli_args[1]))?;
+        println!("{}", serde_json::to_string_pretty(&minted)?);
+        println!(
+            "Use this profile only for offline import staging. Set CORTEX_APP_DATA_DIR and {} to the values above before importing.",
+            STAGING_TOKEN_ENV
+        );
+        return Ok(());
+    }
+
+    let app_data_dir =
+        isolated_import_data_dir(std::env::var_os("CORTEX_APP_DATA_DIR"), std::env::var_os(STAGING_TOKEN_ENV))?;
 
     // Single-instance guard shared with the GUI (same cortex.lock): refuse to run against the live DB
     // while the app — or another importer — is open, so two writers never contend on the WAL DB or the
@@ -323,7 +644,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _lock = cortex_speech_app_lib::flock::InstanceLock::try_lock(&app_data_dir)
         .map_err(|e| format!("Cannot start batch importer: {e}. Close the Cortex app (or another importer) first."))?;
 
-    let db_path = app_data_dir.join("cortex-speech.db");
+    let db_path = app_data_dir.join(SQLITE_DB_NAME);
 
     let db = Database::open_with_retry(&db_path.to_string_lossy())?;
     if let Some(path) = cortex_speech_app_lib::snapshot::initialize_with_required_pre_migration_pin(&db, &app_data_dir)?
@@ -335,10 +656,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // raw `load()` is reserved for explicit offline diagnostic tools.
     let mut settings = AppSettings::load_production(&app_data_dir.join("settings.json"));
 
-    let mut args = std::env::args().skip(1);
+    let mut args = cli_args.into_iter();
     let first_arg = args.next();
     let (prepared_voice, target_dir) = match first_arg.as_deref() {
-        Some("--prepared-voice") => (true, args.next().map(PathBuf::from)),
+        Some(value) if value == OsStr::new("--prepared-voice") => (true, args.next().map(PathBuf::from)),
         Some(path) => (false, Some(PathBuf::from(path))),
         None => (
             std::env::var_os("CORTEX_IMPORT_PREPARED_VOICE").as_deref() == Some(std::ffi::OsStr::new("1")),
@@ -379,7 +700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fingerprint = Arc::new(AudioFingerprint::new());
     // Before ANY import work, in BOTH modes — the map must already know every recording the library
     // holds by the time the first file is offered to it.
-    rehydrate_dedup_from_library(&db, &fingerprint);
+    rehydrate_dedup_from_library(&db, &fingerprint)?;
     let model_manager = Arc::new(ModelManager::new(app_data_dir.join("models")));
 
     let pipeline = ProcessingPipeline::new(
@@ -411,7 +732,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (per-file faults only emit PipelineEvent::Error). Capture the final tally so this binary's EXIT
     // CODE reflects reality — otherwise a cron/CI wrapper pointed at a mistyped/empty dir sees exit 0
     // and believes the import succeeded when it did nothing.
-    let outcome = std::cell::Cell::new((0usize, 0usize, 0usize)); // (total, succeeded, failed)
+    let outcome = std::cell::Cell::new(None::<(usize, usize, usize)>); // (total, succeeded, failed)
 
     // RE-RUNNING A DIRECTORY IS A RESUME, NOT A FRESH IMPORT.
     //
@@ -422,9 +743,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // processed a second time and persisted AGAIN under the same `audio_path`. That is the
     // 2026-08-14 shape, where one folder re-import silently doubled 494 already-reviewed clips.
     //
-    // Handing the importer the set of paths it already holds turns that into the resume the
-    // machinery was written for: finished files are adopted (never re-persisted), and a file left
-    // mid-stage — placeholder or empty drafts from an interrupted run — is discarded and redone.
+    // Handing the importer the set of candidate paths lets the pipeline perform a resume. The set is
+    // NOT authority: before adoption, the pipeline re-reads every row and requires either durable
+    // human truth or an exact current local-champion draft, then binds those rows to the canonical PCM
+    // decoded from the current source. Placeholder/blank/wrong-model/cloud/source-drift stages are
+    // never skipped merely because a prior journal or path query found them.
     //
     // The prefix query matches case/separator-insensitively, but the pipeline consults this set with
     // an EXACT compare against the path it walks, so a re-run typed in another case printed
@@ -440,10 +763,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if already_imported.is_empty() {
         println!("Fresh import: this directory has no clips in the library yet.");
     } else {
-        println!("Resuming: {} file(s) from this directory are already in the library.", already_imported.len());
+        println!(
+            "Resume candidates: {} file(s) have existing rows; each will be re-verified before adoption.",
+            already_imported.len()
+        );
     }
 
-    pipeline.import_directory_with_agent_run_id(&target_dir, None, None, Some(&already_imported), |event| {
+    pipeline.import_directory_with_agent_run_id(&target_dir, None, None, Some(&already_imported), None, |event| {
         use cortex_speech_app_lib::pipeline::PipelineEvent;
         match event {
             PipelineEvent::Progress { current, total, file, status } => {
@@ -451,7 +777,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             PipelineEvent::Completed { total, succeeded, failed } => {
                 println!("Completed: Total {}, Succeeded {}, Failed {}", total, succeeded, failed);
-                outcome.set((total, succeeded, failed));
+                outcome.set(Some((total, succeeded, failed)));
             }
             PipelineEvent::Error { file, error } => {
                 println!("Error in {}: {}", file, error);
@@ -460,13 +786,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    let (total, succeeded, failed) = outcome.get();
-    if total == 0 {
-        return Err(format!("No audio files found to import in {}", target_dir.display()).into());
-    }
-    if succeeded == 0 {
-        return Err(format!("Import failed: all {failed} file(s) failed").into());
-    }
+    let (total, succeeded, failed) = outcome
+        .get()
+        .ok_or_else(|| "Import incomplete: the pipeline returned without a terminal completion tally".to_string())?;
+    require_complete_import(total, succeeded, failed, &target_dir)?;
 
     println!("Batch Importer Finished!");
     Ok(())
@@ -506,6 +829,116 @@ mod tests {
         assert!(!is_exact_champion_segment(&segment, "champion-v1"), "an empty transcript is not champion work");
         segment.raw_transcript = "   \n\t ".into();
         assert!(!is_exact_champion_segment(&segment, "champion-v1"), "whitespace-only is still empty");
+    }
+
+    fn write_identity_wav(path: &Path, sample: i16) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create identity WAV");
+        for _ in 0..3_200 {
+            writer.write_sample(sample).expect("write identity sample");
+        }
+        writer.finalize().expect("finalize identity WAV");
+    }
+
+    fn prepared_identity_fixture(human_owned: bool) -> (tempfile::TempDir, Database, PathBuf, String) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("prepared-identity.db");
+        let db = Database::open_with_retry(&db_path.to_string_lossy()).expect("open database");
+        cortex_speech_app_lib::snapshot::initialize_with_required_pre_migration_pin(&db, directory.path())
+            .expect("initialize database");
+        let wav = directory.path().join("voice.wav");
+        write_identity_wav(&wav, 1_000);
+        let path_text = wav.to_string_lossy().to_string();
+        db.insert_segment(&cortex_speech_app_lib::db::SpeechSegment {
+            id: "existing-prepared".into(),
+            audio_path: path_text.clone(),
+            raw_transcript: "دەنگێکی ڕاستەقینە".into(),
+            model_version_id: Some("unknown@pre-registry".into()),
+            ..Default::default()
+        })
+        .expect("insert prepared row");
+        let (sample_rate, pcm) = cortex_speech_app_lib::audio::decode_to_pcm(&wav).expect("decode original WAV");
+        db.set_audio_identity(&path_text, &AudioFingerprint::identify(&pcm, sample_rate))
+            .expect("bind original identity");
+        if human_owned {
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET verified = 1, human_decision = 'accept', reviewed_by = 'owner'
+                      WHERE id = 'existing-prepared'",
+                    [],
+                )
+                .expect("mark fixture human-owned");
+        }
+        (directory, db, wav, path_text)
+    }
+
+    #[test]
+    fn prepared_reuse_refuses_same_path_pcm_replacement() {
+        let (_directory, db, wav, path_text) = prepared_identity_fixture(false);
+        let prior_hash = db.segment_audio_content_hash("existing-prepared").unwrap().unwrap();
+        write_identity_wav(&wav, 9_000);
+
+        let error = inspect_prepared_existing_file(&db, &wav, std::slice::from_ref(&path_text), "unknown@pre-registry")
+            .unwrap_err();
+        assert!(error.contains("SOURCE_IDENTITY_DRIFT"), "unexpected refusal: {error}");
+        assert_eq!(
+            db.segment_audio_content_hash("existing-prepared").unwrap().as_deref(),
+            Some(prior_hash.as_str()),
+            "replacement bytes must not rebind the older transcript"
+        );
+        assert_eq!(db.segment_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn prepared_reuse_refuses_human_owned_source_drift() {
+        let (_directory, db, wav, path_text) = prepared_identity_fixture(true);
+        let prior_hash = db.segment_audio_content_hash("existing-prepared").unwrap().unwrap();
+        write_identity_wav(&wav, -7_000);
+
+        let error = inspect_prepared_existing_file(&db, &wav, std::slice::from_ref(&path_text), "unknown@pre-registry")
+            .unwrap_err();
+        assert!(error.contains("SOURCE_IDENTITY_DRIFT"), "unexpected refusal: {error}");
+        assert!(error.contains("human-owned"), "the refusal must identify protected human authority: {error}");
+        let retained = db.get_segment_by_id("existing-prepared").unwrap().unwrap();
+        assert!(retained.verified);
+        assert_eq!(retained.human_decision.as_deref(), Some("accept"));
+        assert_eq!(db.segment_audio_content_hash("existing-prepared").unwrap().as_deref(), Some(prior_hash.as_str()));
+    }
+
+    #[test]
+    fn prepared_case_separator_alias_ambiguity_fails_closed() {
+        let target = r"D:\Voice";
+        let walked = r"D:\Voice\Clip.wav";
+        let indexed = prepared_stored_paths_by_alias(
+            [r"d:/voice/clip.wav".to_string(), r"D:\VOICE\CLIP.WAV".to_string()],
+            target,
+        );
+        let candidates = indexed.get(&prepared_path_alias_key(walked)).expect("logical path indexed");
+        assert_eq!(candidates.len(), 2, "every alias candidate must survive indexing");
+
+        let db = Database::open(":memory:").unwrap();
+        let error = inspect_prepared_existing_file(&db, Path::new(walked), candidates, "champion-v1").unwrap_err();
+        assert!(error.contains("PREPARED_PATH_AMBIGUITY"), "unexpected refusal: {error}");
+        assert!(error.contains("multiple stored case/separator aliases"));
+    }
+
+    #[test]
+    fn prepared_unchanged_replay_is_idempotently_reused() {
+        let (_directory, db, wav, path_text) = prepared_identity_fixture(false);
+        let candidates = vec![path_text];
+        for _ in 0..2 {
+            assert_eq!(
+                inspect_prepared_existing_file(&db, &wav, &candidates, "unknown@pre-registry").unwrap(),
+                PreparedExistingAction::Reuse(vec!["existing-prepared".into()])
+            );
+        }
+        assert_eq!(db.segment_count().unwrap(), 1, "replay must not add or replace a row");
     }
 
     /// A re-run typed with a different case or separator must resolve to the SAME per-file key the
@@ -551,13 +984,13 @@ mod tests {
         };
         db.insert_segment(&segment).expect("insert segment");
         let identity =
-            cortex_speech_app_lib::fingerprint::AudioIdentity { spectral: 0xDEAD_BEEF, content: "abc123".into() };
+            cortex_speech_app_lib::fingerprint::AudioIdentity { spectral: 0xDEAD_BEEF, content: "a".repeat(64) };
         db.set_audio_identity(&segment.audio_path, &identity).expect("store identity");
 
         // A fresh importer process starts with an EMPTY map — that is the whole defect.
         let fingerprint = AudioFingerprint::new();
         assert_eq!(fingerprint.count(), 0);
-        assert_eq!(rehydrate_dedup_from_library(&db, &fingerprint), 1);
+        assert_eq!(rehydrate_dedup_from_library(&db, &fingerprint).unwrap(), 1);
         // Offered again under a different file name — the cross-run duplicate this lane could not see.
         assert!(
             fingerprint
@@ -566,6 +999,38 @@ mod tests {
             "a recording already in the library must be refused on a later run"
         );
     }
+
+    #[test]
+    fn headless_importer_hard_stops_when_the_identity_inventory_cannot_be_read() {
+        // No schema makes the inventory SELECT fail deterministically. The binary's only safe mode is
+        // to return the same stable admission error as the desktop before constructing its pipeline.
+        let db = Database::open(":memory:").unwrap();
+        let fingerprint = AudioFingerprint::new();
+        let error = rehydrate_dedup_from_library(&db, &fingerprint).unwrap_err();
+        assert_eq!(error, cortex_speech_app_lib::DEDUP_INDEX_UNAVAILABLE_MESSAGE);
+        assert_eq!(fingerprint.count(), 0);
+    }
+
+    #[test]
+    fn headless_importer_hard_stops_on_an_active_unhashed_recording() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open_with_retry(&dir.path().join("cortex-speech.db").to_string_lossy()).expect("open db");
+        cortex_speech_app_lib::snapshot::initialize_with_required_pre_migration_pin(&db, dir.path())
+            .expect("initialize schema through the production admission guard");
+        db.insert_segment(&cortex_speech_app_lib::db::SpeechSegment {
+            id: "unhashed".into(),
+            audio_path: "d:/voice/unhashed.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        })
+        .expect("insert legacy fixture");
+
+        let fingerprint = AudioFingerprint::new();
+        let error = rehydrate_dedup_from_library(&db, &fingerprint).unwrap_err();
+        assert_eq!(error, cortex_speech_app_lib::DEDUP_INDEX_UNAVAILABLE_MESSAGE);
+        assert_eq!(fingerprint.count(), 0);
+    }
+
     #[test]
     fn prepared_inventory_accepts_only_wavs_and_is_deterministic() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -578,38 +1043,89 @@ mod tests {
         let files = collect_prepared_wavs(root.path()).expect("collect prepared wavs");
         assert_eq!(files, vec![root.path().join("b.WAV"), nested.join("a.wav")]);
     }
-    #[test]
-    fn production_import_requires_an_explicit_nonoverlapping_staging_profile() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let appdata = root.path().join("appdata");
-        let live = appdata.join("cortex-speech");
-        let live_child = live.join("staging");
-        let isolated = root.path().join("isolated-import");
-        std::fs::create_dir_all(&live_child).expect("live fixture");
-        std::fs::create_dir_all(&isolated).expect("isolated fixture");
-        let appdata_value = Some(appdata.as_os_str().to_owned());
+    fn valid_test_token() -> String {
+        "0123456789abcdef".repeat(4)
+    }
 
-        let absent = isolated_import_data_dir(None, appdata_value.clone()).unwrap_err();
-        assert!(absent.contains("CORTEX_APP_DATA_DIR is required"));
-        let exact_live =
-            isolated_import_data_dir(Some(live.as_os_str().to_owned()), appdata_value.clone()).unwrap_err();
-        assert!(exact_live.contains("live review imports are forbidden"));
-        let live_descendant =
-            isolated_import_data_dir(Some(live_child.as_os_str().to_owned()), appdata_value.clone()).unwrap_err();
-        assert!(live_descendant.contains("live review imports are forbidden"));
-        let live_ancestor =
-            isolated_import_data_dir(Some(appdata.as_os_str().to_owned()), appdata_value.clone()).unwrap_err();
-        assert!(live_ancestor.contains("live review imports are forbidden"));
-        let missing = isolated_import_data_dir(
-            Some(root.path().join("typo-does-not-exist").as_os_str().to_owned()),
-            appdata_value.clone(),
+    fn profile_database_bytes(profile: &Path) -> Vec<(String, Vec<u8>)> {
+        [SQLITE_DB_NAME.to_string(), format!("{SQLITE_DB_NAME}-wal"), format!("{SQLITE_DB_NAME}-shm")]
+            .into_iter()
+            .filter_map(|name| std::fs::read(profile.join(&name)).ok().map(|bytes| (name, bytes)))
+            .collect()
+    }
+
+    /// A caller-supplied relocated owner profile is exactly what the old `%APPDATA%` comparison
+    /// admitted. Missing the importer-minted identity must now refuse before even a SQLite read-only
+    /// connection can create SHM state; all database-family bytes therefore remain identical.
+    #[test]
+    fn supplied_relocated_live_profile_is_refused_without_touching_database() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let relocated_live = root.path().join("relocated-owner-live-profile");
+        std::fs::create_dir(&relocated_live).expect("live-like directory");
+        {
+            let connection = rusqlite::Connection::open(relocated_live.join(SQLITE_DB_NAME)).expect("live-like db");
+            connection
+                .execute_batch("CREATE TABLE human_decisions(id TEXT PRIMARY KEY, transcript TEXT NOT NULL); INSERT INTO human_decisions VALUES('decision-1', 'owner truth');")
+                .expect("live-like truth");
+        }
+        let before = profile_database_bytes(&relocated_live);
+
+        let error = isolated_import_data_dir(
+            Some(relocated_live.as_os_str().to_owned()),
+            Some(OsString::from(valid_test_token())),
         )
         .unwrap_err();
-        assert!(missing.contains("existing isolated staging directory"));
+        assert!(error.contains("not a batch-importer-minted staging profile"), "unexpected refusal: {error}");
+        assert!(error.contains("live review imports are forbidden"), "unexpected refusal: {error}");
+        assert_eq!(profile_database_bytes(&relocated_live), before, "a refused live profile must be byte-identical");
+    }
 
+    #[test]
+    fn only_the_exact_minted_staging_identity_is_admitted() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let staging = root.path().join("offline-import-staging");
+        let minted = mint_import_staging_profile(&staging).expect("mint staging profile");
         assert_eq!(
-            isolated_import_data_dir(Some(isolated.as_os_str().to_owned()), appdata_value).unwrap(),
-            std::fs::canonicalize(isolated).unwrap()
+            isolated_import_data_dir(Some(staging.as_os_str().to_owned()), Some(OsString::from(&minted.profile_token)))
+                .expect("minted profile admitted"),
+            std::fs::canonicalize(&staging).unwrap()
         );
+
+        let missing_token = isolated_import_data_dir(Some(staging.as_os_str().to_owned()), None).unwrap_err();
+        assert!(missing_token.contains(STAGING_TOKEN_ENV));
+        let wrong_token =
+            isolated_import_data_dir(Some(staging.as_os_str().to_owned()), Some(OsString::from(valid_test_token())))
+                .unwrap_err();
+        assert!(wrong_token.contains("token does not match"));
+        assert!(mint_import_staging_profile(&staging).unwrap_err().contains("existing path"));
+
+        // Copying both marker-bearing files still cannot bless a different (possibly live) path:
+        // the signed intent is bound to the canonical directory identity as well as the DB header.
+        let relocated = root.path().join("copied-profile");
+        std::fs::create_dir(&relocated).expect("relocated directory");
+        std::fs::copy(staging.join(SQLITE_DB_NAME), relocated.join(SQLITE_DB_NAME)).expect("copy db");
+        std::fs::copy(staging.join(STAGING_SENTINEL_NAME), relocated.join(STAGING_SENTINEL_NAME))
+            .expect("copy sentinel");
+        let before = profile_database_bytes(&relocated);
+        let error = isolated_import_data_dir(
+            Some(relocated.as_os_str().to_owned()),
+            Some(OsString::from(&minted.profile_token)),
+        )
+        .unwrap_err();
+        assert!(error.contains("bound to a different canonical profile"), "unexpected refusal: {error}");
+        assert_eq!(profile_database_bytes(&relocated), before, "a copied contract must be refused without writes");
+    }
+
+    #[test]
+    fn any_partial_or_inconsistent_import_tally_is_an_incomplete_exit() {
+        let target = Path::new("D:/offline-staging/audio");
+        assert!(require_complete_import(3, 3, 0, target).is_ok());
+
+        for (total, succeeded, failed) in [(3, 2, 1), (3, 2, 0), (3, 3, 1), (3, 0, 3)] {
+            let error = require_complete_import(total, succeeded, failed, target).unwrap_err();
+            assert!(error.starts_with("Import incomplete:"), "unexpected partial-import verdict: {error}");
+            assert!(error.contains("remain durably committed for resume"));
+        }
+        assert!(require_complete_import(0, 0, 0, target).unwrap_err().contains("No audio files"));
     }
 }
