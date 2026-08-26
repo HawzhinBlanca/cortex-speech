@@ -1,6 +1,10 @@
 # Remediation of the 2026-08-25 deep audit
 
-**Branch:** `integrate/codex-flywheel` · **Audited HEAD:** `1282578` · **14 fix commits**
+**Audited HEAD:** `1282578` · **14 fix commits + 1 lint cleanup**
+**Branch:** the work was made on `integrate/codex-flywheel` and integrated into
+`codex/10-10-integration`, which rebased it — the SHAs below are the ones reachable HERE.
+The originals (`86719e3`..`e69198c`) survive on `integrate/codex-flywheel` and are the same
+content; each was matched to its rebased twin by commit subject and verified reachable.
 **Companion:** [DEEP_BRUTAL_AUDIT.md](DEEP_BRUTAL_AUDIT.md) — the findings, preserved verbatim.
 
 Every fix carries a regression gate, per the repo's own law that a fix without one is incomplete.
@@ -32,7 +36,9 @@ The policy suite grew 101 → 105 scripts: four new gates, each with a working `
 1. **Watchdog re-enabled.** `schtasks /change /tn CortexWatchdog /enable`; the gate now prints
    `WATCHDOG GATE: OK (CortexWatchdog state=Ready)`. The rebuild procedure that disabled it must
    re-enable it as its final step rather than leaving it for the sweep to notice.
-2. **Ledger entry written** (the commit carrying this document).
+2. **Ledger entry written** — on `integrate/codex-flywheel` (`f89c521`). It is NOT on this
+   branch: `codex/10-10-integration` carries its own ledger entry from the session that
+   integrated this work, and the staleness gate passes here on that one.
 3. **Hidden-check capacity — NOT fixed, and deliberately so.** The gate's own contract says it:
    *"Fixing it is an owner action, not a code change."* Fabricating answer keys is forbidden. What
    the live database says, so the action is concrete rather than a shrug:
@@ -49,20 +55,20 @@ The policy suite grew 101 → 105 scripts: four new gates, each with a working `
 
 | Commit | Findings closed |
 |---|---|
-| `ea2ec3d` | **H2** champion hard stop reported, not swallowed |
-| `cc8e6ca` | **M10** + 3 lows — decisions written back by id; blank text no longer masks the draft |
-| `6f01162` | **M7 + M8** + 2 lows — wrong-model probe FAILs; meta-gate sees unittest policy files |
-| `56816cb` | **H4** duplicate detection across sample rates |
-| `2a4f20b` | **M14 + M15** + 1 low — decision-bearing exemptions; registry, not the startup mirror |
-| `0fa0389` | **H5 (visibility)** uncredited second-pass work surfaced |
-| `a796c7d` | **M3** + 2 lows — Halwest splits at the source recording |
-| `6cbb750` | **H6** + 1 critic lead — gold eval hard-stops; external hypotheses labelled |
-| `3adfe03` | **M1 + M2 + M11(couch)** + 2 lows — hidden-check durability, case-insensitive identity |
-| `530509c` | **M11(db)** + 7 lows — one placeholder authority; blank guard at the shared boundary |
-| `99c82c1` | **M4 + M5** + 1 low + 2 critic leads — honest bundle counts, thresholds unified |
-| `e3238b5` | **M6** + 3 lows — instant spawn failures charged now; WSL7B integrity hole closed |
-| `19b8c95` | **H3 + M12** + 1 low — headless importer gets cross-run dedup |
-| `bd97072` | **M13** + 6 lows — span-divergent doubled generations refused; legacy IPC deleted |
+| `86719e3` | **H2** champion hard stop reported, not swallowed |
+| `d2e3b0e` | **M10** + 3 lows — decisions written back by id; blank text no longer masks the draft |
+| `3f851a6` | **M7 + M8** + 2 lows — wrong-model probe FAILs; meta-gate sees unittest policy files |
+| `4729ba9` | **H4** duplicate detection across sample rates |
+| `47e501e` | **M14 + M15** + 1 low — decision-bearing exemptions; registry, not the startup mirror |
+| `edf8bbb` | **H5 (visibility)** uncredited second-pass work surfaced |
+| `d5b6fde` | **M3** + 2 lows — Halwest splits at the source recording |
+| `e682c67` | **H6** + 1 critic lead — gold eval hard-stops; external hypotheses labelled |
+| `00f1f21` | **M1 + M2 + M11(couch)** + 2 lows — hidden-check durability, case-insensitive identity |
+| `eec4d01` | **M11(db)** + 7 lows — one placeholder authority; blank guard at the shared boundary |
+| `040e04b` | **M4 + M5** + 1 low + 2 critic leads — honest bundle counts, thresholds unified |
+| `51058eb` | **M6** + 3 lows — instant spawn failures charged now; WSL7B integrity hole closed |
+| `e7f75e7` | **H3 + M12** + 1 low — headless importer gets cross-run dedup |
+| `d759515` | **M13** + 6 lows — span-divergent doubled generations refused; legacy IPC deleted |
 
 ### The two not fixed as written, and why
 
