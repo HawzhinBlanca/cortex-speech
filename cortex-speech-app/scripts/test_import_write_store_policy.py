@@ -1,6 +1,7 @@
 """Architecture policy for fail-closed import publication and metadata backfills."""
 
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
@@ -14,8 +15,15 @@ def method(source: str, signature: str) -> str:
     start = source.find(signature)
     if start < 0:
         raise AssertionError(f"missing pipeline method `{signature}`")
-    end = source.find("\n    fn ", start + len(signature))
-    return source[start:] if end < 0 else source[start:end]
+    next_method = re.search(
+        r"^    (?:(?:pub(?:\(crate\)|\(super\))?)\s+)?(?:async\s+)?fn ",
+        source[start + len(signature) :],
+        flags=re.MULTILINE,
+    )
+    if next_method is None:
+        return source[start:]
+    end = start + len(signature) + next_method.start()
+    return source[start:end]
 
 
 def test_store_owns_import_publication_rollback_and_revision_guarded_alignment() -> None:
@@ -47,7 +55,13 @@ def test_store_owns_import_publication_rollback_and_revision_guarded_alignment()
 
 
 def test_pipeline_delegates_import_segment_writes_without_raw_writer_calls() -> None:
-    pipeline = read("pipeline.rs")
+    pipeline_root = read("pipeline.rs")
+    pipeline_import = read("pipeline/import_flow.rs")
+    pipeline_transcription = read("pipeline/transcription.rs")
+    pipeline = "\n".join((pipeline_root, pipeline_import, pipeline_transcription))
+    for module in ("mod import_flow;", "mod transcription;"):
+        if module not in pipeline_root:
+            raise AssertionError(f"pipeline composition root lost `{module}`")
     for forbidden in (
         "db.insert_segments_batch(",
         "db.delete_segments_batch(",

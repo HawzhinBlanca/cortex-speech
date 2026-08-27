@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface
+
 SRC = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
 PIPELINE = SRC / "pipeline.rs"
 COMMANDS = SRC / "commands.rs"
@@ -46,7 +48,7 @@ def test_selecting_the_champion_cannot_be_overridden_by_the_small_model() -> Non
     The removed clause was `&& !(use_finetuned_asr && finetuned_model_paths().is_some())` — the exact
     line that silently handed 494 clips to the smaller model.
     """
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     body = _fn_body(text, "fn should_use_wsl_primary_asr(&self) -> bool {")
     assert "use_finetuned_asr" not in body, (
         "should_use_wsl_primary_asr consults use_finetuned_asr again — selecting WSL7B must outrank "
@@ -77,7 +79,7 @@ def test_champion_is_the_factory_default_and_auxiliary_models_default_off() -> N
 
 def test_legacy_auxiliary_flag_cannot_run_smaller_models_beside_champion() -> None:
     """Old settings may contain multi_engine_hypotheses=true; WSL7B must still remain single-engine."""
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     helper = _fn_body(text, "fn auxiliary_hypotheses_enabled(settings: &AppSettings) -> bool {")
     assert "multi_engine_hypotheses" in helper, "shared auxiliary-model opt-in guard is missing"
     assert "AsrModelSize::WSL7B" in helper and "!=" in helper, (
@@ -92,7 +94,7 @@ def test_legacy_auxiliary_flag_cannot_run_smaller_models_beside_champion() -> No
 
 def test_import_never_routes_through_scribe_or_cloud_fallback() -> None:
     """Cloud consent may reveal explicit tools, but it must never replace the champion during import."""
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     body = _fn_body(text, "pub fn import_single_file_with_events(")
     # Do not search for the bare substring "scribe": ordinary words such as "Transcribe" contain it.
     assert "scribe_api" not in body.lower() and "elevenlabs" not in body.lower(), (
@@ -128,7 +130,7 @@ def test_champion_review_cannot_consume_stale_auxiliary_votes() -> None:
         "the automatic multi-ASR jury can still run while the sole 7B champion is selected"
     )
 
-    pipeline = PIPELINE.read_text(encoding="utf-8")
+    pipeline = pipeline_surface(SRC)
     stage = _fn_body(pipeline, "fn multi_model_hypothesis_stage(")
     assert "AsrModelSize::WSL7B" in stage and '"not_required"' in stage, (
         "champion imports are still falsely blocked on optional multi-model coverage"
@@ -137,7 +139,7 @@ def test_champion_review_cannot_consume_stale_auxiliary_votes() -> None:
 
 def test_the_finetuned_override_yields_to_the_champion() -> None:
     """Every primary-drafter override goes through `finetuned_override_active`, which yields to WSL7B."""
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     body = _fn_body(text, "fn finetuned_override_active(&self) -> bool {")
     assert "use_finetuned_asr" in body and "WSL7B" in body, (
         "finetuned_override_active must require the flag AND that the champion is not the selection"

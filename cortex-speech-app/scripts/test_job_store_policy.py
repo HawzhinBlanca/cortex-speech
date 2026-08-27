@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface
+
 
 ROOT = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
 
@@ -108,7 +110,7 @@ def test_commands_delegate_without_raw_database_authority() -> None:
 
 
 def test_pipeline_import_journal_is_store_owned_and_fail_closed() -> None:
-    pipeline = read("pipeline.rs")
+    pipeline = pipeline_surface(ROOT)
     for forbidden in (
         "db.begin_import_job(",
         "db.mark_import_file_done(",

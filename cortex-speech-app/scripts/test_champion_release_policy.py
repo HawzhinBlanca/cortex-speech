@@ -11,6 +11,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+from _pipeline_policy_util import pipeline_surface
+
 
 APP = Path(__file__).resolve().parent.parent
 REPO = APP.parent
@@ -234,7 +236,7 @@ def test_production_importer_can_only_write_an_explicit_isolated_staging_profile
 def test_shipped_gold_eval_has_no_auxiliary_engine_selector() -> None:
     lib = (APP / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
     command = (APP / "src-tauri" / "src" / "commands" / "gold_eval.rs").read_text(encoding="utf-8")
-    pipeline = (APP / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface(APP / "src-tauri" / "src")
     frontend = (APP / "src" / "lib" / "commands.ts").read_text(encoding="utf-8")
     panel = (APP / "src" / "lib" / "RefineryPanel.svelte").read_text(encoding="utf-8")
 

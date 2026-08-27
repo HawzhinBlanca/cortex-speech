@@ -18,6 +18,8 @@ would then assert provenance it no longer checks.
 
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -44,7 +46,7 @@ def test_the_schema_can_hold_a_processing_declaration() -> None:
 
 
 def test_the_import_records_it_without_being_asked() -> None:
-    pipeline = _read("src-tauri/src/pipeline.rs")
+    pipeline = pipeline_surface(REPO_ROOT / "src-tauri" / "src")
     if "crate::source_provenance::detect(path)" not in pipeline:
         raise AssertionError(
             "the import must detect processed source audio itself — a declaration that depends on "

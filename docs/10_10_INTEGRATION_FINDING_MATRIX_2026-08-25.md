@@ -91,7 +91,8 @@ SHA in the immutable manifest, not a short hash copied into this file.
 | Oversized source modules and unverifiable Rust coverage could be hidden by an optimistic aggregate gate. | A fail-closed quality gate requires branch-bearing `cargo llvm-cov` JSON and scans all shipped Rust modules, with only one exact-hash immutable-migration exception. | Gate works and correctly reports both conditions **RED**; details are below. |
 | Stable-toolchain checks did not expose two atomics deprecated by the pinned branch-coverage compiler. | Cortex media singleflight and the vendored bounded HTTP worker pool use an MSRV-safe compare-exchange loop; the deprecated API is gone without requiring Rust 1.95. | **CLOSED locally**: affected media tests 24/24, vendored worker-ceiling test 1/1, strict MSRV-aware Clippy and rustfmt green; the exact nightly coverage rerun compiled without the prior deprecation warnings. |
 | Crash-safe export publication and recovery were embedded in the oversized evaluation facade. | Sealed-generation digesting, validation, promotion, rollback, directory synchronization and interrupted-publication recovery now live in a dedicated Tauri-free `eval/export_generation.rs` service. The extraction preserves one implementation only; it does not dual-write or weaken fail-closed publication. | **CLOSED locally**: `eval.rs` measures 1,638 production lines and the extracted service 511. All 43 evaluation/export fault regressions, backend layering, strict all-target/all-feature Clippy, rustfmt and the quality-gate self-tests pass. This slice reduced the failing architecture set from six to five; the next row reduces it again. |
-| Immutable review-pool deduplication authority was embedded in the oversized review facade. | Canonical manifest parsing, frozen source/champion binding, deterministic canonical selection, review-authority preservation and transactional exclusion publication now live in `review_pool/dedup.rs`; the facade retains pool lifecycle, consensus, rights and decision authority. | **CLOSED locally**: `review_pool.rs` measures 1,973 production lines and the dedup service 685. Pool tests 17/17, pool-export 7/7, pool-admin 7/7, dedup-policy 4/4 and compensation-readiness 38/38 pass, along with backend layering, strict all-target/all-feature Clippy and rustfmt. The architecture gate is still correctly red on the four modules below. |
+| Immutable review-pool deduplication authority was embedded in the oversized review facade. | Canonical manifest parsing, frozen source/champion binding, deterministic canonical selection, review-authority preservation and transactional exclusion publication now live in `review_pool/dedup.rs`; the facade retains pool lifecycle, consensus, rights and decision authority. | **CLOSED locally**: `review_pool.rs` measures 1,973 production lines and the dedup service 685. Pool tests 17/17, pool-export 7/7, pool-admin 7/7, dedup-policy 4/4 and compensation-readiness 38/38 pass, along with backend layering, strict all-target/all-feature Clippy and rustfmt. This slice reduced the failing set from five to four; the next row reduces it again. |
+| File import/publication and transcription/refinement were embedded in one oversized processing facade. | The existing `ProcessingPipeline` type now has cohesive sibling implementation modules: `pipeline/import_flow.rs` owns champion-first import, resumable journaling and atomic publication; `pipeline/transcription.rs` owns bound transcription, refinement and hypothesis population. The root retains engine lifecycle, consent, shared runtime and audio operations. Source policies consume the full composed surface, so moving code cannot evade raw-write or champion constraints. | **CLOSED locally**: root 1,957 production lines, import flow 1,778 and transcription 841. Pipeline regressions passed 64 with zero failures and one explicit live-WSL ignore; 14 pipeline-related source policies, backend layering, strict all-target/all-feature Clippy and rustfmt pass. The gate remains correctly red on the three modules below. |
 
 ## Integrated checkpoint evidence
 
@@ -143,19 +144,20 @@ SHA in the immutable manifest, not a short hash copied into this file.
   (6,335/11,642), 49.26% branches (2,675/5,430), 54.57% functions (1,516/2,778), and 56.83%
   lines (4,601/8,096)**. The fail-closed summary SHA-256 is
   `c8c0d37962ebf10ac2f2c67febe39e0f9a87b3cec721ea2aaf1ea88a019e84`.
-- Four shipped Rust modules exceed the normal 2,000-line ceiling:
+- Three shipped Rust modules exceed the normal 2,000-line ceiling:
 
   | Module | Production LOC |
   |---|---:|
   | `src-tauri/src/db.rs` | 11,857 |
   | `src-tauri/src/couch.rs` | 5,593 |
-  | `src-tauri/src/pipeline.rs` | 4,563 |
   | `src-tauri/src/commands.rs` | 4,013 |
 
   The sole exception is immutable migration history, pinned to an exact file SHA and size ceiling;
-  none of the four production modules above is excepted. `eval.rs` is now below the ceiling at
+  none of the three production modules above is excepted. `eval.rs` is now below the ceiling at
   1,638 production lines after the sealed export-generation service extraction, and
-  `review_pool.rs` is below it at 1,973 after the immutable dedup-authority extraction.
+  `review_pool.rs` is below it at 1,973 after the immutable dedup-authority extraction. The
+  `pipeline.rs` composition root is below it at 1,957, with its import and transcription modules
+  independently below policy.
 - IPC is contained but incomplete: **103 handwritten calls remain** (13 generated / 116 invoked).
   This is materially safer than an open bridge but does not satisfy the zero-untyped-invoke target.
 - `App.svelte` is now a 5-line composition shell and extracted presentational modules are 69–289

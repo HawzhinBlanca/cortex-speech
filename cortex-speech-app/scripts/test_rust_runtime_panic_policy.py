@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface as shipped_pipeline_surface
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # Week-4 decomposes commands.rs into slices under src/commands/. Every command-CONTENT check here
@@ -50,9 +52,8 @@ def db_surface() -> str:
 
 
 def pipeline_surface() -> str:
-    """pipeline.rs PLUS pipeline_tests.rs — the test module was split out via #[path], so both the
-    production checks AND the test-name assertions below must scan the whole pipeline module."""
-    parts = [(REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")]
+    """The shipped decomposed pipeline surface plus its #[path] regression module."""
+    parts = [shipped_pipeline_surface(REPO_ROOT / "src-tauri" / "src")]
     pt = REPO_ROOT / "src-tauri" / "src" / "pipeline_tests.rs"
     if pt.is_file():
         parts.append(pt.read_text(encoding="utf-8"))
@@ -1222,7 +1223,7 @@ def test_wsl_try_wait_loops_always_reap_the_child() -> None:
 
     Regression guard: iter-65; re-pointed 2026-08-18 when the probe was replaced.
     """
-    pipeline = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
+    pipeline = pipeline_surface()
     if "fn kill_and_reap_wsl_child(" not in pipeline:
         raise AssertionError("kill_and_reap_wsl_child not found — this gate would pass vacuously")
     reaps = pipeline.count("kill_and_reap_wsl_child(&mut child,")
@@ -2264,7 +2265,7 @@ def test_bundled_only_models_resolve_per_file_not_all_or_nothing() -> None:
     the whole root — orphans them once the user downloads an OmniASR model (silent VAD→energy /
     no-denoise / no-diarization degradation). They must resolve PER FILE via `resolve_root_for`. Recurring
     class (VAD, denoiser, aligner+campp). Runtime path needs real models, so source-pinned."""
-    src = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
+    src = pipeline_surface()
     for bad in (
         "SpeakerEmbeddingService::new(&self.model_manager.resolved_dir()",
         "ForcedAligner::new(&self.model_manager.resolved_dir()",

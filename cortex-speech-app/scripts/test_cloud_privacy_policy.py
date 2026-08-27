@@ -1,6 +1,8 @@
 from pathlib import Path
 import re
 
+from _pipeline_policy_util import pipeline_surface
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_RS = REPO_ROOT / "src-tauri" / "src" / "settings.rs"
@@ -70,7 +72,7 @@ def test_cloud_llm_defaults_are_opt_out() -> None:
 
 def test_gemini_refinement_requires_effective_opt_in_mode() -> None:
     settings = read(SETTINGS_RS)
-    pipeline = read(PIPELINE_RS)
+    pipeline = pipeline_surface(REPO_ROOT / "src-tauri" / "src")
 
     assert_contains(settings, "pub fn effective_llm_mode(&self) -> LlmMode", SETTINGS_RS.name)
     assert_contains(settings, "if self.llm_mode == LlmMode::Gemini && !self.cloud_llm_opt_in", SETTINGS_RS.name)

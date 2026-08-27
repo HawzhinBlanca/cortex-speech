@@ -12,6 +12,8 @@ import json
 import re
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT.parent
@@ -71,7 +73,7 @@ def test_public_runtime_sources_do_not_embed_an_unattested_metric() -> None:
 def test_active_engine_guidance_does_not_depend_on_historical_metrics() -> None:
     active_sources = {
         "CLAUDE.md": read(ROOT / "CLAUDE.md"),
-        "src-tauri/src/pipeline.rs": read(ROOT / "src-tauri" / "src" / "pipeline.rs"),
+        "src-tauri/src/pipeline surface": pipeline_surface(ROOT / "src-tauri" / "src"),
     }
     for label, source in active_sources.items():
         if re.search(r"\b7\.03\s*%|\b9\.32\s*%|\b21\.00\s*%", source):
