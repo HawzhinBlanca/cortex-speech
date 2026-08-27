@@ -11883,3 +11883,38 @@ Pool/Couch/reviewer implementation remains owned by the separate pool workstream
 its shared-database and API seams but does not create overlapping implementation edits. No production
 database, release pointer, credential, process, port, reviewer truth, or payment state was changed.
 Honest status: **OWNER SCOPE AND PLAN LOCKED — IMPLEMENTATION PENDING — NOT 10/10**.
+
+## 2026-08-27 — Python proof identity and Rust opt-in routing fail closed
+
+Commit `a80ad4341366f2bb2de164382bfdd79013ef9111` closes the first owner proof-integrity slice. Python
+policies now run only through a repository-owned isolated environment. Its exact nine-distribution
+lock includes `jiwer==4.0.0`, NumPy and SoundFile with all direct runtime dependencies; the launcher
+binds the lock and interpreter hashes, and the policy runner revalidates every exact installed
+version before executing a test. CI/release workflows provision that environment explicitly. A
+missing environment refused before running any policy, and missing/wrong JiWER plus an unreviewed
+Python minor are permanent negative regressions instead of optional skips.
+
+The CER consistency policy and the standalone Rust metric cross-validation now require exactly
+JiWER 4.0.0. The cross-validation passed all 12 computable vectors within `1e-6`; two empty-reference
+cases remain explicitly documented convention differences rather than silently compared. Adding
+the scientific dependencies also converted the FLEURS manifest and duplicate-audio policies from
+optional branches into executed proof: 4/4 FLEURS writer tests, 6/6 mixed-rate duplicate pins and
+17/17 duplicate-audit core tests passed.
+
+The Rust opt-in inventory is now exact and mechanical. One deterministic Sorani normalizer test was
+removed from `#[ignore]` and passed 1/1 in the default mode. All 42 remaining explicit ignores are
+bound in `cortex-speech-app/docs/owner_rust_opt_in_tests.v1.json`: 17 owner-product tests, 23
+model-evidence tests and two non-certifying diagnostic/tools. The owner media/audiobook and real-scale
+export groups now have verifier gates whose runner requires exact real inputs, executes each selector
+individually, demands exactly one passing test and rejects any skip output. Missing media/clone inputs
+were exercised and refused; those gates remain honestly pending until the local proof inputs and
+isolated production-sized clone exist.
+
+Proof: the final isolated campaign passed all 131 Python policy scripts; verifier supervisor passed
+30/30; workflow, gitignore, opt-in manifest, Python environment, JiWER/CER, py-compile, rustfmt and
+`git diff --check` gates passed. The complete Rust graph was not rerun because production Rust changed
+only by de-ignoring the focused normalizer test, which compiled and passed. Pool/Couch/reviewer and
+compensation implementation was untouched. No production database, release pointer, credential,
+model, process, port, reviewer truth, or payment state was changed. Honest status: **PROOF GAP CLOSED
+AND OWNER OPT-INS ROUTED — MEDIA/SCALE EXECUTION, COVERAGE, ARCHITECTURE AND RELEASE EVIDENCE STILL
+PENDING — NOT 10/10**.
