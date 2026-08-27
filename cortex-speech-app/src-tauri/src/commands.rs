@@ -77,6 +77,8 @@ pub use ingest::*;
 #[cfg(test)]
 use ingest::{batch_terminal_halt_cause, parse_batch_concurrency};
 use ingest::{emit_or_log, send_audio_duration_probe_result};
+mod recovery_ipc;
+pub use recovery_ipc::*;
 mod system_ops;
 #[cfg(test)]
 use crate::database_runtime::RestoreAdmission;

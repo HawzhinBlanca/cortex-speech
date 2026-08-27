@@ -237,6 +237,13 @@ export const commands = {
 	 *  on the blocking pool; the restore-admission token remains live through session persistence.
 	 */
 	assignSpeakersV1: (request: AssignSpeakersRequestV1) => typedError<AssignedSpeakersV1, CommandErrorV1>(__TAURI_INVOKE("assign_speakers_v1", { request })),
+	dbBackup: (dest: string) => typedError<BackupVerificationV1, CommandErrorV1>(__TAURI_INVOKE("db_backup", { dest })),
+	dbRestore: (src: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("db_restore", { src })),
+	dbVacuum: () => typedError<null, CommandErrorV1>(__TAURI_INVOKE("db_vacuum")),
+	getQuarantineNotice: () => typedError<QuarantineNoticeV1, CommandErrorV1>(__TAURI_INVOKE("get_quarantine_notice")),
+	acknowledgeQuarantine: () => typedError<number, CommandErrorV1>(__TAURI_INVOKE("acknowledge_quarantine")),
+	listDbSnapshots: () => typedError<SnapshotInfoV1[], CommandErrorV1>(__TAURI_INVOKE("list_db_snapshots")),
+	restoreDbFromSnapshot: (name: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("restore_db_from_snapshot", { name })),
 };
 
 /* Types */
@@ -283,6 +290,11 @@ export type AssignedSpeakersV1 = {
 	requestedCount: number,
 	changedCount: number,
 	unchangedCount: number,
+};
+
+export type BackupVerificationV1 = {
+	integrityOk: boolean,
+	segmentCount: number,
 };
 
 // Consent remains an explicit privacy transaction instead of an ordinary preference field.
@@ -631,6 +643,13 @@ export type ProofRunManifestV1 = {
 	artifactHashes: { [key in string]: string },
 };
 
+export type QuarantineNoticeV1 = {
+	// A count is sufficient for the warning surface. Local quarantine filenames remain private.
+	quarantinedFileCount: number,
+	snapshotCount: number,
+	newestSnapshotSegments: number | null,
+};
+
 /**
  *  Compare-and-set request for a whole speaker group. The two expected counts bind the destructive
  *  merge confirmation to the exact source and target inventory the renderer displayed.
@@ -803,6 +822,14 @@ export type SettingsPatchV1 = {
 export type SettingsSnapshotV1 = {
 	settingsRevision: number,
 	settings: RendererSettingsV1,
+};
+
+export type SnapshotInfoV1 = {
+	// Opaque selector returned to `restore_db_from_snapshot`; never an arbitrary filesystem path.
+	name: string,
+	timestamp: number,
+	dbSizeBytes: number,
+	segmentCount: number | null,
 };
 
 /**

@@ -587,7 +587,7 @@
       // count, instead of letting the owner work on silently in an empty library.
       quarantineNotice = await api
         .getQuarantineNotice()
-        .then((n) => (n.quarantinedFiles.length > 0 ? n : null))
+        .then((n) => (n.quarantinedFileCount > 0 ? n : null))
         .catch(() => null);
       // Surface silent safety-net failures (auto-snapshot down, low disk, missing models) at startup
       // and every 5 minutes thereafter.

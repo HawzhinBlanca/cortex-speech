@@ -16,15 +16,18 @@ describe('handwritten IPC containment', () => {
 
   it('preserves exact critical arguments while inferring the registered result type', async () => {
     invokeMock.mockReset();
-    invokeMock.mockResolvedValueOnce({ integrityOk: true, segmentCount: 12 });
+    invokeMock.mockResolvedValueOnce(undefined);
 
-    const result = invokeCritical('db_backup', { dest: 'D:/proof/library.db' });
-    expectTypeOf(result).toEqualTypeOf<Promise<{ integrityOk: boolean; segmentCount: number }>>();
-    await expect(result).resolves.toEqual({
-      integrityOk: true,
-      segmentCount: 12,
+    const result = invokeCritical('export_dataset', {
+      path: 'D:/proof/library.jsonl',
+      format: 'jsonl',
     });
-    expect(invokeMock).toHaveBeenCalledWith('db_backup', { dest: 'D:/proof/library.db' });
+    expectTypeOf(result).toEqualTypeOf<Promise<void>>();
+    await expect(result).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenCalledWith('export_dataset', {
+      path: 'D:/proof/library.jsonl',
+      format: 'jsonl',
+    });
   });
 });
 
@@ -91,8 +94,10 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('delete_segment');
   // @ts-expect-error the retired batch deletion bridge cannot return
   void invokeLegacy<unknown>('delete_segments_batch');
-  // @ts-expect-error destructive restore requires its exact source argument
-  void invokeCritical('db_restore');
+  // @ts-expect-error backup and recovery use generated, scrubbed contracts
+  void invokeCritical('db_backup', { dest: 'D:/proof/library.db' });
+  // @ts-expect-error destructive restore cannot regress into the handwritten boundary
+  void invokeCritical('db_restore', { src: 'D:/proof/library.db' });
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings
   void invokeLegacy<unknown>('runtime_' + 'command');
 };

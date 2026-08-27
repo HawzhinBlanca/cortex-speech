@@ -34,7 +34,8 @@ def _fn_body(src: str, signature_start: str, span: int = 1400) -> str:
 
 def test_prepare_restore_reserves_before_the_fence_and_returns_the_guard() -> None:
     commands = _read("commands.rs")
-    adapter = _fn_body(commands, "fn prepare_restore(", span=1200)
+    recovery_ipc = _read("commands/recovery_ipc.rs")
+    adapter = _fn_body(recovery_ipc, "fn prepare_restore(", span=1200)
     if "prepare_restore_admission(data_dir, || state.writers_active())" not in adapter:
         raise AssertionError("the Tauri command adapter must delegate admission and its writer fence")
     recovery = _read("recovery.rs")
@@ -131,14 +132,17 @@ def test_restore_service_owns_sql_authority_without_ui_dependencies() -> None:
     ):
         if required not in fixture:
             raise AssertionError(f"restore policy-4 characterization uses a synthetic/bypass fixture: {required}")
-    adapter = commands[commands.find("fn prepare_restore(") : commands.find("pub fn cancel_operation(")]
+    # Recovery commands now own a dedicated module. Inspect that exact boundary instead of slicing
+    # the composed command surface between symbols from different files: module concatenation order
+    # can otherwise pull unrelated diagnostics code into this SQL scan and create a false verdict.
+    adapter = _read("commands/recovery_ipc.rs")
     for forbidden in (".connection()", "rusqlite::", "query_row(", "prepare("):
         if forbidden in adapter:
             raise AssertionError(f"restore command adapter issues SQL instead of calling the service: {forbidden}")
 
 
 def test_both_restore_callers_hold_the_reservation() -> None:
-    commands = _read("commands.rs")
+    commands = _read("commands/recovery_ipc.rs")
     binding = "let (restore_reservation,"
     if commands.count(binding) != 2:
         raise AssertionError(
@@ -278,7 +282,7 @@ def test_every_production_database_entrypoint_requires_the_shared_pre_migration_
 
 
 def test_named_snapshot_restore_commits_config_only_after_atomic_required_state_and_settings() -> None:
-    commands = _read("commands.rs")
+    commands = _read("commands/recovery_ipc.rs")
     body = _fn_body(commands, "pub async fn restore_db_from_snapshot(", span=14_000)
     history = body.find("state.lock_history().clear();")
     install = body.find("install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?")

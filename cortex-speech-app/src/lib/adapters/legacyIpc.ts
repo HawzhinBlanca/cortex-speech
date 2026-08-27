@@ -18,7 +18,6 @@ type CommandResult<Name extends keyof CommandService> = Awaited<
  * a future build step bypasses TypeScript.
  */
 export const LEGACY_IPC_COMMANDS = [
-  'acknowledge_quarantine',
   'align_segment',
   'batch_normalize',
   'batch_transcribe',
@@ -27,9 +26,6 @@ export const LEGACY_IPC_COMMANDS = [
   'compute_signal_anomaly_scores',
   'couch_review_status',
   'create_gold_from_file',
-  'db_backup',
-  'db_restore',
-  'db_vacuum',
   'discard_interrupted_import',
   'export_agreement_sample',
   'export_audio',
@@ -44,7 +40,6 @@ export const LEGACY_IPC_COMMANDS = [
   'get_escalation_rate_trend',
   'get_intelligence_report',
   'get_interrupted_import',
-  'get_quarantine_notice',
   'get_segment_consensus',
   'get_waveform',
   'import_audio_file',
@@ -52,14 +47,12 @@ export const LEGACY_IPC_COMMANDS = [
   'import_verified_segments_as_gold',
   'list_agent_import_reports',
   'list_agent_stage_events',
-  'list_db_snapshots',
   'list_eval_runs',
   'merge_dataset_json',
   'open_audio_file',
   'record_review_flag',
   'rediarize_segments',
   'relink_audio',
-  'restore_db_from_snapshot',
   'resume_interrupted_import',
   'reviewer_throughput',
   'revoke_couch_reviewer',
@@ -113,12 +106,6 @@ type CriticalLegacyIpcContract = {
     args: undefined;
     result: CommandResult<'exportAgreementSample'>;
   };
-  get_quarantine_notice: { args: undefined; result: CommandResult<'getQuarantineNotice'> };
-  list_db_snapshots: { args: undefined; result: CommandResult<'listDbSnapshots'> };
-  restore_db_from_snapshot: {
-    args: { name: string };
-    result: CommandResult<'restoreDbFromSnapshot'>;
-  };
   get_audio_health: { args: undefined; result: CommandResult<'getAudioHealth'> };
   relink_audio: { args: { searchDir: string }; result: CommandResult<'relinkAudio'> };
   validate_dataset_cmd: { args: undefined; result: CommandResult<'validateDataset'> };
@@ -142,10 +129,6 @@ type CriticalLegacyIpcContract = {
     args: { path: string };
     result: CommandResult<'exportHuggingfaceDataset'>;
   };
-  db_backup: { args: { dest: string }; result: CommandResult<'dbBackup'> };
-  acknowledge_quarantine: { args: undefined; result: CommandResult<'acknowledgeQuarantine'> };
-  db_restore: { args: { src: string }; result: CommandResult<'dbRestore'> };
-  db_vacuum: { args: undefined; result: CommandResult<'dbVacuum'> };
   create_gold_from_file: {
     args: { audioPath: string };
     result: CommandResult<'createGoldFromFile'>;

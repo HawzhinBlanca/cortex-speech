@@ -6,6 +6,7 @@ import type {
   AssignedSpeakersV1,
   AssignSpeakersRequestV1,
   AppHealthV1,
+  BackupVerificationV1,
   CommandErrorV1,
   DeletedSegmentsV1,
   CommitReviewRequestV1,
@@ -24,6 +25,7 @@ import type {
   ModelStatusEntryV1,
   ModelVersionSummaryV1,
   PlaybackIntervalV1,
+  QuarantineNoticeV1,
   RenamedSpeakerV1,
   RenameSpeakerRequestV1,
   ReviewDraftV1,
@@ -33,6 +35,7 @@ import type {
   SettingsPatchResultV1,
   SettingsPatchV1,
   SettingsSnapshotV1,
+  SnapshotInfoV1,
   SpeakerInventoryItemV1,
   TextDiff,
   TracingSpanV1,
@@ -1013,31 +1016,27 @@ export async function getIntelligenceReport(): Promise<IntelligenceReport> {
 }
 
 /** B2: a past corruption quarantine, if any, plus how many restore snapshots exist. */
-export interface QuarantineNotice {
-  quarantinedFiles: string[];
-  snapshotCount: number;
-  newestSnapshotSegments: number | null;
-}
+export type QuarantineNotice = QuarantineNoticeV1;
 
 export async function getQuarantineNotice(): Promise<QuarantineNotice> {
-  return invokeCritical('get_quarantine_notice');
+  const result = await generatedCommands.getQuarantineNotice();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** B2: one rotating auto-snapshot in the restore picker (newest first). */
-export interface SnapshotInfo {
-  name: string;
-  timestamp: number;
-  dbSizeBytes: number;
-  segmentCount: number | null;
-}
+export type SnapshotInfo = SnapshotInfoV1;
 
 export async function listDbSnapshots(): Promise<SnapshotInfo[]> {
-  return invokeCritical('list_db_snapshots');
+  const result = await generatedCommands.listDbSnapshots();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** B2: restore the live database from a named auto-snapshot (destructive — confirm first). */
 export async function restoreDbFromSnapshot(name: string): Promise<void> {
-  return invokeCritical('restore_db_from_snapshot', { name });
+  const result = await generatedCommands.restoreDbFromSnapshot(name);
+  if (result.status === 'error') throw result.error;
 }
 
 /** Complete speaker inventory; SQL NULL/unassigned is distinct from every literal speaker id. */
@@ -1456,26 +1455,30 @@ export async function computeDiff(raw: string, annotated: string): Promise<TextD
 /** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then
  * verify the WRITTEN file (integrity check + segment count) — a disaster copy that is itself bad
  * must fail now, not at the disaster. */
-export async function dbBackup(
-  dest: string,
-): Promise<{ integrityOk: boolean; segmentCount: number }> {
-  return invokeCritical('db_backup', { dest });
+export async function dbBackup(dest: string): Promise<BackupVerificationV1> {
+  const result = await generatedCommands.dbBackup(dest);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Archive every quarantined `*.corrupt.*` artifact into `<data_dir>/quarantine/`, releasing the
  * snapshot prune-pin explicitly (bytes stay salvageable). Returns how many files were archived. */
 export async function acknowledgeQuarantine(): Promise<number> {
-  return invokeCritical('acknowledge_quarantine');
+  const result = await generatedCommands.acknowledgeQuarantine();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Restore the live library from a backup .db file (the counterpart to dbBackup). Destructive — the
  *  backend PRAGMA integrity_check's the source before overwriting, so a corrupt file fails fast. */
 export async function dbRestore(src: string): Promise<void> {
-  return invokeCritical('db_restore', { src });
+  const result = await generatedCommands.dbRestore(src);
+  if (result.status === 'error') throw result.error;
 }
 
 export async function dbVacuum(): Promise<void> {
-  return invokeCritical('db_vacuum');
+  const result = await generatedCommands.dbVacuum();
+  if (result.status === 'error') throw result.error;
 }
 
 export type ModelStatusEntry = ModelStatusEntryV1;

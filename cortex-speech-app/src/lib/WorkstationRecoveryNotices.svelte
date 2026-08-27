@@ -28,7 +28,7 @@
   >
     <span class="text-sm text-red-200">
       {$t('db.quarantined')
-        .replace('{files}', String(quarantineNotice.quarantinedFiles.length))
+        .replace('{files}', String(quarantineNotice.quarantinedFileCount))
         .replace('{snapshots}', String(quarantineNotice.snapshotCount))}
     </span>
     <div class="flex items-center gap-2">

@@ -702,7 +702,14 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::update_segment_metadata_v1,
             crate::commands::delete_segments_v1,
             crate::commands::rename_speaker_v1,
-            crate::commands::assign_speakers_v1
+            crate::commands::assign_speakers_v1,
+            crate::commands::db_backup,
+            crate::commands::db_restore,
+            crate::commands::db_vacuum,
+            crate::commands::get_quarantine_notice,
+            crate::commands::acknowledge_quarantine,
+            crate::commands::list_db_snapshots,
+            crate::commands::restore_db_from_snapshot
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
@@ -748,6 +755,9 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<RenamedSpeakerV1>()
         .typ::<AssignSpeakersRequestV1>()
         .typ::<AssignedSpeakersV1>()
+        .typ::<crate::commands::BackupVerificationV1>()
+        .typ::<crate::commands::QuarantineNoticeV1>()
+        .typ::<crate::commands::SnapshotInfoV1>()
         .typ::<HistoryActionV1>()
         .typ::<HistoryStatusV1>()
         .typ::<HistoryMutationResultV1>()
