@@ -11612,3 +11612,42 @@ workspace decomposition, real decision latency, timeout calibration, certifying 
 sessions, comparator study and pilot evidence remain red. Production data, processes, ports,
 credentials, migrations and the active immutable release pointer were untouched. The verdict remains
 **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — evidence-safe deletion, atomic speaker changes, and exact history inverses
+
+Commits `9de2fc2dcbef982aa49f64ebc2a285e7270232b8`, `4bd4b4d7`, and
+`fb16b2e8b969c3129eebc74eb67ce1f9aaa24d96` close three desktop mutation hazards without changing
+historical migrations or touching production state. Segment deletion now captures exact server rows,
+refuses duplicate/missing identifiers and protected review authority before mutation, and restores a
+complete server snapshot on Undo. Speaker rename, merge, and batch assignment are revision-aware,
+all-or-nothing, replay-safe operations with exact server-owned Undo and Redo. Async command workers
+retain restore admission until database mutation and crash-session persistence both finish, so a
+cancelled renderer future cannot commit a change and silently skip session recovery state.
+
+The history boundary no longer sends backend English descriptions or separately polls racy boolean
+capabilities. Its generated V1 contract returns a stable action enum plus one coherent post-mutation
+status. Renderer Undo/Redo is single-flight and locally translated in English and Sorani. Delete and
+batch-transcription history now use writer-reserved savepoints, exact endpoint compare-and-set, and
+whole-command rollback; deterministic batch Redo stores both server-observed endpoints. Injected
+late-row failures prove that a partial multi-row inverse is never published, while stale rows refuse
+without consuming the retryable history entry.
+
+Exact proof on `fb16b2e8b969c3129eebc74eb67ce1f9aaa24d96`: strict all-target Clippy passed
+with warnings denied; `cargo test --all-targets` passed 1,755 library tests with zero failures and
+eight explicit library ignores, then every binary, integration, property, reliability, shell,
+87.92-second soak, Tauri-integration and benchmark target completed successfully. Frontend proof was
+466/466 unit tests across 78 files and 101/101 Playwright tests; Svelte/TypeScript reported zero
+errors and warnings; ESLint, Prettier, rustfmt, generated IPC, secret hygiene, migration immutability,
+and all 128 reachable Python policy scripts passed. The production bundle measured 120.66 KB gzip
+initial JavaScript and 11.42 KB gzip initial CSS, below the 125 KB and 15 KB budgets. No final gate
+needed a test retry; an earlier mistyped policy-runner path executed no gate and is not represented as
+product evidence.
+
+This is the strongest integrated source checkpoint so far, not a product attestation. The verifier
+still truthfully reports ten missing evidence classes: timeout calibration, verifier fault campaigns,
+coverage/mutation thresholds, architecture contract, known-defect ledger, schema clone/restore,
+concurrency/performance/memory, owner workflow/recovery, deployment/reboot runs, and owner field
+sessions. Signed Windows artifacts, clean-VM update/rollback, manual accessibility, pilot, and paired
+comparator proof also remain absent. Production databases, releases, ports, credentials, models and
+reviewer work were not touched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED —
+NOT 10/10**.
