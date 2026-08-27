@@ -82,10 +82,9 @@ export const commands = {
 	 *  before persistence; grants become effective only after durable settings publication.
 	 */
 	setCloudConsentV1: (request: SetCloudConsentRequestV1) => typedError<SettingsPatchResultV1, CommandErrorV1>(__TAURI_INVOKE("set_cloud_consent_v1", { request })),
-	undo: () => typedError<string | null, CommandErrorV1>(__TAURI_INVOKE("undo")),
-	redo: () => typedError<string | null, CommandErrorV1>(__TAURI_INVOKE("redo")),
-	canUndo: () => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("can_undo")),
-	canRedo: () => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("can_redo")),
+	undo: () => typedError<HistoryMutationResultV1, CommandErrorV1>(__TAURI_INVOKE("undo")),
+	redo: () => typedError<HistoryMutationResultV1, CommandErrorV1>(__TAURI_INVOKE("redo")),
+	getHistoryStatusV1: () => typedError<HistoryStatusV1, CommandErrorV1>(__TAURI_INVOKE("get_history_status_v1")),
 	normalizeText: (text: string) => typedError<string, CommandErrorV1>(__TAURI_INVOKE("normalize_text", { text })),
 	computeDiff: (raw: string, annotated: string) => typedError<TextDiff, CommandErrorV1>(__TAURI_INVOKE("compute_diff", { raw, annotated })),
 	getTracingStats: () => typedError<TracingStatsV1, CommandErrorV1>(__TAURI_INVOKE("get_tracing_stats")),
@@ -267,6 +266,31 @@ export type DiffStats = {
 	changed_words: number,
 	unchanged_words: number,
 	similarity: number,
+};
+
+/**
+ *  Stable action identity for global machine/source history. This is intentionally an enum rather
+ *  than backend-authored display text so every locale owns its own copy and unknown future variants
+ *  fail at the generated TypeScript boundary.
+ */
+export type HistoryActionV1 = "updateSegment" | "deleteSegments" | "batchTranscribe" | "speakerAssignment";
+
+/**
+ *  Server-confirmed history transition and the exact post-transition stack state. `action = None`
+ *  is an honest empty-stack no-op, never an ambiguous English fallback.
+ */
+export type HistoryMutationResultV1 = {
+	action: HistoryActionV1 | null,
+	status: HistoryStatusV1,
+};
+
+/**
+ *  One coherent read of both stacks. Two separate boolean calls could describe different moments
+ *  if a mutation landed between them; this snapshot cannot.
+ */
+export type HistoryStatusV1 = {
+	undoAction: HistoryActionV1 | null,
+	redoAction: HistoryActionV1 | null,
 };
 
 export type InferenceKindStatsV1 = {

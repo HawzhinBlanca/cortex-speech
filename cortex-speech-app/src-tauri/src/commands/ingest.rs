@@ -1072,7 +1072,20 @@ pub fn batch_transcribe(
 
         if !previous_segments.is_empty() {
             if let Some(app_state) = app_clone.try_state::<AppState>() {
-                app_state.lock_history().push(Command::BatchTranscribe { previous_segments });
+                let endpoint_ids = previous_segments.iter().map(|segment| segment.id.clone()).collect::<Vec<_>>();
+                match app_state.lock_db().get_segments_by_ids(&endpoint_ids) {
+                    Ok(current_segments) if current_segments.len() == previous_segments.len() => {
+                        app_state.lock_history().push(Command::BatchTranscribe { previous_segments, current_segments });
+                    }
+                    Ok(current_segments) => tracing::error!(
+                        "Batch history refused: {} durable ASR writes produced only {} current endpoints",
+                        previous_segments.len(),
+                        current_segments.len()
+                    ),
+                    Err(error) => tracing::error!(
+                        "Batch history refused because its current endpoint snapshot could not be read: {error}"
+                    ),
+                }
             }
         }
 

@@ -6,8 +6,6 @@ import {
   ASR_7B_UNAVAILABLE_TAG,
   appGitSha,
   appHealth,
-  canRedo,
-  canUndo,
   cancelDesktopPlaybackSessionV1,
   commitReviewV1,
   computeDiff,
@@ -15,6 +13,7 @@ import {
   deleteReviewDraftV1,
   getSettings,
   getActiveVoiceFocusV1,
+  getHistoryStatusV1,
   getInferenceStats,
   getRecentSpans,
   getReviewDraftV1,
@@ -215,18 +214,25 @@ describe('generated desktop history contract', () => {
     invokeMock.mockReset();
   });
 
-  it('routes all four history commands through their generated names and preserves results', async () => {
+  it('uses one coherent status snapshot and preserves typed mutation results', async () => {
+    const initialStatus = { undoAction: 'updateSegment' as const, redoAction: null };
+    const undone = {
+      action: 'updateSegment' as const,
+      status: { undoAction: null, redoAction: 'updateSegment' as const },
+    };
+    const redone = {
+      action: 'updateSegment' as const,
+      status: { undoAction: 'updateSegment' as const, redoAction: null },
+    };
     invokeMock
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce('Update transcript')
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce(initialStatus)
+      .mockResolvedValueOnce(undone)
+      .mockResolvedValueOnce(redone);
 
-    await expect(canUndo()).resolves.toBe(true);
-    await expect(canRedo()).resolves.toBe(false);
-    await expect(undo()).resolves.toBe('Update transcript');
-    await expect(redo()).resolves.toBeNull();
-    expect(invokeMock.mock.calls).toEqual([['can_undo'], ['can_redo'], ['undo'], ['redo']]);
+    await expect(getHistoryStatusV1()).resolves.toEqual(initialStatus);
+    await expect(undo()).resolves.toEqual(undone);
+    await expect(redo()).resolves.toEqual(redone);
+    expect(invokeMock.mock.calls).toEqual([['get_history_status_v1'], ['undo'], ['redo']]);
   });
 
   it('preserves a structured typed refusal without converting it to a raw string', async () => {

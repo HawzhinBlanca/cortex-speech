@@ -176,6 +176,11 @@ export async function installTauriMock(page: Page): Promise<void> {
             return [mockSegment];
           case 'get_settings':
             return mockSettings;
+          case 'get_history_status_v1':
+            return { undoAction: null, redoAction: null };
+          case 'undo':
+          case 'redo':
+            return { action: null, status: { undoAction: null, redoAction: null } };
           case 'get_dataset_quality':
             return mockQuality;
           case 'get_dataset_certificate':

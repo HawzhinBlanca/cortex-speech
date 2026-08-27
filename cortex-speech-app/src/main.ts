@@ -558,6 +558,10 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     }
     if (cmd === 'restore_session' || cmd === 'take_last_crash') return null;
     if (cmd === 'save_session' || cmd === 'update_settings') return null;
+    if (cmd === 'get_history_status_v1') return { undoAction: null, redoAction: null };
+    if (cmd === 'undo' || cmd === 'redo') {
+      return { action: null, status: { undoAction: null, redoAction: null } };
+    }
     if (cmd === 'get_configured_providers') return [];
     if (cmd === 'couch_review_status') return { running: false, reviewers: [] };
     if (cmd === 'spot_check_report' || cmd === 'reviewer_throughput') return [];

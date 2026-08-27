@@ -387,6 +387,32 @@ impl Database {
         Ok(())
     }
 
+    /// Writer-reserved wrapper for the read/compare/write history transition above. Holding the
+    /// reservation across its validation read closes the external-connection race where a row could
+    /// change after comparison but before the UPDATE.
+    pub(crate) fn apply_history_machine_snapshot_atomic(
+        &self,
+        expected: &SpeechSegment,
+        desired: &SpeechSegment,
+    ) -> AppResult<()> {
+        self.conn.execute("SAVEPOINT history_machine_snapshot", [])?;
+        let result: AppResult<()> = (|| {
+            self.conn.execute("UPDATE speech_segments SET id = id WHERE 0", [])?;
+            self.apply_history_machine_snapshot(expected, desired)
+        })();
+        match result {
+            Ok(()) => {
+                self.release_savepoint("history_machine_snapshot")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("history_machine_snapshot");
+                Err(error)
+            }
+        }
+    }
+
     /// Undo the fields owned by batch transcription. The command intentionally carries only the
     /// pre-batch row, so deterministic redo is unsupported; its inverse is correspondingly limited
     /// to the exact ASR columns the batch writer owns. Review/source fields are never named.
@@ -394,9 +420,12 @@ impl Database {
         if crate::migrations::get_current_version(self)? < 60 {
             return self.insert_segment(previous);
         }
-        let Some(current) = self.get_segment_by_id(&previous.id)? else {
-            return Ok(());
-        };
+        let current = self.get_segment_by_id(&previous.id)?.ok_or_else(|| {
+            AppError::Validation(format!(
+                "Cannot undo batch transcription for segment {}: it no longer exists",
+                previous.id
+            ))
+        })?;
         if !history_source_identity_matches(&current, previous) {
             return Err(AppError::Validation(format!(
                 "Cannot undo batch transcription for segment {}: its protected source identity changed",
@@ -440,6 +469,152 @@ impl Database {
         )?;
         self.track_write()?;
         Ok(())
+    }
+
+    /// Apply one batch-transcription history endpoint as a compare-and-set, all-or-nothing action.
+    /// Both endpoint vectors are server snapshots; renderer data never enters this boundary.
+    pub(crate) fn apply_batch_transcription_history(
+        &self,
+        previous_segments: &[SpeechSegment],
+        current_segments: &[SpeechSegment],
+        forward: bool,
+    ) -> AppResult<()> {
+        let mut unique_ids = HashSet::with_capacity(previous_segments.len());
+        if previous_segments.is_empty()
+            || previous_segments.len() != current_segments.len()
+            || previous_segments.iter().any(|segment| !unique_ids.insert(segment.id.as_str()))
+        {
+            return Err(AppError::Validation(
+                "batch transcription history requires equal non-empty endpoints with unique segment ids".into(),
+            ));
+        }
+        let current_by_id: HashMap<&str, &SpeechSegment> =
+            current_segments.iter().map(|segment| (segment.id.as_str(), segment)).collect();
+        if current_by_id.len() != current_segments.len() {
+            return Err(AppError::Validation(
+                "batch transcription history current endpoints contain duplicate segment ids".into(),
+            ));
+        }
+        for previous in previous_segments {
+            let current = current_by_id.get(previous.id.as_str()).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "batch transcription history has no current endpoint for segment {}",
+                    previous.id
+                ))
+            })?;
+            if !history_source_identity_matches(previous, current)
+                || !review_owned_projection_matches(previous, current)
+            {
+                return Err(AppError::Validation(format!(
+                    "batch transcription history endpoints changed protected truth for segment {}",
+                    previous.id
+                )));
+            }
+        }
+
+        self.conn.execute("SAVEPOINT history_batch_transcription", [])?;
+        let result: AppResult<()> = (|| {
+            // Acquire SQLite's writer reservation before the first validation read. Otherwise an
+            // external connection could change a row between validation and the first UPDATE.
+            self.conn.execute("UPDATE speech_segments SET id = id WHERE 0", [])?;
+            for previous in previous_segments {
+                let current = current_by_id[previous.id.as_str()];
+                let (expected, desired) = if forward { (previous, current) } else { (current, previous) };
+                let actual = self.get_segment_by_id(&expected.id)?.ok_or_else(|| {
+                    AppError::Validation(format!(
+                        "Cannot apply batch transcription history for segment {}: it no longer exists",
+                        expected.id
+                    ))
+                })?;
+                if !history_source_identity_matches(&actual, expected)
+                    || !review_owned_projection_matches(&actual, expected)
+                    || !batch_transcription_projection_matches(&actual, expected)
+                {
+                    return Err(AppError::Validation(format!(
+                        "Cannot apply stale batch transcription history for segment {}",
+                        expected.id
+                    )));
+                }
+                self.restore_batch_transcription_snapshot(desired)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.release_savepoint("history_batch_transcription")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("history_batch_transcription");
+                Err(error)
+            }
+        }
+    }
+
+    /// Apply the inverse or forward form of one exact deleted-segment history command. Restores
+    /// require every id to still be absent. Redos require every current row to match the snapshot
+    /// restored by Undo; a later edit or partial external deletion therefore deletes nothing.
+    pub(crate) fn apply_deleted_segments_history(&self, segments: &[SpeechSegment], forward: bool) -> AppResult<()> {
+        let mut unique_ids = HashSet::with_capacity(segments.len());
+        if segments.is_empty() || segments.iter().any(|segment| !unique_ids.insert(segment.id.as_str())) {
+            return Err(AppError::Validation(
+                "deleted-segment history requires a non-empty set of unique segment ids".into(),
+            ));
+        }
+
+        self.conn.execute("SAVEPOINT history_deleted_segments", [])?;
+        let result: AppResult<()> = (|| {
+            self.conn.execute("UPDATE speech_segments SET id = id WHERE 0", [])?;
+            if forward {
+                for expected in segments {
+                    let current = self.get_segment_by_id(&expected.id)?.ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "Cannot redo deletion for segment {}: it no longer exists",
+                            expected.id
+                        ))
+                    })?;
+                    if current.created_at != expected.created_at
+                        || !review_owned_projection_matches(&current, expected)
+                        || !history_source_identity_matches(&current, expected)
+                        || !history_machine_projection_matches(&current, expected)
+                    {
+                        return Err(AppError::Validation(format!(
+                            "Cannot redo stale deletion for segment {}: it changed after Undo",
+                            expected.id
+                        )));
+                    }
+                }
+                let ids = segments.iter().map(|segment| segment.id.clone()).collect::<Vec<_>>();
+                self.delete_segments_batch(&ids)?;
+            } else {
+                for segment in segments {
+                    if self.get_segment_by_id(&segment.id)?.is_some() {
+                        return Err(AppError::Validation(format!(
+                            "Cannot undo deletion for segment {}: that id is already present",
+                            segment.id
+                        )));
+                    }
+                    // The row was hard-deleted, so this is a fresh full-column restore. At schema
+                    // v60+, reviewed/gold rows could not have been deleted in the first place.
+                    self.insert_segment_full(segment)?;
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.release_savepoint("history_deleted_segments")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("history_deleted_segments");
+                Err(error)
+            }
+        }
     }
 
     /// Legacy lossless full-row insertion. Schema 60 turns this generic boundary into a machine/source

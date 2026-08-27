@@ -317,13 +317,18 @@ pub async fn rename_speaker_v1(
     let target_speaker_id = request.target_speaker_id;
     let expected_source_count = request.expected_source_count;
     let expected_target_count = request.expected_target_count;
+    let worker_app = app.clone();
     let (renamed, _mutation) = tokio::task::spawn_blocking(move || {
-        segment_writes.rename_speaker_v1(
+        let result = segment_writes.rename_speaker_v1(
             source_speaker_id.as_deref(),
             &target_speaker_id,
             expected_source_count,
             expected_target_count,
-        )
+        )?;
+        if let Some(app_state) = worker_app.try_state::<AppState>() {
+            app_state.session_auto_save();
+        }
+        Ok::<_, crate::stores::SpeakerRenameError>(result)
     })
     .await
     .map_err(|_| {
@@ -335,9 +340,6 @@ pub async fn rename_speaker_v1(
         .suggested(SuggestedActionV1::Retry)
     })?
     .map_err(public_speaker_rename_error)?;
-    if let Some(app_state) = app.try_state::<AppState>() {
-        app_state.session_auto_save();
-    }
     Ok(RenamedSpeakerV1 {
         source_speaker_id: renamed.source_speaker_id,
         target_speaker_id: renamed.target_speaker_id,

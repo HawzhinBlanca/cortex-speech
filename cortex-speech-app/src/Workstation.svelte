@@ -46,6 +46,7 @@
   import { notifications } from './lib/stores/notificationStore';
   import { isVerifiedGood } from './lib/segmentQuality';
   import { historyStore } from './lib/stores/historyStore';
+  import { historyMutationMessage, type HistoryRecorder } from './lib/historyAction';
   import {
     initKeyboardManager,
     globalKeyboardManager,
@@ -105,10 +106,6 @@
   } from './lib/alignment';
   import { wordPlayBounds } from './lib/wordEdit';
 
-  type HistoryPanelApi = {
-    recordAction: (description: string, type: 'edit' | 'verify' | 'delete' | 'import') => void;
-  };
-
   // Secondary workspaces are isolated chunks. These stable loader functions are intentionally
   // declared outside reactive work so a parent update cannot restart an in-flight import.
   const loadSettingsPanel = () => import('./lib/SettingsPanel.svelte');
@@ -162,7 +159,7 @@
   });
   let batchSpeakerId = $state('');
   let editorTab = $state<'interactive' | 'raw'>('interactive');
-  let historyPanel = $state<HistoryPanelApi | null>(null);
+  let historyPanel = $state<HistoryRecorder | null>(null);
   let latestAgentReport = $state<AgentImportReport | null>(null);
   let latestAgentStageEvents = $state<AgentStageEvent[]>([]);
 
@@ -1188,6 +1185,7 @@
 
   async function handleUndo() {
     if (!requireDesktopRuntime()) return;
+    if ($historyStore.processing) return;
     // The global history stack records only updateSegment, NOT record_human_decision. On the review
     // surfaces (Review & Correct, and the Inbox overlay) a global Ctrl+Z would revert `verified` but
     // leave the human_decision row — splitting state (the clip re-enters the queue while the DB says it
@@ -1198,13 +1196,16 @@
       return;
     }
     try {
-      const description = await historyStore.undo();
-      notifications.info(
-        $t('notifications.undone', { what: description ?? $t('notifications.lastActionReverted') }),
-      );
+      const result = await historyStore.undo();
+      const message = historyMutationMessage($t, result.action, 'undo');
+      if (!result.action) {
+        notifications.info(message);
+        return;
+      }
+      notifications.info(message);
       await loadSegments();
       if (historyPanel) {
-        historyPanel.recordAction(`Reverted: ${description ?? 'action'}`, 'edit');
+        historyPanel.recordAction(message, 'edit');
       }
     } catch (e) {
       notifications.error($t('notifications.undoFailed'), { cause: e });
@@ -1213,18 +1214,20 @@
 
   async function handleRedo() {
     if (!requireDesktopRuntime()) return;
+    if ($historyStore.processing) return;
     // Same split-state hazard as handleUndo: the global redo has no meaning on the review surfaces.
     if (viewMode === 'review' || $showReviewInbox) return;
     try {
-      const description = await historyStore.redo();
-      notifications.info(
-        $t('notifications.redone', {
-          what: description ?? $t('notifications.lastActionReapplied'),
-        }),
-      );
+      const result = await historyStore.redo();
+      const message = historyMutationMessage($t, result.action, 'redo');
+      if (!result.action) {
+        notifications.info(message);
+        return;
+      }
+      notifications.info(message);
       await loadSegments();
       if (historyPanel) {
-        historyPanel.recordAction(`Redone: ${description ?? 'action'}`, 'edit');
+        historyPanel.recordAction(message, 'edit');
       }
     } catch (e) {
       notifications.error($t('notifications.redoFailed'), { cause: e });

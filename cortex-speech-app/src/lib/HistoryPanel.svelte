@@ -1,5 +1,7 @@
 <script lang="ts">
   import { historyStore } from './stores/historyStore';
+  import { notifications } from './stores/notificationStore';
+  import { historyMutationMessage } from './historyAction';
   import { onDestroy } from 'svelte';
   import { t } from './i18n';
 
@@ -15,10 +17,12 @@
   let localEdits = $state<EditRecord[]>([]);
   let canUndo = $state(false);
   let canRedo = $state(false);
+  let processing = $state(false);
 
   const unsubscribe = historyStore.subscribe(($history) => {
     canUndo = $history.canUndo;
     canRedo = $history.canRedo;
+    processing = $history.processing;
   });
 
   onDestroy(() => {
@@ -39,20 +43,34 @@
   }
 
   async function handleUndo() {
+    if (processing) return;
     try {
-      await historyStore.undo();
-      recordAction($t('history.undoneAction'), 'edit');
+      const result = await historyStore.undo();
+      const message = historyMutationMessage($t, result.action, 'undo');
+      if (!result.action) {
+        notifications.info(message);
+        return;
+      }
+      recordAction(message, 'edit');
+      notifications.info(message);
     } catch (e) {
-      console.error(e);
+      notifications.error($t('notifications.undoFailed'), { cause: e });
     }
   }
 
   async function handleRedo() {
+    if (processing) return;
     try {
-      await historyStore.redo();
-      recordAction($t('history.redoneAction'), 'edit');
+      const result = await historyStore.redo();
+      const message = historyMutationMessage($t, result.action, 'redo');
+      if (!result.action) {
+        notifications.info(message);
+        return;
+      }
+      recordAction(message, 'edit');
+      notifications.info(message);
     } catch (e) {
-      console.error(e);
+      notifications.error($t('notifications.redoFailed'), { cause: e });
     }
   }
 </script>
@@ -68,16 +86,20 @@
     <div class="flex gap-1.5">
       <button
         class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 flex items-center gap-1 relative
-          {canUndo
+          {canUndo && !processing
           ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/30 hover:bg-indigo-600/30'
           : 'bg-transparent text-cortex-600 border-cortex-900 cursor-not-allowed opacity-40'}"
         onclick={handleUndo}
-        disabled={!canUndo}
+        disabled={!canUndo || processing}
         title={$t('history.undoShortcut')}
-        aria-describedby={!canUndo ? 'history-no-undo' : undefined}
+        aria-describedby={processing
+          ? 'history-processing'
+          : !canUndo
+            ? 'history-no-undo'
+            : undefined}
       >
         <span>{$t('undo')}</span>
-        {#if showHotkeyOverlay && canUndo}
+        {#if showHotkeyOverlay && canUndo && !processing}
           <span
             class="absolute -top-1.5 -right-1.5 bg-cyan-400 text-black text-[8px] font-mono font-bold px-1 rounded shadow-md border border-cyan-500 select-none z-50 pointer-events-none"
             >^Z</span
@@ -87,16 +109,20 @@
 
       <button
         class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all duration-150 flex items-center gap-1 relative
-          {canRedo
+          {canRedo && !processing
           ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/30 hover:bg-indigo-600/30'
           : 'bg-transparent text-cortex-600 border-cortex-900 cursor-not-allowed opacity-40'}"
         onclick={handleRedo}
-        disabled={!canRedo}
+        disabled={!canRedo || processing}
         title={$t('history.redoShortcut')}
-        aria-describedby={!canRedo ? 'history-no-redo' : undefined}
+        aria-describedby={processing
+          ? 'history-processing'
+          : !canRedo
+            ? 'history-no-redo'
+            : undefined}
       >
         <span>{$t('redo')}</span>
-        {#if showHotkeyOverlay && canRedo}
+        {#if showHotkeyOverlay && canRedo && !processing}
           <span
             class="absolute -top-1.5 -right-1.5 bg-cyan-400 text-black text-[8px] font-mono font-bold px-1 rounded shadow-md border border-cyan-500 select-none z-50 pointer-events-none"
             >^+Z</span
@@ -105,6 +131,7 @@
       </button>
       <span id="history-no-undo" class="sr-only">{$t('history.nothingToUndo')}</span>
       <span id="history-no-redo" class="sr-only">{$t('history.nothingToRedo')}</span>
+      <span id="history-processing" class="sr-only">{$t('history.processing')}</span>
     </div>
   </div>
 

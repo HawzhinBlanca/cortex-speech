@@ -311,48 +311,99 @@ fn public_history_error(action: &str, error: &str) -> crate::ipc_contract::Comma
         .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
 }
 
+fn history_status(history: &crate::history::HistoryManager) -> crate::ipc_contract::HistoryStatusV1 {
+    crate::ipc_contract::HistoryStatusV1 {
+        undo_action: history.undo_action().map(Into::into),
+        redo_action: history.redo_action().map(Into::into),
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
-pub fn undo(state: State<'_, AppState>) -> Result<Option<String>, crate::ipc_contract::CommandErrorV1> {
+pub async fn undo(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("undo").map_err(|_| history_rate_limited_error())?;
-    let _mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
-    let result = {
-        let db = state.lock_db();
-        let history = state.lock_history();
-        history.undo(&db).map_err(|error| public_history_error("undo", &error.to_string()))?
-    };
-    if result.is_some() {
-        state.session_auto_save();
-    }
+    let database = state.db_arc();
+    let history = state.history_arc_for_restore();
+    let worker_app = app.clone();
+    let (result, _mutation) = tokio::task::spawn_blocking(move || {
+        let mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+        let database = database.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let action = history.undo(&database).map_err(|error| public_history_error("undo", &error.to_string()))?;
+        let status = history_status(&history);
+        drop(history);
+        drop(database);
+        if action.is_some() {
+            if let Some(app_state) = worker_app.try_state::<AppState>() {
+                app_state.session_auto_save();
+            }
+        }
+        Ok::<_, crate::ipc_contract::CommandErrorV1>((
+            crate::ipc_contract::HistoryMutationResultV1 { action: action.map(Into::into), status },
+            mutation,
+        ))
+    })
+    .await
+    .map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "UNDO_WORKER_FAILED",
+            "The Undo worker stopped unexpectedly. Retry the action.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })??;
     Ok(result)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn redo(state: State<'_, AppState>) -> Result<Option<String>, crate::ipc_contract::CommandErrorV1> {
+pub async fn redo(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("redo").map_err(|_| history_rate_limited_error())?;
-    let _mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
-    let result = {
-        let db = state.lock_db();
-        let history = state.lock_history();
-        history.redo(&db).map_err(|error| public_history_error("redo", &error.to_string()))?
-    };
-    if result.is_some() {
-        state.session_auto_save();
-    }
+    let database = state.db_arc();
+    let history = state.history_arc_for_restore();
+    let worker_app = app.clone();
+    let (result, _mutation) = tokio::task::spawn_blocking(move || {
+        let mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+        let database = database.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let action = history.redo(&database).map_err(|error| public_history_error("redo", &error.to_string()))?;
+        let status = history_status(&history);
+        drop(history);
+        drop(database);
+        if action.is_some() {
+            if let Some(app_state) = worker_app.try_state::<AppState>() {
+                app_state.session_auto_save();
+            }
+        }
+        Ok::<_, crate::ipc_contract::CommandErrorV1>((
+            crate::ipc_contract::HistoryMutationResultV1 { action: action.map(Into::into), status },
+            mutation,
+        ))
+    })
+    .await
+    .map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "REDO_WORKER_FAILED",
+            "The Redo worker stopped unexpectedly. Retry the action.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })??;
     Ok(result)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn can_undo(state: State<'_, AppState>) -> Result<bool, crate::ipc_contract::CommandErrorV1> {
-    Ok(state.lock_history().can_undo())
-}
-
-#[tauri::command]
-#[specta::specta]
-pub fn can_redo(state: State<'_, AppState>) -> Result<bool, crate::ipc_contract::CommandErrorV1> {
-    Ok(state.lock_history().can_redo())
+pub fn get_history_status_v1(
+    state: State<'_, AppState>,
+) -> Result<crate::ipc_contract::HistoryStatusV1, crate::ipc_contract::CommandErrorV1> {
+    Ok(history_status(&state.lock_history()))
 }
 
 #[cfg(test)]

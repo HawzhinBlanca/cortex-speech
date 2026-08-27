@@ -12,6 +12,8 @@ import type {
   CommittedReviewV1,
   DesktopPlaybackReceiptV1,
   DesktopPlaybackSessionV1,
+  HistoryMutationResultV1,
+  HistoryStatusV1,
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1,
@@ -36,6 +38,9 @@ export type {
   AppHealthV1 as AppHealth,
   DesktopPlaybackReceiptV1,
   DesktopPlaybackSessionV1,
+  HistoryActionV1,
+  HistoryMutationResultV1,
+  HistoryStatusV1,
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1 as InferenceStats,
@@ -1415,26 +1420,20 @@ export async function exportHuggingfaceDataset(outputDir: string): Promise<void>
   return invokeCritical('export_huggingface_dataset', { path: outputDir });
 }
 
-export async function undo(): Promise<string | null> {
+export async function undo(): Promise<HistoryMutationResultV1> {
   const result = await generatedCommands.undo();
   if (result.status === 'error') throw result.error;
   return result.data;
 }
 
-export async function redo(): Promise<string | null> {
+export async function redo(): Promise<HistoryMutationResultV1> {
   const result = await generatedCommands.redo();
   if (result.status === 'error') throw result.error;
   return result.data;
 }
 
-export async function canUndo(): Promise<boolean> {
-  const result = await generatedCommands.canUndo();
-  if (result.status === 'error') throw result.error;
-  return result.data;
-}
-
-export async function canRedo(): Promise<boolean> {
-  const result = await generatedCommands.canRedo();
+export async function getHistoryStatusV1(): Promise<HistoryStatusV1> {
+  const result = await generatedCommands.getHistoryStatusV1();
   if (result.status === 'error') throw result.error;
   return result.data;
 }

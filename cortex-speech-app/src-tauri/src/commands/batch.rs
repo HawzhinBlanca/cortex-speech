@@ -126,8 +126,15 @@ pub async fn assign_speakers_v1(
     let requested_count = request.ids.len();
     let target_speaker_id = request.target_speaker_id;
     let segment_writes = state.segment_writes();
+    let worker_app = app.clone();
     let (assigned, _mutation) = tokio::task::spawn_blocking(move || {
-        segment_writes.assign_speaker_batch_v1(&request.ids, target_speaker_id.as_deref())
+        let result = segment_writes.assign_speaker_batch_v1(&request.ids, target_speaker_id.as_deref())?;
+        if result.0.changed_count > 0 {
+            if let Some(app_state) = worker_app.try_state::<AppState>() {
+                app_state.session_auto_save();
+            }
+        }
+        Ok::<_, crate::stores::SpeakerAssignmentError>(result)
     })
     .await
     .map_err(|_| {
@@ -139,11 +146,6 @@ pub async fn assign_speakers_v1(
         .suggested(SuggestedActionV1::Retry)
     })?
     .map_err(public_speaker_assignment_error)?;
-    if assigned.changed_count > 0 {
-        if let Some(app_state) = app.try_state::<AppState>() {
-            app_state.session_auto_save();
-        }
-    }
     Ok(AssignedSpeakersV1 {
         requested_count,
         changed_count: assigned.changed_count,

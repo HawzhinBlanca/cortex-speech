@@ -1,69 +1,91 @@
 import { writable } from 'svelte/store';
-import { canRedo, canUndo, redo, undo } from '../commands';
+import {
+  getHistoryStatusV1,
+  redo,
+  undo,
+  type HistoryActionV1,
+  type HistoryMutationResultV1,
+  type HistoryStatusV1,
+} from '../commands';
 import { isTauriRuntime } from '../runtime';
 
 export interface HistoryState {
   canUndo: boolean;
   canRedo: boolean;
-  undoDescription: string | null;
-  redoDescription: string | null;
+  undoAction: HistoryActionV1 | null;
+  redoAction: HistoryActionV1 | null;
   processing: boolean;
+}
+
+const emptyStatus: HistoryStatusV1 = { undoAction: null, redoAction: null };
+
+function stateFromStatus(status: HistoryStatusV1, processing: boolean): HistoryState {
+  return {
+    canUndo: status.undoAction !== null,
+    canRedo: status.redoAction !== null,
+    undoAction: status.undoAction,
+    redoAction: status.redoAction,
+    processing,
+  };
 }
 
 function createHistoryStore() {
   const store = writable<HistoryState>({
     canUndo: false,
     canRedo: false,
-    undoDescription: null,
-    redoDescription: null,
+    undoAction: null,
+    redoAction: null,
     processing: false,
   });
+  let activeMutation: Promise<HistoryMutationResultV1> | null = null;
+
+  function runMutation(operation: () => Promise<HistoryMutationResultV1>) {
+    // A double click or repeated shortcut while the first durable write is pending must observe the
+    // same result, never consume a second history entry.
+    if (activeMutation) return activeMutation;
+    store.update((state) => ({ ...state, processing: true }));
+    activeMutation = operation()
+      .then((result) => {
+        store.set(stateFromStatus(result.status, true));
+        return result;
+      })
+      .finally(() => {
+        activeMutation = null;
+        store.update((state) => ({ ...state, processing: false }));
+      });
+    return activeMutation;
+  }
 
   async function refresh() {
     if (!isTauriRuntime()) {
-      store.update((s) => ({ ...s, canUndo: false, canRedo: false }));
+      store.set(stateFromStatus(emptyStatus, false));
       return;
     }
 
     try {
-      const [undoAvailable, redoAvailable] = await Promise.all([canUndo(), canRedo()]);
-      store.update((s) => ({ ...s, canUndo: undoAvailable, canRedo: redoAvailable }));
+      store.set(stateFromStatus(await getHistoryStatusV1(), false));
     } catch {
-      store.update((s) => ({ ...s, canUndo: false, canRedo: false }));
+      store.set(stateFromStatus(emptyStatus, false));
     }
   }
 
   return {
     subscribe: store.subscribe,
-    async undo(): Promise<string | null> {
+    async undo(): Promise<HistoryMutationResultV1> {
       if (!isTauriRuntime()) {
-        store.update((s) => ({ ...s, canUndo: false, canRedo: false, processing: false }));
-        return null;
+        store.set(stateFromStatus(emptyStatus, false));
+        return { action: null, status: emptyStatus };
       }
 
-      store.update((s) => ({ ...s, processing: true }));
-      try {
-        const description = await undo();
-        await refresh();
-        return description;
-      } finally {
-        store.update((s) => ({ ...s, processing: false }));
-      }
+      return runMutation(undo);
     },
-    async redo(): Promise<string | null> {
+    async redo(): Promise<HistoryMutationResultV1> {
       if (!isTauriRuntime()) {
-        store.update((s) => ({ ...s, canUndo: false, canRedo: false, processing: false }));
-        return null;
+        store.set(stateFromStatus(emptyStatus, false));
+        return { action: null, status: emptyStatus };
       }
 
-      store.update((s) => ({ ...s, processing: true }));
-      try {
-        const description = await redo();
-        await refresh();
-        return description;
-      } finally {
-        store.update((s) => ({ ...s, processing: false }));
-      }
+      return runMutation(redo);
     },
     refresh,
   };

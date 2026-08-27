@@ -1162,6 +1162,20 @@ pub(super) fn history_machine_projection_matches(left: &SpeechSegment, right: &S
         && left.speaker_change_score == right.speaker_change_score
 }
 
+/// The exact columns owned by one batch-transcription write. Undo/redo compares and replaces only
+/// this projection, so an unrelated later speaker/split/quality edit neither gets clobbered nor
+/// unnecessarily blocks the inverse.
+pub(super) fn batch_transcription_projection_matches(left: &SpeechSegment, right: &SpeechSegment) -> bool {
+    left.raw_transcript == right.raw_transcript
+        && left.normalized_transcript == right.normalized_transcript
+        && left.confidence == right.confidence
+        && left.confidence_source.as_deref().unwrap_or("unknown")
+            == right.confidence_source.as_deref().unwrap_or("unknown")
+        && left.model_version_id.as_deref().unwrap_or("unknown@pre-registry")
+            == right.model_version_id.as_deref().unwrap_or("unknown@pre-registry")
+        && left.cloud_call == right.cloud_call
+}
+
 /// Fold Sorani codepoint variants (Kaf ك/ک, Yeh ي/ی, Heh, Hamza, ZWNJ, tatweel) in a
 /// full-text search query so it matches the canonical `normalized_transcript` column
 /// regardless of which keyboard variant the user typed — the FTS index stores the

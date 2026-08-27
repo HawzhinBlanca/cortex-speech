@@ -371,7 +371,7 @@ mod tests {
 
         let database = runtime.lock().unwrap();
         let history = history.lock().unwrap();
-        assert_eq!(history.undo(&database).unwrap().as_deref(), Some("Delete segments"));
+        assert_eq!(history.undo(&database).unwrap(), Some(crate::history::HistoryAction::DeleteSegments));
         let restored = database.get_segment_by_id("one").unwrap().unwrap();
         assert_eq!(restored.raw_transcript, "draft-one");
         assert_eq!(restored.speaker_id.as_deref(), Some("speaker-a"));
@@ -471,7 +471,7 @@ mod tests {
         {
             let database = runtime.lock().unwrap();
             let history = history.lock().unwrap();
-            assert_eq!(history.undo(&database).unwrap().as_deref(), Some("Assign speaker"));
+            assert_eq!(history.undo(&database).unwrap(), Some(crate::history::HistoryAction::SpeakerAssignment));
         }
         let restored =
             runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
@@ -481,7 +481,7 @@ mod tests {
         {
             let database = runtime.lock().unwrap();
             let history = history.lock().unwrap();
-            assert_eq!(history.redo(&database).unwrap().as_deref(), Some("Assign speaker"));
+            assert_eq!(history.redo(&database).unwrap(), Some(crate::history::HistoryAction::SpeakerAssignment));
         }
         let redone =
             runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
@@ -504,7 +504,7 @@ mod tests {
         {
             let database = runtime.lock().unwrap();
             let history = history.lock().unwrap();
-            assert_eq!(history.undo(&database).unwrap().as_deref(), Some("Assign speaker"));
+            assert_eq!(history.undo(&database).unwrap(), Some(crate::history::HistoryAction::SpeakerAssignment));
             assert!(!history.can_undo(), "the no-op replay must not add a second history entry");
         }
         let restored = runtime.open_read().unwrap().get_segments_by_ids(&ids).unwrap();

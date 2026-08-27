@@ -63,6 +63,10 @@ ASYNC_SLOW_COMMANDS = [
     "merge_dataset_json",
     "assign_speakers_v1",
     "rename_speaker_v1",
+    # A single history action can restore/delete tens of thousands of full segment snapshots. Both
+    # paths are typed async commands and execute their transaction on spawn_blocking.
+    "undo",
+    "redo",
     # Eval / quality / calibration compute over the whole dataset.
     "get_dataset_certificate",
     "run_gold_eval",

@@ -301,6 +301,47 @@ pub struct AssignedSpeakersV1 {
     pub unchanged_count: usize,
 }
 
+/// Stable action identity for global machine/source history. This is intentionally an enum rather
+/// than backend-authored display text so every locale owns its own copy and unknown future variants
+/// fail at the generated TypeScript boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HistoryActionV1 {
+    UpdateSegment,
+    DeleteSegments,
+    BatchTranscribe,
+    SpeakerAssignment,
+}
+
+impl From<crate::history::HistoryAction> for HistoryActionV1 {
+    fn from(action: crate::history::HistoryAction) -> Self {
+        match action {
+            crate::history::HistoryAction::UpdateSegment => Self::UpdateSegment,
+            crate::history::HistoryAction::DeleteSegments => Self::DeleteSegments,
+            crate::history::HistoryAction::BatchTranscribe => Self::BatchTranscribe,
+            crate::history::HistoryAction::SpeakerAssignment => Self::SpeakerAssignment,
+        }
+    }
+}
+
+/// One coherent read of both stacks. Two separate boolean calls could describe different moments
+/// if a mutation landed between them; this snapshot cannot.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryStatusV1 {
+    pub undo_action: Option<HistoryActionV1>,
+    pub redo_action: Option<HistoryActionV1>,
+}
+
+/// Server-confirmed history transition and the exact post-transition stack state. `action = None`
+/// is an honest empty-stack no-op, never an ambiguous English fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMutationResultV1 {
+    pub action: Option<HistoryActionV1>,
+    pub status: HistoryStatusV1,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewItemV1 {
@@ -584,8 +625,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::set_cloud_consent_v1,
             crate::commands::undo,
             crate::commands::redo,
-            crate::commands::can_undo,
-            crate::commands::can_redo,
+            crate::commands::get_history_status_v1,
             crate::commands::normalize_text,
             crate::commands::compute_diff,
             crate::commands::get_tracing_stats,
@@ -635,6 +675,9 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<RenamedSpeakerV1>()
         .typ::<AssignSpeakersRequestV1>()
         .typ::<AssignedSpeakersV1>()
+        .typ::<HistoryActionV1>()
+        .typ::<HistoryStatusV1>()
+        .typ::<HistoryMutationResultV1>()
         .typ::<ReviewItemV1>()
         .typ::<ReviewPageV1>()
         .typ::<ReviewDecisionV1>()

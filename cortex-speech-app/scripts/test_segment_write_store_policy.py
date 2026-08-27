@@ -84,7 +84,7 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
         "expected_source_count",
         "expected_target_count",
         "spawn_blocking",
-        "app.try_state::<AppState>()",
+        "worker_app.try_state::<AppState>()",
     ):
         if required not in rename:
             raise AssertionError(f"typed speaker rename boundary lost {required!r}")
@@ -117,6 +117,7 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
         "_mutation",
         "session_auto_save()",
         "public_speaker_assignment_error",
+        "worker_app.try_state::<AppState>()",
     ):
         if required not in batch_body and required != "#[specta::specta]":
             raise AssertionError(f"typed batch speaker assignment lost {required!r}")
@@ -131,6 +132,10 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
         "SpeakerAssignment {",
         "db.apply_speaker_assignment_history(changes, false)?",
         "db.apply_speaker_assignment_history(changes, true)?",
+        "db.apply_deleted_segments_history(segments, false)?",
+        "db.apply_deleted_segments_history(segments, true)?",
+        "db.apply_batch_transcription_history(previous_segments, current_segments, false)?",
+        "db.apply_batch_transcription_history(previous_segments, current_segments, true)?",
         "MAX_HISTORY_BYTES",
         "retained_bytes > self.max_bytes",
     ):
@@ -139,10 +144,37 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
 
     system_ops = read("commands/system_ops.rs")
     for action in ("undo", "redo"):
-        body = command(system_ops, f"pub fn {action}(")
-        for required in ("begin_mutation()", "_mutation", "state.session_auto_save()"):
+        body = command(system_ops, f"pub async fn {action}(")
+        for required in (
+            "begin_mutation()",
+            "_mutation",
+            "spawn_blocking",
+            "HistoryMutationResultV1",
+            "worker_app.try_state::<AppState>()",
+            "app_state.session_auto_save()",
+        ):
             if required not in body:
                 raise AssertionError(f"{action} no longer holds restore admission through session save: {required}")
+
+    history_database = read("db/segments.rs")
+    for required in (
+        "SAVEPOINT history_machine_snapshot",
+        "SAVEPOINT history_batch_transcription",
+        "SAVEPOINT history_deleted_segments",
+        "batch_transcription_projection_matches(&actual, expected)",
+        "Cannot redo stale deletion",
+        'self.conn.execute("UPDATE speech_segments SET id = id WHERE 0", [])?',
+    ):
+        if required not in history_database:
+            raise AssertionError(f"atomic history database boundary lost {required!r}")
+    for required in (
+        "fn multi_row_delete_undo_rolls_back_the_complete_restore_on_late_failure()",
+        "fn delete_redo_refuses_the_complete_batch_when_one_restored_row_changed()",
+        "fn multi_row_batch_transcription_undo_rolls_back_on_late_failure()",
+        "fn batch_transcribe_redo_reapplies_the_exact_recorded_endpoint()",
+    ):
+        if required not in history:
+            raise AssertionError(f"atomic history runtime regression lost {required!r}")
 
     deletion = command(source, signatures["delete_segments_v1"])
     for required in ("MAX_SEGMENT_DELETE_IDS", "public_segment_delete_error", "deleted_count > 0"):
