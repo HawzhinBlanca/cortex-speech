@@ -90,6 +90,7 @@ SHA in the immutable manifest, not a short hash copied into this file.
 | Handwritten IPC calls were diffuse and could bypass inventory review. | One closed legacy adapter rejects unregistered commands; generated commands cannot regress through it; inventory policy currently reports 116 invoked commands: 13 generated and 103 explicitly contained handwritten calls. | Containment is green; the required zero-handwritten end state is **RED (103 remain)**. |
 | Oversized source modules and unverifiable Rust coverage could be hidden by an optimistic aggregate gate. | A fail-closed quality gate requires branch-bearing `cargo llvm-cov` JSON and scans all shipped Rust modules, with only one exact-hash immutable-migration exception. | Gate works and correctly reports both conditions **RED**; details are below. |
 | Stable-toolchain checks did not expose two atomics deprecated by the pinned branch-coverage compiler. | Cortex media singleflight and the vendored bounded HTTP worker pool use an MSRV-safe compare-exchange loop; the deprecated API is gone without requiring Rust 1.95. | **CLOSED locally**: affected media tests 24/24, vendored worker-ceiling test 1/1, strict MSRV-aware Clippy and rustfmt green; the exact nightly coverage rerun compiled without the prior deprecation warnings. |
+| Crash-safe export publication and recovery were embedded in the oversized evaluation facade. | Sealed-generation digesting, validation, promotion, rollback, directory synchronization and interrupted-publication recovery now live in a dedicated Tauri-free `eval/export_generation.rs` service. The extraction preserves one implementation only; it does not dual-write or weaken fail-closed publication. | **CLOSED locally**: `eval.rs` measures 1,638 production lines and the extracted service 511. All 43 evaluation/export fault regressions, backend layering, strict all-target/all-feature Clippy, rustfmt and the quality-gate self-tests pass. The repository-wide architecture gate remains correctly red on the five modules below. |
 
 ## Integrated checkpoint evidence
 
@@ -141,7 +142,7 @@ SHA in the immutable manifest, not a short hash copied into this file.
   (6,335/11,642), 49.26% branches (2,675/5,430), 54.57% functions (1,516/2,778), and 56.83%
   lines (4,601/8,096)**. The fail-closed summary SHA-256 is
   `c8c0d37962ebf10ac2f2c67febe39e0f9a87b3cec721ea2aaf1ea88a019e84`.
-- Six shipped Rust modules exceed the normal 2,000-line ceiling:
+- Five shipped Rust modules exceed the normal 2,000-line ceiling:
 
   | Module | Production LOC |
   |---|---:|
@@ -150,10 +151,10 @@ SHA in the immutable manifest, not a short hash copied into this file.
   | `src-tauri/src/pipeline.rs` | 4,563 |
   | `src-tauri/src/commands.rs` | 4,013 |
   | `src-tauri/src/review_pool.rs` | 2,641 |
-  | `src-tauri/src/eval.rs` | 2,139 |
 
   The sole exception is immutable migration history, pinned to an exact file SHA and size ceiling;
-  none of the six production modules above is excepted.
+  none of the five production modules above is excepted. `eval.rs` is now below the ceiling at
+  1,638 production lines after the sealed export-generation service extraction.
 - IPC is contained but incomplete: **103 handwritten calls remain** (13 generated / 116 invoked).
   This is materially safer than an open bridge but does not satisfy the zero-untyped-invoke target.
 - `App.svelte` is now a 5-line composition shell and extracted presentational modules are 69–289
