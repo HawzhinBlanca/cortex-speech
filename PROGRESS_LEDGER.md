@@ -11760,3 +11760,41 @@ field sessions, comparator study, pilot, and model evidence remain absent. Produ
 release pointers, processes, ports, credentials, models, migrations, reviewer decisions, and payment
 state were untouched. The honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT
 10/10**.
+
+## 2026-08-27 — generated model/engine IPC and renderer-safe registry mutations
+
+Commits `a3b743abf0d0070c2ad73a1967a2dd7f6fb8a97a` and
+`5f1bec63e0374207790f668396d2a1cd39c0743d` move eight model-management commands from the
+handwritten compatibility bridge to checked-in Tauri Specta contracts. Read/start coverage is
+`models_status`, `models_download_all`, `get_champion_engine_status`, `start_champion_engine`, and
+`list_model_versions`; registry-write coverage is `import_model_checkpoint`,
+`import_model_deployment`, and `bootstrap_legacy_champion`. Renderer DTOs are versioned and
+camel-cased, model paths remain backend-only, development preview returns the same result shape as
+production, and the frontend preserves structured `CommandErrorV1` values instead of flattening
+them to strings.
+
+The champion-status command no longer turns a registry database failure into a false “no champion”
+state or forwards raw engine/WSL diagnostics. Registry mutations validate inputs before worker
+admission and reduce hashing, manifest, database, pointer, path, SQL, and restore-fence failures to
+bounded public codes. The restore fence and async-worker ownership remain intact; no simultaneous
+old/new write path was introduced. Focused Rust proof passed 2/2 typed public-contract tests and
+33/33 registry tests. Frontend proof passed 492/492 tests across 86 files with zero Svelte/TypeScript,
+ESLint, or Prettier findings. Generated-binding regeneration, secret hygiene, model-provenance,
+owner-canon (12/12 pins), and UI-thread policy gates passed. The measured IPC inventory is now 114
+invoked commands: 57 generated, 57 explicitly contained handwritten, one closed dynamic bridge, and
+zero generated commands with a noncanonical error contract.
+
+Strict Clippy for the second commit did not produce a source verdict: Windows refused a Tauri build
+artifact with `os error 32` while the separately owned pool agent's concurrent Cargo process held it
+open. The failure is retained as an uncompleted proof, not rewritten as a pass. The scoped diff check
+was clean, and the Rust contract/registry test binaries compiled and passed. Pool/Couch/reviewer-link/
+compensation files were neither edited nor staged by this tranche; they remain owned by the concurrent
+pool workstream. Production databases, releases, credentials, ports, models, migrations, reviewer
+truth, and payment state were untouched.
+
+This closes eight concrete IPC/error-leak imperfections but does not satisfy the architecture class:
+57 handwritten calls, the closed legacy bridge, and ten oversized Svelte files remain. The prior
+coverage/mutation, calibrated certifying-manifest, schema-clone, 50,000-segment fault/performance,
+owner workflow/deployment/reboot/field, signed Windows/VM/manual-accessibility, comparator, pilot, and
+model-evidence gaps also remain. The honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT
+CERTIFIED — NOT 10/10**.
