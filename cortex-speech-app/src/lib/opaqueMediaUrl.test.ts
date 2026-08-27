@@ -14,7 +14,7 @@ describe('opaque media URL boundary', () => {
   });
 
   it.each([
-    `file:///C:/Users/Owner/private.wav`,
+    `file:///Z:/fixture/private.wav`,
     `http://example.com/${ID}`,
     `http://cortex-media.localhost/C:/private.wav`,
     `http://cortex-media.localhost/${ID}?path=C:/private.wav`,

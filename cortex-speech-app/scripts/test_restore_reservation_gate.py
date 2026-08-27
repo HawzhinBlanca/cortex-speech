@@ -320,9 +320,11 @@ def test_long_prework_publishers_hold_full_operation_mutation_guards() -> None:
     ):
         body = _fn_body(commands, signature, span=7500)
         worker = body.find("run_blocking(move ||")
-        mutation = body.find("let _mutation = begin_mutation()?;")
+        mutation = body.find("let _mutation = begin_mutation()")
+        mutation_end = body.find(";", mutation)
         publish = body.find(final_publish)
-        if -1 in (worker, mutation, publish) or not (worker < mutation < publish):
+        propagated = mutation != -1 and mutation_end != -1 and "?" in body[mutation:mutation_end]
+        if -1 in (worker, mutation, mutation_end, publish) or not propagated or not (worker < mutation < publish):
             raise AssertionError(f"{signature} must own mutation admission inside its detachable worker through publish")
 
     integration = _read("integration_runner.rs")

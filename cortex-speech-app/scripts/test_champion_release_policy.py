@@ -193,8 +193,9 @@ def test_registry_renderer_contract_never_returns_checkpoint_paths() -> None:
     frontend = (APP / "src" / "lib" / "commands.ts").read_text(encoding="utf-8")
     summary = backend[backend.index("pub struct ModelVersionSummary") : backend.index("impl From<crate::registry::ModelVersion>")]
     assert "checkpoint_path" not in summary
-    assert "Result<Vec<ModelVersionSummary>" in backend
-    assert backend.count("Result<ModelVersionSummary, String>") >= 2
+    assert "Result<Vec<ModelVersionSummaryV1>, crate::ipc_contract::CommandErrorV1>" in backend
+    assert backend.count("Result<ModelVersionSummaryV1, crate::ipc_contract::CommandErrorV1>") >= 2
+    assert "Result<ModelVersionSummary, String>" not in backend
     assert "checkpoint_path" not in frontend
     listing = backend[backend.index("pub fn list_model_versions") : backend.index("pub async fn import_model_checkpoint")]
     importing = backend[backend.index("pub async fn import_model_checkpoint") : backend.index("pub async fn import_model_deployment")]
