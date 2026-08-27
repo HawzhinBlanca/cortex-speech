@@ -404,8 +404,8 @@ export async function installTauriMock(page: Page): Promise<void> {
               {
                 id: 'omniasr-7b-champion',
                 family: 'omniasr-7b',
-                model_card_name: 'Pinned Kurdish champion deployment',
-                checkpoint_sha256:
+                modelCardName: 'Pinned Kurdish champion deployment',
+                checkpointSha256:
                   'a1b2c3d4e5f600112233445566778899aabbccddeeff00112233445566778899',
                 source: 'owner-finetune',
                 license: 'Apache-2.0',
@@ -414,8 +414,8 @@ export async function installTauriMock(page: Page): Promise<void> {
               {
                 id: 'omniasr-7b-challenger',
                 family: 'omniasr-7b',
-                model_card_name: null,
-                checkpoint_sha256:
+                modelCardName: null,
+                checkpointSha256:
                   '00112233445566778899aabbccddeeffa1b2c3d4e5f6000000000000deadbeef',
                 source: 'owner-finetune',
                 license: 'Apache-2.0',
@@ -429,8 +429,8 @@ export async function installTauriMock(page: Page): Promise<void> {
                 filename: 'silero_vad_v4.onnx',
                 downloaded: true,
                 exists: true,
-                size_bytes: 2_000_000,
-                min_size_bytes: 1_000_000,
+                sizeBytes: 2_000_000,
+                minSizeBytes: 1_000_000,
                 version: '4.0',
                 source: 'bundled',
                 downloadable: true,
@@ -440,8 +440,8 @@ export async function installTauriMock(page: Page): Promise<void> {
                 filename: 'campp/model.onnx',
                 downloaded: true,
                 exists: true,
-                size_bytes: 12_000_000,
-                min_size_bytes: 10_000_000,
+                sizeBytes: 12_000_000,
+                minSizeBytes: 10_000_000,
                 version: '1.0',
                 source: 'bundled',
                 downloadable: true,
@@ -451,8 +451,8 @@ export async function installTauriMock(page: Page): Promise<void> {
                 filename: 'denoiser/model.onnx',
                 downloaded: true,
                 exists: true,
-                size_bytes: 500_000,
-                min_size_bytes: 400_000,
+                sizeBytes: 500_000,
+                minSizeBytes: 400_000,
                 version: '1.0',
                 source: 'bundled',
                 downloadable: true,

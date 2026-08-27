@@ -3,22 +3,49 @@
 //! remain available solely to explicit offline diagnostic tools.
 
 use super::{emit_or_log, run_blocking, RATE_LIMITER, STRICT_RATE_LIMITER};
+use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
+use crate::models::ModelStatusEntryV1;
 use crate::AppState;
+use serde::{Deserialize, Serialize};
+use specta::Type;
 use tauri::State;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadSummaryV1 {
+    pub downloaded: u32,
+    pub failed: u32,
+    pub total: usize,
+    pub skipped: usize,
+}
+
+fn model_rate_limited(message: &str) -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", message, true).suggested(SuggestedActionV1::Retry)
+}
+
+fn public_model_failure(code: &str, message: &str, _private_detail: &str) -> CommandErrorV1 {
+    CommandErrorV1::new(code, message, true).suggested(SuggestedActionV1::OpenModels)
+}
+
 #[tauri::command]
-pub fn models_status(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
-    RATE_LIMITER.check("models_status")?;
+#[specta::specta]
+pub fn models_status(state: State<'_, AppState>) -> Result<Vec<ModelStatusEntryV1>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("models_status")
+        .map_err(|_| model_rate_limited("The support-model status is busy. Retry in a moment."))?;
     let mm = state.lock_model_manager();
     Ok(mm.production_status())
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn models_download_all(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("models_download_all")?;
+) -> Result<ModelDownloadSummaryV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("models_download_all")
+        .map_err(|_| model_rate_limited("Support-model download is already busy. Retry in a moment."))?;
     // Clone the manager and DROP the AppState lock before the long download loop — otherwise every
     // missing model is fetched (hundreds of MB each) with lock_model_manager() held the whole time,
     // starving the model panel's own progress poll and the readiness/score checks. The whole loop
@@ -32,7 +59,7 @@ pub async fn models_download_all(
         let skipped = all_missing_count.saturating_sub(total);
 
         if total == 0 {
-            return Ok(serde_json::json!({"downloaded": 0, "failed": 0, "total": 0, "skipped": skipped}));
+            return Ok(ModelDownloadSummaryV1 { downloaded: 0, failed: 0, total: 0, skipped });
         }
 
         emit_or_log(
@@ -75,9 +102,39 @@ pub async fn models_download_all(
             }),
         );
 
-        Ok(serde_json::json!({
-            "downloaded": succeeded, "failed": failed, "total": total, "skipped": skipped
-        }))
+        Ok(ModelDownloadSummaryV1 { downloaded: succeeded, failed, total, skipped })
     })
     .await
+    .map_err(|error| {
+        public_model_failure(
+            "MODEL_DOWNLOAD_FAILED",
+            "Support-model download could not complete. Open Models and retry.",
+            &error,
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_download_contract_is_typed_camel_case_and_scrubs_private_failures() {
+        let summary = ModelDownloadSummaryV1 { downloaded: 2, failed: 1, total: 3, skipped: 1 };
+        let wire = serde_json::to_value(summary).expect("serialize download summary");
+        assert_eq!(wire["downloaded"], 2);
+        assert_eq!(wire["skipped"], 1);
+
+        let hostile = public_model_failure(
+            "MODEL_DOWNLOAD_FAILED",
+            "Support-model download could not complete. Open Models and retry.",
+            r"token=secret SQL D:\private\models\support.onnx",
+        );
+        let wire = serde_json::to_string(&hostile).expect("serialize public model failure");
+        assert!(wire.contains("MODEL_DOWNLOAD_FAILED"));
+        assert!(wire.contains("openModels"));
+        for forbidden in ["secret", "SQL", "D:\\", "private", "support.onnx"] {
+            assert!(!wire.contains(forbidden));
+        }
+    }
 }

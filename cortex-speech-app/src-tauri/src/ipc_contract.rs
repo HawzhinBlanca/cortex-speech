@@ -689,6 +689,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_training_grade_breakdown,
             crate::commands::get_dataset_certificate,
             crate::commands::get_label_quality_lift,
+            crate::commands::models_status,
+            crate::commands::models_download_all,
+            crate::commands::get_champion_engine_status,
+            crate::commands::start_champion_engine,
+            crate::commands::list_model_versions,
             crate::commands::get_speaker_inventory_v1,
             crate::commands::update_segment_metadata_v1,
             crate::commands::delete_segments_v1,
@@ -720,6 +725,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<crate::quality::TrainingGradeBreakdown>()
         .typ::<crate::quality::conformal::ConformalCertificate>()
         .typ::<crate::eval::LabelQualityLift>()
+        .typ::<crate::models::ModelArtifactSourceV1>()
+        .typ::<crate::models::ModelStatusEntryV1>()
+        .typ::<crate::commands::ModelDownloadSummaryV1>()
+        .typ::<crate::commands::EngineStatusV1>()
+        .typ::<crate::commands::ModelVersionSummaryV1>()
         .typ::<ReviewScope>()
         .typ::<ActiveVoiceFocusV1>()
         .typ::<SegmentMetadataChangeV1>()

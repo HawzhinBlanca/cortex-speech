@@ -112,7 +112,7 @@
             {$t('modelRegistry.licenseLabel')}
             <bdi dir="ltr">{m.license}</bdi>
             · {$t('modelRegistry.shaLabel')}
-            <bdi dir="ltr">{shortSha(m.checkpoint_sha256)}</bdi>
+            <bdi dir="ltr">{shortSha(m.checkpointSha256)}</bdi>
           </div>
         </li>
       {/each}

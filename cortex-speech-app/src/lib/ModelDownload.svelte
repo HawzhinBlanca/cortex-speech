@@ -155,8 +155,8 @@
           </span>
           <bdi dir="ltr" class="flex-1 text-cortex-300">{model.name}</bdi>
           <span class="text-cortex-500 text-[10px]">
-            {#if model.size_bytes}
-              {(model.size_bytes / 1048576).toFixed(1)} MB
+            {#if model.sizeBytes}
+              {(model.sizeBytes / 1048576).toFixed(1)} MB
             {:else}
               {$t('models.notDownloaded')}
             {/if}

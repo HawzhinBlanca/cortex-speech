@@ -172,6 +172,23 @@ export const commands = {
 	getDatasetCertificate: (targetError: number, confidenceLevel: number) => typedError<ConformalCertificate, CommandErrorV1>(__TAURI_INVOKE("get_dataset_certificate", { targetError, confidenceLevel })),
 	// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
 	getLabelQualityLift: () => typedError<LabelQualityLift, CommandErrorV1>(__TAURI_INVOKE("get_label_quality_lift")),
+	modelsStatus: () => typedError<ModelStatusEntryV1[], CommandErrorV1>(__TAURI_INVOKE("models_status")),
+	modelsDownloadAll: () => typedError<ModelDownloadSummaryV1, CommandErrorV1>(__TAURI_INVOKE("models_download_all")),
+	/**
+	 *  Bounded (~5s) health check of the champion 7B engine, for the UI status pill. Cheap + side-effect
+	 *  free (a TCP probe), so the frontend can poll it.
+	 */
+	getChampionEngineStatus: () => typedError<EngineStatusV1, CommandErrorV1>(__TAURI_INVOKE("get_champion_engine_status")),
+	/**
+	 *  Start the champion 7B server (WSL) FROM THE APP so the owner never hand-runs a terminal. Spawns
+	 *  the committed start script DETACHED and returns immediately; the UI then polls
+	 *  get_champion_engine_status until ready (warm-up loads ~30 GB, 1-5 min). The script path comes from
+	 *  CORTEX_7B_START_SCRIPT (the desktop launcher sets it); without it we return an actionable error
+	 *  rather than guess a path.
+	 */
+	startChampionEngine: () => typedError<null, CommandErrorV1>(__TAURI_INVOKE("start_champion_engine")),
+	// The model registry, newest-first within each family — what a registry panel lists.
+	listModelVersions: () => typedError<ModelVersionSummaryV1[], CommandErrorV1>(__TAURI_INVOKE("list_model_versions")),
 	/**
 	 *  Complete, non-lossy speaker inventory for the management panel. SQL NULL stays distinct from a
 	 *  literal `unknown` id, and backend failures are reduced to a stable renderer-safe contract.
@@ -416,6 +433,18 @@ export type DurationOutlier = {
 	reason: string,
 };
 
+export type EngineStatusV1 = {
+	// True only when the warm server reports the exact id + deployment SHA selected by registry.
+	ready: boolean,
+	port: number,
+	identityMatches: boolean,
+	expectedModelVersionId: string | null,
+	expectedDeploymentSha256: string | null,
+	loadedModelVersionId: string | null,
+	loadedDeploymentSha256: string | null,
+	reason: string | null,
+};
+
 /**
  *  Stable action identity for global machine/source history. This is intentionally an enum rather
  *  than backend-authored display text so every locale owns its own copy and unknown future variants
@@ -490,6 +519,46 @@ export type MarkedSegmentUnusableV1 = {
 export type MediaGrant = {
 	id: string,
 	expiresAt: string,
+};
+
+/**
+ *  Closed renderer-visible location class for a support model. The concrete filesystem root is
+ *  deliberately backend-only.
+ */
+export type ModelArtifactSourceV1 = "user" | "bundled" | "missing";
+
+export type ModelDownloadSummaryV1 = {
+	downloaded: number,
+	failed: number,
+	total: number,
+	skipped: number,
+};
+
+// Path-free status for one support model managed by the shipped desktop.
+export type ModelStatusEntryV1 = {
+	name: string,
+	filename: string,
+	downloaded: boolean,
+	exists: boolean,
+	sizeBytes: number | null,
+	minSizeBytes: number,
+	version: string,
+	source: ModelArtifactSourceV1,
+	downloadable: boolean,
+};
+
+/**
+ *  Versioned renderer contract for a model-registry row. Legacy import commands retain their
+ *  historical snake-case response until they migrate independently.
+ */
+export type ModelVersionSummaryV1 = {
+	id: string,
+	family: string,
+	modelCardName: string | null,
+	checkpointSha256: string,
+	source: string,
+	license: string,
+	status: string,
 };
 
 export type OperationEventV1 = { type: "started"; operationId: string } | { type: "progress"; operationId: string; completed: number; total: number } | { type: "completed"; operationId: string } | { type: "failed"; operationId: string; error: CommandErrorV1 } | { type: "cancelled"; operationId: string } | { type: "halted"; operationId: string; haltedBy: string };

@@ -2,6 +2,7 @@ use crate::atomic_file::{remove_file_on_error, replace_file};
 use crate::settings::AsrModelSize;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use specta::Type;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -223,6 +224,31 @@ pub struct ModelInfo {
     pub sha256: &'static str,
     pub min_size_bytes: u64,
     pub version: &'static str,
+}
+
+/// Closed renderer-visible location class for a support model. The concrete filesystem root is
+/// deliberately backend-only.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelArtifactSourceV1 {
+    User,
+    Bundled,
+    Missing,
+}
+
+/// Path-free status for one support model managed by the shipped desktop.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStatusEntryV1 {
+    pub name: String,
+    pub filename: String,
+    pub downloaded: bool,
+    pub exists: bool,
+    pub size_bytes: Option<u64>,
+    pub min_size_bytes: u64,
+    pub version: String,
+    pub source: ModelArtifactSourceV1,
+    pub downloadable: bool,
 }
 
 pub const MODELS: &[ModelInfo] = &[
@@ -1043,7 +1069,7 @@ impl ModelManager {
     /// Sanitized model-management response for the shipped desktop. This is an explicit allowlist,
     /// not a filtered presentation of every diagnostic artifact, and intentionally exposes no local
     /// filesystem path.
-    pub fn production_status(&self) -> Vec<serde_json::Value> {
+    pub fn production_status(&self) -> Vec<ModelStatusEntryV1> {
         MODELS
             .iter()
             .filter(|model| is_production_runtime_model(model))
@@ -1052,23 +1078,23 @@ impl ModelManager {
                 let (exists, size) = model_file_state(&root, model.filename);
                 let available = size.unwrap_or(0) >= model.min_size_bytes;
                 let source = if !available {
-                    "missing"
+                    ModelArtifactSourceV1::Missing
                 } else if root == self.models_dir {
-                    "user"
+                    ModelArtifactSourceV1::User
                 } else {
-                    "bundled"
+                    ModelArtifactSourceV1::Bundled
                 };
-                serde_json::json!({
-                    "name": model.name,
-                    "filename": model.filename,
-                    "downloaded": available,
-                    "exists": exists,
-                    "size_bytes": size,
-                    "min_size_bytes": model.min_size_bytes,
-                    "version": model.version,
-                    "source": source,
-                    "downloadable": model_download_supported(model),
-                })
+                ModelStatusEntryV1 {
+                    name: model.name.to_string(),
+                    filename: model.filename.to_string(),
+                    downloaded: available,
+                    exists,
+                    size_bytes: size,
+                    min_size_bytes: model.min_size_bytes,
+                    version: model.version.to_string(),
+                    source,
+                    downloadable: model_download_supported(model),
+                }
             })
             .collect()
     }
@@ -1598,14 +1624,14 @@ mod tests {
         let manager = ModelManager::new(tmp.path().join("models"));
 
         let status = manager.production_status();
-        let filenames = status.iter().map(|row| row["filename"].as_str().expect("filename")).collect::<Vec<_>>();
+        let filenames = status.iter().map(|row| row.filename.as_str()).collect::<Vec<_>>();
 
         assert_eq!(filenames, PRODUCTION_RUNTIME_MODEL_FILENAMES);
         for row in &status {
-            assert!(row.get("path").is_none(), "production IPC must not disclose a filesystem path: {row}");
-            let serialized = row.to_string().to_ascii_lowercase();
+            let serialized = serde_json::to_string(row).expect("serialize public model status").to_ascii_lowercase();
+            assert!(!serialized.contains("path"), "production IPC must not disclose a filesystem path: {serialized}");
             for forbidden in ["300m", "1b", "mms", "scribe", "elevenlabs"] {
-                assert!(!serialized.contains(forbidden), "production status exposed {forbidden}: {row}");
+                assert!(!serialized.contains(forbidden), "production status exposed {forbidden}: {serialized}");
             }
         }
 

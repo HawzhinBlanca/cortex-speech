@@ -2,9 +2,9 @@
 
 use super::*;
 
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct EngineStatus {
+pub struct EngineStatusV1 {
     /// True only when the warm server reports the exact id + deployment SHA selected by registry.
     pub ready: bool,
     pub port: u16,
@@ -29,6 +29,20 @@ pub struct ModelVersionSummary {
     pub status: String,
 }
 
+/// Versioned renderer contract for a model-registry row. Legacy import commands retain their
+/// historical snake-case response until they migrate independently.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelVersionSummaryV1 {
+    pub id: String,
+    pub family: String,
+    pub model_card_name: Option<String>,
+    pub checkpoint_sha256: String,
+    pub source: String,
+    pub license: String,
+    pub status: String,
+}
+
 impl From<crate::registry::ModelVersion> for ModelVersionSummary {
     fn from(version: crate::registry::ModelVersion) -> Self {
         Self {
@@ -43,20 +57,81 @@ impl From<crate::registry::ModelVersion> for ModelVersionSummary {
     }
 }
 
+impl From<crate::registry::ModelVersion> for ModelVersionSummaryV1 {
+    fn from(version: crate::registry::ModelVersion) -> Self {
+        Self {
+            id: version.id,
+            family: version.family,
+            model_card_name: version.model_card_name,
+            checkpoint_sha256: version.checkpoint_sha256,
+            source: version.source,
+            license: version.license,
+            status: version.status,
+        }
+    }
+}
+
+fn model_registry_rate_limited_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new("RATE_LIMITED", "The model registry is busy. Retry in a moment.", true)
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+}
+
+fn public_model_registry_error(_private_detail: &str) -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "MODEL_REGISTRY_READ_FAILED",
+        "The model registry could not be read. Open Models or Health for recovery options.",
+        false,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::OpenModels)
+}
+
 /// The model registry, newest-first within each family — what a registry panel lists.
 #[tauri::command]
-pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<ModelVersionSummary>, String> {
-    RATE_LIMITER.check("list_model_versions")?;
+#[specta::specta]
+pub fn list_model_versions(
+    state: State<'_, AppState>,
+) -> Result<Vec<ModelVersionSummaryV1>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("list_model_versions").map_err(|_| model_registry_rate_limited_error())?;
     let db = state.lock_db();
     crate::registry::list_model_versions(&db)
         .map(|versions| {
             versions
                 .into_iter()
                 .filter(|version| version.family == crate::deployment::OMNIASR_7B_FAMILY)
-                .map(ModelVersionSummary::from)
+                .map(ModelVersionSummaryV1::from)
                 .collect()
         })
-        .map_err(|e| e.to_string())
+        .map_err(|error| public_model_registry_error(&error.to_string()))
+}
+
+#[cfg(test)]
+mod typed_model_registry_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn public_registry_rows_are_camel_case_and_failures_scrub_backend_details() {
+        let row = ModelVersionSummaryV1 {
+            id: "candidate-1".into(),
+            family: "omniasr-7b".into(),
+            model_card_name: Some("owner-card".into()),
+            checkpoint_sha256: "a".repeat(64),
+            source: "owner-finetune".into(),
+            license: "Apache-2.0".into(),
+            status: "candidate".into(),
+        };
+        let wire = serde_json::to_value(row).expect("serialize public registry row");
+        assert_eq!(wire["modelCardName"], "owner-card");
+        assert_eq!(wire["checkpointSha256"], "a".repeat(64));
+        assert!(wire.get("model_card_name").is_none());
+
+        let error = public_model_registry_error(r"SQL D:\private\registry.db token=secret");
+        let wire = serde_json::to_string(&error).expect("serialize public registry error");
+        assert!(wire.contains("MODEL_REGISTRY_READ_FAILED"));
+        assert!(wire.contains("openModels"));
+        for forbidden in ["SQL", "D:\\", "private", "token", "secret"] {
+            assert!(!wire.contains(forbidden));
+        }
+    }
 }
 
 /// Import an externally fine-tuned checkpoint into the registry as a gated candidate. The SHA is

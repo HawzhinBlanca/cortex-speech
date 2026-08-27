@@ -14,10 +14,14 @@ import type {
   DesktopPlaybackSessionV1,
   HistoryMutationResultV1,
   HistoryStatusV1,
+  EngineStatusV1,
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1,
   MediaGrant,
+  ModelDownloadSummaryV1,
+  ModelStatusEntryV1,
+  ModelVersionSummaryV1,
   PlaybackIntervalV1,
   RenamedSpeakerV1,
   RenameSpeakerRequestV1,
@@ -497,20 +501,13 @@ export async function exportTranscript(path: string, format: 'txt' | 'srt' | 'vt
   return invokeCritical('export_transcript', { path, format });
 }
 
-export interface EngineStatus {
-  ready: boolean;
-  port: number;
-  identityMatches: boolean;
-  expectedModelVersionId: string | null;
-  expectedDeploymentSha256: string | null;
-  loadedModelVersionId: string | null;
-  loadedDeploymentSha256: string | null;
-  reason: string | null;
-}
+export type EngineStatus = EngineStatusV1;
 
 /** Health of the champion (OmniASR-7B) warm server, for the engine-status pill. */
 export async function getChampionEngineStatus(): Promise<EngineStatus> {
-  return invokeLegacy<EngineStatus>('get_champion_engine_status');
+  const result = await generatedCommands.getChampionEngineStatus();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** A durable background job (P0 #3 Job Supervisor). Mirrors crate::jobs::Job (camelCase). */
@@ -531,7 +528,8 @@ export async function getJobs(): Promise<Job[]> {
 
 /** Start the champion 7B server (WSL) from the app; returns immediately, then poll status. */
 export async function startChampionEngine(): Promise<void> {
-  return invokeLegacy<void>('start_champion_engine');
+  const result = await generatedCommands.startChampionEngine();
+  if (result.status === 'error') throw result.error;
 }
 
 export interface AgentSourceReferenceSummary {
@@ -818,21 +816,14 @@ export async function exportAgreementSample(): Promise<AgreementExport | null> {
   return invokeCritical('export_agreement_sample');
 }
 
-/** A row of the model-version registry (snake_case, as serialized by the backend). */
-export interface ModelVersion {
-  id: string;
-  family: string;
-  model_card_name: string | null;
-  checkpoint_sha256: string;
-  source: string;
-  license: string;
-  /** "candidate" or "champion". */
-  status: string;
-}
+/** A versioned, renderer-safe row of the model-version registry. */
+export type ModelVersion = ModelVersionSummaryV1;
 
 /** The registered model versions, newest-first within each family. */
 export async function listModelVersions(): Promise<ModelVersion[]> {
-  return invokeLegacy<ModelVersion[]>('list_model_versions');
+  const result = await generatedCommands.listModelVersions();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -1486,30 +1477,20 @@ export async function dbVacuum(): Promise<void> {
   return invokeCritical('db_vacuum');
 }
 
-export interface ModelStatusEntry {
-  name: string;
-  filename: string;
-  downloaded: boolean;
-  exists?: boolean;
-  size_bytes: number | null;
-  min_size_bytes: number;
-  source?: 'user' | 'bundled' | 'missing';
-  downloadable?: boolean;
-}
+export type ModelStatusEntry = ModelStatusEntryV1;
 
 export async function modelsStatus(): Promise<ModelStatusEntry[]> {
-  return invokeLegacy<ModelStatusEntry[]>('models_status');
+  const result = await generatedCommands.modelsStatus();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export interface ModelDownloadSummary {
-  downloaded: number;
-  failed: number;
-  total: number;
-  skipped: number;
-}
+export type ModelDownloadSummary = ModelDownloadSummaryV1;
 
 export async function modelsDownloadAll(): Promise<ModelDownloadSummary> {
-  return invokeLegacy<ModelDownloadSummary>('models_download_all');
+  const result = await generatedCommands.modelsDownloadAll();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function getInferenceStats(): Promise<InferenceStatsV1> {

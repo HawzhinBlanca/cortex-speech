@@ -28,6 +28,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     'list_db_snapshots',
     'list_eval_runs',
     'list_model_versions',
+    'models_status',
   ]);
   const emptyObjectCommands = new Set([
     'app_health',
@@ -35,7 +36,6 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     'db_info',
     'get_settings',
     'import_status',
-    'models_status',
   ]);
 
   // Sample Sorani dataset so the populated curate UI renders without a backend.

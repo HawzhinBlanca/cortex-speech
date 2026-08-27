@@ -9,24 +9,60 @@
 //! run_blocking so polling never freezes the UI (per the Week-1 responsiveness audit).
 
 use super::{
-    build_agentic_readiness, external_provider_status, run_blocking, AgenticReadiness, EngineStatus, RATE_LIMITER,
+    build_agentic_readiness, external_provider_status, run_blocking, AgenticReadiness, EngineStatusV1, RATE_LIMITER,
     STRICT_RATE_LIMITER,
 };
+use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
 use crate::AppState;
 use tauri::State;
+
+fn engine_rate_limited(message: &str) -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", message, true).suggested(SuggestedActionV1::Retry)
+}
+
+fn public_engine_error(
+    code: &str,
+    message: &str,
+    retryable: bool,
+    action: SuggestedActionV1,
+    _private_detail: &str,
+) -> CommandErrorV1 {
+    CommandErrorV1::new(code, message, retryable).suggested(action)
+}
+
+fn public_engine_block_reason(_private_detail: &str) -> String {
+    "Champion engine startup is blocked. Open Models or Health for recovery options.".to_string()
+}
+
+fn public_engine_probe_failure_reason(_private_detail: &str) -> String {
+    "Champion engine is offline or did not answer the health probe.".to_string()
+}
 
 /// Bounded (~5s) health check of the champion 7B engine, for the UI status pill. Cheap + side-effect
 /// free (a TCP probe), so the frontend can poll it.
 #[tauri::command]
+#[specta::specta]
 pub async fn get_champion_engine_status(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<EngineStatus, String> {
+) -> Result<EngineStatusV1, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_champion_engine_status")
+        .map_err(|_| engine_rate_limited("The champion health check is busy. Retry in a moment."))?;
     let port = crate::pipeline::wsl_7b_port();
-    let expected =
-        crate::registry::champion_identity(&state.lock_db(), crate::deployment::OMNIASR_7B_FAMILY).ok().flatten();
+    let expected = crate::registry::champion_identity(&state.lock_db(), crate::deployment::OMNIASR_7B_FAMILY).map_err(
+        |error| {
+            public_engine_error(
+                "CHAMPION_REGISTRY_UNAVAILABLE",
+                "Champion identity could not be read. Open Health for recovery options.",
+                false,
+                SuggestedActionV1::OpenHealth,
+                &error.to_string(),
+            )
+        },
+    )?;
     let Some(expected) = expected else {
-        return Ok(EngineStatus {
+        return Ok(EngineStatusV1 {
             ready: false,
             port,
             identity_matches: false,
@@ -38,7 +74,7 @@ pub async fn get_champion_engine_status(
         });
     };
     if let Some(reason) = crate::engine_runtime::champion_operational_block_reason() {
-        return Ok(EngineStatus {
+        return Ok(EngineStatusV1 {
             ready: false,
             port,
             identity_matches: false,
@@ -46,7 +82,7 @@ pub async fn get_champion_engine_status(
             expected_deployment_sha256: Some(expected.deployment_sha256),
             loaded_model_version_id: None,
             loaded_deployment_sha256: None,
-            reason: Some(reason.to_string()),
+            reason: Some(public_engine_block_reason(reason)),
         });
     }
     let expected_for_probe = expected.clone();
@@ -56,7 +92,7 @@ pub async fn get_champion_engine_status(
     Ok(match result {
         Ok(loaded) => {
             let identity_matches = loaded.matches(&expected_for_probe);
-            EngineStatus {
+            EngineStatusV1 {
                 ready: identity_matches,
                 port,
                 identity_matches,
@@ -69,7 +105,7 @@ pub async fn get_champion_engine_status(
                 ),
             }
         }
-        Err(error) => EngineStatus {
+        Err(error) => EngineStatusV1 {
             ready: false,
             port,
             identity_matches: false,
@@ -77,7 +113,7 @@ pub async fn get_champion_engine_status(
             expected_deployment_sha256: Some(expected.deployment_sha256),
             loaded_model_version_id: None,
             loaded_deployment_sha256: None,
-            reason: Some(error),
+            reason: Some(public_engine_probe_failure_reason(&error)),
         },
     })
 }
@@ -88,13 +124,49 @@ pub async fn get_champion_engine_status(
 /// CORTEX_7B_START_SCRIPT (the desktop launcher sets it); without it we return an actionable error
 /// rather than guess a path.
 #[tauri::command]
-pub async fn start_champion_engine(app: tauri::AppHandle) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("start_champion_engine")?;
+#[specta::specta]
+pub async fn start_champion_engine(app: tauri::AppHandle) -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("start_champion_engine")
+        .map_err(|_| engine_rate_limited("Champion startup is already busy. Retry in a moment."))?;
     // `restart_current_champion` tree-kills the held child and spawns a new wsl.exe that loads ~30 GB.
     // As a SYNC command that ran inline, that whole body executed on the UI thread and froze the
     // window (test_ui_thread_blocking_audit.py). Same async + run_blocking shape as
     // `get_champion_engine_status` above.
-    run_blocking(move || crate::engine_runtime::restart_current_champion(&app)).await
+    run_blocking(move || crate::engine_runtime::restart_current_champion(&app)).await.map_err(|error| {
+        public_engine_error(
+            "CHAMPION_START_FAILED",
+            "Champion startup failed. Open Models or Health for recovery options.",
+            true,
+            SuggestedActionV1::OpenModels,
+            &error,
+        )
+    })
+}
+
+#[cfg(test)]
+mod typed_engine_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn public_engine_status_and_start_failures_never_forward_private_probe_details() {
+        let hostile = r"WSL SQL token=secret D:\private\cortex_7b_server.py";
+        let blocked = public_engine_block_reason(hostile);
+        let offline = public_engine_probe_failure_reason(hostile);
+        let start = public_engine_error(
+            "CHAMPION_START_FAILED",
+            "Champion startup failed. Open Models or Health for recovery options.",
+            true,
+            SuggestedActionV1::OpenModels,
+            hostile,
+        );
+        let wire = format!("{blocked} {offline} {}", serde_json::to_string(&start).unwrap());
+        assert!(wire.contains("CHAMPION_START_FAILED"));
+        assert!(wire.contains("openModels"));
+        for forbidden in ["SQL", "D:\\", "private", "token", "secret", "cortex_7b_server.py"] {
+            assert!(!wire.contains(forbidden));
+        }
+    }
 }
 
 #[tauri::command]
