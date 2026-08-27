@@ -806,13 +806,55 @@ class Verify10SupervisorTests(unittest.TestCase):
             self.verify._revalidate_latest_release_executable(
                 self.verify.PROFILE_WINDOWS, [recorded], "b" * 40
             )
-        drifted = {**live, "sha256": "d" * 64}
+        for label, field, value in (
+            ("sha256", "sha256", "d" * 64),
+            ("pointer", "activeReleasePointerSha256", "e" * 64),
+            ("pointer-git-sha", "activeReleaseGitSha", "f" * 40),
+            ("authority", "authority", "build-output"),
+            ("build-marker", "buildGitSha", "e" * 40),
+        ):
+            drifted = {**live, field: value}
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    self.verify, "_release_artifact_bindings", return_value=[drifted]
+                ),
+                self.assertRaisesRegex(self.verify.EvidenceError, "changed after measurement"),
+            ):
+                self.verify._revalidate_latest_release_executable(
+                    self.verify.PROFILE_WINDOWS, [recorded], "b" * 40
+                )
+
+        # Presence asymmetry in either direction is drift: a recorded binary that vanished, and a
+        # binary that appeared under a proof which recorded none, both invalidate latest-proof.
         with (
-            mock.patch.object(self.verify, "_release_artifact_bindings", return_value=[drifted]),
+            mock.patch.object(self.verify, "_release_artifact_bindings", return_value=[]),
             self.assertRaisesRegex(self.verify.EvidenceError, "changed after measurement"),
         ):
             self.verify._revalidate_latest_release_executable(
                 self.verify.PROFILE_WINDOWS, [recorded], "b" * 40
+            )
+        with (
+            mock.patch.object(self.verify, "_release_artifact_bindings", return_value=[live]),
+            self.assertRaisesRegex(self.verify.EvidenceError, "changed after measurement"),
+        ):
+            self.verify._revalidate_latest_release_executable(
+                self.verify.PROFILE_WINDOWS, [], "b" * 40
+            )
+
+        # A checkout with no built application records no executable role at all. Re-observing that
+        # same absence is not deployment drift, and such a proof can never certify: the required
+        # release-artifact roles are still missing, which _validate_release_artifacts rejects for any
+        # certification-eligible proof.
+        with mock.patch.object(self.verify, "_release_artifact_bindings", return_value=[]):
+            self.verify._revalidate_latest_release_executable(
+                self.verify.PROFILE_WINDOWS, [], "b" * 40
+            )
+        with self.assertRaisesRegex(
+            self.verify.EvidenceError, "omits release-artifact roles"
+        ):
+            self.verify._validate_release_artifacts(
+                self.verify.PROFILE_WINDOWS, [], "b" * 40, eligible=True
             )
 
     def test_gate_environments_are_allowlisted_and_secret_isolation_is_per_gate(self) -> None:

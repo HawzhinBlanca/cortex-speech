@@ -4961,7 +4961,19 @@ def _revalidate_latest_release_executable(
         "activeReleasePointerSha256",
         "activeReleaseGitSha",
     )
-    if recorded is None or observed is None or any(
+    # Drift is a *difference* between what the proof recorded and what is deployed now, in either
+    # direction: an executable that vanished, one that appeared, or one whose identity/pointer
+    # authority changed.  A proof taken on a checkout with no built application records no
+    # application-executable role at all; re-observing that same absence is not drift, and treating
+    # it as drift made every such latest-proof permanently unvalidatable.  This cannot launder a
+    # missing binary into a claim: _validate_release_artifacts still rejects a certification-eligible
+    # proof whose release artifacts omit any required role, so an empty binding can only ever back a
+    # non-certifying (INCOMPLETE/FAILED) proof.
+    if (recorded is None) != (observed is None):
+        raise EvidenceError(
+            "latest-proof release executable or active immutable release pointer changed after measurement"
+        )
+    if recorded is not None and observed is not None and any(
         recorded.get(field) != observed.get(field) for field in live_fields
     ):
         raise EvidenceError(
