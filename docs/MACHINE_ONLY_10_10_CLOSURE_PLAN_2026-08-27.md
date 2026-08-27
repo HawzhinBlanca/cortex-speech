@@ -1,5 +1,10 @@
 # Cortex Speech machine-only 10/10 closure plan
 
+> [!NOTE]
+> For the current single-PC, single-owner release scope, this plan is superseded by
+> `docs/OWNER_WORKSTATION_10_10_EXECUTION_PLAN_2026-08-27.md`. Public Windows distribution work and
+> external-human evidence remain documented here but do not block the owner-workstation verdict.
+
 **Authority date:** 2026-08-27  
 **Starting commit:** `d4df9251ebcef446258f07a68606762492af3729`  
 **Branch:** `codex/10-10-integration`

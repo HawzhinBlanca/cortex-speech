@@ -11859,3 +11859,27 @@ owner workflow/deployment/reboot/field evidence, signed Windows VM/manual-access
 comparator/pilot evidence, and model evidence remain incomplete. No production data, active release,
 credentials, reviewer truth, or payment state was changed. Honest verdict: **INTEGRATED SOURCE GREEN
 FOR THE NAMED GATES — NOT CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — owner-workstation-only execution plan locked
+
+Owner direction narrows the active release target to the current Windows 11 workstation and one
+desktop user. `docs/OWNER_WORKSTATION_10_10_EXECUTION_PLAN_2026-08-27.md` is now the controlling
+execution order from starting commit `865c5c01e5c7a4c1b1f53fa0c1dc11cb3ee101bb`. Public installer
+signing/updater work, servicing-release VM matrices, comparator studies, external pilots/reviewers,
+and broad ASR-superiority evidence do not block this owner verdict. Local human truth, exact champion
+identity, crash recovery, schema-65 clone compatibility, offline privacy, internal concurrency,
+coverage/mutation, performance/memory, exact-binary proof, cold reboot, and thirty owner sessions
+remain mandatory.
+
+The execution order is proof integrity first: pin the desktop Python verifier environment with
+`jiwer==4.0.0`, route all 43 explicit Rust opt-in tests without letting an owner-critical check hide
+behind an ignore, and refresh coverage at the exact clean SHA. Then close the 56 handwritten IPC
+commands, one dynamic bridge, ten oversized Svelte owners, coverage/mutation thresholds, hostile
+local campaigns, real champion workflow, and final no-retry verifier/burn-in evidence. Rust's current
+mechanical architecture gate is green; the measured renderer inventory remains 58 generated, 56
+handwritten, one dynamic, and zero noncanonical generated errors.
+
+Pool/Couch/reviewer implementation remains owned by the separate pool workstream. This plan verifies
+its shared-database and API seams but does not create overlapping implementation edits. No production
+database, release pointer, credential, process, port, reviewer truth, or payment state was changed.
+Honest status: **OWNER SCOPE AND PLAN LOCKED — IMPLEMENTATION PENDING — NOT 10/10**.
