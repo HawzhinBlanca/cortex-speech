@@ -94,6 +94,8 @@ SHA in the immutable manifest, not a short hash copied into this file.
 | Immutable review-pool deduplication authority was embedded in the oversized review facade. | Canonical manifest parsing, frozen source/champion binding, deterministic canonical selection, review-authority preservation and transactional exclusion publication now live in `review_pool/dedup.rs`; the facade retains pool lifecycle, consensus, rights and decision authority. | **CLOSED locally**: `review_pool.rs` measures 1,973 production lines and the dedup service 685. Pool tests 17/17, pool-export 7/7, pool-admin 7/7, dedup-policy 4/4 and compensation-readiness 38/38 pass, along with backend layering, strict all-target/all-feature Clippy and rustfmt. This slice reduced the failing set from five to four; the next row reduces it again. |
 | File import/publication and transcription/refinement were embedded in one oversized processing facade. | The existing `ProcessingPipeline` type now has cohesive sibling implementation modules: `pipeline/import_flow.rs` owns champion-first import, resumable journaling and atomic publication; `pipeline/transcription.rs` owns bound transcription, refinement and hypothesis population. The root retains engine lifecycle, consent, shared runtime and audio operations. Source policies consume the full composed surface, so moving code cannot evade raw-write or champion constraints. | **CLOSED locally**: root 1,957 production lines, import flow 1,778 and transcription 841. Pipeline regressions passed 64 with zero failures and one explicit live-WSL ignore; 14 pipeline-related source policies, backend layering, strict all-target/all-feature Clippy and rustfmt pass. The gate remains correctly red on the three modules below. |
 | Import, batch-processing, model/download and system/recovery adapters were embedded in one oversized Tauri command facade. | The public command registry and command names are unchanged, while `commands/ingest.rs` owns import/batch/model flows and `commands/system_ops.rs` owns diagnostics, WSL control, database snapshot/restore and destructive workspace operations. A shared fail-closed policy utility composes every shipped command slice, preventing source gates from becoming blind after extraction. | **CLOSED locally**: root 1,743 production lines, ingest 1,128 and system operations 1,153. All 75 command regressions and all 13 command-source policies pass, including restore admission/order and blank-transcript refusal. Backend layering, strict all-target/all-feature Clippy, rustfmt and quality-gate self-tests pass. The architecture gate now remains correctly red only on Database and Couch. |
+| TLS/session lifecycle, HTTP routing, queue/audio authorization and canonical decision authority were embedded in one oversized Couch server file. | `couch.rs` remains the state/type composition root while `couch/lifecycle.rs`, `routing.rs`, `queue_audio.rs` and `decisions.rs` own the four explicit service boundaries. Public start/stop/status behavior is re-exported unchanged; sibling-only structs stay non-public. A fail-closed composed-surface utility keeps policy checks attached to moved authority. | **CLOSED locally**: root 404 production lines, lifecycle 1,347, routing 813, queue/audio 1,641 and decisions 1,444. Couch regressions passed 127/127; all 8 Couch-source policy programs, strict all-target/all-feature Clippy, rustfmt, backend layering and quality-gate self-tests pass. The architecture gate now remains correctly red only on Database. |
+| Public-error test fixtures themselves contained a generic `C:\Users\owner` path even though repository hygiene forbids every tracked Windows profile path. | The hostile-message fixtures now use a non-profile private path, preserving the redaction/totality test without teaching the public repository a profile-path exception. | **CLOSED locally**: the 5 focused frontend error-boundary tests and the repository hygiene regression pass. |
 
 ## Integrated checkpoint evidence
 
@@ -145,20 +147,20 @@ SHA in the immutable manifest, not a short hash copied into this file.
   (6,335/11,642), 49.26% branches (2,675/5,430), 54.57% functions (1,516/2,778), and 56.83%
   lines (4,601/8,096)**. The fail-closed summary SHA-256 is
   `c8c0d37962ebf10ac2f2c67febe39e0f9a87b3cec721ea2aaf1ea88a019e84`.
-- Two shipped Rust modules exceed the normal 2,000-line ceiling:
+- One shipped Rust module exceeds the normal 2,000-line ceiling:
 
   | Module | Production LOC |
   |---|---:|
   | `src-tauri/src/db.rs` | 11,857 |
-  | `src-tauri/src/couch.rs` | 5,593 |
 
   The sole exception is immutable migration history, pinned to an exact file SHA and size ceiling;
-  neither production module above is excepted. `eval.rs` is now below the ceiling at
+  the production module above is not excepted. `eval.rs` is now below the ceiling at
   1,638 production lines after the sealed export-generation service extraction, and
   `review_pool.rs` is below it at 1,973 after the immutable dedup-authority extraction. The
   `pipeline.rs` composition root is below it at 1,957, with its import and transcription modules
   independently below policy. The `commands.rs` composition root is below it at 1,743, with its
-  ingest and system-operation modules independently below policy.
+  ingest and system-operation modules independently below policy. The `couch.rs` composition root
+  is below it at 404, with lifecycle, routing, queue/audio and decisions independently below policy.
 - IPC is contained but incomplete: **103 handwritten calls remain** (13 generated / 116 invoked).
   This is materially safer than an open bridge but does not satisfy the zero-untyped-invoke target.
 - `App.svelte` is now a 5-line composition shell and extracted presentational modules are 69–289

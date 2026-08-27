@@ -24,6 +24,7 @@ import tempfile
 from pathlib import Path
 
 from _command_policy_util import command_surface
+from _couch_policy_util import couch_surface
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE = REPO_ROOT / "scripts" / "check_playback_enforcement_readiness.py"
@@ -95,7 +96,7 @@ def test_runtime_and_repair_tools_never_authorize_from_the_stored_ratio() -> Non
 def test_playback_identity_has_no_segment_id_or_path_fallback() -> None:
     sources = [
         (DB_RS.name, DB_RS.read_text(encoding="utf-8")),
-        (COUCH_RS.name, COUCH_RS.read_text(encoding="utf-8")),
+        (COUCH_RS.name, couch_surface(REPO_ROOT / "src-tauri" / "src")),
         ("command surface", command_surface(REPO_ROOT / "src-tauri" / "src")),
         (SEGMENTS_WRITE_RS.name, SEGMENTS_WRITE_RS.read_text(encoding="utf-8")),
         (GATE.name, GATE.read_text(encoding="utf-8")),
@@ -108,7 +109,7 @@ def test_playback_identity_has_no_segment_id_or_path_fallback() -> None:
 
 
 def test_the_refusal_marker_is_the_string_the_server_actually_logs() -> None:
-    assert gate.ENFORCE_MARKER.decode() in COUCH_RS.read_text(encoding="utf-8"), (
+    assert gate.ENFORCE_MARKER.decode() in couch_surface(REPO_ROOT / "src-tauri" / "src"), (
         "the gate greps the binary for a marker the server no longer emits, so it would pass on silence"
     )
 

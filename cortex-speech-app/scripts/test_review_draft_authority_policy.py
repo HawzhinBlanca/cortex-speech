@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from _couch_policy_util import couch_surface
+
 
 REPO = Path(__file__).resolve().parents[1]
 RUST = REPO / "src-tauri" / "src"
@@ -100,9 +102,10 @@ def test_drafts_never_enter_truth_export_eval_payment_or_serving_queries() -> No
         RUST / "quality.rs",
         RUST / "review_pool.rs",
         RUST / "review_pool_export.rs",
-        RUST / "couch.rs",
     ]
     contaminated = [str(path.relative_to(REPO)) for path in authority_paths if "review_drafts" in read(path)]
+    if "review_drafts" in couch_surface(RUST):
+        contaminated.append("src-tauri/src/couch.rs + couch/*.rs")
     if contaminated:
         raise AssertionError(f"non-authoritative drafts entered an authority query: {contaminated}")
 

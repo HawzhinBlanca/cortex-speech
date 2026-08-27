@@ -8,6 +8,7 @@ global admission state and cannot flake concurrent Rust tests.
 from pathlib import Path
 
 from _command_policy_util import command_production_surface, command_surface
+from _couch_policy_util import couch_surface
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src-tauri" / "src"
@@ -16,6 +17,8 @@ SRC = REPO_ROOT / "src-tauri" / "src"
 def _read(rel: str) -> str:
     if rel == "commands.rs":
         return command_surface(SRC)
+    if rel == "couch.rs":
+        return couch_surface(SRC)
     return (SRC / rel).read_text(encoding="utf-8")
 
 

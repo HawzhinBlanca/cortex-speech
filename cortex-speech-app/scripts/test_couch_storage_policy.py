@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+from _couch_policy_util import couch_surface
+
 
 def test_transcript_drafts_are_session_scoped() -> None:
     source = (Path(__file__).parents[1] / "src-tauri" / "assets" / "couch.html").read_text(encoding="utf-8")
@@ -69,7 +71,7 @@ def test_cookie_sessions_survive_a_restart() -> None:
 
     Each anchor is a load-bearing half of the fix; losing any one silently restores the amnesia.
     """
-    source = (Path(__file__).parents[1] / "src-tauri" / "src" / "couch.rs").read_text(encoding="utf-8")
+    source = couch_surface(Path(__file__).parents[1] / "src-tauri" / "src")
     required = {
         "sessions are persisted": "struct SavedCookieSession",
         # The RESTORE WIRING, not just the word `session_issued` — that substring also matches the

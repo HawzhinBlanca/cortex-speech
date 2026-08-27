@@ -17,6 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _couch_policy_util import couch_surface
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "activate_voice_focus.py"
 TRACKED = [
@@ -281,7 +283,8 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
         (src / "db.rs", "pub focus_narrowed: bool"),
     ]
     for path, needle in anchors:
-        assert needle in path.read_text(encoding="utf-8"), f"{path.name} lost its focus anchor: {needle!r}"
+        source = couch_surface(src) if path == src / "couch.rs" else path.read_text(encoding="utf-8")
+        assert needle in source, f"{path.name} lost its focus anchor: {needle!r}"
     review = (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte").read_text(encoding="utf-8")
     assert "allReviewed: !subsetScoped" in review, (
         "the completion banner must exclude EVERY subset, not just a search — a drained focus queue "

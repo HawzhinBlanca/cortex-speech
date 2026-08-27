@@ -8,7 +8,7 @@ describe('public error boundary', () => {
     const failure = {
       schema: 1,
       code: 'PAY_POLICY_REQUIRED',
-      message: 'SQL failed at C:\\Users\\owner\\secret.db\nstack: internal()',
+      message: 'SQL failed at C:\\private\\secret.db\nstack: internal()',
       retryable: false,
       suggestedAction: 'openModels',
       operationId,
@@ -60,14 +60,14 @@ describe('public error boundary', () => {
         code: '../../secret',
         retryable: 'yes',
         suggestedAction: 'runSql',
-        operationId: 'C:\\Users\\owner',
+        operationId: 'C:\\private',
       }),
     ).toEqual({});
   });
 
   it('retains only a legacy E_* token and drops surrounding prose', () => {
     const rendered = formatPublicErrorReference(
-      'write failed E_DATABASE_LOCKED: C:\\Users\\owner\\library.db; SQL stack follows',
+      'write failed E_DATABASE_LOCKED: C:\\private\\library.db; SQL stack follows',
     );
     expect(rendered).toBe('E_DATABASE_LOCKED');
   });

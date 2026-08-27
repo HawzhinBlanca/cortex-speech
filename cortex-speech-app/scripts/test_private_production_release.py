@@ -14,6 +14,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+from _couch_policy_util import couch_surface
+
 APP = Path(__file__).resolve().parent.parent
 SUBJECT = APP / "scripts" / "release_private_production.py"
 SPEC = importlib.util.spec_from_file_location("private_release", SUBJECT)
@@ -272,7 +274,7 @@ def test_recovery_restores_schema64_and_reactivates_managed_previous_release() -
 
 def test_watchdog_and_server_pin_the_release_boundary() -> None:
     watchdog = (APP / "scripts" / "ops" / "cortex-watchdog.ps1").read_text(encoding="utf-8")
-    couch = (APP / "src-tauri" / "src" / "couch.rs").read_text(encoding="utf-8")
+    couch = couch_surface(APP / "src-tauri" / "src")
     controller = SUBJECT.read_text(encoding="utf-8")
     assert release.POINTER_FILE in watchdog
     assert "Get-VerifiedActiveRelease" in watchdog
