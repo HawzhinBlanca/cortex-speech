@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import errno
+import ctypes
 import hashlib
 import json
 import os
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
+from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -197,6 +204,137 @@ class Verify10SupervisorTests(unittest.TestCase):
             "expiresAt": phase["expiresAt"],
             "commandRegistryHash": phase["commandRegistry"]["registrySha256"],
         }
+
+    def _write_fault_campaign(
+        self,
+        root: Path,
+        *,
+        token: str,
+        started: datetime,
+        sha: str,
+        registry_hash: str,
+        checkout_digest: str,
+        environment: dict[str, object],
+    ) -> Path:
+        run_dir = root / token
+        run_dir.mkdir(parents=True, exist_ok=False)
+        ended = started + timedelta(minutes=1)
+        started_at = self.verify._format_utc(started)
+        ended_at = self.verify._format_utc(ended)
+        environment_digest = self.verify._document_digest(environment)
+        start = {
+            "schema": 1,
+            "type": "VerifierFaultCampaignStartV1",
+            "runToken": token,
+            "fullGitSha": sha,
+            "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+            "checkoutStateDigest": checkout_digest,
+            "gateRegistryHash": registry_hash,
+            "environmentDigest": environment_digest,
+            "startedAt": started_at,
+            "attemptCount": 1,
+            "retryPolicy": "none",
+        }
+        self.supervisor.atomic_write_json(
+            run_dir / self.verify.VERIFIER_FAULT_CAMPAIGN_START, start
+        )
+        events = [
+            {
+                "schema": 1,
+                "sequence": 1,
+                "runToken": token,
+                "event": "campaign_start",
+                "at": started_at,
+                "fullGitSha": sha,
+                "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+                "checkoutStateDigest": checkout_digest,
+                "gateRegistryHash": registry_hash,
+                "environmentDigest": environment_digest,
+                "attemptCount": 1,
+                "retryPolicy": "none",
+            },
+            {
+                "schema": 1,
+                "sequence": 2,
+                "runToken": token,
+                "event": "campaign_end",
+                "at": ended_at,
+                "exitCode": 0,
+                "passed": True,
+                "retryCount": 0,
+                "failureCount": 0,
+            },
+        ]
+        (run_dir / "events.jsonl").write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+            encoding="utf-8",
+            newline="\n",
+        )
+        test_results = [
+            {"name": name, "outcome": "ok"}
+            for name in self.verify.VERIFIER_FAULT_TEST_METHODS
+        ]
+        log_lines = [
+            f"{name} (test_verify10_supervisor.Verify10SupervisorTests.{name}) ... ok"
+            for name in self.verify.VERIFIER_FAULT_TEST_METHODS
+        ]
+        log_lines.extend(
+            [
+                "----------------------------------------------------------------------",
+                f"Ran {len(test_results)} tests in 1.000s",
+                "",
+                "OK",
+            ]
+        )
+        (run_dir / self.verify.VERIFIER_FAULT_CAMPAIGN_LOG).write_text(
+            "\n".join(log_lines) + "\n", encoding="utf-8", newline="\n"
+        )
+        manifest = {
+            "schema": 1,
+            "type": "VerifierFaultCampaignV1",
+            "complete": True,
+            "runToken": token,
+            "fullGitSha": sha,
+            "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+            "checkoutStateDigest": checkout_digest,
+            "gateRegistryHash": registry_hash,
+            "environment": environment,
+            "environmentDigest": environment_digest,
+            "startedAt": started_at,
+            "endedAt": ended_at,
+            "expiresAt": self.verify._format_utc(
+                ended
+                + timedelta(seconds=self.verify.VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS)
+            ),
+            "attemptCount": 1,
+            "retryCount": 0,
+            "command": {
+                "argv": self.verify._verifier_fault_campaign_command(),
+                "cwd": str(self.verify._fault_campaign_test_source().parent.resolve()),
+                "forcedEnvironment": {
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONUTF8": "1",
+                },
+            },
+            "testSource": self.verify._tracked_authority_binding(
+                self.verify._fault_campaign_test_source(), sha
+            ),
+            "testResults": test_results,
+            "scenarioResults": self.verify._fault_scenario_results(test_results),
+            "residuals": {
+                "processIdentities": [],
+                "occupiedDevelopmentPorts": [],
+                "leasePaths": [],
+                "partialStatusPointers": [],
+            },
+            "exitCode": 0,
+            "passed": True,
+            "failures": [],
+            "artifacts": self.verify._fault_campaign_artifacts(run_dir),
+        }
+        manifest_path = run_dir / self.verify.VERIFIER_FAULT_CAMPAIGN_MANIFEST
+        self.supervisor.atomic_write_json(manifest_path, manifest)
+        return manifest_path
 
     def test_registry_is_typed_profiled_explicit_and_below_six_hours(self) -> None:
         gates = self.verify.GATES
@@ -485,6 +623,14 @@ class Verify10SupervisorTests(unittest.TestCase):
         self.assertIn("PENDING_EXTERNAL", freshness["rule"])
         classes = {item["id"]: item for item in registry["evidenceContract"]["classes"]}
         self.assertEqual(
+            classes["timeout-calibration-baselines"]["validatorGate"],
+            "timeout-calibration-evidence",
+        )
+        self.assertEqual(
+            classes["verifier-fault-campaigns"]["validatorGate"],
+            "verifier-fault-campaign-evidence",
+        )
+        self.assertEqual(
             classes["architecture-contract"]["validatorGate"],
             "architecture-contract-evidence",
         )
@@ -609,6 +755,457 @@ class Verify10SupervisorTests(unittest.TestCase):
                     proof_root=proof_root,
                     expected_sha=sha,
                 )
+
+    def test_fault_campaign_evidence_rejects_self_authored_retry_stale_and_incomplete_reports(self) -> None:
+        sha = self.verify._full_git_sha()
+        registry_hash = self.verify.gate_registry_hash()
+        checkout_digest = self.verify._checkout_state_digest()
+        environment = self.verify._environment_document()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign_root = root / "campaigns"
+            gate_root = root / "gate"
+            gate_root.mkdir()
+            for index, minutes in enumerate((12, 8, 4), start=1):
+                self._write_fault_campaign(
+                    campaign_root,
+                    token=f"{index:032x}",
+                    started=now - timedelta(minutes=minutes),
+                    sha=sha,
+                    registry_hash=registry_hash,
+                    checkout_digest=checkout_digest,
+                    environment=environment,
+                )
+            original = self.verify.VERIFIER_FAULT_CAMPAIGN_ROOT, self.verify.LOG_DIR
+            try:
+                self.verify.VERIFIER_FAULT_CAMPAIGN_ROOT = campaign_root
+                self.verify.LOG_DIR = gate_root
+                artifact = self.verify._build_verifier_fault_campaign_evidence()
+            finally:
+                self.verify.VERIFIER_FAULT_CAMPAIGN_ROOT, self.verify.LOG_DIR = original
+            path = gate_root / self.verify._FAULT_CAMPAIGNS_ARTIFACT
+            self.supervisor.atomic_write_json(path, artifact)
+
+            def validate() -> None:
+                self.verify._validate_class_evidence_artifact(
+                    "verifier-fault-campaigns",
+                    path,
+                    expected_sha=sha,
+                    expected_profile=self.verify.PROFILE_OWNER,
+                    expected_registry_hash=registry_hash,
+                    expected_checkout_digest=checkout_digest,
+                    expected_environment=environment,
+                )
+
+            validate()
+            mutations = {}
+            retried = json.loads(json.dumps(artifact))
+            retried["campaigns"][1]["retryCount"] = 1
+            mutations["retry"] = retried
+            incomplete = json.loads(json.dumps(artifact))
+            incomplete["campaigns"] = incomplete["campaigns"][:2]
+            mutations["incomplete"] = incomplete
+            scenario_omission = json.loads(json.dumps(artifact))
+            scenario_omission["campaigns"][0]["scenarioResults"].pop()
+            mutations["scenario"] = scenario_omission
+            stale = json.loads(json.dumps(artifact))
+            stale["expiresAt"] = self.verify._format_utc(now - timedelta(seconds=1))
+            mutations["stale"] = stale
+            for label, mutation in mutations.items():
+                with self.subTest(label=label):
+                    self.supervisor.atomic_write_json(path, mutation)
+                    with self.assertRaises(self.verify.EvidenceError):
+                        validate()
+            self_authored_root = root / "self-authored"
+            self_authored_root.mkdir()
+            self_authored_path = self_authored_root / self.verify._FAULT_CAMPAIGNS_ARTIFACT
+            self.supervisor.atomic_write_json(self_authored_path, artifact)
+            with self.assertRaises(self.verify.EvidenceError):
+                self.verify._validate_class_evidence_artifact(
+                    "verifier-fault-campaigns",
+                    self_authored_path,
+                    expected_sha=sha,
+                    expected_profile=self.verify.PROFILE_OWNER,
+                    expected_registry_hash=registry_hash,
+                    expected_checkout_digest=checkout_digest,
+                    expected_environment=environment,
+                )
+            self.supervisor.atomic_write_json(path, artifact)
+            copied_log = next(
+                gate_root.glob(
+                    f"{self.verify.MACHINE_EVIDENCE_DIRECTORY}/verifier-fault-campaigns/*/"
+                    f"{self.verify.VERIFIER_FAULT_CAMPAIGN_LOG}"
+                )
+            )
+            copied_log.write_text("self-authored pass\n", encoding="utf-8")
+            with self.assertRaises(self.verify.EvidenceError):
+                validate()
+
+            incomplete_token = "f" * 32
+            incomplete = campaign_root / incomplete_token
+            incomplete.mkdir()
+            incomplete_started = self.verify._format_utc(now - timedelta(minutes=1))
+            incomplete_event = {
+                "schema": 1,
+                "sequence": 1,
+                "runToken": incomplete_token,
+                "event": "campaign_start",
+                "at": incomplete_started,
+                "fullGitSha": sha,
+                "sourceTreeDigest": self.verify._source_tree_digest_for_sha(sha),
+                "checkoutStateDigest": checkout_digest,
+                "gateRegistryHash": registry_hash,
+                "environmentDigest": self.verify._document_digest(environment),
+                "attemptCount": 1,
+                "retryPolicy": "none",
+            }
+            (incomplete / "events.jsonl").write_text(
+                json.dumps(incomplete_event, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            retry_gate_root = root / "retry-gate"
+            retry_gate_root.mkdir()
+            original = self.verify.VERIFIER_FAULT_CAMPAIGN_ROOT, self.verify.LOG_DIR
+            try:
+                self.verify.VERIFIER_FAULT_CAMPAIGN_ROOT = campaign_root
+                self.verify.LOG_DIR = retry_gate_root
+                self.assertEqual(
+                    len(
+                        self.verify._matching_fault_campaign_attempts(
+                            expected_sha=sha,
+                            expected_registry_hash=registry_hash,
+                            expected_checkout_digest=checkout_digest,
+                            expected_environment=environment,
+                        )
+                    ),
+                    4,
+                )
+                with self.assertRaisesRegex(self.verify.EvidenceError, "incomplete"):
+                    self.verify._build_verifier_fault_campaign_evidence()
+            finally:
+                self.verify.VERIFIER_FAULT_CAMPAIGN_ROOT, self.verify.LOG_DIR = original
+
+    def test_timeout_calibration_evidence_recomputes_every_gate_and_rejects_retries(self) -> None:
+        profile = self.verify.PROFILE_OWNER
+        sha = self.verify._full_git_sha()
+        registry_hash = self.verify.gate_registry_hash()
+        checkout_digest = self.verify._checkout_state_digest()
+        environment = self.verify._environment_document()
+        selected = [gate for gate in self.verify.GATES if profile in gate.profiles]
+        calibrated = [
+            gate for gate in selected if gate.id != "timeout-calibration-evidence"
+        ]
+        observations = {
+            gate.id: 0.0 if gate.timeout_seconds == 120 else gate.timeout_seconds / 4.0
+            for gate in calibrated
+        }
+        for gate in calibrated:
+            self.assertGreaterEqual(
+                gate.timeout_seconds,
+                self.verify._required_calibrated_timeout(observations[gate.id]),
+                gate.id,
+            )
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        baselines = []
+        for index, minutes in enumerate((12, 8, 4), start=1):
+            started = now - timedelta(minutes=minutes)
+            ended = started + timedelta(minutes=1)
+            token = f"{index + 20:032x}"
+            gate_results = []
+            for gate in selected:
+                gate_results.append(
+                    {
+                        "gateId": gate.id,
+                        "status": (
+                            self.verify.FAIL
+                            if gate.id == "timeout-calibration-evidence"
+                            else self.verify.PASS
+                        ),
+                        "seconds": observations.get(gate.id, 0.0),
+                    }
+                )
+            baselines.append(
+                {
+                    "runToken": token,
+                    "manifestSha256": hashlib.sha256((token + "m").encode()).hexdigest(),
+                    "productAttestationSha256": hashlib.sha256(
+                        (token + "a").encode()
+                    ).hexdigest(),
+                    "startedAt": self.verify._format_utc(started),
+                    "endedAt": self.verify._format_utc(ended),
+                    "expiresAt": self.verify._format_utc(
+                        ended
+                        + timedelta(
+                            seconds=self.verify.TIMEOUT_CALIBRATION_FRESH_SECONDS
+                        )
+                    ),
+                    "attemptCount": 1,
+                    "retryCount": 0,
+                    "staleTakeover": False,
+                    "gateResults": gate_results,
+                }
+            )
+        calibrations = [
+            {
+                "gateId": gate.id,
+                "observedSeconds": [observations[gate.id]] * 3,
+                "observedMaximumSeconds": observations[gate.id],
+                "requiredTimeoutSeconds": gate.timeout_seconds,
+                "configuredTimeoutSeconds": gate.timeout_seconds,
+            }
+            for gate in calibrated
+        ]
+        artifact = {
+            "schema": 1,
+            "classId": "timeout-calibration-baselines",
+            "fullGitSha": sha,
+            "gateRegistryHash": registry_hash,
+            "checkoutStateDigest": checkout_digest,
+            "environment": environment,
+            "environmentDigest": self.verify._document_digest(environment),
+            "profile": profile,
+            "measuredAt": baselines[-1]["endedAt"],
+            "expiresAt": baselines[0]["expiresAt"],
+            "immutableAuthority": "exact-git-commit",
+            "formula": "ceil(max(3 * observedMaximumSeconds, observedMaximumSeconds + 120))",
+            "excludedSelfGateId": "timeout-calibration-evidence",
+            "selectedBudgetSeconds": sum(gate.timeout_seconds for gate in selected),
+            "baselines": baselines,
+            "calibrations": calibrations,
+            "passed": True,
+            "failures": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / self.verify._TIMEOUT_CALIBRATION_ARTIFACT
+            self.supervisor.atomic_write_json(path, artifact)
+            with self.assertRaises(self.verify.EvidenceError):
+                self.verify._validate_class_evidence_artifact(
+                    "timeout-calibration-baselines",
+                    path,
+                    expected_sha=sha,
+                    expected_profile=profile,
+                    expected_registry_hash=registry_hash,
+                    expected_checkout_digest=checkout_digest,
+                    expected_environment=environment,
+                )
+            mutations = {}
+            retried = json.loads(json.dumps(artifact))
+            first_workload = next(
+                item
+                for item in retried["baselines"][0]["gateResults"]
+                if item["gateId"] != "timeout-calibration-evidence"
+            )
+            first_workload["status"] = self.verify.PASS_AFTER_RETRY
+            mutations["retry-status"] = retried
+            retry_count = json.loads(json.dumps(artifact))
+            retry_count["baselines"][0]["retryCount"] = 1
+            mutations["retry-count"] = retry_count
+            incomplete = json.loads(json.dumps(artifact))
+            incomplete["baselines"].pop()
+            mutations["incomplete"] = incomplete
+            substituted_registry = json.loads(json.dumps(artifact))
+            substituted_registry["gateRegistryHash"] = "0" * 64
+            mutations["registry"] = substituted_registry
+            stale = json.loads(json.dumps(artifact))
+            stale["expiresAt"] = self.verify._format_utc(now - timedelta(seconds=1))
+            mutations["stale"] = stale
+            under_budget = json.loads(json.dumps(artifact))
+            first_calibration = under_budget["calibrations"][0]
+            configured = first_calibration["configuredTimeoutSeconds"]
+            under_budget_observation = max(1.0, (configured + 1.0) / 3.0)
+            required = self.verify._required_calibrated_timeout(under_budget_observation)
+            self.assertGreater(required, configured)
+            for baseline in under_budget["baselines"]:
+                next(
+                    item
+                    for item in baseline["gateResults"]
+                    if item["gateId"] == first_calibration["gateId"]
+                )["seconds"] = under_budget_observation
+            first_calibration["observedSeconds"] = [under_budget_observation] * 3
+            first_calibration["observedMaximumSeconds"] = under_budget_observation
+            first_calibration["requiredTimeoutSeconds"] = required
+            mutations["under-budget"] = under_budget
+            for label, mutation in mutations.items():
+                with self.subTest(label=label):
+                    self.supervisor.atomic_write_json(path, mutation)
+                    with self.assertRaises(self.verify.EvidenceError):
+                        self.verify._validate_class_evidence_artifact(
+                            "timeout-calibration-baselines",
+                            path,
+                            expected_sha=sha,
+                            expected_profile=profile,
+                            expected_registry_hash=registry_hash,
+                            expected_checkout_digest=checkout_digest,
+                            expected_environment=environment,
+                        )
+
+    def test_timeout_calibration_consumes_completed_manifests_and_latest_incomplete_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixed_checkout_digest = self.verify._checkout_state_digest()
+            manifest_gate = replace(
+                self.verify._gate_by_id("manifest-alignment"),
+                timeout_seconds=121,
+            )
+            original = (
+                self.verify.PROOF_ROOT,
+                self.verify.LATEST_PROOF,
+                self.verify.RUN_LOCK,
+                self.verify.LEGACY_RUN_LOCK,
+                self.verify.GATES,
+                self.verify.LOG_DIR,
+                self.verify._assert_source_state,
+                self.verify._checkout_state_digest,
+            )
+            try:
+                self.verify.PROOF_ROOT = root / "proofs"
+                self.verify.LATEST_PROOF = root / "latest-proof.json"
+                self.verify.RUN_LOCK = root / "verify.lease.json"
+                self.verify.LEGACY_RUN_LOCK = root / "legacy.lock"
+                self.verify.GATES = [manifest_gate]
+                self.verify.LOG_DIR = root / "gate"
+                self.verify.LOG_DIR.mkdir()
+                self.verify._assert_source_state = lambda *_args: None
+                self.verify._checkout_state_digest = lambda: fixed_checkout_digest
+                with mock.patch.object(
+                    self.verify,
+                    "_consume_rust_coverage_prerequisite",
+                    side_effect=self._synthetic_coverage_binding,
+                ):
+                    for _index in range(3):
+                        self.assertEqual(
+                            self.verify.aggregate_main(
+                                quick=False,
+                                status_md=None,
+                                profile=self.verify.PROFILE_OWNER,
+                            ),
+                            2,
+                        )
+                first_source_attestation = next(
+                    run_dir / self.verify.PRODUCT_ATTESTATION_NAME
+                    for run_dir in self.verify.PROOF_ROOT.iterdir()
+                )
+                original_source_attestation = first_source_attestation.read_bytes()
+                self.supervisor.atomic_write_json(first_source_attestation, {})
+                evidence_gate_root = self.verify.LOG_DIR
+                self.verify.LOG_DIR = root / "tamper-gate"
+                self.verify.LOG_DIR.mkdir()
+                with self.assertRaises(self.verify.EvidenceError):
+                    self.verify._build_timeout_calibration_evidence(
+                        profile=self.verify.PROFILE_OWNER,
+                        current_run_token=None,
+                    )
+                self.supervisor.atomic_write_bytes(
+                    first_source_attestation, original_source_attestation
+                )
+                self.verify.LOG_DIR = evidence_gate_root
+                report = self.verify._build_timeout_calibration_evidence(
+                    profile=self.verify.PROFILE_OWNER,
+                    current_run_token=None,
+                )
+                self.assertTrue(report["passed"])
+                self.assertEqual(len(report["baselines"]), 3)
+                self.assertEqual(len(report["calibrations"]), 1)
+                calibration = report["calibrations"][0]
+                self.assertEqual(calibration["gateId"], "manifest-alignment")
+                self.assertEqual(calibration["requiredTimeoutSeconds"], 121)
+                self.assertEqual(calibration["configuredTimeoutSeconds"], 121)
+                self.assertEqual(len(calibration["observedSeconds"]), 3)
+                report_path = self.verify.LOG_DIR / self.verify._TIMEOUT_CALIBRATION_ARTIFACT
+                self.supervisor.atomic_write_json(report_path, report)
+                self.verify._validate_class_evidence_artifact(
+                    "timeout-calibration-baselines",
+                    report_path,
+                    expected_sha=self.verify._full_git_sha(),
+                    expected_profile=self.verify.PROFILE_OWNER,
+                    expected_registry_hash=self.verify.gate_registry_hash(),
+                    expected_checkout_digest=fixed_checkout_digest,
+                    expected_environment=self.verify._environment_document(),
+                )
+                first_attestation = next(
+                    self.verify.LOG_DIR.glob(
+                        f"{self.verify.MACHINE_EVIDENCE_DIRECTORY}/"
+                        "timeout-calibration-baselines/*/product-attestation.json"
+                    )
+                )
+                original_attestation = first_attestation.read_bytes()
+                self.supervisor.atomic_write_json(first_attestation, {})
+                with self.assertRaises(self.verify.EvidenceError):
+                    self.verify._validate_class_evidence_artifact(
+                        "timeout-calibration-baselines",
+                        report_path,
+                        expected_sha=self.verify._full_git_sha(),
+                        expected_profile=self.verify.PROFILE_OWNER,
+                        expected_registry_hash=self.verify.gate_registry_hash(),
+                        expected_checkout_digest=fixed_checkout_digest,
+                        expected_environment=self.verify._environment_document(),
+                    )
+                self.supervisor.atomic_write_bytes(first_attestation, original_attestation)
+
+                latest_start = max(
+                    json.loads(
+                        (run_dir / "events.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()[0]
+                    )["at"]
+                    for run_dir in self.verify.PROOF_ROOT.iterdir()
+                )
+                incomplete_token = "f" * 32
+                incomplete = self.verify.PROOF_ROOT / incomplete_token
+                incomplete.mkdir()
+                start_event = {
+                    "schema": 1,
+                    "sequence": 1,
+                    "runToken": incomplete_token,
+                    "event": "run_start",
+                    "at": latest_start,
+                    "fullGitSha": self.verify._full_git_sha(),
+                    "sourceTreeDigest": self.verify._source_tree_digest(),
+                    "checkoutStateDigest": fixed_checkout_digest,
+                    "profile": self.verify.PROFILE_OWNER,
+                    "quick": False,
+                    "gateRegistryHash": self.verify.gate_registry_hash(),
+                    "authorityMode": self.verify.AUTHORITY_MODE_LIVE,
+                    "runAuthorityDigest": "0" * 64,
+                }
+                (incomplete / "events.jsonl").write_text(
+                    json.dumps(start_event) + "\n",
+                    encoding="utf-8",
+                )
+                self.supervisor.atomic_write_json(
+                    incomplete / "environment.json",
+                    self.verify._environment_document(),
+                )
+                self.verify.LOG_DIR = root / "retry-gate"
+                self.verify.LOG_DIR.mkdir()
+                with self.assertRaisesRegex(self.verify.EvidenceError, "incomplete"):
+                    self.verify._build_timeout_calibration_evidence(
+                        profile=self.verify.PROFILE_OWNER,
+                        current_run_token=None,
+                    )
+                (self.verify.PROOF_ROOT / ("e" * 32)).mkdir()
+                self.verify.LOG_DIR = root / "missing-start-gate"
+                self.verify.LOG_DIR.mkdir()
+                with self.assertRaisesRegex(
+                    self.verify.EvidenceError, "no durable run_start authority"
+                ):
+                    self.verify._build_timeout_calibration_evidence(
+                        profile=self.verify.PROFILE_OWNER,
+                        current_run_token=None,
+                    )
+            finally:
+                (
+                    self.verify.PROOF_ROOT,
+                    self.verify.LATEST_PROOF,
+                    self.verify.RUN_LOCK,
+                    self.verify.LEGACY_RUN_LOCK,
+                    self.verify.GATES,
+                    self.verify.LOG_DIR,
+                    self.verify._assert_source_state,
+                    self.verify._checkout_state_digest,
+                ) = original
 
     def test_known_defect_validator_blocks_supported_p2_but_keeps_disabled_scope_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1604,6 +2201,541 @@ class Verify10SupervisorTests(unittest.TestCase):
                 )
             )
 
+    def test_keyboard_interrupt_terminates_worker_and_publishes_no_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lease = self.supervisor.LeaseManager(
+                root / "lease.json", "e" * 40, "owner-product", "interrupt"
+            )
+            lease.acquire()
+            journal = self.supervisor.EvidenceJournal(root / "events.jsonl", "interrupt")
+            gate = self.verify._gate_by_id("manifest-alignment")
+            authority = self.verify._run_authority_document(diagnostic_overrides=False)
+            authority_mode, authority_digest = self.verify._validate_run_authority(authority)
+
+            class FakeProcess:
+                pid = 424_242
+
+            fake_process = FakeProcess()
+            fake_job = object()
+            try:
+                with mock.patch.object(
+                    self.verify,
+                    "spawn_isolated",
+                    return_value=(fake_process, fake_job),
+                ), mock.patch.object(
+                    self.verify,
+                    "wait_isolated",
+                    side_effect=KeyboardInterrupt,
+                ), mock.patch.object(
+                    self.verify,
+                    "terminate_isolated",
+                ) as terminate:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.verify._run_gate_worker(
+                            gate,
+                            root / "run",
+                            "interrupt",
+                            lease,
+                            journal,
+                            profile=self.verify.PROFILE_OWNER,
+                            authority_mode=authority_mode,
+                            run_authority_digest=authority_digest,
+                        )
+                terminate.assert_called_once_with(fake_process, fake_job)
+                events = [
+                    json.loads(line)
+                    for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertEqual(events[-1]["event"], "gate_end")
+                self.assertEqual(events[-1]["status"], "ABORTED")
+                self.assertEqual(events[-1]["reason"], "KeyboardInterrupt")
+                self.assertFalse((root / "latest-proof.json").exists())
+            finally:
+                lease.release()
+
+    @unittest.skipUnless(os.name == "nt", "real Windows console interrupt proof")
+    def test_real_console_interrupt_terminates_worker_and_publishes_no_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = root / "ready.json"
+            ready_staging = root / "ready.json.staging"
+            lease_path = root / "lease.json"
+            event_path = root / "events.jsonl"
+            pointer = root / "latest-proof.json"
+            worker_log = root / "worker.log"
+            helper_script = (
+                "import importlib.util,json,os,pathlib,signal,sys,time;"
+                f"p=pathlib.Path(r'{SUPERVISOR}');"
+                "s=importlib.util.spec_from_file_location('ctrl_c_supervisor',p);"
+                "m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;s.loader.exec_module(m);"
+                f"root=pathlib.Path(r'{root}');"
+                f"lease=m.LeaseManager(pathlib.Path(r'{lease_path}'),'a'*40,'owner-product','ctrl-c');"
+                f"journal=m.EvidenceJournal(pathlib.Path(r'{event_path}'),'ctrl-c');"
+                "signal.signal(signal.SIGBREAK,lambda *_args:(_ for _ in ()).throw(KeyboardInterrupt()));"
+                "lease.acquire();process=None;job=None;"
+                "\ntry:\n"
+                f" log=open(r'{worker_log}','w',encoding='utf-8')\n"
+                " process,job=m.spawn_isolated([sys.executable,'-c','import time;time.sleep(120)'],cwd=root,log=log)\n"
+                " creation=m.process_creation_time(process.pid)\n"
+                " lease.update_gate('interrupt-fixture',process.pid)\n"
+                f" f=open(r'{ready_staging}','w',encoding='utf-8');f.write(json.dumps([process.pid,creation]));f.flush();os.fsync(f.fileno());f.close();os.replace(r'{ready_staging}',r'{ready}')\n"
+                " m.wait_isolated(process,job,timeout=120,heartbeat=lease.heartbeat)\n"
+                "except KeyboardInterrupt:\n"
+                " if process is not None and job is not None:m.terminate_isolated(process,job)\n"
+                " lease.update_gate(None,None)\n"
+                " journal.append('gate_end',gate='interrupt-fixture',status='ABORTED',reason='KeyboardInterrupt')\n"
+                " raise SystemExit(130)\n"
+                "finally:\n"
+                " lease.release()\n"
+            )
+            helper = subprocess.Popen(
+                [sys.executable, "-c", helper_script],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+            child_pid = None
+            child_creation = None
+            try:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and time.monotonic() < deadline:
+                    if helper.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                stdout, stderr = ("", "")
+                if helper.poll() is not None:
+                    stdout, stderr = helper.communicate(timeout=1)
+                self.assertTrue(ready.exists(), f"interrupt fixture failed: {stdout} {stderr}")
+                child_pid, child_creation = json.loads(ready.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    self.supervisor.process_creation_time(child_pid), child_creation
+                )
+                helper.send_signal(signal.CTRL_BREAK_EVENT)
+                self.assertEqual(helper.wait(timeout=10), 130)
+                events = [
+                    json.loads(line)
+                    for line in event_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(events[-1]["status"], "ABORTED")
+                self.assertEqual(events[-1]["reason"], "KeyboardInterrupt")
+                self.assertFalse(lease_path.exists())
+                self.assertFalse(pointer.exists())
+                deadline = time.monotonic() + 5
+                while (
+                    self.supervisor.process_creation_time(child_pid) == child_creation
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.05)
+                self.assertNotEqual(
+                    self.supervisor.process_creation_time(child_pid), child_creation
+                )
+            finally:
+                if helper.poll() is None:
+                    helper.kill()
+                    helper.wait(timeout=5)
+                if (
+                    child_pid is not None
+                    and self.supervisor.process_creation_time(child_pid) == child_creation
+                ):
+                    subprocess.run(
+                        ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=10,
+                    )
+                if helper.stdout is not None:
+                    helper.stdout.close()
+                if helper.stderr is not None:
+                    helper.stderr.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job parent-kill and handle inheritance proof")
+    def test_killed_parent_closes_job_with_inherited_grandchild(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity_path = root / "descendants.json"
+            staging_path = root / "descendants.json.staging"
+            log_path = root / "worker.log"
+            child_script = (
+                "import json,os,subprocess,sys,time;"
+                "g=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)']);"
+                f"f=open(r'{staging_path}','w',encoding='utf-8');"
+                "f.write(json.dumps([os.getpid(),g.pid]));f.flush();os.fsync(f.fileno());f.close();"
+                f"os.replace(r'{staging_path}',r'{identity_path}');"
+                "time.sleep(120)"
+            )
+            parent_script = (
+                "import importlib.util,pathlib,sys,time;"
+                f"p=pathlib.Path(r'{SUPERVISOR}');"
+                "s=importlib.util.spec_from_file_location('parent_kill_supervisor',p);"
+                "m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;s.loader.exec_module(m);"
+                f"root=pathlib.Path(r'{root}');log=open(r'{log_path}','w',encoding='utf-8');"
+                f"process,job=m.spawn_isolated([sys.executable,'-c',{child_script!r}],cwd=root,log=log);"
+                "time.sleep(120)"
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-c", parent_script],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            identities: list[tuple[int, str | None]] = []
+            try:
+                deadline = time.monotonic() + 10
+                while not identity_path.exists() and time.monotonic() < deadline:
+                    if parent.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                stderr = parent.stderr.read() if parent.poll() is not None and parent.stderr else ""
+                self.assertTrue(identity_path.exists(), f"parent fixture failed: {stderr}")
+                descendant_pids = json.loads(identity_path.read_text(encoding="utf-8"))
+                self.assertEqual(len(descendant_pids), 2)
+                identities = [
+                    (pid, self.supervisor.process_creation_time(pid))
+                    for pid in descendant_pids
+                ]
+                self.assertTrue(all(creation is not None for _pid, creation in identities))
+                parent.kill()
+                parent.wait(timeout=5)
+                deadline = time.monotonic() + 5
+                while any(
+                    creation is not None
+                    and self.supervisor.process_creation_time(pid) == creation
+                    for pid, creation in identities
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(
+                    all(
+                        creation is None
+                        or self.supervisor.process_creation_time(pid) != creation
+                        for pid, creation in identities
+                    ),
+                    "killing the Job-owning parent left an assigned descendant alive",
+                )
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                if parent.stderr is not None:
+                    parent.stderr.close()
+                for pid, creation in identities:
+                    if self.supervisor.process_creation_time(pid) == creation:
+                        subprocess.run(
+                            ["taskkill", "/PID", str(pid), "/T", "/F"],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                            timeout=10,
+                        )
+
+    def test_process_kill_during_pointer_publication_never_exposes_partial_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pointer = root / "latest-proof.json"
+            pointer.write_text(json.dumps({"schema": 1, "value": "prior"}), encoding="utf-8")
+            marker = root / "public-validation-started"
+            counter = root / "validation-count"
+            script = (
+                "import importlib.util,json,pathlib,sys,time\n"
+                f"p=pathlib.Path(r'{SUPERVISOR}')\n"
+                "s=importlib.util.spec_from_file_location('publication_kill_supervisor',p)\n"
+                "m=importlib.util.module_from_spec(s)\n"
+                "sys.modules[s.name]=m\n"
+                "s.loader.exec_module(m)\n"
+                f"pointer=pathlib.Path(r'{pointer}')\n"
+                f"marker=pathlib.Path(r'{marker}')\n"
+                f"counter=pathlib.Path(r'{counter}')\n"
+                "def validate(path):\n"
+                " value=json.loads(path.read_text(encoding='utf-8'))\n"
+                " assert value == {'schema':1,'value':'candidate'}\n"
+                " count=int(counter.read_text())+1 if counter.exists() else 1\n"
+                " counter.write_text(str(count))\n"
+                " if count == 2:\n"
+                "  marker.write_text('published')\n"
+                "  time.sleep(120)\n"
+                "m.publish_validated_json(pointer,{'schema':1,'value':'candidate'},validate)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not marker.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                stderr = process.stderr.read() if process.poll() is not None and process.stderr else ""
+                self.assertTrue(
+                    marker.exists(),
+                    f"fixture never reached public-name validation: {stderr}",
+                )
+                process.kill()
+                process.wait(timeout=5)
+                self.assertEqual(
+                    json.loads(pointer.read_text(encoding="utf-8")),
+                    {"schema": 1, "value": "candidate"},
+                )
+                self.assertEqual(list(root.glob("*.candidate")), [])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    def test_disk_full_and_unwritable_evidence_are_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "evidence.json"
+            with mock.patch.object(
+                self.supervisor.os,
+                "fsync",
+                side_effect=OSError(errno.ENOSPC, "injected disk full"),
+            ):
+                with self.assertRaisesRegex(self.supervisor.EvidenceError, "atomic evidence write failed"):
+                    self.supervisor.atomic_write_json(output, {"schema": 1})
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob("*.tmp")), [])
+            with self.assertRaises(self.supervisor.EvidenceError):
+                journal = self.supervisor.EvidenceJournal(root, "token")
+                journal.append("run_start")
+
+    def test_probe_crash_fails_only_its_gate(self) -> None:
+        def crash():
+            raise RuntimeError("injected probe crash")
+
+        status, _seconds, detail = self.verify.run_gate(
+            "probe-crash-campaign", "fn", lambda: True, None, crash
+        )
+        self.assertEqual(status, self.verify.FAIL)
+        self.assertIn("probe crashed", detail)
+
+    def test_abnormal_node_termination_retry_is_noncertifying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            node = shutil.which("node")
+            self.assertIsNotNone(node, "the Windows verifier fault campaign requires Node")
+            marker = root / "node.pid"
+            script_path = root / "abnormal-exit.js"
+            script_path.write_text(
+                "const fs=require('fs');\n"
+                f"const marker={json.dumps(str(marker))};\n"
+                "if (fs.existsSync(marker)) process.exit(0);\n"
+                "fs.writeFileSync(marker,String(process.pid));\n"
+                "setInterval(()=>{},1000);\n",
+                encoding="utf-8",
+            )
+            original_log_dir = self.verify.LOG_DIR
+            self.verify.LOG_DIR = root
+            killed_identity: list[tuple[int, str | None]] = []
+            killer_errors: list[BaseException] = []
+
+            def terminate_node_with_abnormal_status() -> None:
+                try:
+                    deadline = time.monotonic() + 10
+                    while not marker.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    pid = int(marker.read_text(encoding="utf-8"))
+                    creation = self.supervisor.process_creation_time(pid)
+                    killed_identity.append((pid, creation))
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    kernel32.OpenProcess.argtypes = [
+                        wintypes.DWORD,
+                        wintypes.BOOL,
+                        wintypes.DWORD,
+                    ]
+                    kernel32.OpenProcess.restype = wintypes.HANDLE
+                    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+                    kernel32.TerminateProcess.restype = wintypes.BOOL
+                    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                    kernel32.CloseHandle.restype = wintypes.BOOL
+                    handle = kernel32.OpenProcess(0x0001, False, pid)
+                    if not handle:
+                        raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+                    try:
+                        if not kernel32.TerminateProcess(handle, 0xC0000409):
+                            raise OSError(ctypes.get_last_error(), "TerminateProcess failed")
+                    finally:
+                        kernel32.CloseHandle(handle)
+                except BaseException as error:  # noqa: BLE001 - delivered to the asserting thread
+                    killer_errors.append(error)
+
+            killer = threading.Thread(target=terminate_node_with_abnormal_status, daemon=True)
+            killer.start()
+            try:
+                status, _seconds, detail = self.verify.run_gate(
+                    "abnormal-node-campaign",
+                    "cmd",
+                    f'"{node}" "{script_path}"',
+                    root,
+                    None,
+                    timeout=60,
+                )
+                killer.join(timeout=10)
+                self.assertFalse(killer.is_alive())
+                self.assertEqual(killer_errors, [])
+                self.assertEqual(len(killed_identity), 1)
+                self.assertEqual(status, self.verify.PASS_AFTER_RETRY)
+                self.assertIn("re-ran once", detail)
+                self.assertEqual(len(list(root.glob("abnormal-node-campaign.attempt-*.log"))), 2)
+                code, _verdict = self.verify._profile_verdict(
+                    self.verify.PROFILE_OWNER,
+                    False,
+                    [("abnormal-node-campaign", status, 0.2, detail)],
+                    [],
+                )
+                self.assertNotEqual(code, 0)
+            finally:
+                self.verify.LOG_DIR = original_log_dir
+                killer.join(timeout=1)
+
+    def test_occupied_development_port_fails_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            node = shutil.which("node")
+            self.assertIsNotNone(node, "the Windows verifier fault campaign requires Node")
+
+            class AnsweringDebugPort(BaseHTTPRequestHandler):
+                requests = 0
+
+                def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+                    type(self).requests += 1
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b"[]")
+
+                def log_message(self, _format: str, *_args: object) -> None:
+                    return
+
+            server = None
+            for declared_port in (9271, 9261, 9333, 9334, 9335, 9355):
+                try:
+                    server = ThreadingHTTPServer(("127.0.0.1", declared_port), AnsweringDebugPort)
+                    break
+                except OSError:
+                    continue
+            self.assertIsNotNone(server, "every declared Cortex development port is already occupied")
+            assert server is not None
+            port = server.server_address[1]
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            profile_module = REPO_ROOT / "cortex-speech-app" / "e2e_profile.cjs"
+            fixture = root / "occupied-port.cjs"
+            fixture.write_text(
+                f"require({json.dumps(str(profile_module))})"
+                f".refuseIfDebugPortBusy({port},'verifier-fault-campaign');\n",
+                encoding="utf-8",
+            )
+            original_log_dir = self.verify.LOG_DIR
+            self.verify.LOG_DIR = root
+            try:
+                status, _seconds, detail = self.verify.run_gate(
+                    "occupied-port-campaign",
+                    "cmd",
+                    f'"{node}" "{fixture}"',
+                    root,
+                    None,
+                    timeout=60,
+                )
+            finally:
+                self.verify.LOG_DIR = original_log_dir
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+            self.assertEqual(status, self.verify.FAIL)
+            self.assertIn(f"debug port {port} is already answering", detail)
+            self.assertEqual(AnsweringDebugPort.requests, 1)
+            self.assertEqual(len(list(root.glob("occupied-port-campaign.attempt-*.log"))), 1)
+
+    def test_residual_inventory_measures_process_port_and_owned_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time;time.sleep(120)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            server = None
+            try:
+                creation = self.supervisor.process_creation_time(child.pid)
+                self.assertIsNotNone(creation)
+                identities = self.verify._process_tree_identities(child.pid)
+                self.assertIn(
+                    {"pid": child.pid, "processCreationTime": creation}, identities
+                )
+                for declared_port in sorted(self.verify.VERIFIER_FAULT_DECLARED_PORTS):
+                    try:
+                        server = ThreadingHTTPServer(
+                            ("127.0.0.1", declared_port), BaseHTTPRequestHandler
+                        )
+                        break
+                    except OSError:
+                        continue
+                self.assertIsNotNone(server)
+                assert server is not None
+                listeners = self.verify._declared_port_listeners()
+                self.assertTrue(
+                    any(
+                        item["port"] == server.server_address[1]
+                        and item["pid"] == os.getpid()
+                        for item in listeners
+                    )
+                )
+                owned = root / "owned.lease.json"
+                contender = root / "contender.lease.json"
+                self.supervisor.atomic_write_json(owned, {"runToken": "ours"})
+                self.supervisor.atomic_write_json(contender, {"runToken": "theirs"})
+                self.assertEqual(
+                    self.verify._owned_lease_residuals((owned, contender), "ours"),
+                    [owned.name],
+                )
+            finally:
+                if server is not None:
+                    server.server_close()
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+
+    def test_stale_status_from_another_commit_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pointer = Path(temporary) / "latest-proof.json"
+            pointer.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "runToken": "stale-run",
+                        "fullGitSha": "a" * 40,
+                        "profile": self.verify.PROFILE_OWNER,
+                        "manifest": "proofs/stale-run/manifest.json",
+                        "manifestSha256": "b" * 64,
+                        "productAttestation": "proofs/stale-run/product-attestation.json",
+                        "productAttestationSha256": "c" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.verify.EvidenceError,
+                "wrong source/run identity",
+            ):
+                self.verify._validate_latest_proof(pointer, "d" * 40)
+
     def test_evidence_write_failure_is_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(self.supervisor.EvidenceError):
@@ -1971,6 +3103,7 @@ class Verify10SupervisorTests(unittest.TestCase):
     def test_takeover_is_bound_into_manifest_attestation_and_terminal_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            fixed_checkout_digest = self.verify._checkout_state_digest()
             original = (
                 self.verify.PROOF_ROOT,
                 self.verify.LATEST_PROOF,
@@ -1978,6 +3111,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 self.verify.LEGACY_RUN_LOCK,
                 self.verify.GATES,
                 self.verify._assert_source_state,
+                self.verify._checkout_state_digest,
             )
             try:
                 self.verify.PROOF_ROOT = root / "proofs"
@@ -1986,6 +3120,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                 self.verify.LEGACY_RUN_LOCK = root / "legacy.lock"
                 self.verify.GATES = []
                 self.verify._assert_source_state = lambda *_args: None
+                self.verify._checkout_state_digest = lambda: fixed_checkout_digest
                 with mock.patch.object(
                     self.verify.LeaseManager,
                     "acquire",
@@ -2071,6 +3206,7 @@ class Verify10SupervisorTests(unittest.TestCase):
                     self.verify.LEGACY_RUN_LOCK,
                     self.verify.GATES,
                     self.verify._assert_source_state,
+                    self.verify._checkout_state_digest,
                 ) = original
 
     def test_attestation_publication_failure_invalidates_the_run_and_publishes_no_pointer(self) -> None:

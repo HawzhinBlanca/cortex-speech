@@ -37,6 +37,7 @@ import ctypes
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -48,6 +49,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
@@ -65,6 +67,7 @@ try:
         acquired_lease,
         atomic_write_bytes,
         atomic_write_json,
+        process_creation_time,
         publish_validated_json,
         sha256_file,
         spawn_isolated,
@@ -81,6 +84,7 @@ except ModuleNotFoundError:  # Imported as ``scripts.verify_10`` by policy tests
         acquired_lease,
         atomic_write_bytes,
         atomic_write_json,
+        process_creation_time,
         publish_validated_json,
         sha256_file,
         spawn_isolated,
@@ -106,6 +110,8 @@ ACTIVE_RELEASE_POINTER = "active-private-production-release.json"
 _RUNTIME_EXE_CONFIGURED = False
 _RUNTIME_EXE_ERROR = None
 _WINDOWS_RELEASE_AUTHORITY: dict[str, object] | None = None
+_ACTIVE_WORKER_PROFILE: str | None = None
+_ACTIVE_WORKER_RUN_TOKEN: str | None = None
 
 
 def validate_active_release_runtime(manifest, release_root):
@@ -966,6 +972,94 @@ PENDING_EXTERNAL = "PENDING_EXTERNAL"
 EVIDENCE_VERIFIED = "VERIFIED"
 EVIDENCE_FAILED = "FAILED_VALIDATION"
 
+# These are executable fault contracts, not prose labels.  The campaign producer runs the exact
+# committed unittest methods below in one isolated, no-retry process and the consumer re-parses its
+# durable log.  A report that merely repeats these scenario ids with ``passed: true`` is rejected.
+VERIFIER_FAULT_SCENARIOS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "hanging-child-and-grandchild",
+        ("test_timeout_kills_hanging_child_and_grandchild",),
+    ),
+    (
+        "live-wedged-holder",
+        ("test_verified_wedged_holder_is_terminated_and_replaced",),
+    ),
+    (
+        "dead-pid",
+        ("test_dead_holder_is_replaced_but_pid_reuse_fails_closed",),
+    ),
+    (
+        "pid-reuse",
+        ("test_dead_holder_is_replaced_but_pid_reuse_fails_closed",),
+    ),
+    (
+        "concurrent-verifier-starts",
+        ("test_two_concurrent_starts_have_exactly_one_winner",),
+    ),
+    (
+        "ctrl-c",
+        ("test_real_console_interrupt_terminates_worker_and_publishes_no_status",),
+    ),
+    (
+        "parent-kill",
+        ("test_killed_parent_closes_job_with_inherited_grandchild",),
+    ),
+    (
+        "kill-during-manifest-publication",
+        ("test_process_kill_during_pointer_publication_never_exposes_partial_json",),
+    ),
+    (
+        "inherited-pipe-handles",
+        ("test_killed_parent_closes_job_with_inherited_grandchild",),
+    ),
+    (
+        "disk-full",
+        ("test_disk_full_and_unwritable_evidence_are_terminal",),
+    ),
+    (
+        "unwritable-evidence-directory",
+        ("test_disk_full_and_unwritable_evidence_are_terminal",),
+    ),
+    (
+        "gate-timeout",
+        ("test_timeout_kills_hanging_child_and_grandchild",),
+    ),
+    (
+        "probe-crash",
+        ("test_probe_crash_fails_only_its_gate",),
+    ),
+    (
+        "abnormal-node-termination",
+        ("test_abnormal_node_termination_retry_is_noncertifying",),
+    ),
+    (
+        "stale-status-from-another-commit",
+        ("test_stale_status_from_another_commit_is_rejected",),
+    ),
+    (
+        "occupied-development-ports",
+        (
+            "test_occupied_development_port_fails_without_retry",
+            "test_residual_inventory_measures_process_port_and_owned_lease",
+        ),
+    ),
+    (
+        "surviving-child-processes",
+        (
+            "test_timeout_kills_hanging_child_and_grandchild",
+            "test_killed_parent_closes_job_with_inherited_grandchild",
+            "test_residual_inventory_measures_process_port_and_owned_lease",
+        ),
+    ),
+)
+VERIFIER_FAULT_TEST_METHODS = tuple(
+    dict.fromkeys(
+        test_name
+        for _scenario_id, test_names in VERIFIER_FAULT_SCENARIOS
+        for test_name in test_names
+    )
+)
+
 
 @dataclass(frozen=True)
 class EvidenceClassSpec:
@@ -1447,6 +1541,8 @@ GATE_FORCED_ENVIRONMENT_BY_ID: dict[str, dict[str, str]] = {
 GATE_ARTIFACT_REQUIREMENTS_BY_ID: dict[str, tuple[str, ...]] = {
     "architecture-contract-evidence": ("architecture-contract.json",),
     "known-defect-ledger-evidence": ("known-defect-ledger.json",),
+    "timeout-calibration-evidence": ("timeout-calibration-baselines.json",),
+    "verifier-fault-campaign-evidence": ("verifier-fault-campaigns.json",),
 }
 
 RUST_COVERAGE_ENVIRONMENT_ALLOWLIST = GATE_BASE_ENVIRONMENT
@@ -1769,6 +1865,8 @@ def _typed_gate(row: Sequence[object]) -> GateSpec:
 KNOWN_DEFECT_LEDGER = REPO_ROOT / "docs" / "KNOWN_DEFECTS.v1.json"
 _ARCHITECTURE_ARTIFACT = "architecture-contract.json"
 _KNOWN_DEFECT_ARTIFACT = "known-defect-ledger.json"
+_TIMEOUT_CALIBRATION_ARTIFACT = "timeout-calibration-baselines.json"
+_FAULT_CAMPAIGNS_ARTIFACT = "verifier-fault-campaigns.json"
 
 
 def _load_json_without_duplicate_keys(path: Path) -> object:
@@ -2101,6 +2199,48 @@ def _fn_architecture_contract() -> bool:
     return not failures
 
 
+def _failed_campaign_evidence(class_id: str, error: BaseException) -> dict[str, object]:
+    """Keep a durable red artifact even when a campaign authority is absent or malformed."""
+
+    environment = _environment_document()
+    return {
+        "schema": 1,
+        "classId": class_id,
+        "fullGitSha": _full_git_sha(),
+        "gateRegistryHash": gate_registry_hash(),
+        "checkoutStateDigest": _checkout_state_digest(),
+        "environment": environment,
+        "environmentDigest": _document_digest(environment),
+        "measuredAt": utc_now(),
+        "immutableAuthority": "exact-git-commit",
+        "passed": False,
+        "failures": [str(error)],
+    }
+
+
+def _fn_timeout_calibration_evidence() -> bool:
+    artifact_path = LOG_DIR / _TIMEOUT_CALIBRATION_ARTIFACT
+    try:
+        report = _build_timeout_calibration_evidence(
+            profile=_require_active_worker_profile(),
+            current_run_token=_ACTIVE_WORKER_RUN_TOKEN,
+        )
+    except (EvidenceError, OSError, ValueError) as error:
+        report = _failed_campaign_evidence("timeout-calibration-baselines", error)
+    atomic_write_json(artifact_path, report)
+    return report.get("passed") is True
+
+
+def _fn_verifier_fault_campaign_evidence() -> bool:
+    artifact_path = LOG_DIR / _FAULT_CAMPAIGNS_ARTIFACT
+    try:
+        report = _build_verifier_fault_campaign_evidence()
+    except (EvidenceError, OSError, ValueError) as error:
+        report = _failed_campaign_evidence("verifier-fault-campaigns", error)
+    atomic_write_json(artifact_path, report)
+    return report.get("passed") is True
+
+
 # (name, tier, kind, payload, cwd, env_probe, charter_ref)
 #   kind "fn"  -> payload is a callable returning bool
 #   kind "cmd" -> payload is a shell command string
@@ -2118,6 +2258,8 @@ GATES = [
     ("rust-architecture-truth", 1, "cmd", f'"{sys.executable}" scripts/rust_quality_gate.py architecture', APP, None, "Fail-closed shipped-Rust architecture ceiling: every production module stays below 2,000 logical lines unless an exact SHA-bound immutable-history exception applies. Oversized production modules are RED, never warnings."),
     ("architecture-contract-evidence", 1, "fn", _fn_architecture_contract, None, None, "Hash-bound final architecture contract: Rust module ceilings, zero handwritten/dynamic IPC, bounded frontend workspaces/components, and no component-level desktop runtime imports."),
     ("known-defect-ledger-evidence", 1, "fn", _fn_known_defect_ledger, None, None, "Hash-bound strict known-defect inventory with zero OPEN/REOPENED P0, P1 or P2 defect in any supported release profile."),
+    ("verifier-fault-campaign-evidence", 1, "fn", _fn_verifier_fault_campaign_evidence, None, None, "Three consecutive, fresh, exact-SHA/registry/environment verifier-produced fault campaigns. Every required lock, process-tree, interruption, evidence-write, timeout, crash, stale-status and occupied-port scenario must execute once without skip or retry, and every residual inventory must be empty."),
+    ("timeout-calibration-evidence", 1, "fn", _fn_timeout_calibration_evidence, None, None, "Three consecutive clean full verifier manifests for this exact profile, source, registry, checkout and environment. Every non-calibration gate must pass once with no retry/takeover/skip; every configured timeout must meet or exceed ceil(max(3 x observed maximum, observed maximum + 120s)) and the total budget must remain at or below six hours."),
     ("spot-check-pool", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_spot_check_pool.py"}"', APP, None, "The listening-QC must cover the WHOLE accessible paid-review campaign, not merely be able to fire once. The gate mirrors live focus, roster, dialect, on-disk audio, prior per-reviewer scores, and the Rust queue/check cadence; it derives each reviewer's worst-case key requirement because no enforced quota prevents one eligible reviewer from draining the queue. MEASURED 2026-08-21: the Hawleri campaign exposed 1,293 work clips but only 0-2 fresh keys per reviewer, so the old floor-of-3 gate would have gone green after three owner edits and then silently stopped measuring. Answer keys must be genuine owner-adjudicated/is_gold rows; never synthetic."),
     ("dataset-duplicates", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_dataset_duplicates.py"}"', APP, None, "The same-recording-under-different-names audit, on the LIVE library. FOUND BY THE OWNER'S EARS 2026-08-17, not by any gate: one recording lived under three filenames as different ENCODES, so the byte fingerprint saw three distinct files — ~68 duplicate sentences entered the corpus and 33 were reviewed (paid) twice, and duplicate content across nominally-different recordings can straddle a train/test split. Signal: source-timeline offset AND transcript agreeing across different files. Baseline 70, ratchets DOWN only."),
     ("snapshot-immutability", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_snapshot_immutability.py"}"', APP, None, "Gate C of docs/PLAN_TRUE_10.md. A training run cites a dataset snapshot id, and every CER measured from the resulting model hangs off that citation. This proves, on the LIVE library, that the id IS the content hash of the manifest it sealed (not a label someone chose), that no id is reused, that the sealed config names its own id, and that any pack still on disk still hashes to the snapshot it claims. Without it, 'trained on snapshot X' is decoration and every number downstream is unanchored. SKIP-ENV until the first pack is exported — it reports on data that exists and never invents a pass."),
@@ -2403,6 +2545,27 @@ RUST_COVERAGE_TOOLCHAIN_CONTRACT = APP / "scripts" / "rust_coverage_toolchain.js
 RUST_COVERAGE_INNER_TIMEOUT_SECONDS = 7_200
 RUST_COVERAGE_SUPERVISOR_TIMEOUT_SECONDS = 7_500
 RUST_COVERAGE_FRESH_SECONDS = 8 * 60 * 60
+TIMEOUT_CALIBRATION_FRESH_SECONDS = 72 * 60 * 60
+VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS = 72 * 60 * 60
+VERIFIER_FAULT_CAMPAIGN_TIMEOUT_SECONDS = 30 * 60
+VERIFIER_FAULT_CAMPAIGN_ROOT = LOG_DIR / "verifier-fault-campaigns"
+VERIFIER_FAULT_CAMPAIGN_LOCK = LOG_DIR / "verifier-fault-campaign.lease.json"
+VERIFIER_FAULT_CAMPAIGN_MANIFEST = "verifier-fault-campaign-manifest.json"
+VERIFIER_FAULT_CAMPAIGN_START = "campaign-start.json"
+VERIFIER_FAULT_CAMPAIGN_LOG = "unittest.log"
+VERIFIER_FAULT_DECLARED_PORTS = frozenset(
+    {1420, 8737, 8799, 9251, 9261, 9271, 9333, 9334, 9335, 9355}
+)
+MACHINE_EVIDENCE_DIRECTORY = "machine-evidence"
+TIMEOUT_BASELINE_CONTROL_FILES = (
+    "manifest.json",
+    "product-attestation.json",
+    "events.jsonl",
+    "environment.json",
+    "gate-registry.json",
+    RUN_AUTHORITY_NAME,
+    "evidence-contract.json",
+)
 
 # Append-only per-gate run record (external review 2026-08-06, P0.1): "a result that ran but cannot be
 # retrieved is operationally indistinguishable from no result."
@@ -3349,6 +3512,1245 @@ def _format_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _process_tree_identities(root_pid: int) -> list[dict[str, object]]:
+    """Snapshot the exact root/descendant PID identities without trusting names."""
+
+    if os.name != "nt":
+        creation = process_creation_time(root_pid)
+        return (
+            [{"pid": root_pid, "processCreationTime": creation}]
+            if creation is not None
+            else []
+        )
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if not snapshot or ctypes.cast(snapshot, ctypes.c_void_p).value == invalid_handle:
+        raise EvidenceError(
+            f"cannot snapshot verifier fault process tree: Windows error {ctypes.get_last_error()}"
+        )
+    parents: dict[int, int] = {}
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        success = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while success:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            success = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if parent in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    identities: list[dict[str, object]] = []
+    for pid in sorted(descendants):
+        creation = process_creation_time(pid)
+        if creation is not None:
+            identities.append({"pid": pid, "processCreationTime": creation})
+    return identities
+
+
+def _declared_port_listeners() -> list[dict[str, object]]:
+    """Return declared Cortex TCP listeners with PID creation-time ownership."""
+
+    if os.name != "nt":
+        return []
+    completed = subprocess.run(
+        ["netstat", "-ano", "-p", "tcp"],
+        cwd=REPO_ROOT,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    if completed.returncode != 0:
+        raise EvidenceError("cannot inventory declared verifier development ports")
+    listeners: list[dict[str, object]] = []
+    for raw in completed.stdout.splitlines():
+        fields = raw.split()
+        if len(fields) != 5 or fields[0].upper() != "TCP" or fields[3].upper() != "LISTENING":
+            continue
+        try:
+            port = int(fields[1].rsplit(":", 1)[1])
+            pid = int(fields[4])
+        except (IndexError, ValueError):
+            continue
+        if port not in VERIFIER_FAULT_DECLARED_PORTS:
+            continue
+        creation = process_creation_time(pid)
+        if creation is not None:
+            listeners.append(
+                {"port": port, "pid": pid, "processCreationTime": creation}
+            )
+    return sorted(listeners, key=lambda item: (item["port"], item["pid"]))
+
+
+def _owned_lease_residuals(paths: Sequence[Path], run_token: str) -> list[str]:
+    residuals: list[str] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            value = _load_json_without_duplicate_keys(path)
+        except (EvidenceError, OSError):
+            residuals.append(path.name)
+            continue
+        if not isinstance(value, dict) or value.get("runToken") == run_token:
+            residuals.append(path.name)
+    return residuals
+
+
+def _copy_machine_evidence_files(
+    source_dir: Path,
+    destination_dir: Path,
+    names: Sequence[str],
+    *,
+    artifact_root: Path,
+) -> list[dict[str, object]]:
+    """Copy a validated machine record into the proof gate's immutable artifact tree."""
+
+    resolved_root = artifact_root.resolve()
+    resolved_destination = destination_dir.resolve()
+    try:
+        resolved_destination.relative_to(resolved_root)
+    except ValueError as error:
+        raise EvidenceError("machine evidence destination escapes its gate artifact root") from error
+    if destination_dir.exists():
+        raise EvidenceError(f"machine evidence destination already exists: {destination_dir.name}")
+    destination_dir.mkdir(parents=True, exist_ok=False)
+    records: list[dict[str, object]] = []
+    for name in names:
+        if Path(name).name != name:
+            raise EvidenceError(f"machine evidence filename is unsafe: {name!r}")
+        source = source_dir / name
+        if not source.is_file() or source.is_symlink():
+            raise EvidenceError(f"machine evidence source is missing or not a regular file: {name}")
+        destination = destination_dir / name
+        atomic_write_bytes(destination, source.read_bytes())
+        records.append(
+            {
+                "path": destination.relative_to(artifact_root).as_posix(),
+                "sha256": sha256_file(destination),
+                "bytes": destination.stat().st_size,
+            }
+        )
+    return records
+
+
+def _validate_machine_evidence_files(
+    records: object,
+    *,
+    artifact_root: Path,
+    expected_directory: Path,
+    expected_names: Sequence[str],
+    label: str,
+) -> dict[str, Path]:
+    expected_paths = [
+        (expected_directory / name).as_posix() for name in expected_names
+    ]
+    if not isinstance(records, list) or len(records) != len(expected_paths):
+        raise EvidenceError(f"{label} machine artifact inventory is incomplete")
+    resolved_root = artifact_root.resolve()
+    validated: dict[str, Path] = {}
+    for record, expected_relative, name in zip(
+        records, expected_paths, expected_names, strict=True
+    ):
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "bytes"}:
+            raise EvidenceError(f"{label} machine artifact record is malformed")
+        if record.get("path") != expected_relative:
+            raise EvidenceError(f"{label} machine artifact path is substituted")
+        candidate = (artifact_root / expected_relative).resolve()
+        try:
+            candidate.relative_to(resolved_root)
+        except ValueError as error:
+            raise EvidenceError(f"{label} machine artifact escapes its proof") from error
+        size = record.get("bytes")
+        if (
+            not candidate.is_file()
+            or candidate.is_symlink()
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or candidate.stat().st_size != size
+            or sha256_file(candidate) != record.get("sha256")
+        ):
+            raise EvidenceError(f"{label} machine artifact is missing or hash-substituted: {name}")
+        validated[name] = candidate
+    actual = {
+        path.name
+        for path in (artifact_root / expected_directory).iterdir()
+        if path.is_file()
+    }
+    if actual != set(expected_names):
+        raise EvidenceError(f"{label} machine artifact directory has an unregistered file")
+    return validated
+
+
+def _require_active_worker_profile() -> str:
+    if _ACTIVE_WORKER_PROFILE not in PROFILES:
+        raise EvidenceError("evidence validator has no exact active worker profile")
+    return str(_ACTIVE_WORKER_PROFILE)
+
+
+def _strict_json_lines(path: Path, label: str) -> list[dict[str, object]]:
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise EvidenceError(f"cannot read {label}: {error}") from error
+    values: list[dict[str, object]] = []
+    for line_number, raw in enumerate(raw_lines, start=1):
+        if not raw.strip():
+            continue
+        def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            value: dict[str, object] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError(f"duplicate key {key!r}")
+                value[key] = item
+            return value
+
+        try:
+            parsed = json.loads(raw, object_pairs_hook=pairs_hook)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise EvidenceError(f"{label} line {line_number} is not strict JSON: {error}") from error
+        if not isinstance(parsed, dict):
+            raise EvidenceError(f"{label} line {line_number} is not an object")
+        values.append(parsed)
+    if not values:
+        raise EvidenceError(f"{label} is empty")
+    return values
+
+
+def _strict_first_json_line(path: Path, label: str) -> dict[str, object]:
+    try:
+        raw = next(line for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    except (OSError, UnicodeError, StopIteration) as error:
+        raise EvidenceError(f"cannot read {label} first event: {error}") from error
+
+    def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key {key!r}")
+            value[key] = item
+        return value
+
+    try:
+        parsed = json.loads(raw, object_pairs_hook=pairs_hook)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise EvidenceError(f"{label} first event is not strict JSON: {error}") from error
+    if not isinstance(parsed, dict):
+        raise EvidenceError(f"{label} first event is not an object")
+    return parsed
+
+
+def _fault_campaign_test_source() -> Path:
+    return APP / "scripts" / "test_verify10_supervisor.py"
+
+
+def _verifier_fault_campaign_command() -> list[str]:
+    prefix = "test_verify10_supervisor.Verify10SupervisorTests."
+    return [
+        sys.executable,
+        "-m",
+        "unittest",
+        "-v",
+        *(prefix + name for name in VERIFIER_FAULT_TEST_METHODS),
+    ]
+
+
+def _parse_fault_campaign_unittest_log(path: Path) -> list[dict[str, str]]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise EvidenceError(f"fault campaign unittest log is unreadable: {error}") from error
+    pattern = re.compile(
+        r"^(test_[A-Za-z0-9_]+) "
+        r"\(test_verify10_supervisor\.Verify10SupervisorTests\.\1\) \.\.\. "
+        r"(ok|FAIL|ERROR|skipped .+)$"
+    )
+    parsed = [
+        {"name": match.group(1), "outcome": match.group(2)}
+        for line in lines
+        if (match := pattern.fullmatch(line.strip())) is not None
+    ]
+    names = [item["name"] for item in parsed]
+    if names != list(VERIFIER_FAULT_TEST_METHODS) or len(names) != len(set(names)):
+        raise EvidenceError(
+            "fault campaign log does not contain the exact ordered required unittest method set"
+        )
+    if any(item["outcome"] != "ok" for item in parsed):
+        raise EvidenceError("fault campaign contains a failed, errored, or skipped scenario test")
+    run_count = re.compile(rf"^Ran {len(parsed)} tests in [0-9]+(?:\.[0-9]+)?s$")
+    if not any(run_count.fullmatch(line.strip()) for line in lines):
+        raise EvidenceError("fault campaign log has no exact unittest execution count")
+    if not any(line.strip() == "OK" for line in lines):
+        raise EvidenceError("fault campaign log has no successful terminal unittest verdict")
+    return parsed
+
+
+def _fault_scenario_results(test_results: list[dict[str, str]]) -> list[dict[str, object]]:
+    outcomes = {item["name"]: item["outcome"] for item in test_results}
+    return [
+        {
+            "scenarioId": scenario_id,
+            "testMethods": list(test_names),
+            "observedOutcomes": [outcomes.get(name) for name in test_names],
+        }
+        for scenario_id, test_names in VERIFIER_FAULT_SCENARIOS
+    ]
+
+
+def _fault_campaign_artifacts(run_dir: Path) -> list[dict[str, object]]:
+    required = {
+        VERIFIER_FAULT_CAMPAIGN_START,
+        "events.jsonl",
+        VERIFIER_FAULT_CAMPAIGN_LOG,
+    }
+    actual = {
+        path.name
+        for path in run_dir.iterdir()
+        if path.is_file() and path.name != VERIFIER_FAULT_CAMPAIGN_MANIFEST
+    }
+    if actual != required:
+        raise EvidenceError("fault campaign directory has a missing or unregistered artifact")
+    return [
+        {
+            "path": name,
+            "sha256": sha256_file(run_dir / name),
+            "bytes": (run_dir / name).stat().st_size,
+        }
+        for name in sorted(required)
+    ]
+
+
+def _validate_fault_campaign_manifest(
+    path: Path,
+    *,
+    expected_sha: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+    require_fresh: bool,
+    require_pass: bool,
+) -> dict[str, object]:
+    value = _load_json_without_duplicate_keys(path)
+    required_keys = {
+        "schema",
+        "type",
+        "complete",
+        "runToken",
+        "fullGitSha",
+        "sourceTreeDigest",
+        "checkoutStateDigest",
+        "gateRegistryHash",
+        "environment",
+        "environmentDigest",
+        "startedAt",
+        "endedAt",
+        "expiresAt",
+        "attemptCount",
+        "retryCount",
+        "command",
+        "testSource",
+        "testResults",
+        "scenarioResults",
+        "residuals",
+        "exitCode",
+        "passed",
+        "failures",
+        "artifacts",
+    }
+    if not isinstance(value, dict) or set(value) != required_keys:
+        raise EvidenceError("fault campaign manifest has a non-canonical schema-1 envelope")
+    token = value.get("runToken")
+    if (
+        value.get("schema") != 1
+        or value.get("type") != "VerifierFaultCampaignV1"
+        or value.get("complete") is not True
+        or not isinstance(token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", token)
+        or path.name != VERIFIER_FAULT_CAMPAIGN_MANIFEST
+        or path.parent.name != token
+    ):
+        raise EvidenceError("fault campaign manifest has an invalid schema/type/run identity")
+    if (
+        value.get("fullGitSha") != expected_sha
+        or value.get("sourceTreeDigest") != _source_tree_digest_for_sha(expected_sha)
+        or value.get("checkoutStateDigest") != expected_checkout_digest
+        or value.get("gateRegistryHash") != expected_registry_hash
+    ):
+        raise EvidenceError("fault campaign is bound to stale source, registry, or checkout bytes")
+    environment = value.get("environment")
+    if (
+        environment != expected_environment
+        or value.get("environmentDigest") != _document_digest(expected_environment)
+    ):
+        raise EvidenceError("fault campaign is bound to another execution environment")
+
+    started = _parse_utc(value.get("startedAt"), "fault campaign startedAt")
+    ended = _parse_utc(value.get("endedAt"), "fault campaign endedAt")
+    expires = _parse_utc(value.get("expiresAt"), "fault campaign expiresAt")
+    if ended < started or expires != ended + timedelta(seconds=VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS):
+        raise EvidenceError("fault campaign chronology or expiry is invalid")
+    if require_fresh and datetime.now(timezone.utc) >= expires:
+        raise EvidenceError("fault campaign is stale")
+    if value.get("attemptCount") != 1 or value.get("retryCount") != 0:
+        raise EvidenceError("fault campaign used a retry or has an ambiguous attempt count")
+    command = value.get("command")
+    if command != {
+        "argv": _verifier_fault_campaign_command(),
+        "cwd": str(_fault_campaign_test_source().parent.resolve()),
+        "forcedEnvironment": {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+    }:
+        raise EvidenceError("fault campaign executed another command or working directory")
+    if value.get("testSource") != _tracked_authority_binding(
+        _fault_campaign_test_source(), expected_sha
+    ):
+        raise EvidenceError("fault campaign test source is not the exact committed authority")
+
+    start_path = path.parent / VERIFIER_FAULT_CAMPAIGN_START
+    start = _load_json_without_duplicate_keys(start_path)
+    expected_start = {
+        "schema": 1,
+        "type": "VerifierFaultCampaignStartV1",
+        "runToken": token,
+        "fullGitSha": expected_sha,
+        "sourceTreeDigest": value["sourceTreeDigest"],
+        "checkoutStateDigest": expected_checkout_digest,
+        "gateRegistryHash": expected_registry_hash,
+        "environmentDigest": value["environmentDigest"],
+        "startedAt": value["startedAt"],
+        "attemptCount": 1,
+        "retryPolicy": "none",
+    }
+    if start != expected_start:
+        raise EvidenceError("fault campaign start authority is missing or substituted")
+
+    artifacts = value.get("artifacts")
+    if not isinstance(artifacts, list) or artifacts != _fault_campaign_artifacts(path.parent):
+        raise EvidenceError("fault campaign artifact inventory is missing, changed, or reordered")
+    events = _strict_json_lines(path.parent / "events.jsonl", "fault campaign journal")
+    if len(events) != 2:
+        raise EvidenceError("fault campaign journal is incomplete or contains an unexpected event")
+    for sequence, event in enumerate(events, start=1):
+        if (
+            event.get("schema") != 1
+            or event.get("sequence") != sequence
+            or event.get("runToken") != token
+        ):
+            raise EvidenceError("fault campaign journal identity or sequence is invalid")
+    first, last = events
+    if (
+        first.get("event") != "campaign_start"
+        or first.get("at") != value.get("startedAt")
+        or first.get("fullGitSha") != expected_sha
+        or first.get("sourceTreeDigest") != value.get("sourceTreeDigest")
+        or first.get("checkoutStateDigest") != expected_checkout_digest
+        or first.get("gateRegistryHash") != expected_registry_hash
+        or first.get("environmentDigest") != value.get("environmentDigest")
+        or first.get("attemptCount") != 1
+        or first.get("retryPolicy") != "none"
+    ):
+        raise EvidenceError("fault campaign journal has no matching machine start event")
+    if (
+        last.get("event") != "campaign_end"
+        or last.get("at") != value.get("endedAt")
+        or last.get("exitCode") != value.get("exitCode")
+        or last.get("passed") is not value.get("passed")
+        or last.get("retryCount") != 0
+        or last.get("failureCount") != len(value.get("failures", []))
+    ):
+        raise EvidenceError("fault campaign journal has no matching terminal event")
+
+    parsed_results = _parse_fault_campaign_unittest_log(
+        path.parent / VERIFIER_FAULT_CAMPAIGN_LOG
+    )
+    if value.get("testResults") != parsed_results:
+        raise EvidenceError("fault campaign test results are not derivable from its raw unittest log")
+    expected_scenarios = _fault_scenario_results(parsed_results)
+    if value.get("scenarioResults") != expected_scenarios:
+        raise EvidenceError("fault campaign omits or substitutes a required fault scenario")
+    residuals = value.get("residuals")
+    if residuals != {
+        "processIdentities": [],
+        "occupiedDevelopmentPorts": [],
+        "leasePaths": [],
+        "partialStatusPointers": [],
+    }:
+        raise EvidenceError("fault campaign left a process, port, lease, or partial status pointer")
+    failures = value.get("failures")
+    if not isinstance(failures, list) or any(not isinstance(item, str) for item in failures):
+        raise EvidenceError("fault campaign failures are malformed")
+    derived_pass = value.get("exitCode") == 0 and failures == []
+    if value.get("passed") is not derived_pass:
+        raise EvidenceError("fault campaign pass flag is not derivable from its raw execution")
+    if require_pass and not derived_pass:
+        raise EvidenceError("fault campaign did not pass every required scenario")
+    return value
+
+
+def _fault_campaign_projection(
+    path: Path,
+    value: dict[str, object],
+    *,
+    artifact_root: Path,
+) -> dict[str, object]:
+    return {
+        "runToken": value["runToken"],
+        "manifestPath": path.relative_to(artifact_root).as_posix(),
+        "manifestSha256": sha256_file(path),
+        "startedAt": value["startedAt"],
+        "endedAt": value["endedAt"],
+        "expiresAt": value["expiresAt"],
+        "attemptCount": value["attemptCount"],
+        "retryCount": value["retryCount"],
+        "testResults": value["testResults"],
+        "scenarioResults": value["scenarioResults"],
+        "residuals": value["residuals"],
+    }
+
+
+def _matching_fault_campaign_attempts(
+    *,
+    expected_sha: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+) -> list[tuple[datetime, Path]]:
+    if not VERIFIER_FAULT_CAMPAIGN_ROOT.is_dir():
+        return []
+    matches: list[tuple[datetime, Path]] = []
+    environment_digest = _document_digest(expected_environment)
+    for run_dir in VERIFIER_FAULT_CAMPAIGN_ROOT.iterdir():
+        if not run_dir.is_dir():
+            continue
+        start_path = run_dir / VERIFIER_FAULT_CAMPAIGN_START
+        event_path = run_dir / "events.jsonl"
+        authorities: list[dict[str, object]] = []
+        if start_path.is_file():
+            start = _load_json_without_duplicate_keys(start_path)
+            if not isinstance(start, dict):
+                raise EvidenceError("fault campaign start marker is not an object")
+            authorities.append(
+                {
+                    "fullGitSha": start.get("fullGitSha"),
+                    "gateRegistryHash": start.get("gateRegistryHash"),
+                    "checkoutStateDigest": start.get("checkoutStateDigest"),
+                    "environmentDigest": start.get("environmentDigest"),
+                    "startedAt": start.get("startedAt"),
+                }
+            )
+        if event_path.is_file():
+            first = _strict_first_json_line(event_path, "fault campaign journal")
+            if first.get("event") != "campaign_start":
+                raise EvidenceError("fault campaign journal has no first campaign_start event")
+            authorities.append(
+                {
+                    "fullGitSha": first.get("fullGitSha"),
+                    "gateRegistryHash": first.get("gateRegistryHash"),
+                    "checkoutStateDigest": first.get("checkoutStateDigest"),
+                    "environmentDigest": first.get("environmentDigest"),
+                    "startedAt": first.get("at"),
+                }
+            )
+        if not authorities:
+            raise EvidenceError(
+                f"fault campaign attempt {run_dir.name} has no durable start authority"
+            )
+        authority = authorities[0]
+        if any(item != authority for item in authorities[1:]):
+            raise EvidenceError(
+                f"fault campaign attempt {run_dir.name} has conflicting start authorities"
+            )
+        if authority.get("fullGitSha") != expected_sha:
+            continue
+        if (
+            authority.get("gateRegistryHash") != expected_registry_hash
+            or authority.get("checkoutStateDigest") != expected_checkout_digest
+            or authority.get("environmentDigest") != environment_digest
+        ):
+            continue
+        matches.append(
+            (
+                _parse_utc(
+                    authority.get("startedAt"), "fault campaign attempt startedAt"
+                ),
+                run_dir,
+            )
+        )
+    return sorted(matches, key=lambda item: (item[0], item[1].name))
+
+
+def _build_verifier_fault_campaign_evidence() -> dict[str, object]:
+    full_sha = _full_git_sha()
+    registry_hash = gate_registry_hash()
+    checkout_digest = _checkout_state_digest()
+    environment = _environment_document()
+    attempts = _matching_fault_campaign_attempts(
+        expected_sha=full_sha,
+        expected_registry_hash=registry_hash,
+        expected_checkout_digest=checkout_digest,
+        expected_environment=environment,
+    )
+    if len(attempts) < 3:
+        raise EvidenceError(
+            f"verifier fault evidence has {len(attempts)}/3 exact-authority campaign attempts"
+        )
+    selected = attempts[-3:]
+    campaigns: list[dict[str, object]] = []
+    previous_end: datetime | None = None
+    expirations: list[datetime] = []
+    for _started, run_dir in selected:
+        manifest_path = run_dir / VERIFIER_FAULT_CAMPAIGN_MANIFEST
+        if not manifest_path.is_file():
+            raise EvidenceError(
+                f"one of the latest three fault campaigns is incomplete: {run_dir.name}"
+            )
+        manifest = _validate_fault_campaign_manifest(
+            manifest_path,
+            expected_sha=full_sha,
+            expected_registry_hash=registry_hash,
+            expected_checkout_digest=checkout_digest,
+            expected_environment=environment,
+            require_fresh=True,
+            require_pass=True,
+        )
+        started = _parse_utc(manifest["startedAt"], "fault campaign selected startedAt")
+        ended = _parse_utc(manifest["endedAt"], "fault campaign selected endedAt")
+        if previous_end is not None and started < previous_end:
+            raise EvidenceError("fault campaigns overlap and are not three consecutive executions")
+        previous_end = ended
+        expirations.append(_parse_utc(manifest["expiresAt"], "fault campaign selected expiresAt"))
+        embedded_dir = (
+            LOG_DIR
+            / MACHINE_EVIDENCE_DIRECTORY
+            / "verifier-fault-campaigns"
+            / str(manifest["runToken"])
+        )
+        _copy_machine_evidence_files(
+            run_dir,
+            embedded_dir,
+            (
+                VERIFIER_FAULT_CAMPAIGN_MANIFEST,
+                VERIFIER_FAULT_CAMPAIGN_START,
+                "events.jsonl",
+                VERIFIER_FAULT_CAMPAIGN_LOG,
+            ),
+            artifact_root=LOG_DIR,
+        )
+        campaigns.append(
+            _fault_campaign_projection(
+                embedded_dir / VERIFIER_FAULT_CAMPAIGN_MANIFEST,
+                manifest,
+                artifact_root=LOG_DIR,
+            )
+        )
+    measured_at = previous_end
+    if measured_at is None:
+        raise EvidenceError("fault campaign selection produced no terminal measurement")
+    return {
+        "schema": 1,
+        "classId": "verifier-fault-campaigns",
+        "fullGitSha": full_sha,
+        "gateRegistryHash": registry_hash,
+        "checkoutStateDigest": checkout_digest,
+        "environment": environment,
+        "environmentDigest": _document_digest(environment),
+        "measuredAt": _format_utc(measured_at),
+        "expiresAt": _format_utc(min(expirations)),
+        "immutableAuthority": "exact-git-commit",
+        "campaignSource": _tracked_authority_binding(_fault_campaign_test_source(), full_sha),
+        "requiredScenarioIds": [item[0] for item in VERIFIER_FAULT_SCENARIOS],
+        "expectedTestMethods": list(VERIFIER_FAULT_TEST_METHODS),
+        "campaigns": campaigns,
+        "passed": True,
+        "failures": [],
+    }
+
+
+def _matching_timeout_baseline_attempts(
+    *,
+    profile: str,
+    expected_sha: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+    current_run_token: str | None,
+) -> list[tuple[datetime, Path]]:
+    if not PROOF_ROOT.is_dir():
+        return []
+    matches: list[tuple[datetime, Path]] = []
+    for run_dir in PROOF_ROOT.iterdir():
+        if not run_dir.is_dir() or run_dir.name == current_run_token:
+            continue
+        event_path = run_dir / "events.jsonl"
+        environment_path = run_dir / "environment.json"
+        if not event_path.is_file():
+            raise EvidenceError(
+                f"timeout baseline attempt {run_dir.name} has no durable run_start authority"
+            )
+        first = _strict_first_json_line(event_path, "timeout baseline journal")
+        if (
+            first.get("event") != "run_start"
+            or first.get("fullGitSha") != expected_sha
+            or first.get("profile") != profile
+            or first.get("quick") is not False
+            or first.get("gateRegistryHash") != expected_registry_hash
+            or first.get("checkoutStateDigest") != expected_checkout_digest
+        ):
+            continue
+        if not environment_path.is_file():
+            matches.append(
+                (_parse_utc(first.get("at"), "timeout baseline run_start"), run_dir)
+            )
+            continue
+        try:
+            stored_environment = _load_json_without_duplicate_keys(environment_path)
+        except EvidenceError:
+            matches.append(
+                (_parse_utc(first.get("at"), "timeout baseline run_start"), run_dir)
+            )
+            continue
+        if stored_environment != expected_environment:
+            continue
+        matches.append(
+            (
+                _parse_utc(first.get("at"), "timeout baseline run_start"),
+                run_dir,
+            )
+        )
+    return sorted(matches, key=lambda item: (item[0], item[1].name))
+
+
+def _validate_timeout_baseline_manifest(
+    path: Path,
+    *,
+    profile: str,
+    expected_sha: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    if not path.is_file():
+        raise EvidenceError(f"timeout baseline attempt is incomplete: {path.parent.name}")
+    token = path.parent.name
+    manifest = _validate_completed_manifest(path, expected_sha, token)
+    if (
+        manifest.get("profile") != profile
+        or manifest.get("quick") is not False
+        or manifest.get("gateRegistryHash") != expected_registry_hash
+        or manifest.get("checkoutStateDigest") != expected_checkout_digest
+        or manifest.get("environment") != expected_environment
+    ):
+        raise EvidenceError("timeout baseline manifest is stale or belongs to another profile")
+    authority_mode, _authority_digest = _validate_run_authority(manifest.get("runAuthority"))
+    if authority_mode != AUTHORITY_MODE_LIVE:
+        raise EvidenceError("timeout baseline used diagnostic live-authority overrides")
+    if manifest.get("staleTakeover") != {
+        "occurred": False,
+        "abandonedRunToken": None,
+    }:
+        raise EvidenceError("timeout baseline recovered a stale lock and is not a clean run")
+
+    selected_gates = [gate for gate in GATES if profile in gate.profiles]
+    expected_ids = [gate.id for gate in selected_gates]
+    results = manifest.get("results")
+    if not isinstance(results, list) or [item.get("gateId") for item in results] != expected_ids:
+        raise EvidenceError("timeout baseline does not contain the exact selected gate set")
+    for result in results:
+        gate_id = result.get("gateId")
+        status = result.get("status")
+        if gate_id == "timeout-calibration-evidence":
+            if status not in {PASS, FAIL}:
+                raise EvidenceError("timeout validator self-result contains a retry, skip, or omission")
+        elif status != PASS:
+            raise EvidenceError(
+                f"timeout baseline gate {gate_id} is {status!r}, not one clean PASS"
+            )
+    events = _strict_json_lines(path.parent / "events.jsonl", "timeout baseline journal")
+    if any(event.get("event") in {"retry", "abandonment", "publication_failure"} for event in events):
+        raise EvidenceError("timeout baseline journal contains a retry, takeover, or publication failure")
+    started = _parse_utc(events[0].get("at"), "timeout baseline startedAt")
+    ended = _parse_utc(events[-1].get("at"), "timeout baseline endedAt")
+    if ended < started:
+        raise EvidenceError("timeout baseline has reversed chronology")
+    expires = ended + timedelta(seconds=TIMEOUT_CALIBRATION_FRESH_SECONDS)
+    if datetime.now(timezone.utc) >= expires:
+        raise EvidenceError("timeout baseline is stale")
+    gate_results: list[dict[str, object]] = []
+    for result in results:
+        seconds = result.get("seconds")
+        if (
+            not isinstance(seconds, (int, float))
+            or isinstance(seconds, bool)
+            or not math.isfinite(float(seconds))
+            or float(seconds) < 0
+        ):
+            raise EvidenceError(f"timeout baseline gate {result['gateId']} has invalid timing")
+        gate_results.append(
+            {
+                "gateId": result["gateId"],
+                "status": result["status"],
+                "seconds": float(seconds),
+            }
+        )
+    attestation_path = path.parent / PRODUCT_ATTESTATION_NAME
+    _validate_product_attestation(attestation_path, path, manifest)
+    projection = {
+        "runToken": token,
+        "manifestSha256": sha256_file(path),
+        "productAttestationSha256": sha256_file(attestation_path),
+        "startedAt": _format_utc(started),
+        "endedAt": _format_utc(ended),
+        "expiresAt": _format_utc(expires),
+        "attemptCount": 1,
+        "retryCount": 0,
+        "staleTakeover": False,
+        "gateResults": gate_results,
+    }
+    return manifest, projection
+
+
+def _required_calibrated_timeout(observed_maximum: float) -> int:
+    if not math.isfinite(observed_maximum) or observed_maximum < 0:
+        raise EvidenceError("timeout calibration contains a non-finite or negative observation")
+    return math.ceil(max(3.0 * observed_maximum, observed_maximum + 120.0))
+
+
+def _build_timeout_calibration_evidence(
+    *,
+    profile: str,
+    current_run_token: str | None,
+) -> dict[str, object]:
+    if profile not in PROFILES:
+        raise EvidenceError(f"timeout calibration received unknown profile {profile!r}")
+    full_sha = _full_git_sha()
+    registry_hash = gate_registry_hash()
+    checkout_digest = _checkout_state_digest()
+    environment = _environment_document()
+    attempts = _matching_timeout_baseline_attempts(
+        profile=profile,
+        expected_sha=full_sha,
+        expected_registry_hash=registry_hash,
+        expected_checkout_digest=checkout_digest,
+        expected_environment=environment,
+        current_run_token=current_run_token,
+    )
+    if len(attempts) < 3:
+        raise EvidenceError(
+            f"timeout calibration has {len(attempts)}/3 exact-authority full-run attempts"
+        )
+    selected = attempts[-3:]
+    baselines: list[dict[str, object]] = []
+    previous_end: datetime | None = None
+    expirations: list[datetime] = []
+    for _started, run_dir in selected:
+        source_manifest_path = run_dir / "manifest.json"
+        _manifest, projection = _validate_timeout_baseline_manifest(
+            source_manifest_path,
+            profile=profile,
+            expected_sha=full_sha,
+            expected_registry_hash=registry_hash,
+            expected_checkout_digest=checkout_digest,
+            expected_environment=environment,
+        )
+        started = _parse_utc(projection["startedAt"], "selected timeout baseline startedAt")
+        ended = _parse_utc(projection["endedAt"], "selected timeout baseline endedAt")
+        if previous_end is not None and started < previous_end:
+            raise EvidenceError("timeout baselines overlap and are not three consecutive clean runs")
+        previous_end = ended
+        expirations.append(_parse_utc(projection["expiresAt"], "selected timeout baseline expiresAt"))
+        embedded_dir = (
+            LOG_DIR
+            / MACHINE_EVIDENCE_DIRECTORY
+            / "timeout-calibration-baselines"
+            / str(projection["runToken"])
+        )
+        projection["controlArtifacts"] = _copy_machine_evidence_files(
+            source_manifest_path.parent,
+            embedded_dir,
+            TIMEOUT_BASELINE_CONTROL_FILES,
+            artifact_root=LOG_DIR,
+        )
+        baselines.append(projection)
+
+    calibrated_gates = [
+        gate
+        for gate in GATES
+        if profile in gate.profiles and gate.id != "timeout-calibration-evidence"
+    ]
+    selected_gate_ids = [gate.id for gate in GATES if profile in gate.profiles]
+    for baseline in baselines:
+        if [item["gateId"] for item in baseline["gateResults"]] != selected_gate_ids:
+            raise EvidenceError("timeout baseline measurement order or gate coverage is incomplete")
+    calibrations: list[dict[str, object]] = []
+    for gate in calibrated_gates:
+        observations = [
+            float(
+                next(
+                    item
+                    for item in baseline["gateResults"]
+                    if item["gateId"] == gate.id
+                )["seconds"]
+            )
+            for baseline in baselines
+        ]
+        observed_maximum = max(observations)
+        required_timeout = _required_calibrated_timeout(observed_maximum)
+        calibrations.append(
+            {
+                "gateId": gate.id,
+                "observedSeconds": observations,
+                "observedMaximumSeconds": observed_maximum,
+                "requiredTimeoutSeconds": required_timeout,
+                "configuredTimeoutSeconds": gate.timeout_seconds,
+            }
+        )
+        if gate.timeout_seconds < required_timeout:
+            raise EvidenceError(
+                f"gate {gate.id} timeout is {gate.timeout_seconds}s; three-baseline "
+                f"calibration requires at least {required_timeout}s"
+            )
+    selected_budget = sum(
+        gate.timeout_seconds for gate in GATES if profile in gate.profiles
+    )
+    if selected_budget > 6 * 60 * 60:
+        raise EvidenceError(
+            f"{profile} calibrated timeout budget is {selected_budget}s, above six hours"
+        )
+    measured_at = previous_end
+    if measured_at is None:
+        raise EvidenceError("timeout baseline selection produced no terminal measurement")
+    return {
+        "schema": 1,
+        "classId": "timeout-calibration-baselines",
+        "fullGitSha": full_sha,
+        "gateRegistryHash": registry_hash,
+        "checkoutStateDigest": checkout_digest,
+        "environment": environment,
+        "environmentDigest": _document_digest(environment),
+        "profile": profile,
+        "measuredAt": _format_utc(measured_at),
+        "expiresAt": _format_utc(min(expirations)),
+        "immutableAuthority": "exact-git-commit",
+        "formula": "ceil(max(3 * observedMaximumSeconds, observedMaximumSeconds + 120))",
+        "excludedSelfGateId": "timeout-calibration-evidence",
+        "selectedBudgetSeconds": selected_budget,
+        "baselines": baselines,
+        "calibrations": calibrations,
+        "passed": True,
+        "failures": [],
+    }
+
+
+def verifier_fault_campaign_main() -> int:
+    """Run one immutable no-retry campaign; three separate clean attempts are required later."""
+
+    if not check_clean_source_tree():
+        print(
+            "VERIFIER FAULT CAMPAIGN REFUSED: source checkout is not exactly clean at HEAD",
+            flush=True,
+        )
+        return 1
+    full_sha = _full_git_sha()
+    source_tree_digest = _source_tree_digest()
+    checkout_digest = _checkout_state_digest()
+    registry_hash = gate_registry_hash()
+    environment = _environment_document()
+    environment_digest = _document_digest(environment)
+    run_token = uuid.uuid4().hex
+    run_dir = VERIFIER_FAULT_CAMPAIGN_ROOT / run_token
+    run_dir.mkdir(parents=True, exist_ok=False)
+    journal = EvidenceJournal(run_dir / "events.jsonl", run_token)
+    first = journal.append(
+        "campaign_start",
+        fullGitSha=full_sha,
+        sourceTreeDigest=source_tree_digest,
+        checkoutStateDigest=checkout_digest,
+        gateRegistryHash=registry_hash,
+        environmentDigest=environment_digest,
+        attemptCount=1,
+        retryPolicy="none",
+    )
+    start = {
+        "schema": 1,
+        "type": "VerifierFaultCampaignStartV1",
+        "runToken": run_token,
+        "fullGitSha": full_sha,
+        "sourceTreeDigest": source_tree_digest,
+        "checkoutStateDigest": checkout_digest,
+        "gateRegistryHash": registry_hash,
+        "environmentDigest": environment_digest,
+        "startedAt": first["at"],
+        "attemptCount": 1,
+        "retryPolicy": "none",
+    }
+    atomic_write_json(run_dir / VERIFIER_FAULT_CAMPAIGN_START, start)
+    log_path = run_dir / VERIFIER_FAULT_CAMPAIGN_LOG
+    command = _verifier_fault_campaign_command()
+    child_environment = {
+        key: value
+        for key in GATE_BASE_ENVIRONMENT
+        if (value := os.environ.get(key)) is not None
+    }
+    child_environment.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+    lease = LeaseManager(
+        VERIFIER_FAULT_CAMPAIGN_LOCK,
+        full_sha,
+        "verifier-fault-campaign",
+        run_token,
+    )
+    failures: list[str] = []
+    baseline_port_listeners: list[dict[str, object]] = []
+    try:
+        baseline_port_listeners = _declared_port_listeners()
+    except (EvidenceError, OSError, subprocess.SubprocessError) as error:
+        failures.append(str(error))
+    process = None
+    job = None
+    process_creation: str | None = None
+    observed_process_identities: dict[tuple[int, str], dict[str, object]] = {}
+    return_code: int | None = None
+    timed_out = False
+    stale_takeover = False
+    try:
+        with acquired_lease(lease) as abandoned_token:
+            stale_takeover = abandoned_token is not None
+            if stale_takeover:
+                failures.append(
+                    "fault campaign recovered a stale campaign lease; a fresh no-takeover attempt is required"
+                )
+            with log_path.open("x", encoding="utf-8", errors="replace", buffering=1) as log:
+                process, job = spawn_isolated(
+                    command,
+                    cwd=_fault_campaign_test_source().parent,
+                    log=log,
+                    env=child_environment,
+                )
+                process_creation = process_creation_time(process.pid)
+                if process_creation is None:
+                    raise EvidenceError("fault campaign cannot bind its unittest process identity")
+                for identity in _process_tree_identities(process.pid):
+                    observed_process_identities[
+                        (int(identity["pid"]), str(identity["processCreationTime"]))
+                    ] = identity
+                lease.update_gate("verifier-fault-campaign", process.pid)
+
+                def campaign_heartbeat() -> None:
+                    lease.heartbeat()
+                    for identity in _process_tree_identities(process.pid):
+                        observed_process_identities[
+                            (int(identity["pid"]), str(identity["processCreationTime"]))
+                        ] = identity
+
+                return_code, timed_out = wait_isolated(
+                    process,
+                    job,
+                    timeout=VERIFIER_FAULT_CAMPAIGN_TIMEOUT_SECONDS,
+                    heartbeat=campaign_heartbeat,
+                )
+                lease.update_gate(None, None)
+                log.flush()
+                os.fsync(log.fileno())
+    except KeyboardInterrupt:
+        failures.append("fault campaign interrupted by Ctrl+C")
+        if process is not None and job is not None:
+            try:
+                terminate_isolated(process, job)
+            except Exception as cleanup_error:  # noqa: BLE001 - cleanup failure is campaign evidence
+                failures.append(f"fault campaign interrupt cleanup failed: {cleanup_error}")
+    except (EvidenceError, LeaseError, OSError, ValueError) as error:
+        failures.append(str(error))
+        if process is not None and job is not None:
+            try:
+                terminate_isolated(process, job)
+            except Exception as cleanup_error:  # noqa: BLE001 - cleanup failure is campaign evidence
+                failures.append(f"fault campaign process cleanup failed: {cleanup_error}")
+        if not log_path.exists():
+            atomic_write_bytes(log_path, (f"campaign supervisor failure: {error}\n").encode("utf-8"))
+    if not log_path.exists():
+        atomic_write_bytes(
+            log_path,
+            ("campaign supervisor failure: " + " | ".join(failures) + "\n").encode("utf-8"),
+        )
+    try:
+        _assert_source_state(full_sha, source_tree_digest, checkout_digest)
+    except EvidenceError as error:
+        failures.append(str(error))
+    if timed_out:
+        failures.append(
+            f"fault campaign exceeded its explicit {VERIFIER_FAULT_CAMPAIGN_TIMEOUT_SECONDS}s timeout"
+        )
+    if return_code != 0:
+        failures.append(f"fault campaign unittest process exited {return_code!r}")
+
+    test_results: list[dict[str, str]] = []
+    if log_path.is_file():
+        try:
+            test_results = _parse_fault_campaign_unittest_log(log_path)
+        except EvidenceError as error:
+            failures.append(str(error))
+    scenario_results = _fault_scenario_results(test_results) if test_results else []
+    surviving_processes = [
+        identity
+        for identity in observed_process_identities.values()
+        if process_creation_time(int(identity["pid"]))
+        == identity["processCreationTime"]
+    ]
+    occupied_development_ports: list[dict[str, object]] = []
+    try:
+        baseline_ports = {
+            (item["port"], item["pid"], item["processCreationTime"])
+            for item in baseline_port_listeners
+        }
+        occupied_development_ports = [
+            item
+            for item in _declared_port_listeners()
+            if (item["port"], item["pid"], item["processCreationTime"])
+            not in baseline_ports
+        ]
+    except (EvidenceError, OSError, subprocess.SubprocessError) as error:
+        failures.append(str(error))
+    lease_paths = _owned_lease_residuals(
+        (
+            VERIFIER_FAULT_CAMPAIGN_LOCK,
+            VERIFIER_FAULT_CAMPAIGN_LOCK.with_suffix(
+                VERIFIER_FAULT_CAMPAIGN_LOCK.suffix + ".takeover"
+            ),
+        ),
+        run_token,
+    )
+    partial_pointers = sorted(
+        str(candidate.relative_to(run_dir))
+        for candidate in run_dir.rglob("*")
+        if candidate.is_file()
+        and (
+            candidate.name.endswith(".candidate")
+            or candidate.name.endswith(".tmp")
+            or candidate.name.endswith(".rollback")
+        )
+    )
+    residuals = {
+        "processIdentities": sorted(
+            surviving_processes, key=lambda item: (item["pid"], item["processCreationTime"])
+        ),
+        "occupiedDevelopmentPorts": occupied_development_ports,
+        "leasePaths": lease_paths,
+        "partialStatusPointers": partial_pointers,
+    }
+    if any(residuals.values()):
+        failures.append("fault campaign left a process, port, lease, or partial status pointer")
+    if stale_takeover and not failures:
+        failures.append("fault campaign used stale takeover")
+    # Keep the first occurrence of a diagnostic while preserving execution order.
+    failures = list(dict.fromkeys(failures))
+    passed = not failures
+    ended_at = utc_now()
+    expires_at = _format_utc(
+        _parse_utc(ended_at, "fault campaign completion")
+        + timedelta(seconds=VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS)
+    )
+    journal.append(
+        "campaign_end",
+        exitCode=0 if passed else 1,
+        passed=passed,
+        retryCount=0,
+        failureCount=len(failures),
+    )
+    # EvidenceJournal owns the timestamp.  Reading it back prevents a separately sampled clock from
+    # becoming a second terminal authority at a UTC-second boundary.
+    events = _strict_json_lines(run_dir / "events.jsonl", "fault campaign journal")
+    ended_at = str(events[-1]["at"])
+    expires_at = _format_utc(
+        _parse_utc(ended_at, "fault campaign completion")
+        + timedelta(seconds=VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS)
+    )
+    manifest = {
+        "schema": 1,
+        "type": "VerifierFaultCampaignV1",
+        "complete": True,
+        "runToken": run_token,
+        "fullGitSha": full_sha,
+        "sourceTreeDigest": source_tree_digest,
+        "checkoutStateDigest": checkout_digest,
+        "gateRegistryHash": registry_hash,
+        "environment": environment,
+        "environmentDigest": environment_digest,
+        "startedAt": first["at"],
+        "endedAt": ended_at,
+        "expiresAt": expires_at,
+        "attemptCount": 1,
+        "retryCount": 0,
+        "command": {
+            "argv": command,
+            "cwd": str(_fault_campaign_test_source().parent.resolve()),
+            "forcedEnvironment": {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+        },
+        "testSource": _tracked_authority_binding(_fault_campaign_test_source(), full_sha),
+        "testResults": test_results,
+        "scenarioResults": scenario_results,
+        "residuals": residuals,
+        "exitCode": 0 if passed else 1,
+        "passed": passed,
+        "failures": failures,
+        "artifacts": _fault_campaign_artifacts(run_dir),
+    }
+    manifest_path = run_dir / VERIFIER_FAULT_CAMPAIGN_MANIFEST
+    atomic_write_json(manifest_path, manifest)
+    if passed:
+        try:
+            _validate_fault_campaign_manifest(
+                manifest_path,
+                expected_sha=full_sha,
+                expected_registry_hash=registry_hash,
+                expected_checkout_digest=checkout_digest,
+                expected_environment=environment,
+                require_fresh=True,
+                require_pass=True,
+            )
+        except EvidenceError as error:
+            print(f"VERIFIER FAULT CAMPAIGN REJECTED AFTER WRITE: {error}", flush=True)
+            return 1
+        print(f"VERIFIER FAULT CAMPAIGN PASS: {manifest_path}", flush=True)
+        return 0
+    print(
+        "VERIFIER FAULT CAMPAIGN FAIL: " + " | ".join(failures),
+        flush=True,
+    )
+    print(f"campaign: {manifest_path}", flush=True)
+    return 1
+
+
 def _rust_coverage_command_registry() -> dict[str, object]:
     module = _rust_quality_module()
     try:
@@ -4133,13 +5535,18 @@ def gate_worker_main(
     gate_id: str,
     result_path: Path,
     run_token: str,
+    profile: str,
     authority_mode: str,
     run_authority_digest: str,
 ) -> int:
     """Execute a probe and gate body in an isolated worker, then atomically publish its result."""
 
-    global LOG_DIR
+    global LOG_DIR, _ACTIVE_WORKER_PROFILE, _ACTIVE_WORKER_RUN_TOKEN
     gate = _gate_by_id(gate_id)
+    if profile not in PROFILES or profile not in gate.profiles:
+        raise EvidenceError(f"gate {gate.id} received an invalid worker profile {profile!r}")
+    _ACTIVE_WORKER_PROFILE = profile
+    _ACTIVE_WORKER_RUN_TOKEN = run_token
     effective_environment = _gate_environment(gate, authority_mode)
     environment_authority = _gate_environment_authority(
         gate,
@@ -4269,9 +5676,13 @@ def _run_gate_worker(
     lease: LeaseManager,
     journal: EvidenceJournal,
     *,
+    profile: str | None = None,
     authority_mode: str,
     run_authority_digest: str,
 ) -> tuple[str, float, str, list[dict[str, object]], dict[str, object]]:
+    worker_profile = profile or (
+        PROFILE_OWNER if PROFILE_OWNER in gate.profiles else sorted(gate.profiles)[0]
+    )
     gate_dir = run_dir / "gates" / gate.id
     gate_dir.mkdir(parents=True, exist_ok=False)
     result_path = gate_dir / "worker-result.json"
@@ -4300,6 +5711,8 @@ def _run_gate_worker(
         str(result_path),
         "--run-token",
         run_token,
+        "--worker-profile",
+        worker_profile,
         "--authority-mode",
         authority_mode,
         "--run-authority-digest",
@@ -4445,6 +5858,20 @@ def _manifest_artifacts(run_dir: Path) -> list[dict[str, object]]:
 
 
 EVIDENCE_VALIDATOR_GATES: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "timeout-calibration-baselines": (
+        "timeout-calibration-evidence",
+        (
+            "clean-source-tree",
+            "verifier-fault-campaign-evidence",
+            "timeout-calibration-evidence",
+        ),
+        _TIMEOUT_CALIBRATION_ARTIFACT,
+    ),
+    "verifier-fault-campaigns": (
+        "verifier-fault-campaign-evidence",
+        ("clean-source-tree", "verifier-fault-campaign-evidence"),
+        _FAULT_CAMPAIGNS_ARTIFACT,
+    ),
     "architecture-contract": (
         "architecture-contract-evidence",
         (
@@ -4465,11 +5892,539 @@ EVIDENCE_VALIDATOR_GATES: dict[str, tuple[str, tuple[str, ...], str]] = {
 }
 
 
+def _validate_campaign_artifact_authority(
+    value: dict[str, object],
+    *,
+    class_id: str,
+    expected_registry_hash: str | None,
+    expected_checkout_digest: str | None,
+    expected_environment: dict[str, object] | None,
+) -> tuple[datetime, datetime]:
+    if (
+        not isinstance(expected_registry_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_registry_hash)
+        or not isinstance(expected_checkout_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_checkout_digest)
+        or not isinstance(expected_environment, dict)
+    ):
+        raise EvidenceError(f"{class_id} validator has no enclosing run authority")
+    if (
+        value.get("gateRegistryHash") != expected_registry_hash
+        or value.get("checkoutStateDigest") != expected_checkout_digest
+        or value.get("environment") != expected_environment
+        or value.get("environmentDigest") != _document_digest(expected_environment)
+    ):
+        raise EvidenceError(f"{class_id} evidence is bound to another registry, checkout, or environment")
+    measured = _parse_utc(value.get("measuredAt"), f"{class_id}.measuredAt")
+    expires = _parse_utc(value.get("expiresAt"), f"{class_id}.expiresAt")
+    if expires <= measured or datetime.now(timezone.utc) >= expires:
+        raise EvidenceError(f"{class_id} evidence is stale")
+    return measured, expires
+
+
+def _validate_fault_campaign_evidence_document(
+    value: dict[str, object],
+    *,
+    artifact_root: Path,
+    expected_sha: str,
+    expected_registry_hash: str | None,
+    expected_checkout_digest: str | None,
+    expected_environment: dict[str, object] | None,
+) -> None:
+    expected_keys = {
+        "schema",
+        "classId",
+        "fullGitSha",
+        "gateRegistryHash",
+        "checkoutStateDigest",
+        "environment",
+        "environmentDigest",
+        "measuredAt",
+        "expiresAt",
+        "immutableAuthority",
+        "campaignSource",
+        "requiredScenarioIds",
+        "expectedTestMethods",
+        "campaigns",
+        "passed",
+        "failures",
+    }
+    if set(value) != expected_keys:
+        raise EvidenceError("verifier fault evidence has a non-canonical envelope")
+    measured, artifact_expires = _validate_campaign_artifact_authority(
+        value,
+        class_id="verifier-fault-campaigns",
+        expected_registry_hash=expected_registry_hash,
+        expected_checkout_digest=expected_checkout_digest,
+        expected_environment=expected_environment,
+    )
+    if value.get("campaignSource") != _tracked_authority_binding(
+        _fault_campaign_test_source(), expected_sha
+    ):
+        raise EvidenceError("verifier fault evidence substituted its committed campaign source")
+    if value.get("requiredScenarioIds") != [item[0] for item in VERIFIER_FAULT_SCENARIOS]:
+        raise EvidenceError("verifier fault evidence omits a required scenario id")
+    if value.get("expectedTestMethods") != list(VERIFIER_FAULT_TEST_METHODS):
+        raise EvidenceError("verifier fault evidence substituted its exact test registry")
+    campaigns = value.get("campaigns")
+    if not isinstance(campaigns, list) or len(campaigns) != 3:
+        raise EvidenceError("verifier fault evidence does not contain exactly three campaigns")
+    previous_end: datetime | None = None
+    expirations: list[datetime] = []
+    tokens: list[str] = []
+    manifest_hashes: list[str] = []
+    empty_residuals = {
+        "processIdentities": [],
+        "occupiedDevelopmentPorts": [],
+        "leasePaths": [],
+        "partialStatusPointers": [],
+    }
+    for index, campaign in enumerate(campaigns, start=1):
+        if not isinstance(campaign, dict) or set(campaign) != {
+            "runToken",
+            "manifestPath",
+            "manifestSha256",
+            "startedAt",
+            "endedAt",
+            "expiresAt",
+            "attemptCount",
+            "retryCount",
+            "testResults",
+            "scenarioResults",
+            "residuals",
+        }:
+            raise EvidenceError(f"verifier fault campaign {index} is malformed")
+        token = campaign.get("runToken")
+        expected_directory = (
+            Path(MACHINE_EVIDENCE_DIRECTORY)
+            / "verifier-fault-campaigns"
+            / str(token)
+        )
+        files = _validate_machine_evidence_files(
+            [
+                {
+                    "path": (expected_directory / name).as_posix(),
+                    "sha256": sha256_file(artifact_root / expected_directory / name)
+                    if (artifact_root / expected_directory / name).is_file()
+                    else None,
+                    "bytes": (artifact_root / expected_directory / name).stat().st_size
+                    if (artifact_root / expected_directory / name).is_file()
+                    else None,
+                }
+                for name in (
+                    VERIFIER_FAULT_CAMPAIGN_MANIFEST,
+                    VERIFIER_FAULT_CAMPAIGN_START,
+                    "events.jsonl",
+                    VERIFIER_FAULT_CAMPAIGN_LOG,
+                )
+            ],
+            artifact_root=artifact_root,
+            expected_directory=expected_directory,
+            expected_names=(
+                VERIFIER_FAULT_CAMPAIGN_MANIFEST,
+                VERIFIER_FAULT_CAMPAIGN_START,
+                "events.jsonl",
+                VERIFIER_FAULT_CAMPAIGN_LOG,
+            ),
+            label=f"verifier fault campaign {index}",
+        )
+        manifest_path = files[VERIFIER_FAULT_CAMPAIGN_MANIFEST]
+        manifest_hash = campaign.get("manifestSha256")
+        if (
+            not isinstance(token, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or not isinstance(manifest_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash)
+        ):
+            raise EvidenceError(f"verifier fault campaign {index} has no immutable identity")
+        if campaign.get("manifestPath") != manifest_path.relative_to(artifact_root).as_posix():
+            raise EvidenceError(f"verifier fault campaign {index} manifest path is substituted")
+        raw_manifest = _validate_fault_campaign_manifest(
+            manifest_path,
+            expected_sha=expected_sha,
+            expected_registry_hash=str(expected_registry_hash),
+            expected_checkout_digest=str(expected_checkout_digest),
+            expected_environment=dict(expected_environment or {}),
+            require_fresh=True,
+            require_pass=True,
+        )
+        if campaign != _fault_campaign_projection(
+            manifest_path,
+            raw_manifest,
+            artifact_root=artifact_root,
+        ):
+            raise EvidenceError(
+                f"verifier fault campaign {index} is not derivable from its machine artifacts"
+            )
+        tokens.append(token)
+        manifest_hashes.append(manifest_hash)
+        started = _parse_utc(campaign.get("startedAt"), f"fault campaign {index}.startedAt")
+        ended = _parse_utc(campaign.get("endedAt"), f"fault campaign {index}.endedAt")
+        expires = _parse_utc(campaign.get("expiresAt"), f"fault campaign {index}.expiresAt")
+        if (
+            ended < started
+            or expires != ended + timedelta(seconds=VERIFIER_FAULT_CAMPAIGN_FRESH_SECONDS)
+            or datetime.now(timezone.utc) >= expires
+            or (previous_end is not None and started < previous_end)
+        ):
+            raise EvidenceError("verifier fault campaigns are stale, overlapping, or misordered")
+        previous_end = ended
+        expirations.append(expires)
+        if campaign.get("attemptCount") != 1 or campaign.get("retryCount") != 0:
+            raise EvidenceError("verifier fault campaign contains a retry")
+        test_results = campaign.get("testResults")
+        expected_tests = [
+            {"name": name, "outcome": "ok"} for name in VERIFIER_FAULT_TEST_METHODS
+        ]
+        if test_results != expected_tests:
+            raise EvidenceError("verifier fault campaign test execution is incomplete or skipped")
+        if campaign.get("scenarioResults") != _fault_scenario_results(expected_tests):
+            raise EvidenceError("verifier fault campaign scenario outcomes are not derivable")
+        if campaign.get("residuals") != empty_residuals:
+            raise EvidenceError("verifier fault campaign has a surviving process/port/lease/pointer")
+    if len(tokens) != len(set(tokens)) or len(manifest_hashes) != len(set(manifest_hashes)):
+        raise EvidenceError("verifier fault evidence reuses a campaign identity")
+    if previous_end != measured or min(expirations) != artifact_expires:
+        raise EvidenceError("verifier fault evidence summary chronology is not derivable")
+
+
+def _validate_embedded_timeout_baseline(
+    baseline: dict[str, object],
+    *,
+    artifact_root: Path,
+    expected_sha: str,
+    expected_profile: str,
+    expected_registry_hash: str,
+    expected_checkout_digest: str,
+    expected_environment: dict[str, object],
+) -> dict[str, object]:
+    token = baseline.get("runToken")
+    expected_directory = (
+        Path(MACHINE_EVIDENCE_DIRECTORY)
+        / "timeout-calibration-baselines"
+        / str(token)
+    )
+    files = _validate_machine_evidence_files(
+        baseline.get("controlArtifacts"),
+        artifact_root=artifact_root,
+        expected_directory=expected_directory,
+        expected_names=TIMEOUT_BASELINE_CONTROL_FILES,
+        label=f"timeout baseline {token}",
+    )
+    manifest_path = files["manifest.json"]
+    attestation_path = files[PRODUCT_ATTESTATION_NAME]
+    if (
+        sha256_file(manifest_path) != baseline.get("manifestSha256")
+        or sha256_file(attestation_path) != baseline.get("productAttestationSha256")
+    ):
+        raise EvidenceError("timeout baseline control artifacts do not match their projection")
+    manifest = _load_json_without_duplicate_keys(manifest_path)
+    if not isinstance(manifest, dict):
+        raise EvidenceError("timeout baseline manifest is not an object")
+    if (
+        manifest.get("schema") != 1
+        or manifest.get("complete") is not True
+        or manifest.get("runToken") != token
+        or manifest.get("fullGitSha") != expected_sha
+        or manifest.get("sourceTreeDigest") != _source_tree_digest_for_sha(expected_sha)
+        or manifest.get("checkoutStateDigest") != expected_checkout_digest
+        or manifest.get("profile") != expected_profile
+        or manifest.get("quick") is not False
+        or manifest.get("gateRegistryHash") != expected_registry_hash
+        or manifest.get("environment") != expected_environment
+        or manifest.get("staleTakeover")
+        != {"occurred": False, "abandonedRunToken": None}
+    ):
+        raise EvidenceError("timeout baseline embedded manifest has stale or substituted authority")
+    registry = _load_json_without_duplicate_keys(files["gate-registry.json"])
+    environment = _load_json_without_duplicate_keys(files["environment.json"])
+    run_authority = _load_json_without_duplicate_keys(files[RUN_AUTHORITY_NAME])
+    evidence_contract = _load_json_without_duplicate_keys(files[EVIDENCE_CONTRACT_NAME])
+    if registry != gate_registry_document():
+        raise EvidenceError("timeout baseline embedded gate registry is substituted")
+    if environment != expected_environment:
+        raise EvidenceError("timeout baseline embedded environment is substituted")
+    if run_authority != manifest.get("runAuthority"):
+        raise EvidenceError("timeout baseline embedded live authority is substituted")
+    authority_mode, authority_digest = _validate_run_authority(run_authority)
+    if authority_mode != AUTHORITY_MODE_LIVE:
+        raise EvidenceError("timeout baseline embedded run used diagnostic live authority")
+    if (
+        evidence_contract != evidence_contract_document()
+        or manifest.get("evidenceContractHash") != evidence_contract_hash()
+    ):
+        raise EvidenceError("timeout baseline embedded evidence contract is substituted")
+
+    selected_gates = [gate for gate in GATES if expected_profile in gate.profiles]
+    selected_ids = [gate.id for gate in selected_gates]
+    results = manifest.get("results")
+    if (
+        not isinstance(results, list)
+        or [item.get("gateId") if isinstance(item, dict) else None for item in results]
+        != selected_ids
+    ):
+        raise EvidenceError("timeout baseline embedded manifest omits or reorders a gate")
+    projected_results = baseline.get("gateResults")
+    if not isinstance(projected_results, list) or len(projected_results) != len(results):
+        raise EvidenceError("timeout baseline projected gate results are incomplete")
+    for result, projected in zip(results, projected_results, strict=True):
+        if not isinstance(result, dict) or not isinstance(projected, dict):
+            raise EvidenceError("timeout baseline embedded gate result is malformed")
+        seconds = result.get("seconds")
+        if (
+            not isinstance(seconds, (int, float))
+            or isinstance(seconds, bool)
+            or not math.isfinite(float(seconds))
+            or float(seconds) < 0
+        ):
+            raise EvidenceError("timeout baseline embedded gate timing is invalid")
+        expected_projection = {
+            "gateId": result.get("gateId"),
+            "status": result.get("status"),
+            "seconds": float(seconds),
+        }
+        if projected != expected_projection:
+            raise EvidenceError("timeout baseline gate timing/status is not machine-derived")
+
+    events = _strict_json_lines(files["events.jsonl"], "embedded timeout baseline journal")
+    for sequence, event in enumerate(events, start=1):
+        if (
+            event.get("schema") != 1
+            or event.get("sequence") != sequence
+            or event.get("runToken") != token
+        ):
+            raise EvidenceError("timeout baseline embedded journal identity is invalid")
+    first, last = events[0], events[-1]
+    if (
+        first.get("event") != "run_start"
+        or first.get("fullGitSha") != expected_sha
+        or first.get("sourceTreeDigest") != manifest.get("sourceTreeDigest")
+        or first.get("checkoutStateDigest") != expected_checkout_digest
+        or first.get("profile") != expected_profile
+        or first.get("quick") is not False
+        or first.get("gateRegistryHash") != expected_registry_hash
+        or first.get("authorityMode") != AUTHORITY_MODE_LIVE
+        or first.get("runAuthorityDigest") != authority_digest
+        or last.get("event") != "run_end"
+        or last.get("fullGitSha") != expected_sha
+        or last.get("profile") != expected_profile
+        or last.get("results") != len(results)
+        or last.get("staleTakeover") is not False
+        or last.get("authorityMode") != AUTHORITY_MODE_LIVE
+        or last.get("runAuthorityDigest") != authority_digest
+        or last.get("diagnosticAuthorityOverrides") is not False
+    ):
+        raise EvidenceError("timeout baseline embedded journal has no matching start/end authority")
+    if any(
+        event.get("event") in {"retry", "abandonment", "publication_failure"}
+        for event in events
+    ):
+        raise EvidenceError("timeout baseline embedded journal contains a retry or recovery")
+    for result, gate in zip(results, selected_gates, strict=True):
+        gate_events = [event for event in events if event.get("gate") == gate.id]
+        starts = [event for event in gate_events if event.get("event") == "gate_start"]
+        ends = [event for event in gate_events if event.get("event") == "gate_end"]
+        if (
+            len(starts) != 1
+            or len(ends) != 1
+            or ends[0].get("status") != result.get("status")
+            or ends[0].get("seconds") != result.get("seconds")
+        ):
+            raise EvidenceError(f"timeout baseline journal does not match gate {gate.id}")
+    if (
+        _format_utc(_parse_utc(first.get("at"), "embedded timeout baseline startedAt"))
+        != baseline.get("startedAt")
+        or _format_utc(_parse_utc(last.get("at"), "embedded timeout baseline endedAt"))
+        != baseline.get("endedAt")
+    ):
+        raise EvidenceError("timeout baseline projection chronology is not machine-derived")
+    _validate_product_attestation(attestation_path, manifest_path, manifest)
+    return manifest
+
+
+def _validate_timeout_calibration_evidence_document(
+    value: dict[str, object],
+    *,
+    artifact_root: Path,
+    expected_sha: str,
+    expected_profile: str | None,
+    expected_registry_hash: str | None,
+    expected_checkout_digest: str | None,
+    expected_environment: dict[str, object] | None,
+) -> None:
+    expected_keys = {
+        "schema",
+        "classId",
+        "fullGitSha",
+        "gateRegistryHash",
+        "checkoutStateDigest",
+        "environment",
+        "environmentDigest",
+        "profile",
+        "measuredAt",
+        "expiresAt",
+        "immutableAuthority",
+        "formula",
+        "excludedSelfGateId",
+        "selectedBudgetSeconds",
+        "baselines",
+        "calibrations",
+        "passed",
+        "failures",
+    }
+    if set(value) != expected_keys:
+        raise EvidenceError("timeout calibration evidence has a non-canonical envelope")
+    if expected_profile not in PROFILES or value.get("profile") != expected_profile:
+        raise EvidenceError("timeout calibration evidence is bound to another profile")
+    measured, artifact_expires = _validate_campaign_artifact_authority(
+        value,
+        class_id="timeout-calibration-baselines",
+        expected_registry_hash=expected_registry_hash,
+        expected_checkout_digest=expected_checkout_digest,
+        expected_environment=expected_environment,
+    )
+    if (
+        value.get("formula")
+        != "ceil(max(3 * observedMaximumSeconds, observedMaximumSeconds + 120))"
+        or value.get("excludedSelfGateId") != "timeout-calibration-evidence"
+    ):
+        raise EvidenceError("timeout calibration evidence substituted its formula or self-exclusion")
+    calibrated_gates = [
+        gate
+        for gate in GATES
+        if expected_profile in gate.profiles and gate.id != "timeout-calibration-evidence"
+    ]
+    expected_ids = [gate.id for gate in calibrated_gates]
+    baselines = value.get("baselines")
+    if not isinstance(baselines, list) or len(baselines) != 3:
+        raise EvidenceError("timeout calibration does not contain exactly three baselines")
+    previous_end: datetime | None = None
+    expirations: list[datetime] = []
+    tokens: list[str] = []
+    manifest_hashes: list[str] = []
+    observation_columns: list[list[float]] = [[] for _gate in calibrated_gates]
+    for index, baseline in enumerate(baselines, start=1):
+        if not isinstance(baseline, dict) or set(baseline) != {
+            "runToken",
+            "manifestSha256",
+            "productAttestationSha256",
+            "controlArtifacts",
+            "startedAt",
+            "endedAt",
+            "expiresAt",
+            "attemptCount",
+            "retryCount",
+            "staleTakeover",
+            "gateResults",
+        }:
+            raise EvidenceError(f"timeout baseline {index} is malformed")
+        token = baseline.get("runToken")
+        manifest_hash = baseline.get("manifestSha256")
+        attestation_hash = baseline.get("productAttestationSha256")
+        if (
+            not isinstance(token, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or not isinstance(manifest_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash)
+            or not isinstance(attestation_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", attestation_hash)
+        ):
+            raise EvidenceError(f"timeout baseline {index} has no immutable identity")
+        _validate_embedded_timeout_baseline(
+            baseline,
+            artifact_root=artifact_root,
+            expected_sha=expected_sha,
+            expected_profile=str(expected_profile),
+            expected_registry_hash=str(expected_registry_hash),
+            expected_checkout_digest=str(expected_checkout_digest),
+            expected_environment=dict(expected_environment or {}),
+        )
+        tokens.append(token)
+        manifest_hashes.append(manifest_hash)
+        started = _parse_utc(baseline.get("startedAt"), f"timeout baseline {index}.startedAt")
+        ended = _parse_utc(baseline.get("endedAt"), f"timeout baseline {index}.endedAt")
+        expires = _parse_utc(baseline.get("expiresAt"), f"timeout baseline {index}.expiresAt")
+        if (
+            ended < started
+            or expires != ended + timedelta(seconds=TIMEOUT_CALIBRATION_FRESH_SECONDS)
+            or datetime.now(timezone.utc) >= expires
+            or (previous_end is not None and started < previous_end)
+        ):
+            raise EvidenceError("timeout baselines are stale, overlapping, or misordered")
+        previous_end = ended
+        expirations.append(expires)
+        if (
+            baseline.get("attemptCount") != 1
+            or baseline.get("retryCount") != 0
+            or baseline.get("staleTakeover") is not False
+        ):
+            raise EvidenceError("timeout baseline contains a retry, takeover, or ambiguous attempt")
+        gate_results = baseline.get("gateResults")
+        selected_ids = [gate.id for gate in GATES if expected_profile in gate.profiles]
+        if (
+            not isinstance(gate_results, list)
+            or [item.get("gateId") if isinstance(item, dict) else None for item in gate_results]
+            != selected_ids
+        ):
+            raise EvidenceError("timeout baseline omits or reorders a gate measurement")
+        observation_index = 0
+        for result in gate_results:
+            if not isinstance(result, dict) or set(result) != {"gateId", "status", "seconds"}:
+                raise EvidenceError("timeout baseline measurement is malformed")
+            if result["gateId"] == "timeout-calibration-evidence":
+                if result.get("status") not in {PASS, FAIL}:
+                    raise EvidenceError("timeout baseline self-result contains a retry or skip")
+                continue
+            if result.get("status") != PASS:
+                raise EvidenceError("timeout baseline contains a non-PASS workload gate")
+            seconds = result.get("seconds")
+            if (
+                not isinstance(seconds, (int, float))
+                or isinstance(seconds, bool)
+                or not math.isfinite(float(seconds))
+                or float(seconds) < 0
+            ):
+                raise EvidenceError("timeout baseline measurement is non-finite or negative")
+            observation_columns[observation_index].append(float(seconds))
+            observation_index += 1
+    if len(tokens) != len(set(tokens)) or len(manifest_hashes) != len(set(manifest_hashes)):
+        raise EvidenceError("timeout calibration reuses a baseline identity")
+
+    calibrations = value.get("calibrations")
+    if not isinstance(calibrations, list) or len(calibrations) != len(calibrated_gates):
+        raise EvidenceError("timeout calibration does not cover every selected gate")
+    for gate, observations, calibration in zip(
+        calibrated_gates, observation_columns, calibrations, strict=True
+    ):
+        observed_maximum = max(observations)
+        required_timeout = _required_calibrated_timeout(observed_maximum)
+        expected_calibration = {
+            "gateId": gate.id,
+            "observedSeconds": observations,
+            "observedMaximumSeconds": observed_maximum,
+            "requiredTimeoutSeconds": required_timeout,
+            "configuredTimeoutSeconds": gate.timeout_seconds,
+        }
+        if calibration != expected_calibration or gate.timeout_seconds < required_timeout:
+            raise EvidenceError(f"timeout calibration for gate {gate.id} is not exactly derivable")
+    selected_budget = sum(
+        gate.timeout_seconds for gate in GATES if expected_profile in gate.profiles
+    )
+    if value.get("selectedBudgetSeconds") != selected_budget or selected_budget > 6 * 60 * 60:
+        raise EvidenceError("timeout calibration budget is substituted or exceeds six hours")
+    if previous_end != measured or min(expirations) != artifact_expires:
+        raise EvidenceError("timeout calibration summary chronology is not derivable")
+
+
 def _validate_class_evidence_artifact(
     class_id: str,
     path: Path,
     *,
     expected_sha: str,
+    expected_profile: str | None = None,
+    expected_registry_hash: str | None = None,
+    expected_checkout_digest: str | None = None,
+    expected_environment: dict[str, object] | None = None,
 ) -> dict[str, object]:
     value = _load_json_without_duplicate_keys(path)
     if (
@@ -4521,6 +6476,25 @@ def _validate_class_evidence_artifact(
             )
         ):
             raise EvidenceError("architecture evidence does not pass every frontend boundary")
+    elif class_id == "verifier-fault-campaigns":
+        _validate_fault_campaign_evidence_document(
+            value,
+            artifact_root=path.parent,
+            expected_sha=expected_sha,
+            expected_registry_hash=expected_registry_hash,
+            expected_checkout_digest=expected_checkout_digest,
+            expected_environment=expected_environment,
+        )
+    elif class_id == "timeout-calibration-baselines":
+        _validate_timeout_calibration_evidence_document(
+            value,
+            artifact_root=path.parent,
+            expected_sha=expected_sha,
+            expected_profile=expected_profile,
+            expected_registry_hash=expected_registry_hash,
+            expected_checkout_digest=expected_checkout_digest,
+            expected_environment=expected_environment,
+        )
     else:
         raise EvidenceError(f"no semantic validator exists for evidence class {class_id}")
     return value
@@ -4531,6 +6505,10 @@ def _derive_evidence_results(
     results: list[dict[str, object]],
     proof_root: Path,
     expected_sha: str,
+    *,
+    expected_registry_hash: str | None = None,
+    expected_checkout_digest: str | None = None,
+    expected_environment: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     by_gate: dict[str, dict[str, object]] = {}
     for result in results:
@@ -4610,25 +6588,30 @@ def _derive_evidence_results(
             spec.id,
             artifact_path,
             expected_sha=expected_sha,
+            expected_profile=profile,
+            expected_registry_hash=expected_registry_hash,
+            expected_checkout_digest=expected_checkout_digest,
+            expected_environment=expected_environment,
         )
-        derived.append(
-            {
-                "classId": spec.id,
-                "status": EVIDENCE_VERIFIED,
-                "detail": spec.description,
-                "measuredAt": document["measuredAt"],
-                "immutableAuthority": {
-                    "kind": "exact-git-commit",
-                    "fullGitSha": expected_sha,
-                },
-                "evidence": {
-                    "gateId": validator_gate,
-                    "path": expected_relative,
-                    "sha256": artifact["sha256"],
-                    "bytes": size,
-                },
-            }
-        )
+        derived_result: dict[str, object] = {
+            "classId": spec.id,
+            "status": EVIDENCE_VERIFIED,
+            "detail": spec.description,
+            "measuredAt": document["measuredAt"],
+            "immutableAuthority": {
+                "kind": "exact-git-commit",
+                "fullGitSha": expected_sha,
+            },
+            "evidence": {
+                "gateId": validator_gate,
+                "path": expected_relative,
+                "sha256": artifact["sha256"],
+                "bytes": size,
+            },
+        }
+        if "expiresAt" in document:
+            derived_result["expiresAt"] = document["expiresAt"]
+        derived.append(derived_result)
     return derived
 
 
@@ -4639,11 +6622,22 @@ def _validate_evidence_results(
     results: list[dict[str, object]] | None = None,
     proof_root: Path | None = None,
     expected_sha: str | None = None,
+    expected_registry_hash: str | None = None,
+    expected_checkout_digest: str | None = None,
+    expected_environment: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     if results is None or proof_root is None or expected_sha is None:
         expected: list[dict[str, object]] = list(_pending_evidence_results(profile))
     else:
-        expected = _derive_evidence_results(profile, results, proof_root, expected_sha)
+        expected = _derive_evidence_results(
+            profile,
+            results,
+            proof_root,
+            expected_sha,
+            expected_registry_hash=expected_registry_hash,
+            expected_checkout_digest=expected_checkout_digest,
+            expected_environment=expected_environment,
+        )
     if value != expected:
         raise EvidenceError(
             "certification evidence classes were omitted, substituted, reordered, or self-asserted; "
@@ -5413,6 +7407,9 @@ def _validate_completed_manifest(
         results=results,
         proof_root=path.parent,
         expected_sha=expected_sha,
+        expected_registry_hash=str(manifest.get("gateRegistryHash")),
+        expected_checkout_digest=checkout_digest,
+        expected_environment=stored_environment,
     )
     reconstructed_code, reconstructed_verdict = _profile_verdict(
         str(profile),
@@ -5781,6 +7778,7 @@ def aggregate_main(
                     run_token,
                     lease,
                     journal,
+                    profile=profile,
                     authority_mode=authority_mode,
                     run_authority_digest=run_authority_digest,
                 )
@@ -5805,6 +7803,9 @@ def aggregate_main(
                 result_documents,
                 run_dir,
                 full_sha,
+                expected_registry_hash=registry_hash,
+                expected_checkout_digest=checkout_state_digest,
+                expected_environment=environment,
             )
             code, verdict = _profile_verdict(
                 profile,
@@ -6045,6 +8046,7 @@ def main():
     ap.add_argument("--gate-worker", help=argparse.SUPPRESS)
     ap.add_argument("--worker-result", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--run-token", help=argparse.SUPPRESS)
+    ap.add_argument("--worker-profile", choices=sorted(PROFILES), help=argparse.SUPPRESS)
     ap.add_argument("--authority-mode", choices=sorted(AUTHORITY_MODES), help=argparse.SUPPRESS)
     ap.add_argument("--run-authority-digest", help=argparse.SUPPRESS)
     ap.add_argument(
@@ -6059,6 +8061,14 @@ def main():
         "--rust-coverage-prerequisite",
         action="store_true",
         help="run the separately supervised no-retry Rust coverage prerequisite and publish only its immutable completed pointer",
+    )
+    ap.add_argument(
+        "--verifier-fault-campaign",
+        action="store_true",
+        help=(
+            "run one isolated no-retry verifier fault campaign and publish its immutable machine "
+            "manifest; three separate consecutive passes are required by product certification"
+        ),
     )
     ap.add_argument(
         "--require-certifying-proof",
@@ -6078,6 +8088,31 @@ def main():
     ap.add_argument("--windows-signer-thumbprint", help="expected SHA-1 Authenticode signer thumbprint")
     ap.add_argument("--windows-signer-cert-sha256", help="expected SHA-256 signer certificate fingerprint")
     args = ap.parse_args()
+    if args.verifier_fault_campaign:
+        if (
+            args.static
+            or args.quick
+            or args.gate_worker
+            or args.rust_coverage_prerequisite
+            or args.require_certifying_proof
+            or args.proof_manifest is not None
+            or args.expected_sha is not None
+            or args.windows_release_bundle is not None
+            or args.expected_repository is not None
+            or args.expected_ref is not None
+            or args.expected_version is not None
+            or args.windows_signer_thumbprint is not None
+            or args.windows_signer_cert_sha256 is not None
+            or args.status_md is not None
+            or args.worker_result is not None
+            or args.run_token is not None
+            or args.diagnostic_live_authority_overrides
+            or args.authority_mode is not None
+            or args.run_authority_digest is not None
+            or args.worker_profile is not None
+        ):
+            ap.error("--verifier-fault-campaign cannot be combined with another verifier mode")
+        return verifier_fault_campaign_main()
     if args.rust_coverage_prerequisite:
         if (
             args.static
@@ -6090,6 +8125,7 @@ def main():
             or args.diagnostic_live_authority_overrides
             or args.authority_mode is not None
             or args.run_authority_digest is not None
+            or args.worker_profile is not None
         ):
             ap.error("--rust-coverage-prerequisite cannot be combined with another verifier mode")
         return rust_coverage_prerequisite_main()
@@ -6107,7 +8143,9 @@ def main():
             "--diagnostic-live-authority-overrides is accepted only for a full or quick verifier run"
         )
     if not args.gate_worker and (
-        args.authority_mode is not None or args.run_authority_digest is not None
+        args.authority_mode is not None
+        or args.run_authority_digest is not None
+        or args.worker_profile is not None
     ):
         ap.error("internal worker authority options are accepted only with --gate-worker")
     release_options = (
@@ -6174,16 +8212,19 @@ def main():
         if (
             args.worker_result is None
             or not args.run_token
+            or args.worker_profile is None
             or args.authority_mode is None
             or not args.run_authority_digest
         ):
             ap.error(
-                "--gate-worker requires --worker-result, --run-token, --authority-mode, and --run-authority-digest"
+                "--gate-worker requires --worker-result, --run-token, --worker-profile, "
+                "--authority-mode, and --run-authority-digest"
             )
         return gate_worker_main(
             args.gate_worker,
             args.worker_result,
             args.run_token,
+            args.worker_profile,
             args.authority_mode,
             args.run_authority_digest,
         )
