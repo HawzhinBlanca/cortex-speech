@@ -19,6 +19,7 @@ CLEAN_RELEASE_GATE_COMMANDS = [
     "npx playwright install chromium",
     "npm run typecheck",
     "npm test",
+    "npm run setup:python-policies",
     "npm run test:python-policies",
     "npm run lint",
     "cargo fmt --manifest-path src-tauri/Cargo.toml --all --check",
@@ -266,6 +267,28 @@ def test_playwright_browser_install_precedes_e2e() -> None:
         raise AssertionError("release.yml must install Playwright Chromium before npm run test:e2e")
 
 
+def test_locked_python_setup_precedes_every_policy_run() -> None:
+    setup = "npm run setup:python-policies"
+    run = "npm run test:python-policies"
+    for name in ["ci.yml", "release.yml"]:
+        text = workflow_steps_text(name)
+        cursor = 0
+        runs = 0
+        while True:
+            run_index = text.find(run, cursor)
+            if run_index < 0:
+                break
+            setup_index = text.rfind(setup, cursor, run_index)
+            if setup_index < 0:
+                raise AssertionError(
+                    f"{name}: every Python policy run needs a preceding locked-environment setup"
+                )
+            runs += 1
+            cursor = run_index + len(run)
+        if runs == 0:
+            raise AssertionError(f"{name}: no Python policy run found")
+
+
 def test_provisioning_precedes_every_compiling_cargo_step() -> None:
     """The failure class that broke main twice in two days (2026-07-08 Release Gate, 2026-07-09
     Nightly): any workflow step that COMPILES the crate runs build.rs -> tauri-build, which
@@ -499,6 +522,7 @@ def main() -> None:
     test_rust_quality_authorities_are_split_mandatory_and_fail_closed()
     test_release_docs_and_tag_workflow_share_clean_gate()
     test_playwright_browser_install_precedes_e2e()
+    test_locked_python_setup_precedes_every_policy_run()
     test_provisioning_precedes_every_compiling_cargo_step()
     test_release_runs_the_governance_gate()
     test_windows_ci_covers_every_rust_target_and_feature()

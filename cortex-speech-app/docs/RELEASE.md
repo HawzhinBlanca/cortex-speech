@@ -20,6 +20,7 @@ Use this before tagging a production release (`v*`). Windows Pro is the primary 
 - [ ] `npx playwright install chromium`
 - [ ] `npm run typecheck`
 - [ ] `npm test`
+- [ ] `npm run setup:python-policies`
 - [ ] `npm run test:python-policies`
 - [ ] `python scripts/rust_quality_gate.py architecture`
 - [ ] From the repository root, run `python scripts/verify_10.py --rust-coverage-prerequisite`.

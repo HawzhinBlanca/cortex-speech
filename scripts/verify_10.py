@@ -665,6 +665,28 @@ def _probe_bench():
     return None
 
 
+def _probe_owner_real_media():
+    media = os.environ.get("CORTEX_OWNER_REAL_MEDIA_DIR", "").strip()
+    audiobook = os.environ.get("CORTEX_OWNER_AUDIOBOOK_MP3", "").strip()
+    if not media or not audiobook:
+        return (
+            "owner real-media proof inputs are not configured "
+            "(CORTEX_OWNER_REAL_MEDIA_DIR and CORTEX_OWNER_AUDIOBOOK_MP3 are mandatory)"
+        )
+    if not Path(media).is_dir() or not Path(audiobook).is_file():
+        return "owner real-media proof inputs are missing or have the wrong filesystem type"
+    return None
+
+
+def _probe_owner_scale_database():
+    database = os.environ.get("CORTEX_OWNER_SCALE_DB", "").strip()
+    if not database:
+        return "owner scale-export clone is not configured (CORTEX_OWNER_SCALE_DB is mandatory)"
+    if not Path(database).is_file():
+        return "owner scale-export clone does not exist"
+    return None
+
+
 def _probe_ipc_harness():
     """Shared executable/fixture probe for disposable-profile IPC harnesses.
 
@@ -1275,6 +1297,8 @@ def _timeout_for_gate(name: str, kind: str) -> int:
         "pipeline-ipc-e2e": 900,
         "durability-drill": 1_200,
         "export-kill-drill": 900,
+        "owner-real-media-rust": 1_800,
+        "owner-scale-export-rust": 900,
     }.get(name, 240)
 
 
@@ -1335,6 +1359,9 @@ REDACTED_PATH_ENVIRONMENT = frozenset(
         "CORTEX_CHAMPION_POINTER",
         "CORTEX_DB",
         "CORTEX_DB_DIR",
+        "CORTEX_OWNER_AUDIOBOOK_MP3",
+        "CORTEX_OWNER_REAL_MEDIA_DIR",
+        "CORTEX_OWNER_SCALE_DB",
     }
 )
 
@@ -1372,6 +1399,11 @@ GATE_ENVIRONMENT_BY_ID: dict[str, tuple[str, ...]] = {
     # These are disposable/non-live harness inputs. Their presence is redacted and hash-bound in
     # the gate result, while the live database gates below remain isolated from them.
     "test-rust": ("CORTEX_REAL_AUDIO_DIR",),
+    "owner-real-media-rust": (
+        "CORTEX_OWNER_AUDIOBOOK_MP3",
+        "CORTEX_OWNER_REAL_MEDIA_DIR",
+    ),
+    "owner-scale-export-rust": ("CORTEX_OWNER_SCALE_DB",),
     "test-e2e+a11y": ("CORTEX_GATE", "CORTEX_SMOKE_TEST"),
     "real-app-e2e": (
         "CORTEX_GATE",
@@ -2117,6 +2149,8 @@ GATES = [
     # Tier 3 — deep proof legs (env-gated; skipped honestly when absent)
     ("egress-runtime", 3, "cmd", f'node "{APP / "scripts" / "egress_probe.cjs"}"', APP, _probe_egress, "Privacy: zero outbound TCP from the complete app process tree, including WebView2, during startup + browse, with a positive-control sampler. Standard coverage makes no ASR-path claim and never auto-runs an installed smaller model. An explicit CORTEX_EGRESS_TRANSCRIBE=1 diagnostic adds WSL7B transcription coverage on a disposable profile."),
     ("champion-7b-preflight", 3, "cmd", f'cargo test --manifest-path "{MANIFEST}" --jobs 4 -- --ignored wsl_7b_preflight', REPO_ROOT, _probe_champion_7b, "The champion's preflight against the REAL OmniASR-7B server. The champion drafts every clip (owner rule 2026-08-11), so the check that it is reachable before an import starts is the difference between a halt and a library half-drafted by a weaker engine."),
+    ("owner-real-media-rust", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "run_owner_rust_opt_ins.py"}" media', REPO_ROOT, _probe_owner_real_media, "Every owner-scoped real-media/audiobook Rust opt-in executes individually against curated local proof inputs; the runner rejects missing formats, early-return skip output, and any result other than exactly one passing test."),
+    ("owner-scale-export-rust", 3, "cmd", f'"{sys.executable}" "{APP / "scripts" / "run_owner_rust_opt_ins.py"}" scale', REPO_ROOT, _probe_owner_scale_database, "The ignored real-scale Hugging Face export test executes against an isolated production-sized database clone; missing clone input, early-return skip output, or anything other than exactly one passing test is red."),
     # Deliberately count-agnostic: the gate enumerates targets with `cargo fuzz list` and fails loud on an
     # empty list, so hardcoding a number here only creates a second place to go stale. It said "5" until
     # the `features` target was removed with the dead FbankExtractor module it fuzzed (iteration 231).

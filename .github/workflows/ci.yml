@@ -153,7 +153,9 @@ jobs:
         run: npm run build
 
       - name: Python policy regressions
-        run: npm run test:python-policies
+        run: |
+          npm run setup:python-policies
+          npm run test:python-policies
 
       - name: Fail-closed Rust production-module architecture
         run: python scripts/rust_quality_gate.py architecture
@@ -234,6 +236,7 @@ jobs:
       - run: npm ci
       # Runtime support must exist before cargo build: tauri-build validates bundle.resources.
       - run: npm run fetch-models
+      - run: npm run setup:python-policies
       - run: npm run test:python-policies
       - run: npm run build
       - run: cargo build --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app
@@ -265,6 +268,7 @@ jobs:
       - run: npm ci
       # Runtime support must exist before cargo build: tauri-build validates bundle.resources.
       - run: npm run fetch-models
+      - run: npm run setup:python-policies
       - run: npm run test:python-policies
       - run: npm run build
       - run: cargo build --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app

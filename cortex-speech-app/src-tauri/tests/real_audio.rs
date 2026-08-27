@@ -323,7 +323,6 @@ fn test_vad_on_real_kurdish_audio() {
 // ── Normalizer Tests ────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn test_normalizer_on_kurdish_text() {
     let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "test_normalizer_on_kurdish_text");
     let normalizer = SoraniNormalizer::new();

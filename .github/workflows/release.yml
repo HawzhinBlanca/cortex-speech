@@ -226,6 +226,7 @@ jobs:
         run: python "${{ github.workspace }}/scripts/verify_10.py" --static
       - run: npm run typecheck
       - run: npm test
+      - run: npm run setup:python-policies
       - run: npm run test:python-policies
       - name: Fail-closed Rust production-module architecture
         run: python scripts/rust_quality_gate.py architecture
