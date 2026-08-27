@@ -3622,6 +3622,12 @@ def _validate_rust_coverage_phase(
         raise EvidenceError("Rust coverage prerequisite manifest has a non-canonical envelope")
     token = manifest.get("runToken")
     phase_dir = manifest_path.parent.resolve()
+    # Re-express the manifest on the SAME resolved basis as phase_dir. The inventory check below
+    # excludes the manifest by path identity, and `phase_dir` is resolved while the caller's
+    # `manifest_path` need not be — so wherever the evidence root sits behind a symlink (macOS puts
+    # every temp dir under /var -> /private/var) the two spellings differ, the manifest fails that
+    # `!=`, and it counts as an undeclared extra file. That rejected VALID coverage evidence.
+    resolved_manifest_path = phase_dir / manifest_path.name
     if (
         manifest_path.name != RUST_COVERAGE_MANIFEST_NAME
         or not isinstance(token, str)
@@ -3704,7 +3710,7 @@ def _validate_rust_coverage_phase(
     actual = {
         candidate.relative_to(phase_dir).as_posix()
         for candidate in phase_dir.rglob("*")
-        if candidate.is_file() and candidate != manifest_path
+        if candidate.is_file() and candidate != resolved_manifest_path
     }
     if actual != set(artifact_by_path):
         raise EvidenceError("Rust coverage prerequisite artifact inventory is not exact")
