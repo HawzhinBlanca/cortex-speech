@@ -234,8 +234,13 @@ jobs:
       - run: npm ci
       # Runtime support must exist before cargo build: tauri-build validates bundle.resources.
       - run: npm run fetch-models
-      - run: npm run test:python-policies
+      # dist/ MUST exist before the Python policies: test_generated_ipc_bindings.py shells out to
+      # `cargo run --bin generate_ipc_bindings`, which compiles the lib -- and lib.rs's
+      # tauri::generate_context! panics at proc-macro time when build.frontendDist ("../dist") is
+      # missing. Running policies before `npm run build` is why that gate passed on Windows (which
+      # already ordered build -> policies) and failed on every Linux/macOS run.
       - run: npm run build
+      - run: npm run test:python-policies
       - run: cargo build --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app
 
   macos-build-smoke:
@@ -265,6 +270,8 @@ jobs:
       - run: npm ci
       # Runtime support must exist before cargo build: tauri-build validates bundle.resources.
       - run: npm run fetch-models
-      - run: npm run test:python-policies
+      # dist/ before policies -- see the Linux job: the IPC-contract gate compiles the lib, and
+      # tauri::generate_context! requires build.frontendDist to exist.
       - run: npm run build
+      - run: npm run test:python-policies
       - run: cargo build --manifest-path src-tauri/Cargo.toml --bin cortex-speech-app

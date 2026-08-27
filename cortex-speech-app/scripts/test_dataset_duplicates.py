@@ -8,7 +8,7 @@ import difflib
 import random
 import sqlite3
 from unittest import mock
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -339,9 +339,13 @@ def test_audio_confirmation_ignores_same_file_pairs_and_splits_true_components()
             return True
         return False
 
+    # PureWindowsPath, not Path: the fixture paths above are Windows literals, and on Linux/macOS
+    # `Path(r"D:\x\one.wav").name` is the WHOLE string — the stand-in clips would then all carry
+    # distinct identities, `verdict` would never fire, and this pin would report "no duplicates"
+    # on exactly the case it exists to catch.
     with mock.patch(
         "check_dataset_duplicates._clip_pcm",
-        side_effect=lambda path, _: (Path(path).name, 16_000),
+        side_effect=lambda path, _: (PureWindowsPath(path).name, 16_000),
     ):
         with mock.patch("check_dataset_duplicates.audio_says_duplicate", side_effect=verdict) as audio:
             confirmed, unconfirmed, repeats = confirm_groups_with_audio(group, rows)

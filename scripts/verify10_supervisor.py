@@ -175,17 +175,64 @@ def read_json_object(path: Path) -> dict[str, object]:
     return value
 
 
+def _ps_process_creation_time(pid: int) -> str | None:
+    """`ps` fallback for a POSIX system with no procfs (macOS). Still OS-issued, never estimated."""
+
+    completed = subprocess.run(
+        ["ps", "-o", "lstart=", "-o", "state=", "-p", str(pid)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    line = completed.stdout.strip()
+    if completed.returncode != 0 or not line:
+        return None
+    started, _, state = line.rpartition(" ")
+    started = started.strip()
+    if not started or state.startswith("Z"):
+        return None
+    return started
+
+
+def _posix_process_creation_time(pid: int) -> str | None:
+    """POSIX half of :func:`process_creation_time`.
+
+    Two things here cost a real takeover if they are wrong, and both were wrong until 2026-08-25:
+
+    * A zombie is DEAD. Its /proc entry survives with the original start time until the parent
+      reaps it, so reading "the entry is still there" as liveness makes
+      ``_terminate_verified_process_tree`` wait out its whole graceful deadline and then report
+      "verified stale process tree survived takeover" about a process it had just killed.
+    * macOS has no procfs at all, so /proc returned None for EVERY pid there — including this
+      one, which turned every LeaseManager construction into an unconditional LeaseError.
+    """
+
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except FileNotFoundError:
+        # Distinguish "no procfs on this OS" from "procfs works, that pid is gone".
+        return None if Path("/proc/self/stat").exists() else _ps_process_creation_time(pid)
+    except OSError:
+        return None
+    # `comm` is parenthesised and may itself contain spaces or ')', so index from the LAST one:
+    # the fields after it are state(3) through starttime(22).
+    try:
+        fields = raw[raw.rindex(")") + 1 :].split()
+    except ValueError:
+        return None
+    if len(fields) < 20 or fields[0] == "Z":
+        return None
+    return fields[19]
+
+
 def process_creation_time(pid: int) -> str | None:
     """Return an OS-issued process start identity, never a wall-clock estimate."""
 
     if pid <= 0:
         return None
     if os.name != "nt":
-        try:
-            fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").split()
-            return fields[21]
-        except (OSError, IndexError, UnicodeError):
-            return None
+        return _posix_process_creation_time(pid)
 
     from ctypes import wintypes
 

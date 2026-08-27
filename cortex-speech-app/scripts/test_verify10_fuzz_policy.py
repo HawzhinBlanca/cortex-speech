@@ -1,6 +1,7 @@
 """Fail-closed policy tests for the verify-10 fuzz leg."""
 
 import importlib.util
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +34,13 @@ def test_windows_fuzz_uses_one_ext4_cache_with_quoted_arguments():
     assert "${XDG_CACHE_HOME:-$HOME/.cache}/cortex-speech/fuzz/" in shell
     assert 'export CARGO_TARGET_DIR="$cache_dir"' in shell
     assert "exec cargo +nightly fuzz run normalizer -- -max_total_time=30" in shell
-    assert "/mnt/c/" in shell
+    # The WSL shell must `cd` to the DRIVE-TRANSLATED checkout, never to the raw Windows path.
+    # Asserting a literal "/mnt/c/" only held while the checkout itself sat on a Windows drive: on a
+    # Linux/macOS runner SRC_TAURI is already POSIX and the assertion failed on a correct command.
+    # These two assert the same invariant everywhere, and strictly more of it — the translation rule
+    # itself, plus that _fuzz_cmd actually applies it.
+    assert module._wsl_path(r"D:\build\cortex-speech\src-tauri") == "/mnt/d/build/cortex-speech/src-tauri"
+    assert f"cd {shlex.quote(module._wsl_path(module.SRC_TAURI))};" in shell
 
 
 def test_fuzz_smoke_builds_all_targets_once_then_runs_every_target():

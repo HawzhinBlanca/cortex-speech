@@ -871,7 +871,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path)
     parser.add_argument("--focus", type=Path)
     args = parser.parse_args(argv)
-    data_dir = args.data_dir or _default_data_dir()
+    # Resolve the live %APPDATA% data dir only for the paths that were NOT given explicitly.
+    # Demanding it up front made a fully parameterised run (--db and --focus both supplied) die on
+    # any machine without APPDATA, which is every non-Windows CI runner.
+    data_dir = args.data_dir
+    if data_dir is None and (args.db is None or args.focus is None):
+        data_dir = _default_data_dir()
     db_path = args.db or data_dir / "cortex-speech.db"
     focus_path = args.focus or data_dir / "voice_focus.json"
     result = audit_flexible_deferred(db_path)

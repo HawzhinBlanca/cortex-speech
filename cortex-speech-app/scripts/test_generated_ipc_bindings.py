@@ -32,7 +32,10 @@ def main() -> None:
             cwd=REPO_ROOT,
             text=True,
             capture_output=True,
-            timeout=300,
+            # Generous because this is a real build, not a lint: the Linux/macOS smoke jobs carry no
+            # cargo cache (only the Windows job does), so the first `cargo run` here compiles the
+            # whole dependency graph on a 2-core hosted runner. 300s was a Windows-warm-cache number.
+            timeout=1800,
         )
         if completed.returncode != 0:
             raise AssertionError(

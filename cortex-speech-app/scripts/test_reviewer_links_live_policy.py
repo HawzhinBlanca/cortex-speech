@@ -572,11 +572,21 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
                 self.assertEqual(gate.main(), 1)
             self.assertNotIn("SECRET", output.getvalue())
 
-    def test_dpapi_parser_is_strict_and_forbids_ui(self):
+    def test_dpapi_parser_rejects_malformed_ciphertext(self):
         gate = load_gate()
         for malformed in ("dpapi:QU JD", "dpapi:QUJD!"):
             with self.assertRaises(Exception):
                 gate.dpapi_unprotect(malformed)
+
+    # SKIP: live product authority is Windows-only — CryptUnprotectData reaches ctypes.WinDLL, which
+    # does not exist off Windows. The UI-forbidden flag still has to be proven on the platform that
+    # actually decrypts reviewer credentials, so this stays exactly as strict there.
+    @unittest.skipUnless(
+        os.name == "nt",
+        "SKIP: live product authority is Windows-only (DPAPI CryptUnprotectData needs ctypes.WinDLL)",
+    )
+    def test_dpapi_unprotect_forbids_ui(self):
+        gate = load_gate()
 
         class Function:
             def __init__(self):
