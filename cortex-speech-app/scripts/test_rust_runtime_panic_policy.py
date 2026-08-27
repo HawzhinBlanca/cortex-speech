@@ -1374,14 +1374,29 @@ def test_save_session_is_rate_limited() -> None:
     rest = infra[start:]
     nxt = rest.find("#[tauri::command]")
     body = rest if nxt == -1 else rest[:nxt]
-    # A STRICT_RATE_LIMITER.check("save_session") superstring would satisfy this too (either limiter is
-    # acceptable throttling); the substring match accepts both.
-    if 'RATE_LIMITER.check("save_session")' not in body:
+    # rustfmt is free to place the receiver and method call on separate lines. Match the actual call
+    # expression rather than one incidental layout; a comment containing the old single-line spelling
+    # must not satisfy the gate. STRICT_RATE_LIMITER is also acceptable throttling.
+    code_without_line_comments = re.sub(r"//[^\n]*", "", body)
+    limiter_call = re.compile(
+        r"\b(?:STRICT_)?RATE_LIMITER\s*\.\s*check\s*\(\s*\"save_session\"\s*\)"
+    )
+    if limiter_call.search(code_without_line_comments) is None:
         raise AssertionError(
             'save_session must throttle through RATE_LIMITER.check("save_session") — it is a '
             "webview-reachable DB write under the global db lock and was the lone infra.rs command "
             "without a rate limiter (local DoS gap)."
         )
+
+
+def test_save_session_rate_limit_scanner_accepts_rustfmt_and_rejects_comment_only() -> None:
+    limiter_call = re.compile(
+        r"\b(?:STRICT_)?RATE_LIMITER\s*\.\s*check\s*\(\s*\"save_session\"\s*\)"
+    )
+    formatted = 'RATE_LIMITER\n    .check(\n        "save_session"\n    )?;'
+    comment_only = '// RATE_LIMITER.check("save_session")\nlet db = state.lock_db();'
+    assert limiter_call.search(re.sub(r"//[^\n]*", "", formatted)) is not None
+    assert limiter_call.search(re.sub(r"//[^\n]*", "", comment_only)) is None
 
 
 def test_atomic_replace_post_swap_backup_cleanup_is_best_effort() -> None:
@@ -2464,6 +2479,7 @@ def main() -> None:
     test_finish_import_clears_cancel_token_before_opening_the_gate()
     test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert()
     test_save_session_is_rate_limited()
+    test_save_session_rate_limit_scanner_accepts_rustfmt_and_rejects_comment_only()
     test_atomic_replace_post_swap_backup_cleanup_is_best_effort()
     test_t0_calibration_excludes_human_rejected_from_the_conformal_set()
     test_run_t2_for_segment_respects_the_autonomy_dial()
