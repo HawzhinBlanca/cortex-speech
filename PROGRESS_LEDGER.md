@@ -11713,3 +11713,50 @@ reachable Python policy scripts, including syntax compilation and the real watch
 No production database, release pointer, port, credential, model, migration, reviewer decision, or
 payment state was touched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT
 10/10**.
+
+## 2026-08-27 — opaque renderer media grants and deterministic redirect refusal proof
+
+Commits `90dcfbca84a1e6aa6449338ed21fb7a097a26c3f` and
+`93676500a7ec57d847d46b949c2b4f37672e511f` close a renderer privacy and capability flaw: the media
+command previously returned an absolute cache path even though its contract described an opaque
+grant. The public generated `MediaGrant` now contains only a canonical RFC 4122 version-4 grant ID
+and expiry. The renderer accepts only the private `cortex-media:` origin (or its exact Windows
+loopback-origin form), while backend registry state remains the sole path authority. The generic
+Tauri asset filesystem protocol, `convertFileSrc`, renderer path conversion, and asset CSP origins
+are removed.
+
+The private media protocol is live-grant-only, GET/HEAD-only, query-free, canonical-ID-only, and
+returns generic empty error bodies with `no-store` and `nosniff`. Reads hold an immutable cache-file
+lease, execute through bounded blocking work, allow at most eight concurrent protocol workers, and
+cap each response at 1,024,000 bytes. Single byte ranges are supported; multiple ranges and malformed
+or stale grants fail closed. All three media commands are checked-in Specta contracts returning
+`CommandErrorV1`; renderer-visible failures are bounded and scrub paths, SQL, tokens, and backend
+details. The IPC architecture inventory is now 49 generated, 65 handwritten, one closed dynamic
+legacy bridge, and zero generated commands with noncanonical errors.
+
+The same hunt found a nondeterministic security-test fixture rather than a production redirect bug:
+the local redirect server could close with an unread POST body, causing Windows to surface a TCP
+reset before the client could prove redirect refusal. It now consumes the declared request body
+before returning 307. The isolated redirect-refusal test passed 30 consecutive runs and passed again
+inside the full Rust campaign.
+
+Post-freeze proof: 1,766 nonignored Rust library tests passed with zero failures and eight explicit
+ignores; every binary, integration, property, reliability, shell, 61.19-second soak, Tauri, and user
+data target reached a green result. The first aggregate command then exited 1 because its libtest-only
+`--test-threads=1` argument was forwarded to Criterion; this invocation is retained as failed proof,
+not reclassified. A corrected exact run of the `audio`, `diff`, and `normalizer` benchmark targets
+passed. The frontend passed 489/489 tests across 85 files and 101/101 Playwright tests; Svelte/
+TypeScript, ESLint, Prettier, strict all-target/all-feature Clippy, rustfmt, generated bindings,
+security policy, and all 128 Python policy scripts passed. Verifier supervisor proof was 30/30;
+`npm audit --audit-level=high` reported zero vulnerabilities; `cargo deny check` passed; the production
+bundle measured 120.95 KB gzip initial JavaScript and 11.42 KB gzip initial CSS.
+
+This is not a 10/10 attestation. The measured architecture gate remains red with 65 handwritten IPC
+calls, one legacy dynamic bridge, and ten oversized Svelte files. Coverage/mutation thresholds,
+timeout calibration, full verifier fault campaigns as certifying manifests, live-sized schema-65
+clone/restore, 50,000-segment concurrency and performance, exact owner workflow/recovery, immutable
+deployment/reboot runs, real champion/hardware exercises, signed Windows/VM/manual accessibility,
+field sessions, comparator study, pilot, and model evidence remain absent. Production databases,
+release pointers, processes, ports, credentials, models, migrations, reviewer decisions, and payment
+state were untouched. The honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT
+10/10**.
