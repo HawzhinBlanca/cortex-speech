@@ -123,6 +123,11 @@ export const commands = {
 	 */
 	getSignalAnomalySegments: (limit: number | null) => typedError<SpeechSegment[], CommandErrorV1>(__TAURI_INVOKE("get_signal_anomaly_segments", { limit })),
 	/**
+	 *  Complete, non-lossy speaker inventory for the management panel. SQL NULL stays distinct from a
+	 *  literal `unknown` id, and backend failures are reduced to a stable renderer-safe contract.
+	 */
+	getSpeakerInventoryV1: () => typedError<SpeakerInventoryItemV1[], CommandErrorV1>(__TAURI_INVOKE("get_speaker_inventory_v1")),
+	/**
 	 *  Versioned per-field compare-and-set for library-owned metadata. Unlike the retired generic JSON
 	 *  writer, every nullable field is explicit and bound to the exact last server value the renderer
 	 *  observed. A stale save therefore conflicts instead of overwriting newer metadata, while an exact
@@ -135,6 +140,16 @@ export const commands = {
 	 *  remains append-only. Replaying after response loss succeeds with `deleted_count = 0`.
 	 */
 	deleteSegmentsV1: (request: DeleteSegmentsRequestV1) => typedError<DeletedSegmentsV1, CommandErrorV1>(__TAURI_INVOKE("delete_segments_v1", { request })),
+	/**
+	 *  Atomic compare-and-set speaker rename. Source and target counts make an earlier merge
+	 *  confirmation expire if either group changes before the write reaches SQLite.
+	 */
+	renameSpeakerV1: (request: RenameSpeakerRequestV1) => typedError<RenamedSpeakerV1, CommandErrorV1>(__TAURI_INVOKE("rename_speaker_v1", { request })),
+	/**
+	 *  One generated, bounded and all-or-nothing speaker assignment. SQLite and exact history work run
+	 *  on the blocking pool; the restore-admission token remains live through session persistence.
+	 */
+	assignSpeakersV1: (request: AssignSpeakersRequestV1) => typedError<AssignedSpeakersV1, CommandErrorV1>(__TAURI_INVOKE("assign_speakers_v1", { request })),
 };
 
 /* Types */
@@ -160,6 +175,21 @@ export type AppHealthV1 = {
 	snapshot_last_success_epoch_secs: number | null,
 	snapshot_consecutive_failures: number,
 	free_disk_bytes: number | null,
+};
+
+export type AssignSpeakersRequestV1 = {
+	ids: string[],
+	targetSpeakerId: string | null,
+};
+
+/**
+ *  All-or-nothing batch speaker assignment result. `unchanged_count` makes an exact replay honest
+ *  without rewriting timestamps or review revisions for rows already at the requested value.
+ */
+export type AssignedSpeakersV1 = {
+	requestedCount: number,
+	changedCount: number,
+	unchangedCount: number,
 };
 
 // Consent remains an explicit privacy transaction instead of an ordinary preference field.
@@ -300,6 +330,26 @@ export type ProofRunManifestV1 = {
 };
 
 /**
+ *  Compare-and-set request for a whole speaker group. The two expected counts bind the destructive
+ *  merge confirmation to the exact source and target inventory the renderer displayed.
+ */
+export type RenameSpeakerRequestV1 = {
+	sourceSpeakerId: string | null,
+	targetSpeakerId: string,
+	expectedSourceCount: number,
+	expectedTargetCount: number,
+};
+
+// Server-confirmed result of one atomic speaker rename or merge.
+export type RenamedSpeakerV1 = {
+	sourceSpeakerId: string | null,
+	targetSpeakerId: string,
+	renamedCount: number,
+	targetCount: number,
+	merged: boolean,
+};
+
+/**
  *  Renderer-safe settings snapshot. This deliberately omits API-key values and the app's internal
  *  data/model/output paths. The revision is an opaque server-owned compare-and-swap token; the
  *  renderer must never synthesize it from these fields.
@@ -423,6 +473,16 @@ export type SettingsPatchV1 = {
 export type SettingsSnapshotV1 = {
 	settingsRevision: number,
 	settings: RendererSettingsV1,
+};
+
+/**
+ *  One exact speaker group from the library. `None` is the SQL NULL/unassigned group and remains
+ *  distinct from a literal speaker id such as `"unknown"`.
+ */
+export type SpeakerInventoryItemV1 = {
+	speakerId: string | null,
+	segmentCount: number,
+	totalDurationSeconds: number,
 };
 
 export type SpeechSegment = {

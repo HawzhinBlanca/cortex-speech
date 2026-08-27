@@ -252,6 +252,55 @@ pub struct DeletedSegmentsV1 {
     pub deleted_count: usize,
 }
 
+/// One exact speaker group from the library. `None` is the SQL NULL/unassigned group and remains
+/// distinct from a literal speaker id such as `"unknown"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerInventoryItemV1 {
+    pub speaker_id: Option<String>,
+    pub segment_count: usize,
+    pub total_duration_seconds: f64,
+}
+
+/// Compare-and-set request for a whole speaker group. The two expected counts bind the destructive
+/// merge confirmation to the exact source and target inventory the renderer displayed.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSpeakerRequestV1 {
+    pub source_speaker_id: Option<String>,
+    pub target_speaker_id: String,
+    pub expected_source_count: usize,
+    pub expected_target_count: usize,
+}
+
+/// Server-confirmed result of one atomic speaker rename or merge.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamedSpeakerV1 {
+    pub source_speaker_id: Option<String>,
+    pub target_speaker_id: String,
+    pub renamed_count: usize,
+    pub target_count: usize,
+    pub merged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignSpeakersRequestV1 {
+    pub ids: Vec<String>,
+    pub target_speaker_id: Option<String>,
+}
+
+/// All-or-nothing batch speaker assignment result. `unchanged_count` makes an exact replay honest
+/// without rewriting timestamps or review revisions for rows already at the requested value.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignedSpeakersV1 {
+    pub requested_count: usize,
+    pub changed_count: usize,
+    pub unchanged_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewItemV1 {
@@ -550,8 +599,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_segments_page,
             crate::commands::get_segment_ids_for_view,
             crate::commands::get_signal_anomaly_segments,
+            crate::commands::get_speaker_inventory_v1,
             crate::commands::update_segment_metadata_v1,
-            crate::commands::delete_segments_v1
+            crate::commands::delete_segments_v1,
+            crate::commands::rename_speaker_v1,
+            crate::commands::assign_speakers_v1
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
@@ -578,6 +630,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<UpdatedSegmentMetadataV1>()
         .typ::<DeleteSegmentsRequestV1>()
         .typ::<DeletedSegmentsV1>()
+        .typ::<SpeakerInventoryItemV1>()
+        .typ::<RenameSpeakerRequestV1>()
+        .typ::<RenamedSpeakerV1>()
+        .typ::<AssignSpeakersRequestV1>()
+        .typ::<AssignedSpeakersV1>()
         .typ::<ReviewItemV1>()
         .typ::<ReviewPageV1>()
         .typ::<ReviewDecisionV1>()

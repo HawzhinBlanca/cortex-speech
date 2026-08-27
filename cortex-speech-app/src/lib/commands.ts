@@ -3,6 +3,8 @@ import { commands as generatedCommands } from './generated/ipc';
 import { formatUnknownError } from './errorText';
 import type {
   ActiveVoiceFocusV1,
+  AssignedSpeakersV1,
+  AssignSpeakersRequestV1,
   AppHealthV1,
   CommandErrorV1,
   DeletedSegmentsV1,
@@ -14,6 +16,8 @@ import type {
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1,
   PlaybackIntervalV1,
+  RenamedSpeakerV1,
+  RenameSpeakerRequestV1,
   ReviewDraftV1,
   ReviewPageV1,
   ReviewScope,
@@ -21,6 +25,7 @@ import type {
   SettingsPatchResultV1,
   SettingsPatchV1,
   SettingsSnapshotV1,
+  SpeakerInventoryItemV1,
   TextDiff,
   TracingSpanV1,
   TracingStatsV1,
@@ -37,17 +42,12 @@ export type {
   PlaybackIntervalV1,
   ReviewDraftV1,
   ReviewPageV1,
+  SpeakerInventoryItemV1,
   TechnicalUnusableReasonV1,
   TracingSpanV1 as TracingSpan,
   TracingStatsV1 as TracingStats,
 } from './generated/ipc';
-import type {
-  SpeechSegment,
-  SegmentsPage,
-  WordTimestamp,
-  DatasetStats,
-  SpeakerStat,
-} from './types';
+import type { SpeechSegment, SegmentsPage, WordTimestamp, DatasetStats } from './types';
 import type { AppSettings } from './stores/settingsStore';
 import {
   mapBackendToFrontend,
@@ -1030,9 +1030,11 @@ export async function restoreDbFromSnapshot(name: string): Promise<void> {
   return invokeCritical('restore_db_from_snapshot', { name });
 }
 
-/** Complete speaker list (not the truncated top-10 dashboard summary) for the speaker manager. */
-export async function getSpeakers(): Promise<SpeakerStat[]> {
-  return invokeLegacy<SpeakerStat[]>('get_speakers');
+/** Complete speaker inventory; SQL NULL/unassigned is distinct from every literal speaker id. */
+export async function getSpeakerInventoryV1(): Promise<SpeakerInventoryItemV1[]> {
+  const result = await generatedCommands.getSpeakerInventoryV1();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export interface DatasetQuality {
@@ -1381,11 +1383,12 @@ export async function exportAudio(
   return invokeCritical('export_audio', { segmentIds, options });
 }
 
-export async function batchAssignSpeaker(
-  ids: string[],
-  speakerId: string,
-): Promise<{ status: string }> {
-  return invokeLegacy<{ status: string }>('batch_assign_speaker', { ids, speakerId });
+export async function assignSpeakersV1(
+  request: AssignSpeakersRequestV1,
+): Promise<AssignedSpeakersV1> {
+  const result = await generatedCommands.assignSpeakersV1(request);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function batchNormalize(ids: string[]): Promise<{ status: string }> {
@@ -1396,8 +1399,10 @@ export async function rediarizeSegments(ids: string[]): Promise<number> {
   return invokeLegacy<number>('rediarize_segments', { ids });
 }
 
-export async function renameSpeaker(oldId: string, newId: string): Promise<number> {
-  return invokeLegacy<number>('rename_speaker', { oldId, newId });
+export async function renameSpeakerV1(request: RenameSpeakerRequestV1): Promise<RenamedSpeakerV1> {
+  const result = await generatedCommands.renameSpeakerV1(request);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function mergeDatasetJson(

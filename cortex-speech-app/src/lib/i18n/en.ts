@@ -802,6 +802,7 @@ export const en = {
   // Speaker panel
   'speaker.title': 'Speaker Management',
   'speaker.noneIdentified': 'No speakers identified yet.',
+  'speaker.unassigned': 'Unassigned',
   'speaker.segmentsMinutes': '{count} segments · {minutes} min',
   'speaker.rename': 'Rename',
   'speaker.newNamePlaceholder': 'New speaker name...',

@@ -615,13 +615,76 @@ impl Database {
         Ok(segments)
     }
 
-    pub fn rename_speaker(&self, old_id: &str, new_id: &str) -> AppResult<usize> {
-        let count = self.conn.execute(
-            "UPDATE speech_segments SET speaker_id = ?2, updated_at = datetime('now') WHERE speaker_id = ?1",
-            params![old_id, new_id],
+    /// Atomically rename exactly the speaker inventory the caller observed and return the minimal
+    /// inverse for history. The operation rechecks source/target counts after acquiring SQLite's
+    /// writer lock, so even a same-count membership swap cannot produce mismatched undo evidence.
+    pub fn rename_speaker_with_inventory(
+        &self,
+        old_id: Option<&str>,
+        new_id: &str,
+        expected_source_count: usize,
+        expected_target_count: usize,
+    ) -> AppResult<Option<Vec<SpeakerAssignmentChange>>> {
+        self.conn.execute("SAVEPOINT speaker_rename", [])?;
+        let result: AppResult<Vec<SpeakerAssignmentChange>> = (|| {
+            let (source_count, target_count) = self.speaker_counts(old_id, new_id)?;
+            if source_count != expected_source_count || target_count != expected_target_count {
+                return Err(AppError::Validation("speaker inventory changed before rename".into()));
+            }
+            let source_segments = self.get_segments_by_speaker_id(old_id)?;
+            let source_ids: Vec<String> = source_segments.into_iter().map(|segment| segment.id).collect();
+            let changes = self.assign_speaker_batch_atomic(&source_ids, Some(new_id))?;
+            let (source_after, target_after) = self.speaker_counts(old_id, new_id)?;
+            if source_after != 0 || target_after != expected_source_count + expected_target_count {
+                return Err(AppError::Validation("speaker inventory changed during rename".into()));
+            }
+            Ok(changes)
+        })();
+
+        match result {
+            Ok(changes) => {
+                self.release_savepoint("speaker_rename")?;
+                Ok(Some(changes))
+            }
+            Err(AppError::Validation(_)) => {
+                self.cleanup_savepoint_after_error("speaker_rename");
+                Ok(None)
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("speaker_rename");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn speaker_counts(&self, old_id: Option<&str>, new_id: &str) -> AppResult<(usize, usize)> {
+        let source_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM speech_segments
+             WHERE ((?1 IS NULL AND speaker_id IS NULL) OR (?1 IS NOT NULL AND speaker_id = ?1))",
+            params![old_id],
+            |row| row.get::<_, i64>(0),
         )?;
-        self.track_write()?;
-        Ok(count)
+        let target_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM speech_segments WHERE speaker_id = ?1",
+            params![new_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok((source_count as usize, target_count as usize))
+    }
+
+    pub fn get_segments_by_speaker_id(&self, speaker_id: Option<&str>) -> AppResult<Vec<SpeechSegment>> {
+        let query = format!(
+            "SELECT {SEGMENT_SELECT_COLUMNS} FROM speech_segments
+             WHERE ((?1 IS NULL AND speaker_id IS NULL) OR (?1 IS NOT NULL AND speaker_id = ?1))
+             ORDER BY id ASC"
+        );
+        let mut statement = self.conn.prepare(&query)?;
+        let rows = statement.query_map(params![speaker_id], Self::map_row)?;
+        let mut segments = Vec::new();
+        for row in rows {
+            segments.push(row?);
+        }
+        Ok(segments)
     }
 
     pub fn integrity_check(&self) -> AppResult<String> {

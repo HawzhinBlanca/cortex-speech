@@ -142,7 +142,6 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
   const batchOps: Readonly<Record<string, { partial: TranslationKey; success: TranslationKey }>> = {
     transcribe: { partial: 'events.batchTranscribePartial', success: 'events.transcribed' },
     verify: { partial: 'events.batchVerifyPartial', success: 'events.verified' },
-    assign_speaker: { partial: 'events.batchSpeakerPartial', success: 'events.speakerAssigned' },
     normalize: { partial: 'events.batchNormalizePartial', success: 'events.normalized' },
   };
   // Checked FIRST, and as an error carrying its cause: a hard-stopped run must never be softened into

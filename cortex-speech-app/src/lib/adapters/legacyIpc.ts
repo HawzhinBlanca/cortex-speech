@@ -20,7 +20,6 @@ type CommandResult<Name extends keyof CommandService> = Awaited<
 export const LEGACY_IPC_COMMANDS = [
   'acknowledge_quarantine',
   'align_segment',
-  'batch_assign_speaker',
   'batch_normalize',
   'batch_transcribe',
   'bootstrap_legacy_champion',
@@ -59,7 +58,6 @@ export const LEGACY_IPC_COMMANDS = [
   'get_media_asset_url',
   'get_quarantine_notice',
   'get_segment_consensus',
-  'get_speakers',
   'get_training_grade_breakdown',
   'get_waveform',
   'import_audio_file',
@@ -81,7 +79,6 @@ export const LEGACY_IPC_COMMANDS = [
   'register_media_asset',
   'register_review_media_asset',
   'relink_audio',
-  'rename_speaker',
   'restore_db_from_snapshot',
   'restore_session',
   'resume_interrupted_import',

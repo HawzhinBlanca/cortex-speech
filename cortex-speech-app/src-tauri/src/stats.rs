@@ -58,29 +58,6 @@ pub struct SpeakerStat {
     pub total_duration_seconds: f64,
 }
 
-/// The COMPLETE set of speakers (no truncation), sorted by segment count desc then id. Unlike
-/// `compute_stats().top_speakers`, which is a dashboard summary capped at 10, this is what the
-/// speaker-management panel needs so EVERY speaker can be renamed — not just the top ten.
-pub fn list_speakers(db: &Database) -> AppResult<Vec<SpeakerStat>> {
-    let conn = db.connection();
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(speaker_id, 'unknown') AS spk, COUNT(*), COALESCE(SUM(duration_ms), 0)
-         FROM speech_segments
-         GROUP BY spk",
-    )?;
-    let mut speakers: Vec<SpeakerStat> = stmt
-        .query_map([], |r| {
-            Ok(SpeakerStat {
-                speaker_id: r.get::<_, String>(0)?,
-                segment_count: r.get::<_, i64>(1)? as usize,
-                total_duration_seconds: r.get::<_, i64>(2)? as f64 / 1000.0,
-            })
-        })?
-        .collect::<Result<_, _>>()?;
-    speakers.sort_by(|a, b| b.segment_count.cmp(&a.segment_count).then_with(|| a.speaker_id.cmp(&b.speaker_id)));
-    Ok(speakers)
-}
-
 /// Median within-session seconds per decision from the ordered decision_log timestamps (M2.1).
 fn compute_review_timing(conn: &rusqlite::Connection) -> AppResult<ReviewTimingStats> {
     let mut stmt = conn.prepare("SELECT timestamp_ms FROM decision_log ORDER BY timestamp_ms ASC")?;
@@ -324,21 +301,6 @@ mod tests {
             speaker_id: speaker.map(str::to_string),
             ..SpeechSegment::default()
         }
-    }
-
-    #[test]
-    fn list_speakers_returns_all_speakers_not_just_the_top_ten() {
-        // Round-2 audit LOW: the speaker-management panel used compute_stats().top_speakers, which is
-        // truncated to 10, so speakers beyond the top ten could never be renamed. list_speakers
-        // returns the complete set.
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
-        for i in 0..12 {
-            let speaker = format!("SPEAKER_{i:02}");
-            db.insert_legacy_segment_fixture(&seg(&format!("s{i}"), 1_000, true, Some(&speaker), "x")).unwrap();
-        }
-        assert_eq!(list_speakers(&db).unwrap().len(), 12, "every distinct speaker is returned");
-        assert_eq!(compute_stats(&db).unwrap().top_speakers.len(), 10, "the dashboard summary stays capped at 10");
     }
 
     #[test]

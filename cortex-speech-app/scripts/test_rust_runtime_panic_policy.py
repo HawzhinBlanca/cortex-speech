@@ -623,7 +623,6 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
     commands = command_surface()
     required = [
         'tracing::error!("Batch transcribe DB prefetch failed: {error}")',
-        'tracing::error!("Batch speaker assignment DB update failed for {id}: {error}")',
         '.get_segments_by_ids(&segment_ids)\n        .map_err(|e| e.to_string())?',
         'let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',
         'let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted, recorded_is_champion);',
@@ -634,6 +633,10 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"commands.rs is missing explicit DB failure handling:\n{formatted}")
+    if 'Batch speaker assignment DB update failed for {id}: {error}' in commands:
+        raise AssertionError(
+            "the retired per-row batch speaker assignment failure path must not remain in the command surface"
+        )
 
     segment_store = (REPO_ROOT / "src-tauri" / "src" / "stores" / "segment_write.rs").read_text(encoding="utf-8")
     store_required = [
@@ -643,6 +646,7 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
         "AppError::Validation(_) => Self::Invalid",
         "AppError::Database(rusqlite::Error::SqliteFailure(code, _))",
         "rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked",
+        "database.assign_speaker_batch_atomic(ids, target_speaker_id).map_err(SpeakerAssignmentError::from)?;",
     ]
     store_missing = [pattern for pattern in store_required if pattern not in segment_store]
     if store_missing:
@@ -1858,9 +1862,9 @@ def test_normalizer_cache_recovers_poisoned_lock() -> None:
 
 def test_history_manager_recovers_poisoned_stacks() -> None:
     history = (REPO_ROOT / "src-tauri/src/history/mod.rs").read_text(encoding="utf-8")
-    if "fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<Command>>" not in history:
+    if "fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>>" not in history:
         raise AssertionError("HistoryManager must centralize undo locking behind lock_undo_stack()")
-    if "fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<Command>>" not in history:
+    if "fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>>" not in history:
         raise AssertionError("HistoryManager must centralize redo locking behind lock_redo_stack()")
     if "Recovering poisoned undo history stack" not in history:
         raise AssertionError("HistoryManager must warn when recovering a poisoned undo stack")
@@ -1870,6 +1874,8 @@ def test_history_manager_recovers_poisoned_stacks() -> None:
         raise AssertionError("HistoryManager must recover poisoned stack locks with poisoned.into_inner()")
     if "history_operations_recover_poisoned_stacks" not in history:
         raise AssertionError("history/mod.rs must keep a unit test for poisoned stack recovery")
+    if "history_memory_budget_evicts_old_batches_but_keeps_the_latest_action_recoverable" not in history:
+        raise AssertionError("history/mod.rs must keep a regression for bounded retained batch-history bytes")
 
 
 def test_inference_metrics_recover_poisoned_locks() -> None:

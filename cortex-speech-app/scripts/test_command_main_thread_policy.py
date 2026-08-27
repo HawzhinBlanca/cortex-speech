@@ -61,6 +61,8 @@ ASYNC_SLOW_COMMANDS = [
     "relink_audio",
     "db_vacuum",
     "merge_dataset_json",
+    "assign_speakers_v1",
+    "rename_speaker_v1",
     # Eval / quality / calibration compute over the whole dataset.
     "get_dataset_certificate",
     "run_gold_eval",

@@ -1,8 +1,10 @@
-use crate::db::SpeechSegment;
+use crate::db::{SpeakerAssignmentChange, SpeechSegment};
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
+
+const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Represents a reversible change to the dataset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +23,15 @@ pub enum Command {
         /// annotated_transcript, and confidence on undo.
         previous_segments: Vec<SpeechSegment>,
     },
+    SpeakerAssignment {
+        changes: Vec<SpeakerAssignmentChange>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct HistoryEntry {
+    command: Command,
+    estimated_bytes: usize,
 }
 
 impl Command {
@@ -29,33 +40,40 @@ impl Command {
             Command::UpdateSegment { .. } => "Update segment",
             Command::DeleteSegments { .. } => "Delete segments",
             Command::BatchTranscribe { .. } => "Batch transcribe",
+            Command::SpeakerAssignment { .. } => "Assign speaker",
         }
     }
 }
 
 pub struct HistoryManager {
-    undo_stack: Mutex<VecDeque<Command>>,
-    redo_stack: Mutex<VecDeque<Command>>,
+    undo_stack: Mutex<VecDeque<HistoryEntry>>,
+    redo_stack: Mutex<VecDeque<HistoryEntry>>,
     max_history: usize,
+    max_bytes: usize,
 }
 
 impl HistoryManager {
     pub fn new(max_history: usize) -> Self {
+        Self::with_limits(max_history, MAX_HISTORY_BYTES)
+    }
+
+    fn with_limits(max_history: usize, max_bytes: usize) -> Self {
         Self {
             undo_stack: Mutex::new(VecDeque::with_capacity(max_history.min(256))),
             redo_stack: Mutex::new(VecDeque::new()),
             max_history,
+            max_bytes,
         }
     }
 
-    fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<Command>> {
+    fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>> {
         self.undo_stack.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned undo history stack");
             poisoned.into_inner()
         })
     }
 
-    fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<Command>> {
+    fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>> {
         self.redo_stack.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned redo history stack");
             poisoned.into_inner()
@@ -65,10 +83,18 @@ impl HistoryManager {
     pub fn push(&self, cmd: Command) {
         {
             let mut stack = self.lock_undo_stack();
-            stack.push_back(cmd);
+            // Serialized size is a conservative, schema-aware proxy for retained heap. Measure once
+            // when the command enters history; large batch inverses must not multiply into gigabytes
+            // merely because the count-based history limit is 500.
+            let estimated_bytes = serde_json::to_vec(&cmd).map_or(usize::MAX, |bytes| bytes.len());
+            stack.push_back(HistoryEntry { command: cmd, estimated_bytes });
             // VecDeque::pop_front is O(1); was O(N) with Vec::remove(0).
-            while stack.len() > self.max_history {
-                stack.pop_front();
+            let mut retained_bytes =
+                stack.iter().fold(0usize, |total, entry| total.saturating_add(entry.estimated_bytes));
+            while stack.len() > self.max_history || (stack.len() > 1 && retained_bytes > self.max_bytes) {
+                if let Some(removed) = stack.pop_front() {
+                    retained_bytes = retained_bytes.saturating_sub(removed.estimated_bytes);
+                }
             }
         }
         // Clear redo stack on new action.
@@ -115,19 +141,19 @@ impl HistoryManager {
             stack.pop_back()
         };
         match cmd {
-            Some(cmd) => {
-                let description = cmd.description().to_string();
+            Some(entry) => {
+                let description = entry.command.description().to_string();
                 // Apply BEFORE moving the command to the redo stack, and on failure put it BACK on the
                 // undo stack it came from — never drop it from BOTH stacks. Popping first and pushing only
                 // on success means a failing apply (e.g. a DB error) would destroy the command and desync
                 // the stacks, corrupting history and mis-ordering future undo/redo.
-                match self.apply_undo(db, &cmd) {
+                match self.apply_undo(db, &entry.command) {
                     Ok(()) => {
-                        self.lock_redo_stack().push_back(cmd);
+                        self.lock_redo_stack().push_back(entry);
                         Ok(Some(description))
                     }
                     Err(e) => {
-                        self.lock_undo_stack().push_back(cmd);
+                        self.lock_undo_stack().push_back(entry);
                         Err(e)
                     }
                 }
@@ -142,21 +168,21 @@ impl HistoryManager {
             stack.pop_back()
         };
         match cmd {
-            Some(cmd) => {
-                let description = cmd.description().to_string();
+            Some(entry) => {
+                let description = entry.command.description().to_string();
                 // Same invariant as undo: only move the command to the undo stack if the redo actually
                 // applied, and keep it on the redo stack if apply_redo fails. An unsupported redo
                 // (Command::BatchTranscribe returns Err) would otherwise DESTROY the popped command,
                 // leaving can_redo()=false and the DB stranded in the undone state with no recovery, and
                 // corrupting the stacks. Re-pushing on failure preserves the entry so the user is never
                 // silently stranded.
-                match self.apply_redo(db, &cmd) {
+                match self.apply_redo(db, &entry.command) {
                     Ok(()) => {
-                        self.lock_undo_stack().push_back(cmd);
+                        self.lock_undo_stack().push_back(entry);
                         Ok(Some(description))
                     }
                     Err(e) => {
-                        self.lock_redo_stack().push_back(cmd);
+                        self.lock_redo_stack().push_back(entry);
                         Err(e)
                     }
                 }
@@ -202,6 +228,9 @@ impl HistoryManager {
                     db.restore_batch_transcription_snapshot(prev)?;
                 }
             }
+            Command::SpeakerAssignment { changes } => {
+                db.apply_speaker_assignment_history(changes, false)?;
+            }
         }
         Ok(())
     }
@@ -225,6 +254,9 @@ impl HistoryManager {
                 // would need to be stored in the command for deterministic replay.
                 return Err(crate::error::AppError::Other("BatchTranscribe redo is not supported".into()));
             }
+            Command::SpeakerAssignment { changes } => {
+                db.apply_speaker_assignment_history(changes, true)?;
+            }
         }
         Ok(())
     }
@@ -243,11 +275,11 @@ impl HistoryManager {
     }
 
     pub fn undo_description(&self) -> Option<String> {
-        self.lock_undo_stack().back().map(|c| c.description().to_string())
+        self.lock_undo_stack().back().map(|entry| entry.command.description().to_string())
     }
 
     pub fn redo_description(&self) -> Option<String> {
-        self.lock_redo_stack().back().map(|c| c.description().to_string())
+        self.lock_redo_stack().back().map(|entry| entry.command.description().to_string())
     }
 }
 
@@ -655,6 +687,32 @@ mod tests {
         }
         // VecDeque evicts oldest (front) entries; should have exactly max_history items.
         assert_eq!(history.undo_stack.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn history_memory_budget_evicts_old_batches_but_keeps_the_latest_action_recoverable() {
+        let history = HistoryManager::with_limits(100, 1);
+        history.push(Command::SpeakerAssignment {
+            changes: vec![SpeakerAssignmentChange {
+                segment_id: "older".into(),
+                previous_speaker_id: Some("a".into()),
+                current_speaker_id: Some("b".into()),
+            }],
+        });
+        history.push(Command::SpeakerAssignment {
+            changes: vec![SpeakerAssignmentChange {
+                segment_id: "latest".into(),
+                previous_speaker_id: Some("b".into()),
+                current_speaker_id: Some("c".into()),
+            }],
+        });
+
+        let stack = history.undo_stack.lock().unwrap();
+        assert_eq!(stack.len(), 1, "the byte budget must evict the older retained batch");
+        assert!(matches!(
+            stack.back().map(|entry| &entry.command),
+            Some(Command::SpeakerAssignment { changes }) if changes[0].segment_id == "latest"
+        ));
     }
 
     #[test]

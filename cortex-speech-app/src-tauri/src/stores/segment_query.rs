@@ -6,6 +6,13 @@ use crate::error::AppResult;
 use crate::quality;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SpeakerInventoryItem {
+    pub(crate) speaker_id: Option<String>,
+    pub(crate) segment_count: usize,
+    pub(crate) total_duration_seconds: f64,
+}
+
 #[derive(Clone)]
 pub(crate) struct SegmentQueryStore {
     runtime: DatabaseRuntime,
@@ -96,6 +103,31 @@ impl SegmentQueryStore {
         self.runtime.open_read()?.audio_health()
     }
 
+    /// Return every speaker group without collapsing SQL NULL into a user-chosen string. This is
+    /// the inventory authority used by the compare-and-set rename flow, not the truncated dashboard
+    /// summary.
+    pub(crate) fn speaker_inventory(&self) -> AppResult<Vec<SpeakerInventoryItem>> {
+        let database = self.runtime.open_read()?;
+        let mut statement = database.connection().prepare(
+            "SELECT speaker_id, COUNT(*), COALESCE(SUM(duration_ms), 0)
+             FROM speech_segments
+             GROUP BY speaker_id",
+        )?;
+        let mut speakers: Vec<SpeakerInventoryItem> = statement
+            .query_map([], |row| {
+                Ok(SpeakerInventoryItem {
+                    speaker_id: row.get(0)?,
+                    segment_count: row.get::<_, i64>(1)? as usize,
+                    total_duration_seconds: row.get::<_, i64>(2)? as f64 / 1000.0,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        speakers.sort_by(|left, right| {
+            right.segment_count.cmp(&left.segment_count).then_with(|| left.speaker_id.cmp(&right.speaker_id))
+        });
+        Ok(speakers)
+    }
+
     /// Preserve the established active-learning selection rule while keeping its scan, tally and
     /// hydration on one stable query snapshot. The global-threshold ranking remains intentionally
     /// naive until a frozen Gold Marathon calibration split can support a separate evidence-backed
@@ -148,11 +180,42 @@ mod tests {
         assert!(store.search_segments("missing").unwrap().is_empty());
         assert!(store.get_segment_ids_for_view(None, None, "any").unwrap().is_empty());
         assert!(store.get_signal_anomaly_segments(10).unwrap().is_empty());
+        assert!(store.speaker_inventory().unwrap().is_empty());
         assert!(store.active_learning_queue(0.1, 0.95, 10).unwrap().is_empty());
         assert_eq!(store.resolve_transcription_segment("missing.wav", None).unwrap(), None);
         let page = store.get_segments_page(Some(false), None, "oldest", 10, None, None).unwrap();
         assert_eq!(page.total, 0);
         assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn speaker_inventory_keeps_unassigned_distinct_from_literal_unknown_and_returns_every_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("speakers.db");
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        for index in 0..12 {
+            let speaker_id = match index {
+                0 => None,
+                1 => Some("unknown".to_string()),
+                _ => Some(format!("speaker-{index}")),
+            };
+            database
+                .insert_segment(&SpeechSegment {
+                    id: format!("segment-{index}"),
+                    audio_path: directory.path().join(format!("{index}.wav")).to_string_lossy().into_owned(),
+                    speaker_id,
+                    duration_ms: 1_000,
+                    ..SpeechSegment::default()
+                })
+                .unwrap();
+        }
+
+        let store = SegmentQueryStore::new(DatabaseRuntime::new(database));
+        let inventory = store.speaker_inventory().unwrap();
+        assert_eq!(inventory.len(), 12, "the inventory must not truncate or merge speaker groups");
+        assert!(inventory.iter().any(|speaker| speaker.speaker_id.is_none()));
+        assert!(inventory.iter().any(|speaker| speaker.speaker_id.as_deref() == Some("unknown")));
     }
 
     #[test]

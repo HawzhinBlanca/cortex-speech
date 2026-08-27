@@ -124,6 +124,23 @@ pub fn validate_text(s: &str, max_len: usize, field_name: &str) -> Result<(), St
     Ok(())
 }
 
+/// Validate a human-visible speaker label. Unlike technical identifiers, names may contain spaces
+/// and Sorani punctuation; leading/trailing whitespace, control characters and empty labels remain
+/// forbidden so visually ambiguous groups cannot be created.
+pub fn validate_speaker_label(s: &str) -> Result<(), String> {
+    validate_text(s, 256, "Speaker label")?;
+    if s.is_empty() || s.trim().is_empty() {
+        return Err("Speaker label must not be empty".to_string());
+    }
+    if s != s.trim() {
+        return Err("Speaker label must not have leading or trailing whitespace".to_string());
+    }
+    if s.chars().any(char::is_control) {
+        return Err("Speaker label must not contain control characters".to_string());
+    }
+    Ok(())
+}
+
 /// Validate and size-bound an arbitrary JSON blob.
 pub fn validate_json_blob(s: &str) -> Result<serde_json::Value, String> {
     if s.len() > 500_000 {
@@ -323,6 +340,15 @@ mod tests {
     fn test_validate_text() {
         assert!(validate_text("hello", 100, "test").is_ok());
         assert!(validate_text("hello", 3, "test").is_err());
+    }
+
+    #[test]
+    fn speaker_labels_allow_human_names_but_refuse_ambiguous_whitespace_and_controls() {
+        assert!(validate_speaker_label("Shara Karim").is_ok());
+        assert!(validate_speaker_label("شارە کریم").is_ok());
+        assert!(validate_speaker_label("").is_err());
+        assert!(validate_speaker_label(" speaker ").is_err());
+        assert!(validate_speaker_label("speaker\nother").is_err());
     }
 
     #[test]

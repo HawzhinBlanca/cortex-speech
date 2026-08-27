@@ -81,7 +81,6 @@ OFFLOADED_HIGH = [
     "import_audio_file",
     "resume_interrupted_import",
     "batch_transcribe",
-    "batch_assign_speaker",
     "batch_normalize",
     "run_wsl_refinement",
     # Detached subprocess launcher: spawns powershell (CREATE_NO_WINDOW, stdio null) and returns without

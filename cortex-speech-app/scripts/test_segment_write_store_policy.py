@@ -39,7 +39,13 @@ def test_store_owns_serialized_deletes_history_and_rename_without_ui_dependencie
         "database.get_segments_by_ids(ids)",
         "database.delete_segments_batch(ids)",
         "Command::DeleteSegments",
-        '.rename_speaker(old_id, new_id)',
+        "fn rename_speaker_v1(",
+        "begin_mutation().map_err(AppError::Other).map_err(SpeakerRenameError::from)?",
+        ".rename_speaker_with_inventory(old_id, new_id, expected_source_count, expected_target_count)",
+        "SpeakerRenameError::Stale { source_count, target_count }",
+        "fn assign_speaker_batch_v1(",
+        ".assign_speaker_batch_atomic(ids, target_speaker_id)",
+        "Command::SpeakerAssignment { changes }",
     ):
         if required not in store:
             raise AssertionError(f"SegmentWriteStore lost required mutation boundary: {required}")
@@ -50,7 +56,7 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
     signatures = {
         "update_segment_metadata_v1": "pub fn update_segment_metadata_v1(",
         "delete_segments_v1": "pub fn delete_segments_v1(",
-        "rename_speaker": "pub fn rename_speaker(",
+        "rename_speaker_v1": "pub async fn rename_speaker_v1(",
     }
     for name, signature in signatures.items():
         body = command(source, signature)
@@ -60,16 +66,83 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
             if forbidden in body:
                 raise AssertionError(f"{name} regained raw database authority: {forbidden}")
 
-    for name in ("update_segment_metadata_v1", "delete_segments_v1"):
+    for name in ("update_segment_metadata_v1", "delete_segments_v1", "rename_speaker_v1"):
         body = command(source, signatures[name])
-        if "validate::validate_identifier" not in body:
-            raise AssertionError(f"{name} lost identifier validation")
         if "_mutation" not in body:
             raise AssertionError(f"{name} no longer retains the restore-admission token")
-        if "state.session_auto_save()" not in body:
+        session_save = "app_state.session_auto_save()" if name == "rename_speaker_v1" else "state.session_auto_save()"
+        if session_save not in body:
             raise AssertionError(f"{name} no longer keeps restore admission alive through session save")
-    if "validate::validate_identifier(&new_id)" not in command(source, signatures["rename_speaker"]):
-        raise AssertionError("rename_speaker lost new identity validation")
+    for name in ("update_segment_metadata_v1", "delete_segments_v1"):
+        if "validate::validate_identifier" not in command(source, signatures[name]):
+            raise AssertionError(f"{name} lost identifier validation")
+    rename = command(source, signatures["rename_speaker_v1"])
+    for required in (
+        "validate::validate_text(source_speaker_id, 256",
+        "validate::validate_speaker_label(&request.target_speaker_id)",
+        "public_speaker_rename_error",
+        "expected_source_count",
+        "expected_target_count",
+        "spawn_blocking",
+        "app.try_state::<AppState>()",
+    ):
+        if required not in rename:
+            raise AssertionError(f"typed speaker rename boundary lost {required!r}")
+
+    database = read("db/queries_recovery.rs")
+    rename_start = database.find("pub fn rename_speaker_with_inventory(")
+    rename_end = database.find("pub fn speaker_counts(", rename_start)
+    if min(rename_start, rename_end) < 0:
+        raise AssertionError("atomic database speaker rename boundary is missing")
+    rename_sql = database[rename_start:rename_end]
+    for required in (
+        "expected_source_count",
+        "expected_target_count",
+        "SAVEPOINT speaker_rename",
+        "assign_speaker_batch_atomic",
+        "source_after != 0",
+    ):
+        if required not in rename_sql:
+            raise AssertionError(f"speaker rename lost atomic inventory guard {required!r}")
+
+    batch = read("commands/batch.rs")
+    batch_body = command(batch, "pub async fn assign_speakers_v1(")
+    for required in (
+        "#[specta::specta]",
+        "validate::validate_identifier",
+        "validate::validate_speaker_label",
+        "spawn_blocking",
+        ".segment_writes()",
+        ".assign_speaker_batch_v1",
+        "_mutation",
+        "session_auto_save()",
+        "public_speaker_assignment_error",
+    ):
+        if required not in batch_body and required != "#[specta::specta]":
+            raise AssertionError(f"typed batch speaker assignment lost {required!r}")
+    if "#[specta::specta]\npub async fn assign_speakers_v1(" not in batch:
+        raise AssertionError("batch speaker assignment is not in the generated IPC registry")
+    for forbidden in ("state.lock_db()", "state.db_arc()", ".connection()", "thread::spawn"):
+        if forbidden in batch_body:
+            raise AssertionError(f"batch speaker assignment bypasses its store/worker boundary: {forbidden}")
+
+    history = read("history/mod.rs")
+    for required in (
+        "SpeakerAssignment {",
+        "db.apply_speaker_assignment_history(changes, false)?",
+        "db.apply_speaker_assignment_history(changes, true)?",
+        "MAX_HISTORY_BYTES",
+        "retained_bytes > self.max_bytes",
+    ):
+        if required not in history:
+            raise AssertionError(f"exact speaker undo/redo lost {required!r}")
+
+    system_ops = read("commands/system_ops.rs")
+    for action in ("undo", "redo"):
+        body = command(system_ops, f"pub fn {action}(")
+        for required in ("begin_mutation()", "_mutation", "state.session_auto_save()"):
+            if required not in body:
+                raise AssertionError(f"{action} no longer holds restore admission through session save: {required}")
 
     deletion = command(source, signatures["delete_segments_v1"])
     for required in ("MAX_SEGMENT_DELETE_IDS", "public_segment_delete_error", "deleted_count > 0"):

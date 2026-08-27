@@ -366,6 +366,93 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
         deletedCount: previousCount - demoSegments.length,
       };
     }
+    if (cmd === 'get_speaker_inventory_v1') {
+      const inventory = new Map<string | null, { segmentCount: number; durationMs: number }>();
+      for (const segment of demoSegments) {
+        const current = inventory.get(segment.speakerId) ?? { segmentCount: 0, durationMs: 0 };
+        current.segmentCount += 1;
+        current.durationMs += segment.durationMs;
+        inventory.set(segment.speakerId, current);
+      }
+      return Array.from(inventory, ([speakerId, totals]) => ({
+        speakerId,
+        segmentCount: totals.segmentCount,
+        totalDurationSeconds: totals.durationMs / 1000,
+      })).sort((left, right) => right.segmentCount - left.segmentCount);
+    }
+    if (cmd === 'rename_speaker_v1') {
+      const request = args?.request as
+        | {
+            sourceSpeakerId?: string | null;
+            targetSpeakerId?: string;
+            expectedSourceCount?: number;
+            expectedTargetCount?: number;
+          }
+        | undefined;
+      const sourceSpeakerId = request?.sourceSpeakerId ?? null;
+      const targetSpeakerId = String(request?.targetSpeakerId ?? '');
+      const sourceCount = demoSegments.filter(
+        (segment) => segment.speakerId === sourceSpeakerId,
+      ).length;
+      const targetCount = demoSegments.filter(
+        (segment) => segment.speakerId === targetSpeakerId,
+      ).length;
+      if (
+        !targetSpeakerId ||
+        sourceSpeakerId === targetSpeakerId ||
+        sourceCount !== request?.expectedSourceCount ||
+        targetCount !== request?.expectedTargetCount
+      ) {
+        throw {
+          schema: 1,
+          code: 'STALE_SPEAKER_INVENTORY',
+          message: 'The preview speaker inventory changed.',
+          retryable: false,
+        };
+      }
+      demoSegments = demoSegments.map((segment) =>
+        segment.speakerId === sourceSpeakerId
+          ? { ...segment, speakerId: targetSpeakerId }
+          : segment,
+      );
+      return {
+        sourceSpeakerId,
+        targetSpeakerId,
+        renamedCount: sourceCount,
+        targetCount: sourceCount + targetCount,
+        merged: targetCount > 0,
+      };
+    }
+    if (cmd === 'assign_speakers_v1') {
+      const request = args?.request as
+        { ids?: string[]; targetSpeakerId?: string | null } | undefined;
+      const ids = request?.ids ?? [];
+      if (ids.length === 0 || new Set(ids).size !== ids.length) {
+        throw {
+          schema: 1,
+          code: 'INVALID_SPEAKER_ASSIGNMENT',
+          message: 'The preview speaker assignment is invalid.',
+          retryable: false,
+        };
+      }
+      const requested = new Set(ids);
+      let changedCount = 0;
+      demoSegments = demoSegments.map((segment) => {
+        if (
+          !requested.has(segment.id) ||
+          segment.speakerId === (request?.targetSpeakerId ?? null)
+        ) {
+          return segment;
+        }
+        changedCount += 1;
+        return { ...segment, speakerId: request?.targetSpeakerId ?? null };
+      });
+      return {
+        requestedCount: ids.length,
+        changedCount,
+        unchangedCount: ids.length - changedCount,
+      };
+    }
     // Same class: the readiness verdict and the accuracy card call these, and `{}` / `null` from the
     // catch-alls crashed the Insights panel on `.summary`. Mock the real shapes so dev preview shows
     // the decision layer rather than an error.
@@ -475,7 +562,6 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     if (cmd === 'couch_review_status') return { running: false, reviewers: [] };
     if (cmd === 'spot_check_report' || cmd === 'reviewer_throughput') return [];
     if (cmd === 'count_segments' || cmd === 'get_segment_count') return SAMPLE.length;
-    if (cmd === 'get_speakers') return ['SPEAKER_00', 'SPEAKER_01', 'SPEAKER_02'];
     if (cmd === 'validate_dataset_cmd') {
       const segs = sampleSegments();
       const warnings = segs

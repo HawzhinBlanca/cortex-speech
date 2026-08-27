@@ -1,7 +1,7 @@
 //! Durable segment deletion, undo-history capture and speaker rename boundaries.
 
 use crate::database_runtime::{begin_mutation, DatabaseRuntime, MutationGuard};
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
 use crate::history::{Command, HistoryManager};
 use crate::validation::input as validate;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -56,6 +56,72 @@ pub(crate) enum SegmentDeleteError {
     Authority,
     Busy,
     Application,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenamedSpeaker {
+    pub(crate) source_speaker_id: Option<String>,
+    pub(crate) target_speaker_id: String,
+    pub(crate) renamed_count: usize,
+    pub(crate) target_count: usize,
+    pub(crate) merged: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum SpeakerRenameError {
+    Invalid,
+    Stale { source_count: usize, target_count: usize },
+    Busy,
+    Application,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AssignedSpeakers {
+    pub(crate) requested_count: usize,
+    pub(crate) changed_count: usize,
+}
+
+#[derive(Debug)]
+pub(crate) enum SpeakerAssignmentError {
+    Invalid,
+    Stale,
+    Busy,
+    Application,
+}
+
+impl From<AppError> for SpeakerAssignmentError {
+    fn from(error: AppError) -> Self {
+        match error {
+            AppError::Validation(message)
+                if message.contains("no longer exists")
+                    || message.contains("changed concurrently")
+                    || message.contains("disappeared") =>
+            {
+                Self::Stale
+            }
+            AppError::Validation(_) => Self::Invalid,
+            AppError::Database(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
+            {
+                Self::Busy
+            }
+            _ => Self::Application,
+        }
+    }
+}
+
+impl From<AppError> for SpeakerRenameError {
+    fn from(error: AppError) -> Self {
+        match error {
+            AppError::Validation(_) => Self::Invalid,
+            AppError::Database(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
+            {
+                Self::Busy
+            }
+            _ => Self::Application,
+        }
+    }
 }
 
 impl From<AppError> for SegmentDeleteError {
@@ -194,8 +260,77 @@ impl SegmentWriteStore {
         Ok((deleted_count, SegmentMutation { _admission: admission }))
     }
 
-    pub(crate) fn rename_speaker(&self, old_id: &str, new_id: &str) -> AppResult<usize> {
-        self.lock_database("rename_speaker").rename_speaker(old_id, new_id)
+    pub(crate) fn rename_speaker_v1(
+        &self,
+        old_id: Option<&str>,
+        new_id: &str,
+        expected_source_count: usize,
+        expected_target_count: usize,
+    ) -> Result<(RenamedSpeaker, SegmentMutation), SpeakerRenameError> {
+        let admission = begin_mutation().map_err(AppError::Other).map_err(SpeakerRenameError::from)?;
+        if expected_source_count == 0 || old_id == Some(new_id) {
+            return Err(SpeakerRenameError::Invalid);
+        }
+        if let Some(old_id) = old_id {
+            validate::validate_text(old_id, 256, "Source speaker label").map_err(|_| SpeakerRenameError::Invalid)?;
+        }
+        validate::validate_speaker_label(new_id).map_err(|_| SpeakerRenameError::Invalid)?;
+
+        let database = self.lock_database("rename_speaker_v1");
+        let history_changes = database
+            .rename_speaker_with_inventory(old_id, new_id, expected_source_count, expected_target_count)
+            .map_err(SpeakerRenameError::from)?;
+        let Some(history_changes) = history_changes else {
+            let (source_count, target_count) =
+                database.speaker_counts(old_id, new_id).map_err(SpeakerRenameError::from)?;
+            return Err(SpeakerRenameError::Stale { source_count, target_count });
+        };
+        let renamed_count = history_changes.len();
+        debug_assert_eq!(renamed_count, expected_source_count);
+        drop(database);
+        self.lock_history("rename_speaker_v1").push(Command::SpeakerAssignment { changes: history_changes });
+
+        Ok((
+            RenamedSpeaker {
+                source_speaker_id: old_id.map(str::to_owned),
+                target_speaker_id: new_id.to_owned(),
+                renamed_count,
+                target_count: expected_target_count + renamed_count,
+                merged: expected_target_count > 0,
+            },
+            SegmentMutation { _admission: admission },
+        ))
+    }
+
+    pub(crate) fn assign_speaker_batch_v1(
+        &self,
+        ids: &[String],
+        target_speaker_id: Option<&str>,
+    ) -> Result<(AssignedSpeakers, SegmentMutation), SpeakerAssignmentError> {
+        let admission = begin_mutation().map_err(AppError::Other).map_err(SpeakerAssignmentError::from)?;
+        if ids.is_empty() || ids.len() > 100_000 {
+            return Err(SpeakerAssignmentError::Invalid);
+        }
+        let mut unique_ids = std::collections::HashSet::with_capacity(ids.len());
+        for id in ids {
+            validate::validate_identifier(id).map_err(|_| SpeakerAssignmentError::Invalid)?;
+            if !unique_ids.insert(id.as_str()) {
+                return Err(SpeakerAssignmentError::Invalid);
+            }
+        }
+        if let Some(speaker_id) = target_speaker_id {
+            validate::validate_speaker_label(speaker_id).map_err(|_| SpeakerAssignmentError::Invalid)?;
+        }
+
+        let database = self.lock_database("assign_speaker_batch_v1");
+        let changes =
+            database.assign_speaker_batch_atomic(ids, target_speaker_id).map_err(SpeakerAssignmentError::from)?;
+        let changed_count = changes.len();
+        drop(database);
+        if !changes.is_empty() {
+            self.lock_history("assign_speaker_batch_v1").push(Command::SpeakerAssignment { changes });
+        }
+        Ok((AssignedSpeakers { requested_count: ids.len(), changed_count }, SegmentMutation { _admission: admission }))
     }
 }
 
@@ -245,7 +380,10 @@ mod tests {
     #[test]
     fn batch_delete_and_speaker_rename_share_the_serialized_store_boundary() {
         let (_directory, store, runtime, _history) = store_with_segments();
-        assert_eq!(store.rename_speaker("speaker-a", "speaker-z").unwrap(), 2);
+        let (renamed, admission) = store.rename_speaker_v1(Some("speaker-a"), "speaker-z", 2, 0).unwrap();
+        drop(admission);
+        assert_eq!(renamed.renamed_count, 2);
+        assert!(!renamed.merged);
         let renamed = runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into()]).unwrap();
         assert!(renamed.iter().all(|segment| segment.speaker_id.as_deref() == Some("speaker-z")));
 
@@ -256,6 +394,203 @@ mod tests {
             runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "two");
+    }
+
+    #[test]
+    fn speaker_rename_refuses_stale_source_or_target_inventory_without_any_partial_write() {
+        let (_directory, store, runtime, _history) = store_with_segments();
+        let stale_source = match store.rename_speaker_v1(Some("speaker-a"), "speaker-z", 1, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("a stale source count must not rename any segment"),
+        };
+        assert!(matches!(stale_source, SpeakerRenameError::Stale { source_count: 2, target_count: 0 }));
+        assert!(runtime
+            .open_read()
+            .unwrap()
+            .get_segments_by_ids(&["one".into(), "two".into()])
+            .unwrap()
+            .iter()
+            .all(|segment| segment.speaker_id.as_deref() == Some("speaker-a")));
+
+        let stale_target = match store.rename_speaker_v1(Some("speaker-a"), "speaker-b", 2, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("an unconfirmed target group must not be merged"),
+        };
+        assert!(matches!(stale_target, SpeakerRenameError::Stale { source_count: 2, target_count: 1 }));
+        let retained =
+            runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
+        assert_eq!(retained.iter().filter(|segment| segment.speaker_id.as_deref() == Some("speaker-a")).count(), 2);
+        assert_eq!(retained.iter().filter(|segment| segment.speaker_id.as_deref() == Some("speaker-b")).count(), 1);
+    }
+
+    #[test]
+    fn speaker_rename_handles_sql_null_without_touching_literal_unknown_and_rejects_same_id_noops() {
+        let (_directory, store, runtime, _history) = store_with_segments();
+        {
+            let database = runtime.lock().unwrap();
+            database
+                .insert_segment(&SpeechSegment {
+                    id: "unassigned".into(),
+                    audio_path: "unassigned.wav".into(),
+                    speaker_id: None,
+                    ..SpeechSegment::default()
+                })
+                .unwrap();
+            database
+                .insert_segment(&SpeechSegment {
+                    id: "literal-unknown".into(),
+                    audio_path: "literal-unknown.wav".into(),
+                    speaker_id: Some("unknown".into()),
+                    ..SpeechSegment::default()
+                })
+                .unwrap();
+        }
+
+        let (renamed, admission) = store.rename_speaker_v1(None, "assigned", 1, 0).unwrap();
+        drop(admission);
+        assert_eq!(renamed.renamed_count, 1);
+        let read = runtime.open_read().unwrap();
+        assert_eq!(read.get_segment_by_id("unassigned").unwrap().unwrap().speaker_id.as_deref(), Some("assigned"));
+        assert_eq!(read.get_segment_by_id("literal-unknown").unwrap().unwrap().speaker_id.as_deref(), Some("unknown"));
+        drop(read);
+
+        assert!(matches!(
+            store.rename_speaker_v1(Some("speaker-a"), "speaker-a", 2, 2),
+            Err(SpeakerRenameError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn speaker_rename_and_merge_have_exact_server_owned_undo_and_redo() {
+        let (_directory, store, runtime, history) = store_with_segments();
+        let (renamed, admission) = store.rename_speaker_v1(Some("speaker-a"), "speaker-b", 2, 1).unwrap();
+        drop(admission);
+        assert!(renamed.merged);
+        assert_eq!(renamed.target_count, 3);
+
+        {
+            let database = runtime.lock().unwrap();
+            let history = history.lock().unwrap();
+            assert_eq!(history.undo(&database).unwrap().as_deref(), Some("Assign speaker"));
+        }
+        let restored =
+            runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
+        assert_eq!(restored.iter().filter(|segment| segment.speaker_id.as_deref() == Some("speaker-a")).count(), 2);
+        assert_eq!(restored.iter().filter(|segment| segment.speaker_id.as_deref() == Some("speaker-b")).count(), 1);
+
+        {
+            let database = runtime.lock().unwrap();
+            let history = history.lock().unwrap();
+            assert_eq!(history.redo(&database).unwrap().as_deref(), Some("Assign speaker"));
+        }
+        let redone =
+            runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
+        assert!(redone.iter().all(|segment| segment.speaker_id.as_deref() == Some("speaker-b")));
+    }
+
+    #[test]
+    fn batch_speaker_assignment_is_atomic_replay_safe_and_exactly_undoable() {
+        let (_directory, store, runtime, history) = store_with_segments();
+        let ids = ["one".to_string(), "three".to_string()];
+        let (assigned, admission) = store.assign_speaker_batch_v1(&ids, Some("Shara Karim")).unwrap();
+        drop(admission);
+        assert_eq!(assigned.requested_count, 2);
+        assert_eq!(assigned.changed_count, 2);
+
+        let (replay, admission) = store.assign_speaker_batch_v1(&ids, Some("Shara Karim")).unwrap();
+        drop(admission);
+        assert_eq!(replay.changed_count, 0, "an exact replay must not rewrite timestamps or history");
+
+        {
+            let database = runtime.lock().unwrap();
+            let history = history.lock().unwrap();
+            assert_eq!(history.undo(&database).unwrap().as_deref(), Some("Assign speaker"));
+            assert!(!history.can_undo(), "the no-op replay must not add a second history entry");
+        }
+        let restored = runtime.open_read().unwrap().get_segments_by_ids(&ids).unwrap();
+        assert_eq!(
+            restored.iter().find(|segment| segment.id == "one").unwrap().speaker_id.as_deref(),
+            Some("speaker-a")
+        );
+        assert_eq!(
+            restored.iter().find(|segment| segment.id == "three").unwrap().speaker_id.as_deref(),
+            Some("speaker-b")
+        );
+    }
+
+    #[test]
+    fn batch_speaker_assignment_rolls_back_every_row_on_mid_batch_database_failure() {
+        let (_directory, store, runtime, history) = store_with_segments();
+        runtime
+            .lock()
+            .unwrap()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER test_fail_second_speaker
+                 BEFORE UPDATE OF speaker_id ON speech_segments
+                 WHEN old.id = 'two'
+                 BEGIN SELECT RAISE(ABORT, 'forced speaker failure'); END;",
+            )
+            .unwrap();
+        let ids = ["one".to_string(), "two".to_string()];
+        assert!(matches!(
+            store.assign_speaker_batch_v1(&ids, Some("speaker-z")),
+            Err(SpeakerAssignmentError::Application)
+        ));
+        let retained = runtime.open_read().unwrap().get_segments_by_ids(&ids).unwrap();
+        assert!(retained.iter().all(|segment| segment.speaker_id.as_deref() == Some("speaker-a")));
+        let database = runtime.lock().unwrap();
+        let history = history.lock().unwrap();
+        assert!(!history.can_undo(), "a rolled-back assignment must not create history");
+        drop(history);
+        database.connection().execute("DROP TRIGGER test_fail_second_speaker", []).unwrap();
+    }
+
+    #[test]
+    fn batch_speaker_assignment_refuses_missing_or_duplicate_ids_before_mutation() {
+        let (_directory, store, runtime, history) = store_with_segments();
+        assert!(matches!(
+            store.assign_speaker_batch_v1(&["one".into(), "missing".into()], Some("speaker-z")),
+            Err(SpeakerAssignmentError::Stale)
+        ));
+        assert!(matches!(
+            store.assign_speaker_batch_v1(&["one".into(), "one".into()], Some("speaker-z")),
+            Err(SpeakerAssignmentError::Invalid)
+        ));
+        assert_eq!(
+            runtime.open_read().unwrap().get_segment_by_id("one").unwrap().unwrap().speaker_id.as_deref(),
+            Some("speaker-a")
+        );
+        let database = runtime.lock().unwrap();
+        let history = history.lock().unwrap();
+        assert!(!history.can_undo());
+        assert!(database.get_segment_by_id("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_batch_speaker_undo_rolls_back_earlier_inverse_rows_and_stays_retryable() {
+        let (_directory, store, runtime, history) = store_with_segments();
+        let ids = ["one".to_string(), "three".to_string()];
+        let (_, admission) = store.assign_speaker_batch_v1(&ids, Some("speaker-z")).unwrap();
+        drop(admission);
+        runtime.lock().unwrap().update_speaker_id("three", Some("later-owner-edit")).unwrap();
+
+        {
+            let database = runtime.lock().unwrap();
+            let history = history.lock().unwrap();
+            assert!(history.undo(&database).is_err());
+            assert!(history.can_undo(), "a failed atomic undo must remain available for recovery");
+        }
+        let retained = runtime.open_read().unwrap().get_segments_by_ids(&ids).unwrap();
+        assert_eq!(
+            retained.iter().find(|segment| segment.id == "one").unwrap().speaker_id.as_deref(),
+            Some("speaker-z"),
+            "the first inverse must roll back when a later row is stale"
+        );
+        assert_eq!(
+            retained.iter().find(|segment| segment.id == "three").unwrap().speaker_id.as_deref(),
+            Some("later-owner-edit")
+        );
     }
 
     #[test]

@@ -115,6 +115,17 @@ pub struct SpeechSegment {
     pub speaker_change_score: Option<f64>,
 }
 
+/// Minimal server-owned inverse for a speaker metadata change. Keeping only the changed column and
+/// segment identity makes even a large batch undo bounded without retaining duplicate transcripts,
+/// paths, or review evidence in memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerAssignmentChange {
+    pub segment_id: String,
+    pub previous_speaker_id: Option<String>,
+    pub current_speaker_id: Option<String>,
+}
+
 /// One atomic, server-authored human adjudication and its exact inverse identity.
 ///
 /// The renderer receives the authoritative post-commit row; it never supplies the snapshot used by

@@ -21,5 +21,6 @@ pub(crate) use review_write::{ReviewCommitError, ReviewWriteStore, TechnicalUnus
 pub(crate) use rights::RightsStore;
 pub(crate) use segment_query::SegmentQueryStore;
 pub(crate) use segment_write::{
-    SegmentDeleteError, SegmentMetadataChange, SegmentMetadataUpdateError, SegmentWriteStore,
+    SegmentDeleteError, SegmentMetadataChange, SegmentMetadataUpdateError, SegmentWriteStore, SpeakerAssignmentError,
+    SpeakerRenameError,
 };

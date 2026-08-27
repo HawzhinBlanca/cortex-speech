@@ -36,7 +36,6 @@ use crate::restore_service::{
 };
 use crate::restore_service::{prepare_and_restore_named_transaction, restore_with_mandatory_snapshot};
 use crate::settings::{AppSettings, AsrModelSize};
-use crate::stats;
 use crate::throttle::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::validation::input as validate;
 use crate::AppState;

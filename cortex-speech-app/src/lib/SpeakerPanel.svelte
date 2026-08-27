@@ -6,12 +6,13 @@
   import { notifications } from './stores/notificationStore';
   import { segments } from './stores/segmentStore';
   import { t } from './i18n';
+  import type { SpeakerInventoryItemV1 } from './commands';
+  import { historyStore } from './stores/historyStore';
 
-  let speakers = $state<
-    { speakerId: string; segmentCount: number; totalDurationSeconds: number }[]
-  >([]);
+  let speakers = $state<SpeakerInventoryItemV1[]>([]);
   let loading = $state(true);
-  let renamingId = $state<string | null>(null);
+  // `undefined` means no active editor; `null` is the real SQL NULL/unassigned speaker group.
+  let renamingId = $state<string | null | undefined>(undefined);
   let newName = $state('');
 
   async function loadSpeakers() {
@@ -19,7 +20,7 @@
     try {
       // The COMPLETE speaker list — not stats.topSpeakers, which is truncated to 10, so speakers
       // beyond the top ten were invisible here and could never be renamed.
-      speakers = (await api.getSpeakers()) ?? [];
+      speakers = (await api.getSpeakerInventoryV1()) ?? [];
     } catch (e) {
       notifications.error($t('speaker.loadFailed'), { cause: e });
     } finally {
@@ -27,32 +28,53 @@
     }
   }
 
-  async function handleRename(oldId: string) {
+  function speakerLabel(speakerId: string | null): string {
+    return speakerId ?? $t('speaker.unassigned');
+  }
+
+  async function handleRename(source: SpeakerInventoryItemV1) {
     const trimmed = newName.trim();
     if (!trimmed) return;
+    // A semantic no-op must not update timestamps or create a phantom mutation.
+    if (source.speakerId === trimmed) {
+      renamingId = undefined;
+      newName = '';
+      return;
+    }
     // A rename whose target ALREADY belongs to another speaker MERGES the two groups (rename is a blanket
-    // speaker_id UPDATE, and — unlike delete — records nothing on the undo stack, so the merge is
-    // irreversible). The box is prefilled free-text, so a typo matching an existing id silently collapses a
-    // diarization split. Confirm before the merge, matching the destructive-action pattern elsewhere.
-    const mergeTarget = speakers.find((s) => s.speakerId === trimmed && s.speakerId !== oldId);
+    // speaker_id UPDATE). The exact inverse is retained by the backend Undo history, but the box is
+    // prefilled free-text, so a typo matching an existing id can still collapse a diarization split.
+    // Confirm before the merge, matching the destructive-action pattern elsewhere.
+    const mergeTarget = speakers.find(
+      (speaker) => speaker.speakerId === trimmed && speaker.speakerId !== source.speakerId,
+    );
     if (mergeTarget) {
       const message = $t('speaker.mergeConfirm', {
-        source: oldId,
+        source: speakerLabel(source.speakerId),
         target: trimmed,
         n: String(mergeTarget.segmentCount),
       });
       if (!window.confirm(message)) return;
     }
     try {
-      const count = await api.renameSpeaker(oldId, trimmed);
-      notifications.success($t('speaker.renameSuccess', { n: String(count) }));
-      renamingId = null;
+      const result = await api.renameSpeakerV1({
+        sourceSpeakerId: source.speakerId,
+        targetSpeakerId: trimmed,
+        expectedSourceCount: source.segmentCount,
+        expectedTargetCount: mergeTarget?.segmentCount ?? 0,
+      });
+      notifications.success($t('speaker.renameSuccess', { n: String(result.renamedCount) }));
+      renamingId = undefined;
       newName = '';
+      await historyStore.refresh();
       await loadSpeakers();
       // Force segments reload
       segments.load();
     } catch (e) {
       notifications.error($t('speaker.renameFailed'), { cause: e });
+      // Keep the editor and proposed name intact, but refresh the authoritative counts so the user
+      // must explicitly reconfirm any merge against current server truth.
+      if (api.isCommandErrorV1(e, 'STALE_SPEAKER_INVENTORY')) await loadSpeakers();
     }
   }
 
@@ -114,10 +136,12 @@
                 <span
                   class="w-8 h-8 rounded-full bg-cortex-700 flex items-center justify-center text-[10px] font-bold text-cortex-200"
                 >
-                  {speaker.speakerId.slice(-2)}
+                  {speakerLabel(speaker.speakerId).slice(-2)}
                 </span>
                 <div>
-                  <div class="text-sm font-medium text-cortex-100">{speaker.speakerId}</div>
+                  <div class="text-sm font-medium text-cortex-100">
+                    {speakerLabel(speaker.speakerId)}
+                  </div>
                   <div class="text-[10px] text-cortex-500">
                     {$t('speaker.segmentsMinutes', {
                       count: String(speaker.segmentCount),
@@ -130,7 +154,7 @@
                 class="text-[10px] text-cortex-400 hover:text-cortex-200 underline"
                 onclick={() => {
                   renamingId = speaker.speakerId;
-                  newName = speaker.speakerId;
+                  newName = speaker.speakerId ?? '';
                 }}
               >
                 {$t('speaker.rename')}
@@ -148,11 +172,11 @@
                 />
                 <button
                   class="btn btn-primary !text-[10px] !px-2"
-                  onclick={() => handleRename(speaker.speakerId)}>{$t('save')}</button
+                  onclick={() => handleRename(speaker)}>{$t('save')}</button
                 >
                 <button
                   class="btn btn-secondary !text-[10px] !px-2"
-                  onclick={() => (renamingId = null)}>{$t('cancel')}</button
+                  onclick={() => (renamingId = undefined)}>{$t('cancel')}</button
                 >
               </div>
             {/if}

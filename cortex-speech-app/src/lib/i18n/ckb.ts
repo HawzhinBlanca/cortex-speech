@@ -801,6 +801,7 @@ export const ckb = {
   // Speaker panel
   'speaker.title': 'بەڕێوەبردنی قسەکەر',
   'speaker.noneIdentified': 'هێشتا هیچ قسەکەرێک دیاری نەکراوە.',
+  'speaker.unassigned': 'دیاری نەکراو',
   'speaker.segmentsMinutes': '{count} بەش · {minutes} خولەک',
   'speaker.rename': 'گۆڕینی ناو',
   'speaker.newNamePlaceholder': 'ناوی نوێی قسەکەر...',

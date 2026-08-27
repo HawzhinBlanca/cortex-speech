@@ -230,18 +230,66 @@ pub async fn bootstrap_legacy_champion(
     .await
 }
 
-/// The complete speaker list (not the truncated top-10 dashboard summary) so the speaker-management
-/// panel can rename every speaker, including low-frequency ones.
+/// Complete, non-lossy speaker inventory for the management panel. SQL NULL stays distinct from a
+/// literal `unknown` id, and backend failures are reduced to a stable renderer-safe contract.
 #[tauri::command]
-pub fn get_speakers(state: State<'_, AppState>) -> Result<Vec<stats::SpeakerStat>, String> {
-    RATE_LIMITER.check("get_speakers")?;
-    let db = state.lock_db();
-    stats::list_speakers(&db).map_err(|e| e.to_string())
+#[specta::specta]
+pub fn get_speaker_inventory_v1(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::ipc_contract::SpeakerInventoryItemV1>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_speaker_inventory_v1").map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "RATE_LIMITED",
+            "Too many speaker inventory requests. Retry in a moment.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?;
+    state
+        .segment_queries()
+        .speaker_inventory()
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| crate::ipc_contract::SpeakerInventoryItemV1 {
+                    speaker_id: item.speaker_id,
+                    segment_count: item.segment_count,
+                    total_duration_seconds: item.total_duration_seconds,
+                })
+                .collect()
+        })
+        .map_err(|error| {
+            let normalized = error.to_string().to_ascii_lowercase();
+            if normalized.contains("database is locked") || normalized.contains("database is busy") {
+                crate::ipc_contract::CommandErrorV1::new(
+                    "DATABASE_BUSY",
+                    "The workspace is busy. Retry loading speakers.",
+                    true,
+                )
+                .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+            } else {
+                crate::ipc_contract::CommandErrorV1::new(
+                    "SPEAKER_INVENTORY_FAILED",
+                    "The speaker inventory could not be loaded. Open Health for recovery options.",
+                    false,
+                )
+                .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+            }
+        })
 }
 
 fn history_rate_limited_error() -> crate::ipc_contract::CommandErrorV1 {
     crate::ipc_contract::CommandErrorV1::new("RATE_LIMITED", "Too many history actions. Retry in a moment.", true)
         .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+}
+
+fn history_restore_in_progress_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "RESTORE_IN_PROGRESS",
+        "History actions are unavailable while database recovery is in progress. Retry afterward.",
+        true,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
 }
 
 fn public_history_error(action: &str, error: &str) -> crate::ipc_contract::CommandErrorV1 {
@@ -267,18 +315,32 @@ fn public_history_error(action: &str, error: &str) -> crate::ipc_contract::Comma
 #[specta::specta]
 pub fn undo(state: State<'_, AppState>) -> Result<Option<String>, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("undo").map_err(|_| history_rate_limited_error())?;
-    let db = state.lock_db();
-    let history = state.lock_history();
-    history.undo(&db).map_err(|error| public_history_error("undo", &error.to_string()))
+    let _mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+    let result = {
+        let db = state.lock_db();
+        let history = state.lock_history();
+        history.undo(&db).map_err(|error| public_history_error("undo", &error.to_string()))?
+    };
+    if result.is_some() {
+        state.session_auto_save();
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn redo(state: State<'_, AppState>) -> Result<Option<String>, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("redo").map_err(|_| history_rate_limited_error())?;
-    let db = state.lock_db();
-    let history = state.lock_history();
-    history.redo(&db).map_err(|error| public_history_error("redo", &error.to_string()))
+    let _mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+    let result = {
+        let db = state.lock_db();
+        let history = state.lock_history();
+        history.redo(&db).map_err(|error| public_history_error("redo", &error.to_string()))?
+    };
+    if result.is_some() {
+        state.session_auto_save();
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -314,6 +376,10 @@ mod typed_history_ipc_tests {
         let busy_json = serde_json::to_value(busy).expect("serialize busy history error");
         assert_eq!(busy_json["code"], "DATABASE_BUSY");
         assert_eq!(busy_json["retryable"], true);
+
+        let restore = serde_json::to_value(history_restore_in_progress_error()).expect("serialize restore error");
+        assert_eq!(restore["code"], "RESTORE_IN_PROGRESS");
+        assert_eq!(restore["retryable"], true);
         assert_eq!(busy_json["suggestedAction"], "retry");
     }
 }

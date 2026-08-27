@@ -4,12 +4,14 @@
 //! (`pub use batch::*;`), so `lib.rs`'s invoke_handler still names `commands::batch_verify` and the
 //! frontend's `invoke('batch_verify')` is untouched. Same functions, only relocated.
 //!
-//! Each spawns a worker thread and returns immediately (the audit's OFFLOADED_HIGH set) so a
-//! whole-library batch never blocks the UI; progress + per-item failures stream via `emit_or_log`.
-//! (batch_transcribe stays in commands.rs for now — it is coupled to the jury `with_jury_db` helper.)
+//! Long-running legacy normalization still spawns a worker and streams progress. Speaker assignment
+//! is a generated async, all-or-nothing store operation; batch transcription remains in commands.rs
+//! because it is coupled to the jury `with_jury_db` helper.
 
 use super::{emit_or_log, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
+use crate::ipc_contract::{AssignSpeakersRequestV1, AssignedSpeakersV1, CommandErrorV1, SuggestedActionV1};
+use crate::stores::SpeakerAssignmentError;
 use crate::validation::input as validate;
 use crate::AppState;
 use lru::LruCache;
@@ -58,99 +60,95 @@ pub fn batch_verify(
     )
 }
 
+fn public_speaker_assignment_error(error: SpeakerAssignmentError) -> CommandErrorV1 {
+    match error {
+        SpeakerAssignmentError::Invalid => CommandErrorV1::new(
+            "INVALID_SPEAKER_ASSIGNMENT",
+            "The batch speaker assignment is invalid and was not applied.",
+            false,
+        ),
+        SpeakerAssignmentError::Stale => CommandErrorV1::new(
+            "STALE_SEGMENT_SELECTION",
+            "The selected segment set changed. Reload the library before assigning a speaker.",
+            false,
+        )
+        .suggested(SuggestedActionV1::ReloadClip),
+        SpeakerAssignmentError::Busy => {
+            CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry the speaker assignment.", true)
+                .suggested(SuggestedActionV1::Retry)
+        }
+        SpeakerAssignmentError::Application => CommandErrorV1::new(
+            "SPEAKER_ASSIGNMENT_FAILED",
+            "The speaker assignment could not be saved. Open Health before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::OpenHealth),
+    }
+}
+
+/// One generated, bounded and all-or-nothing speaker assignment. SQLite and exact history work run
+/// on the blocking pool; the restore-admission token remains live through session persistence.
 #[tauri::command]
-pub fn batch_assign_speaker(
-    ids: Vec<String>,
-    speaker_id: String,
+#[specta::specta]
+pub async fn assign_speakers_v1(
+    request: AssignSpeakersRequestV1,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("batch_assign_speaker")?;
-    for id in &ids {
-        validate::validate_identifier(id)?;
+) -> Result<AssignedSpeakersV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("assign_speakers_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many speaker assignment requests. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    if request.ids.is_empty() || request.ids.len() > 100_000 {
+        return Err(CommandErrorV1::new(
+            "INVALID_SPEAKER_ASSIGNMENT",
+            "Assign a speaker to between one and 100,000 unique segments.",
+            false,
+        ));
     }
-    if !speaker_id.is_empty() {
-        validate::validate_text(&speaker_id, 256, "Speaker ID")?;
+    let mut unique_ids = std::collections::HashSet::with_capacity(request.ids.len());
+    for id in &request.ids {
+        validate::validate_identifier(id)
+            .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "A selected segment identity is invalid.", false))?;
+        if !unique_ids.insert(id.as_str()) {
+            return Err(CommandErrorV1::new(
+                "INVALID_SPEAKER_ASSIGNMENT",
+                "The speaker assignment contains a duplicate segment identity.",
+                false,
+            ));
+        }
+    }
+    if let Some(speaker_id) = request.target_speaker_id.as_deref() {
+        validate::validate_speaker_label(speaker_id)
+            .map_err(|_| CommandErrorV1::new("INVALID_SPEAKER_ID", "The speaker label is invalid.", false))?;
     }
 
-    let total = ids.len();
-    state.try_start_batch()?;
-
-    let cancel = state.ensure_cancel_token()?;
-    let app_clone = app.clone();
-    let speaker_id_clone = speaker_id.clone();
-
-    std::thread::spawn(move || {
-        struct BatchGuard {
-            app: tauri::AppHandle,
+    let requested_count = request.ids.len();
+    let target_speaker_id = request.target_speaker_id;
+    let segment_writes = state.segment_writes();
+    let (assigned, _mutation) = tokio::task::spawn_blocking(move || {
+        segment_writes.assign_speaker_batch_v1(&request.ids, target_speaker_id.as_deref())
+    })
+    .await
+    .map_err(|_| {
+        CommandErrorV1::new(
+            "SPEAKER_ASSIGNMENT_FAILED",
+            "The speaker assignment worker stopped unexpectedly. Retry the operation.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry)
+    })?
+    .map_err(public_speaker_assignment_error)?;
+    if assigned.changed_count > 0 {
+        if let Some(app_state) = app.try_state::<AppState>() {
+            app_state.session_auto_save();
         }
-        impl Drop for BatchGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_batch();
-                }
-            }
-        }
-        let _guard = BatchGuard { app: app_clone.clone() };
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({ "type": "started", "total": total, "operation": "assign_speaker" }),
-        );
-
-        // One targeted UPDATE per segment — avoids full read-modify-write cycle.
-        let mut succeeded = 0u32;
-        let mut failed = 0u32;
-        let mut cancelled = false;
-        let spk: Option<&str> = if speaker_id_clone.is_empty() { None } else { Some(&speaker_id_clone) };
-
-        for (i, id) in ids.iter().enumerate() {
-            if cancel.is_cancelled() {
-                cancelled = true;
-                break;
-            }
-            let update_ok = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                match app_state.lock_db().update_speaker_id(id, spk) {
-                    Ok(updated) => updated,
-                    Err(error) => {
-                        tracing::error!("Batch speaker assignment DB update failed for {id}: {error}");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            if update_ok {
-                succeeded += 1;
-            } else {
-                failed += 1;
-            }
-
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": i + 1, "total": total,
-                    "file": id, "status": "assigning speaker",
-                    "operation": "assign_speaker"
-                }),
-            );
-        }
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({
-                "type": "completed", "total": total,
-                "succeeded": succeeded, "failed": failed,
-                "cancelled": cancelled, "operation": "assign_speaker"
-            }),
-        );
-    });
-
-    Ok(serde_json::json!({ "status": "started" }))
+    }
+    Ok(AssignedSpeakersV1 {
+        requested_count,
+        changed_count: assigned.changed_count,
+        unchanged_count: assigned.requested_count - assigned.changed_count,
+    })
 }
 
 #[tauri::command]
@@ -264,7 +262,7 @@ pub fn batch_normalize(
                 // upsert) could clobber a concurrent write to this segment (e.g. a background aligner /
                 // 7B pass on the pipeline's own connection) that landed between the re-read and the
                 // upsert. annotated_transcript / verdict are untouched, matching the CRITICAL note this
-                // replaces. Sibling batch commands (verify, assign_speaker) already use this pattern.
+                // replaces. The speaker batch now uses its stronger atomic store boundary.
                 let db = app_state.lock_db();
                 match db.update_normalized_transcript(id, normalized) {
                     Ok(true) => true,

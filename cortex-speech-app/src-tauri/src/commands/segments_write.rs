@@ -13,13 +13,13 @@ use crate::history::HistoryManager;
 use crate::ipc_contract::{
     CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, DeleteSegmentsRequestV1, DeletedSegmentsV1,
     DesktopPlaybackReceiptV1, DesktopPlaybackSessionV1, MarkSegmentUnusableRequestV1, MarkedSegmentUnusableV1,
-    PlaybackIntervalV1, ReviewDecisionV1, ReviewDraftV1, SegmentMetadataChangeV1, SuggestedActionV1,
-    UpdateSegmentMetadataRequestV1, UpdatedSegmentMetadataV1,
+    PlaybackIntervalV1, RenameSpeakerRequestV1, RenamedSpeakerV1, ReviewDecisionV1, ReviewDraftV1,
+    SegmentMetadataChangeV1, SuggestedActionV1, UpdateSegmentMetadataRequestV1, UpdatedSegmentMetadataV1,
 };
-use crate::stores::{SegmentDeleteError, SegmentMetadataChange, SegmentMetadataUpdateError};
+use crate::stores::{SegmentDeleteError, SegmentMetadataChange, SegmentMetadataUpdateError, SpeakerRenameError};
 use crate::validation::input as validate;
 use crate::AppState;
-use tauri::State;
+use tauri::{Manager, State};
 
 const WHOLE_ROW_SEGMENT_WRITE_RETIRED: &str =
     "the whole-row segment writer is retired; use update_segment_metadata_v1 or the review decision/flag flow";
@@ -265,11 +265,86 @@ pub fn delete_segments_v1(
     Ok(DeletedSegmentsV1 { requested_count, deleted_count })
 }
 
+fn public_speaker_rename_error(error: SpeakerRenameError) -> CommandErrorV1 {
+    match error {
+        SpeakerRenameError::Invalid => CommandErrorV1::new(
+            "INVALID_SPEAKER_RENAME",
+            "The speaker rename request is invalid and was not applied.",
+            false,
+        ),
+        SpeakerRenameError::Stale { source_count, target_count } => CommandErrorV1::new(
+            "STALE_SPEAKER_INVENTORY",
+            "The speaker inventory changed. Review the refreshed counts before confirming again.",
+            false,
+        )
+        .detail("sourceCount", source_count as i64)
+        .detail("targetCount", target_count as i64),
+        SpeakerRenameError::Busy => {
+            CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry the speaker rename.", true)
+                .suggested(SuggestedActionV1::Retry)
+        }
+        SpeakerRenameError::Application => CommandErrorV1::new(
+            "SPEAKER_RENAME_FAILED",
+            "The speaker could not be renamed. Open Health before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::OpenHealth),
+    }
+}
+
+/// Atomic compare-and-set speaker rename. Source and target counts make an earlier merge
+/// confirmation expire if either group changes before the write reaches SQLite.
 #[tauri::command]
-pub fn rename_speaker(old_id: String, new_id: String, state: State<'_, AppState>) -> Result<usize, String> {
-    STRICT_RATE_LIMITER.check("rename_speaker")?;
-    validate::validate_identifier(&new_id)?;
-    state.segment_writes().rename_speaker(&old_id, &new_id).map_err(|error| error.to_string())
+#[specta::specta]
+pub async fn rename_speaker_v1(
+    request: RenameSpeakerRequestV1,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<RenamedSpeakerV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("rename_speaker_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many speaker rename requests. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    if let Some(source_speaker_id) = &request.source_speaker_id {
+        validate::validate_text(source_speaker_id, 256, "Source speaker label")
+            .map_err(|_| CommandErrorV1::new("INVALID_SPEAKER_ID", "The source speaker identity is invalid.", false))?;
+    }
+    validate::validate_speaker_label(&request.target_speaker_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_SPEAKER_ID", "The target speaker identity is invalid.", false))?;
+
+    let segment_writes = state.segment_writes();
+    let source_speaker_id = request.source_speaker_id;
+    let target_speaker_id = request.target_speaker_id;
+    let expected_source_count = request.expected_source_count;
+    let expected_target_count = request.expected_target_count;
+    let (renamed, _mutation) = tokio::task::spawn_blocking(move || {
+        segment_writes.rename_speaker_v1(
+            source_speaker_id.as_deref(),
+            &target_speaker_id,
+            expected_source_count,
+            expected_target_count,
+        )
+    })
+    .await
+    .map_err(|_| {
+        CommandErrorV1::new(
+            "SPEAKER_RENAME_FAILED",
+            "The speaker rename worker stopped unexpectedly. Retry the operation.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry)
+    })?
+    .map_err(public_speaker_rename_error)?;
+    if let Some(app_state) = app.try_state::<AppState>() {
+        app_state.session_auto_save();
+    }
+    Ok(RenamedSpeakerV1 {
+        source_speaker_id: renamed.source_speaker_id,
+        target_speaker_id: renamed.target_speaker_id,
+        renamed_count: renamed.renamed_count,
+        target_count: renamed.target_count,
+        merged: renamed.merged,
+    })
 }
 
 #[tauri::command]
@@ -1045,7 +1120,8 @@ mod tests {
     use super::{
         commit_review_v1_on, mark_segment_unusable_v1_on, persist_whole_segment_update_on,
         public_precommit_playback_binding_error, public_segment_delete_error, public_segment_metadata_error,
-        record_human_decision_on, retired_legacy_decision_error, validate_playback_receipt_identity,
+        public_speaker_rename_error, record_human_decision_on, retired_legacy_decision_error,
+        validate_playback_receipt_identity,
     };
     use crate::database_runtime::DatabaseRuntime;
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
@@ -1053,7 +1129,9 @@ mod tests {
     use crate::ipc_contract::{
         CommitReviewRequestV1, MarkSegmentUnusableRequestV1, ReviewDecisionV1, TechnicalUnusableReasonV1,
     };
-    use crate::stores::{require_listened, ReviewWriteStore, SegmentDeleteError, SegmentMetadataUpdateError};
+    use crate::stores::{
+        require_listened, ReviewWriteStore, SegmentDeleteError, SegmentMetadataUpdateError, SpeakerRenameError,
+    };
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -1095,6 +1173,24 @@ mod tests {
         let internal = public_segment_delete_error(SegmentDeleteError::Application);
         let public = serde_json::to_string(&internal).unwrap();
         assert_eq!(internal.code, "SEGMENT_DELETE_FAILED");
+        assert!(!public.contains("owner.db") && !public.contains("secret token"), "{public}");
+    }
+
+    #[test]
+    fn speaker_rename_refusals_are_typed_bounded_and_actionable() {
+        let stale = public_speaker_rename_error(SpeakerRenameError::Stale { source_count: 7, target_count: 3 });
+        assert_eq!(stale.code, "STALE_SPEAKER_INVENTORY");
+        assert!(!stale.retryable);
+        assert_eq!(stale.details.get("sourceCount"), Some(&crate::ipc_contract::CommandErrorDetailV1::Number(7.0)));
+        assert_eq!(stale.details.get("targetCount"), Some(&crate::ipc_contract::CommandErrorDetailV1::Number(3.0)));
+
+        let busy = public_speaker_rename_error(SpeakerRenameError::Busy);
+        assert_eq!(busy.code, "DATABASE_BUSY");
+        assert!(busy.retryable);
+
+        let internal = public_speaker_rename_error(SpeakerRenameError::Application);
+        let public = serde_json::to_string(&internal).unwrap();
+        assert_eq!(internal.code, "SPEAKER_RENAME_FAILED");
         assert!(!public.contains("owner.db") && !public.contains("secret token"), "{public}");
     }
 

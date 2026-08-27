@@ -561,10 +561,6 @@
           await loadSegments();
           statusMessage.set($t('ready'));
           endOperation('batch-verify');
-        } else if (payload.operation === 'assign_speaker') {
-          await loadSegments();
-          statusMessage.set($t('ready'));
-          endOperation('batch-assign-speaker');
         } else if (payload.operation === 'normalize') {
           await loadSegments();
           statusMessage.set($t('ready'));
@@ -1471,11 +1467,18 @@
       return;
     }
     startOperation('batch-assign-speaker');
+    isProcessing.set(true);
+    batchProgress.set({ status: 'running', completed: 0, total: ids.length, percent: 0 });
     statusMessage.set($t('batchAssignSpeaker.progress', { n: String(ids.length) }));
     try {
-      await api.batchAssignSpeaker(ids, speaker);
+      const result = await api.assignSpeakersV1({ ids, targetSpeakerId: speaker });
+      notifications.success($t('events.speakerAssigned', { n: String(result.changedCount) }));
+      await historyStore.refresh();
+      await loadSegments();
     } catch (e) {
       notifications.error($t('batchAssignSpeaker.failed'), { cause: e });
+    } finally {
+      isProcessing.set(false);
       batchProgress.set({ status: 'idle', completed: 0, total: 0, percent: 0 });
       statusMessage.set($t('ready'));
       endOperation('batch-assign-speaker');

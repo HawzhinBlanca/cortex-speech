@@ -513,10 +513,35 @@ export async function installTauriMock(page: Page): Promise<void> {
             const ids = (args?.request as { ids?: string[] } | undefined)?.ids ?? [];
             return { requestedCount: ids.length, deletedCount: ids.length };
           }
+          case 'get_speaker_inventory_v1':
+            return [{ speakerId: 'SPEAKER_00', segmentCount: 1, totalDurationSeconds: 1.5 }];
+          case 'rename_speaker_v1': {
+            const request = args?.request as
+              | {
+                  sourceSpeakerId?: string | null;
+                  targetSpeakerId?: string;
+                  expectedSourceCount?: number;
+                  expectedTargetCount?: number;
+                }
+              | undefined;
+            return {
+              sourceSpeakerId: request?.sourceSpeakerId ?? null,
+              targetSpeakerId: request?.targetSpeakerId ?? '',
+              renamedCount: request?.expectedSourceCount ?? 0,
+              targetCount:
+                (request?.expectedSourceCount ?? 0) + (request?.expectedTargetCount ?? 0),
+              merged: (request?.expectedTargetCount ?? 0) > 0,
+            };
+          }
+          case 'assign_speakers_v1': {
+            const request = args?.request as
+              { ids?: string[]; targetSpeakerId?: string | null } | undefined;
+            const ids = request?.ids ?? [];
+            return { requestedCount: ids.length, changedCount: ids.length, unchangedCount: 0 };
+          }
           case 'export_huggingface_dataset':
             return null;
           case 'batch_verify':
-          case 'batch_assign_speaker':
           case 'batch_normalize':
           case 'batch_transcribe':
           case 'rediarize_segments':

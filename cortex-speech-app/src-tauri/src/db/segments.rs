@@ -608,6 +608,147 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Assign one speaker value to an exact id set as a single all-or-nothing mutation. Every
+    /// changed row is compare-and-set against the server snapshot read for this operation; a missing
+    /// row or concurrent speaker edit rolls the entire savepoint back.
+    pub(crate) fn assign_speaker_batch_atomic(
+        &self,
+        ids: &[String],
+        target_speaker_id: Option<&str>,
+    ) -> AppResult<Vec<SpeakerAssignmentChange>> {
+        let mut unique_ids = HashSet::with_capacity(ids.len());
+        if ids.is_empty() || ids.iter().any(|id| !unique_ids.insert(id.as_str())) {
+            return Err(AppError::Validation("speaker assignment requires a non-empty set of unique ids".into()));
+        }
+
+        let snapshots = self.get_segments_by_ids(ids)?;
+        if snapshots.len() != ids.len() {
+            return Err(AppError::Validation(
+                "speaker assignment refused because at least one selected segment no longer exists".into(),
+            ));
+        }
+        let by_id: HashMap<&str, &SpeechSegment> =
+            snapshots.iter().map(|segment| (segment.id.as_str(), segment)).collect();
+
+        self.conn.execute("SAVEPOINT speaker_assignment", [])?;
+        let result: AppResult<Vec<SpeakerAssignmentChange>> = (|| {
+            let mut changes = Vec::new();
+            for id in ids {
+                let previous = by_id.get(id.as_str()).ok_or_else(|| {
+                    AppError::Validation("speaker assignment snapshot lost a selected segment".into())
+                })?;
+                if previous.speaker_id.as_deref() == target_speaker_id {
+                    continue;
+                }
+                let updated = self.conn.execute(
+                    "UPDATE speech_segments
+                     SET speaker_id = ?3, updated_at = datetime('now')
+                     WHERE id = ?1 AND speaker_id IS ?2",
+                    params![id, previous.speaker_id, target_speaker_id],
+                )?;
+                if updated != 1 {
+                    return Err(AppError::Validation(format!(
+                        "speaker assignment refused because segment {id} changed concurrently"
+                    )));
+                }
+                changes.push(SpeakerAssignmentChange {
+                    segment_id: id.clone(),
+                    previous_speaker_id: previous.speaker_id.clone(),
+                    current_speaker_id: target_speaker_id.map(str::to_owned),
+                });
+            }
+
+            // If at least one UPDATE acquired the SQLite writer lock, verify even the rows that were
+            // already at the target. A concurrent edit that landed after the snapshot but before our
+            // first UPDATE therefore cannot hide inside a partially successful batch.
+            if !changes.is_empty() {
+                let mut statement = self.conn.prepare("SELECT speaker_id FROM speech_segments WHERE id = ?1")?;
+                for id in ids {
+                    let current =
+                        statement.query_row(params![id], |row| row.get::<_, Option<String>>(0)).map_err(|error| {
+                            match error {
+                                rusqlite::Error::QueryReturnedNoRows => AppError::Validation(format!(
+                                    "speaker assignment refused because segment {id} disappeared"
+                                )),
+                                other => AppError::Database(other),
+                            }
+                        })?;
+                    if current.as_deref() != target_speaker_id {
+                        return Err(AppError::Validation(format!(
+                            "speaker assignment refused because segment {id} changed concurrently"
+                        )));
+                    }
+                }
+            }
+            Ok(changes)
+        })();
+
+        match result {
+            Ok(changes) => {
+                self.release_savepoint("speaker_assignment")?;
+                if !changes.is_empty() {
+                    self.track_write()?;
+                }
+                Ok(changes)
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("speaker_assignment");
+                Err(error)
+            }
+        }
+    }
+
+    /// Apply an undo or redo of a speaker assignment atomically. Every row must still equal the
+    /// endpoint being reversed; one stale or missing row rolls back the complete history action.
+    pub(crate) fn apply_speaker_assignment_history(
+        &self,
+        changes: &[SpeakerAssignmentChange],
+        forward: bool,
+    ) -> AppResult<()> {
+        let mut unique_ids = HashSet::with_capacity(changes.len());
+        if changes.is_empty() || changes.iter().any(|change| !unique_ids.insert(change.segment_id.as_str())) {
+            return Err(AppError::Validation(
+                "speaker assignment history requires a non-empty set of unique segment ids".into(),
+            ));
+        }
+
+        self.conn.execute("SAVEPOINT speaker_assignment_history", [])?;
+        let result: AppResult<()> = (|| {
+            for change in changes {
+                let (expected, desired) = if forward {
+                    (&change.previous_speaker_id, &change.current_speaker_id)
+                } else {
+                    (&change.current_speaker_id, &change.previous_speaker_id)
+                };
+                let updated = self.conn.execute(
+                    "UPDATE speech_segments
+                     SET speaker_id = ?3, updated_at = datetime('now')
+                     WHERE id = ?1 AND speaker_id IS ?2",
+                    params![change.segment_id, expected, desired],
+                )?;
+                if updated != 1 {
+                    return Err(AppError::Validation(format!(
+                        "Cannot apply stale speaker history for segment {}",
+                        change.segment_id
+                    )));
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.release_savepoint("speaker_assignment_history")?;
+                self.track_write()?;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_savepoint_after_error("speaker_assignment_history");
+                Err(error)
+            }
+        }
+    }
+
     /// Targeted single-column update: sets `normalized_transcript` (the normalized ASR draft) without
     /// touching the human's answer (annotated_transcript / verdict) or any other field. Returns true
     /// if the row was found and updated. Used by batch_normalize instead of a read-modify-write +
