@@ -11465,6 +11465,7 @@ at schema 65 with all 162 contract objects exact, quick/full integrity `ok`, zer
 `F:` snapshots, Alle/Rubar authenticating, and supervision green with 424.8 GB free. Human progress stayed
 two Rubar judgments, zero resolutions, and 0/20 post-release playback decisions. No reviewer restart,
 live database write, GPU, model server, ASR inference, or synthetic judgment occurred.
+
 ## 2026-08-25 — deep adversarial audit, and the remediation of 53 of its 55 findings
 
 A 43-agent adversarial audit ran over the whole Rust/Python/Svelte surface at `1282578`
@@ -11554,3 +11555,33 @@ Not ship-green, and this entry does not claim otherwise. `spot-check-pool` and `
 remain RED for the reasons above; `iaa-kappa-ceiling`, `cordi-dialect-fairness` and
 `refinery-lift-in-product` remain owner-gated. Only a full `verify_10.py` run at the release commit
 can print `GREEN - PERSONAL-USE SHIP-READY`.
+
+## 2026-08-27 — backend module ceiling closed and generated IPC migration resumed
+
+The schema-65 integration line completed the incremental decomposition of every mutable oversized
+Rust production facade without changing registered Tauri command names, dual-writing human truth,
+or touching the live database or release pointer. Commits `ea20b50`, `fd2fc48`, `b0170c8`,
+`e12edcc`, `c91cd12`, and `e8a8557` split evaluation publication, review-pool deduplication,
+processing, commands, Couch, and database authority into cohesive sibling modules. Historical
+migrations 1–65 remain byte-identical. The fail-closed architecture scanner now covers 151 shipped
+Rust modules with zero failures; the only exception is exact-hash-bound immutable migration
+history. The clean backend code commit `e8a85577fee7a7d7b72ee8b18f8d4c2356074484` passed the
+complete locked Rust graph once without retry: 1,849 passed, 0 failed, and 43 explicit ignores,
+including importer 14/14, soak 1/1, and Tauri integration 1/1. Commit `332e12c` bound that proof in
+the integration finding matrix and Obsidian project record.
+
+The next exact contract slice moved the complete desktop-history domain (`undo`, `redo`,
+`can_undo`, `can_redo`) from the handwritten bridge to generated Tauri Specta bindings. Undo and
+redo now expose renderer-safe `CommandErrorV1` refusals; database-busy remains explicitly
+retryable, while hostile SQL, token, and private-path text cannot cross IPC. Capability queries use
+the same typed-result envelope, and compile-time tests prevent all four commands from returning to
+the legacy inventory. The deterministic policy now measures 116 invoked commands: 17 generated and
+99 explicitly contained handwritten calls. Focused proof passed 1/1 Rust public-error tests, 34/34
+history-related Rust tests, 26/26 frontend command/adapter tests, and the complete 437/437 frontend
+suite; generated-binding drift, TypeScript/Svelte diagnostics, lint, formatting, strict all-target/all-feature Clippy, backend
+layering, main-thread, panic, and secret-hygiene gates are green.
+
+This is an integration checkpoint, not certification. Coverage remains below the declared floors;
+99 handwritten IPC calls and the oversized Review/Settings workspaces remain; the 50,000-segment,
+fault, performance, accessibility, signed-Windows, owner-session, pilot, and comparator evidence is
+absent. The only honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT 10/10**.

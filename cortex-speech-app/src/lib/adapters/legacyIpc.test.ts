@@ -33,6 +33,10 @@ describe('handwritten IPC containment', () => {
 const compileTimeContractProof = (): void => {
   // @ts-expect-error generated playback is intentionally absent from the handwritten inventory
   void invokeLegacy<unknown>('begin_desktop_playback_session_v1');
+  // @ts-expect-error the complete desktop-history domain is generated, not handwritten
+  void invokeCritical('undo');
+  // @ts-expect-error generated history queries cannot regress into the legacy inventory
+  void invokeLegacy<unknown>('can_redo');
   // @ts-expect-error destructive restore requires its exact source argument
   void invokeCritical('db_restore');
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings

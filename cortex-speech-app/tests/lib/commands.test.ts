@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AudioExportFormat,
   ASR_7B_UNAVAILABLE_TAG,
+  canRedo,
+  canUndo,
   cancelDesktopPlaybackSessionV1,
   commitReviewV1,
   deleteReviewDraftV1,
@@ -18,13 +20,56 @@ import {
   markSegmentUnusableV1,
   recordHumanDecision,
   recordReviewFlag,
+  redo,
   saveReviewDraftV1,
   updateSettings,
+  undo,
 } from '../../src/lib/commands';
 import { defaultSettings } from '../../src/lib/stores/settingsStore';
 import type { RendererSettingsV1 } from '../../src/lib/generated/ipc';
 
 const invokeMock = vi.mocked(invoke);
+
+describe('generated desktop history contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('routes all four history commands through their generated names and preserves results', async () => {
+    invokeMock
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce('Update transcript')
+      .mockResolvedValueOnce(null);
+
+    await expect(canUndo()).resolves.toBe(true);
+    await expect(canRedo()).resolves.toBe(false);
+    await expect(undo()).resolves.toBe('Update transcript');
+    await expect(redo()).resolves.toBeNull();
+    expect(invokeMock.mock.calls).toEqual([
+      ['can_undo'],
+      ['can_redo'],
+      ['undo'],
+      ['redo'],
+    ]);
+  });
+
+  it('preserves a structured typed refusal without converting it to a raw string', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'UNDO_FAILED',
+      message: 'The last change could not be undone.',
+      retryable: false,
+      suggestedAction: 'openHealth',
+      operationId: null,
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(undo()).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith('undo');
+  });
+});
 
 function rendererSettings(overrides: Partial<RendererSettingsV1> = {}): RendererSettingsV1 {
   return {

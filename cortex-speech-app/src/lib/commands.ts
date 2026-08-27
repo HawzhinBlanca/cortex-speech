@@ -1333,19 +1333,27 @@ export async function exportHuggingfaceDataset(outputDir: string): Promise<void>
 }
 
 export async function undo(): Promise<string | null> {
-  return invokeCritical('undo');
+  const result = await generatedCommands.undo();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function redo(): Promise<string | null> {
-  return invokeCritical('redo');
+  const result = await generatedCommands.redo();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function canUndo(): Promise<boolean> {
-  return invokeCritical('can_undo');
+  const result = await generatedCommands.canUndo();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function canRedo(): Promise<boolean> {
-  return invokeCritical('can_redo');
+  const result = await generatedCommands.canRedo();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function computeDiff(

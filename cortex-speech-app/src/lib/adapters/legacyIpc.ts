@@ -28,8 +28,6 @@ export const LEGACY_IPC_COMMANDS = [
   'batch_transcribe',
   'bootstrap_legacy_champion',
   'build_scorecard',
-  'can_redo',
-  'can_undo',
   'cancel_operation',
   'cancel_wsl_refinement',
   'check_agentic_readiness',
@@ -95,7 +93,6 @@ export const LEGACY_IPC_COMMANDS = [
   'open_audio_file',
   'record_review_flag',
   'rediarize_segments',
-  'redo',
   'register_media_asset',
   'register_review_media_asset',
   'relink_audio',
@@ -117,7 +114,6 @@ export const LEGACY_IPC_COMMANDS = [
   'stop_couch_review',
   'take_last_crash',
   'transcribe_segment',
-  'undo',
   'undo_human_decision',
   'undo_review_flag',
   'update_segment_fields',
@@ -252,10 +248,6 @@ type CriticalLegacyIpcContract = {
     args: { path: string };
     result: CommandResult<'exportHuggingfaceDataset'>;
   };
-  undo: { args: undefined; result: CommandResult<'undo'> };
-  redo: { args: undefined; result: CommandResult<'redo'> };
-  can_undo: { args: undefined; result: CommandResult<'canUndo'> };
-  can_redo: { args: undefined; result: CommandResult<'canRedo'> };
   db_backup: { args: { dest: string }; result: CommandResult<'dbBackup'> };
   acknowledge_quarantine: { args: undefined; result: CommandResult<'acknowledgeQuarantine'> };
   db_restore: { args: { src: string }; result: CommandResult<'dbRestore'> };

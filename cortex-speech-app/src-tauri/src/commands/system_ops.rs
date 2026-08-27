@@ -239,30 +239,83 @@ pub fn get_speakers(state: State<'_, AppState>) -> Result<Vec<stats::SpeakerStat
     stats::list_speakers(&db).map_err(|e| e.to_string())
 }
 
+fn history_rate_limited_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new("RATE_LIMITED", "Too many history actions. Retry in a moment.", true)
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+}
+
+fn public_history_error(action: &str, error: &str) -> crate::ipc_contract::CommandErrorV1 {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("database is locked") || lower.contains("database is busy") {
+        return crate::ipc_contract::CommandErrorV1::new(
+            "DATABASE_BUSY",
+            "The workspace is busy. Retry this history action.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry);
+    }
+    let (code, message) = if action == "redo" {
+        ("REDO_FAILED", "The last change could not be redone.")
+    } else {
+        ("UNDO_FAILED", "The last change could not be undone.")
+    };
+    crate::ipc_contract::CommandErrorV1::new(code, message, false)
+        .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+}
+
 #[tauri::command]
-pub fn undo(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    RATE_LIMITER.check("undo")?;
+#[specta::specta]
+pub fn undo(state: State<'_, AppState>) -> Result<Option<String>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("undo").map_err(|_| history_rate_limited_error())?;
     let db = state.lock_db();
     let history = state.lock_history();
-    history.undo(&db).map_err(|e| e.to_string())
+    history.undo(&db).map_err(|error| public_history_error("undo", &error.to_string()))
 }
 
 #[tauri::command]
-pub fn redo(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    RATE_LIMITER.check("redo")?;
+#[specta::specta]
+pub fn redo(state: State<'_, AppState>) -> Result<Option<String>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("redo").map_err(|_| history_rate_limited_error())?;
     let db = state.lock_db();
     let history = state.lock_history();
-    history.redo(&db).map_err(|e| e.to_string())
+    history.redo(&db).map_err(|error| public_history_error("redo", &error.to_string()))
 }
 
 #[tauri::command]
-pub fn can_undo(state: State<'_, AppState>) -> bool {
-    state.lock_history().can_undo()
+#[specta::specta]
+pub fn can_undo(state: State<'_, AppState>) -> Result<bool, crate::ipc_contract::CommandErrorV1> {
+    Ok(state.lock_history().can_undo())
 }
 
 #[tauri::command]
-pub fn can_redo(state: State<'_, AppState>) -> bool {
-    state.lock_history().can_redo()
+#[specta::specta]
+pub fn can_redo(state: State<'_, AppState>) -> Result<bool, crate::ipc_contract::CommandErrorV1> {
+    Ok(state.lock_history().can_redo())
+}
+
+#[cfg(test)]
+mod typed_history_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn history_errors_are_stable_typed_and_scrubbed() {
+        let private = public_history_error("undo", r#"SQL failed at C:\private\library.db: token=secret"#);
+        let json = serde_json::to_value(private).expect("serialize public history error");
+        assert_eq!(json["schema"], 1);
+        assert_eq!(json["code"], "UNDO_FAILED");
+        assert_eq!(json["retryable"], false);
+        assert_eq!(json["suggestedAction"], "openHealth");
+        let wire = json.to_string();
+        assert!(!wire.contains("SQL"));
+        assert!(!wire.contains("private"));
+        assert!(!wire.contains("secret"));
+
+        let busy = public_history_error("redo", "database is busy");
+        let busy_json = serde_json::to_value(busy).expect("serialize busy history error");
+        assert_eq!(busy_json["code"], "DATABASE_BUSY");
+        assert_eq!(busy_json["retryable"], true);
+        assert_eq!(busy_json["suggestedAction"], "retry");
+    }
 }
 
 #[tauri::command]

@@ -82,6 +82,10 @@ export const commands = {
 	 *  before persistence; grants become effective only after durable settings publication.
 	 */
 	setCloudConsentV1: (request: SetCloudConsentRequestV1) => typedError<SettingsPatchResultV1, CommandErrorV1>(__TAURI_INVOKE("set_cloud_consent_v1", { request })),
+	undo: () => typedError<string | null, CommandErrorV1>(__TAURI_INVOKE("undo")),
+	redo: () => typedError<string | null, CommandErrorV1>(__TAURI_INVOKE("redo")),
+	canUndo: () => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("can_undo")),
+	canRedo: () => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("can_redo")),
 };
 
 /* Types */
