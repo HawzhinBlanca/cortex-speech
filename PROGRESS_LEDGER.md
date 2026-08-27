@@ -11680,3 +11680,36 @@ files remain. This is proof of a narrower known-defect inventory and an exact ar
 not release certification. Production data, releases, ports, credentials, models, migrations and
 reviewer work were untouched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED —
 NOT 10/10**.
+
+## 2026-08-27 — generated diagnostics, local-state and analytics IPC contracts
+
+Commits `addbd24a5e2fa57ebdd09b839890a72595e5ce5d`,
+`a140b2343a32d7cb361d71d1ddc10a67132ba3e8`, and
+`3347c71702719e52a1d3d875ac85404b8060f54f` move twelve renderer-reachable commands from the
+handwritten compatibility inventory to checked-in Tauri Specta bindings. The first tranche covers
+fingerprint diagnostics, operation cancellation, configured providers, bounded API-key persistence,
+and session save/restore. The second covers dataset statistics, dataset quality, training-grade
+breakdown, conformal certification, and label-quality lift. Generated command failures now use
+`CommandErrorV1`; analytics failures scrub database/internal details, and certificate probabilities
+are rejected unless finite and within their exact public domains.
+
+The measured IPC inventory improved from 34 generated / 80 handwritten to 46 generated / 68
+handwritten. The scanner reports zero generated commands with a noncanonical error type. The one
+remaining dynamic bridge is confined to the legacy adapter. The architecture gate still fails
+honestly because 68 handwritten contracts, that bridge, and ten oversized Svelte files remain; the
+Rust architecture subgate is green.
+
+During the complete policy campaign, the `save_session` rate-limit source policy rejected rustfmt's
+multiline spelling even though the runtime command already contained the correct limiter. The policy
+now recognizes the call expression across formatting whitespace and strips line comments so a
+comment-only spoof cannot pass. Its positive and negative scanner regression and the policy
+reachability meta-gate pass.
+
+Post-change proof: focused analytics and API/session Rust tests passed, strict all-target Clippy and
+rustfmt passed, the frontend passed 476/476 tests across 83 files with zero Svelte/TypeScript,
+ESLint, or Prettier findings, generated-binding drift and secret-hygiene gates passed, and the
+verifier supervisor passed 30/30 fault-contract tests. A fresh complete campaign then passed all 128
+reachable Python policy scripts, including syntax compilation and the real watchdog timing drill.
+No production database, release pointer, port, credential, model, migration, reviewer decision, or
+payment state was touched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT
+10/10**.
