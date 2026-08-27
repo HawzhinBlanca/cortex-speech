@@ -105,7 +105,6 @@ export async function installTauriMock(page: Page): Promise<void> {
       unregisterCallback: (id: number) => {
         eventHandlers.delete(id);
       },
-      convertFileSrc: (path: string) => path,
       invoke: async (
         cmd: string,
         args?: {
@@ -189,7 +188,6 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'register_review_media_asset':
             return {
               id: 'e2e-audio-grant',
-              path: String(args?.audioPath ?? ''),
               expiresAt: new Date(Date.now() + 60_000).toISOString(),
             };
           case 'get_media_asset_url':

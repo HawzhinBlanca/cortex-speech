@@ -11,24 +11,14 @@ const APP_CONFIG = {
 };
 
 describe('Tauri config security boundaries', () => {
-  it('limits asset protocol reads to the media cache', () => {
+  it('keeps the generic filesystem asset protocol disabled', () => {
     const configPath = resolve(process.cwd(), 'src-tauri', 'tauri.conf.json');
     const config = JSON.parse(readFileSync(configPath, 'utf-8')) as TauriConfig;
 
     const assetProtocol = config.app?.security?.assetProtocol;
 
-    expect(assetProtocol?.enable).toBe(true);
-    // Scope must point at the app's REAL data dir ($DATA/cortex-speech, per lib.rs get_app_data_dir)
-    // and stay confined to media-cache. The old '$APPDATA/media-cache/**' resolved to
-    // $APPDATA=app_data_dir (Roaming/<bundle-identifier>), a different folder, so every clip was
-    // blocked ("Failed to load audio file", media errCode 4).
-    expect(assetProtocol?.scope).toEqual(['$DATA/cortex-speech/media-cache/**']);
-    // Still locked down: never a broad data-dir grant.
-    for (const s of assetProtocol?.scope ?? []) {
-      expect(s).toContain('media-cache');
-      expect(s).not.toBe('$DATA/**');
-      expect(s).not.toBe('$APPDATA/**');
-    }
+    expect(assetProtocol?.enable).toBe(false);
+    expect(assetProtocol?.scope).toEqual([]);
   });
 
   it('does not retain stale filesystem plugin configuration', () => {
@@ -46,7 +36,7 @@ describe('Tauri config security boundaries', () => {
 
     const permissions = capability.permissions ?? [];
     const permissionNames = permissions.map((permission) =>
-      typeof permission === 'string' ? permission : permission.identifier ?? '',
+      typeof permission === 'string' ? permission : (permission.identifier ?? ''),
     );
 
     expect(permissionNames.some((permission) => permission.startsWith('fs:'))).toBe(false);
@@ -81,7 +71,13 @@ describe('Tauri config security boundaries', () => {
     expect(resources).not.toContain('models/**');
     expect(resources).toContain(APP_CONFIG.models.vadPath);
     const serializedResources = JSON.stringify(resources).toLowerCase();
-    for (const forbidden of ['omniasr-ctc-300m', 'omniasr-ctc-1b', 'finetuned-mms', 'scribe', 'elevenlabs']) {
+    for (const forbidden of [
+      'omniasr-ctc-300m',
+      'omniasr-ctc-1b',
+      'finetuned-mms',
+      'scribe',
+      'elevenlabs',
+    ]) {
       expect(serializedResources).not.toContain(forbidden);
     }
     // MMS remains available only through a deliberately named diagnostic override; standard CI,
@@ -92,7 +88,11 @@ describe('Tauri config security boundaries', () => {
     const diagnosticConfig = JSON.parse(diagnosticSource) as TauriConfig;
     const mmsPaths = ['models/finetuned-mms-ckb/model.onnx', 'models/finetuned-mms-ckb/vocab.json'];
     expect(diagnosticSource).toContain('EXPLICIT DIAGNOSTIC-ONLY');
-    expect(diagnosticConfig.bundle?.resources ?? []).toEqual([...basePaths, ...mmsPaths, ...scriptPaths]);
+    expect(diagnosticConfig.bundle?.resources ?? []).toEqual([
+      ...basePaths,
+      ...mmsPaths,
+      ...scriptPaths,
+    ]);
     for (const forbidden of ['omniasr-ctc-300m', 'omniasr-ctc-1b', 'scribe', 'elevenlabs']) {
       expect(diagnosticSource.toLowerCase()).not.toContain(forbidden);
     }
@@ -119,7 +119,6 @@ describe('Tauri config security boundaries', () => {
         expect(statSync(resourcePath).size).toBeGreaterThanOrEqual(resource.minBytes);
       }
     }
-
   });
 });
 

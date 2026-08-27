@@ -17,6 +17,7 @@ import type {
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1,
+  MediaGrant,
   PlaybackIntervalV1,
   RenamedSpeakerV1,
   RenameSpeakerRequestV1,
@@ -639,12 +640,6 @@ export interface AgentStageEvent {
   createdAt: string;
 }
 
-export interface MediaGrant {
-  id: string;
-  path: string;
-  expiresAt: string;
-}
-
 export async function listAgentImportReports(limit = 25): Promise<AgentImportReport[]> {
   return invokeLegacy<AgentImportReport[]>('list_agent_import_reports', { limit });
 }
@@ -660,16 +655,22 @@ export async function listAgentStageEvents(
 }
 
 export async function registerMediaAsset(audioPath: string): Promise<MediaGrant> {
-  return invokeCritical('register_media_asset', { audioPath });
+  const result = await generatedCommands.registerMediaAsset(audioPath);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** A decoded-PCM-verified immutable grant. Only review workstations request this stronger authority. */
 export async function registerReviewMediaAsset(audioPath: string): Promise<MediaGrant> {
-  return invokeCritical('register_review_media_asset', { audioPath });
+  const result = await generatedCommands.registerReviewMediaAsset(audioPath);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function getMediaAssetUrl(id: string): Promise<string> {
-  return invokeCritical('get_media_asset_url', { id });
+  const result = await generatedCommands.getMediaAssetUrl(id);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function beginDesktopPlaybackSessionV1(

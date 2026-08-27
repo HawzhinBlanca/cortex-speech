@@ -1,8 +1,7 @@
-import { convertFileSrc as tauriConvertFileSrc } from '@tauri-apps/api/core';
 import { listen as tauriListen, type Event, type UnlistenFn } from '@tauri-apps/api/event';
 
 /**
- * Platform adapter for window, dialog, event and asset mechanics.
+ * Platform adapter for window, dialog and event mechanics.
  *
  * Keep platform mechanics here so components and stores depend on stable application-facing
  * functions. Raw command transport lives separately in the closed legacy IPC adapter; generated
@@ -13,10 +12,6 @@ export type DesktopUnlisten = UnlistenFn;
 
 export function listen<T>(event: string, handler: (event: Event<T>) => void): Promise<UnlistenFn> {
   return tauriListen<T>(event, handler);
-}
-
-export function desktopAssetUrl(path: string): string {
-  return tauriConvertFileSrc(path);
 }
 
 export interface DialogFilter {

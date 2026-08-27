@@ -35,6 +35,9 @@ import { ckb } from '../../src/lib/i18n/ckb';
 import { en } from '../../src/lib/i18n/en';
 import type { SpeechSegment } from '../../src/lib/types';
 
+const MEDIA_GRANT_ID = '2f2d9b66-8566-4d1c-8c14-e18d006b776f';
+const NEXT_MEDIA_GRANT_ID = '52a492d4-14d8-4e24-9f5d-bc44221b48c1';
+
 function inboxSegment(id: string, withAudio = false): SpeechSegment {
   return {
     id,
@@ -128,9 +131,11 @@ describe('ReviewInbox queue loading', () => {
       }),
     );
     api.getSettings.mockResolvedValue(null);
-    api.registerMediaAsset.mockResolvedValue({ id: 'media-grant-1' });
-    api.registerReviewMediaAsset.mockResolvedValue({ id: 'media-grant-1' });
-    api.getMediaAssetUrl.mockResolvedValue('C:\\audio\\review.wav');
+    api.registerMediaAsset.mockResolvedValue({ id: MEDIA_GRANT_ID });
+    api.registerReviewMediaAsset.mockResolvedValue({ id: MEDIA_GRANT_ID });
+    api.getMediaAssetUrl.mockImplementation(
+      async (id: string) => `http://cortex-media.localhost/${id}`,
+    );
     api.beginDesktopPlaybackSessionV1.mockImplementation(
       async (segmentId: string, _mediaGrantId: string, expectedRevision: number) => ({
         playbackReceiptId: `receipt-${segmentId}`,
@@ -435,7 +440,7 @@ describe('ReviewInbox queue loading', () => {
     await waitFor(() => expect(api.commitReviewV1).toHaveBeenCalled());
     expect(api.recordPlaybackReceipt).toHaveBeenCalledWith({
       playbackReceiptId: 'receipt-aaaaaaaa-1',
-      mediaGrantId: 'media-grant-1',
+      mediaGrantId: MEDIA_GRANT_ID,
       intervals: [{ startMs: 0, endMs: 900 }],
     });
     expect(api.commitReviewV1).toHaveBeenCalledWith({
@@ -530,7 +535,7 @@ describe('ReviewInbox queue loading', () => {
     await waitFor(() =>
       expect(api.beginDesktopPlaybackSessionV1).toHaveBeenCalledWith(
         row.id,
-        'media-grant-1',
+        MEDIA_GRANT_ID,
         7,
         expect.any(String),
       ),
@@ -541,7 +546,7 @@ describe('ReviewInbox queue loading', () => {
     await waitFor(() =>
       expect(api.beginDesktopPlaybackSessionV1).toHaveBeenCalledWith(
         row.id,
-        'media-grant-1',
+        MEDIA_GRANT_ID,
         8,
         expect.any(String),
       ),
@@ -820,7 +825,7 @@ describe('ReviewInbox queue loading', () => {
     api.getReviewPageV1.mockResolvedValue(reviewPage([failed, next], { baseRevision: 7 }));
     api.registerReviewMediaAsset.mockImplementation(async (path: string) => {
       if (path.includes('unusable-1')) throw new Error('file missing');
-      return { id: 'next-media-grant' };
+      return { id: NEXT_MEDIA_GRANT_ID };
     });
     api.markSegmentUnusableV1
       .mockRejectedValueOnce(new Error('transport response lost'))

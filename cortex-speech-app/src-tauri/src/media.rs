@@ -2,15 +2,22 @@ use crate::db::Database;
 use crate::validation::input as validate;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use specta::Type;
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use tauri::http::{header, Method, Request, Response, StatusCode};
 
 const MEDIA_TTL_MINUTES: i64 = 30;
 const MAX_DISTINCT_MEDIA_MATERIALIZATIONS: usize = 2;
 const MAX_MEDIA_FLIGHT_FOLLOWERS: usize = 8;
+const MAX_MEDIA_PROTOCOL_RANGE_BYTES: u64 = 1000 * 1024;
+const MAX_MEDIA_PROTOCOL_WORKERS: usize = 8;
+pub(crate) const MEDIA_PROTOCOL_SCHEME: &str = "cortex-media";
 pub(crate) const MEDIA_MATERIALIZATION_BUSY_CODE: &str = "E_MEDIA_MATERIALIZATION_BUSY";
+static MEDIA_PROTOCOL_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 fn try_increment_below(counter: &AtomicUsize, limit: usize) -> bool {
     let mut current = counter.load(Ordering::Acquire);
@@ -25,12 +32,42 @@ fn try_increment_below(counter: &AtomicUsize, limit: usize) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MediaProtocolWorkerPermit;
+
+impl Drop for MediaProtocolWorkerPermit {
+    fn drop(&mut self) {
+        let previous = MEDIA_PROTOCOL_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "media protocol permit accounting underflow");
+    }
+}
+
+/// Bound protocol work before creating an OS thread. A compromised renderer can issue arbitrary
+/// custom-scheme requests; it must not turn that ability into unbounded thread or memory growth.
+pub(crate) fn try_acquire_media_protocol_worker() -> Option<MediaProtocolWorkerPermit> {
+    if try_increment_below(&MEDIA_PROTOCOL_WORKERS, MAX_MEDIA_PROTOCOL_WORKERS) {
+        Some(MediaProtocolWorkerPermit)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaGrant {
     pub id: String,
-    pub path: String,
+    /// Backend-only test/diagnostic handle. The renderer contract intentionally omits every cache
+    /// and source path; playback resolves the opaque grant UUID through `cortex-media` instead.
+    #[cfg(test)]
+    #[serde(skip)]
+    #[specta(skip)]
+    pub(crate) path: String,
     pub expires_at: String,
+}
+
+#[derive(Debug)]
+struct MediaProtocolLease {
+    cached_path: PathBuf,
+    _cache_guard: Arc<std::fs::File>,
 }
 
 #[derive(Debug)]
@@ -399,13 +436,9 @@ enum MediaRegistrationReservation {
 
 /// The directory the registry copies playable clips into, relative to the app data dir.
 ///
-/// This is the SINGLE source of truth shared by the writer (`register`, below) and the
-/// asset-protocol scope grant in `lib.rs` setup. The Tauri WebView can only load an `asset://`
-/// URL whose path is inside the asset-protocol scope, and the static `$APPDATA/media-cache/**`
-/// scope in `tauri.conf.json` resolves (Tauri v2) to the bundle-identifier-qualified app-data dir,
-/// NOT to `get_app_data_dir()`'s `%APPDATA%\cortex-speech`. So the scope is granted at runtime from
-/// THIS function; if the two ever computed different directories, in-app playback would silently
-/// break (every clip would 403). Keeping it in one place makes that drift impossible.
+/// This is the single backend source of truth shared by materialization, startup orphan cleanup and
+/// opaque-protocol resolution. The directory is never granted to the renderer or embedded in its
+/// URL; only a live registry UUID can reach one sealed file.
 pub fn media_cache_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("media-cache")
 }
@@ -589,6 +622,7 @@ impl MediaRegistry {
         let expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
         let grant = MediaGrant {
             id: prepared.id.clone(),
+            #[cfg(test)]
             path: prepared.cached_path.to_string_lossy().to_string(),
             expires_at: expires_at.to_rfc3339(),
         };
@@ -615,19 +649,32 @@ impl MediaRegistry {
         std::mem::take(&mut self.retired_artifacts)
     }
 
+    #[cfg(test)]
     pub fn resolve(&mut self, id: &str) -> Result<String, String> {
+        Ok(self.protocol_lease(id)?.cached_path.to_string_lossy().to_string())
+    }
+
+    /// Refresh one opaque grant without returning its private cache path across IPC.
+    pub(crate) fn refresh_grant(&mut self, id: &str) -> Result<(), String> {
+        self.protocol_lease(id).map(|_| ())
+    }
+
+    /// Lease the exact immutable cache image for a custom-protocol request. The cloned guard keeps
+    /// Windows deletion/replacement denied after the registry mutex is released and until the
+    /// response bytes have been read.
+    fn protocol_lease(&mut self, id: &str) -> Result<MediaProtocolLease, String> {
         self.prune_expired();
         let record = self.grants.get_mut(id).ok_or_else(|| "Media grant is missing or expired".to_string())?;
         if !record.cached_path.exists() {
             return Err("Cached media file is missing".to_string());
         }
-        // Sliding TTL: resolving means the frontend is (re)loading this clip (the AudioPlayer
-        // re-resolves on load/replay), so keep it alive. Without this, a clip the user is still
-        // working with expires after MEDIA_TTL_MINUTES and the next prune (triggered by granting any
-        // other clip, or idle time) deletes the file out from under the playing <audio> element,
-        // making a later play/seek fail with "Cached media file is missing".
+        // Sliding TTL: resolving means the WebView is loading or seeking this clip. Keep it alive so
+        // another registry operation cannot retire the artifact between range requests.
         record.expires_at = Utc::now() + Duration::minutes(MEDIA_TTL_MINUTES);
-        Ok(record.cached_path.to_string_lossy().to_string())
+        Ok(MediaProtocolLease {
+            cached_path: record.cached_path.clone(),
+            _cache_guard: Arc::clone(&record._cache_guard),
+        })
     }
 
     pub(crate) fn playback_binding(&mut self, id: &str) -> Result<MediaGrantBinding, String> {
@@ -687,6 +734,7 @@ impl MediaRegistry {
                 record.expires_at = now + Duration::minutes(MEDIA_TTL_MINUTES);
                 Some(MediaGrant {
                     id: id.clone(),
+                    #[cfg(test)]
                     path: record.cached_path.to_string_lossy().to_string(),
                     expires_at: record.expires_at.to_rfc3339(),
                 })
@@ -709,6 +757,192 @@ impl MediaRegistry {
             }
         }
     }
+}
+
+fn is_canonical_media_grant_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok_and(|parsed| {
+        parsed.get_version_num() == 4 && parsed.get_variant() == uuid::Variant::RFC4122 && parsed.to_string() == id
+    })
+}
+
+pub(crate) fn media_grant_url(id: &str) -> Result<String, String> {
+    if !is_canonical_media_grant_id(id) {
+        return Err("Media grant identity is invalid".to_string());
+    }
+    #[cfg(any(target_os = "windows", target_os = "android"))]
+    {
+        Ok(format!("http://{MEDIA_PROTOCOL_SCHEME}.localhost/{id}"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    {
+        Ok(format!("{MEDIA_PROTOCOL_SCHEME}://localhost/{id}"))
+    }
+}
+
+fn protocol_request_grant_id(request: &Request<Vec<u8>>) -> Option<&str> {
+    if request.uri().query().is_some() {
+        return None;
+    }
+    let host = request.uri().host()?;
+    if host != "localhost" && host != format!("{MEDIA_PROTOCOL_SCHEME}.localhost") {
+        return None;
+    }
+    let id = request.uri().path().strip_prefix('/')?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    is_canonical_media_grant_id(id).then_some(id)
+}
+
+fn parse_single_byte_range(value: &str, len: u64) -> Option<(u64, u64)> {
+    if len == 0 {
+        return None;
+    }
+    let raw = value.trim().strip_prefix("bytes=")?;
+    if raw.contains(',') {
+        return None;
+    }
+    let (start, end) = raw.split_once('-')?;
+    let (start, end) = if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        (len.saturating_sub(suffix), len - 1)
+    } else {
+        let start = start.parse::<u64>().ok()?;
+        let end = if end.is_empty() { len - 1 } else { end.parse::<u64>().ok()? };
+        (start, end)
+    };
+    if start >= len || end < start {
+        return None;
+    }
+    Some((start, end.min(len - 1)))
+}
+
+fn media_content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("wav") | Some("wave") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("flac") => "audio/flac",
+        Some("ogg") | Some("oga") => "audio/ogg",
+        Some("m4a") | Some("mp4") => "audio/mp4",
+        Some("webm") => "audio/webm",
+        Some("aac") => "audio/aac",
+        _ => "application/octet-stream",
+    }
+}
+
+fn media_protocol_response(
+    status: StatusCode,
+    content_type: &'static str,
+    content_length: u64,
+    content_range: Option<String>,
+    body: Vec<u8>,
+) -> Response<Vec<u8>> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, content_length)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, "content-range")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff");
+    if let Some(value) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, value);
+    }
+    match builder.body(body) {
+        Ok(response) => response,
+        Err(_) => Response::new(Vec::new()),
+    }
+}
+
+fn empty_media_protocol_response(status: StatusCode) -> Response<Vec<u8>> {
+    media_protocol_response(status, "text/plain; charset=utf-8", 0, None, Vec::new())
+}
+
+pub(crate) fn media_protocol_busy_response() -> Response<Vec<u8>> {
+    empty_media_protocol_response(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+/// Serve only a live opaque media grant. No source/cache path, filesystem error, or registry detail
+/// is reflected in the response. Ranges are capped to the same ~1 MiB window as Tauri's asset
+/// protocol so a hostile WebView request cannot force an unbounded allocation.
+pub(crate) fn serve_media_protocol_request(
+    registry: &Arc<Mutex<MediaRegistry>>,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return empty_media_protocol_response(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let Some(id) = protocol_request_grant_id(&request) else {
+        return empty_media_protocol_response(StatusCode::NOT_FOUND);
+    };
+    let (lease, retired) = {
+        let mut registry = lock_recovering(registry, "media registry");
+        let lease = registry.protocol_lease(id);
+        (lease, registry.take_retired_artifacts())
+    };
+    cleanup_retired_media_artifacts(retired, "expired protocol media grant");
+    let Ok(lease) = lease else {
+        return empty_media_protocol_response(StatusCode::NOT_FOUND);
+    };
+
+    let Ok(mut file) = std::fs::File::open(&lease.cached_path) else {
+        return empty_media_protocol_response(StatusCode::NOT_FOUND);
+    };
+    let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+        return empty_media_protocol_response(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let content_type = media_content_type(&lease.cached_path);
+    let requested_range = request.headers().get(header::RANGE).and_then(|value| value.to_str().ok());
+    let explicit_range = requested_range.is_some();
+    let range = if let Some(value) = requested_range {
+        match parse_single_byte_range(value, len) {
+            Some(range) => Some(range),
+            None => {
+                return media_protocol_response(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    content_type,
+                    0,
+                    Some(format!("bytes */{len}")),
+                    Vec::new(),
+                )
+            }
+        }
+    } else if len > MAX_MEDIA_PROTOCOL_RANGE_BYTES {
+        // WebView2 normally requests media ranges. If it does not, remain memory-bounded and return
+        // the truthful first partial window rather than allocating an arbitrarily large whole file.
+        Some((0, len - 1))
+    } else {
+        None
+    };
+
+    let (status, start, end, content_range) = if let Some((start, requested_end)) = range {
+        let end = requested_end.min(start.saturating_add(MAX_MEDIA_PROTOCOL_RANGE_BYTES - 1));
+        (StatusCode::PARTIAL_CONTENT, start, end, Some(format!("bytes {start}-{end}/{len}")))
+    } else {
+        (StatusCode::OK, 0, len.saturating_sub(1), None)
+    };
+    let content_length = if len == 0 { 0 } else { end - start + 1 };
+    if request.method() == Method::HEAD {
+        return media_protocol_response(status, content_type, content_length, content_range, Vec::new());
+    }
+    if content_length == 0 {
+        return media_protocol_response(status, content_type, 0, content_range, Vec::new());
+    }
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return empty_media_protocol_response(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut body = Vec::with_capacity(content_length as usize);
+    if file.by_ref().take(content_length).read_to_end(&mut body).is_err() || body.len() as u64 != content_length {
+        return empty_media_protocol_response(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    // `explicit_range` is intentionally retained in this branch condition as documentation: both an
+    // explicit client range and the bounded large-file fallback are proper 206 responses.
+    debug_assert!(status != StatusCode::PARTIAL_CONTENT || explicit_range || len > MAX_MEDIA_PROTOCOL_RANGE_BYTES);
+    media_protocol_response(status, content_type, content_length, content_range, body)
 }
 
 /// Remove cache artifacts from the previous process generation before the WebView can issue media
@@ -1219,12 +1453,8 @@ mod tests {
         writer.finalize().unwrap();
     }
 
-    // The asset-protocol scope grant in lib.rs setup and the registry writer MUST target the same
-    // directory, or the WebView refuses every cached clip's asset:// URL and no audio can play (the
-    // shipped bug: the static `$APPDATA/media-cache/**` scope resolved to the identifier-qualified
-    // app-data dir, a sibling of get_app_data_dir()'s %APPDATA%\cortex-speech). Both sides now derive
-    // the dir from media_cache_dir(); this pins that the registry's cache file really lands under it,
-    // so the runtime grant (which uses the same function) authorizes exactly what the registry wrote.
+    // The private registry remains the only authority for files under this directory. No renderer
+    // filesystem scope is granted; the custom protocol resolves a live UUID back to this cache.
     #[test]
     fn registry_writes_into_media_cache_dir() {
         let tmp = TempDir::new().unwrap();
@@ -1243,9 +1473,126 @@ mod tests {
         assert_eq!(
             cached.parent(),
             Some(expected_dir.as_path()),
-            "cached clip must live in media_cache_dir(data_dir) — the exact dir lib.rs grants to the asset scope"
+            "cached clip must live in the backend-private media cache"
         );
         assert!(cached.exists());
+    }
+
+    #[test]
+    fn renderer_media_contract_contains_no_cache_or_source_path() {
+        let grant = MediaGrant {
+            id: "2f2d9b66-8566-4d1c-8c14-e18d006b776f".to_string(),
+            path: r"D:\private\cortex-speech\media-cache\private.wav".to_string(),
+            expires_at: "2026-08-27T00:00:00Z".to_string(),
+        };
+        let wire = serde_json::to_string(&grant).expect("serialize public media grant");
+        assert_eq!(wire, r#"{"id":"2f2d9b66-8566-4d1c-8c14-e18d006b776f","expiresAt":"2026-08-27T00:00:00Z"}"#);
+        let url = media_grant_url(&grant.id).expect("valid opaque grant URL");
+        assert!(url.ends_with(&grant.id));
+        assert!(!url.contains("private"));
+        assert!(!url.contains("media-cache"));
+        assert!(media_grant_url("not-a-grant").is_err());
+        assert!(media_grant_url("2f2d9b66-8566-4d1c-0c14-e18d006b776f").is_err());
+    }
+
+    #[test]
+    fn opaque_protocol_serves_only_live_uuid_grants_with_bounded_ranges() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("protocol.wav");
+        std::fs::write(&audio, b"0123456789").unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let url = media_grant_url(&grant.id).unwrap();
+
+        let ranged = Request::builder()
+            .method(Method::GET)
+            .uri(&url)
+            .header(header::RANGE, "bytes=2-5")
+            .body(Vec::new())
+            .unwrap();
+        let response = serve_media_protocol_request(&registry, ranged);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.body(), b"2345");
+
+        let head = Request::builder().method(Method::HEAD).uri(&url).body(Vec::new()).unwrap();
+        let response = serve_media_protocol_request(&registry, head);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+        assert!(response.body().is_empty());
+
+        for request in [
+            Request::builder().method(Method::POST).uri(&url).body(Vec::new()).unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("http://cortex-media.localhost/C:/private.wav")
+                .body(Vec::new())
+                .unwrap(),
+            Request::builder()
+                .method(Method::GET)
+                .uri("http://cortex-media.localhost/2f2d9b66-8566-4d1c-8c14-e18d006b776f?path=C:/private.wav")
+                .body(Vec::new())
+                .unwrap(),
+        ] {
+            let response = serve_media_protocol_request(&registry, request);
+            assert!(matches!(response.status(), StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_FOUND));
+            assert!(response.body().is_empty());
+        }
+
+        let invalid_range = Request::builder()
+            .method(Method::GET)
+            .uri(&url)
+            .header(header::RANGE, "bytes=1-2,4-5")
+            .body(Vec::new())
+            .unwrap();
+        let response = serve_media_protocol_request(&registry, invalid_range);
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */10");
+    }
+
+    #[test]
+    fn opaque_protocol_caps_a_large_request_even_without_a_range_header() {
+        let tmp = TempDir::new().unwrap();
+        let audio = tmp.path().join("large-protocol.wav");
+        let bytes = vec![7_u8; MAX_MEDIA_PROTOCOL_RANGE_BYTES as usize + 4_096];
+        std::fs::write(&audio, &bytes).unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&segment(&audio)).unwrap();
+        let mut registry = MediaRegistry::default();
+        let grant = registry.register(&db, tmp.path(), &audio.to_string_lossy()).unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let url = media_grant_url(&grant.id).unwrap();
+
+        let request = Request::builder().method(Method::GET).uri(url).body(Vec::new()).unwrap();
+        let response = serve_media_protocol_request(&registry, request);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body().len(), MAX_MEDIA_PROTOCOL_RANGE_BYTES as usize);
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE],
+            format!("bytes 0-{}/{}", MAX_MEDIA_PROTOCOL_RANGE_BYTES - 1, bytes.len())
+        );
+        assert_eq!(parse_single_byte_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_single_byte_range("bytes=8-", 10), Some((8, 9)));
+        assert_eq!(parse_single_byte_range("bytes=10-11", 10), None);
+    }
+
+    #[test]
+    fn opaque_protocol_worker_admission_is_bounded_and_releases_exactly() {
+        assert_eq!(MEDIA_PROTOCOL_WORKERS.load(Ordering::Acquire), 0);
+        let permits = (0..MAX_MEDIA_PROTOCOL_WORKERS)
+            .map(|_| try_acquire_media_protocol_worker().expect("capacity remains"))
+            .collect::<Vec<_>>();
+        assert!(try_acquire_media_protocol_worker().is_none());
+        drop(permits);
+        let permit = try_acquire_media_protocol_worker().expect("all capacity released");
+        drop(permit);
+        assert_eq!(MEDIA_PROTOCOL_WORKERS.load(Ordering::Acquire), 0);
     }
 
     #[test]

@@ -677,6 +677,9 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::app_health,
             crate::commands::take_last_crash,
             crate::commands::app_git_sha,
+            crate::commands::register_media_asset,
+            crate::commands::register_review_media_asset,
+            crate::commands::get_media_asset_url,
             crate::commands::get_segment,
             crate::commands::get_segments_page,
             crate::commands::get_segment_ids_for_view,
@@ -710,6 +713,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<InferenceStatsV1>()
         .typ::<SessionStateV1>()
         .typ::<AppHealthV1>()
+        .typ::<crate::media::MediaGrant>()
         .typ::<crate::db::SegmentsPage>()
         .typ::<crate::stats::DatasetStats>()
         .typ::<crate::quality::DatasetQuality>()

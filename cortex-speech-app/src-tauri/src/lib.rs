@@ -858,8 +858,24 @@ pub fn run() {
         tracing::info!("Session restored: {} segments, {} verified", state.segment_count, state.verified_count);
     }
 
+    let media_registry = Arc::new(Mutex::new(MediaRegistry::default()));
+    let protocol_media_registry = Arc::clone(&media_registry);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .register_asynchronous_uri_scheme_protocol(
+            crate::media::MEDIA_PROTOCOL_SCHEME,
+            move |_context, request, responder| {
+                let Some(permit) = crate::media::try_acquire_media_protocol_worker() else {
+                    responder.respond(crate::media::media_protocol_busy_response());
+                    return;
+                };
+                let registry = Arc::clone(&protocol_media_registry);
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _permit = permit;
+                    responder.respond(crate::media::serve_media_protocol_request(&registry, request));
+                });
+            },
+        )
         .manage(AppState {
             db: database_runtime,
             pipeline: Mutex::new(pipeline),
@@ -877,7 +893,7 @@ pub fn run() {
             batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
             batch_state: Mutex::new(BatchState::Idle),
-            media_registry: Arc::new(Mutex::new(MediaRegistry::default())),
+            media_registry,
             media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
         })
         .invoke_handler(tauri::generate_handler![
@@ -1021,15 +1037,8 @@ pub fn run() {
         ])
         .setup(|app| {
             use tauri::Manager;
-            // Authorize the asset protocol to read the media-cache directory the registry actually
-            // writes into. The static `$APPDATA/media-cache/**` scope in tauri.conf.json resolves
-            // (Tauri v2) to the bundle-identifier-qualified app-data dir
-            // (%APPDATA%\com.cortex.kurdish-speech\media-cache), which is NOT where get_app_data_dir()
-            // writes (%APPDATA%\cortex-speech\media-cache). Without this runtime grant every
-            // convertFileSrc(asset://) playback URL is refused (403) and no imported clip can be
-            // played in the review UI — the core listen-and-approve step. Grant the REAL directory,
-            // derived from the same data_dir source of truth via media::media_cache_dir, so playback
-            // works regardless of how the static scope token would resolve.
+            // The renderer receives no filesystem scope. Startup owns private-cache maintenance;
+            // playable bytes leave only through the live UUID-bound `cortex-media` protocol.
             if let Some(data_dir) = app.state::<AppState>().lock_data_dir().clone() {
                 let media_cache = crate::media::media_cache_dir(&data_dir);
                 if let Err(e) = std::fs::create_dir_all(&media_cache) {
@@ -1039,12 +1048,6 @@ pub fn run() {
                     // for directory-wide orphan cleanup; runtime builders prune only exact grants so
                     // one parallel materialization can never delete another's unpublished file.
                     crate::media::prune_media_cache_on_startup(&media_cache);
-                }
-                match app.asset_protocol_scope().allow_directory(&media_cache, true) {
-                    Ok(()) => {
-                        tracing::info!("Asset protocol scope authorized for media cache: {}", media_cache.display())
-                    }
-                    Err(e) => tracing::warn!("Failed to authorize media cache dir in asset scope: {e}"),
                 }
             }
 

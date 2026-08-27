@@ -8,6 +8,9 @@ import type { SpeechSegment } from '../../src/lib/types';
 import { ckb } from '../../src/lib/i18n/ckb';
 import { flushReviewDrafts } from '../../src/lib/reviewDraftFlush';
 
+const MEDIA_GRANT_ID = '2f2d9b66-8566-4d1c-8c14-e18d006b776f';
+const NEXT_MEDIA_GRANT_ID = '52a492d4-14d8-4e24-9f5d-bc44221b48c1';
+
 const mocks = vi.hoisted(() => ({
   getSegmentsPage: vi.fn(),
   getReviewPageV1: vi.fn(),
@@ -241,9 +244,11 @@ describe('ReviewMode windowed queue', () => {
       segment: segment(),
     });
     mocks.updateSegmentMetadataV1.mockResolvedValue(undefined);
-    mocks.registerMediaAsset.mockResolvedValue({ id: 'asset-key' });
-    mocks.registerReviewMediaAsset.mockResolvedValue({ id: 'asset-key' });
-    mocks.getMediaAssetUrl.mockResolvedValue('C:\\audio\\review.wav');
+    mocks.registerMediaAsset.mockResolvedValue({ id: MEDIA_GRANT_ID });
+    mocks.registerReviewMediaAsset.mockResolvedValue({ id: MEDIA_GRANT_ID });
+    mocks.getMediaAssetUrl.mockImplementation(
+      async (id: string) => `http://cortex-media.localhost/${id}`,
+    );
     installPlayableMediaStub();
     Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
       configurable: true,
@@ -925,7 +930,7 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() => expect(mocks.recordPlaybackReceipt).toHaveBeenCalledTimes(1));
     expect(mocks.recordPlaybackReceipt).toHaveBeenCalledWith({
       playbackReceiptId: '11111111-1111-4111-8111-111111111111',
-      mediaGrantId: 'asset-key',
+      mediaGrantId: MEDIA_GRANT_ID,
       intervals: [{ startMs: 0, endMs: 850 }],
     });
     expect(mocks.commitReviewV1).toHaveBeenCalledTimes(1);
@@ -1029,7 +1034,7 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() =>
       expect(mocks.beginDesktopPlaybackSessionV1).toHaveBeenCalledWith(
         full.id,
-        'asset-key',
+        MEDIA_GRANT_ID,
         7,
         expect.any(String),
       ),
@@ -1042,7 +1047,7 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() =>
       expect(mocks.beginDesktopPlaybackSessionV1).toHaveBeenCalledWith(
         full.id,
-        'asset-key',
+        MEDIA_GRANT_ID,
         8,
         expect.any(String),
       ),
@@ -1392,7 +1397,7 @@ describe('ReviewMode windowed queue', () => {
     mocks.getSegment.mockImplementation(async (id: string) => (id === failed.id ? failed : next));
     mocks.registerReviewMediaAsset.mockImplementation(async (path: string) => {
       if (path === failed.audioPath) throw new Error('file missing');
-      return { id: 'next-grant' };
+      return { id: NEXT_MEDIA_GRANT_ID };
     });
     mocks.markSegmentUnusableV1
       .mockRejectedValueOnce(new Error('transport response lost'))

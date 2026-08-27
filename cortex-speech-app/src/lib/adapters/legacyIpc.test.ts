@@ -73,6 +73,12 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('get_training_grade_breakdown');
   // @ts-expect-error certificate parameters use the generated command signature
   void invokeLegacy<unknown>('get_dataset_certificate');
+  // @ts-expect-error opaque media grants cannot return to the path-bearing handwritten bridge
+  void invokeCritical('register_media_asset', { audioPath: 'C:/private/source.wav' });
+  // @ts-expect-error review media uses the same generated path-scrubbed contract
+  void invokeLegacy<unknown>('register_review_media_asset');
+  // @ts-expect-error media resolution returns an opaque protocol URL through generated IPC
+  void invokeCritical('get_media_asset_url', { id: 'grant' });
   // @ts-expect-error the library segment/page contract is generated and typed
   void invokeLegacy<unknown>('get_segment');
   // @ts-expect-error contextual batch ids cannot regress into handwritten IPC

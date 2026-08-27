@@ -132,6 +132,14 @@ export const commands = {
 	 *  Referencing `crate::GIT_SHA` here also guarantees the const is retained in the compiled binary.
 	 */
 	appGitSha: () => typedError<string, CommandErrorV1>(__TAURI_INVOKE("app_git_sha")),
+	registerMediaAsset: (audioPath: string) => typedError<MediaGrant, CommandErrorV1>(__TAURI_INVOKE("register_media_asset", { audioPath })),
+	/**
+	 *  Mint the immutable, decoded-PCM-verified grant required by the policy-4 review boundary. This is
+	 *  intentionally separate from ordinary media playback so a legacy/null fingerprint cannot break
+	 *  Library listening, while it still fails closed before any human-truth write is possible.
+	 */
+	registerReviewMediaAsset: (audioPath: string) => typedError<MediaGrant, CommandErrorV1>(__TAURI_INVOKE("register_review_media_asset", { audioPath })),
+	getMediaAssetUrl: (id: string) => typedError<string, CommandErrorV1>(__TAURI_INVOKE("get_media_asset_url", { id })),
 	/**
 	 *  Hydrate one selected list row with its full alignment/evidence payload. The database read runs
 	 *  off the Tauri main thread and every refusal is a stable renderer-safe code.
@@ -477,6 +485,11 @@ export type MarkedSegmentUnusableV1 = {
 	committedRevision: number,
 	reason: TechnicalUnusableReasonV1,
 	effectId: string,
+};
+
+export type MediaGrant = {
+	id: string,
+	expiresAt: string,
 };
 
 export type OperationEventV1 = { type: "started"; operationId: string } | { type: "progress"; operationId: string; completed: number; total: number } | { type: "completed"; operationId: string } | { type: "failed"; operationId: string; error: CommandErrorV1 } | { type: "cancelled"; operationId: string } | { type: "halted"; operationId: string; haltedBy: string };

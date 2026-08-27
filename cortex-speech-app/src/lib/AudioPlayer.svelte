@@ -1,7 +1,6 @@
 <script lang="ts">
   import Pause from '@lucide/svelte/icons/pause';
   import Play from '@lucide/svelte/icons/play';
-  import { localMediaUrl } from './mediaSource';
   import {
     beginDesktopPlaybackSessionV1,
     cancelDesktopPlaybackSessionV1,
@@ -12,6 +11,7 @@
   import { onDestroy } from 'svelte';
   import { notifications } from './stores/notificationStore';
   import { t } from './i18n';
+  import { validatedOpaqueMediaUrl } from './opaqueMediaUrl';
   import {
     audioAttemptBinding,
     audioTransition,
@@ -342,23 +342,19 @@
         return;
       }
       if (requirePlaybackProof) issuedReceiptId = playbackReceiptId;
-      const grantedPath = await getMediaAssetUrl(grant.id);
+      const grantedUrl = await getMediaAssetUrl(grant.id);
       if (ctrl.signal.aborted || !isCurrentAudioAttempt(audioMachine, binding)) {
         retirePlaybackAuthority(issuedReceiptId, clientAttemptId);
         return;
       }
-      if (!grantedPath) throw new Error('audio asset unavailable');
-      let cleanPath = grantedPath.replaceAll('\\', '/');
-      if (cleanPath.startsWith('//?/')) {
-        cleanPath = cleanPath.substring(4);
-      }
+      const safeMediaUrl = validatedOpaqueMediaUrl(grantedUrl);
+      if (!safeMediaUrl) throw new Error('audio asset unavailable');
       transitionAudio({ type: 'resolved', binding });
       // Set src directly; the metadata/error handlers retain the attempt that owns this load.
-      const url = localMediaUrl(cleanPath);
       if (!audioEl) throw new Error('audio element unavailable');
       mediaLoadBinding = binding;
       resetHeardTime(); // new source => new evidence; a previous clip's listen never carries
-      audioEl.src = url;
+      audioEl.src = safeMediaUrl;
       audioEl.playbackRate = playbackRate;
       audioEl.load();
     } catch (e) {

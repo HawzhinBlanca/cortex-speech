@@ -483,7 +483,6 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       const audioPath = String(args?.audioPath ?? '');
       return {
         id: `preview-${audioPath}`,
-        path: audioPath,
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
       };
     }
@@ -603,7 +602,6 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
   };
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: (cmd: string, args?: Record<string, unknown>) => mockInvoke(cmd, args),
-    convertFileSrc: (path: string) => path,
     transformCallback: (cb: unknown) => {
       const id = Math.floor(Math.random() * 1e9);
       const w = window as unknown as Record<string, Record<number, unknown>>;

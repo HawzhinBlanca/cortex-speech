@@ -24,6 +24,25 @@ fn diagnostics_rate_limited_error(action: &str) -> CommandErrorV1 {
     CommandErrorV1::new("RATE_LIMITED", action, true).suggested(SuggestedActionV1::Retry)
 }
 
+fn media_rate_limited_error() -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", "Audio preparation is busy. Retry in a moment.", true)
+        .suggested(SuggestedActionV1::Retry)
+}
+
+fn media_unavailable_error(code: &str, retryable: bool) -> CommandErrorV1 {
+    CommandErrorV1::new(code, "This audio clip is unavailable. Reload the clip and retry.", retryable)
+        .suggested(SuggestedActionV1::ReloadClip)
+}
+
+fn public_media_error(error: String) -> CommandErrorV1 {
+    if error.starts_with(crate::media::MEDIA_MATERIALIZATION_BUSY_CODE) {
+        CommandErrorV1::new("MEDIA_PREPARATION_BUSY", "Other audio is being prepared. Wait a moment, then retry.", true)
+            .suggested(SuggestedActionV1::Retry)
+    } else {
+        media_unavailable_error("MEDIA_ASSET_UNAVAILABLE", false)
+    }
+}
+
 fn renderer_safe_spans(spans: Vec<crate::telemetry::Span>) -> Vec<crate::ipc_contract::TracingSpanV1> {
     spans.into_iter().map(Into::into).collect()
 }
@@ -100,58 +119,92 @@ pub fn take_last_crash(state: State<'_, AppState>) -> Result<Option<String>, Com
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn register_media_asset(
     audio_path: String,
     state: State<'_, AppState>,
-) -> Result<crate::media::MediaGrant, String> {
-    RATE_LIMITER.check("register_media_asset")?;
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+) -> Result<crate::media::MediaGrant, CommandErrorV1> {
+    RATE_LIMITER.check("register_media_asset").map_err(|_| media_rate_limited_error())?;
+    let data_dir =
+        state.lock_data_dir().clone().ok_or_else(|| media_unavailable_error("MEDIA_STATE_UNAVAILABLE", false))?;
     // Ordinary Library/curation playback needs only imported-file membership. Legacy schema-65 rows
     // with a missing identity remain playable here because this grant can never authorize a review
     // decision: playback_binding rejects unverified grants. Keep the stronger proof path separate.
     let canonical = {
         let db = state.lock_db();
-        crate::media::MediaRegistry::ensure_imported(&db, &audio_path)?
+        crate::media::MediaRegistry::ensure_imported(&db, &audio_path).map_err(public_media_error)?
     };
     let registry = Arc::clone(&state.media_registry);
     let materializer = Arc::clone(&state.media_materializer);
     run_blocking(move || materializer.register_unverified(&registry, &data_dir, std::path::PathBuf::from(canonical)))
         .await
+        .map_err(public_media_error)
 }
 
 /// Mint the immutable, decoded-PCM-verified grant required by the policy-4 review boundary. This is
 /// intentionally separate from ordinary media playback so a legacy/null fingerprint cannot break
 /// Library listening, while it still fails closed before any human-truth write is possible.
 #[tauri::command]
+#[specta::specta]
 pub async fn register_review_media_asset(
     audio_path: String,
     state: State<'_, AppState>,
-) -> Result<crate::media::MediaGrant, String> {
-    STRICT_RATE_LIMITER.check("register_review_media_asset")?;
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+) -> Result<crate::media::MediaGrant, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("register_review_media_asset").map_err(|_| media_rate_limited_error())?;
+    let data_dir =
+        state.lock_data_dir().clone().ok_or_else(|| media_unavailable_error("MEDIA_STATE_UNAVAILABLE", false))?;
     // Capture authority under a short DB lock, then release it before the potentially multi-GB copy
     // and PCM decode. Never acquire registry -> DB: session commands deliberately lease registry
     // state first and release it before entering the database transaction.
     let source = {
         let db = state.lock_db();
-        crate::media::MediaRegistry::validate_playback_source(&db, &audio_path)?
+        crate::media::MediaRegistry::validate_playback_source(&db, &audio_path).map_err(public_media_error)?
     };
     let registry = Arc::clone(&state.media_registry);
     let materializer = Arc::clone(&state.media_materializer);
-    run_blocking(move || materializer.register_verified(&registry, &data_dir, source)).await
+    run_blocking(move || materializer.register_verified(&registry, &data_dir, source)).await.map_err(public_media_error)
 }
 
 #[tauri::command]
-pub fn get_media_asset_url(id: String, state: State<'_, AppState>) -> Result<String, String> {
-    RATE_LIMITER.check("get_media_asset_url")?;
-    validate::validate_identifier(&id)?;
+#[specta::specta]
+pub fn get_media_asset_url(id: String, state: State<'_, AppState>) -> Result<String, CommandErrorV1> {
+    RATE_LIMITER.check("get_media_asset_url").map_err(|_| media_rate_limited_error())?;
+    validate::validate_identifier(&id).map_err(|_| media_unavailable_error("INVALID_MEDIA_GRANT", false))?;
     let (result, retired) = {
         let mut registry = state.lock_media_registry();
-        let result = registry.resolve(&id);
+        let result = registry.refresh_grant(&id);
         (result, registry.take_retired_artifacts())
     };
     crate::media::cleanup_retired_media_artifacts(retired, "expired media grant");
-    result
+    result.map_err(public_media_error)?;
+    crate::media::media_grant_url(&id).map_err(public_media_error)
+}
+
+#[cfg(test)]
+mod typed_media_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn media_failures_are_stable_and_scrub_private_backend_details() {
+        let hostile =
+            public_media_error(r"sqlite D:\private\cortex.db token=secret SELECT * FROM speech_segments".to_string());
+        let wire = serde_json::to_string(&hostile).expect("serialize public media error");
+        assert!(wire.contains("MEDIA_ASSET_UNAVAILABLE"));
+        assert!(wire.contains("reloadClip"));
+        for forbidden in ["D:\\", "private", "token", "secret", "SELECT", "speech_segments"] {
+            assert!(!wire.contains(forbidden));
+        }
+
+        let busy = public_media_error(format!(
+            "{}: private internal queue details",
+            crate::media::MEDIA_MATERIALIZATION_BUSY_CODE
+        ));
+        let busy = serde_json::to_value(busy).expect("serialize busy media error");
+        assert_eq!(busy["code"], "MEDIA_PREPARATION_BUSY");
+        assert_eq!(busy["retryable"], true);
+        assert_eq!(busy["suggestedAction"], "retry");
+        assert!(!busy.to_string().contains("private internal"));
+    }
 }
 
 fn fingerprint_count_rate_limited_error() -> CommandErrorV1 {

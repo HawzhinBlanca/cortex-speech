@@ -22,13 +22,15 @@ import { notifications, type Notification } from './stores/notificationStore';
 import * as commandApi from './commands';
 
 vi.mock('./commands', () => ({
-  registerMediaAsset: vi.fn(async (path: string) => ({ id: `grant-${path}`, path, expiresAt: '' })),
-  registerReviewMediaAsset: vi.fn(async (path: string) => ({
-    id: `review-grant-${path}`,
-    path,
+  registerMediaAsset: vi.fn(async () => ({
+    id: '52a492d4-14d8-4e24-9f5d-bc44221b48c1',
     expiresAt: '',
   })),
-  getMediaAssetUrl: vi.fn(async (id: string) => `C:/cache/${id}.wav`),
+  registerReviewMediaAsset: vi.fn(async () => ({
+    id: '2f2d9b66-8566-4d1c-8c14-e18d006b776f',
+    expiresAt: '',
+  })),
+  getMediaAssetUrl: vi.fn(async (id: string) => `http://cortex-media.localhost/${id}`),
   cancelDesktopPlaybackSessionV1: vi.fn(async () => true),
   beginDesktopPlaybackSessionV1: vi.fn(
     async (
@@ -170,7 +172,7 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     expect(commandApi.registerMediaAsset).not.toHaveBeenCalled();
     expect(commandApi.beginDesktopPlaybackSessionV1).toHaveBeenCalledWith(
       'seg-proof',
-      'review-grant-D:/review/canonical.wav',
+      '2f2d9b66-8566-4d1c-8c14-e18d006b776f',
       0,
       expect.stringMatching(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
@@ -190,18 +192,14 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     await settle();
 
     const first = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls[0];
-    expect(first?.slice(0, 3)).toEqual(['seg-same', 'review-grant-D:/review/same-source.wav', 7]);
+    expect(first?.slice(0, 3)).toEqual(['seg-same', '2f2d9b66-8566-4d1c-8c14-e18d006b776f', 7]);
 
     await rerender({ expectedRevision: 8 });
     await settle();
 
     const calls = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls;
     expect(calls).toHaveLength(2);
-    expect(calls[1]?.slice(0, 3)).toEqual([
-      'seg-same',
-      'review-grant-D:/review/same-source.wav',
-      8,
-    ]);
+    expect(calls[1]?.slice(0, 3)).toEqual(['seg-same', '2f2d9b66-8566-4d1c-8c14-e18d006b776f', 8]);
     expect(calls[1]?.[3]).not.toBe(calls[0]?.[3]);
   });
 

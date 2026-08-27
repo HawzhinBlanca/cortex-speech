@@ -47,7 +47,6 @@ export const LEGACY_IPC_COMMANDS = [
   'get_intelligence_report',
   'get_interrupted_import',
   'get_jobs',
-  'get_media_asset_url',
   'get_quarantine_notice',
   'get_segment_consensus',
   'get_waveform',
@@ -67,8 +66,6 @@ export const LEGACY_IPC_COMMANDS = [
   'open_audio_file',
   'record_review_flag',
   'rediarize_segments',
-  'register_media_asset',
-  'register_review_media_asset',
   'relink_audio',
   'restore_db_from_snapshot',
   'resume_interrupted_import',
@@ -109,15 +106,6 @@ type CriticalLegacyIpcContract = {
     args: { path: string; format: 'txt' | 'srt' | 'vtt' };
     result: CommandResult<'exportTranscript'>;
   };
-  register_media_asset: {
-    args: { audioPath: string };
-    result: CommandResult<'registerMediaAsset'>;
-  };
-  register_review_media_asset: {
-    args: { audioPath: string };
-    result: CommandResult<'registerReviewMediaAsset'>;
-  };
-  get_media_asset_url: { args: { id: string }; result: CommandResult<'getMediaAssetUrl'> };
   start_couch_review: {
     args: { reviewers: string[] };
     result: CommandResult<'startCouchReview'>;

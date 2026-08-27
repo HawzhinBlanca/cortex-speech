@@ -22,10 +22,10 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost; connect-src 'self' ipc: https://ipc.localhost http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; media-src 'self' blob: mediastream: asset: https://asset.localhost http://asset.localhost; worker-src 'self' blob:",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self' ipc: https://ipc.localhost http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; media-src 'self' blob: mediastream: cortex-media: http://cortex-media.localhost; worker-src 'self' blob:",
       "assetProtocol": {
-        "enable": true,
-        "scope": ["$DATA/cortex-speech/media-cache/**"]
+        "enable": false,
+        "scope": []
       }
     }
   },
