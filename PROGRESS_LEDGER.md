@@ -11651,3 +11651,32 @@ sessions. Signed Windows artifacts, clean-VM update/rollback, manual accessibili
 comparator proof also remain absent. Production databases, releases, ports, credentials, models and
 reviewer work were not touched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED —
 NOT 10/10**.
+
+## 2026-08-27 — verifier-owned architecture and known-defect evidence
+
+Commits `6a261edd1cc724fd212cb2ac0f81c059bc4c4783` and
+`0f3e81373b9f68ddb2819eaf62101d9342c6a4cb` replace two self-authored certification placeholders
+with class-specific, fail-closed evidence. `architecture-contract-evidence` measures the Rust module
+ceiling, generated-versus-handwritten IPC inventory, Svelte composition/workspace/component ceilings,
+and direct desktop-runtime imports. `known-defect-ledger-evidence` validates a strict tracked defect
+inventory and binds every audit/tracking authority to canonical bytes from the exact Git commit. Its
+evidence cannot verify unless `clean-source-tree` also passes. The Windows LF/CRLF materialization
+false negative found by the first clean-commit run is pinned by a regression test; Git blob bytes,
+not checkout-translated bytes, are now the authority.
+
+The history persistence extraction moved 309 lines from `db/segments.rs` into the cohesive
+`db/history.rs` sibling without changing command behavior. The segment store is back to 1,822
+production lines, and the 152-module Rust architecture scan has zero failures. Focused exact proof:
+20/20 history tests, 12/12 segment-write store tests, strict all-target Clippy, frontend typecheck,
+lint and formatting, 30/30 verifier supervisor/fault-contract tests, and the repaired segment-store
+policy passed. The complete 128-script policy campaign found only the extraction-sensitive path
+assertion; after the policy was pointed at the new authority, that test and the policy reachability
+meta-gate passed independently.
+
+On clean `0f3e81373b9f68ddb2819eaf62101d9342c6a4cb`, the exact known-defect artifact passed with
+zero supported-flow P0/P1/P2 blockers and a SHA-256-bound ledger. The architecture artifact honestly
+failed: Rust passed, but 80 handwritten IPC contracts, one dynamic bridge, and ten oversized Svelte
+files remain. This is proof of a narrower known-defect inventory and an exact architecture worklist,
+not release certification. Production data, releases, ports, credentials, models, migrations and
+reviewer work were untouched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED —
+NOT 10/10**.
