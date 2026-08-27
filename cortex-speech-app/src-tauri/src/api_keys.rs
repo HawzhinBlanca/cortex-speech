@@ -15,6 +15,7 @@ pub const SECRETS_FILE: &str = "secrets.env";
 
 /// The keys Cortex looks for.
 pub const KEY_NAMES: [&str; 2] = ["GEMINI_API_KEY", "OPENROUTER_API_KEY"];
+pub const MAX_API_KEY_CHARS: usize = 16_384;
 
 /// One process-wide authority for the complete secrets-file read/modify/replace transaction.
 ///
@@ -178,6 +179,9 @@ fn validate_key_value(name: &str, value: &str) -> Result<String, String> {
         return Err(format!("unknown API key name '{name}'"));
     }
     let value = value.trim();
+    if value.chars().count() > MAX_API_KEY_CHARS {
+        return Err(format!("API key is too long (max {MAX_API_KEY_CHARS} characters)"));
+    }
     if value.contains(|c: char| c.is_control() || c.is_whitespace()) {
         return Err("API key contains whitespace or control characters — paste the key exactly".to_string());
     }
@@ -367,6 +371,18 @@ mod tests {
     fn configured_providers_lists_only_set_keys_never_values() {
         let keys = ApiKeys { gemini: Some("g".into()), openrouter: Some("o".into()) };
         assert_eq!(keys.configured_providers(), vec!["gemini", "openrouter"]);
+    }
+
+    #[test]
+    fn api_key_values_are_bounded_before_encryption_or_file_io() {
+        let oversized = "k".repeat(MAX_API_KEY_CHARS + 1);
+        let error = validate_key_value("GEMINI_API_KEY", &oversized).expect_err("oversized secret must refuse");
+        assert!(error.contains("too long"));
+        assert!(!error.contains(&oversized));
+        assert_eq!(
+            validate_key_value("GEMINI_API_KEY", &"k".repeat(MAX_API_KEY_CHARS)).unwrap().len(),
+            MAX_API_KEY_CHARS
+        );
     }
 
     #[test]

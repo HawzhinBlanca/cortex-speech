@@ -565,6 +565,15 @@ pub enum CloudConsentKindV1 {
     Jury,
 }
 
+/// Closed provider selector for the explicit secret mutation command. Unknown strings never reach
+/// the secret store, and the key value itself is never returned by any public DTO.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ApiKeyProviderV1 {
+    Gemini,
+    Openrouter,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SetCloudConsentRequestV1 {
@@ -605,6 +614,32 @@ pub struct ProductAttestationV1 {
     pub model_attestation_sha256: Option<String>,
 }
 
+/// Minimal complete view-state returned to the renderer after crash/session recovery. Internal
+/// versioning, timestamps and reserved panel fields stay backend-owned rather than becoming a
+/// permanently optional public contract through `SessionState`'s compatibility defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct SessionStateV1 {
+    pub search_query: String,
+    pub sort_order: String,
+    pub selected_segment_id: Option<String>,
+    pub filter_verified: Option<bool>,
+    pub segment_count: usize,
+    pub verified_count: usize,
+}
+
+impl From<crate::session::SessionState> for SessionStateV1 {
+    fn from(value: crate::session::SessionState) -> Self {
+        Self {
+            search_query: value.search_query,
+            sort_order: value.sort_order,
+            selected_segment_id: value.selected_segment_id,
+            filter_verified: value.filter_verified,
+            segment_count: value.segment_count,
+            verified_count: value.verified_count,
+        }
+    }
+}
+
 /// One registry drives both the typed command metadata and every standalone public contract. Keep
 /// generation separate from application startup so a release build never mutates its source tree.
 pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
@@ -623,6 +658,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_settings_v1,
             crate::commands::patch_settings_v1,
             crate::commands::set_cloud_consent_v1,
+            crate::commands::get_configured_providers,
+            crate::commands::set_api_key,
             crate::commands::undo,
             crate::commands::redo,
             crate::commands::get_history_status_v1,
@@ -631,7 +668,12 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_tracing_stats,
             crate::commands::get_recent_spans,
             crate::commands::clear_tracing_spans,
+            crate::commands::save_session,
+            crate::commands::restore_session,
             crate::commands::get_inference_stats,
+            crate::commands::get_fingerprint_count,
+            crate::commands::cancel_operation,
+            crate::commands::cancel_wsl_refinement,
             crate::commands::app_health,
             crate::commands::take_last_crash,
             crate::commands::app_git_sha,
@@ -661,6 +703,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<TracingSpanV1>()
         .typ::<InferenceKindStatsV1>()
         .typ::<InferenceStatsV1>()
+        .typ::<SessionStateV1>()
         .typ::<AppHealthV1>()
         .typ::<crate::db::SegmentsPage>()
         .typ::<ReviewScope>()
@@ -693,6 +736,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<SettingsSnapshotV1>()
         .typ::<SettingsPatchResultV1>()
         .typ::<CloudConsentKindV1>()
+        .typ::<ApiKeyProviderV1>()
         .typ::<SetCloudConsentRequestV1>()
         .typ::<ProofGateResultV1>()
         .typ::<ProofRunManifestV1>()
@@ -748,6 +792,24 @@ mod tests {
         let scope = serde_json::to_value(ReviewScope::VoiceFocus { focus_id }).expect("serialize exact focus scope");
         assert_eq!(scope["kind"], "voiceFocus");
         assert!(scope.get("focusId").is_some());
+    }
+
+    #[test]
+    fn session_wire_contract_is_complete_and_omits_internal_recovery_fields() {
+        let wire = serde_json::to_value(SessionStateV1 {
+            search_query: "query".into(),
+            sort_order: "newest".into(),
+            selected_segment_id: Some("segment-a".into()),
+            filter_verified: Some(false),
+            segment_count: 12,
+            verified_count: 3,
+        })
+        .expect("serialize session DTO");
+        assert_eq!(wire["search_query"], "query");
+        assert_eq!(wire["segment_count"], 12);
+        assert!(wire.get("version").is_none());
+        assert!(wire.get("last_saved").is_none());
+        assert!(wire.get("view_mode").is_none());
     }
 
     #[test]

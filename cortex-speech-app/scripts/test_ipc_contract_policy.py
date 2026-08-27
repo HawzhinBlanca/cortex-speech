@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LIB_RS = REPO_ROOT / "src-tauri" / "src" / "lib.rs"
 FRONTEND_DIR = REPO_ROOT / "src"
 LEGACY_ADAPTER = FRONTEND_DIR / "lib" / "adapters" / "legacyIpc.ts"
+GENERATED_BINDINGS = FRONTEND_DIR / "lib" / "generated" / "ipc.ts"
 
 # Every supported IPC boundary. The bounded non-greedy generic matcher handles multiline explicit
 # result types without treating ordinary functions whose names merely contain "invoke" as IPC.
@@ -119,6 +120,39 @@ def handwritten_inventory() -> set[str]:
     return names
 
 
+def _noncanonical_generated_error_commands(source: str, generated: set[str]) -> set[str]:
+    invalid: set[str] = set()
+    for name in generated:
+        needle = f'__TAURI_INVOKE("{name}"'
+        positions = [match.start() for match in re.finditer(re.escape(needle), source)]
+        if len(positions) != 1:
+            invalid.add(name)
+            continue
+        prefix = source[max(0, positions[0] - 8_000) : positions[0]]
+        typed_start = prefix.rfind("typedError<")
+        if typed_start < 0:
+            invalid.add(name)
+            continue
+        invocation_prefix = prefix[typed_start + len("typedError<") :]
+        if re.search(r",\s*CommandErrorV1>\(\s*$", invocation_prefix) is None:
+            invalid.add(name)
+    return invalid
+
+
+def generated_noncanonical_error_commands() -> set[str]:
+    """Return generated commands whose public rejection type is not CommandErrorV1.
+
+    Specta generation alone is insufficient: `Result<T, String>` also generates a wrapper, but it
+    would preserve the raw-string error surface that the final IPC contract explicitly retires.
+    Bind each emitted invoke to the nearest generated `typedError<...>` call and require the stable
+    renderer-safe error DTO for every command.
+    """
+
+    source = _strip_comments(GENERATED_BINDINGS.read_text(encoding="utf-8"))
+    _, generated, _ = frontend_invocations()
+    return _noncanonical_generated_error_commands(source, generated)
+
+
 def test_no_command_rename_attribute() -> None:
     # The contract maps a registry entry to its fn name (last path segment). A `#[tauri::command(rename =
     # ...)]` would register a DIFFERENT name, silently breaking that mapping — pin that none exist.
@@ -184,9 +218,34 @@ def test_frontend_invokes_only_registered_commands() -> None:
     )
 
 
+def test_every_generated_command_uses_the_versioned_public_error() -> None:
+    invalid = sorted(generated_noncanonical_error_commands())
+    if invalid:
+        raise AssertionError(
+            "generated IPC commands still expose a non-CommandErrorV1 rejection contract: "
+            + ", ".join(invalid)
+        )
+
+
+def test_generated_error_scanner_rejects_string_and_missing_wrappers() -> None:
+    fixture = """
+const commands = {
+  good: () => typedError<number, CommandErrorV1>(__TAURI_INVOKE(\"good\")),
+  rawString: () => typedError<number, string>(__TAURI_INVOKE(\"raw_string\")),
+  missing: () => __TAURI_INVOKE(\"missing\"),
+};
+"""
+    assert _noncanonical_generated_error_commands(
+        fixture,
+        {"good", "raw_string", "missing"},
+    ) == {"raw_string", "missing"}
+
+
 def main() -> None:
     test_no_command_rename_attribute()
     test_frontend_invokes_only_registered_commands()
+    test_every_generated_command_uses_the_versioned_public_error()
+    test_generated_error_scanner_rejects_string_and_missing_wrappers()
     print("ipc contract policy regression passed")
 
 

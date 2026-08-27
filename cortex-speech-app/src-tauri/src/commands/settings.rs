@@ -11,7 +11,7 @@
 
 use super::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::ipc_contract::{
-    CloudConsentKindV1, CommandErrorV1, RendererSettingsV1, SetCloudConsentRequestV1, SettingValueV1,
+    ApiKeyProviderV1, CloudConsentKindV1, CommandErrorV1, RendererSettingsV1, SetCloudConsentRequestV1, SettingValueV1,
     SettingsPatchResultV1, SettingsPatchV1, SettingsSnapshotV1, SuggestedActionV1,
 };
 use crate::settings::AppSettings;
@@ -76,6 +76,29 @@ fn public_settings_error(code: &str, message: &str, retryable: bool) -> CommandE
     } else {
         error
     }
+}
+
+fn public_api_key_error(code: &str, message: &str, retryable: bool) -> CommandErrorV1 {
+    let error = CommandErrorV1::new(code, message, retryable);
+    if retryable {
+        error.suggested(SuggestedActionV1::Retry)
+    } else {
+        error.suggested(SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn validate_public_api_key(key: &str) -> Result<(), CommandErrorV1> {
+    let trimmed = key.trim();
+    if trimmed.chars().count() > crate::api_keys::MAX_API_KEY_CHARS
+        || trimmed.contains(|character: char| character.is_control() || character.is_whitespace())
+    {
+        return Err(CommandErrorV1::new(
+            "INVALID_API_KEY",
+            "The API key is malformed or exceeds the supported length.",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn settings_wire_bytes(settings: &AppSettings) -> Result<Vec<u8>, CommandErrorV1> {
@@ -454,10 +477,25 @@ pub fn set_cloud_consent_v1(
 /// Report which cloud providers have an API key configured (provider NAMES only — never the key
 /// values), so the user can confirm the keys they pasted into secrets.env were detected.
 #[tauri::command]
-pub fn get_configured_providers(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    RATE_LIMITER.check("get_configured_providers")?;
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let keys = crate::api_keys::ApiKeys::load(&data_dir)?;
+#[specta::specta]
+pub fn get_configured_providers(state: State<'_, AppState>) -> Result<Vec<String>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_configured_providers")
+        .map_err(|_| public_api_key_error("RATE_LIMITED", "The API-key status is busy. Retry in a moment.", true))?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| {
+        public_api_key_error(
+            "API_KEY_STORE_UNAVAILABLE",
+            "The local API-key store is unavailable. Open Health for recovery options.",
+            false,
+        )
+    })?;
+    let keys = crate::api_keys::ApiKeys::load(&data_dir).map_err(|_| {
+        public_api_key_error(
+            "API_KEY_STATUS_FAILED",
+            "The configured API-key status could not be read safely. Open Health for recovery options.",
+            false,
+        )
+    })?;
     Ok(keys.configured_providers().into_iter().map(String::from).collect())
 }
 
@@ -466,28 +504,76 @@ pub fn get_configured_providers(state: State<'_, AppState>) -> Result<Vec<String
 /// never stored in settings.json/DB. Returns the configured provider NAMES so the UI can refresh its
 /// set/unset badges without ever seeing the value again.
 #[tauri::command]
-pub fn set_api_key(provider: String, key: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    STRICT_RATE_LIMITER.check("set_api_key")?;
-    let name = match provider.as_str() {
-        "gemini" => "GEMINI_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        other => return Err(format!("unknown provider '{other}'")),
+#[specta::specta]
+pub fn set_api_key(
+    provider: ApiKeyProviderV1,
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("set_api_key")
+        .map_err(|_| public_api_key_error("RATE_LIMITED", "Too many API-key changes. Retry in a moment.", true))?;
+    validate_public_api_key(&key)?;
+    let name = match provider {
+        ApiKeyProviderV1::Gemini => "GEMINI_API_KEY",
+        ApiKeyProviderV1::Openrouter => "OPENROUTER_API_KEY",
     };
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| {
+        public_api_key_error(
+            "API_KEY_STORE_UNAVAILABLE",
+            "The local API-key store is unavailable. Open Health for recovery options.",
+            false,
+        )
+    })?;
     // P0.3 (2026-07-24 audit H4): DPAPI-encrypt the key at rest on Windows (the ship target) rather than
     // storing it plaintext — save_key_protected was built + unit-tested but never wired to production, so
     // the module header above (and the "privacy-first" posture) was capability theater. On non-Windows a
     // non-empty key ERRORS instead of silently storing plaintext under a "protected" API (the honest
     // fail-safe); clearing a key (empty value) still works everywhere. Existing plaintext keys keep
     // loading (parse_env_file reads both) and upgrade to a dpapi: blob the next time they are saved here.
-    crate::api_keys::ApiKeys::save_key_protected(&data_dir, name, &key)?;
-    let keys = crate::api_keys::ApiKeys::load(&data_dir)?;
+    crate::api_keys::ApiKeys::save_key_protected(&data_dir, name, &key).map_err(|_| {
+        public_api_key_error(
+            "API_KEY_SAVE_FAILED",
+            "The API key could not be saved safely. Open Health for recovery options.",
+            false,
+        )
+    })?;
+    let keys = crate::api_keys::ApiKeys::load(&data_dir).map_err(|_| {
+        public_api_key_error(
+            "API_KEY_STATUS_FAILED",
+            "The key was saved, but its configured status could not be reread safely. Open Health before retrying.",
+            false,
+        )
+    })?;
     Ok(keys.configured_providers().into_iter().map(String::from).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_ipc_is_closed_bounded_and_never_echoes_secret_material() {
+        assert_eq!(serde_json::to_value(ApiKeyProviderV1::Gemini).unwrap(), "gemini");
+        assert_eq!(serde_json::to_value(ApiKeyProviderV1::Openrouter).unwrap(), "openrouter");
+
+        let hostile = format!("token=secret\n{}", "x".repeat(crate::api_keys::MAX_API_KEY_CHARS + 1));
+        let error = validate_public_api_key(&hostile).expect_err("hostile secret must be refused");
+        let wire = serde_json::to_string(&error).expect("serialize public API-key error");
+        assert!(wire.contains("INVALID_API_KEY"));
+        assert!(!wire.contains("secret"));
+        assert!(!wire.contains("token"));
+        assert!(!wire.contains(&hostile));
+
+        let storage = public_api_key_error(
+            "API_KEY_SAVE_FAILED",
+            "The API key could not be saved safely. Open Health for recovery options.",
+            false,
+        );
+        let storage_wire = serde_json::to_string(&storage).unwrap();
+        assert!(!storage_wire.contains("C:\\"));
+        assert!(!storage_wire.contains("SQL"));
+    }
 
     fn patch(revision: i64, field: &str, value: SettingValueV1) -> SettingsPatchV1 {
         SettingsPatchV1 {

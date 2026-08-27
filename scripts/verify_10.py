@@ -1980,6 +1980,7 @@ def _fn_architecture_contract() -> bool:
 
         ipc_module = _load_ipc_policy_module()
         handwritten, generated, dynamic = ipc_module.frontend_invocations()
+        noncanonical_errors = ipc_module.generated_noncanonical_error_commands()
         if not generated:
             failures.append("ipc: generated command inventory is empty")
         if handwritten:
@@ -1989,6 +1990,11 @@ def _fn_architecture_contract() -> bool:
         if dynamic:
             failures.append(
                 f"ipc: {len(dynamic)} dynamic command-name bridge(s) remain; final target is zero"
+            )
+        if noncanonical_errors:
+            failures.append(
+                "ipc: generated command(s) expose a non-CommandErrorV1 rejection contract: "
+                + ", ".join(sorted(noncanonical_errors))
             )
 
         workspace_limits = {
@@ -2042,8 +2048,10 @@ def _fn_architecture_contract() -> bool:
                     "generatedCount": len(generated),
                     "handwrittenCount": len(handwritten),
                     "dynamicCount": len(dynamic),
+                    "noncanonicalErrorCount": len(noncanonical_errors),
                     "handwrittenCommands": sorted(handwritten),
                     "dynamicSites": sorted(dynamic),
+                    "noncanonicalErrorCommands": sorted(noncanonical_errors),
                 },
                 "frontend": {
                     "measurements": frontend_measurements,
@@ -4461,6 +4469,7 @@ def _validate_class_evidence_artifact(
             not isinstance(ipc, dict)
             or ipc.get("handwrittenCount") != 0
             or ipc.get("dynamicCount") != 0
+            or ipc.get("noncanonicalErrorCount") != 0
             or not isinstance(ipc.get("generatedCount"), int)
             or isinstance(ipc.get("generatedCount"), bool)
             or ipc.get("generatedCount", 0) <= 0

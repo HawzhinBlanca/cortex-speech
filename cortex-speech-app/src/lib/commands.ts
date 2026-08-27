@@ -94,7 +94,8 @@ export async function importAudioFile(path: string): Promise<{ status: string; s
 }
 
 export async function cancelOperation(): Promise<void> {
-  return invokeCritical('cancel_operation');
+  const result = await generatedCommands.cancelOperation();
+  if (result.status === 'error') throw result.error;
 }
 
 /**
@@ -709,7 +710,9 @@ export async function cancelDesktopPlaybackSessionV1(
  * values — so it is safe to surface in the UI.
  */
 export async function getConfiguredProviders(): Promise<string[]> {
-  return invokeCritical('get_configured_providers');
+  const result = await generatedCommands.getConfiguredProviders();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -718,7 +721,9 @@ export async function getConfiguredProviders(): Promise<string[]> {
  * provider NAMES is returned so the UI can refresh its set/unset badges.
  */
 export async function setApiKey(provider: 'gemini' | 'openrouter', key: string): Promise<string[]> {
-  return invokeCritical('set_api_key', { provider, key });
+  const result = await generatedCommands.setApiKey(provider, key);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** One reviewer's private way in. Each named reviewer gets their own token, so two people never share
@@ -902,7 +907,9 @@ export interface SessionState {
 
 /** Restore the last session's view-state, or null if there is no recent session. */
 export async function restoreSession(): Promise<SessionState | null> {
-  return invokeCritical('restore_session');
+  const result = await generatedCommands.restoreSession();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Persist the current search query + sort order so they survive a restart. */
@@ -911,12 +918,15 @@ export async function saveSession(
   sortOrder: string,
   filterVerified: boolean | null = null,
 ): Promise<void> {
-  return invokeCritical('save_session', { searchQuery, sortOrder, filterVerified });
+  const result = await generatedCommands.saveSession(searchQuery, sortOrder, filterVerified);
+  if (result.status === 'error') throw result.error;
 }
 
 /** Number of audio fingerprints stored for duplicate-import detection. */
 export async function getFingerprintCount(): Promise<number> {
-  return invokeCritical('get_fingerprint_count');
+  const result = await generatedCommands.getFingerprintCount();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Aggregate telemetry stats (snake_case, as serialized by the backend Tracer). */
@@ -1551,7 +1561,8 @@ export async function runWslRefinement(options: WslRefinementOptions): Promise<{
 }
 
 export async function cancelWslRefinement(): Promise<void> {
-  return invokeLegacy<void>('cancel_wsl_refinement');
+  const result = await generatedCommands.cancelWslRefinement();
+  if (result.status === 'error') throw result.error;
 }
 
 export interface ConformalCertificate {

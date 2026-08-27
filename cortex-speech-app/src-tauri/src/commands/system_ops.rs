@@ -630,7 +630,8 @@ pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) 
 }
 
 #[tauri::command]
-pub fn cancel_operation(state: State<'_, AppState>) -> Result<(), String> {
+#[specta::specta]
+pub fn cancel_operation(state: State<'_, AppState>) -> Result<(), crate::ipc_contract::CommandErrorV1> {
     state.cancel_current_operation();
     Ok(())
 }
@@ -1167,7 +1168,8 @@ fn run_wsl_refinement_loop(
 }
 
 #[tauri::command]
-pub fn cancel_wsl_refinement() -> Result<(), String> {
+#[specta::specta]
+pub fn cancel_wsl_refinement() -> Result<(), crate::ipc_contract::CommandErrorV1> {
     // Only arm the cancel while a batch is actually running, so an idle cancel can't leak into and
     // immediately abort the NEXT run. Signals the batch loop (checked between segments) and the
     // in-flight per-segment spawn (which polls this same flag and kills its child) to stop; there is

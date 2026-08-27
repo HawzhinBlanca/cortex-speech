@@ -82,6 +82,18 @@ export const commands = {
 	 *  before persistence; grants become effective only after durable settings publication.
 	 */
 	setCloudConsentV1: (request: SetCloudConsentRequestV1) => typedError<SettingsPatchResultV1, CommandErrorV1>(__TAURI_INVOKE("set_cloud_consent_v1", { request })),
+	/**
+	 *  Report which cloud providers have an API key configured (provider NAMES only — never the key
+	 *  values), so the user can confirm the keys they pasted into secrets.env were detected.
+	 */
+	getConfiguredProviders: () => typedError<string[], CommandErrorV1>(__TAURI_INVOKE("get_configured_providers")),
+	/**
+	 *  Save one provider API key into `secrets.env` from the Settings UI (an empty key clears it).
+	 *  The key value goes straight to the local secrets file — it is never logged, never echoed back, and
+	 *  never stored in settings.json/DB. Returns the configured provider NAMES so the UI can refresh its
+	 *  set/unset badges without ever seeing the value again.
+	 */
+	setApiKey: (provider: ApiKeyProviderV1, key: string) => typedError<string[], CommandErrorV1>(__TAURI_INVOKE("set_api_key", { provider, key })),
 	undo: () => typedError<HistoryMutationResultV1, CommandErrorV1>(__TAURI_INVOKE("undo")),
 	redo: () => typedError<HistoryMutationResultV1, CommandErrorV1>(__TAURI_INVOKE("redo")),
 	getHistoryStatusV1: () => typedError<HistoryStatusV1, CommandErrorV1>(__TAURI_INVOKE("get_history_status_v1")),
@@ -90,7 +102,23 @@ export const commands = {
 	getTracingStats: () => typedError<TracingStatsV1, CommandErrorV1>(__TAURI_INVOKE("get_tracing_stats")),
 	getRecentSpans: (count: number | null) => typedError<TracingSpanV1[], CommandErrorV1>(__TAURI_INVOKE("get_recent_spans", { count })),
 	clearTracingSpans: () => typedError<null, CommandErrorV1>(__TAURI_INVOKE("clear_tracing_spans")),
+	/**
+	 *  Persist the user's view-state (search query + sort order) so it survives a restart. The values
+	 *  are held in the session manager so the periodic counts-only auto_save preserves them too.
+	 */
+	saveSession: (searchQuery: string, sortOrder: string, filterVerified: boolean | null) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("save_session", { searchQuery, sortOrder, filterVerified })),
+	restoreSession: () => typedError<{
+	search_query: string,
+	sort_order: string,
+	selected_segment_id: string | null,
+	filter_verified: boolean | null,
+	segment_count: number,
+	verified_count: number,
+} | null, CommandErrorV1>(__TAURI_INVOKE("restore_session")),
 	getInferenceStats: () => typedError<InferenceStatsV1, CommandErrorV1>(__TAURI_INVOKE("get_inference_stats")),
+	getFingerprintCount: () => typedError<number, CommandErrorV1>(__TAURI_INVOKE("get_fingerprint_count")),
+	cancelOperation: () => typedError<null, CommandErrorV1>(__TAURI_INVOKE("cancel_operation")),
+	cancelWslRefinement: () => typedError<null, CommandErrorV1>(__TAURI_INVOKE("cancel_wsl_refinement")),
 	appHealth: () => typedError<AppHealthV1, CommandErrorV1>(__TAURI_INVOKE("app_health")),
 	/**
 	 *  Return a generic renderer-safe notice when the previous session left any crash report, surfaced
@@ -161,6 +189,12 @@ export type ActiveVoiceFocusV1 = {
 	focusId: string,
 	segmentCount: number,
 };
+
+/**
+ *  Closed provider selector for the explicit secret mutation command. Unknown strings never reach
+ *  the secret store, and the key value itself is never returned by any public DTO.
+ */
+export type ApiKeyProviderV1 = "gemini" | "openrouter";
 
 export type AppHealthV1 = {
 	status: string,
@@ -473,6 +507,20 @@ export type SegmentsPage = {
 	 *  announced a 15,262-clip library as finished (review 2026-08-20).
 	 */
 	focusNarrowed?: boolean,
+};
+
+/**
+ *  Minimal complete view-state returned to the renderer after crash/session recovery. Internal
+ *  versioning, timestamps and reserved panel fields stay backend-owned rather than becoming a
+ *  permanently optional public contract through `SessionState`'s compatibility defaults.
+ */
+export type SessionStateV1 = {
+	search_query: string,
+	sort_order: string,
+	selected_segment_id: string | null,
+	filter_verified: boolean | null,
+	segment_count: number,
+	verified_count: number,
 };
 
 export type SetCloudConsentRequestV1 = {

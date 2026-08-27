@@ -24,8 +24,6 @@ export const LEGACY_IPC_COMMANDS = [
   'batch_transcribe',
   'bootstrap_legacy_champion',
   'build_scorecard',
-  'cancel_operation',
-  'cancel_wsl_refinement',
   'check_agentic_readiness',
   'compute_signal_anomaly_scores',
   'couch_review_status',
@@ -44,13 +42,11 @@ export const LEGACY_IPC_COMMANDS = [
   'get_active_learning_queue',
   'get_audio_health',
   'get_champion_engine_status',
-  'get_configured_providers',
   'get_dataset_certificate',
   'get_dataset_quality',
   'get_dataset_stats',
   'get_escalation_queue',
   'get_escalation_rate_trend',
-  'get_fingerprint_count',
   'get_intelligence_report',
   'get_interrupted_import',
   'get_jobs',
@@ -80,7 +76,6 @@ export const LEGACY_IPC_COMMANDS = [
   'register_review_media_asset',
   'relink_audio',
   'restore_db_from_snapshot',
-  'restore_session',
   'resume_interrupted_import',
   'reviewer_throughput',
   'revoke_couch_reviewer',
@@ -88,8 +83,6 @@ export const LEGACY_IPC_COMMANDS = [
   'run_jury_pipeline',
   'run_t2_for_segment',
   'run_wsl_refinement',
-  'save_session',
-  'set_api_key',
   'spot_check_report',
   'start_champion_engine',
   'start_couch_review',
@@ -113,7 +106,6 @@ type CriticalLegacyIpcContract = {
     result: CommandResult<'discardInterruptedImport'>;
   };
   import_audio_file: { args: { path: string }; result: CommandResult<'importAudioFile'> };
-  cancel_operation: { args: undefined; result: CommandResult<'cancelOperation'> };
   export_dataset: {
     args: { path: string; format: string };
     result: CommandResult<'exportDataset'>;
@@ -131,14 +123,6 @@ type CriticalLegacyIpcContract = {
     result: CommandResult<'registerReviewMediaAsset'>;
   };
   get_media_asset_url: { args: { id: string }; result: CommandResult<'getMediaAssetUrl'> };
-  get_configured_providers: {
-    args: undefined;
-    result: CommandResult<'getConfiguredProviders'>;
-  };
-  set_api_key: {
-    args: { provider: 'gemini' | 'openrouter'; key: string };
-    result: CommandResult<'setApiKey'>;
-  };
   start_couch_review: {
     args: { reviewers: string[] };
     result: CommandResult<'startCouchReview'>;
@@ -184,18 +168,12 @@ type CriticalLegacyIpcContract = {
     };
     result: CommandResult<'bootstrapLegacyChampion'>;
   };
-  restore_session: { args: undefined; result: CommandResult<'restoreSession'> };
-  save_session: {
-    args: { searchQuery: string; sortOrder: string; filterVerified: boolean | null };
-    result: CommandResult<'saveSession'>;
-  };
   get_quarantine_notice: { args: undefined; result: CommandResult<'getQuarantineNotice'> };
   list_db_snapshots: { args: undefined; result: CommandResult<'listDbSnapshots'> };
   restore_db_from_snapshot: {
     args: { name: string };
     result: CommandResult<'restoreDbFromSnapshot'>;
   };
-  get_fingerprint_count: { args: undefined; result: CommandResult<'getFingerprintCount'> };
   get_audio_health: { args: undefined; result: CommandResult<'getAudioHealth'> };
   relink_audio: { args: { searchDir: string }; result: CommandResult<'relinkAudio'> };
   validate_dataset_cmd: { args: undefined; result: CommandResult<'validateDataset'> };

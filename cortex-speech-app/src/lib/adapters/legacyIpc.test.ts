@@ -49,6 +49,24 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('get_recent_spans');
   // @ts-expect-error the one-shot crash notice is generated and renderer-safe
   void invokeLegacy<unknown>('take_last_crash');
+  // @ts-expect-error duplicate-audio diagnostics use the generated typed contract
+  void invokeCritical('get_fingerprint_count');
+  // @ts-expect-error cancellation is a generated domain, never a handwritten escape hatch
+  void invokeCritical('cancel_operation');
+  // @ts-expect-error the dedicated refinement cancel signal is generated too
+  void invokeLegacy<unknown>('cancel_wsl_refinement');
+  // @ts-expect-error API-key status and mutation use one generated closed provider domain
+  void invokeCritical('get_configured_providers');
+  // @ts-expect-error secrets cannot regain the handwritten IPC surface
+  void invokeCritical('set_api_key', { provider: 'gemini', key: 'secret' });
+  // @ts-expect-error session persistence is generated and renderer-safe
+  void invokeCritical('save_session', {
+    searchQuery: '',
+    sortOrder: 'newest',
+    filterVerified: null,
+  });
+  // @ts-expect-error session restore uses the generated SessionState shape
+  void invokeCritical('restore_session');
   // @ts-expect-error the library segment/page contract is generated and typed
   void invokeLegacy<unknown>('get_segment');
   // @ts-expect-error contextual batch ids cannot regress into handwritten IPC

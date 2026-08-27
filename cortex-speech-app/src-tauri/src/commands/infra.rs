@@ -37,6 +37,21 @@ fn diff_rate_limited_error() -> CommandErrorV1 {
         .suggested(SuggestedActionV1::Retry)
 }
 
+fn public_session_error(code: &str, message: &str, retryable: bool) -> CommandErrorV1 {
+    let error = CommandErrorV1::new(code, message, retryable);
+    if retryable {
+        error.suggested(SuggestedActionV1::Retry)
+    } else {
+        error.suggested(SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn validate_public_session_state(search_query: &str, sort_order: &str) -> Result<(), CommandErrorV1> {
+    validate::validate_text(search_query, 1000, "search_query")
+        .and_then(|_| validate::validate_text(sort_order, 64, "sort_order"))
+        .map_err(|_| CommandErrorV1::new("INVALID_SESSION_STATE", "The saved workspace view is invalid.", false))
+}
+
 fn validate_public_diff_input(raw: &str, annotated: &str) -> Result<(), CommandErrorV1> {
     validate::validate_text(raw, 100_000, "Raw text")
         .and_then(|_| validate::validate_text(annotated, 100_000, "Annotated text"))
@@ -139,9 +154,15 @@ pub fn get_media_asset_url(id: String, state: State<'_, AppState>) -> Result<Str
     result
 }
 
+fn fingerprint_count_rate_limited_error() -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", "The duplicate-audio summary is busy. Retry in a moment.", true)
+        .suggested(SuggestedActionV1::Retry)
+}
+
 #[tauri::command]
-pub fn get_fingerprint_count(state: State<'_, AppState>) -> Result<usize, String> {
-    RATE_LIMITER.check("get_fingerprint_count")?;
+#[specta::specta]
+pub fn get_fingerprint_count(state: State<'_, AppState>) -> Result<usize, CommandErrorV1> {
+    RATE_LIMITER.check("get_fingerprint_count").map_err(|_| fingerprint_count_rate_limited_error())?;
     Ok(state.fingerprint.count())
 }
 
@@ -189,6 +210,47 @@ mod typed_diff_ipc_tests {
         assert!(wire.contains("INVALID_DIFF_INPUT"));
         assert!(!wire.contains("secret"));
         assert!(!wire.contains("token"));
+    }
+}
+
+#[cfg(test)]
+mod typed_fingerprint_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_rate_limit_is_stable_typed_and_renderer_safe() {
+        let error = fingerprint_count_rate_limited_error();
+        let wire = serde_json::to_value(error).expect("serialize fingerprint error");
+        assert_eq!(wire["schema"], 1);
+        assert_eq!(wire["code"], "RATE_LIMITED");
+        assert_eq!(wire["retryable"], true);
+        assert_eq!(wire["suggestedAction"], "retry");
+        assert!(wire.get("sql").is_none());
+        assert!(!wire.to_string().contains("C:\\"));
+    }
+}
+
+#[cfg(test)]
+mod typed_session_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn session_errors_are_stable_bounded_and_renderer_safe() {
+        let hostile = format!("token=secret {}", "x".repeat(1_001));
+        let error = validate_public_session_state(&hostile, "newest").expect_err("oversized state must refuse");
+        let wire = serde_json::to_string(&error).expect("serialize session validation error");
+        assert!(wire.contains("INVALID_SESSION_STATE"));
+        assert!(!wire.contains("secret"));
+        assert!(!wire.contains("token"));
+
+        let storage = public_session_error(
+            "SESSION_SAVE_FAILED",
+            "The workspace view could not be saved. Open Health for recovery options.",
+            false,
+        );
+        let storage_wire = serde_json::to_string(&storage).unwrap();
+        assert!(!storage_wire.contains("C:\\"));
+        assert!(!storage_wire.contains("SQL"));
     }
 }
 
@@ -251,31 +313,50 @@ mod typed_diagnostics_ipc_tests {
 /// Persist the user's view-state (search query + sort order) so it survives a restart. The values
 /// are held in the session manager so the periodic counts-only auto_save preserves them too.
 #[tauri::command]
+#[specta::specta]
 pub fn save_session(
     search_query: String,
     sort_order: String,
     filter_verified: Option<bool>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<(), CommandErrorV1> {
     // Throttle like every other infra.rs command: save_session is a webview-reachable DB write taken
     // under the GLOBAL db lock, and it was the lone one here without a limiter. The frontend debounces
     // it to ~1/800ms, so this never rejects a legitimate save — it only stops a webview loop that
     // bypasses the debounce from pinning the db lock and starving get_segments et al. (same class as
     // export_audio round-22 #5 / register_media_asset round-25 #7).
-    RATE_LIMITER.check("save_session")?;
-    validate::validate_text(&search_query, 1000, "search_query")?;
-    validate::validate_text(&sort_order, 64, "sort_order")?;
+    RATE_LIMITER
+        .check("save_session")
+        .map_err(|_| public_session_error("RATE_LIMITED", "Session saving is busy. Retry in a moment.", true))?;
+    validate_public_session_state(&search_query, &sort_order)?;
     let db = state.lock_db();
     let mut session = state.lock_session();
     session.set_view_state(search_query, sort_order, filter_verified);
-    session.save(&db).map_err(|e| e.to_string())
+    session.save(&db).map_err(|_| {
+        public_session_error(
+            "SESSION_SAVE_FAILED",
+            "The workspace view could not be saved. Open Health for recovery options.",
+            false,
+        )
+    })
 }
 
 #[tauri::command]
-pub fn restore_session(state: State<'_, AppState>) -> Result<Option<crate::session::SessionState>, String> {
-    RATE_LIMITER.check("restore_session")?;
+#[specta::specta]
+pub fn restore_session(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::ipc_contract::SessionStateV1>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("restore_session")
+        .map_err(|_| public_session_error("RATE_LIMITED", "Session recovery is busy. Retry in a moment.", true))?;
     let mut session = state.lock_session();
-    session.restore().map_err(|e| e.to_string())
+    session.restore().map(|state| state.map(Into::into)).map_err(|_| {
+        public_session_error(
+            "SESSION_RESTORE_FAILED",
+            "The previous workspace view could not be restored. Open Health for recovery options.",
+            false,
+        )
+    })
 }
 
 /// Start Couch Review — the LAN-only, token-gated phone review server (see couch.rs for the privacy
