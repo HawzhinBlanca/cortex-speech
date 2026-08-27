@@ -478,12 +478,14 @@ export const en = {
   'diff.removed': 'removed',
   'diff.changed': 'changed',
   ready: 'Ready',
-  'import.interrupted':
-    'An import of {dir} was interrupted ({done}/{total} files done). Resume it?',
+  'import.interrupted': 'An import was interrupted ({done}/{total} files done). Resume it?',
   'import.resume': 'Resume',
   'import.discard': 'Discard',
   'import.resumeStarted': 'Resuming import — already-done files are skipped.',
   'import.resumeFailed': 'Could not resume the import',
+  'import.discardFailed': 'Could not discard the interrupted import',
+  'import.recoveryBusy': 'Finishing the current import recovery action.',
+  'import.recoveryCheckFailed': 'Could not check for an interrupted import',
   importComplete: 'Import complete',
   importFailed: 'Import failed',
   eventListenersFailed: 'Failed to start event listeners',
@@ -678,6 +680,7 @@ export const en = {
   'db.quarantineAcknowledged':
     '{count} quarantined file(s) archived to the quarantine folder - snapshot pruning resumed',
   'db.quarantineAcknowledgeFailed': 'Could not archive the quarantined files',
+  'db.quarantineCheckFailed': 'Could not check database quarantine state',
   'stats.buildSha': 'Build',
   // Audit 2026-08-05 #4 read "Audio fingerprints: 0" beside "Total segments: 144" and concluded
   // legacy data was never backfilled. It is not a corpus statistic at all — the fingerprint map is

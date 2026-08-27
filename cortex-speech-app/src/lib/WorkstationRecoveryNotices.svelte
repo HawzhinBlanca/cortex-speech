@@ -5,6 +5,7 @@
   interface Props {
     quarantineNotice: QuarantineNotice | null;
     interruptedImport: ImportJob | null;
+    importRecoveryBusy: boolean;
     onAcknowledgeQuarantine: () => void;
     onDismissQuarantine: () => void;
     onResumeImport: () => void;
@@ -14,6 +15,7 @@
   let {
     quarantineNotice,
     interruptedImport,
+    importRecoveryBusy,
     onAcknowledgeQuarantine,
     onDismissQuarantine,
     onResumeImport,
@@ -56,18 +58,23 @@
   <div
     class="flex items-center justify-between gap-3 border-b border-amber-600/40 bg-amber-950/40 px-4 py-2"
     data-testid="resume-import-banner"
+    aria-busy={importRecoveryBusy}
   >
     <span class="text-sm text-amber-200">
       {$t('import.interrupted')
-        .replace('{done}', String(interruptedImport.completedPaths.length))
-        .replace('{total}', String(interruptedImport.totalFiles))
-        .replace('{dir}', interruptedImport.dir)}
+        .replace('{done}', String(interruptedImport.completedCount))
+        .replace('{total}', String(interruptedImport.totalFiles))}
     </span>
+    {#if importRecoveryBusy}
+      <span id="import-recovery-busy-reason" class="sr-only">{$t('import.recoveryBusy')}</span>
+    {/if}
     <div class="flex items-center gap-2">
       <button
         type="button"
         class="btn btn-primary !text-xs"
         data-testid="resume-import-btn"
+        disabled={importRecoveryBusy}
+        aria-describedby={importRecoveryBusy ? 'import-recovery-busy-reason' : undefined}
         onclick={onResumeImport}
       >
         {$t('import.resume')}
@@ -76,6 +83,8 @@
         type="button"
         class="btn btn-ghost !text-xs"
         data-testid="dismiss-import-btn"
+        disabled={importRecoveryBusy}
+        aria-describedby={importRecoveryBusy ? 'import-recovery-busy-reason' : undefined}
         onclick={onDismissImport}
       >
         {$t('import.discard')}

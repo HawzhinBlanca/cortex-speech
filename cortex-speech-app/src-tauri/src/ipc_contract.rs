@@ -709,7 +709,10 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_quarantine_notice,
             crate::commands::acknowledge_quarantine,
             crate::commands::list_db_snapshots,
-            crate::commands::restore_db_from_snapshot
+            crate::commands::restore_db_from_snapshot,
+            crate::commands::get_interrupted_import,
+            crate::commands::discard_interrupted_import,
+            crate::commands::resume_interrupted_import
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
@@ -758,6 +761,9 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<crate::commands::BackupVerificationV1>()
         .typ::<crate::commands::QuarantineNoticeV1>()
         .typ::<crate::commands::SnapshotInfoV1>()
+        .typ::<crate::commands::ImportJobV1>()
+        .typ::<crate::commands::ImportResumeStatusV1>()
+        .typ::<crate::commands::ImportResumeV1>()
         .typ::<HistoryActionV1>()
         .typ::<HistoryStatusV1>()
         .typ::<HistoryMutationResultV1>()

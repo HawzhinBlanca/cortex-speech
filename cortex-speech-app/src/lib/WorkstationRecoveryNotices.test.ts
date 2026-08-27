@@ -20,6 +20,7 @@ describe('WorkstationRecoveryNotices', () => {
         newestSnapshotSegments: 42,
       },
       interruptedImport: null,
+      importRecoveryBusy: false,
       onAcknowledgeQuarantine,
       onDismissQuarantine,
       onResumeImport: vi.fn(),
@@ -35,5 +36,57 @@ describe('WorkstationRecoveryNotices', () => {
     await fireEvent.click(screen.getByTestId('dismiss-quarantine-btn'));
     expect(onAcknowledgeQuarantine).toHaveBeenCalledOnce();
     expect(onDismissQuarantine).toHaveBeenCalledOnce();
+  });
+
+  it('renders path-free interrupted-import progress and wires resume and discard', async () => {
+    const onResumeImport = vi.fn();
+    const onDismissImport = vi.fn();
+    render(WorkstationRecoveryNotices, {
+      quarantineNotice: null,
+      interruptedImport: {
+        id: 'import-job-1',
+        totalFiles: 19,
+        completedCount: 7,
+        createdAt: '2026-08-28T10:00:00Z',
+      },
+      importRecoveryBusy: false,
+      onAcknowledgeQuarantine: vi.fn(),
+      onDismissQuarantine: vi.fn(),
+      onResumeImport,
+      onDismissImport,
+    });
+
+    const banner = screen.getByTestId('resume-import-banner');
+    expect(banner).toHaveTextContent('7/19 files done');
+    expect(banner).not.toHaveTextContent('C:');
+
+    await fireEvent.click(screen.getByTestId('resume-import-btn'));
+    await fireEvent.click(screen.getByTestId('dismiss-import-btn'));
+    expect(onResumeImport).toHaveBeenCalledOnce();
+    expect(onDismissImport).toHaveBeenCalledOnce();
+  });
+
+  it('blocks duplicate recovery actions while one durable command is in flight', () => {
+    render(WorkstationRecoveryNotices, {
+      quarantineNotice: null,
+      interruptedImport: {
+        id: 'import-job-1',
+        totalFiles: 2,
+        completedCount: 1,
+        createdAt: '2026-08-28T10:00:00Z',
+      },
+      importRecoveryBusy: true,
+      onAcknowledgeQuarantine: vi.fn(),
+      onDismissQuarantine: vi.fn(),
+      onResumeImport: vi.fn(),
+      onDismissImport: vi.fn(),
+    });
+
+    expect(screen.getByTestId('resume-import-banner')).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByTestId('resume-import-btn')).toBeDisabled();
+    expect(screen.getByTestId('dismiss-import-btn')).toBeDisabled();
+    expect(screen.getByTestId('resume-import-btn')).toHaveAccessibleDescription(
+      'Finishing the current import recovery action.',
+    );
   });
 });

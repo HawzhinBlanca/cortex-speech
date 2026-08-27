@@ -11,6 +11,7 @@
   import * as api from './lib/commands';
   import { createAutosaveController, flushAutosaveForIds } from './lib/autosave';
   import { createSegmentMetadataCoordinator } from './lib/segmentMetadataCoordinator';
+  import { createImportRecoveryController } from './lib/importRecoveryController';
   import { registerDurableCloseGuard } from './lib/closeGuard';
   import { chooseDirectory, saveFile } from './lib/fileDialogs';
   import { flushReviewDrafts } from './lib/reviewDraftFlush';
@@ -203,30 +204,25 @@
 
   // P3.2: a crashed directory import offered for resume at startup.
   let interruptedImport = $state<import('./lib/commands').ImportJob | null>(null);
+  let importRecoveryBusy = $state(false);
   // B2: non-null when a corruption quarantine happened; the banner stays until dismissed this session.
   let quarantineNotice = $state<import('./lib/commands').QuarantineNotice | null>(null);
-  async function resumeImport() {
-    const job = interruptedImport;
-    if (!job) return;
-    interruptedImport = null;
-    try {
-      await api.resumeInterruptedImport();
-      notifications.success($t('import.resumeStarted'));
-    } catch (e) {
-      notifications.error($t('import.resumeFailed'), { cause: e });
-    }
-  }
-  async function dismissInterruptedImport() {
-    const job = interruptedImport;
-    if (!job) return;
-    interruptedImport = null;
-    try {
-      await api.discardInterruptedImport(job.id);
-    } catch (e) {
-      console.error('Discard interrupted import failed:', e);
-    }
-  }
-
+  const importRecovery = createImportRecoveryController({
+    currentJob: () => interruptedImport,
+    setBusy: (busy) => (importRecoveryBusy = busy),
+    clearIfCurrent: (id) => {
+      if (interruptedImport?.id === id) interruptedImport = null;
+    },
+    load: api.getInterruptedImport,
+    replaceCurrent: (job) => (interruptedImport = job),
+    resume: api.resumeInterruptedImport,
+    discard: api.discardInterruptedImport,
+    onResumeSuccess: () => notifications.success($t('import.resumeStarted')),
+    onResumeFailure: (error) => notifications.error($t('import.resumeFailed'), { cause: error }),
+    onDiscardFailure: (error) => notifications.error($t('import.discardFailed'), { cause: error }),
+    onLoadFailure: (error) =>
+      notifications.error($t('import.recoveryCheckFailed'), { cause: error }),
+  });
   async function acknowledgeQuarantine() {
     try {
       const moved = await api.acknowledgeQuarantine();
@@ -534,6 +530,7 @@
             notifications.success($t('openFile.imported'));
           }
         } else {
+          await importRecovery.reconcile();
           statusMessage.set($t('importComplete'));
         }
       } catch (e) {
@@ -582,13 +579,16 @@
       await loadSettings();
       await restoreAndApplySession();
       // P3.2: a still-'running' import job at startup means a crash interrupted a directory import.
-      interruptedImport = await api.getInterruptedImport().catch(() => null);
+      await importRecovery.reconcile();
       // B2: a past corruption event quarantined a database file — say so LOUDLY, with the restore
       // count, instead of letting the owner work on silently in an empty library.
       quarantineNotice = await api
         .getQuarantineNotice()
         .then((n) => (n.quarantinedFileCount > 0 ? n : null))
-        .catch(() => null);
+        .catch((error) => {
+          notifications.error($t('db.quarantineCheckFailed'), { cause: error });
+          return null;
+        });
       // Surface silent safety-net failures (auto-snapshot down, low disk, missing models) at startup
       // and every 5 minutes thereafter.
       void checkHealthAndWarn();
@@ -1711,10 +1711,11 @@
   <WorkstationRecoveryNotices
     {quarantineNotice}
     {interruptedImport}
+    {importRecoveryBusy}
     onAcknowledgeQuarantine={() => void acknowledgeQuarantine()}
     onDismissQuarantine={() => (quarantineNotice = null)}
-    onResumeImport={() => void resumeImport()}
-    onDismissImport={() => void dismissInterruptedImport()}
+    onResumeImport={() => void importRecovery.resume()}
+    onDismissImport={() => void importRecovery.discard()}
   />
   <WorkstationHeader
     {tauriAvailable}

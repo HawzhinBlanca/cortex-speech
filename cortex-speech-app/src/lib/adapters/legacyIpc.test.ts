@@ -98,6 +98,12 @@ const compileTimeContractProof = (): void => {
   void invokeCritical('db_backup', { dest: 'D:/proof/library.db' });
   // @ts-expect-error destructive restore cannot regress into the handwritten boundary
   void invokeCritical('db_restore', { src: 'D:/proof/library.db' });
+  // @ts-expect-error interrupted-import discovery is generated and path-scrubbed
+  void invokeCritical('get_interrupted_import');
+  // @ts-expect-error interrupted-import resume cannot regress into handwritten IPC
+  void invokeLegacy<unknown>('resume_interrupted_import');
+  // @ts-expect-error interrupted-import discard uses the generated typed identity
+  void invokeCritical('discard_interrupted_import', { jobId: 'job-1' });
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings
   void invokeLegacy<unknown>('runtime_' + 'command');
 };

@@ -244,6 +244,24 @@ export const commands = {
 	acknowledgeQuarantine: () => typedError<number, CommandErrorV1>(__TAURI_INVOKE("acknowledge_quarantine")),
 	listDbSnapshots: () => typedError<SnapshotInfoV1[], CommandErrorV1>(__TAURI_INVOKE("list_db_snapshots")),
 	restoreDbFromSnapshot: (name: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("restore_db_from_snapshot", { name })),
+	/**
+	 *  P3.2: the crashed directory import to resume, if any. Query at STARTUP — when no import is active,
+	 *  a still-'running' job is a crash.
+	 */
+	getInterruptedImport: () => typedError<{
+	id: string,
+	totalFiles: number,
+	completedCount: number,
+	createdAt: string,
+} | null, CommandErrorV1>(__TAURI_INVOKE("get_interrupted_import")),
+	// P3.2: discard an interrupted import job (the user chose not to resume).
+	discardInterruptedImport: (jobId: string) => typedError<null, CommandErrorV1>(__TAURI_INVOKE("discard_interrupted_import", { jobId })),
+	/**
+	 *  P3.2: resume the interrupted directory import — re-run its folder, skipping files already imported
+	 *  in the crashed run (their segments persisted per-file). Retires the old crashed job so it is not
+	 *  offered again; the fresh import job now tracks progress.
+	 */
+	resumeInterruptedImport: (jobId: string) => typedError<ImportResumeV1, CommandErrorV1>(__TAURI_INVOKE("resume_interrupted_import", { jobId })),
 };
 
 /* Types */
@@ -500,6 +518,26 @@ export type HistoryMutationResultV1 = {
 export type HistoryStatusV1 = {
 	undoAction: HistoryActionV1 | null,
 	redoAction: HistoryActionV1 | null,
+};
+
+/**
+ *  Renderer-safe view of one durable interrupted-import journal. The source directory and every
+ *  completed absolute path remain backend-only; the owner needs identity and progress to resume or
+ *  discard, not a copy of private filesystem history in the webview.
+ */
+export type ImportJobV1 = {
+	id: string,
+	totalFiles: number,
+	completedCount: number,
+	createdAt: string,
+};
+
+export type ImportResumeStatusV1 = "started";
+
+export type ImportResumeV1 = {
+	status: ImportResumeStatusV1,
+	resuming: boolean,
+	importJobId: string,
 };
 
 export type InferenceKindStatsV1 = {

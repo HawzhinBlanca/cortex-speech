@@ -19,6 +19,8 @@ import type {
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1,
+  ImportJobV1,
+  ImportResumeV1,
   JobV1,
   MediaGrant,
   ModelDownloadSummaryV1,
@@ -77,25 +79,24 @@ export async function importDirectory(): Promise<{ status: string }> {
   return invokeCritical('import_directory');
 }
 
-/** P3.2: a directory import interrupted by a crash, offered for resume at startup. */
-export interface ImportJob {
-  id: string;
-  dir: string;
-  totalFiles: number;
-  completedPaths: string[];
-  createdAt: string;
-}
+/** Renderer-safe progress for a directory import interrupted by a crash. */
+export type ImportJob = ImportJobV1;
 
 export async function getInterruptedImport(): Promise<ImportJob | null> {
-  return invokeCritical('get_interrupted_import');
+  const result = await generatedCommands.getInterruptedImport();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export async function resumeInterruptedImport(): Promise<{ status: string; resuming: boolean }> {
-  return invokeCritical('resume_interrupted_import');
+export async function resumeInterruptedImport(jobId: string): Promise<ImportResumeV1> {
+  const result = await generatedCommands.resumeInterruptedImport(jobId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function discardInterruptedImport(jobId: string): Promise<void> {
-  return invokeCritical('discard_interrupted_import', { jobId });
+  const result = await generatedCommands.discardInterruptedImport(jobId);
+  if (result.status === 'error') throw result.error;
 }
 
 export async function importAudioFile(path: string): Promise<{ status: string; source?: string }> {

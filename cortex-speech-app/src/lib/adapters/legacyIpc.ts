@@ -26,7 +26,6 @@ export const LEGACY_IPC_COMMANDS = [
   'compute_signal_anomaly_scores',
   'couch_review_status',
   'create_gold_from_file',
-  'discard_interrupted_import',
   'export_agreement_sample',
   'export_audio',
   'export_dataset',
@@ -39,7 +38,6 @@ export const LEGACY_IPC_COMMANDS = [
   'get_escalation_queue',
   'get_escalation_rate_trend',
   'get_intelligence_report',
-  'get_interrupted_import',
   'get_segment_consensus',
   'get_waveform',
   'import_audio_file',
@@ -53,7 +51,6 @@ export const LEGACY_IPC_COMMANDS = [
   'record_review_flag',
   'rediarize_segments',
   'relink_audio',
-  'resume_interrupted_import',
   'reviewer_throughput',
   'revoke_couch_reviewer',
   'run_gold_eval_asr',
@@ -72,15 +69,6 @@ export const LEGACY_IPC_COMMANDS = [
 type CriticalLegacyIpcContract = {
   open_audio_file: { args: undefined; result: CommandResult<'openAudioFile'> };
   import_directory: { args: undefined; result: CommandResult<'importDirectory'> };
-  get_interrupted_import: { args: undefined; result: CommandResult<'getInterruptedImport'> };
-  resume_interrupted_import: {
-    args: undefined;
-    result: CommandResult<'resumeInterruptedImport'>;
-  };
-  discard_interrupted_import: {
-    args: { jobId: string };
-    result: CommandResult<'discardInterruptedImport'>;
-  };
   import_audio_file: { args: { path: string }; result: CommandResult<'importAudioFile'> };
   export_dataset: {
     args: { path: string; format: string };

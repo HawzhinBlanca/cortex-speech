@@ -2,6 +2,117 @@
 
 use super::*;
 
+use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
+
+/// Renderer-safe view of one durable interrupted-import journal. The source directory and every
+/// completed absolute path remain backend-only; the owner needs identity and progress to resume or
+/// discard, not a copy of private filesystem history in the webview.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportJobV1 {
+    pub id: String,
+    pub total_files: usize,
+    pub completed_count: usize,
+    pub created_at: String,
+}
+
+impl From<crate::db::ImportJob> for ImportJobV1 {
+    fn from(value: crate::db::ImportJob) -> Self {
+        Self {
+            id: value.id,
+            total_files: value.total_files,
+            completed_count: value.completed_paths.len(),
+            created_at: value.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportResumeStatusV1 {
+    Started,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportResumeV1 {
+    pub status: ImportResumeStatusV1,
+    pub resuming: bool,
+    pub import_job_id: String,
+}
+
+fn import_rate_limited_error() -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", "Import recovery is busy. Wait a moment, then retry.", true)
+        .suggested(SuggestedActionV1::Retry)
+}
+
+fn import_not_ready_error() -> CommandErrorV1 {
+    CommandErrorV1::new(
+        crate::DEDUP_INDEX_UNAVAILABLE_CODE,
+        "Audio import is disabled because duplicate protection could not be verified. Open Health before importing.",
+        false,
+    )
+    .suggested(SuggestedActionV1::OpenHealth)
+}
+
+fn import_journal_read_error(_private_detail: &str) -> CommandErrorV1 {
+    CommandErrorV1::new(
+        "IMPORT_JOURNAL_READ_FAILED",
+        "The interrupted import could not be read. Retry; if it continues, open Health.",
+        true,
+    )
+    .suggested(SuggestedActionV1::Retry)
+}
+
+fn import_journal_write_error(_private_detail: &str) -> CommandErrorV1 {
+    CommandErrorV1::new(
+        "IMPORT_JOURNAL_UPDATE_FAILED",
+        "The interrupted import could not be updated. Its durable journal remains preserved.",
+        true,
+    )
+    .suggested(SuggestedActionV1::Retry)
+}
+
+fn invalid_import_job_id_error() -> CommandErrorV1 {
+    CommandErrorV1::new("INVALID_IMPORT_JOB_ID", "The interrupted import identity is invalid.", false)
+}
+
+fn changed_import_job_error() -> CommandErrorV1 {
+    CommandErrorV1::new(
+        "IMPORT_JOB_CHANGED",
+        "The interrupted import changed since it was shown. Its current durable state has been reloaded.",
+        false,
+    )
+}
+
+fn public_import_start_error(private_detail: &str) -> CommandErrorV1 {
+    if private_detail == RESTORE_IN_PROGRESS_MSG {
+        return CommandErrorV1::new(
+            "RESTORE_IN_PROGRESS",
+            "Import cannot start while database recovery is in progress. Wait for it to finish, then retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if private_detail == "Import already in progress" {
+        return CommandErrorV1::new(
+            "IMPORT_IN_PROGRESS",
+            "Another import is already running. Wait for it to finish or cancel it, then retry.",
+            true,
+        )
+        .suggested(SuggestedActionV1::Retry);
+    }
+    if private_detail.contains(crate::DEDUP_INDEX_UNAVAILABLE_CODE) {
+        return import_not_ready_error();
+    }
+    CommandErrorV1::new(
+        "IMPORT_RESUME_FAILED",
+        "The interrupted import could not be resumed. Its durable journal remains preserved.",
+        true,
+    )
+    .suggested(SuggestedActionV1::Retry)
+}
+
 #[tauri::command]
 pub async fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     RATE_LIMITER.check("open_audio_file")?;
@@ -220,38 +331,60 @@ pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value
 /// P3.2: the crashed directory import to resume, if any. Query at STARTUP — when no import is active,
 /// a still-'running' job is a crash.
 #[tauri::command]
-pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<crate::db::ImportJob>, String> {
-    RATE_LIMITER.check("get_interrupted_import")?;
-    state.job_store().find_interrupted_import().map_err(|error| error.to_string())
+#[specta::specta]
+pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<ImportJobV1>, CommandErrorV1> {
+    RATE_LIMITER.check("get_interrupted_import").map_err(|_| import_rate_limited_error())?;
+    state
+        .job_store()
+        .find_interrupted_import()
+        .map(|job| job.map(ImportJobV1::from))
+        .map_err(|error| import_journal_read_error(&error.to_string()))
 }
 
 /// P3.2: discard an interrupted import job (the user chose not to resume).
 #[tauri::command]
-pub fn discard_interrupted_import(job_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("discard_interrupted_import")?;
-    validate::validate_identifier(&job_id)?;
-    state.job_store().discard_interrupted_import(&job_id).map_err(|error| error.to_string())
+#[specta::specta]
+pub fn discard_interrupted_import(job_id: String, state: State<'_, AppState>) -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("discard_interrupted_import").map_err(|_| import_rate_limited_error())?;
+    validate::validate_identifier(&job_id).map_err(|_| invalid_import_job_id_error())?;
+    state
+        .job_store()
+        .discard_interrupted_import(&job_id)
+        .map_err(|error| import_journal_write_error(&error.to_string()))
 }
 
 /// P3.2: resume the interrupted directory import — re-run its folder, skipping files already imported
 /// in the crashed run (their segments persisted per-file). Retires the old crashed job so it is not
 /// offered again; the fresh import job now tracks progress.
 #[tauri::command]
+#[specta::specta]
 pub fn resume_interrupted_import(
+    job_id: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("resume_interrupted_import")?;
-    state.require_audio_import_ready().map_err(|error| error.to_string())?;
-    let job = state.job_store().find_interrupted_import().map_err(|error| error.to_string())?;
-    let Some(job) = job else { return Err("No interrupted import to resume".into()) };
+) -> Result<ImportResumeV1, CommandErrorV1> {
+    RATE_LIMITER.check("resume_interrupted_import").map_err(|_| import_rate_limited_error())?;
+    validate::validate_identifier(&job_id).map_err(|_| invalid_import_job_id_error())?;
+    state.require_audio_import_ready().map_err(|_| import_not_ready_error())?;
+    let job =
+        state.job_store().find_interrupted_import().map_err(|error| import_journal_read_error(&error.to_string()))?;
+    let Some(job) = job else {
+        return Err(CommandErrorV1::new("NO_INTERRUPTED_IMPORT", "There is no interrupted import to resume.", false));
+    };
+    if job.id != job_id {
+        return Err(changed_import_job_error());
+    }
     let dir_path = std::path::PathBuf::from(&job.dir);
     if !dir_path.is_dir() {
-        return Err(format!("The import folder no longer exists: {}", job.dir));
+        return Err(CommandErrorV1::new(
+            "IMPORT_SOURCE_MISSING",
+            "The interrupted import folder is no longer available. Discard this journal or restore the folder.",
+            false,
+        ));
     }
     let completed: std::collections::HashSet<String> = job.completed_paths.iter().cloned().collect();
 
-    state.try_start_import()?;
+    state.try_start_import().map_err(|error| public_import_start_error(&error))?;
     // Atomically hand the old journal to a successor BEFORE the worker is spawned. The transaction
     // copies every completed path and retires the old row in one commit, so a kill here leaves exactly
     // one resumable journal. On a handoff error, release the in-process single-flight claim while the
@@ -260,7 +393,8 @@ pub fn resume_interrupted_import(
         Ok(job_id) => job_id,
         Err(error) => {
             state.finish_import();
-            return Err(format!("Could not claim the interrupted import journal for resume: {error}"));
+            tracing::warn!("Could not claim interrupted import journal for resume: {error}");
+            return Err(import_journal_write_error(&error.to_string()));
         }
     };
     let cancel = Some(state.start_cancel_token());
@@ -311,11 +445,10 @@ pub fn resume_interrupted_import(
     });
     if let Err(error) = worker {
         state.finish_import();
-        return Err(format!(
-            "Could not start the resume worker: {error}. Durable import journal {resume_job_id} remains resumable."
-        ));
+        tracing::warn!("Could not start interrupted import worker for journal {resume_job_id}: {error}");
+        return Err(public_import_start_error(&error.to_string()));
     }
-    Ok(serde_json::json!({ "status": "started", "resuming": true, "importJobId": resume_job_id }))
+    Ok(ImportResumeV1 { status: ImportResumeStatusV1::Started, resuming: true, import_job_id: resume_job_id })
 }
 
 #[tauri::command]
@@ -1147,6 +1280,95 @@ fn validate_normalization_text(text: &str) -> Result<(), crate::ipc_contract::Co
             false,
         )
     })
+}
+
+#[cfg(test)]
+mod typed_import_journal_ipc_tests {
+    use super::*;
+
+    fn assert_private_detail_absent(error: &CommandErrorV1) {
+        let wire = serde_json::to_string(error).expect("serialize typed import error");
+        assert!(!wire.contains("Wareen"));
+        assert!(!wire.contains("secret-token"));
+        assert!(!wire.contains("SELECT *"));
+        assert!(!wire.contains("D:\\\\private"));
+    }
+
+    #[test]
+    fn interrupted_import_wire_shape_reports_progress_without_paths() {
+        let public = ImportJobV1::from(crate::db::ImportJob {
+            id: "import-job-1".to_string(),
+            dir: r"D:\private\owner-audio".to_string(),
+            total_files: 3,
+            completed_paths: vec![
+                r"D:\private\owner-audio\first.wav".to_string(),
+                r"D:\private\owner-audio\second.wav".to_string(),
+            ],
+            created_at: "2026-08-28T10:00:00Z".to_string(),
+        });
+
+        let wire = serde_json::to_value(public).expect("serialize import job DTO");
+        assert_eq!(wire["id"], "import-job-1");
+        assert_eq!(wire["totalFiles"], 3);
+        assert_eq!(wire["completedCount"], 2);
+        assert_eq!(wire["createdAt"], "2026-08-28T10:00:00Z");
+        assert!(wire.get("dir").is_none());
+        assert!(wire.get("completedPaths").is_none());
+        assert!(!wire.to_string().contains("owner-audio"));
+    }
+
+    #[test]
+    fn typed_import_failures_are_actionable_and_scrub_private_details() {
+        let private = r"D:\private\Wareen\source.wav secret-token SELECT * FROM import_jobs";
+        let cases = [
+            import_journal_read_error(private),
+            import_journal_write_error(private),
+            public_import_start_error(private),
+        ];
+        for error in &cases {
+            assert!(error.retryable);
+            assert_eq!(error.suggested_action, Some(SuggestedActionV1::Retry));
+            assert_private_detail_absent(error);
+        }
+
+        let restore = public_import_start_error(RESTORE_IN_PROGRESS_MSG);
+        assert_eq!(restore.code, "RESTORE_IN_PROGRESS");
+        assert!(restore.retryable);
+        assert_eq!(restore.suggested_action, Some(SuggestedActionV1::Retry));
+
+        let busy = public_import_start_error("Import already in progress");
+        assert_eq!(busy.code, "IMPORT_IN_PROGRESS");
+        assert!(busy.retryable);
+
+        let dedup = public_import_start_error(&format!("{}: {}", crate::DEDUP_INDEX_UNAVAILABLE_CODE, private));
+        assert_eq!(dedup.code, crate::DEDUP_INDEX_UNAVAILABLE_CODE);
+        assert!(!dedup.retryable);
+        assert_eq!(dedup.suggested_action, Some(SuggestedActionV1::OpenHealth));
+        assert_private_detail_absent(&dedup);
+
+        let invalid = invalid_import_job_id_error();
+        assert_eq!(invalid.code, "INVALID_IMPORT_JOB_ID");
+        assert!(!invalid.retryable);
+        assert_eq!(invalid.suggested_action, None);
+
+        let changed = changed_import_job_error();
+        assert_eq!(changed.code, "IMPORT_JOB_CHANGED");
+        assert!(!changed.retryable);
+        assert_eq!(changed.suggested_action, None);
+    }
+
+    #[test]
+    fn resume_wire_status_is_a_closed_literal() {
+        let wire = serde_json::to_value(ImportResumeV1 {
+            status: ImportResumeStatusV1::Started,
+            resuming: true,
+            import_job_id: "import-job-2".to_string(),
+        })
+        .expect("serialize import resume DTO");
+        assert_eq!(wire["status"], "started");
+        assert_eq!(wire["resuming"], true);
+        assert_eq!(wire["importJobId"], "import-job-2");
+    }
 }
 
 #[tauri::command]
