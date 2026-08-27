@@ -1,8 +1,9 @@
 use crate::db::SpeechSegment;
 use crate::wer::compute_cer;
 use serde::Serialize;
+use specta::Type;
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ConformalCertificate {
     pub target_error: f64,

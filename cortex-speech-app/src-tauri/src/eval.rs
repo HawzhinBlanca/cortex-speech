@@ -1507,7 +1507,7 @@ where
 /// ground-truth reference, a raw ASR hypothesis, and a post-jury verdict, this reports the micro
 /// CER of each and the CER reduction (`cer_lift = raw - jury`; positive means the jury improved
 /// labels), with a seeded paired bootstrap 95% CI on the per-replicate micro-CER lift.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelQualityLift {
     /// Number of scoreable triples. References that normalize to an empty string are excluded from

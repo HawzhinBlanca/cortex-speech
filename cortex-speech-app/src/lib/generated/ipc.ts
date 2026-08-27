@@ -149,6 +149,21 @@ export const commands = {
 	 *  this diagnostics view into an unbounded library hydration.
 	 */
 	getSignalAnomalySegments: (limit: number | null) => typedError<SpeechSegment[], CommandErrorV1>(__TAURI_INVOKE("get_signal_anomaly_segments", { limit })),
+	getDatasetStats: () => typedError<DatasetStats, CommandErrorV1>(__TAURI_INVOKE("get_dataset_stats")),
+	getDatasetQuality: () => typedError<DatasetQuality, CommandErrorV1>(__TAURI_INVOKE("get_dataset_quality")),
+	/**
+	 *  Library-wide training grade + the reasons behind it, for the Insights readiness verdict.
+	 *
+	 *  The dashboard's "ready / not ready" MUST agree with what an export would actually write, so this
+	 *  reuses `quality::training_grade_breakdown` — the same `training_grade_for_segment` the export
+	 *  gates on — rather than approximating readiness from the verified count. Those two disagree
+	 *  exactly when it matters most: a library can be 100% human-verified and still export zero rows
+	 *  (e.g. every clip carries `energy_heuristic_alignment` because no word aligner is installed).
+	 */
+	getTrainingGradeBreakdown: () => typedError<TrainingGradeBreakdown, CommandErrorV1>(__TAURI_INVOKE("get_training_grade_breakdown")),
+	getDatasetCertificate: (targetError: number, confidenceLevel: number) => typedError<ConformalCertificate, CommandErrorV1>(__TAURI_INVOKE("get_dataset_certificate", { targetError, confidenceLevel })),
+	// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
+	getLabelQualityLift: () => typedError<LabelQualityLift, CommandErrorV1>(__TAURI_INVOKE("get_label_quality_lift")),
 	/**
 	 *  Complete, non-lossy speaker inventory for the management panel. SQL NULL stays distinct from a
 	 *  literal `unknown` id, and backend failures are reduced to a stable renderer-safe contract.
@@ -257,6 +272,77 @@ export type CommittedReviewV1 = {
 	decisionId: string,
 };
 
+export type ConformalCertificate = {
+	targetError: number,
+	confidenceLevel: number,
+	threshold: number,
+	totalCertified: number,
+	certifiedSegmentIds: string[],
+	expectedErrorBound: number,
+	isCalibrated: boolean,
+	/**
+	 *  PROVENANCE of the calibration set's per-utterance confidences (honesty, not interpretation): how
+	 *  many calibration segments carried a real model posterior vs the heuristic/unknown fallback. On the
+	 *  default offline path (OmniASR CTC exposes no token posteriors) this is `real_posterior == 0` — the
+	 *  readout must not imply a calibrated-posterior guarantee it does not have. This does NOT change the
+	 *  threshold/certification (the score also uses the real ctc_score); it just surfaces the basis.
+	 */
+	calibrationRealPosterior: number,
+	calibrationHeuristic: number,
+	/**
+	 *  Clips that would otherwise have calibrated, excluded because they carry NEITHER a confidence nor
+	 *  a ctc_score. Distinct from `calibration_heuristic` (a non-posterior score IS a score); this is the
+	 *  absence of any signal, which `has_scoreable_confidence` refuses to invent a 1.0 for.
+	 *
+	 *  Surfaced because the UI must be able to say WHY nothing certified. Without it the panel falls
+	 *  back to "verify at least 10 segments", which on a library like the owner's — 67 verified clips,
+	 *  every one from a cloud engine that returns no confidence — is advice that cannot work.
+	 */
+	calibrationNoConfidence: number,
+};
+
+export type DatasetQuality = {
+	totalSegments: number,
+	emptyTranscriptCount: number,
+	lowConfidenceCount: number,
+	duplicateTranscriptGroups: number,
+	duplicateTranscriptSegments: number,
+	durationOutlierCount: number,
+	medianDurationMs: number,
+	q1DurationMs: number,
+	q3DurationMs: number,
+	duplicateGroups: DuplicateGroup[],
+	durationOutliers: DurationOutlier[],
+	annotatedSegmentCount: number,
+	meanWer: number | null,
+	meanCer: number | null,
+	segmentsAboveWerThreshold: number,
+	segmentsAboveCerThreshold: number,
+	qualityGatePassed: boolean,
+	werOutliers: WerOutlier[],
+};
+
+export type DatasetStats = {
+	totalSegments: number,
+	totalDurationSeconds: number,
+	avgDurationSeconds: number,
+	verifiedCount: number,
+	pendingCount: number,
+	verificationRate: number,
+	uniqueSpeakers: number,
+	totalChars: number,
+	avgCharsPerSegment: number,
+	durationHistogram: DurationHistogram,
+	topSpeakers: SpeakerStat[],
+	/**
+	 *  M2.1 / P1.1: review-throughput timing derived from the decision_log rows. Zero/None until the
+	 *  owner has made decisions in the app (the marathon's review-speed baseline lives here).
+	 */
+	reviewTiming: ReviewTimingStats,
+	// P3.8: on-disk database size (page_count × page_size), surfaced so months of growth are visible.
+	dbSizeBytes: number,
+};
+
 export type DeleteSegmentsRequestV1 = {
 	ids: string[],
 };
@@ -302,6 +388,26 @@ export type DiffStats = {
 	similarity: number,
 };
 
+export type DuplicateGroup = {
+	transcriptHash: string,
+	segmentIds: string[],
+	normalizedPreview: string,
+};
+
+export type DurationHistogram = {
+	under5s: number,
+	under10s: number,
+	under15s: number,
+	under30s: number,
+	over30s: number,
+};
+
+export type DurationOutlier = {
+	segmentId: string,
+	durationMs: number,
+	reason: string,
+};
+
 /**
  *  Stable action identity for global machine/source history. This is intentionally an enum rather
  *  than backend-authored display text so every locale owns its own copy and unknown future variants
@@ -338,6 +444,25 @@ export type InferenceStatsV1 = {
 	vad: InferenceKindStatsV1,
 	asr: InferenceKindStatsV1,
 	model_load_ms: number,
+};
+
+/**
+ *  Measured raw-ASR vs post-jury label-quality lift (blueprint M3.1). Over segments that carry a
+ *  ground-truth reference, a raw ASR hypothesis, and a post-jury verdict, this reports the micro
+ *  CER of each and the CER reduction (`cer_lift = raw - jury`; positive means the jury improved
+ *  labels), with a seeded paired bootstrap 95% CI on the per-replicate micro-CER lift.
+ */
+export type LabelQualityLift = {
+	/**
+	 *  Number of scoreable triples. References that normalize to an empty string are excluded from
+	 *  this count, every aggregate, and every bootstrap replicate.
+	 */
+	n: number,
+	rawMicroCer: number,
+	juryMicroCer: number,
+	cerLift: number,
+	liftCiLow: number,
+	liftCiHigh: number,
 };
 
 export type MarkSegmentUnusableRequestV1 = {
@@ -483,6 +608,20 @@ export type ReviewPageV1 = {
 export type ReviewScope = { kind: "pending" } | { kind: "escalation" } | { kind: "search"; query: string } | { kind: "voiceFocus"; focusId: string };
 
 /**
+ *  Review-throughput instrumentation (M2.1). `median_seconds` is the median gap between consecutive
+ *  human decisions, counting only within-session gaps (deltas above `SESSION_GAP_MS` are treated as
+ *  breaks, not review time). This is the honest s/segment figure the C3 ≥3× gate measures against.
+ */
+export type ReviewTimingStats = {
+	// Total rows in decision_log (one per recorded human decision that carried a timestamp).
+	decisionsLogged: number,
+	// Median within-session seconds per decision, or None when there are fewer than 2 timed decisions.
+	medianSeconds: number | null,
+	// Number of consecutive-decision deltas that fell within a session and fed the median.
+	samples: number,
+};
+
+/**
  *  One compare-and-set metadata edit. `expected` is the exact last server value observed by the
  *  renderer; `value` is the requested replacement. Keeping the two fields explicit makes clearing a
  *  nullable value distinguishable from omitting that field entirely.
@@ -553,6 +692,12 @@ export type SettingsSnapshotV1 = {
  */
 export type SpeakerInventoryItemV1 = {
 	speakerId: string | null,
+	segmentCount: number,
+	totalDurationSeconds: number,
+};
+
+export type SpeakerStat = {
+	speakerId: string,
 	segmentCount: number,
 	totalDurationSeconds: number,
 };
@@ -670,6 +815,21 @@ export type TracingStatsV1 = {
 	avg_duration_ms: number,
 };
 
+export type TrainingGradeBreakdown = {
+	summary: TrainingGradeSummary,
+	// How many segments carry each grade reason, e.g. `energy_heuristic_alignment -> 144`.
+	reasonCounts: { [key in string]: number },
+};
+
+export type TrainingGradeSummary = {
+	totalSegments: number,
+	trainingReadySegments: number,
+	goldSegments: number,
+	silverSegments: number,
+	reviewSegments: number,
+	rejectedSegments: number,
+};
+
 export type UpdateSegmentMetadataRequestV1 = {
 	segmentId: string,
 	changes: SegmentMetadataChangeV1[],
@@ -684,6 +844,13 @@ export type UpdatedSegmentMetadataV1 = {
 	speakerId: string | null,
 	alignmentJson: string | null,
 	changed: boolean,
+};
+
+export type WerOutlier = {
+	segmentId: string,
+	wer: number,
+	cer: number,
+	referencePreview: string,
 };
 
 /* Tauri Specta runtime */

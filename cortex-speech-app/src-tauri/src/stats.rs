@@ -1,8 +1,9 @@
 use crate::db::Database;
 use crate::error::AppResult;
 use serde::Serialize;
+use specta::Type;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetStats {
     pub total_segments: usize,
@@ -26,7 +27,7 @@ pub struct DatasetStats {
 /// Review-throughput instrumentation (M2.1). `median_seconds` is the median gap between consecutive
 /// human decisions, counting only within-session gaps (deltas above `SESSION_GAP_MS` are treated as
 /// breaks, not review time). This is the honest s/segment figure the C3 ≥3× gate measures against.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewTimingStats {
     /// Total rows in decision_log (one per recorded human decision that carried a timestamp).
@@ -40,7 +41,7 @@ pub struct ReviewTimingStats {
 /// Consecutive decisions more than this far apart are between-session breaks, not review time.
 const SESSION_GAP_MS: i64 = 300_000; // 5 minutes
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DurationHistogram {
     pub under_5s: usize,
@@ -50,7 +51,7 @@ pub struct DurationHistogram {
     pub over_30s: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakerStat {
     pub speaker_id: String,

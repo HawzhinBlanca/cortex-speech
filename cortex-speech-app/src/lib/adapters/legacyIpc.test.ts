@@ -67,6 +67,12 @@ const compileTimeContractProof = (): void => {
   });
   // @ts-expect-error session restore uses the generated SessionState shape
   void invokeCritical('restore_session');
+  // @ts-expect-error dataset analytics are generated and use public DTOs
+  void invokeLegacy<unknown>('get_dataset_stats');
+  // @ts-expect-error training readiness cannot return to handwritten IPC
+  void invokeLegacy<unknown>('get_training_grade_breakdown');
+  // @ts-expect-error certificate parameters use the generated command signature
+  void invokeLegacy<unknown>('get_dataset_certificate');
   // @ts-expect-error the library segment/page contract is generated and typed
   void invokeLegacy<unknown>('get_segment');
   // @ts-expect-error contextual batch ids cannot regress into handwritten IPC

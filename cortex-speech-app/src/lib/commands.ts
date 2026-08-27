@@ -960,7 +960,9 @@ export async function getWaveform(
 }
 
 export async function getDatasetStats(): Promise<DatasetStats> {
-  return invokeLegacy<DatasetStats>('get_dataset_stats');
+  const result = await generatedCommands.getDatasetStats();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** P3.3: which distinct source audio files are missing on disk. */
@@ -1087,7 +1089,9 @@ export interface DatasetQuality {
 }
 
 export async function getDatasetQuality(): Promise<DatasetQuality> {
-  return invokeLegacy<DatasetQuality>('get_dataset_quality');
+  const result = await generatedCommands.getDatasetQuality();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -1112,7 +1116,9 @@ export interface TrainingGradeBreakdown {
 }
 
 export async function getTrainingGradeBreakdown(): Promise<TrainingGradeBreakdown> {
-  const data = await invokeLegacy<TrainingGradeBreakdown>('get_training_grade_breakdown');
+  const result = await generatedCommands.getTrainingGradeBreakdown();
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
   // THROW on a malformed payload, exactly like the library reads above. A caller that receives `{}`
   // and reads `.summary.trainingReadySegments` dies with a TypeError instead of showing "readiness
   // unknown" — which is what happened: the dev IPC mock has no case for this command, so it fell
@@ -1588,10 +1594,9 @@ export async function getDatasetCertificate(
   targetError: number,
   confidenceLevel: number,
 ): Promise<ConformalCertificate> {
-  return invokeLegacy<ConformalCertificate>('get_dataset_certificate', {
-    targetError,
-    confidenceLevel,
-  });
+  const result = await generatedCommands.getDatasetCertificate(targetError, confidenceLevel);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function computeSignalAnomalyScores(): Promise<number> {
@@ -1686,7 +1691,9 @@ export async function listEvalRuns(): Promise<EvalRun[]> {
 }
 
 export async function getLabelQualityLift(): Promise<LabelQualityLift> {
-  return invokeLegacy<LabelQualityLift>('get_label_quality_lift');
+  const result = await generatedCommands.getLabelQualityLift();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 // ── Phase 2 — T0 Gate + Jury ───────────────────────────────────────────────

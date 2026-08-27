@@ -10,6 +10,7 @@ use crate::settings::AppSettings;
 use crate::wer;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
+use specta::Type;
 use std::collections::{BTreeMap, HashMap};
 
 /// Minimum average word alignment confidence below which a segment is flagged.
@@ -30,7 +31,7 @@ pub struct TrainingGradeReport {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingGradeSummary {
     pub total_segments: usize,
@@ -41,7 +42,7 @@ pub struct TrainingGradeSummary {
     pub rejected_segments: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingGradeBreakdown {
     pub summary: TrainingGradeSummary,
@@ -49,7 +50,7 @@ pub struct TrainingGradeBreakdown {
     pub reason_counts: BTreeMap<String, usize>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetQuality {
     pub total_segments: usize,
@@ -72,7 +73,7 @@ pub struct DatasetQuality {
     pub wer_outliers: Vec<WerOutlier>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct WerOutlier {
     pub segment_id: String,
@@ -81,7 +82,7 @@ pub struct WerOutlier {
     pub reference_preview: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateGroup {
     pub transcript_hash: String,
@@ -89,7 +90,7 @@ pub struct DuplicateGroup {
     pub normalized_preview: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DurationOutlier {
     pub segment_id: String,

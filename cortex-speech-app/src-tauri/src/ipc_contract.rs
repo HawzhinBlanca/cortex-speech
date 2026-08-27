@@ -681,6 +681,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_segments_page,
             crate::commands::get_segment_ids_for_view,
             crate::commands::get_signal_anomaly_segments,
+            crate::commands::get_dataset_stats,
+            crate::commands::get_dataset_quality,
+            crate::commands::get_training_grade_breakdown,
+            crate::commands::get_dataset_certificate,
+            crate::commands::get_label_quality_lift,
             crate::commands::get_speaker_inventory_v1,
             crate::commands::update_segment_metadata_v1,
             crate::commands::delete_segments_v1,
@@ -706,6 +711,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<SessionStateV1>()
         .typ::<AppHealthV1>()
         .typ::<crate::db::SegmentsPage>()
+        .typ::<crate::stats::DatasetStats>()
+        .typ::<crate::quality::DatasetQuality>()
+        .typ::<crate::quality::TrainingGradeBreakdown>()
+        .typ::<crate::quality::conformal::ConformalCertificate>()
+        .typ::<crate::eval::LabelQualityLift>()
         .typ::<ReviewScope>()
         .typ::<ActiveVoiceFocusV1>()
         .typ::<SegmentMetadataChangeV1>()
