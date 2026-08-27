@@ -60,6 +60,21 @@ export interface AutosaveController {
   retainedIds: () => string[];
 }
 
+/** Flush only when a destructive action intersects queued/retry work; failure leaves that work held. */
+export async function flushAutosaveForIds(
+  controller: AutosaveController,
+  ids: Iterable<string>,
+): Promise<boolean> {
+  const targets = new Set(ids);
+  if (!controller.retainedIds().some((id) => targets.has(id))) return true;
+  try {
+    await controller.flushAsync();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function createAutosaveController<T extends object>(
   deps: AutosaveDeps<T>,
 ): AutosaveController {

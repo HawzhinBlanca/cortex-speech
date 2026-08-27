@@ -9,7 +9,7 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import * as api from './lib/commands';
-  import { createAutosaveController } from './lib/autosave';
+  import { createAutosaveController, flushAutosaveForIds } from './lib/autosave';
   import { createSegmentMetadataCoordinator } from './lib/segmentMetadataCoordinator';
   import { registerDurableCloseGuard } from './lib/closeGuard';
   import { chooseDirectory, saveFile } from './lib/fileDialogs';
@@ -302,11 +302,6 @@
     if (tauriAvailable) return true;
     notifications.info($t('desktopRuntimeRequired'));
     return false;
-  }
-
-  // Cancel pending metadata WITHOUT persisting when its target is about to be deleted.
-  function cancelPendingSave() {
-    autosave.cancel();
   }
 
   function scheduleAutoSave(edits: api.SegmentMetadataFields) {
@@ -1564,8 +1559,7 @@
   async function handleDeleteFiltered(ids: string[]) {
     if ($isProcessing) return;
     if (!requireDesktopRuntime()) return;
-    // Cancel a pending autosave for any segment in this batch, so its flush can't resurrect a deleted row.
-    if (autosave.pendingId() !== null && ids.includes(autosave.pendingId()!)) cancelPendingSave();
+    if (!(await flushAutosaveForIds(autosave, ids))) return;
     startOperation('batch-delete');
     isProcessing.set(true);
     statusMessage.set($t('batchDelete.progress', { n: String(ids.length) }));
@@ -1591,9 +1585,8 @@
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
 
-    // Cancel any pending autosave for THIS segment before deleting, so its debounced flush can't fire
-    // after the row is gone and resurrect it via update_segment's INSERT-ON-CONFLICT.
-    if (autosave.pendingId() === seg.id) cancelPendingSave();
+    // Metadata is committed first; if it conflicts, deletion aborts and the retry remains recoverable.
+    if (!(await flushAutosaveForIds(autosave, [seg.id]))) return;
 
     // Optimistic Update
     const originalSegments = $segments;

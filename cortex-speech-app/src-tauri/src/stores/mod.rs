@@ -20,4 +20,6 @@ pub(crate) use review_write::require_listened;
 pub(crate) use review_write::{ReviewCommitError, ReviewWriteStore, TechnicalUnusableCommitError};
 pub(crate) use rights::RightsStore;
 pub(crate) use segment_query::SegmentQueryStore;
-pub(crate) use segment_write::{SegmentMetadataChange, SegmentMetadataUpdateError, SegmentWriteStore};
+pub(crate) use segment_write::{
+    SegmentDeleteError, SegmentMetadataChange, SegmentMetadataUpdateError, SegmentWriteStore,
+};

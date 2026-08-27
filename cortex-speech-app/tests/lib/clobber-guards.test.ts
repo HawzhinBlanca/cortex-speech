@@ -36,6 +36,13 @@ describe('schema-v60 frontend review-write boundary', () => {
     expect(app).not.toMatch(/api\.updateSegment\(/);
   });
 
+  it('flushes intersecting metadata before deletion instead of cancelling a failed save', () => {
+    const app = read('../../src/Workstation.svelte');
+    expect(app).toContain('flushAutosaveForIds(autosave, ids)');
+    expect(app).toContain('flushAutosaveForIds(autosave, [seg.id])');
+    expect(app).not.toContain('cancelPendingSave');
+  });
+
   it('ReviewMode mutators are clobber-safe and champion re-transcribe reloads the atomic backend commit', () => {
     const src = read('../../src/lib/ReviewMode.svelte');
     const region = (fn: string, next: string) => {

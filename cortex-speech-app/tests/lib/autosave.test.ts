@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createAutosaveController } from '../../src/lib/autosave';
+import { createAutosaveController, flushAutosaveForIds } from '../../src/lib/autosave';
 
 type Row = { id: string; text: string; speaker?: string };
 
@@ -288,6 +288,22 @@ describe('autosave controller', () => {
     expect(new Set(ctrl.retainedIds())).toEqual(new Set(['A', 'B']));
     await ctrl.flushAsync();
     expect(ctrl.retainedIds()).toEqual([]);
+  });
+
+  it('flushAutosaveForIds blocks destructive work on an intersecting save failure', async () => {
+    const save = vi.fn().mockRejectedValue(new Error('metadata conflict'));
+    const ctrl = createAutosaveController({
+      targetId: () => 'A',
+      getRow: () => ({ id: 'A', text: 'old' }),
+      save,
+      debounceMs: 10_000,
+    });
+    ctrl.schedule({ text: 'new' });
+
+    await expect(flushAutosaveForIds(ctrl, ['B'])).resolves.toBe(true);
+    expect(save).not.toHaveBeenCalled();
+    await expect(flushAutosaveForIds(ctrl, ['A'])).resolves.toBe(false);
+    expect(ctrl.retainedIds()).toEqual(['A']);
   });
 
   // Latent until a second autosaved field existed, but the class is dataset loss: an edit typed while

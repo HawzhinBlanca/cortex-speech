@@ -348,6 +348,24 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
           next.speakerId !== current.speakerId || next.alignmentJson !== current.alignmentJson,
       };
     }
+    if (cmd === 'delete_segments_v1') {
+      const ids = (args?.request as { ids?: string[] } | undefined)?.ids ?? [];
+      if (ids.length === 0 || new Set(ids).size !== ids.length) {
+        throw {
+          schema: 1,
+          code: 'INVALID_DELETE_REQUEST',
+          message: 'The preview deletion request is invalid.',
+          retryable: false,
+        };
+      }
+      const requested = new Set(ids);
+      const previousCount = demoSegments.length;
+      demoSegments = demoSegments.filter((segment) => !requested.has(segment.id));
+      return {
+        requestedCount: ids.length,
+        deletedCount: previousCount - demoSegments.length,
+      };
+    }
     // Same class: the readiness verdict and the accuracy card call these, and `{}` / `null` from the
     // catch-alls crashed the Insights panel on `.summary`. Mock the real shapes so dev preview shows
     // the decision layer rather than an error.

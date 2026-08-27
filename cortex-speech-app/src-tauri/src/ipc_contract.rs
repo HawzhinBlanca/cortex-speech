@@ -237,6 +237,21 @@ pub struct UpdatedSegmentMetadataV1 {
     pub changed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSegmentsRequestV1 {
+    pub ids: Vec<String>,
+}
+
+/// Idempotent deletion outcome. A response-loss replay may report zero newly deleted rows while
+/// still proving the requested final state: every requested id is absent.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedSegmentsV1 {
+    pub requested_count: usize,
+    pub deleted_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewItemV1 {
@@ -535,7 +550,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_segments_page,
             crate::commands::get_segment_ids_for_view,
             crate::commands::get_signal_anomaly_segments,
-            crate::commands::update_segment_metadata_v1
+            crate::commands::update_segment_metadata_v1,
+            crate::commands::delete_segments_v1
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
@@ -560,6 +576,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<SegmentMetadataChangeV1>()
         .typ::<UpdateSegmentMetadataRequestV1>()
         .typ::<UpdatedSegmentMetadataV1>()
+        .typ::<DeleteSegmentsRequestV1>()
+        .typ::<DeletedSegmentsV1>()
         .typ::<ReviewItemV1>()
         .typ::<ReviewPageV1>()
         .typ::<ReviewDecisionV1>()

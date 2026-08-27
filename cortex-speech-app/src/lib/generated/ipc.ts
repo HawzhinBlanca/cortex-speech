@@ -129,6 +129,12 @@ export const commands = {
 	 *  lost-response replay remains an idempotent success.
 	 */
 	updateSegmentMetadataV1: (request: UpdateSegmentMetadataRequestV1) => typedError<UpdatedSegmentMetadataV1, CommandErrorV1>(__TAURI_INVOKE("update_segment_metadata_v1", { request })),
+	/**
+	 *  One generated, idempotent deletion boundary for both single and batch UI actions. Duplicate ids
+	 *  are refused by the shared database boundary before evidence archival, and reviewed authority
+	 *  remains append-only. Replaying after response loss succeeds with `deleted_count = 0`.
+	 */
+	deleteSegmentsV1: (request: DeleteSegmentsRequestV1) => typedError<DeletedSegmentsV1, CommandErrorV1>(__TAURI_INVOKE("delete_segments_v1", { request })),
 };
 
 /* Types */
@@ -186,6 +192,19 @@ export type CommittedReviewV1 = {
 	committedRevision: number,
 	authoritativeTranscript: string,
 	decisionId: string,
+};
+
+export type DeleteSegmentsRequestV1 = {
+	ids: string[],
+};
+
+/**
+ *  Idempotent deletion outcome. A response-loss replay may report zero newly deleted rows while
+ *  still proving the requested final state: every requested id is absent.
+ */
+export type DeletedSegmentsV1 = {
+	requestedCount: number,
+	deletedCount: number,
 };
 
 export type DesktopPlaybackReceiptV1 = {

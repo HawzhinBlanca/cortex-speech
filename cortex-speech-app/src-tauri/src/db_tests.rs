@@ -4008,6 +4008,82 @@ fn c4_precision_refuses_deleting_a_contradicted_auto_accept() {
 }
 
 #[test]
+fn duplicate_batch_ids_cannot_double_archive_loop0_or_c4_evidence() {
+    let db = make_db();
+    db.insert_segment(&make_segment("duplicate-evidence", "/audio/duplicate-evidence.wav")).unwrap();
+    db.record_loop0_shadow("duplicate-evidence", true).unwrap();
+    db.connection()
+        .execute(
+            "INSERT INTO decision_verdicts(segment_id, auto_accept_verdict, verdict_computed_at)
+             VALUES ('duplicate-evidence', 'T0_ACCEPT', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+    let loop0_before: (i64, i64, i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT total_observations, would_fire, fired_human_accepted,
+                    fired_human_edited, fired_human_rejected
+               FROM loop0_evidence_archive WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    let c4_before: (i64, i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT t0_accepts, t1_escalations, t0_human_confirmed, t0_human_contradicted
+               FROM c4_evidence_archive WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+
+    let id = "duplicate-evidence".to_string();
+    let error = db.delete_segments_batch(&[id.clone(), id]).expect_err("duplicate ids must fail before archival");
+    assert!(error.to_string().contains("duplicate ids before evidence archival"), "unexpected refusal: {error}");
+    assert!(db.get_segment_by_id("duplicate-evidence").unwrap().is_some());
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT COUNT(*) FROM loop0_shadow_log WHERE segment_id = 'duplicate-evidence'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.connection()
+            .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = 'duplicate-evidence'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+    let loop0_after: (i64, i64, i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT total_observations, would_fire, fired_human_accepted,
+                    fired_human_edited, fired_human_rejected
+               FROM loop0_evidence_archive WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    let c4_after: (i64, i64, i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT t0_accepts, t1_escalations, t0_human_confirmed, t0_human_contradicted
+               FROM c4_evidence_archive WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(loop0_after, loop0_before, "a refused request cannot mutate LOOP-0 archive counters");
+    assert_eq!(c4_after, c4_before, "a refused request cannot mutate C4 archive counters");
+}
+
+#[test]
 fn shadow_metrics_count_distinct_segments_not_observations() {
     // True-10 audit 2026-07-09: a re-processed segment accumulates several shadow rows, but C5
     // reasons about distinct events — one clip, one human decision, at most one over-trigger.

@@ -1545,6 +1545,12 @@ impl Database {
     }
 
     pub fn delete_segments_batch(&self, ids: &[String]) -> AppResult<()> {
+        let mut unique_ids = HashSet::with_capacity(ids.len());
+        if ids.iter().any(|id| !unique_ids.insert(id.as_str())) {
+            return Err(AppError::Validation(
+                "batch segment deletion refuses duplicate ids before evidence archival".into(),
+            ));
+        }
         self.conn.execute("SAVEPOINT batch_delete", [])?;
         let result: AppResult<()> = (|| {
             // Archive each segment's shadow + C4 evidence FIRST (while its rows still exist), then delete.

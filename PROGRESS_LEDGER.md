@@ -11585,3 +11585,30 @@ This is an integration checkpoint, not certification. Coverage remains below the
 99 handwritten IPC calls and the oversized Review/Settings workspaces remain; the 50,000-segment,
 fault, performance, accessibility, signed-Windows, owner-session, pilot, and comparator evidence is
 absent. The only honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — generated library/metadata contracts and conflict-safe autosave
+
+Commits `6c5cb53`, `1e47eab`, `d8f0454`, and `5551fc1` continued the generated IPC migration through
+transcript utilities, renderer-safe diagnostics, bounded library reads, and versioned segment
+metadata. The last slice retires the generic renderer field writer: speaker/alignment edits now carry
+the exact server value observed and execute as an atomic per-field compare-and-set. Stale same-field
+writes fail with a scrubbed typed conflict, mixed conflicts make no partial mutation, and exact
+response-loss replay is idempotent. Failed autosave now rejects and remains in an ordered retry queue,
+so a native close cannot acknowledge an unsaved edit; retained comparison baselines are bounded to
+current or pending work instead of accumulating large alignment JSON across visited clips.
+
+Exact proof at clean `5551fc1bdebfdfc2dd9b2c521791172ff33159e3`: the locked Rust all-target
+graph passed with 1,739 library tests, zero failures and eight explicit library ignores plus green
+binary/integration/soak/shell/benchmark targets; frontend passed 456/456 across 74 files; Playwright
+passed 101/101; all 128 reachable Python policy scripts passed; strict Clippy with warnings denied,
+rustfmt, generated bindings, Svelte/TypeScript, ESLint, Prettier, source layering, secret hygiene and
+survivor/port checks were green. One development frontend run exceeded the frozen Workstation ceiling
+by one line and is not counted; the corrected file is 2,489 lines. The latency probe now honestly names
+this operation `metadata_save` and leaves durable playback-authorized decision latency unmeasured.
+
+The inventory at that commit is 116 invoked commands: 31 generated and 85 handwritten. Coverage,
+workspace decomposition, real decision latency, timeout calibration, certifying verifier runs,
+50,000-segment concurrency/recovery/performance, signed Windows/VM/manual accessibility, owner field
+sessions, comparator study and pilot evidence remain red. Production data, processes, ports,
+credentials, migrations and the active immutable release pointer were untouched. The verdict remains
+**INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT 10/10**.

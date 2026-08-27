@@ -57,6 +57,10 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('get_signal_anomaly_segments');
   // @ts-expect-error segment metadata compare-and-set is generated, never handwritten
   void invokeLegacy<unknown>('update_segment_fields');
+  // @ts-expect-error segment deletion is generated and shared by single/batch callers
+  void invokeLegacy<unknown>('delete_segment');
+  // @ts-expect-error the retired batch deletion bridge cannot return
+  void invokeLegacy<unknown>('delete_segments_batch');
   // @ts-expect-error destructive restore requires its exact source argument
   void invokeCritical('db_restore');
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings

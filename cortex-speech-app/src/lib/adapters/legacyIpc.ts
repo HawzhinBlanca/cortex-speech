@@ -34,8 +34,6 @@ export const LEGACY_IPC_COMMANDS = [
   'db_backup',
   'db_restore',
   'db_vacuum',
-  'delete_segment',
-  'delete_segments_batch',
   'discard_interrupted_import',
   'export_agreement_sample',
   'export_audio',
@@ -119,8 +117,6 @@ type CriticalLegacyIpcContract = {
   };
   import_audio_file: { args: { path: string }; result: CommandResult<'importAudioFile'> };
   cancel_operation: { args: undefined; result: CommandResult<'cancelOperation'> };
-  delete_segment: { args: { id: string }; result: CommandResult<'deleteSegment'> };
-  delete_segments_batch: { args: { ids: string[] }; result: CommandResult<'deleteSegmentsBatch'> };
   export_dataset: {
     args: { path: string; format: string };
     result: CommandResult<'exportDataset'>;

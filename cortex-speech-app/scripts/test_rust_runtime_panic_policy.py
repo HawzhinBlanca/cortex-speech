@@ -637,8 +637,12 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
 
     segment_store = (REPO_ROOT / "src-tauri" / "src" / "stores" / "segment_write.rs").read_text(encoding="utf-8")
     store_required = [
-        "let segments = database.get_segments_by_ids(ids)?;",
-        "database.delete_segments_batch(ids)?;",
+        "let segments = database.get_segments_by_ids(ids).map_err(SegmentDeleteError::from)?;",
+        "database.delete_segments_batch(ids).map_err(SegmentDeleteError::from)?;",
+        "impl From<AppError> for SegmentDeleteError",
+        "AppError::Validation(_) => Self::Invalid",
+        "AppError::Database(rusqlite::Error::SqliteFailure(code, _))",
+        "rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked",
     ]
     store_missing = [pattern for pattern in store_required if pattern not in segment_store]
     if store_missing:

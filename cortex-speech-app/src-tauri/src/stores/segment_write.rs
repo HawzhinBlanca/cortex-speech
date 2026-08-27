@@ -50,6 +50,29 @@ impl From<String> for SegmentMetadataUpdateError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum SegmentDeleteError {
+    Invalid,
+    Authority,
+    Busy,
+    Application,
+}
+
+impl From<AppError> for SegmentDeleteError {
+    fn from(error: AppError) -> Self {
+        match error {
+            AppError::Validation(message) if message.contains("durable review authority") => Self::Authority,
+            AppError::Validation(_) => Self::Invalid,
+            AppError::Database(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) =>
+            {
+                Self::Busy
+            }
+            _ => Self::Application,
+        }
+    }
+}
+
 impl SegmentWriteStore {
     pub(crate) fn new(runtime: DatabaseRuntime, history: Arc<Mutex<HistoryManager>>) -> Self {
         Self { runtime, history }
@@ -157,30 +180,18 @@ impl SegmentWriteStore {
         Ok((result, SegmentMutation { _admission: admission }))
     }
 
-    pub(crate) fn delete_one(&self, id: &str) -> AppResult<SegmentMutation> {
-        let admission = begin_mutation().map_err(AppError::Other)?;
-        let database = self.lock_database("delete_segment");
-        let previous = database.get_segment_by_id(id)?;
-        database.delete_segment(id)?;
-        drop(database);
-
-        if let Some(segment) = previous {
-            self.lock_history("delete_segment").push(Command::DeleteSegments { segments: vec![segment] });
-        }
-        Ok(SegmentMutation { _admission: admission })
-    }
-
-    pub(crate) fn delete_batch(&self, ids: &[String]) -> AppResult<SegmentMutation> {
-        let admission = begin_mutation().map_err(AppError::Other)?;
+    pub(crate) fn delete_batch(&self, ids: &[String]) -> Result<(usize, SegmentMutation), SegmentDeleteError> {
+        let admission = begin_mutation().map_err(AppError::Other).map_err(SegmentDeleteError::from)?;
         let database = self.lock_database("delete_segments_batch");
-        let segments = database.get_segments_by_ids(ids)?;
-        database.delete_segments_batch(ids)?;
+        let segments = database.get_segments_by_ids(ids).map_err(SegmentDeleteError::from)?;
+        database.delete_segments_batch(ids).map_err(SegmentDeleteError::from)?;
         drop(database);
 
-        if !segments.is_empty() {
+        let deleted_count = segments.len();
+        if deleted_count > 0 {
             self.lock_history("delete_segments_batch").push(Command::DeleteSegments { segments });
         }
-        Ok(SegmentMutation { _admission: admission })
+        Ok((deleted_count, SegmentMutation { _admission: admission }))
     }
 
     pub(crate) fn rename_speaker(&self, old_id: &str, new_id: &str) -> AppResult<usize> {
@@ -219,7 +230,8 @@ mod tests {
     #[test]
     fn deletion_captures_the_server_row_and_exact_undo_restores_it() {
         let (_directory, store, runtime, history) = store_with_segments();
-        store.delete_one("one").unwrap();
+        let (_, admission) = store.delete_batch(&["one".into()]).unwrap();
+        drop(admission);
         assert!(runtime.open_read().unwrap().get_segment_by_id("one").unwrap().is_none());
 
         let database = runtime.lock().unwrap();
@@ -237,11 +249,27 @@ mod tests {
         let renamed = runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into()]).unwrap();
         assert!(renamed.iter().all(|segment| segment.speaker_id.as_deref() == Some("speaker-z")));
 
-        store.delete_batch(&["one".into(), "three".into()]).unwrap();
+        let (deleted, admission) = store.delete_batch(&["one".into(), "three".into()]).unwrap();
+        drop(admission);
+        assert_eq!(deleted, 2);
         let remaining =
             runtime.open_read().unwrap().get_segments_by_ids(&["one".into(), "two".into(), "three".into()]).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "two");
+    }
+
+    #[test]
+    fn duplicate_batch_ids_are_refused_before_delete_or_history_mutation() {
+        let (_directory, store, runtime, history) = store_with_segments();
+        let error = match store.delete_batch(&["one".into(), "one".into()]) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate ids must fail before deletion"),
+        };
+        assert!(matches!(error, SegmentDeleteError::Invalid));
+        assert!(runtime.open_read().unwrap().get_segment_by_id("one").unwrap().is_some());
+        let database = runtime.lock().unwrap();
+        let history = history.lock().unwrap();
+        assert!(history.undo(&database).unwrap().is_none());
     }
 
     #[test]

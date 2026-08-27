@@ -509,7 +509,10 @@ export async function installTauriMock(page: Page): Promise<void> {
               errors: [],
               summary: '1 segment checked — no issues',
             };
-          case 'delete_segments_batch':
+          case 'delete_segments_v1': {
+            const ids = (args?.request as { ids?: string[] } | undefined)?.ids ?? [];
+            return { requestedCount: ids.length, deletedCount: ids.length };
+          }
           case 'export_huggingface_dataset':
             return null;
           case 'batch_verify':

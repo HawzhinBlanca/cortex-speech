@@ -5,6 +5,7 @@ import type {
   ActiveVoiceFocusV1,
   AppHealthV1,
   CommandErrorV1,
+  DeletedSegmentsV1,
   CommitReviewRequestV1,
   CommittedReviewV1,
   DesktopPlaybackReceiptV1,
@@ -467,11 +468,17 @@ export async function updateSegmentMetadataV1(
 }
 
 export async function deleteSegment(id: string): Promise<void> {
-  return invokeCritical('delete_segment', { id });
+  await deleteSegmentsV1([id]);
 }
 
 export async function deleteSegmentsBatch(ids: string[]): Promise<void> {
-  return invokeCritical('delete_segments_batch', { ids });
+  await deleteSegmentsV1(ids);
+}
+
+export async function deleteSegmentsV1(ids: string[]): Promise<DeletedSegmentsV1> {
+  const result = await generatedCommands.deleteSegmentsV1({ ids });
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function exportDataset(path: string, format: string): Promise<void> {

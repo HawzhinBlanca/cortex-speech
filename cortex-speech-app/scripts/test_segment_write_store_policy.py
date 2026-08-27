@@ -36,10 +36,8 @@ def test_store_owns_serialized_deletes_history_and_rename_without_ui_dependencie
         "segment.speaker_id != *expected && segment.speaker_id != *value",
         "segment.alignment_json != *expected && segment.alignment_json != *value",
         "HistoryManager::persist_segment_update(&database, &history, &segment)?",
-        "database.get_segment_by_id(id)?",
-        "database.get_segments_by_ids(ids)?",
-        "database.delete_segment(id)?",
-        "database.delete_segments_batch(ids)?",
+        "database.get_segments_by_ids(ids)",
+        "database.delete_segments_batch(ids)",
         "Command::DeleteSegments",
         '.rename_speaker(old_id, new_id)',
     ):
@@ -51,8 +49,7 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
     source = read("commands/segments_write.rs")
     signatures = {
         "update_segment_metadata_v1": "pub fn update_segment_metadata_v1(",
-        "delete_segment": "pub fn delete_segment(",
-        "delete_segments_batch": "pub fn delete_segments_batch(",
+        "delete_segments_v1": "pub fn delete_segments_v1(",
         "rename_speaker": "pub fn rename_speaker(",
     }
     for name, signature in signatures.items():
@@ -63,7 +60,7 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
             if forbidden in body:
                 raise AssertionError(f"{name} regained raw database authority: {forbidden}")
 
-    for name in ("update_segment_metadata_v1", "delete_segment", "delete_segments_batch"):
+    for name in ("update_segment_metadata_v1", "delete_segments_v1"):
         body = command(source, signatures[name])
         if "validate::validate_identifier" not in body:
             raise AssertionError(f"{name} lost identifier validation")
@@ -73,6 +70,34 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
             raise AssertionError(f"{name} no longer keeps restore admission alive through session save")
     if "validate::validate_identifier(&new_id)" not in command(source, signatures["rename_speaker"]):
         raise AssertionError("rename_speaker lost new identity validation")
+
+    deletion = command(source, signatures["delete_segments_v1"])
+    for required in ("MAX_SEGMENT_DELETE_IDS", "public_segment_delete_error", "deleted_count > 0"):
+        if required not in deletion:
+            raise AssertionError(f"typed deletion boundary lost {required!r}")
+
+
+def test_duplicate_batch_ids_fail_before_shared_evidence_archival() -> None:
+    source = read("db/segments.rs")
+    start = source.find("pub fn delete_segments_batch(")
+    end = source.find("pub fn get_segment_by_id(", start)
+    if start < 0 or end < 0:
+        raise AssertionError("shared batch deletion boundary not found")
+    body = source[start:end]
+    duplicate_guard = body.find("ids.iter().any(|id| !unique_ids.insert(id.as_str()))")
+    savepoint = body.find('self.conn.execute("SAVEPOINT batch_delete", [])?')
+    archival = body.find("self.archive_loop0_evidence_for(id)?")
+    if min(duplicate_guard, savepoint, archival) < 0 or not duplicate_guard < savepoint < archival:
+        raise AssertionError("duplicate ids are not refused before batch savepoint and evidence archival")
+
+    runtime_tests = read("db_tests.rs")
+    for required in (
+        "fn duplicate_batch_ids_cannot_double_archive_loop0_or_c4_evidence()",
+        "assert_eq!(loop0_after, loop0_before",
+        "assert_eq!(c4_after, c4_before",
+    ):
+        if required not in runtime_tests:
+            raise AssertionError(f"duplicate-id evidence regression lost runtime proof {required!r}")
 
 
 def test_retired_whole_row_command_cannot_acquire_database_authority() -> None:
@@ -87,6 +112,7 @@ def test_retired_whole_row_command_cannot_acquire_database_authority() -> None:
 def main() -> None:
     test_store_owns_serialized_deletes_history_and_rename_without_ui_dependencies()
     test_migrated_commands_validate_then_delegate_without_raw_database_authority()
+    test_duplicate_batch_ids_fail_before_shared_evidence_archival()
     test_retired_whole_row_command_cannot_acquire_database_authority()
     print("segment-write store architecture policy passed")
 

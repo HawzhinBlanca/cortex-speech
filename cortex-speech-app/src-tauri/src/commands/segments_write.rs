@@ -11,17 +11,19 @@ use super::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::db::SpeechSegment;
 use crate::history::HistoryManager;
 use crate::ipc_contract::{
-    CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, DesktopPlaybackReceiptV1, DesktopPlaybackSessionV1,
-    MarkSegmentUnusableRequestV1, MarkedSegmentUnusableV1, PlaybackIntervalV1, ReviewDecisionV1, ReviewDraftV1,
-    SegmentMetadataChangeV1, SuggestedActionV1, UpdateSegmentMetadataRequestV1, UpdatedSegmentMetadataV1,
+    CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, DeleteSegmentsRequestV1, DeletedSegmentsV1,
+    DesktopPlaybackReceiptV1, DesktopPlaybackSessionV1, MarkSegmentUnusableRequestV1, MarkedSegmentUnusableV1,
+    PlaybackIntervalV1, ReviewDecisionV1, ReviewDraftV1, SegmentMetadataChangeV1, SuggestedActionV1,
+    UpdateSegmentMetadataRequestV1, UpdatedSegmentMetadataV1,
 };
-use crate::stores::{SegmentMetadataChange, SegmentMetadataUpdateError};
+use crate::stores::{SegmentDeleteError, SegmentMetadataChange, SegmentMetadataUpdateError};
 use crate::validation::input as validate;
 use crate::AppState;
 use tauri::State;
 
 const WHOLE_ROW_SEGMENT_WRITE_RETIRED: &str =
     "the whole-row segment writer is retired; use update_segment_metadata_v1 or the review decision/flag flow";
+const MAX_SEGMENT_DELETE_IDS: usize = 100_000;
 
 /// RETIRED (deep audit 2026-08-25) — the legacy whole-row segment write.
 ///
@@ -207,24 +209,60 @@ pub fn update_segment_metadata_v1(
     })
 }
 
-#[tauri::command]
-pub fn delete_segment(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("delete_segment")?;
-    validate::validate_identifier(&id)?;
-    let _mutation = state.segment_writes().delete_one(&id).map_err(|error| error.to_string())?;
-    state.session_auto_save();
-    Ok(())
+fn public_segment_delete_error(error: SegmentDeleteError) -> CommandErrorV1 {
+    match error {
+        SegmentDeleteError::Authority => CommandErrorV1::new(
+            "SEGMENT_DELETE_BLOCKED",
+            "Reviewed segments and their evidence are append-only and cannot be deleted.",
+            false,
+        ),
+        SegmentDeleteError::Invalid => {
+            CommandErrorV1::new("INVALID_DELETE_REQUEST", "The segment deletion request is invalid.", false)
+        }
+        SegmentDeleteError::Busy => {
+            CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry the deletion.", true)
+                .suggested(SuggestedActionV1::Retry)
+        }
+        SegmentDeleteError::Application => CommandErrorV1::new(
+            "SEGMENT_DELETE_FAILED",
+            "The segments could not be deleted. Open Health before retrying.",
+            false,
+        )
+        .suggested(SuggestedActionV1::OpenHealth),
+    }
 }
 
+/// One generated, idempotent deletion boundary for both single and batch UI actions. Duplicate ids
+/// are refused by the shared database boundary before evidence archival, and reviewed authority
+/// remains append-only. Replaying after response loss succeeds with `deleted_count = 0`.
 #[tauri::command]
-pub fn delete_segments_batch(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("delete_segments_batch")?;
-    for id in &ids {
-        validate::validate_identifier(id)?;
+#[specta::specta]
+pub fn delete_segments_v1(
+    request: DeleteSegmentsRequestV1,
+    state: State<'_, AppState>,
+) -> Result<DeletedSegmentsV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("delete_segments_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many deletion requests. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    if request.ids.is_empty() || request.ids.len() > MAX_SEGMENT_DELETE_IDS {
+        return Err(CommandErrorV1::new(
+            "INVALID_DELETE_REQUEST",
+            "Delete between one and 100,000 segments at a time.",
+            false,
+        ));
     }
-    let _mutation = state.segment_writes().delete_batch(&ids).map_err(|error| error.to_string())?;
-    state.session_auto_save();
-    Ok(())
+    for id in &request.ids {
+        validate::validate_identifier(id)
+            .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "A segment identity is invalid.", false))?;
+    }
+    let requested_count = request.ids.len();
+    let (deleted_count, _mutation) =
+        state.segment_writes().delete_batch(&request.ids).map_err(public_segment_delete_error)?;
+    if deleted_count > 0 {
+        state.session_auto_save();
+    }
+    Ok(DeletedSegmentsV1 { requested_count, deleted_count })
 }
 
 #[tauri::command]
@@ -1006,8 +1044,8 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 mod tests {
     use super::{
         commit_review_v1_on, mark_segment_unusable_v1_on, persist_whole_segment_update_on,
-        public_precommit_playback_binding_error, public_segment_metadata_error, record_human_decision_on,
-        retired_legacy_decision_error, validate_playback_receipt_identity,
+        public_precommit_playback_binding_error, public_segment_delete_error, public_segment_metadata_error,
+        record_human_decision_on, retired_legacy_decision_error, validate_playback_receipt_identity,
     };
     use crate::database_runtime::DatabaseRuntime;
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
@@ -1015,7 +1053,7 @@ mod tests {
     use crate::ipc_contract::{
         CommitReviewRequestV1, MarkSegmentUnusableRequestV1, ReviewDecisionV1, TechnicalUnusableReasonV1,
     };
-    use crate::stores::{require_listened, ReviewWriteStore, SegmentMetadataUpdateError};
+    use crate::stores::{require_listened, ReviewWriteStore, SegmentDeleteError, SegmentMetadataUpdateError};
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -1042,6 +1080,21 @@ mod tests {
         ));
         let public = serde_json::to_string(&internal).unwrap();
         assert_eq!(internal.code, "SEGMENT_METADATA_SAVE_FAILED");
+        assert!(!public.contains("owner.db") && !public.contains("secret token"), "{public}");
+    }
+
+    #[test]
+    fn deletion_refusals_are_typed_and_scrub_backend_details() {
+        let blocked = public_segment_delete_error(SegmentDeleteError::Authority);
+        assert_eq!(blocked.code, "SEGMENT_DELETE_BLOCKED");
+        assert!(!blocked.retryable);
+
+        let invalid = public_segment_delete_error(SegmentDeleteError::Invalid);
+        assert_eq!(invalid.code, "INVALID_DELETE_REQUEST");
+
+        let internal = public_segment_delete_error(SegmentDeleteError::Application);
+        let public = serde_json::to_string(&internal).unwrap();
+        assert_eq!(internal.code, "SEGMENT_DELETE_FAILED");
         assert!(!public.contains("owner.db") && !public.contains("secret token"), "{public}");
     }
 
