@@ -2,6 +2,9 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import './app.css';
 import { installGlobalErrorTrap } from './lib/globalErrorTrap';
+import type { SpeechSegment } from './lib/types';
+
+type DemoSpeechSegment = SpeechSegment & { confidence: number; snrDb: number };
 
 // P2.2 (audit F3): surface un-awaited promise rejections as a toast instead of letting them vanish.
 // Installed BEFORE mount so it covers the whole app lifetime. Idempotent.
@@ -70,7 +73,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     });
     return JSON.stringify({ words });
   };
-  let demoSegments = SAMPLE.map(([text, conf, spk, ver, dur], i) => ({
+  let demoSegments: DemoSpeechSegment[] = SAMPLE.map(([text, conf, spk, ver, dur], i) => ({
     id: `seg_${String(i + 1).padStart(3, '0')}`,
     createdAt: `2026-06-1${i % 9}T0${i % 8}:12:00Z`,
     audioPath: `fixtures/clip_${i + 1}.wav`,
@@ -290,16 +293,60 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
       if (!segment) throw new Error(`Segment '${id}' no longer exists`);
       return segment;
     }
-    if (cmd === 'update_segment_fields') {
-      const id = String(args?.segmentId ?? '');
-      const fields = args?.fields;
-      if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
-        throw new Error('update_segment_fields requires an object fields payload');
-      }
+    if (cmd === 'update_segment_metadata_v1') {
+      const request = args?.request as
+        | {
+            segmentId?: string;
+            changes?: Array<{
+              field?: 'speakerId' | 'alignmentJson';
+              expected?: string | null;
+              value?: string | null;
+            }>;
+          }
+        | undefined;
+      const id = String(request?.segmentId ?? '');
       const index = demoSegments.findIndex((segment) => segment.id === id);
-      if (index < 0) return false;
-      demoSegments[index] = { ...demoSegments[index], ...fields };
-      return true;
+      if (index < 0) {
+        throw {
+          schema: 1,
+          code: 'SEGMENT_NOT_FOUND',
+          message: 'The selected preview segment no longer exists.',
+          retryable: false,
+          suggestedAction: 'reloadClip',
+        };
+      }
+      const changes = request?.changes ?? [];
+      if (changes.length === 0) throw new Error('metadata changes cannot be empty');
+      const current = demoSegments[index];
+      for (const change of changes) {
+        const currentValue =
+          change.field === 'speakerId' ? current.speakerId : current.alignmentJson;
+        if (currentValue !== change.expected && currentValue !== change.value) {
+          throw {
+            schema: 1,
+            code: 'STALE_SEGMENT_METADATA',
+            message:
+              'This preview metadata changed. Reload it before choosing which value to keep.',
+            retryable: false,
+            suggestedAction: 'reloadClip',
+          };
+        }
+      }
+      let next = current;
+      for (const change of changes) {
+        next =
+          change.field === 'speakerId'
+            ? { ...next, speakerId: change.value ?? null }
+            : { ...next, alignmentJson: change.value ?? null };
+      }
+      demoSegments[index] = next;
+      return {
+        segmentId: id,
+        speakerId: next.speakerId,
+        alignmentJson: next.alignmentJson,
+        changed:
+          next.speakerId !== current.speakerId || next.alignmentJson !== current.alignmentJson,
+      };
     }
     // Same class: the readiness verdict and the accuracy card call these, and `{}` / `null` from the
     // catch-alls crashed the Insights panel on `.summary`. Mock the real shapes so dev preview shows

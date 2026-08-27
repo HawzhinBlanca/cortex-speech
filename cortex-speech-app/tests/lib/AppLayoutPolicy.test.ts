@@ -87,8 +87,9 @@ describe('App layout integrity', () => {
       "const verified = typeof args?.verified === 'boolean' ? args.verified : null;",
     );
     expect(main).toContain('(verified === null || s.verified === verified)');
-    expect(main).toContain("if (cmd === 'update_segment_fields')");
-    expect(main).toContain('demoSegments[index] = { ...demoSegments[index], ...fields };');
+    expect(main).toContain("if (cmd === 'update_segment_metadata_v1')");
+    expect(main).toContain("code: 'STALE_SEGMENT_METADATA'");
+    expect(main).toContain('demoSegments[index] = next;');
     expect(main).toContain("if (cmd === 'plugin:event|listen') return args?.handler ?? 0;");
     expect(main).toContain('__TAURI_EVENT_PLUGIN_INTERNALS__');
     expect(main).toContain('if (callbacks) delete callbacks[id];');

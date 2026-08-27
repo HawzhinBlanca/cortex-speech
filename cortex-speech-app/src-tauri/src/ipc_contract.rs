@@ -209,6 +209,34 @@ pub struct ActiveVoiceFocusV1 {
     pub segment_count: i64,
 }
 
+/// One compare-and-set metadata edit. `expected` is the exact last server value observed by the
+/// renderer; `value` is the requested replacement. Keeping the two fields explicit makes clearing a
+/// nullable value distinguishable from omitting that field entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(tag = "field", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum SegmentMetadataChangeV1 {
+    SpeakerId { expected: Option<String>, value: Option<String> },
+    AlignmentJson { expected: Option<String>, value: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSegmentMetadataRequestV1 {
+    pub segment_id: String,
+    pub changes: Vec<SegmentMetadataChangeV1>,
+}
+
+/// Server truth after an atomic metadata compare-and-set. Returning both fields lets the renderer
+/// rebase its next edit without trusting its pre-save row or performing a second read.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatedSegmentMetadataV1 {
+    pub segment_id: String,
+    pub speaker_id: Option<String>,
+    pub alignment_json: Option<String>,
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewItemV1 {
@@ -506,7 +534,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_segment,
             crate::commands::get_segments_page,
             crate::commands::get_segment_ids_for_view,
-            crate::commands::get_signal_anomaly_segments
+            crate::commands::get_signal_anomaly_segments,
+            crate::commands::update_segment_metadata_v1
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
@@ -528,6 +557,9 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<crate::db::SegmentsPage>()
         .typ::<ReviewScope>()
         .typ::<ActiveVoiceFocusV1>()
+        .typ::<SegmentMetadataChangeV1>()
+        .typ::<UpdateSegmentMetadataRequestV1>()
+        .typ::<UpdatedSegmentMetadataV1>()
         .typ::<ReviewItemV1>()
         .typ::<ReviewPageV1>()
         .typ::<ReviewDecisionV1>()

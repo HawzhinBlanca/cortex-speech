@@ -55,6 +55,8 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('get_segment_ids_for_view');
   // @ts-expect-error anomaly hydration uses the bounded generated contract
   void invokeLegacy<unknown>('get_signal_anomaly_segments');
+  // @ts-expect-error segment metadata compare-and-set is generated, never handwritten
+  void invokeLegacy<unknown>('update_segment_fields');
   // @ts-expect-error destructive restore requires its exact source argument
   void invokeCritical('db_restore');
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings

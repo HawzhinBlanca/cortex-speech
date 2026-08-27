@@ -122,6 +122,13 @@ export const commands = {
 	 *  this diagnostics view into an unbounded library hydration.
 	 */
 	getSignalAnomalySegments: (limit: number | null) => typedError<SpeechSegment[], CommandErrorV1>(__TAURI_INVOKE("get_signal_anomaly_segments", { limit })),
+	/**
+	 *  Versioned per-field compare-and-set for library-owned metadata. Unlike the retired generic JSON
+	 *  writer, every nullable field is explicit and bound to the exact last server value the renderer
+	 *  observed. A stale save therefore conflicts instead of overwriting newer metadata, while an exact
+	 *  lost-response replay remains an idempotent success.
+	 */
+	updateSegmentMetadataV1: (request: UpdateSegmentMetadataRequestV1) => typedError<UpdatedSegmentMetadataV1, CommandErrorV1>(__TAURI_INVOKE("update_segment_metadata_v1", { request })),
 };
 
 /* Types */
@@ -348,6 +355,13 @@ export type ReviewPageV1 = {
 
 export type ReviewScope = { kind: "pending" } | { kind: "escalation" } | { kind: "search"; query: string } | { kind: "voiceFocus"; focusId: string };
 
+/**
+ *  One compare-and-set metadata edit. `expected` is the exact last server value observed by the
+ *  renderer; `value` is the requested replacement. Keeping the two fields explicit makes clearing a
+ *  nullable value distinguishable from omitting that field entirely.
+ */
+export type SegmentMetadataChangeV1 = { field: "speakerId"; expected: string | null; value: string | null } | { field: "alignmentJson"; expected: string | null; value: string | null };
+
 export type SegmentsPage = {
 	items: SpeechSegment[],
 	total: number,
@@ -503,6 +517,22 @@ export type TracingStatsV1 = {
 	failures: number,
 	total_duration_ms: number,
 	avg_duration_ms: number,
+};
+
+export type UpdateSegmentMetadataRequestV1 = {
+	segmentId: string,
+	changes: SegmentMetadataChangeV1[],
+};
+
+/**
+ *  Server truth after an atomic metadata compare-and-set. Returning both fields lets the renderer
+ *  rebase its next edit without trusting its pre-save row or performing a second read.
+ */
+export type UpdatedSegmentMetadataV1 = {
+	segmentId: string,
+	speakerId: string | null,
+	alignmentJson: string | null,
+	changed: boolean,
 };
 
 /* Tauri Specta runtime */

@@ -25,7 +25,7 @@ export interface AutosaveDeps<T extends object> {
    *
    * Receives the merged row (fresh store row + edits, for callers that persist whole rows), plus the
    * raw edited `fields` and the segment `id` — the app wires these to the partial-update IPC
-   * (`updateSegmentFields`), so ONLY the user-edited fields are persisted and a stale store row can
+   * (`updateSegmentMetadataV1`), so ONLY the user-edited fields are persisted and a stale store row can
    * never clobber concurrently-written columns (F10 root fix).
    */
   save: (row: T, fields: Record<string, unknown>, id: string) => Promise<unknown>;
@@ -56,14 +56,36 @@ export interface AutosaveController {
    * to be deleted or re-transcribed), so an unrelated segment's queued edit is never lost.
    */
   pendingId: () => string | null;
+  /** IDs whose hydrated compare-and-set baselines must remain resident until save/retry settles. */
+  retainedIds: () => string[];
 }
 
 export function createAutosaveController<T extends object>(
   deps: AutosaveDeps<T>,
 ): AutosaveController {
+  type PendingSave = { id: string; fields: Record<string, unknown>; sequence: number };
   const debounceMs = deps.debounceMs ?? 1000;
+  let nextSequence = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let pending: { id: string; fields: Record<string, unknown> } | null = null;
+  let pending: PendingSave | null = null;
+  const retryQueue = new Map<string, PendingSave>();
+
+  function queueRetry(entry: PendingSave): void {
+    const existing = retryQueue.get(entry.id);
+    if (!existing || existing === entry) {
+      retryQueue.set(entry.id, entry);
+      return;
+    }
+    // Retain disjoint fields from both attempts and let the chronologically newer entry win for an
+    // overlapping field. This race occurs when a failed in-flight save returns after the user has
+    // revisited the same segment and queued a new entry.
+    if (entry.sequence > existing.sequence) {
+      entry.fields = { ...existing.fields, ...entry.fields };
+      retryQueue.set(entry.id, entry);
+    } else {
+      existing.fields = { ...entry.fields, ...existing.fields };
+    }
+  }
 
   // Re-read the FRESH row so a concurrent change to OTHER fields (a verify/normalize/background
   // reload during the debounce) is preserved, then re-apply the user's edited fields so their edit
@@ -72,7 +94,7 @@ export function createAutosaveController<T extends object>(
   // merged row is advisory, never the persistence source of truth). Returns the in-flight save
   // promise, or null (no save issued) when the row no longer exists — callers that only need "was a
   // save issued?" can still test truthiness (null is falsy).
-  function persist(entry: { id: string; fields: Record<string, unknown> }): Promise<void> | null {
+  function persist(entry: PendingSave): Promise<void> | null {
     const fresh = deps.getRow(entry.id);
     if (!fresh) return null;
     const merged = { ...fresh, ...entry.fields } as T;
@@ -82,11 +104,14 @@ export function createAutosaveController<T extends object>(
         // scheduled while this save was in flight merged into `entry` and armed a fresh timer, and
         // nulling `pending` here would let the next re-key's `clearTimer()` drop that edit unsaved.
         if (pending === entry && timer === null) pending = null;
+        if (retryQueue.get(entry.id) === entry) retryQueue.delete(entry.id);
         deps.onState?.('saved');
       },
       (error) => {
+        queueRetry(entry);
         deps.onError?.(error);
         deps.onState?.('idle');
+        throw error;
       },
     );
   }
@@ -99,15 +124,25 @@ export function createAutosaveController<T extends object>(
   }
 
   function flush() {
-    void flushAsync();
+    // `onError` already surfaced the failure; fire-and-forget callers cannot await it, so consume the
+    // rejection here. `flushAsync` deliberately preserves it for close guards and explicit Save.
+    void flushAsync().catch(() => undefined);
   }
 
-  function flushAsync(): Promise<void> {
+  async function flushAsync(): Promise<void> {
     clearTimer();
-    const entry = pending;
+    const entries = [...retryQueue.values()];
+    if (pending && !entries.includes(pending)) entries.push(pending);
     pending = null;
-    if (!entry) return Promise.resolve();
-    return persist(entry) ?? Promise.resolve();
+    for (const entry of entries) queueRetry(entry);
+    for (const entry of entries) {
+      const saving = persist(entry);
+      if (!saving) {
+        if (retryQueue.get(entry.id) === entry) retryQueue.delete(entry.id);
+        continue;
+      }
+      await saving;
+    }
   }
 
   function schedule(edits: Record<string, unknown>) {
@@ -121,23 +156,38 @@ export function createAutosaveController<T extends object>(
     // persist it now before re-keying the timer to the new target.
     if (pending && pending.id !== id) flush();
     clearTimer();
-    if (!pending || pending.id !== id) pending = { id, fields: {} };
+    if (!pending || pending.id !== id) {
+      pending = retryQueue.get(id) ?? { id, fields: {}, sequence: 0 };
+    }
+    pending.sequence = ++nextSequence;
     Object.assign(pending.fields, edits);
     const entry = pending;
     timer = setTimeout(() => {
       timer = null;
-      if (!persist(entry)) deps.onState?.('idle');
+      const saving = persist(entry);
+      if (!saving) deps.onState?.('idle');
+      else void saving.catch(() => undefined);
     }, debounceMs);
   }
 
   function cancel() {
     clearTimer();
+    const target = pending?.id ?? deps.targetId();
+    if (target) retryQueue.delete(target);
     pending = null;
   }
 
   function pendingId(): string | null {
-    return pending ? pending.id : null;
+    if (pending) return pending.id;
+    const target = deps.targetId();
+    return target && retryQueue.has(target) ? target : null;
   }
 
-  return { schedule, flush, flushAsync, cancel, pendingId };
+  function retainedIds(): string[] {
+    const ids = new Set(retryQueue.keys());
+    if (pending) ids.add(pending.id);
+    return [...ids];
+  }
+
+  return { schedule, flush, flushAsync, cancel, pendingId, retainedIds };
 }

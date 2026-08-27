@@ -51,7 +51,7 @@ describe('autosave controller', () => {
   });
 
   // F10 root fix: the save callback receives the raw edited FIELDS and the segment id, so the app can
-  // persist ONLY the user's edits via the partial-update IPC (updateSegmentFields) — the merged store
+  // persist ONLY the user's edits via compare-and-set IPC (updateSegmentMetadataV1) — the merged store
   // row may be stale during a long batch and must never be the persistence source of truth.
   it('passes the accumulated raw fields and the segment id to the save callback', async () => {
     vi.useFakeTimers();
@@ -114,6 +114,49 @@ describe('autosave controller', () => {
       save: async () => {},
     });
     await expect(ctrl.flushAsync()).resolves.toBeUndefined();
+  });
+
+  it('flushAsync rejects and retains the edit until a later retry succeeds', async () => {
+    let attempts = 0;
+    const ctrl = createAutosaveController<Row>({
+      targetId: () => 'A',
+      getRow: () => ({ id: 'A', text: 'orig' }),
+      save: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('stale metadata');
+      },
+    });
+    ctrl.schedule({ text: 'must-survive' });
+
+    await expect(ctrl.flushAsync()).rejects.toThrow('stale metadata');
+    expect(ctrl.pendingId()).toBe('A');
+    await expect(ctrl.flushAsync()).resolves.toBeUndefined();
+    expect(attempts).toBe(2);
+    expect(ctrl.pendingId()).toBeNull();
+  });
+
+  it('retains later-segment work when an earlier retry fails during a close flush', async () => {
+    let target: string | null = 'A';
+    const attempts: string[] = [];
+    let failA = true;
+    const ctrl = createAutosaveController<Row>({
+      targetId: () => target,
+      getRow: (id) => ({ id, text: 'orig' }),
+      save: async (row) => {
+        attempts.push(row.id);
+        if (row.id === 'A' && failA) throw new Error('A unavailable');
+      },
+      debounceMs: 1000,
+    });
+    ctrl.schedule({ text: 'edit-a' });
+    target = 'B';
+    ctrl.schedule({ text: 'edit-b' });
+    await Promise.resolve();
+
+    await expect(ctrl.flushAsync()).rejects.toThrow('A unavailable');
+    failA = false;
+    await expect(ctrl.flushAsync()).resolves.toBeUndefined();
+    expect(attempts.filter((id) => id === 'B')).toHaveLength(1);
   });
 
   // The core round-16 fix: switching to (and editing) a different segment within the debounce window
@@ -218,6 +261,33 @@ describe('autosave controller', () => {
     await vi.runAllTimersAsync();
     expect(h.ctrl.pendingId()).toBeNull(); // the debounced save landing clears the queue
     vi.useRealTimers();
+  });
+
+  it('retainedIds exposes every baseline required by pending and failed retry work', async () => {
+    const rows = new Map([
+      ['A', { id: 'A', text: 'old-a' }],
+      ['B', { id: 'B', text: 'old-b' }],
+    ]);
+    let current = 'A';
+    const save = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('A unavailable'))
+      .mockResolvedValue(undefined);
+    const ctrl = createAutosaveController({
+      targetId: () => current,
+      getRow: (id) => rows.get(id) ?? null,
+      save,
+      debounceMs: 10_000,
+    });
+
+    ctrl.schedule({ text: 'new-a' });
+    expect(ctrl.retainedIds()).toEqual(['A']);
+    await expect(ctrl.flushAsync()).rejects.toThrow('A unavailable');
+    current = 'B';
+    ctrl.schedule({ text: 'new-b' });
+    expect(new Set(ctrl.retainedIds())).toEqual(new Set(['A', 'B']));
+    await ctrl.flushAsync();
+    expect(ctrl.retainedIds()).toEqual([]);
   });
 
   // Latent until a second autosaved field existed, but the class is dataset loss: an edit typed while

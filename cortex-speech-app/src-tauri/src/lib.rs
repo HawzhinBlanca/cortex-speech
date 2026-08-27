@@ -900,7 +900,7 @@ pub fn run() {
             commands::get_segment_ids_for_view,
             commands::get_signal_anomaly_segments,
             commands::update_segment,
-            commands::update_segment_fields,
+            commands::update_segment_metadata_v1,
             commands::delete_segment,
             commands::delete_segments_batch,
             commands::merge_dataset_json,

@@ -1,5 +1,4 @@
 import { invoke as invokeDesktop } from '@tauri-apps/api/core';
-import type { SpeechSegment } from '../types';
 
 type CommandService = typeof import('../commands');
 type CommandResult<Name extends keyof CommandService> = Awaited<
@@ -103,7 +102,6 @@ export const LEGACY_IPC_COMMANDS = [
   'transcribe_segment',
   'undo_human_decision',
   'undo_review_flag',
-  'update_segment_fields',
   'validate_dataset_cmd',
 ] as const;
 
@@ -121,13 +119,6 @@ type CriticalLegacyIpcContract = {
   };
   import_audio_file: { args: { path: string }; result: CommandResult<'importAudioFile'> };
   cancel_operation: { args: undefined; result: CommandResult<'cancelOperation'> };
-  update_segment_fields: {
-    args: {
-      segmentId: string;
-      fields: Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>;
-    };
-    result: CommandResult<'updateSegmentFields'>;
-  };
   delete_segment: { args: { id: string }; result: CommandResult<'deleteSegment'> };
   delete_segments_batch: { args: { ids: string[] }; result: CommandResult<'deleteSegmentsBatch'> };
   export_dataset: {

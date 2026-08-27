@@ -6,10 +6,11 @@
   import SquarePen from '@lucide/svelte/icons/square-pen';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import X from '@lucide/svelte/icons/x';
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import * as api from './lib/commands';
   import { createAutosaveController } from './lib/autosave';
+  import { createSegmentMetadataCoordinator } from './lib/segmentMetadataCoordinator';
   import { registerDurableCloseGuard } from './lib/closeGuard';
   import { chooseDirectory, saveFile } from './lib/fileDialogs';
   import { flushReviewDrafts } from './lib/reviewDraftFlush';
@@ -165,40 +166,28 @@
   let latestAgentReport = $state<AgentImportReport | null>(null);
   let latestAgentStageEvents = $state<AgentStageEvent[]>([]);
 
-  type SegmentMetadataFields = Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>;
-  // The library is deliberately read-only for review truth. This controller persists only independent
-  // metadata, and its runtime key check fails closed if a future caller tries to smuggle transcript or
-  // verification fields through the generic autosave plumbing.
+  let metadataReadinessEpoch = $state(0);
+  const metadataCoordinator = createSegmentMetadataCoordinator({
+    save: api.updateSegmentMetadataV1,
+    applyServerTruth: (updated) =>
+      segments.update((rows) =>
+        rows.map((row) =>
+          row.id === updated.segmentId
+            ? { ...row, speakerId: updated.speakerId, alignmentJson: updated.alignmentJson }
+            : row,
+        ),
+      ),
+    onReadinessChanged: () => (metadataReadinessEpoch += 1),
+  });
+  let selectedMetadataReady = $derived.by(() => {
+    void metadataReadinessEpoch;
+    return metadataCoordinator.isReady($selectedSegment?.id ?? null);
+  });
+
   const autosave = createAutosaveController<SpeechSegment>({
     targetId: () => get(selectedSegment)?.id ?? null,
     getRow: (id) => get(segments).find((s) => s.id === id) ?? null,
-    save: (_row, fields, id) => {
-      const unexpected = Object.keys(fields).filter(
-        (key) => key !== 'speakerId' && key !== 'alignmentJson',
-      );
-      if (unexpected.length > 0) {
-        return Promise.reject(
-          new Error(`Refusing non-metadata autosave fields: ${unexpected.join(', ')}`),
-        );
-      }
-
-      const metadata: SegmentMetadataFields = {};
-      if ('speakerId' in fields) {
-        const speakerId = fields.speakerId;
-        if (speakerId !== null && typeof speakerId !== 'string') {
-          return Promise.reject(new Error('Refusing invalid speakerId metadata'));
-        }
-        metadata.speakerId = speakerId;
-      }
-      if ('alignmentJson' in fields) {
-        const alignmentJson = fields.alignmentJson;
-        if (alignmentJson !== null && typeof alignmentJson !== 'string') {
-          return Promise.reject(new Error('Refusing invalid alignmentJson metadata'));
-        }
-        metadata.alignmentJson = alignmentJson;
-      }
-      return api.updateSegmentFields(id, metadata);
-    },
+    save: (_row, fields, id) => metadataCoordinator.saveFields(id, fields),
     onError: (e) => notifications.error($t('notifications.saveFailed'), { cause: e }),
   });
   let tauriAvailable = $state(false);
@@ -320,7 +309,7 @@
     autosave.cancel();
   }
 
-  function scheduleAutoSave(edits: SegmentMetadataFields) {
+  function scheduleAutoSave(edits: api.SegmentMetadataFields) {
     autosave.schedule(edits);
   }
 
@@ -341,9 +330,9 @@
   $effect(() => {
     const id = $selectedSegmentId; // any selection change ends word-playback mode AND reseats the view
     clearWordOverride();
+    if (id) untrack(() => metadataCoordinator.forget(id));
     // Per-selection VIEW setup for EVERY selection path. selectSegment() used to set these inline, but
-    // store-only selections from OTHER components — ValidationPanel "Go to segment" (jumpToSegment) and the
-    // active-learning / signal-anomaly jumps — only set the selectedSegmentId store and bypassed it. When
+    // Store-only jumps set the selectedSegmentId store and bypassed selectSegment(). When
     // chunks share ONE source audioPath (single-file import), the AudioPlayer then kept playing from the OLD
     // position straight through the new clip's endTime (the renderer advanced through the wrong clip while
     // the UI showed the new one), and the waveform bars / tap-a-word data stayed on the previous chunk. Centralizing it
@@ -360,6 +349,11 @@
         .hydrate(seg.id)
         .then((full) => {
           if (get(selectedSegmentId) !== full.id) return;
+          metadataCoordinator.remember(full.id, {
+            speakerId: full.speakerId,
+            alignmentJson: full.alignmentJson,
+          });
+          metadataCoordinator.pruneExcept([full.id, ...autosave.retainedIds()]);
           currentTime = chunkPlaybackRange(parseSourceMeta(full.alignmentJson)).startTime;
           wordTimestamps.set(parseWordTimestamps(full.alignmentJson));
           void loadWaveform(full.audioPath, full.alignmentJson);
@@ -1264,13 +1258,15 @@
     const seg = $selectedSegment;
     if (!seg) return;
     if (!requireDesktopRuntime()) return;
+    const hadPendingSave = autosave.pendingId() === seg.id;
     try {
-      // Speaker attribution is independent metadata. Persist only that field onto the fresh row;
-      // review transcript and verification truth remain unreachable from the library.
-      await api.updateSegmentFields(seg.id, { speakerId: seg.speakerId });
+      await autosave.flushAsync();
+      if (!hadPendingSave) {
+        await metadataCoordinator.saveFields(seg.id, { speakerId: seg.speakerId });
+      }
       notifications.success($t('speaker.saved'));
     } catch (e) {
-      notifications.error($t('notifications.saveFailed'), { cause: e });
+      if (!hadPendingSave) notifications.error($t('notifications.saveFailed'), { cause: e });
     }
   }
 
@@ -2328,7 +2324,8 @@
                   class="input !text-xs font-mono"
                   value={$selectedSegment.speakerId ?? ''}
                   placeholder={$t('batchAssignSpeaker.placeholder')}
-                  disabled={$isProcessing}
+                  disabled={$isProcessing || !selectedMetadataReady}
+                  aria-describedby={!selectedMetadataReady ? 'speaker-metadata-loading' : undefined}
                   oninput={(e) => {
                     const seg = $selectedSegment;
                     if (seg) {
@@ -2342,9 +2339,14 @@
                   }}
                 />
               </div>
-              <button class="btn btn-secondary !text-xs shrink-0" onclick={handleSaveSpeaker}
-                >{$t('speaker.save')}</button
+              <button
+                class="btn btn-secondary !text-xs shrink-0"
+                onclick={handleSaveSpeaker}
+                disabled={$isProcessing || !selectedMetadataReady}>{$t('speaker.save')}</button
               >
+              {#if !selectedMetadataReady}
+                <span id="speaker-metadata-loading" class="sr-only">{$t('loading')}</span>
+              {/if}
             </div>
 
             <DiffView

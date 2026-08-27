@@ -16,12 +16,14 @@ import type {
   ReviewDraftV1,
   ReviewPageV1,
   ReviewScope,
+  SegmentMetadataChangeV1,
   SettingsPatchResultV1,
   SettingsPatchV1,
   SettingsSnapshotV1,
   TextDiff,
   TracingSpanV1,
   TracingStatsV1,
+  UpdatedSegmentMetadataV1,
 } from './generated/ipc';
 export type {
   ActiveVoiceFocusV1,
@@ -429,16 +431,39 @@ export async function getSignalAnomalySegments(limit = 100): Promise<SpeechSegme
   return data;
 }
 
+export type SegmentMetadataFields = Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>;
+export type SegmentMetadataBaseline = Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>;
+
 /**
- * Partial metadata update for fields that do not own human-review truth. Transcript corrections and
- * verification are committed only by recordHumanDecision, so they are intentionally unrepresentable
- * in this frontend wrapper. Resolves false when the row no longer exists.
+ * Compare-and-set only library-owned metadata against the exact server values last observed by the
+ * renderer. Human transcript and verification truth are deliberately unrepresentable here.
  */
-export async function updateSegmentFields(
+export async function updateSegmentMetadataV1(
   segmentId: string,
-  fields: Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>,
-): Promise<boolean> {
-  return invokeCritical('update_segment_fields', { segmentId, fields });
+  expected: SegmentMetadataBaseline,
+  fields: SegmentMetadataFields,
+): Promise<UpdatedSegmentMetadataV1> {
+  const changes: SegmentMetadataChangeV1[] = [];
+  if ('speakerId' in fields) {
+    changes.push({
+      field: 'speakerId',
+      expected: expected.speakerId,
+      value: fields.speakerId ?? null,
+    });
+  }
+  if ('alignmentJson' in fields) {
+    changes.push({
+      field: 'alignmentJson',
+      expected: expected.alignmentJson,
+      value: fields.alignmentJson ?? null,
+    });
+  }
+  if (changes.length === 0) {
+    throw new Error('Refusing an empty segment metadata update');
+  }
+  const result = await generatedCommands.updateSegmentMetadataV1({ segmentId, changes });
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function deleteSegment(id: string): Promise<void> {

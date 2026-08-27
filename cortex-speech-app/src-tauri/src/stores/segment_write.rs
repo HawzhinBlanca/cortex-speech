@@ -1,71 +1,10 @@
 //! Durable segment deletion, undo-history capture and speaker rename boundaries.
 
 use crate::database_runtime::{begin_mutation, DatabaseRuntime, MutationGuard};
-use crate::db::SpeechSegment;
 use crate::error::{AppError, AppResult};
 use crate::history::{Command, HistoryManager};
 use crate::validation::input as validate;
 use std::sync::{Arc, Mutex, MutexGuard};
-
-const UNBOUND_REVIEW_FIELD_MUTATION_DISABLED: &str =
-    "generic review-owned field mutation is disabled at schema v60; use the evidence-bound review decision/flag flow";
-
-fn schema_uses_effect_bound_human_truth(database: &crate::db::Database) -> AppResult<bool> {
-    crate::migrations::get_current_version(database).map(|version| version >= 60)
-}
-
-/// Apply only the fields owned by curation autosave. Unknown keys and wrong value types are loud
-/// errors, and the caller persists only after the complete payload has validated.
-fn apply_curation_fields(
-    segment: &mut SpeechSegment,
-    fields: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    fn optional_string(key: &str, value: &serde_json::Value) -> Result<Option<String>, String> {
-        if value.is_null() {
-            Ok(None)
-        } else {
-            value.as_str().map(str::to_string).map(Some).ok_or_else(|| format!("{key} must be a string or null"))
-        }
-    }
-
-    for (key, value) in fields {
-        match key.as_str() {
-            "annotatedTranscript" => {
-                let value = optional_string(key, value)?;
-                if let Some(ref transcript) = value {
-                    validate::validate_text(transcript, 100_000, "Annotated transcript")?;
-                }
-                segment.annotated_transcript = value;
-            }
-            "speakerId" => {
-                let value = optional_string(key, value)?;
-                if let Some(ref speaker) = value {
-                    if !speaker.is_empty() {
-                        validate::validate_text(speaker, 256, "Speaker ID")?;
-                    }
-                }
-                segment.speaker_id = value;
-            }
-            "alignmentJson" => {
-                let value = optional_string(key, value)?;
-                if let Some(ref alignment) = value {
-                    validate::validate_alignment_json(alignment)?;
-                }
-                segment.alignment_json = value;
-            }
-            "verified" => {
-                segment.verified = value.as_bool().ok_or_else(|| format!("{key} must be a boolean"))?;
-            }
-            other => {
-                return Err(format!(
-                    "update_segment_fields: unsupported field '{other}' — only curation fields \
-                     (annotatedTranscript, speakerId, alignmentJson, verified) may be partially updated"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 
 #[derive(Clone)]
 pub(crate) struct SegmentWriteStore {
@@ -76,6 +15,39 @@ pub(crate) struct SegmentWriteStore {
 /// Keeps restore admission fenced until the command has persisted its matching session state.
 pub(crate) struct SegmentMutation {
     _admission: MutationGuard<'static>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SegmentMetadataChange {
+    SpeakerId { expected: Option<String>, value: Option<String> },
+    AlignmentJson { expected: Option<String>, value: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpdatedSegmentMetadata {
+    pub(crate) segment_id: String,
+    pub(crate) speaker_id: Option<String>,
+    pub(crate) alignment_json: Option<String>,
+    pub(crate) changed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum SegmentMetadataUpdateError {
+    Application(AppError),
+    Missing,
+    Conflict(&'static str),
+}
+
+impl From<AppError> for SegmentMetadataUpdateError {
+    fn from(error: AppError) -> Self {
+        Self::Application(error)
+    }
+}
+
+impl From<String> for SegmentMetadataUpdateError {
+    fn from(error: String) -> Self {
+        Self::Application(AppError::Validation(error))
+    }
 }
 
 impl SegmentWriteStore {
@@ -97,27 +69,92 @@ impl SegmentWriteStore {
         })
     }
 
-    pub(crate) fn update_fields(
+    /// Atomically compare-and-set the nullable metadata fields owned by the library workspace.
+    ///
+    /// An exact lost-response replay is a success when the current value already equals `value`.
+    /// Otherwise every edited field must still equal the renderer's `expected` value; all conflicts
+    /// are detected before any field is changed, so a mixed request can never partially commit.
+    pub(crate) fn update_metadata_v1(
         &self,
         segment_id: &str,
-        fields: &serde_json::Map<String, serde_json::Value>,
-    ) -> AppResult<(bool, SegmentMutation)> {
+        changes: &[SegmentMetadataChange],
+    ) -> Result<(UpdatedSegmentMetadata, SegmentMutation), SegmentMetadataUpdateError> {
         let admission = begin_mutation().map_err(AppError::Other)?;
-        let database = self.lock_database("update_segment_fields");
-        if schema_uses_effect_bound_human_truth(&database)?
-            && fields.keys().any(|key| matches!(key.as_str(), "verified" | "annotatedTranscript"))
-        {
-            return Err(AppError::Other(UNBOUND_REVIEW_FIELD_MUTATION_DISABLED.into()));
+        if changes.is_empty() {
+            return Err(AppError::Validation("segment metadata update requires at least one change".into()).into());
         }
+        if changes.len() > 2 {
+            return Err(AppError::Validation("segment metadata update accepts at most two changes".into()).into());
+        }
+
+        let mut speaker_change: Option<(&Option<String>, &Option<String>)> = None;
+        let mut alignment_change: Option<(&Option<String>, &Option<String>)> = None;
+        for change in changes {
+            match change {
+                SegmentMetadataChange::SpeakerId { expected, value } => {
+                    if speaker_change.replace((expected, value)).is_some() {
+                        return Err(AppError::Validation(
+                            "speakerId appears more than once in one metadata update".into(),
+                        )
+                        .into());
+                    }
+                    if let Some(speaker) = value {
+                        if !speaker.is_empty() {
+                            validate::validate_text(speaker, 256, "Speaker ID")?;
+                        }
+                    }
+                }
+                SegmentMetadataChange::AlignmentJson { expected, value } => {
+                    if alignment_change.replace((expected, value)).is_some() {
+                        return Err(AppError::Validation(
+                            "alignmentJson appears more than once in one metadata update".into(),
+                        )
+                        .into());
+                    }
+                    if let Some(alignment) = value {
+                        validate::validate_alignment_json(alignment)?;
+                    }
+                }
+            }
+        }
+
+        let database = self.lock_database("update_segment_metadata_v1");
         let Some(mut segment) = database.get_segment_by_id(segment_id)? else {
-            return Ok((false, SegmentMutation { _admission: admission }));
+            return Err(SegmentMetadataUpdateError::Missing);
         };
-        apply_curation_fields(&mut segment, fields)?;
-        let history = self.lock_history("update_segment_fields");
-        HistoryManager::persist_segment_update(&database, &history, &segment)?;
-        drop(history);
+
+        if let Some((expected, value)) = speaker_change {
+            if segment.speaker_id != *expected && segment.speaker_id != *value {
+                return Err(SegmentMetadataUpdateError::Conflict("speakerId"));
+            }
+        }
+        if let Some((expected, value)) = alignment_change {
+            if segment.alignment_json != *expected && segment.alignment_json != *value {
+                return Err(SegmentMetadataUpdateError::Conflict("alignmentJson"));
+            }
+        }
+
+        let previous_speaker = segment.speaker_id.clone();
+        let previous_alignment = segment.alignment_json.clone();
+        if let Some((_, value)) = speaker_change {
+            segment.speaker_id.clone_from(value);
+        }
+        if let Some((_, value)) = alignment_change {
+            segment.alignment_json.clone_from(value);
+        }
+        let changed = segment.speaker_id != previous_speaker || segment.alignment_json != previous_alignment;
+        if changed {
+            let history = self.lock_history("update_segment_metadata_v1");
+            HistoryManager::persist_segment_update(&database, &history, &segment)?;
+        }
+        let result = UpdatedSegmentMetadata {
+            segment_id: segment.id,
+            speaker_id: segment.speaker_id,
+            alignment_json: segment.alignment_json,
+            changed,
+        };
         drop(database);
-        Ok((true, SegmentMutation { _admission: admission }))
+        Ok((result, SegmentMutation { _admission: admission }))
     }
 
     pub(crate) fn delete_one(&self, id: &str) -> AppResult<SegmentMutation> {
@@ -154,7 +191,7 @@ impl SegmentWriteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::db::{Database, SpeechSegment};
 
     fn store_with_segments() -> (tempfile::TempDir, SegmentWriteStore, DatabaseRuntime, Arc<Mutex<HistoryManager>>) {
         let directory = tempfile::tempdir().unwrap();
@@ -208,74 +245,58 @@ mod tests {
     }
 
     #[test]
-    fn apply_curation_fields_touches_only_whitelisted_fields_and_rejects_unknown_keys() {
-        let mut segment = SpeechSegment {
-            id: "curation".into(),
-            audio_path: "curation.wav".into(),
-            raw_transcript: "raw text".into(),
-            verified: true,
-            confidence: Some(0.42),
-            ..SpeechSegment::default()
-        };
-        let before = segment.clone();
-        let fields = serde_json::json!({ "annotatedTranscript": "دەق", "speakerId": "SPEAKER_01" });
-        apply_curation_fields(&mut segment, fields.as_object().unwrap()).unwrap();
-        assert_eq!(segment.annotated_transcript.as_deref(), Some("دەق"));
-        assert_eq!(segment.speaker_id.as_deref(), Some("SPEAKER_01"));
-        assert_eq!(segment.verified, before.verified);
-        assert_eq!(segment.confidence, before.confidence);
-        assert_eq!(segment.raw_transcript, before.raw_transcript);
-        assert_eq!(segment.audio_path, before.audio_path);
-        assert_eq!(segment.alignment_json, before.alignment_json);
+    fn metadata_compare_and_set_refuses_a_stale_same_field_write() {
+        let (_directory, store, runtime, _history) = store_with_segments();
+        let first =
+            [SegmentMetadataChange::SpeakerId { expected: Some("speaker-a".into()), value: Some("speaker-z".into()) }];
+        let (updated, admission) = store.update_metadata_v1("one", &first).unwrap();
+        drop(admission);
+        assert!(updated.changed);
+        assert_eq!(updated.speaker_id.as_deref(), Some("speaker-z"));
 
-        let clear = serde_json::json!({ "speakerId": null });
-        apply_curation_fields(&mut segment, clear.as_object().unwrap()).unwrap();
-        assert_eq!(segment.speaker_id, None);
-
-        let verified = serde_json::json!({ "verified": false });
-        apply_curation_fields(&mut segment, verified.as_object().unwrap()).unwrap();
-        assert!(!segment.verified);
-        assert_eq!(segment.raw_transcript, before.raw_transcript);
-        let bad_verified = serde_json::json!({ "verified": "yes" });
-        assert!(apply_curation_fields(&mut segment, bad_verified.as_object().unwrap()).is_err());
-
-        let unsupported = serde_json::json!({ "confidence": 0.9 });
-        let error = apply_curation_fields(&mut segment, unsupported.as_object().unwrap()).unwrap_err();
-        assert!(error.contains("unsupported field 'confidence'"), "{error}");
-        assert_eq!(segment.confidence, before.confidence);
-        let wrong_type = serde_json::json!({ "annotatedTranscript": 7 });
-        assert!(apply_curation_fields(&mut segment, wrong_type.as_object().unwrap()).is_err());
+        let stale = [SegmentMetadataChange::SpeakerId {
+            expected: Some("speaker-a".into()),
+            value: Some("must-not-clobber".into()),
+        }];
+        assert!(matches!(
+            store.update_metadata_v1("one", &stale),
+            Err(SegmentMetadataUpdateError::Conflict("speakerId"))
+        ));
+        let retained = runtime.open_read().unwrap().get_segment_by_id("one").unwrap().unwrap();
+        assert_eq!(retained.speaker_id.as_deref(), Some("speaker-z"));
+        assert_eq!(retained.raw_transcript, "draft-one");
     }
 
     #[test]
-    fn schema_v60_field_writer_refuses_unbound_review_fields_atomically() {
+    fn metadata_update_is_atomic_and_an_exact_lost_response_replay_is_idempotent() {
         let (_directory, store, runtime, _history) = store_with_segments();
-        let allowed = serde_json::json!({
-            "speakerId": "speaker-z",
-            "alignmentJson": r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#
-        });
-        let (changed, admission) = store.update_fields("one", allowed.as_object().unwrap()).unwrap();
-        assert!(changed);
+        let alignment = r#"{"source_start_ms":0,"source_end_ms":1000,"chunk_index":0,"chunk_count":1}"#.to_string();
+        let request = [
+            SegmentMetadataChange::SpeakerId { expected: Some("speaker-a".into()), value: Some("speaker-z".into()) },
+            SegmentMetadataChange::AlignmentJson { expected: None, value: Some(alignment.clone()) },
+        ];
+        let (first, admission) = store.update_metadata_v1("one", &request).unwrap();
         drop(admission);
-        assert_eq!(
-            runtime.open_read().unwrap().get_segment_by_id("one").unwrap().unwrap().speaker_id.as_deref(),
-            Some("speaker-z")
-        );
+        assert!(first.changed);
+        assert_eq!(first.alignment_json.as_deref(), Some(alignment.as_str()));
 
-        for restricted in [
-            serde_json::json!({ "verified": true }),
-            serde_json::json!({ "annotatedTranscript": "unbound human truth" }),
-        ] {
-            let error =
-                store.update_fields("one", restricted.as_object().unwrap()).err().expect("restricted field refused");
-            assert!(error.to_string().contains("disabled at schema v60"), "{error}");
-        }
+        let (replay, admission) = store.update_metadata_v1("one", &request).unwrap();
+        drop(admission);
+        assert!(!replay.changed, "an exact replay must acknowledge the existing server value");
 
-        let mixed = serde_json::json!({ "speakerId": "must-not-commit", "verified": true });
-        let error = store.update_fields("one", mixed.as_object().unwrap()).err().expect("mixed field payload refused");
-        assert!(error.to_string().contains("disabled at schema v60"), "{error}");
+        let conflict = [
+            SegmentMetadataChange::SpeakerId {
+                expected: Some("speaker-a".into()),
+                value: Some("must-not-commit".into()),
+            },
+            SegmentMetadataChange::AlignmentJson { expected: Some(alignment.clone()), value: None },
+        ];
+        assert!(matches!(
+            store.update_metadata_v1("one", &conflict),
+            Err(SegmentMetadataUpdateError::Conflict("speakerId"))
+        ));
         let retained = runtime.open_read().unwrap().get_segment_by_id("one").unwrap().unwrap();
         assert_eq!(retained.speaker_id.as_deref(), Some("speaker-z"));
-        assert!(!retained.verified && retained.annotated_transcript.is_none());
+        assert_eq!(retained.alignment_json.as_deref(), Some(alignment.as_str()));
     }
 }

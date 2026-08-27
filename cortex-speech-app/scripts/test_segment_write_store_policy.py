@@ -30,10 +30,12 @@ def test_store_owns_serialized_deletes_history_and_rename_without_ui_dependencie
         "struct SegmentMutation",
         "_admission: MutationGuard<'static>",
         "begin_mutation().map_err(AppError::Other)?",
-        "fn apply_curation_fields(",
-        "schema_uses_effect_bound_human_truth(&database)?",
+        "fn update_metadata_v1(",
+        "SegmentMetadataChange::SpeakerId",
+        "SegmentMetadataChange::AlignmentJson",
+        "segment.speaker_id != *expected && segment.speaker_id != *value",
+        "segment.alignment_json != *expected && segment.alignment_json != *value",
         "HistoryManager::persist_segment_update(&database, &history, &segment)?",
-        "UNBOUND_REVIEW_FIELD_MUTATION_DISABLED",
         "database.get_segment_by_id(id)?",
         "database.get_segments_by_ids(ids)?",
         "database.delete_segment(id)?",
@@ -48,7 +50,7 @@ def test_store_owns_serialized_deletes_history_and_rename_without_ui_dependencie
 def test_migrated_commands_validate_then_delegate_without_raw_database_authority() -> None:
     source = read("commands/segments_write.rs")
     signatures = {
-        "update_segment_fields": "pub fn update_segment_fields(",
+        "update_segment_metadata_v1": "pub fn update_segment_metadata_v1(",
         "delete_segment": "pub fn delete_segment(",
         "delete_segments_batch": "pub fn delete_segments_batch(",
         "rename_speaker": "pub fn rename_speaker(",
@@ -61,7 +63,7 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
             if forbidden in body:
                 raise AssertionError(f"{name} regained raw database authority: {forbidden}")
 
-    for name in ("update_segment_fields", "delete_segment", "delete_segments_batch"):
+    for name in ("update_segment_metadata_v1", "delete_segment", "delete_segments_batch"):
         body = command(source, signatures[name])
         if "validate::validate_identifier" not in body:
             raise AssertionError(f"{name} lost identifier validation")

@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => ({
   saveReviewDraftV1: vi.fn(),
   deleteReviewDraftV1: vi.fn(),
   undoHumanDecision: vi.fn(),
-  updateSegmentFields: vi.fn(),
+  updateSegmentMetadataV1: vi.fn(),
   registerMediaAsset: vi.fn(),
   registerReviewMediaAsset: vi.fn(),
   getMediaAssetUrl: vi.fn(),
@@ -240,7 +240,7 @@ describe('ReviewMode windowed queue', () => {
       restoredRevision: 2,
       segment: segment(),
     });
-    mocks.updateSegmentFields.mockResolvedValue(undefined);
+    mocks.updateSegmentMetadataV1.mockResolvedValue(undefined);
     mocks.registerMediaAsset.mockResolvedValue({ id: 'asset-key' });
     mocks.registerReviewMediaAsset.mockResolvedValue({ id: 'asset-key' });
     mocks.getMediaAssetUrl.mockResolvedValue('C:\\audio\\review.wav');
@@ -294,7 +294,7 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() =>
       expect(mocks.recordHumanDecision).toHaveBeenCalledWith('review-1', 'reject', null),
     );
-    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
     expect(await screen.findByTestId('review-terminal')).toBeInTheDocument();
   });
 
@@ -324,7 +324,7 @@ describe('ReviewMode windowed queue', () => {
     );
     expect(await screen.findByTestId('review-action-bar')).toBeInTheDocument();
     expect(screen.getByRole('textbox')).toHaveValue('authoritative restored text');
-    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
   });
 
   it('never exposes a lightweight row before its chunk metadata is hydrated', async () => {
@@ -1232,7 +1232,7 @@ describe('ReviewMode windowed queue', () => {
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript));
 
     resolveDecision(decisionCommit(first, 'accept', first.rawTranscript));
-    await waitFor(() => expect(mocks.updateSegmentFields).not.toHaveBeenCalled());
+    await waitFor(() => expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled());
     expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript);
   });
 
@@ -1263,15 +1263,15 @@ describe('ReviewMode windowed queue', () => {
 
     await fireEvent.keyDown(window, { key: 'ArrowRight', code: 'ArrowRight' });
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue(second.rawTranscript));
-    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
     expect(mocks.recordHumanDecision).not.toHaveBeenCalled();
 
     await fireEvent.keyDown(window, { key: 'ArrowLeft', code: 'ArrowLeft' });
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('دەقی دەستکاریکراو'));
-    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
 
     view.unmount();
-    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
     expect(mocks.recordHumanDecision).not.toHaveBeenCalled();
   });
 
@@ -1367,7 +1367,7 @@ describe('ReviewMode windowed queue', () => {
     await fireEvent.click(accept);
     // The refusal is the assertion: nothing was written.
     await waitFor(() => expect(mocks.recordHumanDecision).not.toHaveBeenCalled());
-    expect(mocks.updateSegmentFields).not.toHaveBeenCalled();
+    expect(mocks.updateSegmentMetadataV1).not.toHaveBeenCalled();
   });
 
   it('requires an explicit technical reason, retains the clip on failure, and advances only after a verified unusable commit', async () => {

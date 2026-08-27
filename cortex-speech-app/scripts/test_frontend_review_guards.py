@@ -146,7 +146,10 @@ def test_submit_guards_editor_writes_against_navigation() -> None:
             "write with `if (visibleId === seg.id)`: navigating during the decision await would put seg's "
             "text into another clip's editor and Save it as that clip's human gold."
         )
-    if "api.updateSegmentFields(seg.id" in body or "api.updateSegment(" in body:
+    if any(
+        forbidden in body
+        for forbidden in ("api.updateSegmentFields(seg.id", "api.updateSegmentMetadataV1(seg.id", "api.updateSegment(")
+    ):
         raise AssertionError(
             "submit() performs a second renderer-owned segment write after the atomic human decision; "
             "that can split verification from its immutable effect or clobber a fresher row"
@@ -159,7 +162,7 @@ def test_review_mode_drafts_are_session_local_until_atomic_decision() -> None:
     teardown must never persist annotatedTranscript by themselves."""
     src = _read("src/lib/ReviewMode.svelte")
     body = _function_body(src, "async function go(")
-    for forbidden in ("api.updateSegmentFields(", "api.updateSegment("):
+    for forbidden in ("api.updateSegmentFields(", "api.updateSegmentMetadataV1(", "api.updateSegment("):
         if forbidden in src:
             raise AssertionError(
                 f"ReviewMode still contains {forbidden!r}; drafts must stay session-local until the atomic "
@@ -247,6 +250,7 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
     metadata, and no frontend call may send annotatedTranscript or verified through it."""
     app = _read("src/Workstation.svelte")
     commands = _read("src/lib/commands.ts")
+    coordinator = _read("src/lib/segmentMetadataCoordinator.ts")
     review_mode = _read("src/lib/ReviewMode.svelte")
 
     forbidden_ui = (
@@ -278,24 +282,30 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
         if retained not in app:
             raise AssertionError(f"the read-only/metadata library capability {retained!r} was removed")
 
-    allowed_type = "Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>"
-    if allowed_type not in commands:
+    if "export type SegmentMetadataFields = Partial<" not in commands or (
+        "Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>" not in commands
+    ):
         raise AssertionError(
-            "updateSegmentFields is not statically limited to speakerId/alignmentJson metadata"
+            "updateSegmentMetadataV1 is not statically limited to speakerId/alignmentJson metadata"
         )
-    wrapper_start = commands.find("export async function updateSegmentFields(")
+    wrapper_start = commands.find("export async function updateSegmentMetadataV1(")
     wrapper_end = commands.find("\n}\n", wrapper_start)
     if wrapper_start == -1 or wrapper_end == -1:
-        raise AssertionError("updateSegmentFields wrapper not found — this gate would pass vacuously")
+        raise AssertionError("updateSegmentMetadataV1 wrapper not found — this gate would pass vacuously")
     wrapper = commands[wrapper_start:wrapper_end]
+    for required in ("expected: SegmentMetadataBaseline", "expected: expected.speakerId", "expected: expected.alignmentJson"):
+        if required not in wrapper:
+            raise AssertionError(f"updateSegmentMetadataV1 lost compare-and-set binding {required!r}")
     for forbidden in ("annotatedTranscript", "verified"):
         if forbidden in wrapper:
-            raise AssertionError(f"updateSegmentFields can represent forbidden review field {forbidden}")
+            raise AssertionError(f"updateSegmentMetadataV1 can represent forbidden review field {forbidden}")
 
-    if "const unexpected = Object.keys(fields).filter(" not in app:
-        raise AssertionError("App autosave has no runtime fail-closed metadata key allowlist")
-    if "key !== 'speakerId' && key !== 'alignmentJson'" not in app:
-        raise AssertionError("App autosave metadata allowlist drifted from the typed wrapper")
+    if "save: api.updateSegmentMetadataV1" not in app:
+        raise AssertionError("Workstation no longer wires metadata through the versioned coordinator")
+    if "const unexpected = Object.keys(fields).filter(" not in coordinator:
+        raise AssertionError("Metadata coordinator has no runtime fail-closed key allowlist")
+    if "key !== 'speakerId' && key !== 'alignmentJson'" not in coordinator:
+        raise AssertionError("Metadata coordinator allowlist drifted from the typed wrapper")
 
     for path in sorted((REPO_ROOT / "src").rglob("*")):
         if path.suffix not in {".ts", ".svelte"}:
@@ -303,19 +313,19 @@ def test_library_review_truth_is_read_only_and_metadata_writer_is_narrow() -> No
         src = path.read_text(encoding="utf-8")
         cursor = 0
         while True:
-            marker = src.find("api.updateSegmentFields", cursor)
+            marker = src.find("api.updateSegmentMetadataV1(", cursor)
             if marker == -1:
                 break
             opening = src.find("(", marker)
             closing = _matching_paren(src, opening)
             if closing == -1:
-                raise AssertionError(f"could not parse updateSegmentFields call in {path.relative_to(REPO_ROOT)}")
+                raise AssertionError(f"could not parse updateSegmentMetadataV1 call in {path.relative_to(REPO_ROOT)}")
             call = src[marker : closing + 1]
             for forbidden in ("annotatedTranscript", "verified"):
                 if forbidden in call:
                     raise AssertionError(
                         f"{path.relative_to(REPO_ROOT)} sends forbidden review field {forbidden} "
-                        "through updateSegmentFields"
+                        "through updateSegmentMetadataV1"
                     )
             cursor = closing + 1
 

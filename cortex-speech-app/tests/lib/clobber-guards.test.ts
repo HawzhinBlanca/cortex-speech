@@ -11,16 +11,19 @@ describe('schema-v60 frontend review-write boundary', () => {
     const src = read('../../src/lib/ReviewMode.svelte');
     expect(src).toContain('const editCache = new Map<string, string>()');
     expect(src).toContain('session-local editCache');
-    expect(src).not.toContain('api.updateSegmentFields(');
+    expect(src).not.toContain('api.updateSegmentMetadataV1(');
     expect(src).not.toMatch(/api\.updateSegment\(/);
   });
 
   it('the library exposes only a fail-closed metadata partial writer', () => {
     const app = read('../../src/Workstation.svelte');
     const commands = read('../../src/lib/commands.ts');
+    const coordinator = read('../../src/lib/segmentMetadataCoordinator.ts');
     expect(commands).not.toContain('export async function updateSegment(');
-    expect(commands).toContain("Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>");
-    expect(app).toContain("key !== 'speakerId' && key !== 'alignmentJson'");
+    expect(commands).toContain("Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>");
+    expect(commands).toContain('export async function updateSegmentMetadataV1(');
+    expect(commands).toContain('expected: SegmentMetadataBaseline');
+    expect(coordinator).toContain("key !== 'speakerId' && key !== 'alignmentJson'");
     for (const forbidden of [
       'handleSaveAnnotation',
       'handleToggleVerify',
@@ -48,18 +51,18 @@ describe('schema-v60 frontend review-write boundary', () => {
     expect(submit).toContain('const commit = await api.commitReviewV1({');
     expect(submit).toContain('baseRevision');
     expect(submit).toContain('commit.authoritativeTranscript');
-    expect(submit).not.toContain('updateSegmentFields(seg.id');
+    expect(submit).not.toContain('updateSegmentMetadataV1(seg.id');
     expect(submit).not.toMatch(/api\.updateSegment\(/);
     const markBad = region('async function markBad(', 'async function submit(');
     expect(markBad).toContain('const commit = await api.commitReviewV1({');
     expect(markBad).toContain("decision: 'reject'");
     expect(markBad).toContain('baseRevision');
     expect(markBad).toContain('commit.authoritativeTranscript');
-    expect(markBad).not.toContain('updateSegmentFields(seg.id');
+    expect(markBad).not.toContain('updateSegmentMetadataV1(seg.id');
     expect(markBad).not.toMatch(/api\.updateSegment\(/);
     const go = region('async function go(', 'function resetToOriginal(');
     expect(go).toContain('session-local editCache');
-    expect(go).not.toContain('updateSegmentFields(');
+    expect(go).not.toContain('updateSegmentMetadataV1(');
     expect(go).not.toMatch(/api\.updateSegment\(/);
     // Re-transcribe is champion-only: the backend commits transcript + provenance atomically, then the
     // UI reloads that authoritative row. It must never whole-row upsert a stale frontend snapshot.

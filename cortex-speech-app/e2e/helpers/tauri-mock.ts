@@ -9,9 +9,9 @@ export async function installTauriMock(page: Page): Promise<void> {
       rawTranscript: 'hello world',
       normalizedTranscript: 'hello world',
       annotatedTranscript: 'hello world',
-      alignmentJson: null,
+      alignmentJson: null as string | null,
       durationMs: 1500,
-      speakerId: 'SPEAKER_00',
+      speakerId: 'SPEAKER_00' as string | null,
       verified: false,
     };
 
@@ -245,9 +245,44 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'set_api_key':
             // Echo the post-save provider-NAMES list (never a key value), like the real command.
             return ['gemini', args?.provider ?? 'openrouter'];
-          case 'update_segment_fields':
-            // F10 partial autosave: true = the fresh row existed and the fields were applied.
-            return true;
+          case 'update_segment_metadata_v1': {
+            const request = args?.request as
+              | {
+                  segmentId?: string;
+                  changes?: Array<{
+                    field?: 'speakerId' | 'alignmentJson';
+                    expected?: string | null;
+                    value?: string | null;
+                  }>;
+                }
+              | undefined;
+            const speaker = request?.changes?.find((change) => change.field === 'speakerId');
+            const alignment = request?.changes?.find((change) => change.field === 'alignmentJson');
+            if (
+              (speaker &&
+                mockSegment.speakerId !== speaker.expected &&
+                mockSegment.speakerId !== speaker.value) ||
+              (alignment &&
+                mockSegment.alignmentJson !== alignment.expected &&
+                mockSegment.alignmentJson !== alignment.value)
+            ) {
+              throw {
+                schema: 1,
+                code: 'STALE_SEGMENT_METADATA',
+                message: 'The mock metadata changed. Reload it before saving.',
+                retryable: false,
+                suggestedAction: 'reloadClip',
+              };
+            }
+            if (speaker) mockSegment.speakerId = speaker.value ?? null;
+            if (alignment) mockSegment.alignmentJson = alignment.value ?? null;
+            return {
+              segmentId: request?.segmentId ?? 'seg-1',
+              speakerId: mockSegment.speakerId,
+              alignmentJson: mockSegment.alignmentJson,
+              changed: true,
+            };
+          }
           case 'couch_review_status':
             return { running: false, reviewers: [] };
           case 'start_couch_review':

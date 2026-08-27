@@ -1,9 +1,7 @@
 //! Segment mutation IPC commands — slice 9 of the Week-4 `commands.rs` decomposition.
 //!
-//! Behaviour and command NAMES unchanged: `commands.rs` re-exports this module (`pub use
-//! segments_write::*;`), so `lib.rs`'s invoke_handler still names `commands::update_segment` and the
-//! frontend invokes are untouched. Same functions, only relocated; the re-export also keeps them
-//! callable by bare name from commands.rs.
+//! `commands.rs` re-exports this module (`pub use segments_write::*;`). Legacy whole-row writes stay
+//! retired; library metadata uses the generated compare-and-set v1 contract.
 //!
 //! These are fast single-row/batch DB writes (edit, delete, speaker rename, human decision, verdict,
 //! bounds) — they run on the caller thread (no run_blocking) exactly as before, since a single indexed
@@ -15,18 +13,19 @@ use crate::history::HistoryManager;
 use crate::ipc_contract::{
     CommandErrorV1, CommitReviewRequestV1, CommittedReviewV1, DesktopPlaybackReceiptV1, DesktopPlaybackSessionV1,
     MarkSegmentUnusableRequestV1, MarkedSegmentUnusableV1, PlaybackIntervalV1, ReviewDecisionV1, ReviewDraftV1,
-    SuggestedActionV1,
+    SegmentMetadataChangeV1, SuggestedActionV1, UpdateSegmentMetadataRequestV1, UpdatedSegmentMetadataV1,
 };
+use crate::stores::{SegmentMetadataChange, SegmentMetadataUpdateError};
 use crate::validation::input as validate;
 use crate::AppState;
 use tauri::State;
 
 const WHOLE_ROW_SEGMENT_WRITE_RETIRED: &str =
-    "the whole-row segment writer is retired; use update_segment_fields or the review decision/flag flow";
+    "the whole-row segment writer is retired; use update_segment_metadata_v1 or the review decision/flag flow";
 
 /// RETIRED (deep audit 2026-08-25) — the legacy whole-row segment write.
 ///
-/// It had no callers left: curation autosave moved to `update_segment_fields` and human truth moved to
+/// It had no callers left: curation autosave moved to `update_segment_metadata_v1` and human truth moved to
 /// the evidence-bound decision/flag flow. What it still carried was every retired write hazard on one
 /// endpoint — a BLANK `raw_transcript` overwriting a good champion draft, renderer-supplied STALE
 /// machine fields, and resurrection of a row deleted mid-edit through `insert_segment`'s ON CONFLICT
@@ -130,37 +129,82 @@ pub fn restore_segment_snapshot(segment: SpeechSegment, state: State<'_, AppStat
     let _ = (segment, state);
     Err("Renderer-owned whole-row restore is disabled; review undo requires an immutable server-owned effect id".into())
 }
-/// F10 root fix — the partial-update IPC the debounced curation autosave calls instead of
-/// whole-row `update_segment`.
-///
-/// The old path merged the user's field edits into the FRONTEND STORE row and upserted the whole row;
-/// during a minutes-long batch the store is stale (it reloads only on batch completion), so that
-/// upsert could silently revert concurrently-written columns (verify stamps, alignment quality,
-/// confidence...). Here the FRESH row is read from the DB and the whitelisted fields applied under the
-/// SAME held lock with no await in between (this command is sync), then persisted through the same
-/// history path as `update_segment` — undo/redo still works, and nothing else in the row can be
-/// clobbered by construction. A row deleted mid-debounce returns `Ok(false)` (no-op) rather than being
-/// resurrected by the upsert.
-#[tauri::command]
-pub fn update_segment_fields(
-    segment_id: String,
-    fields: serde_json::Value,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    STRICT_RATE_LIMITER.check("update_segment_fields")?;
-    validate::validate_identifier(&segment_id)?;
-    let obj = fields.as_object().ok_or("update_segment_fields: fields must be a JSON object")?;
-    if obj.is_empty() {
-        return Ok(false); // nothing to apply
+fn public_segment_metadata_error(error: SegmentMetadataUpdateError) -> CommandErrorV1 {
+    match error {
+        SegmentMetadataUpdateError::Missing => CommandErrorV1::new(
+            "SEGMENT_NOT_FOUND",
+            "The selected segment no longer exists. Reload the library.",
+            false,
+        )
+        .suggested(SuggestedActionV1::ReloadClip),
+        SegmentMetadataUpdateError::Conflict(field) => CommandErrorV1::new(
+            "STALE_SEGMENT_METADATA",
+            "This metadata changed in another operation. Reload the segment before choosing which value to keep.",
+            false,
+        )
+        .detail("field", field)
+        .suggested(SuggestedActionV1::ReloadClip),
+        SegmentMetadataUpdateError::Application(crate::error::AppError::Validation(_)) => {
+            CommandErrorV1::new("INVALID_SEGMENT_METADATA", "The segment metadata is invalid and was not saved.", false)
+        }
+        SegmentMetadataUpdateError::Application(error) => {
+            let normalized = error.to_string().to_ascii_lowercase();
+            if normalized.contains("database is locked") || normalized.contains("database is busy") {
+                CommandErrorV1::new("DATABASE_BUSY", "The workspace is busy. Retry saving this metadata.", true)
+                    .suggested(SuggestedActionV1::Retry)
+            } else {
+                CommandErrorV1::new(
+                    "SEGMENT_METADATA_SAVE_FAILED",
+                    "The metadata could not be saved. Open Health before retrying.",
+                    false,
+                )
+                .suggested(SuggestedActionV1::OpenHealth)
+            }
+        }
     }
+}
 
-    let (changed, _mutation) =
-        state.segment_writes().update_fields(&segment_id, obj).map_err(|error| error.to_string())?;
-
-    if changed {
+/// Versioned per-field compare-and-set for library-owned metadata. Unlike the retired generic JSON
+/// writer, every nullable field is explicit and bound to the exact last server value the renderer
+/// observed. A stale save therefore conflicts instead of overwriting newer metadata, while an exact
+/// lost-response replay remains an idempotent success.
+#[tauri::command]
+#[specta::specta]
+pub fn update_segment_metadata_v1(
+    request: UpdateSegmentMetadataRequestV1,
+    state: State<'_, AppState>,
+) -> Result<UpdatedSegmentMetadataV1, CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("update_segment_metadata_v1").map_err(|_| {
+        CommandErrorV1::new("RATE_LIMITED", "Too many metadata saves. Retry in a moment.", true)
+            .suggested(SuggestedActionV1::Retry)
+    })?;
+    validate::validate_identifier(&request.segment_id)
+        .map_err(|_| CommandErrorV1::new("INVALID_SEGMENT_ID", "The selected segment identity is invalid.", false))?;
+    let changes = request
+        .changes
+        .into_iter()
+        .map(|change| match change {
+            SegmentMetadataChangeV1::SpeakerId { expected, value } => {
+                SegmentMetadataChange::SpeakerId { expected, value }
+            }
+            SegmentMetadataChangeV1::AlignmentJson { expected, value } => {
+                SegmentMetadataChange::AlignmentJson { expected, value }
+            }
+        })
+        .collect::<Vec<_>>();
+    let (updated, _mutation) = state
+        .segment_writes()
+        .update_metadata_v1(&request.segment_id, &changes)
+        .map_err(public_segment_metadata_error)?;
+    if updated.changed {
         state.session_auto_save();
     }
-    Ok(changed)
+    Ok(UpdatedSegmentMetadataV1 {
+        segment_id: updated.segment_id,
+        speaker_id: updated.speaker_id,
+        alignment_json: updated.alignment_json,
+        changed: updated.changed,
+    })
 }
 
 #[tauri::command]
@@ -962,8 +1006,8 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 mod tests {
     use super::{
         commit_review_v1_on, mark_segment_unusable_v1_on, persist_whole_segment_update_on,
-        public_precommit_playback_binding_error, record_human_decision_on, retired_legacy_decision_error,
-        validate_playback_receipt_identity,
+        public_precommit_playback_binding_error, public_segment_metadata_error, record_human_decision_on,
+        retired_legacy_decision_error, validate_playback_receipt_identity,
     };
     use crate::database_runtime::DatabaseRuntime;
     use crate::db::{Database, PlaybackReceipt, SpeechSegment};
@@ -971,7 +1015,7 @@ mod tests {
     use crate::ipc_contract::{
         CommitReviewRequestV1, MarkSegmentUnusableRequestV1, ReviewDecisionV1, TechnicalUnusableReasonV1,
     };
-    use crate::stores::{require_listened, ReviewWriteStore};
+    use crate::stores::{require_listened, ReviewWriteStore, SegmentMetadataUpdateError};
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -981,6 +1025,24 @@ mod tests {
         assert_eq!(error.code, "PLAYBACK_MEDIA_GRANT_UNAVAILABLE");
         assert!(error.retryable);
         assert_eq!(error.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+    }
+
+    #[test]
+    fn metadata_refusals_are_typed_and_scrub_backend_details() {
+        let conflict = public_segment_metadata_error(SegmentMetadataUpdateError::Conflict("speakerId"));
+        assert_eq!(conflict.code, "STALE_SEGMENT_METADATA");
+        assert_eq!(conflict.suggested_action, Some(crate::ipc_contract::SuggestedActionV1::ReloadClip));
+        assert_eq!(
+            conflict.details.get("field"),
+            Some(&crate::ipc_contract::CommandErrorDetailV1::String("speakerId".into()))
+        );
+
+        let internal = public_segment_metadata_error(SegmentMetadataUpdateError::Application(
+            crate::error::AppError::Other("SQL failed at C:\\private\\owner.db with secret token".into()),
+        ));
+        let public = serde_json::to_string(&internal).unwrap();
+        assert_eq!(internal.code, "SEGMENT_METADATA_SAVE_FAILED");
+        assert!(!public.contains("owner.db") && !public.contains("secret token"), "{public}");
     }
 
     fn db_with_clip(dir: &std::path::Path, id: &str) -> Database {
