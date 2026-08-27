@@ -20,6 +20,8 @@ import re
 import sys
 from pathlib import Path
 
+from _db_policy_util import database_surface
+
 APP = Path(__file__).resolve().parents[1]
 
 
@@ -51,7 +53,7 @@ def main() -> int:
     failures = []
 
     # 1. The batch persist path must never mention the human-only column.
-    db_rs = (APP / "src-tauri" / "src" / "db.rs").read_text(encoding="utf-8")
+    db_rs = database_surface(APP / "src-tauri" / "src")
     body = rust_function_body(db_rs, "update_batch_transcription_if_unreviewed")
     if "annotated" in body:
         failures.append(

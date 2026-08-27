@@ -9,6 +9,8 @@ the external success ping when the data plane is unhealthy.
 
 from pathlib import Path
 
+from _db_policy_util import database_surface
+
 
 SCRIPT = Path(__file__).resolve().parent / "ops" / "cortex-watchdog.ps1"
 ADMIN = Path(__file__).resolve().parents[1] / "src-tauri" / "src" / "bin" / "pool_admin.rs"
@@ -46,7 +48,7 @@ def main() -> int:
     direct_or_writers = classifier[classifier.index("const DIRECT_READ_COMMANDS") :]
     if '"certify"' not in classifier or '"certify"' in direct_or_writers:
         raise AssertionError("pool_admin does not classify certify exclusively as detached read-only")
-    database = (ADMIN.parents[1] / "db.rs").read_text(encoding="utf-8")
+    database = database_surface(ADMIN.parents[1])
     if "SQLITE_OPEN_READ_ONLY" not in database or "BEGIN DEFERRED" not in database:
         raise AssertionError("pool_admin's read path is not source-enforced and snapshot-consistent")
     print("POOL CERTIFICATION MONITOR: OK (read-only five-minute hook, alert-gated, no restart coupling)")

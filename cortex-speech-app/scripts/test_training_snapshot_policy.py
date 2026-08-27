@@ -17,10 +17,14 @@ These pins cover the middle clause. Phases 3-4 cover the last one.
 
 from pathlib import Path
 
+from _db_policy_util import database_surface
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _read(relative_path: str) -> str:
+    if relative_path == "src-tauri/src/db.rs":
+        return database_surface(REPO_ROOT / "src-tauri" / "src")
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
 

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from _db_policy_util import database_surface
+
 from _pipeline_policy_util import pipeline_surface
 
 
@@ -7,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def read(path: str) -> str:
+    if path == "src-tauri/src/db.rs":
+        return database_surface(ROOT / "src-tauri" / "src")
     return (ROOT / path).read_text(encoding="utf-8")
 
 

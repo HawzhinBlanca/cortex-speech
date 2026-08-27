@@ -41,12 +41,17 @@ def db_surface() -> str:
     db.rs under the size target, so both the production checks AND the test-name assertions below must
     scan the whole db module, or a moved test would read as "missing" and a forbidden pattern could hide
     in the test file."""
-    parts = [(REPO_ROOT / "src-tauri" / "src" / "db.rs").read_text(encoding="utf-8")]
+    db_root = REPO_ROOT / "src-tauri" / "src"
+    parts = [(db_root / "db.rs").read_text(encoding="utf-8")]
+    db_modules = db_root / "db"
+    if not db_modules.is_dir():
+        raise AssertionError("db module directory is missing — this gate would pass vacuously")
+    parts += [path.read_text(encoding="utf-8") for path in sorted(db_modules.rglob("*.rs"))]
     db_tests = REPO_ROOT / "src-tauri" / "src" / "db_tests.rs"
     if db_tests.is_file():
         parts.append(db_tests.read_text(encoding="utf-8"))
     text = "\n".join(parts)
-    if "impl Database" not in text:
+    if "impl Database" not in text or "pub fn record_review_event(" not in text:
         raise AssertionError("db.rs surface missing `impl Database` — this gate would pass vacuously")
     return text
 
@@ -943,7 +948,8 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
         # v60 widened the authority from a hand-mapped decision tuple to the complete SpeechSegment,
         # revision and canonical PCM hash in one statement.  `map_row` and both `row.get` calls must
         # retain `?`, or a malformed database row could be silently treated as absent/defaulted.
-        "fn decision_snapshot_on(conn: &Connection, id: &str) -> AppResult<Option<(SpeechSegment, i64, Option<String>)>>",
+        "fn decision_snapshot_on(",
+        ") -> AppResult<Option<(SpeechSegment, i64, Option<String>)>>",
         "Ok(Some((Self::map_row(row)?, row.get(37)?, row.get(38)?)))",
         "let Some((prior, prior_revision, stored_content_hash)) = Self::decision_snapshot_on(&tx, segment_id)?",
         "prior.verdict_transcript.clone(),",

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from _couch_policy_util import couch_surface
+from _db_policy_util import database_surface
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -10,6 +11,8 @@ RUST = REPO / "src-tauri" / "src"
 
 
 def read(path: Path) -> str:
+    if path == RUST / "db.rs":
+        return database_surface(RUST)
     return path.read_text(encoding="utf-8")
 
 

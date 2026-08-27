@@ -1,6 +1,8 @@
 """Architecture policy for fail-closed import publication and metadata backfills."""
 
 from pathlib import Path
+
+from _db_policy_util import database_surface
 import re
 
 
@@ -8,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
 
 
 def read(relative: str) -> str:
+    if relative == "db.rs":
+        return database_surface(ROOT)
     return (ROOT / relative).read_text(encoding="utf-8")
 
 

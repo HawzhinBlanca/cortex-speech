@@ -2,12 +2,16 @@
 
 from pathlib import Path
 
+from _db_policy_util import database_surface
+
 
 REPO = Path(__file__).resolve().parents[1]
 RUST = REPO / "src-tauri" / "src"
 
 
 def read(relative: str) -> str:
+    if relative == "db.rs":
+        return database_surface(RUST)
     return (RUST / relative).read_text(encoding="utf-8")
 
 

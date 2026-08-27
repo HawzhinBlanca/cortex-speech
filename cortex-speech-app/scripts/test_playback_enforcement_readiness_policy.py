@@ -25,6 +25,7 @@ from pathlib import Path
 
 from _command_policy_util import command_surface
 from _couch_policy_util import couch_surface
+from _db_policy_util import database_surface
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE = REPO_ROOT / "scripts" / "check_playback_enforcement_readiness.py"
@@ -48,7 +49,8 @@ OTHER_CONTENT_HASH = "b" * 64
 
 
 def _rust_const(name: str, source: Path) -> str:
-    match = re.search(rf"pub const {name}:\s*\w+\s*=\s*([0-9.]+);", source.read_text(encoding="utf-8"))
+    text = database_surface(REPO_ROOT / "src-tauri" / "src") if source == DB_RS else source.read_text(encoding="utf-8")
+    match = re.search(rf"pub const {name}:\s*\w+\s*=\s*([0-9.]+);", text)
     assert match, f"{name} is gone from {source.name} — the gate now pins a constant that no longer exists"
     return match.group(1)
 
@@ -72,7 +74,7 @@ def test_source_span_duration_tolerance_matches_the_rust_constant() -> None:
 
 
 def test_runtime_and_repair_tools_never_authorize_from_the_stored_ratio() -> None:
-    rust = DB_RS.read_text(encoding="utf-8")
+    rust = database_surface(REPO_ROOT / "src-tauri" / "src")
     start = rust.index("fn has_sufficient_playback_evidence_on(")
     end = rust.index("\n/// Re-derive one historical policy-4 authority", start)
     authorization = rust[start:end]
@@ -95,7 +97,7 @@ def test_runtime_and_repair_tools_never_authorize_from_the_stored_ratio() -> Non
 
 def test_playback_identity_has_no_segment_id_or_path_fallback() -> None:
     sources = [
-        (DB_RS.name, DB_RS.read_text(encoding="utf-8")),
+        (DB_RS.name, database_surface(REPO_ROOT / "src-tauri" / "src")),
         (COUCH_RS.name, couch_surface(REPO_ROOT / "src-tauri" / "src")),
         ("command surface", command_surface(REPO_ROOT / "src-tauri" / "src")),
         (SEGMENTS_WRITE_RS.name, SEGMENTS_WRITE_RS.read_text(encoding="utf-8")),

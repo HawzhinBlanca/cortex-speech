@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from _couch_policy_util import couch_surface
+from _db_policy_util import database_surface
 
 APP = Path(__file__).resolve().parent.parent
 REPO = APP.parent
@@ -21,6 +22,8 @@ REPO = APP.parent
 def _read(rel: str) -> str:
     if rel == "src-tauri/src/couch.rs":
         return couch_surface(APP / "src-tauri" / "src")
+    if rel == "src-tauri/src/db.rs":
+        return database_surface(APP / "src-tauri" / "src")
     return (APP / rel).read_text(encoding="utf-8")
 
 

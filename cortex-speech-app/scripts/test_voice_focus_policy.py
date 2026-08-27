@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from _couch_policy_util import couch_surface
+from _db_policy_util import database_surface
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "activate_voice_focus.py"
@@ -283,7 +284,12 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
         (src / "db.rs", "pub focus_narrowed: bool"),
     ]
     for path, needle in anchors:
-        source = couch_surface(src) if path == src / "couch.rs" else path.read_text(encoding="utf-8")
+        if path == src / "couch.rs":
+            source = couch_surface(src)
+        elif path == src / "db.rs":
+            source = database_surface(src)
+        else:
+            source = path.read_text(encoding="utf-8")
         assert needle in source, f"{path.name} lost its focus anchor: {needle!r}"
     review = (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte").read_text(encoding="utf-8")
     assert "allReviewed: !subsetScoped" in review, (
