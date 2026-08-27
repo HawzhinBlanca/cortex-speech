@@ -11798,3 +11798,26 @@ coverage/mutation, calibrated certifying-manifest, schema-clone, 50,000-segment 
 owner workflow/deployment/reboot/field, signed Windows/VM/manual-accessibility, comparator, pilot, and
 model-evidence gaps also remain. The honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT
 CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — generated durable Job Center contract
+
+Commit `5132b6d8a2065618c99facd9cc8e63d5ff9e1747` moves `get_jobs` out of the handwritten IPC
+bridge. The native boundary now returns `JobV1` with an exact generated five-state union and
+renderer-safe `CommandErrorV1` failures; database and path detail can no longer cross into the UI.
+The development browser preview also returns the production list shape instead of rejecting the Job
+Center as an unknown mock command. No job lifecycle transition, durable row, or database schema was
+changed.
+
+Proof ran after the independently owned pool fix landed as base commit `4446cbb2`: the focused Rust
+wire/error test passed 1/1, the focused frontend adapter tests passed 2/2, the complete frontend
+suite passed 494/494 across 87 files, Svelte/TypeScript reported zero errors and warnings, and ESLint,
+Prettier, strict library/all-feature Clippy with warnings denied, rustfmt, generated-binding drift,
+secret hygiene, scoped diff, and IPC policy gates passed. The measured IPC inventory is now 58
+generated / 56 handwritten / one closed dynamic bridge / zero noncanonical generated errors.
+
+The proof used a separate Cargo target because the pool workstream held the default Windows target;
+Cargo removed all 9,729 disposable build artifacts (11.8 GiB) afterward. Pool/Couch/reviewer and
+compensation source was not edited or staged in this commit. Production data, migrations, release
+pointers, ports, credentials, models, reviewer truth, and payment state were untouched. Architecture
+and the previously declared release/evidence classes remain incomplete, so this is **NOT CERTIFIED —
+NOT 10/10**.
