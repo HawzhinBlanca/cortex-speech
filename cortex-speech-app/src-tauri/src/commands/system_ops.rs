@@ -519,8 +519,17 @@ pub fn cancel_operation(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_inference_stats() -> Result<serde_json::Value, String> {
-    Ok(crate::inference::get_inference_stats())
+#[specta::specta]
+pub fn get_inference_stats() -> Result<crate::ipc_contract::InferenceStatsV1, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_inference_stats").map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "RATE_LIMITED",
+            "The inference diagnostics are busy. Retry in a moment.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?;
+    Ok(crate::inference::get_inference_stats().into())
 }
 
 pub(super) const WSL_LOG_LINE_PREVIEW_CHARS: usize = 4096;

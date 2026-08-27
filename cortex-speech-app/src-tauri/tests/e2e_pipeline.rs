@@ -200,11 +200,8 @@ fn test_e2e_health_check() {
     let mgr = ModelManager::new(tmp.path().to_path_buf());
     let health =
         health::health_check(&db, &mgr, &cortex_speech_app_lib::settings::AppSettings::default(), None).unwrap();
-    assert!(
-        health["status"] == "ok" || health["status"] == "models_needed",
-        "Health status should be ok or models_needed"
-    );
-    assert!(health.get("uptime").is_some(), "Health should include uptime");
+    assert!(health.status == "ok" || health.status == "models_needed", "Health status should be ok or models_needed");
+    assert_eq!(health.segment_count, 0, "fresh health database should be empty");
 }
 
 #[test]

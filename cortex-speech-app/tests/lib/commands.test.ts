@@ -4,16 +4,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AudioExportFormat,
   ASR_7B_UNAVAILABLE_TAG,
+  appGitSha,
+  appHealth,
   canRedo,
   canUndo,
   cancelDesktopPlaybackSessionV1,
   commitReviewV1,
   computeDiff,
+  clearTracingSpans,
   deleteReviewDraftV1,
   getSettings,
   getActiveVoiceFocusV1,
+  getInferenceStats,
+  getRecentSpans,
   getReviewDraftV1,
   getVoiceFocusReviewPageV1,
+  getTracingStats,
   authoritativeSettingsFromWriteError,
   is7bUnavailableError,
   listAgentImportReports,
@@ -24,6 +30,7 @@ import {
   recordReviewFlag,
   redo,
   saveReviewDraftV1,
+  takeLastCrash,
   updateSettings,
   undo,
 } from '../../src/lib/commands';
@@ -31,6 +38,88 @@ import { defaultSettings } from '../../src/lib/stores/settingsStore';
 import type { RendererSettingsV1 } from '../../src/lib/generated/ipc';
 
 const invokeMock = vi.mocked(invoke);
+
+describe('generated renderer-safe diagnostics contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('uses exact generated commands and preserves the minimized typed DTOs', async () => {
+    const tracingStats = {
+      total_spans: 4,
+      failures: 1,
+      total_duration_ms: 12.5,
+      avg_duration_ms: 3.125,
+    };
+    const spans = [
+      {
+        operation: 'diff.compute',
+        start: '2026-08-27T00:00:00Z',
+        duration_ms: 4.5,
+        success: true,
+      },
+    ];
+    const inference = {
+      vad: { calls: 2, failures: 0, p50_ms: 1, p99_ms: 2 },
+      asr: { calls: 1, failures: 0, p50_ms: 10, p99_ms: 10 },
+      model_load_ms: 25,
+    };
+    const health = {
+      status: 'ok',
+      db_size: 1024,
+      uptime: 60,
+      segment_count: 8,
+      memory_mb: 256,
+      primary_asr_model: 'LargeV3',
+      missing_models: [],
+      missing_optional_models: [],
+      snapshot_last_success_epoch_secs: 1_787_800_000,
+      snapshot_consecutive_failures: 0,
+      free_disk_bytes: 5_000_000,
+    };
+    invokeMock
+      .mockResolvedValueOnce(tracingStats)
+      .mockResolvedValueOnce(spans)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(inference)
+      .mockResolvedValueOnce(health)
+      .mockResolvedValueOnce('the previous session ended unexpectedly (details in the logs folder)')
+      .mockResolvedValueOnce('abcdef123456');
+
+    await expect(getTracingStats()).resolves.toEqual(tracingStats);
+    await expect(getRecentSpans(50)).resolves.toEqual(spans);
+    await expect(clearTracingSpans()).resolves.toBeUndefined();
+    await expect(getInferenceStats()).resolves.toEqual(inference);
+    await expect(appHealth()).resolves.toEqual(health);
+    await expect(takeLastCrash()).resolves.toContain('ended unexpectedly');
+    await expect(appGitSha()).resolves.toBe('abcdef123456');
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['get_tracing_stats'],
+      ['get_recent_spans', { count: 50 }],
+      ['clear_tracing_spans'],
+      ['get_inference_stats'],
+      ['app_health'],
+      ['take_last_crash'],
+      ['app_git_sha'],
+    ]);
+  });
+
+  it('preserves a structured diagnostics refusal without exposing a raw string fallback', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'RATE_LIMITED',
+      message: 'The diagnostics history is busy. Retry in a moment.',
+      retryable: true,
+      suggestedAction: 'retry',
+      operationId: null,
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(getRecentSpans()).rejects.toBe(refusal);
+    expect(invokeMock).toHaveBeenCalledWith('get_recent_spans', { count: null });
+  });
+});
 
 describe('generated desktop history contract', () => {
   beforeEach(() => {
@@ -48,12 +137,7 @@ describe('generated desktop history contract', () => {
     await expect(canRedo()).resolves.toBe(false);
     await expect(undo()).resolves.toBe('Update transcript');
     await expect(redo()).resolves.toBeNull();
-    expect(invokeMock.mock.calls).toEqual([
-      ['can_undo'],
-      ['can_redo'],
-      ['undo'],
-      ['redo'],
-    ]);
+    expect(invokeMock.mock.calls).toEqual([['can_undo'], ['can_redo'], ['undo'], ['redo']]);
   });
 
   it('preserves a structured typed refusal without converting it to a raw string', async () => {

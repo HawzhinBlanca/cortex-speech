@@ -355,16 +355,12 @@ fn test_health_check() {
     let db = Database::open(&path).unwrap();
     let health = health_check(&db, &model_mgr, &cortex_speech_app_lib::settings::AppSettings::default(), None).unwrap();
 
-    assert_eq!(health["status"], "ok", "Bundled runtime models should satisfy essential health");
-    assert!(health.get("db_size").and_then(|v| v.as_i64()).is_some(), "db_size should be present");
-    assert!(health.get("uptime").and_then(|v| v.as_i64()).is_some(), "uptime should be present");
-    assert!(health.get("segment_count").and_then(|v| v.as_i64()).is_some(), "segment_count should be present");
-    assert_eq!(health["segment_count"], 0, "Fresh DB should have 0 segments");
-    assert_eq!(health["missing_models"].as_array().map(Vec::len), Some(0));
-    let optional = health["missing_optional_models"].as_array().expect("optional support inventory is always an array");
-    assert!(optional.iter().all(serde_json::Value::is_string));
+    assert_eq!(health.status, "ok", "Bundled runtime models should satisfy essential health");
+    assert!(health.db_size >= 0, "db_size should be a non-negative typed field");
+    assert_eq!(health.segment_count, 0, "Fresh DB should have 0 segments");
+    assert!(health.missing_models.is_empty());
     assert!(
-        optional.iter().filter_map(serde_json::Value::as_str).all(|name| !name.contains("OmniASR CTC")),
+        health.missing_optional_models.iter().all(|name| !name.contains("OmniASR CTC")),
         "production health must never advertise retired 300M/1B diagnostic ASR artifacts"
     );
 }
@@ -380,9 +376,9 @@ fn test_health_check_with_data() {
     db.insert_segment(&make_seg("health_2", "/b.wav", "world")).unwrap();
 
     let health = health_check(&db, &model_mgr, &cortex_speech_app_lib::settings::AppSettings::default(), None).unwrap();
-    assert_eq!(health["status"], "ok");
-    assert_eq!(health["segment_count"], 2);
-    assert!(health["db_size"].as_i64().unwrap_or(0) > 0);
+    assert_eq!(health.status, "ok");
+    assert_eq!(health.segment_count, 2);
+    assert!(health.db_size > 0);
 }
 
 // ── 9. Multi-Threaded Lock Ordering ───────────────────────────────────
@@ -552,9 +548,8 @@ fn test_health_check_empty_db_fields() {
     let db = Database::open(&path).unwrap();
     let health = health_check(&db, &model_mgr, &cortex_speech_app_lib::settings::AppSettings::default(), None).unwrap();
 
-    let obj = health.as_object().expect("health_check should return JSON object");
-    assert!(obj.contains_key("status"), "Must contain 'status'");
-    assert!(obj.contains_key("db_size"), "Must contain 'db_size'");
-    assert!(obj.contains_key("uptime"), "Must contain 'uptime'");
-    assert!(obj.contains_key("segment_count"), "Must contain 'segment_count'");
+    assert!(!health.status.is_empty(), "Must contain a typed status");
+    assert!(health.db_size >= 0, "Must contain a typed db_size");
+    assert_eq!(health.segment_count, 0, "Must contain the typed segment_count");
+    assert!(!health.primary_asr_model.is_empty(), "Must contain the selected ASR model identity");
 }

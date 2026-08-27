@@ -90,6 +90,106 @@ impl From<bool> for CommandErrorDetailV1 {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+pub struct TracingStatsV1 {
+    pub total_spans: usize,
+    pub failures: usize,
+    pub total_duration_ms: f64,
+    pub avg_duration_ms: f64,
+}
+
+impl From<crate::telemetry::TracingStats> for TracingStatsV1 {
+    fn from(value: crate::telemetry::TracingStats) -> Self {
+        Self {
+            total_spans: value.total_spans,
+            failures: value.failures,
+            total_duration_ms: value.total_duration_ms,
+            avg_duration_ms: value.avg_duration_ms,
+        }
+    }
+}
+
+/// Minimal developer-diagnostic span. Raw metadata and error strings deliberately remain in the
+/// backend because they can contain local paths, transcripts, SQL or third-party error payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+pub struct TracingSpanV1 {
+    pub operation: String,
+    pub start: String,
+    pub duration_ms: f64,
+    pub success: bool,
+}
+
+impl From<crate::telemetry::Span> for TracingSpanV1 {
+    fn from(value: crate::telemetry::Span) -> Self {
+        Self {
+            operation: value.operation.to_string(),
+            start: value.start,
+            duration_ms: value.duration_ms,
+            success: value.success,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+pub struct InferenceKindStatsV1 {
+    pub calls: u64,
+    pub failures: u64,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+}
+
+impl From<crate::inference::InferenceKindStats> for InferenceKindStatsV1 {
+    fn from(value: crate::inference::InferenceKindStats) -> Self {
+        Self { calls: value.calls, failures: value.failures, p50_ms: value.p50_ms, p99_ms: value.p99_ms }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+pub struct InferenceStatsV1 {
+    pub vad: InferenceKindStatsV1,
+    pub asr: InferenceKindStatsV1,
+    pub model_load_ms: f64,
+}
+
+impl From<crate::inference::InferenceStatsSnapshot> for InferenceStatsV1 {
+    fn from(value: crate::inference::InferenceStatsSnapshot) -> Self {
+        Self { vad: value.vad.into(), asr: value.asr.into(), model_load_ms: value.model_load_ms }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct AppHealthV1 {
+    pub status: String,
+    pub db_size: i64,
+    pub uptime: u64,
+    pub segment_count: i64,
+    pub memory_mb: u64,
+    pub primary_asr_model: String,
+    pub missing_models: Vec<String>,
+    pub missing_optional_models: Vec<String>,
+    pub snapshot_last_success_epoch_secs: Option<u64>,
+    pub snapshot_consecutive_failures: usize,
+    pub free_disk_bytes: Option<u64>,
+}
+
+impl From<crate::health::HealthSnapshot> for AppHealthV1 {
+    fn from(value: crate::health::HealthSnapshot) -> Self {
+        Self {
+            status: value.status,
+            db_size: value.db_size,
+            uptime: value.uptime,
+            segment_count: value.segment_count,
+            memory_mb: value.memory_mb,
+            primary_asr_model: value.primary_asr_model,
+            missing_models: value.missing_models,
+            missing_optional_models: value.missing_optional_models,
+            snapshot_last_success_epoch_secs: value.snapshot_last_success_epoch_secs,
+            snapshot_consecutive_failures: value.snapshot_consecutive_failures,
+            free_disk_bytes: value.free_disk_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ReviewScope {
@@ -395,7 +495,14 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::can_undo,
             crate::commands::can_redo,
             crate::commands::normalize_text,
-            crate::commands::compute_diff
+            crate::commands::compute_diff,
+            crate::commands::get_tracing_stats,
+            crate::commands::get_recent_spans,
+            crate::commands::clear_tracing_spans,
+            crate::commands::get_inference_stats,
+            crate::commands::app_health,
+            crate::commands::take_last_crash,
+            crate::commands::app_git_sha
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
@@ -409,6 +516,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         )
         .typ::<CommandErrorDetailV1>()
         .typ::<SuggestedActionV1>()
+        .typ::<TracingStatsV1>()
+        .typ::<TracingSpanV1>()
+        .typ::<InferenceKindStatsV1>()
+        .typ::<InferenceStatsV1>()
+        .typ::<AppHealthV1>()
         .typ::<ReviewScope>()
         .typ::<ActiveVoiceFocusV1>()
         .typ::<ReviewItemV1>()

@@ -3,6 +3,7 @@ import { commands as generatedCommands } from './generated/ipc';
 import { formatUnknownError } from './errorText';
 import type {
   ActiveVoiceFocusV1,
+  AppHealthV1,
   CommandErrorV1,
   CommitReviewRequestV1,
   CommittedReviewV1,
@@ -10,6 +11,7 @@ import type {
   DesktopPlaybackSessionV1,
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
+  InferenceStatsV1,
   PlaybackIntervalV1,
   ReviewDraftV1,
   ReviewPageV1,
@@ -18,17 +20,23 @@ import type {
   SettingsPatchV1,
   SettingsSnapshotV1,
   TextDiff,
+  TracingSpanV1,
+  TracingStatsV1,
 } from './generated/ipc';
 export type {
   ActiveVoiceFocusV1,
+  AppHealthV1 as AppHealth,
   DesktopPlaybackReceiptV1,
   DesktopPlaybackSessionV1,
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
+  InferenceStatsV1 as InferenceStats,
   PlaybackIntervalV1,
   ReviewDraftV1,
   ReviewPageV1,
   TechnicalUnusableReasonV1,
+  TracingSpanV1 as TracingSpan,
+  TracingStatsV1 as TracingStats,
 } from './generated/ipc';
 import type {
   SpeechSegment,
@@ -828,33 +836,21 @@ export async function getFingerprintCount(): Promise<number> {
 }
 
 /** Aggregate telemetry stats (snake_case, as serialized by the backend Tracer). */
-export interface TracingStats {
-  total_spans: number;
-  failures: number;
-  total_duration_ms: number;
-  avg_duration_ms: number;
+export async function getTracingStats(): Promise<TracingStatsV1> {
+  const result = await generatedCommands.getTracingStats();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-/** A single recorded operation span. */
-export interface TracingSpan {
-  operation: string;
-  start: string;
-  duration_ms: number;
-  metadata: Record<string, string>;
-  success: boolean;
-  error: string | null;
-}
-
-export async function getTracingStats(): Promise<TracingStats> {
-  return invokeLegacy<TracingStats>('get_tracing_stats');
-}
-
-export async function getRecentSpans(count?: number): Promise<TracingSpan[]> {
-  return invokeLegacy<TracingSpan[]>('get_recent_spans', { count: count ?? null });
+export async function getRecentSpans(count?: number): Promise<TracingSpanV1[]> {
+  const result = await generatedCommands.getRecentSpans(count ?? null);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function clearTracingSpans(): Promise<void> {
-  return invokeLegacy<void>('clear_tracing_spans');
+  const result = await generatedCommands.clearTracingSpans();
+  if (result.status === 'error') throw result.error;
 }
 
 export async function getWaveform(
@@ -1416,39 +1412,23 @@ export async function modelsDownloadAll(): Promise<ModelDownloadSummary> {
   return invokeLegacy<ModelDownloadSummary>('models_download_all');
 }
 
-export interface InferenceStats {
-  vad: { calls: number; failures: number; p50_ms: number; p99_ms: number };
-  asr: { calls: number; failures: number; p50_ms: number; p99_ms: number };
-  model_load_ms: number;
+export async function getInferenceStats(): Promise<InferenceStatsV1> {
+  const result = await generatedCommands.getInferenceStats();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export async function getInferenceStats(): Promise<InferenceStats> {
-  return invokeLegacy<InferenceStats>('get_inference_stats');
-}
-
-export interface AppHealth {
-  status: string;
-  db_size: number;
-  uptime: number;
-  segment_count: number;
-  memory_mb: number;
-  missing_models: string[];
-  missing_optional_models?: string[];
-  /** Epoch seconds of the last successful auto-snapshot, or 0 if none yet this session. */
-  snapshot_last_success_epoch_secs?: number;
-  /** Consecutive auto-snapshot failures — a rising streak means the safety net is silently down. */
-  snapshot_consecutive_failures?: number;
-  /** Free bytes on the volume holding the data dir, or null when it couldn't be determined. */
-  free_disk_bytes?: number | null;
-}
-
-export async function appHealth(): Promise<AppHealth> {
-  return invokeLegacy<AppHealth>('app_health');
+export async function appHealth(): Promise<AppHealthV1> {
+  const result = await generatedCommands.appHealth();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** One-line summary of the previous session's crash (surfaced once), or null if it exited cleanly. */
 export async function takeLastCrash(): Promise<string | null> {
-  return invokeLegacy<string | null>('take_last_crash');
+  const result = await generatedCommands.takeLastCrash();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export interface AgenticReadinessCheck {
@@ -1588,7 +1568,9 @@ export async function exportFinetunePack(outDir: string): Promise<FinetunePackRe
 
 /** P0.2: the git SHA the running binary was built from (baked at build time). Used for build-info display. */
 export async function appGitSha(): Promise<string> {
-  return invokeLegacy<string>('app_git_sha');
+  const result = await generatedCommands.appGitSha();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** A reproducible scorecard built from already-computed gold-eval results. */

@@ -1379,27 +1379,58 @@ class Verify10SupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             pids = root / "pids.json"
+            pids_staging = root / "pids.json.staging"
             log_path = root / "worker.log"
             script = (
                 "import json,os,subprocess,sys,time;"
                 "g=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)']);"
-                f"open(r'{pids}','w').write(json.dumps([os.getpid(),g.pid]));"
+                f"f=open(r'{pids_staging}','w',encoding='utf-8');"
+                "f.write(json.dumps([os.getpid(),g.pid]));f.flush();os.fsync(f.fileno());f.close();"
+                f"os.replace(r'{pids_staging}',r'{pids}');"
                 "time.sleep(120)"
             )
+            process = None
+            job = None
+            identities: list[tuple[int, str | None]] = []
+            timed_out = False
             with log_path.open("w", encoding="utf-8") as log:
-                process, job = self.supervisor.spawn_isolated(
-                    [sys.executable, "-c", script], cwd=root, log=log
-                )
-                deadline = time.monotonic() + 5
-                while not pids.exists() and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                identities = [
-                    (pid, self.supervisor.process_creation_time(pid))
-                    for pid in json.loads(pids.read_text(encoding="utf-8"))
-                ]
-                _return_code, timed_out = self.supervisor.wait_isolated(
-                    process, job, timeout=0.2, heartbeat=lambda: None
-                )
+                try:
+                    process, job = self.supervisor.spawn_isolated(
+                        [sys.executable, "-c", script], cwd=root, log=log
+                    )
+                    deadline = time.monotonic() + 5
+                    published_pids = None
+                    last_publication_error = "PID publication did not appear"
+                    while time.monotonic() < deadline:
+                        try:
+                            candidate = json.loads(pids.read_text(encoding="utf-8"))
+                            if (
+                                isinstance(candidate, list)
+                                and len(candidate) == 2
+                                and all(isinstance(pid, int) and pid > 0 for pid in candidate)
+                            ):
+                                published_pids = candidate
+                                break
+                            last_publication_error = f"invalid PID publication: {candidate!r}"
+                        except (OSError, json.JSONDecodeError) as error:
+                            last_publication_error = str(error)
+                        time.sleep(0.02)
+                    self.assertIsNotNone(
+                        published_pids,
+                        f"worker did not atomically publish both process identities: {last_publication_error}",
+                    )
+                    identities = [
+                        (pid, self.supervisor.process_creation_time(pid))
+                        for pid in published_pids or []
+                    ]
+                    self.assertTrue(all(creation is not None for _pid, creation in identities))
+                    _return_code, timed_out = self.supervisor.wait_isolated(
+                        process, job, timeout=0.2, heartbeat=lambda: None
+                    )
+                    job = None  # wait_isolated closed the kill-on-close authority.
+                finally:
+                    if job is not None and process is not None:
+                        self.supervisor.terminate_isolated(process, job)
             self.assertTrue(timed_out)
             deadline = time.monotonic() + 5
             while any(

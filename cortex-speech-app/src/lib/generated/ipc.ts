@@ -88,6 +88,23 @@ export const commands = {
 	canRedo: () => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("can_redo")),
 	normalizeText: (text: string) => typedError<string, CommandErrorV1>(__TAURI_INVOKE("normalize_text", { text })),
 	computeDiff: (raw: string, annotated: string) => typedError<TextDiff, CommandErrorV1>(__TAURI_INVOKE("compute_diff", { raw, annotated })),
+	getTracingStats: () => typedError<TracingStatsV1, CommandErrorV1>(__TAURI_INVOKE("get_tracing_stats")),
+	getRecentSpans: (count: number | null) => typedError<TracingSpanV1[], CommandErrorV1>(__TAURI_INVOKE("get_recent_spans", { count })),
+	clearTracingSpans: () => typedError<null, CommandErrorV1>(__TAURI_INVOKE("clear_tracing_spans")),
+	getInferenceStats: () => typedError<InferenceStatsV1, CommandErrorV1>(__TAURI_INVOKE("get_inference_stats")),
+	appHealth: () => typedError<AppHealthV1, CommandErrorV1>(__TAURI_INVOKE("app_health")),
+	/**
+	 *  Return a generic renderer-safe notice when the previous session left any crash report, surfaced
+	 *  exactly once. The frontend shows it at startup so a mid-review crash is no longer silent, while
+	 *  the panic message, location and full report remain in backend-owned diagnostics.
+	 */
+	takeLastCrash: () => typedError<string | null, CommandErrorV1>(__TAURI_INVOKE("take_last_crash")),
+	/**
+	 *  P0.2 — expose the git SHA baked into the running exe at build time so the frontend/e2e harness
+	 *  (and a curious user, via the About panel) can confirm the running binary matches a given commit.
+	 *  Referencing `crate::GIT_SHA` here also guarantees the const is retained in the compiled binary.
+	 */
+	appGitSha: () => typedError<string, CommandErrorV1>(__TAURI_INVOKE("app_git_sha")),
 };
 
 /* Types */
@@ -99,6 +116,20 @@ export const commands = {
 export type ActiveVoiceFocusV1 = {
 	focusId: string,
 	segmentCount: number,
+};
+
+export type AppHealthV1 = {
+	status: string,
+	db_size: number,
+	uptime: number,
+	segment_count: number,
+	memory_mb: number,
+	primary_asr_model: string,
+	missing_models: string[],
+	missing_optional_models: string[],
+	snapshot_last_success_epoch_secs: number | null,
+	snapshot_consecutive_failures: number,
+	free_disk_bytes: number | null,
 };
 
 // Consent remains an explicit privacy transaction instead of an ordinary preference field.
@@ -163,6 +194,19 @@ export type DiffStats = {
 	changed_words: number,
 	unchanged_words: number,
 	similarity: number,
+};
+
+export type InferenceKindStatsV1 = {
+	calls: number,
+	failures: number,
+	p50_ms: number,
+	p99_ms: number,
+};
+
+export type InferenceStatsV1 = {
+	vad: InferenceKindStatsV1,
+	asr: InferenceKindStatsV1,
+	model_load_ms: number,
 };
 
 export type MarkSegmentUnusableRequestV1 = {
@@ -404,6 +448,24 @@ export type TextDiff = {
 	annotated: string,
 	changes: DiffChange[],
 	stats: DiffStats,
+};
+
+/**
+ *  Minimal developer-diagnostic span. Raw metadata and error strings deliberately remain in the
+ *  backend because they can contain local paths, transcripts, SQL or third-party error payloads.
+ */
+export type TracingSpanV1 = {
+	operation: string,
+	start: string,
+	duration_ms: number,
+	success: boolean,
+};
+
+export type TracingStatsV1 = {
+	total_spans: number,
+	failures: number,
+	total_duration_ms: number,
+	avg_duration_ms: number,
 };
 
 /* Tauri Specta runtime */

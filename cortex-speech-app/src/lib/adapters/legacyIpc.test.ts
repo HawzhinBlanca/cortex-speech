@@ -41,6 +41,14 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('compute_diff');
   // @ts-expect-error generated normalization cannot regress into the legacy inventory
   void invokeLegacy<unknown>('normalize_text');
+  // @ts-expect-error health and build identity are generated, not handwritten
+  void invokeLegacy<unknown>('app_health');
+  // @ts-expect-error inference diagnostics use the generated public DTO
+  void invokeLegacy<unknown>('get_inference_stats');
+  // @ts-expect-error telemetry diagnostics cannot regain the raw handwritten bridge
+  void invokeLegacy<unknown>('get_recent_spans');
+  // @ts-expect-error the one-shot crash notice is generated and renderer-safe
+  void invokeLegacy<unknown>('take_last_crash');
   // @ts-expect-error destructive restore requires its exact source argument
   void invokeCritical('db_restore');
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings

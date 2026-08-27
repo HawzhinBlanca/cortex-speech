@@ -723,18 +723,32 @@ pub fn import_audio_file(
 /// (and a curious user, via the About panel) can confirm the running binary matches a given commit.
 /// Referencing `crate::GIT_SHA` here also guarantees the const is retained in the compiled binary.
 #[tauri::command]
-pub fn app_git_sha() -> String {
-    crate::GIT_SHA.to_string()
+#[specta::specta]
+pub fn app_git_sha() -> Result<String, crate::ipc_contract::CommandErrorV1> {
+    Ok(crate::GIT_SHA.to_string())
 }
 
 #[tauri::command]
-pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("app_health")?;
+#[specta::specta]
+pub fn app_health(
+    state: State<'_, AppState>,
+) -> Result<crate::ipc_contract::AppHealthV1, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("app_health").map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new("RATE_LIMITED", "The health check is busy. Retry in a moment.", true)
+            .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?;
     let data_dir = state.lock_data_dir().clone();
     let settings = state.lock_settings().clone();
     let db = state.lock_db();
     let mm = state.lock_model_manager();
-    health::health_check(&db, &mm, &settings, data_dir.as_deref()).map_err(|e| e.to_string())
+    health::health_check(&db, &mm, &settings, data_dir.as_deref()).map(Into::into).map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "HEALTH_CHECK_FAILED",
+            "The workspace health check could not be completed.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })
 }
 
 /// One clip to slice out of a source recording during a grouped decode. `end_ms == i64::MAX` means

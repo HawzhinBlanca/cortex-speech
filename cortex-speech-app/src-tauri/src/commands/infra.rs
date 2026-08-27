@@ -18,6 +18,19 @@ use tauri::State;
 
 const MAX_PUBLIC_DIFF_WORDS: usize = 10_000;
 const MAX_PUBLIC_DIFF_LCS_CELLS: usize = 12_500_000;
+const MAX_PUBLIC_RECENT_SPANS: usize = 200;
+
+fn diagnostics_rate_limited_error(action: &str) -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", action, true).suggested(SuggestedActionV1::Retry)
+}
+
+fn renderer_safe_spans(spans: Vec<crate::telemetry::Span>) -> Vec<crate::ipc_contract::TracingSpanV1> {
+    spans.into_iter().map(Into::into).collect()
+}
+
+fn public_recent_span_limit(count: Option<usize>) -> usize {
+    count.unwrap_or(50).min(MAX_PUBLIC_RECENT_SPANS)
+}
 
 fn diff_rate_limited_error() -> CommandErrorV1 {
     CommandErrorV1::new("RATE_LIMITED", "Too many transcript comparisons. Retry in a moment.", true)
@@ -56,13 +69,19 @@ fn validate_public_diff_input(raw: &str, annotated: &str) -> Result<(), CommandE
     Ok(())
 }
 
-/// Return a one-line summary of the most recent crash report (if the last session panicked), surfaced
-/// exactly once. The frontend shows it as a notification on startup so a mid-review crash — after which
-/// the app relaunches looking normal — is no longer silent. The full report stays in the rolling log.
+/// Return a generic renderer-safe notice when the previous session left any crash report, surfaced
+/// exactly once. The frontend shows it at startup so a mid-review crash is no longer silent, while
+/// the panic message, location and full report remain in backend-owned diagnostics.
 #[tauri::command]
-pub fn take_last_crash(state: State<'_, AppState>) -> Option<String> {
-    let data_dir = state.lock_data_dir().clone()?;
-    crate::crash::take_latest_crash_summary(&data_dir)
+#[specta::specta]
+pub fn take_last_crash(state: State<'_, AppState>) -> Result<Option<String>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("take_last_crash")
+        .map_err(|_| diagnostics_rate_limited_error("The previous-crash check is busy. Retry in a moment."))?;
+    let Some(data_dir) = state.lock_data_dir().clone() else {
+        return Ok(None);
+    };
+    Ok(crate::crash::take_latest_crash_summary(&data_dir))
 }
 
 #[tauri::command]
@@ -174,24 +193,59 @@ mod typed_diff_ipc_tests {
 }
 
 #[tauri::command]
-pub fn get_tracing_stats(_state: State<'_, AppState>) -> Result<crate::telemetry::TracingStats, String> {
-    RATE_LIMITER.check("get_tracing_stats")?;
-    Ok(crate::telemetry::TRACER.stats())
+#[specta::specta]
+pub fn get_tracing_stats(_state: State<'_, AppState>) -> Result<crate::ipc_contract::TracingStatsV1, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_tracing_stats")
+        .map_err(|_| diagnostics_rate_limited_error("The diagnostics summary is busy. Retry in a moment."))?;
+    Ok(crate::telemetry::TRACER.stats().into())
 }
 
 #[tauri::command]
-pub fn get_recent_spans(count: Option<usize>) -> Result<Vec<crate::telemetry::Span>, String> {
-    RATE_LIMITER.check("get_recent_spans")?;
-    let spans = crate::telemetry::TRACER.get_recent();
-    let count = count.unwrap_or(50).min(spans.len());
-    Ok(spans.into_iter().rev().take(count).collect())
+#[specta::specta]
+pub fn get_recent_spans(count: Option<usize>) -> Result<Vec<crate::ipc_contract::TracingSpanV1>, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_recent_spans")
+        .map_err(|_| diagnostics_rate_limited_error("The diagnostics history is busy. Retry in a moment."))?;
+    let count = public_recent_span_limit(count);
+    Ok(renderer_safe_spans(crate::telemetry::TRACER.get_recent_limited(count)))
 }
 
 #[tauri::command]
-pub fn clear_tracing_spans() -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("clear_tracing_spans")?;
+#[specta::specta]
+pub fn clear_tracing_spans() -> Result<(), CommandErrorV1> {
+    STRICT_RATE_LIMITER
+        .check("clear_tracing_spans")
+        .map_err(|_| diagnostics_rate_limited_error("The diagnostics clear action is busy. Retry in a moment."))?;
     crate::telemetry::TRACER.clear();
     Ok(())
+}
+
+#[cfg(test)]
+mod typed_diagnostics_ipc_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn public_spans_drop_raw_error_metadata_and_enforce_the_count_ceiling() {
+        let hostile = crate::telemetry::Span {
+            operation: "diagnostic.test",
+            start: "2026-08-27T00:00:00Z".to_string(),
+            duration_ms: 12.5,
+            metadata: HashMap::from([("path".to_string(), r"X:\private\owner.wav".to_string())]),
+            success: false,
+            error: Some("token=secret SQL SELECT transcript".to_string()),
+        };
+        let spans = renderer_safe_spans(vec![hostile; public_recent_span_limit(Some(usize::MAX))]);
+        assert_eq!(spans.len(), MAX_PUBLIC_RECENT_SPANS);
+        let wire = serde_json::to_string(&spans).expect("serialize public diagnostics");
+        assert!(wire.contains("diagnostic.test"));
+        assert!(!wire.contains("private"));
+        assert!(!wire.contains("secret"));
+        assert!(!wire.contains("SELECT"));
+        assert!(!wire.contains("metadata"));
+        assert!(!wire.contains("error"));
+    }
 }
 
 /// Persist the user's view-state (search query + sort order) so it survives a restart. The values

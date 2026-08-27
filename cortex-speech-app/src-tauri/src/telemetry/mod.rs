@@ -99,6 +99,13 @@ impl Tracer {
         self.lock_spans().clone()
     }
 
+    /// Clone only the newest requested window, newest first. Public diagnostics ask for at most a
+    /// small bounded page; cloning all 10,000 retained raw spans (including private backend-only
+    /// metadata and errors) before truncating wastes memory and can turn a refresh into a long task.
+    pub fn get_recent_limited(&self, count: usize) -> Vec<Span> {
+        self.lock_spans().iter().rev().take(count).cloned().collect()
+    }
+
     pub fn clear(&self) {
         self.lock_spans().clear();
     }
@@ -209,6 +216,18 @@ mod tests {
         assert_eq!(tracer.get_recent().len(), 3);
         // Oldest should be evicted (i=0,1 should be gone)
         assert_eq!(tracer.get_recent()[0].metadata.get("i").unwrap(), "2");
+    }
+
+    #[test]
+    fn recent_limit_clones_only_the_newest_window_in_display_order() {
+        let tracer = Tracer::new(10);
+        for i in 0..5 {
+            tracer.record("op", Tracer::metadata(vec![("i", i.to_string())]), || {});
+        }
+        let recent = tracer.get_recent_limited(2);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].metadata.get("i").map(String::as_str), Some("4"));
+        assert_eq!(recent[1].metadata.get("i").map(String::as_str), Some("3"));
     }
 
     #[test]

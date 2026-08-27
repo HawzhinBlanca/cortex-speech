@@ -23,10 +23,10 @@ pub fn write_crash_report(data_dir: &Path, location: &str, message: &str, timest
     Some(path)
 }
 
-/// Return a one-line summary of the MOST RECENT crash report (if any) and remove ALL crash reports so
-/// it surfaces exactly once. Called at startup to tell the owner "last session crashed" instead of
-/// letting the report sit unseen (the rolling file log keeps the full detail). Best-effort: any
-/// read/dir error yields `None`.
+/// Return a renderer-safe notice when any crash report exists and remove ALL crash reports so it
+/// surfaces exactly once. Panic messages and locations remain in backend-owned diagnostics: either
+/// can contain a private path, transcript fragment or secret supplied to a dependency, so neither is
+/// a public IPC value. Best-effort: any directory error yields `None`.
 pub fn take_latest_crash_summary(data_dir: &Path) -> Option<String> {
     let dir = data_dir.join("crashes");
     let entries: Vec<_> = std::fs::read_dir(&dir)
@@ -34,23 +34,10 @@ pub fn take_latest_crash_summary(data_dir: &Path) -> Option<String> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
         .collect();
-    // The sanitized ISO timestamp in the filename sorts lexicographically, so max = newest.
-    let latest = entries.iter().max_by_key(|e| e.file_name())?;
-    // Build the summary from the latest report. A truncated/corrupt report is realistic — it is written
-    // DURING the panic that produced it, so the process can be killed mid-write — and must NOT wedge the
-    // notification: if it can't be read/parsed, fall back to a generic notice rather than returning early.
-    let summary = std::fs::read_to_string(latest.path())
-        .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-        .map(|v| {
-            format!(
-                "{} at {} (v{})",
-                v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"),
-                v.get("location").and_then(|l| l.as_str()).unwrap_or("?"),
-                v.get("version").and_then(|x| x.as_str()).unwrap_or("?"),
-            )
-        })
-        .unwrap_or_else(|| "the previous session ended unexpectedly (details in the logs folder)".to_string());
+    if entries.is_empty() {
+        return None;
+    }
+    let summary = "the previous session ended unexpectedly (details in the logs folder)".to_string();
     // Shown once: remove EVERY crash report REGARDLESS of parse success (crashes are rare; the file log
     // retains detail). Doing this unconditionally is what prevents a single corrupt report from wedging
     // the notification forever and leaking reports on disk.
@@ -71,8 +58,9 @@ mod tests {
         write_crash_report(tmp.path(), "a.rs:1:1", "older panic", "2026-06-20T00:00:00Z").unwrap();
         write_crash_report(tmp.path(), "b.rs:2:2", "newer panic", "2026-06-21T00:00:00Z").unwrap();
         let summary = take_latest_crash_summary(tmp.path()).expect("a crash summary");
-        assert!(summary.contains("newer panic"), "returns the NEWEST crash: {summary}");
-        assert!(summary.contains("b.rs:2:2"));
+        assert!(summary.contains("ended unexpectedly"));
+        assert!(!summary.contains("newer panic"), "panic text must remain backend-only: {summary}");
+        assert!(!summary.contains("b.rs:2:2"), "panic location must remain backend-only: {summary}");
         // Surfaced once: a second call finds nothing (reports cleared).
         assert!(take_latest_crash_summary(tmp.path()).is_none(), "reports cleared after being surfaced");
     }
