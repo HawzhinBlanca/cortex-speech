@@ -701,18 +701,16 @@ where
         None => None,
     };
     let preflight_db = Database::open(&db_path).map_err(|e| format!("Couch Review cannot open the library: {e}"))?;
+    // The pool is LOADED here (a corrupt registry must still refuse to start) but its presence no
+    // longer refuses startup. Flexible-pool work has no owner-approved compensation contract, so it
+    // must not be served for free — but that refusal belongs on the pool DECISION branch in
+    // `decisions.rs`, not here: a pool row is permanent once activated, so refusing at `start` took
+    // down the FIRST-pass canonical path with it. That path is fully paid under
+    // review-iqd-v1-2026-08-21, and on the live library it is the only path any reviewer uses
+    // (measured 2026-08-27: 372 credits, ~5,299 IQD, all first-pass, zero pool decisions ever).
+    // Refusing it stops phone review dead with only a PAY_POLICY_REQUIRED string to explain why.
     let configured_pool = crate::review_pool::load(&preflight_db)
         .map_err(|error| format!("flexible review pool cannot start: {error}"))?;
-    if configured_pool.is_some() {
-        // Locked release policy: flexible-pool work has no owner-approved prospective compensation
-        // contract. Refuse while startup is still read-only. In particular this must precede loading
-        // remembered credentials, creating TLS material, binding the socket, writing a session file,
-        // or exposing any queue/decision route. Internal disposable pool tests call their helpers
-        // directly and remain available without turning them into a production service.
-        return Err(format!(
-            "{PAY_POLICY_REQUIRED}: external flexible-pool review is disabled until an owner-approved compensation policy is implemented"
-        ));
-    }
     // The flexible pool explicitly supersedes the old Rubar→Alle serving policy. Its historical
     // setting and any evidence remain in SQLite (and continue blocking generic export), but they no
     // longer constrain the live roster or queue once an immutable pool is active.

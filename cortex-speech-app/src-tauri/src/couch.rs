@@ -5345,7 +5345,7 @@ mod tests {
     }
 
     #[test]
-    fn active_flexible_pool_refuses_start_before_any_external_or_durable_mutation() {
+    fn an_active_flexible_pool_keeps_paid_first_pass_review_serving() {
         let _serial = GLOBAL_SESSION_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if is_running() {
             stop().unwrap();
@@ -5377,8 +5377,6 @@ mod tests {
         )
         .unwrap();
 
-        let data_version_before: i64 = db.connection().query_row("PRAGMA data_version", [], |row| row.get(0)).unwrap();
-        let changes_before: i64 = db.connection().query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
         let pool_before: String = db
             .connection()
             .query_row("SELECT pool_id FROM review_pool_registry WHERE singleton_key=1", [], |row| row.get(0))
@@ -5403,32 +5401,26 @@ mod tests {
             },
         );
 
-        let error = match result {
-            Ok(_) => panic!("an active flexible pool must not expose external review"),
-            Err(error) => error,
+        // A pool row is PERMANENT once activated, and the live library carries one. Refusing start on
+        // its presence therefore killed phone review outright — including the FIRST-pass canonical
+        // path, which is fully paid under review-iqd-v1-2026-08-21 and is the only path any reviewer
+        // uses (measured 2026-08-27: 372 credits, ~5,299 IQD, zero pool decisions ever). The
+        // pay-policy fence now sits on the pool DECISION branch instead, where the unpaid work is.
+        let started = match result {
+            Ok(started) => started,
+            Err(error) => panic!("an active flexible pool must not take paid first-pass review down: {error}"),
         };
-        assert!(error.contains(PAY_POLICY_REQUIRED), "stable policy code missing from: {error}");
-        assert!(!writer_called.get(), "session persistence is downstream of the pay-policy fence");
-        assert!(!revocation_called.get(), "revocation/session lifecycle is downstream of the pay-policy fence");
-        assert!(!is_running());
+        assert!(is_running(), "the review server must serve while a pool row exists");
+        assert!(writer_called.get(), "a real start persists its session");
         let published = status();
-        assert!(!published.running && published.reviewers.is_empty());
-        assert!(!session_path(tmp.path()).exists());
-        assert!(!tmp.path().join(TLS_IDENTITY_FILE).exists());
-        assert!(
-            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
-            "the refused start must never bind the requested socket"
-        );
-        assert_eq!(
-            db.connection().query_row::<i64, _, _>("SELECT total_changes()", [], |row| row.get(0)).unwrap(),
-            changes_before,
-            "preflight must not write through this handle"
-        );
-        assert_eq!(
-            db.connection().query_row::<i64, _, _>("PRAGMA data_version", [], |row| row.get(0)).unwrap(),
-            data_version_before,
-            "preflight must not commit through its separate database connection"
-        );
+        assert!(published.running, "status must publish a running server");
+        let _ = started;
+        let _ = revocation_called.get();
+        // This test now STARTS a real server, so it must hand the global singleton back. Leaving it
+        // running made two unrelated lifecycle tests fail for a reason that had nothing to do with them.
+        stop_with_data_dir(Some(tmp.path())).unwrap();
+        assert!(!is_running(), "the test must leave the singleton clean for the next one");
+        // Whatever start does, it must never mutate the immutable pool registry.
         assert_eq!(
             db.connection()
                 .query_row::<String, _, _>(

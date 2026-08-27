@@ -701,11 +701,6 @@ pub(super) fn api_decision_authenticated(
         Ok(policy) => policy,
         Err(error) => return err_reply(503, &error),
     };
-    #[cfg(not(test))]
-    if early_pool.is_some() {
-        return err_reply(503, &format!("{PAY_POLICY_REQUIRED}: external flexible-pool decisions are disabled"));
-    }
-    #[cfg(test)]
     if let Some(pool) = early_pool.as_ref() {
         // Pool mode never mints synthetic hidden checks: every real judgement contributes to visible
         // coverage. A remembered pre-pool check on a verified clip therefore becomes an ordinary,
@@ -729,7 +724,25 @@ pub(super) fn api_decision_authenticated(
             Err(error) => return err_reply(500, &error.to_string()),
         };
         if pool_replay || already_canonical {
+            // ONLY this branch is refused in production. A pool observation is a SECOND judgement on a
+            // clip that already carries a canonical human answer, and `review_pool::record_decision`
+            // never writes `review_compensation_ledger` — serving it would take playback-evidenced work
+            // for free, so it fails closed until an owner-approved pool pay contract exists.
+            //
+            // The refusal used to sit at `is_some()`, before this routing ran, and `couch::start` had a
+            // matching one. Together they killed ALL phone review whenever a pool row existed — and the
+            // live library carries one permanently — including the FIRST-pass path below, which is fully
+            // paid under review-iqd-v1-2026-08-21 and is the only path any reviewer is actually using.
+            #[cfg(test)]
             return api_pool_decision(db, &parsed, reviewer, state, pool);
+            #[cfg(not(test))]
+            {
+                let _ = pool;
+                return err_reply(
+                    503,
+                    &format!("{PAY_POLICY_REQUIRED}: external flexible-pool decisions are disabled"),
+                );
+            }
         }
     }
     let early_campaign = match active_campaign_policy(db, reviewer, state) {
