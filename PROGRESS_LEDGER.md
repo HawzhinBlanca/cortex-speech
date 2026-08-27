@@ -11821,3 +11821,41 @@ compensation source was not edited or staged in this commit. Production data, mi
 pointers, ports, credentials, models, reviewer truth, and payment state were untouched. Architecture
 and the previously declared release/evidence classes remain incomplete, so this is **NOT CERTIFIED —
 NOT 10/10**.
+
+## 2026-08-27 — integrated source freeze after pool and typed-IPC convergence
+
+Commit `f00282cac13a1e965f24e4a772453d6729a94899` repairs three proof-surface defects exposed by a
+complete campaign: champion-release policy now requires the generated `ModelVersionSummaryV1` and
+`CommandErrorV1` boundary; restore-admission policy verifies guard assignment plus propagated failure
+instead of demanding one literal `begin_mutation()?` spelling; and the opaque-media rejection fixture
+no longer hardcodes a fake private Windows user-profile URL. The first 129-script campaign remains a
+failed diagnostic with four named failures: those two stale scanners, that repository-hygiene finding,
+and generated-binding compilation colliding with the concurrently running Rust target.
+
+Fresh proof was then run without that contention. On clean
+`f00282cac13a1e965f24e4a772453d6729a94899`, one uninterrupted sequential campaign passed all 129
+reachable Python policy scripts, including generated-binding regeneration, the repaired scanners,
+pool pay-fence scope, repository hygiene, verifier supervisor 30/30, the real watchdog timing drill,
+and Python byte compilation. The current frontend passed 494/494 tests across 87 files with zero
+Svelte/TypeScript, ESLint, or Prettier findings. Playwright passed 101/101 with zero retries on clean
+`009220f1c41fd17995e974d47dc34095bf6f6bc2`.
+
+The same integrated Rust source at `009220f1c41fd17995e974d47dc34095bf6f6bc2` completed one
+uninterrupted `cargo test --all-targets`: 1,771 library tests passed, zero failed, eight library tests
+were explicitly ignored, and every binary, integration, property, reliability, 88.38-second soak,
+Tauri, user-data, and Criterion audio/diff/normalizer target passed. Another 35 target-specific tests
+were explicitly ignored because they require live models, network, or real media. Strict
+library/all-feature Clippy with warnings denied had already passed on the same production Rust source.
+The later `f00282c` commit changes only Python policies and one TypeScript test fixture, not production
+Rust or frontend code.
+
+This is a strong integrated source freeze, not certifying evidence. Final runs may not contain ignored
+or skipped checks; the policy campaign also reports that its optional jiwer numeric-equivalence check
+was skipped because jiwer is absent, and Couch Sorani policy still identifies 19 strings awaiting
+owner linguistic review. Architecture remains 58 generated / 56 handwritten IPC calls, one closed
+dynamic bridge, and ten oversized Svelte files. Coverage/mutation thresholds, calibrated certifying
+manifests, live-sized schema-65 clone/restore, 50,000-segment concurrency/performance/memory, exact
+owner workflow/deployment/reboot/field evidence, signed Windows VM/manual-accessibility evidence,
+comparator/pilot evidence, and model evidence remain incomplete. No production data, active release,
+credentials, reviewer truth, or payment state was changed. Honest verdict: **INTEGRATED SOURCE GREEN
+FOR THE NAMED GATES — NOT CERTIFIED — NOT 10/10**.
