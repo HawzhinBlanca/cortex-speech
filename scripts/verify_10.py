@@ -1755,20 +1755,24 @@ def _load_json_without_duplicate_keys(path: Path) -> object:
 
 
 def _tracked_authority_binding(path: Path, full_sha: str) -> dict[str, object]:
+    """Bind an authority to Git's canonical blob bytes, independent of checkout EOL translation.
+
+    The evidence class requires ``clean-source-tree`` before it can verify, so a dirty checkout can
+    never certify. Reading the blob here avoids treating Git's normal LF/CRLF materialization on
+    Windows as source drift while still hashing the exact bytes identified by ``full_sha``.
+    """
+
     resolved = path.resolve(strict=True)
     try:
         relative = resolved.relative_to(REPO_ROOT.resolve()).as_posix()
     except ValueError as error:
         raise EvidenceError(f"authority path escapes the repository: {path}") from error
     committed = _git_file_bytes(full_sha, relative)
-    observed = resolved.read_bytes()
-    if observed != committed:
-        raise EvidenceError(f"authority file differs from exact Git commit {full_sha}: {relative}")
     return {
         "path": relative,
         "gitBlobSha1": _git_blob_id(full_sha, relative),
-        "sha256": hashlib.sha256(observed).hexdigest(),
-        "bytes": len(observed),
+        "sha256": hashlib.sha256(committed).hexdigest(),
+        "bytes": len(committed),
     }
 
 

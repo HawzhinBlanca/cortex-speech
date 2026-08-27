@@ -665,6 +665,22 @@ class Verify10SupervisorTests(unittest.TestCase):
             )
             self.assertIn("schema is not 1", report["failures"][0])
 
+    def test_tracked_authority_binding_uses_canonical_git_bytes_across_windows_eol(self) -> None:
+        committed = b"line one\nline two\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authority = root / "authority.md"
+            authority.write_bytes(committed.replace(b"\n", b"\r\n"))
+            with (
+                mock.patch.object(self.verify, "REPO_ROOT", root),
+                mock.patch.object(self.verify, "_git_file_bytes", return_value=committed),
+                mock.patch.object(self.verify, "_git_blob_id", return_value="b" * 40),
+            ):
+                binding = self.verify._tracked_authority_binding(authority, "a" * 40)
+            self.assertEqual(binding["sha256"], hashlib.sha256(committed).hexdigest())
+            self.assertEqual(binding["bytes"], len(committed))
+            self.assertEqual(binding["gitBlobSha1"], "b" * 40)
+
     def test_windows_proof_consumer_rebinds_every_required_role_to_measured_bundle(self) -> None:
         profile = self.verify.PROFILE_WINDOWS
         sha = "a" * 40
