@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from _pipeline_policy_util import pipeline_surface
+from _command_policy_util import command_surface
 
 
 ROOT = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
@@ -56,7 +57,7 @@ def test_store_owns_bounded_reads_and_serialized_discard_without_ui_dependencies
 
 
 def test_commands_delegate_without_raw_database_authority() -> None:
-    source = read("commands.rs")
+    source = command_surface(ROOT)
     signatures = {
         "get_interrupted_import": "pub fn get_interrupted_import(",
         "discard_interrupted_import": "pub fn discard_interrupted_import(",

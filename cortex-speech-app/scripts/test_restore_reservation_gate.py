@@ -7,11 +7,15 @@ global admission state and cannot flake concurrent Rust tests.
 
 from pathlib import Path
 
+from _command_policy_util import command_production_surface, command_surface
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src-tauri" / "src"
 
 
 def _read(rel: str) -> str:
+    if rel == "commands.rs":
+        return command_surface(SRC)
     return (SRC / rel).read_text(encoding="utf-8")
 
 
@@ -198,7 +202,7 @@ def test_snapshot_and_restore_share_one_mutex_guard_in_both_commands() -> None:
     commands = _read("commands.rs")
     service = _read("restore_service/orchestration.rs")
     runtime = _read("database_runtime.rs")
-    production = commands.split("#[cfg(test)]\nmod tests", 1)[0]
+    production = command_production_surface(SRC)
     # Restore validation now includes the complete durable-history and semantic gates before the
     # pin. Keep the scan wide enough to include the final publish call as that safety work grows.
     helper = _fn_body(service, "pub(crate) fn restore_with_mandatory_snapshot(", span=1800)

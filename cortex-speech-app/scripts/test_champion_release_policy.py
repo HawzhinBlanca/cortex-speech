@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from _pipeline_policy_util import pipeline_surface
+from _command_policy_util import command_surface
 
 
 APP = Path(__file__).resolve().parent.parent
@@ -175,7 +176,7 @@ def test_shipped_model_management_is_support_only() -> None:
 
 
 def test_removed_mms_and_single_file_ipc_cannot_be_reintroduced() -> None:
-    backend = (APP / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
+    backend = command_surface(APP / "src-tauri" / "src")
     lib = (APP / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
     frontend = (APP / "src" / "lib" / "commands.ts").read_text(encoding="utf-8")
     stats = (APP / "src" / "lib" / "StatsDashboard.svelte").read_text(encoding="utf-8")
@@ -188,7 +189,7 @@ def test_removed_mms_and_single_file_ipc_cannot_be_reintroduced() -> None:
 
 
 def test_registry_renderer_contract_never_returns_checkpoint_paths() -> None:
-    backend = (APP / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
+    backend = command_surface(APP / "src-tauri" / "src")
     frontend = (APP / "src" / "lib" / "commands.ts").read_text(encoding="utf-8")
     summary = backend[backend.index("pub struct ModelVersionSummary") : backend.index("impl From<crate::registry::ModelVersion>")]
     assert "checkpoint_path" not in summary

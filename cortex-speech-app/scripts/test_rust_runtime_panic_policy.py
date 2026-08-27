@@ -2207,7 +2207,7 @@ def test_batch_transcribe_refuses_blank_draft() -> None:
     re-batch-transcribed by the offline CTC engine that returns Ok("") on a quiet clip). Recurring
     blank-transcript-never-overwrites-good data-loss class. The runtime path needs a full app + pipeline,
     so it is source-pinned."""
-    src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
+    src = command_surface()
     if "update_batch_transcription_if_unreviewed" not in src:
         raise AssertionError("batch_transcribe persist call not found in commands.rs")
     guard = "Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty()"
@@ -2323,7 +2323,7 @@ def test_wsl_refinement_loop_refuses_blank_draft() -> None:
     silent/music/noise clip, per parse_wsl_segment_result) would overwrite a good existing transcript. It
     must SKIP a blank draft. Runtime path needs the WSL server, so source-pinned. (blank-transcript-never-
     overwrites-good class; siblings transcribe_segment / batch_transcribe / batch_processor.)"""
-    src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
+    src = command_surface()
     if "commit_bound_champion_transcript_if_unreviewed" not in src:
         raise AssertionError("source-bound atomic WSL refinement persist call not found in commands.rs")
     # parse_wsl_segment_result now returns a Wsl7bResult STRUCT (it carries the serving identity too),

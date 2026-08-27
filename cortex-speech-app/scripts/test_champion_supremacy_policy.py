@@ -22,6 +22,7 @@ import re
 from pathlib import Path
 
 from _pipeline_policy_util import pipeline_surface
+from _command_policy_util import command_surface
 
 SRC = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
 PIPELINE = SRC / "pipeline.rs"
@@ -107,7 +108,7 @@ def test_import_never_routes_through_scribe_or_cloud_fallback() -> None:
 
 def test_champion_review_cannot_consume_stale_auxiliary_votes() -> None:
     """Legacy hypothesis rows must not influence review or trigger a multi-ASR jury in champion mode."""
-    commands = COMMANDS.read_text(encoding="utf-8")
+    commands = command_surface(SRC)
     filter_body = _fn_body(commands, "fn hypotheses_for_selected_asr(")
     assert "AsrModelSize::WSL7B" in filter_body, "review hypothesis filtering is not selected-mode aware"
     # Pins the BEHAVIOUR, not a symbol name. The champion is content-addressed now, so the filter no
@@ -157,7 +158,7 @@ def test_the_finetuned_override_yields_to_the_champion() -> None:
 
 def test_batch_transcribe_hard_stops_on_the_first_failure() -> None:
     """A failure must cancel the run and be reported as halted — never counted and carried past."""
-    text = COMMANDS.read_text(encoding="utf-8")
+    text = command_surface(SRC)
 
     assert "record_first_failure(&first_failure" in text, (
         "batch_transcribe no longer records the failure that stopped it"

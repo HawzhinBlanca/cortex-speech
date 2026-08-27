@@ -23,6 +23,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _command_policy_util import command_surface
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE = REPO_ROOT / "scripts" / "check_playback_enforcement_readiness.py"
 DB_RS = REPO_ROOT / "src-tauri" / "src" / "db.rs"
@@ -91,10 +93,17 @@ def test_runtime_and_repair_tools_never_authorize_from_the_stored_ratio() -> Non
 
 
 def test_playback_identity_has_no_segment_id_or_path_fallback() -> None:
-    for path in (DB_RS, COUCH_RS, COMMANDS_RS, SEGMENTS_WRITE_RS, GATE, CERTIFICATION_GATE):
-        source = path.read_text(encoding="utf-8")
-        assert "'id:' ||" not in source, f"{path.name} still invents SQL identity from a segment id"
-        assert 'format!("id:' not in source, f"{path.name} still invents identity from a segment id"
+    sources = [
+        (DB_RS.name, DB_RS.read_text(encoding="utf-8")),
+        (COUCH_RS.name, COUCH_RS.read_text(encoding="utf-8")),
+        ("command surface", command_surface(REPO_ROOT / "src-tauri" / "src")),
+        (SEGMENTS_WRITE_RS.name, SEGMENTS_WRITE_RS.read_text(encoding="utf-8")),
+        (GATE.name, GATE.read_text(encoding="utf-8")),
+        (CERTIFICATION_GATE.name, CERTIFICATION_GATE.read_text(encoding="utf-8")),
+    ]
+    for label, source in sources:
+        assert "'id:' ||" not in source, f"{label} still invents SQL identity from a segment id"
+        assert 'format!("id:' not in source, f"{label} still invents identity from a segment id"
         assert 'format!("path:' not in source, f"{path.name} still substitutes a path for audio identity"
 
 

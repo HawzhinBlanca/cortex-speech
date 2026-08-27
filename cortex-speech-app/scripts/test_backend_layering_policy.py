@@ -51,7 +51,8 @@ def test_backend_services_and_stores_remain_ui_independent() -> None:
 
 
 def test_backup_command_delegates_artifact_verification_to_the_service() -> None:
-    commands = production_prefix((RUST / "commands.rs").read_text(encoding="utf-8"))
+    command_files = [RUST / "commands.rs", *sorted((RUST / "commands").glob("*.rs"))]
+    commands = "\n".join(production_prefix(path.read_text(encoding="utf-8")) for path in command_files)
     start = commands.find("pub async fn db_backup(")
     end = commands.find("\n#[tauri::command]", start + 1)
     if start < 0 or end < 0:
