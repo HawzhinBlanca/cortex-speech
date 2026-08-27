@@ -732,9 +732,39 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept DPO request");
             stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-            let mut request = [0_u8; 4096];
-            let read = stream.read(&mut request).expect("read DPO request");
-            assert!(read > 0, "the fixture server received the POST");
+            // Drain the complete request before replying. Closing a Windows socket with unread POST
+            // bytes sends an RST, which made this security proof intermittently observe a transport
+            // error instead of the deliberate 307. The test must prove redirect refusal, not merely
+            // that some network failure happened.
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).expect("read DPO request");
+                assert!(read > 0, "the fixture server received the complete POST headers");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 1024 * 1024, "fixture POST stays bounded");
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).expect("ASCII request headers");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("numeric content length"))
+                    })
+                    .expect("send_string sets content-length");
+                break (header_end + 4, content_length);
+            };
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).expect("read DPO request body");
+                assert!(read > 0, "the fixture server received the complete POST body");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 1024 * 1024, "fixture POST stays bounded");
+            }
+            assert!(request.starts_with(b"POST /train HTTP/1.1\r\n"));
             stream
                 .write_all(
                     b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://attacker.invalid/collect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
