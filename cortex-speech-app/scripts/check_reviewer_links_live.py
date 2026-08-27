@@ -402,7 +402,17 @@ def request(
         resp = opener.open(req, timeout=20)
         return resp.status, resp.headers.get("Set-Cookie"), resp.read()
     except urllib.error.HTTPError as e:
-        return e.code, None, e.read()
+        # The STATUS is the answer here; the body is best-effort diagnostics. Reading it can still
+        # fail after the response line and headers arrived intact: a peer that replies without
+        # draining our request body makes the close send an RST on BSD stacks, so this raises
+        # ConnectionResetError on macOS where Linux and Windows return b"". Letting that escape
+        # crashed the whole reviewer-links gate over a status code it already held -- and this gate
+        # is what says whether reviewers can work. Never lose a status to a body read.
+        try:
+            body = e.read()
+        except Exception as read_error:  # noqa: BLE001 - an unreadable body is not a missing status
+            body = f"<body unreadable: {read_error}>".encode()
+        return e.code, None, body
     except Exception as e:  # noqa: BLE001 - transport failure is a real answer here
         return None, None, str(e).encode()
 
