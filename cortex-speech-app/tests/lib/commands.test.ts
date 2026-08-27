@@ -18,6 +18,10 @@ import {
   getInferenceStats,
   getRecentSpans,
   getReviewDraftV1,
+  getSegment,
+  getSegmentIdsForView,
+  getSegmentsPage,
+  getSignalAnomalySegments,
   getVoiceFocusReviewPageV1,
   getTracingStats,
   authoritativeSettingsFromWriteError,
@@ -38,6 +42,91 @@ import { defaultSettings } from '../../src/lib/stores/settingsStore';
 import type { RendererSettingsV1 } from '../../src/lib/generated/ipc';
 
 const invokeMock = vi.mocked(invoke);
+
+describe('generated library read contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('uses exact generated commands and preserves page scope and revision evidence', async () => {
+    const segment = {
+      id: 'segment-1',
+      audioPath: 'fixture.wav',
+      rawTranscript: 'دەق',
+      normalizedTranscript: null,
+      annotatedTranscript: null,
+      alignmentJson: null,
+      durationMs: 1000,
+      speakerId: null,
+      verified: false,
+    };
+    const page = {
+      items: [segment],
+      total: 1,
+      nextCursor: 'cursor_2',
+      revisions: { 'segment-1': 7 },
+      focusNarrowed: true,
+    };
+    invokeMock
+      .mockResolvedValueOnce(segment)
+      .mockResolvedValueOnce(page)
+      .mockResolvedValueOnce(['segment-1'])
+      .mockResolvedValueOnce([segment]);
+
+    await expect(getSegment('segment-1')).resolves.toEqual(segment);
+    await expect(
+      getSegmentsPage({
+        verified: false,
+        query: 'دەق',
+        sort: 'oldest',
+        limit: 25,
+        cursor: 'cursor_1',
+        focused: true,
+      }),
+    ).resolves.toEqual(page);
+    await expect(
+      getSegmentIdsForView({ verified: false, query: 'دەق', transcriptState: 'real' }),
+    ).resolves.toEqual(['segment-1']);
+    await expect(getSignalAnomalySegments(25)).resolves.toEqual([segment]);
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['get_segment', { segmentId: 'segment-1' }],
+      [
+        'get_segments_page',
+        {
+          verified: false,
+          query: 'دەق',
+          sort: 'oldest',
+          limit: 25,
+          cursor: 'cursor_1',
+          focused: true,
+        },
+      ],
+      ['get_segment_ids_for_view', { verified: false, query: 'دەق', transcriptState: 'real' }],
+      ['get_signal_anomaly_segments', { limit: 25 }],
+    ]);
+  });
+
+  it('preserves a structured library refusal without manufacturing an empty result', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'LIBRARY_READ_FAILED',
+      message: 'The library could not be read. Open Health for recovery options.',
+      retryable: false,
+      suggestedAction: 'openHealth',
+      operationId: null,
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(getSegmentsPage()).rejects.toBe(refusal);
+  });
+
+  it('rejects a malformed success payload instead of presenting an empty library', async () => {
+    invokeMock.mockResolvedValueOnce({ items: [], total: '1', nextCursor: null });
+
+    await expect(getSegmentsPage()).rejects.toThrow('not a page payload');
+  });
+});
 
 describe('generated renderer-safe diagnostics contract', () => {
   beforeEach(() => {

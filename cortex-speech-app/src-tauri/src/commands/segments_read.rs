@@ -1,14 +1,14 @@
 //! Segment + audio read/retrieval IPC commands — slice 8 of the Week-4 `commands.rs` decomposition.
 //!
-//! Behaviour and command NAMES unchanged: `commands.rs` re-exports this module (`pub use
-//! segments_read::*;`), so `lib.rs`'s invoke_handler still names `commands::get_segments` and the
-//! frontend invokes are untouched. Same functions, only relocated.
+//! Public command names remain stable: `commands.rs` re-exports this module (`pub use
+//! segments_read::*;`), so `lib.rs`'s invoke handler keeps the same registration surface. Library
+//! page/id/anomaly reads additionally use generated typed contracts and renderer-safe errors.
 //!
 //! These are the whole-library reads / unbounded FTS search / audio-health scan / waveform + duration
 //! probes — all `async` + `run_blocking` so a large library never freezes the UI thread.
 
 use super::{run_blocking, send_audio_duration_probe_result, RATE_LIMITER, STRICT_RATE_LIMITER};
-use crate::db::SpeechSegment;
+use crate::db::{SegmentsPage, SpeechSegment};
 use crate::validation::input as validate;
 use crate::{audio, AppState};
 use std::path::Path;
@@ -28,6 +28,98 @@ fn public_review_read_error(error: &str) -> crate::ipc_contract::CommandErrorV1 
     } else {
         crate::ipc_contract::CommandErrorV1::new("REVIEW_PAGE_FAILED", "The review queue could not be loaded.", false)
             .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn public_library_read_error(error: &str) -> crate::ipc_contract::CommandErrorV1 {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("database is locked") || normalized.contains("database is busy") {
+        crate::ipc_contract::CommandErrorV1::new(
+            "DATABASE_BUSY",
+            "The workspace is busy. Retry loading the library.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    } else {
+        crate::ipc_contract::CommandErrorV1::new(
+            "LIBRARY_READ_FAILED",
+            "The library could not be read. Open Health for recovery options.",
+            false,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+    }
+}
+
+fn library_rate_limited_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new("RATE_LIMITED", "Too many library requests. Retry in a moment.", true)
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+}
+
+fn library_worker_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "LIBRARY_READ_FAILED",
+        "The library worker stopped unexpectedly. Retry the request.",
+        true,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+}
+
+fn invalid_library_request(code: &str, message: &str) -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(code, message, false)
+}
+
+fn public_library_sort(sort: Option<String>) -> Result<String, crate::ipc_contract::CommandErrorV1> {
+    let sort = sort.unwrap_or_else(|| "newest".to_string());
+    validate::validate_text(&sort, 64, "Segment sort")
+        .map_err(|_| invalid_library_request("INVALID_LIBRARY_SORT", "The selected library sort is invalid."))?;
+    match sort.as_str() {
+        "newest" | "oldest" | "duration" | "verified" | "confidence" | "activeLearning" | "active_learning"
+        | "suspectFirst" | "suspect_first" => Ok(sort),
+        _ => Err(invalid_library_request("INVALID_LIBRARY_SORT", "The selected library sort is invalid.")),
+    }
+}
+
+fn validate_library_cursor(cursor: Option<&str>) -> Result<(), crate::ipc_contract::CommandErrorV1> {
+    let Some(cursor) = cursor else {
+        return Ok(());
+    };
+    validate::validate_text(cursor, 2048, "Segment page cursor").map_err(|_| {
+        invalid_library_request("INVALID_LIBRARY_CURSOR", "The library cursor is invalid. Reload the library.")
+    })?;
+    if cursor.chars().all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_') {
+        Ok(())
+    } else {
+        Err(invalid_library_request("INVALID_LIBRARY_CURSOR", "The library cursor is invalid. Reload the library."))
+    }
+}
+
+fn public_library_page_limit(limit: Option<i64>) -> usize {
+    limit.unwrap_or(200).clamp(1, 500) as usize
+}
+
+fn public_anomaly_limit(limit: Option<i64>) -> usize {
+    limit.unwrap_or(100).clamp(1, 500) as usize
+}
+
+fn stale_library_focus_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "STALE_VOICE_FOCUS",
+        "The voice-focus policy changed while the page was loading. Reload the review workspace.",
+        false,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip)
+}
+
+fn ensure_library_focus_unchanged(
+    before: Option<&crate::voice_focus::VoiceFocusBinding>,
+    current: Option<&crate::voice_focus::VoiceFocusBinding>,
+) -> Result<(), crate::ipc_contract::CommandErrorV1> {
+    let before_id = before.map(|binding| binding.focus_id.as_str());
+    let current_id = current.map(|binding| binding.focus_id.as_str());
+    if current_id == before_id {
+        Ok(())
+    } else {
+        Err(stale_library_focus_error())
     }
 }
 
@@ -232,6 +324,138 @@ pub async fn get_review_page_v1(
     })?
 }
 
+/// Hydrate one selected list row with its full alignment/evidence payload. The database read runs
+/// off the Tauri main thread and every refusal is a stable renderer-safe code.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_segment(
+    segment_id: String,
+    state: State<'_, AppState>,
+) -> Result<SpeechSegment, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_segment").map_err(|_| library_rate_limited_error())?;
+    validate::validate_identifier(&segment_id)
+        .map_err(|_| invalid_library_request("INVALID_SEGMENT_ID", "The selected segment identity is invalid."))?;
+    let segment_queries = state.segment_queries();
+    tokio::task::spawn_blocking(move || {
+        segment_queries
+            .get_segment(&segment_id)
+            .map_err(|error| public_library_read_error(&error.to_string()))?
+            .ok_or_else(|| {
+                crate::ipc_contract::CommandErrorV1::new(
+                    "SEGMENT_NOT_FOUND",
+                    "The selected segment no longer exists. Reload the library.",
+                    false,
+                )
+                .suggested(crate::ipc_contract::SuggestedActionV1::ReloadClip)
+            })
+    })
+    .await
+    .map_err(|_| library_worker_error())?
+}
+
+/// Read one stable keyset page from the owner library. Voice-focus resolution and SQLite work stay
+/// in the blocking worker; malformed policy files fail closed without exposing their private path.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_segments_page(
+    verified: Option<bool>,
+    query: Option<String>,
+    sort: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+    focused: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<SegmentsPage, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_segments_page").map_err(|_| library_rate_limited_error())?;
+    if let Some(query) = query.as_deref() {
+        validate::validate_text(query, 1000, "Search query").map_err(|_| {
+            invalid_library_request("INVALID_LIBRARY_QUERY", "The library search is invalid or too long.")
+        })?;
+    }
+    let sort = public_library_sort(sort)?;
+    validate_library_cursor(cursor.as_deref())?;
+    let limit = public_library_page_limit(limit);
+    let data_dir = state.lock_data_dir().clone();
+    let segment_queries = state.segment_queries();
+    let focused = focused.unwrap_or(false);
+    tokio::task::spawn_blocking(move || {
+        // A missing focus file is unrestricted; a present-but-invalid file fails closed. Only the
+        // review queue opts into this scope. Library/curation reads remain corpus-wide.
+        let focus_binding = if focused {
+            crate::voice_focus::resolve_binding(data_dir.as_deref()).map_err(|_| voice_focus_policy_error())?
+        } else {
+            None
+        };
+        let page = segment_queries
+            .get_segments_page(
+                verified,
+                query.as_deref(),
+                &sort,
+                limit,
+                cursor.as_deref(),
+                focus_binding.as_ref().map(|binding| binding.segment_ids.as_ref()),
+            )
+            .map_err(|error| public_library_read_error(&error.to_string()))?;
+        if focused {
+            let current =
+                crate::voice_focus::resolve_binding(data_dir.as_deref()).map_err(|_| voice_focus_policy_error())?;
+            ensure_library_focus_unchanged(focus_binding.as_ref(), current.as_ref())?;
+        }
+        Ok(page)
+    })
+    .await
+    .map_err(|_| library_worker_error())?
+}
+
+/// Read the exact id set for a contextual batch action without hydrating every segment row.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_segment_ids_for_view(
+    verified: Option<bool>,
+    query: Option<String>,
+    transcript_state: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_segment_ids_for_view").map_err(|_| library_rate_limited_error())?;
+    if let Some(query) = query.as_deref() {
+        validate::validate_text(query, 1000, "Search query").map_err(|_| {
+            invalid_library_request("INVALID_LIBRARY_QUERY", "The library search is invalid or too long.")
+        })?;
+    }
+    let transcript_state = transcript_state.unwrap_or_else(|| "any".to_string());
+    if !matches!(transcript_state.as_str(), "any" | "real" | "missing") {
+        return Err(invalid_library_request("INVALID_TRANSCRIPT_STATE", "The selected transcript filter is invalid."));
+    }
+    let segment_queries = state.segment_queries();
+    tokio::task::spawn_blocking(move || {
+        segment_queries
+            .get_segment_ids_for_view(verified, query.as_deref(), &transcript_state)
+            .map_err(|error| public_library_read_error(&error.to_string()))
+    })
+    .await
+    .map_err(|_| library_worker_error())?
+}
+
+/// Read the highest anomaly scores using a bounded public page. An untrusted renderer cannot turn
+/// this diagnostics view into an unbounded library hydration.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_signal_anomaly_segments(
+    limit: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<SpeechSegment>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_signal_anomaly_segments").map_err(|_| library_rate_limited_error())?;
+    let limit = public_anomaly_limit(limit);
+    let segment_queries = state.segment_queries();
+    tokio::task::spawn_blocking(move || {
+        segment_queries
+            .get_signal_anomaly_segments(limit)
+            .map_err(|error| public_library_read_error(&error.to_string()))
+    })
+    .await
+    .map_err(|_| library_worker_error())?
+}
+
 #[cfg(test)]
 mod voice_focus_scope_tests {
     use super::*;
@@ -278,6 +502,66 @@ mod voice_focus_scope_tests {
         assert_eq!(error.code, "VOICE_FOCUS_POLICY_INVALID");
         assert!(!error.message.contains(dir.path().to_string_lossy().as_ref()));
         assert!(!error.message.contains(crate::voice_focus::VOICE_FOCUS_FILE));
+    }
+}
+
+#[cfg(test)]
+mod library_read_contract_tests {
+    use super::*;
+
+    #[test]
+    fn library_errors_are_typed_retry_aware_and_scrub_internal_text() {
+        let busy = public_library_read_error("database is locked at X:\\private\\owner.db");
+        assert_eq!(busy.code, "DATABASE_BUSY");
+        assert!(busy.retryable);
+
+        let failed = public_library_read_error("token=secret SQL SELECT annotated_transcript FROM speech_segments");
+        assert_eq!(failed.code, "LIBRARY_READ_FAILED");
+        assert!(!failed.retryable);
+        let wire = serde_json::to_string(&failed).expect("serialize public library error");
+        assert!(!wire.contains("secret"));
+        assert!(!wire.contains("SELECT"));
+        assert!(!wire.contains("annotated_transcript"));
+        assert!(!wire.contains("speech_segments"));
+    }
+
+    #[test]
+    fn public_library_bounds_and_filters_fail_closed() {
+        assert_eq!(public_library_page_limit(None), 200);
+        assert_eq!(public_library_page_limit(Some(0)), 1);
+        assert_eq!(public_library_page_limit(Some(-10)), 1);
+        assert_eq!(public_library_page_limit(Some(i64::MAX)), 500);
+        assert_eq!(public_anomaly_limit(None), 100);
+        assert_eq!(public_anomaly_limit(Some(-10)), 1);
+        assert_eq!(public_anomaly_limit(Some(i64::MAX)), 500);
+
+        assert_eq!(public_library_sort(Some("oldest".to_string())).unwrap(), "oldest");
+        assert_eq!(public_library_sort(Some("DROP TABLE".to_string())).unwrap_err().code, "INVALID_LIBRARY_SORT");
+        assert!(validate_library_cursor(Some("opaque_ABC-123")).is_ok());
+        assert_eq!(validate_library_cursor(Some("../private.db")).unwrap_err().code, "INVALID_LIBRARY_CURSOR");
+    }
+
+    #[test]
+    fn a_replaced_or_newly_activated_focus_invalidates_the_page_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE),
+            br#"{"name":"private one","segment_ids":["segment-one"]}"#,
+        )
+        .unwrap();
+        let before = crate::voice_focus::resolve_binding(Some(dir.path())).unwrap().unwrap();
+
+        std::fs::write(
+            dir.path().join(crate::voice_focus::VOICE_FOCUS_FILE),
+            br#"{"name":"private two","segment_ids":["segment-two"]}"#,
+        )
+        .unwrap();
+        let current = crate::voice_focus::resolve_binding(Some(dir.path())).unwrap().unwrap();
+        assert_eq!(
+            ensure_library_focus_unchanged(Some(&before), Some(&current)).unwrap_err().code,
+            "STALE_VOICE_FOCUS"
+        );
+        assert_eq!(ensure_library_focus_unchanged(None, Some(&current)).unwrap_err().code, "STALE_VOICE_FOCUS");
     }
 }
 

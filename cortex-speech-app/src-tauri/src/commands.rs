@@ -11,7 +11,6 @@
 
 use crate::aligner;
 use crate::audio;
-use crate::db::{SegmentsPage, SpeechSegment};
 use crate::health;
 use crate::history::Command;
 use crate::models;
@@ -530,95 +529,6 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
         (min, mean)
     };
     Ok(SegmentConsensus { draft, words, model_count, min_agreement, mean_agreement, models })
-}
-
-/// Hydrate one selected list row with its full alignment/evidence payload.
-#[tauri::command]
-pub fn get_segment(segment_id: String, state: State<'_, AppState>) -> Result<SpeechSegment, String> {
-    RATE_LIMITER.check("get_segment")?;
-    validate::validate_identifier(&segment_id)?;
-    state
-        .segment_queries()
-        .get_segment(&segment_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))
-}
-
-#[tauri::command]
-pub fn get_segments_page(
-    verified: Option<bool>,
-    query: Option<String>,
-    sort: Option<String>,
-    limit: Option<usize>,
-    cursor: Option<String>,
-    focused: Option<bool>,
-    state: State<'_, AppState>,
-) -> Result<SegmentsPage, String> {
-    RATE_LIMITER.check("get_segments_page")?;
-    if let Some(ref query) = query {
-        validate::validate_text(query, 1000, "Search query")?;
-    }
-    let sort = sort.unwrap_or_else(|| "newest".to_string());
-    validate::validate_text(&sort, 64, "Segment sort")?;
-    match sort.as_str() {
-        "newest" | "oldest" | "duration" | "verified" | "confidence" | "activeLearning" | "active_learning"
-        | "suspectFirst" | "suspect_first" => {}
-        _ => return Err(format!("Invalid segment sort: {sort}")),
-    }
-    if let Some(ref cursor) = cursor {
-        validate::validate_text(cursor, 2048, "Segment page cursor")?;
-        if !cursor.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
-            return Err("Invalid segment page cursor".to_string());
-        }
-    }
-    let limit = limit.unwrap_or(200).clamp(1, 500);
-    // Voice focus for the DESKTOP review queue (owner report 2026-08-20: guests still played on
-    // desktop while the phones were narrowed — the focus lived only on the couch path). Same
-    // semantics as couch.rs: a MISSING file is no restriction, a file that EXISTS but cannot be
-    // honoured serves NOTHING (present-but-broken fails CLOSED), and it is re-read per fetch so an
-    // edit takes effect on the next refill. Only the review queue asks (`focused: true`); the
-    // curate/library views stay unfocused — the queue narrows, the library does not.
-    let focus = if focused.unwrap_or(false) {
-        let dir = state.lock_data_dir().clone();
-        crate::voice_focus::resolve(dir.as_deref())?
-    } else {
-        None
-    };
-    state
-        .segment_queries()
-        .get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref(), focus.as_deref())
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_segment_ids_for_view(
-    verified: Option<bool>,
-    query: Option<String>,
-    transcript_state: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<Vec<String>, String> {
-    RATE_LIMITER.check("get_segment_ids_for_view")?;
-    if let Some(ref query) = query {
-        validate::validate_text(query, 1000, "Search query")?;
-    }
-    let transcript_state = transcript_state.unwrap_or_else(|| "any".into());
-    match transcript_state.as_str() {
-        "any" | "real" | "missing" => {}
-        _ => return Err("Invalid transcript state".into()),
-    }
-    state
-        .segment_queries()
-        .get_segment_ids_for_view(verified, query.as_deref(), &transcript_state)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_signal_anomaly_segments(
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<SpeechSegment>, String> {
-    RATE_LIMITER.check("get_signal_anomaly_segments")?;
-    state.segment_queries().get_signal_anomaly_segments(limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

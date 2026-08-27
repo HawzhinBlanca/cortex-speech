@@ -502,7 +502,11 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_inference_stats,
             crate::commands::app_health,
             crate::commands::take_last_crash,
-            crate::commands::app_git_sha
+            crate::commands::app_git_sha,
+            crate::commands::get_segment,
+            crate::commands::get_segments_page,
+            crate::commands::get_segment_ids_for_view,
+            crate::commands::get_signal_anomaly_segments
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {
@@ -521,6 +525,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<InferenceKindStatsV1>()
         .typ::<InferenceStatsV1>()
         .typ::<AppHealthV1>()
+        .typ::<crate::db::SegmentsPage>()
         .typ::<ReviewScope>()
         .typ::<ActiveVoiceFocusV1>()
         .typ::<ReviewItemV1>()

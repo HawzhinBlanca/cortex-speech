@@ -680,7 +680,7 @@ pub struct SpotCheckScore {
     pub mean_cer: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentsPage {
     pub items: Vec<SpeechSegment>,

@@ -204,23 +204,66 @@ export interface GetSegmentsPageOptions {
   focused?: boolean;
 }
 
+function isSpeechSegmentPayload(value: unknown): value is SpeechSegment {
+  if (!value || typeof value !== 'object') return false;
+  const segment = value as Partial<SpeechSegment>;
+  return (
+    typeof segment.id === 'string' &&
+    typeof segment.audioPath === 'string' &&
+    typeof segment.rawTranscript === 'string' &&
+    typeof segment.durationMs === 'number' &&
+    Number.isFinite(segment.durationMs) &&
+    typeof segment.verified === 'boolean'
+  );
+}
+
+function isSegmentsPagePayload(value: unknown): value is SegmentsPage {
+  if (!value || typeof value !== 'object') return false;
+  const page = value as Partial<SegmentsPage>;
+  if (
+    !Array.isArray(page.items) ||
+    !page.items.every(isSpeechSegmentPayload) ||
+    typeof page.total !== 'number' ||
+    !Number.isSafeInteger(page.total) ||
+    page.total < 0 ||
+    page.total < page.items.length ||
+    (page.nextCursor !== null && typeof page.nextCursor !== 'string') ||
+    (page.focusNarrowed !== undefined && typeof page.focusNarrowed !== 'boolean')
+  ) {
+    return false;
+  }
+  if (page.revisions === undefined) return true;
+  return (
+    !!page.revisions &&
+    typeof page.revisions === 'object' &&
+    !Array.isArray(page.revisions) &&
+    Object.values(page.revisions).every(
+      (revision) => Number.isSafeInteger(revision) && revision >= 0,
+    )
+  );
+}
+
 export async function getSegment(segmentId: string): Promise<SpeechSegment> {
-  const data = await invokeLegacy<SpeechSegment>('get_segment', { segmentId });
-  if (!data || typeof data.id !== 'string') {
-    throw new Error(`get_segment returned an invalid payload for ${segmentId}`);
+  const result = await generatedCommands.getSegment(segmentId);
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
+  if (!isSpeechSegmentPayload(data)) {
+    throw new Error('get_segment returned an invalid payload');
   }
   return data;
 }
 
 export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Promise<SegmentsPage> {
-  const data = await invokeLegacy<SegmentsPage>('get_segments_page', {
-    verified: options.verified ?? null,
-    query: options.query ?? null,
-    sort: options.sort ?? 'newest',
-    limit: options.limit ?? 300,
-    cursor: options.cursor ?? null,
-    focused: options.focused ?? false,
-  });
+  const result = await generatedCommands.getSegmentsPage(
+    options.verified ?? null,
+    options.query ?? null,
+    options.sort ?? 'newest',
+    options.limit ?? 300,
+    options.cursor ?? null,
+    options.focused ?? false,
+  );
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
   // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
   // app understands" into "your library is empty" — a failure that looks exactly like success. Every
   // caller of these three already has a user-visible error path (segmentStore raises a PERSISTENT
@@ -228,7 +271,7 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
   // silent fallback bypassed all of them and left console.error, which no user opens, as the only
   // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
   // to review" — both are clean bills of health issued by a broken read.
-  if (!data || !Array.isArray(data.items)) {
+  if (!isSegmentsPagePayload(data)) {
     throw new Error(
       `get_segments_page returned ${typeof data}, not a page payload — the library could not be read`,
     );
@@ -364,11 +407,13 @@ export async function getSegmentIdsForView(
     transcriptState?: 'any' | 'real' | 'missing';
   } = {},
 ): Promise<string[]> {
-  const data = await invokeLegacy<string[]>('get_segment_ids_for_view', {
-    verified: options.verified ?? null,
-    query: options.query ?? null,
-    transcriptState: options.transcriptState ?? 'any',
-  });
+  const result = await generatedCommands.getSegmentIdsForView(
+    options.verified ?? null,
+    options.query ?? null,
+    options.transcriptState ?? 'any',
+  );
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
   if (!Array.isArray(data) || data.some((id) => typeof id !== 'string')) {
     throw new Error('get_segment_ids_for_view returned an invalid payload');
   }
@@ -376,8 +421,10 @@ export async function getSegmentIdsForView(
 }
 
 export async function getSignalAnomalySegments(limit = 100): Promise<SpeechSegment[]> {
-  const data = await invokeLegacy<SpeechSegment[]>('get_signal_anomaly_segments', { limit });
-  if (!Array.isArray(data))
+  const result = await generatedCommands.getSignalAnomalySegments(limit);
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
+  if (!Array.isArray(data) || !data.every(isSpeechSegmentPayload))
     throw new Error('get_signal_anomaly_segments returned an invalid payload');
   return data;
 }

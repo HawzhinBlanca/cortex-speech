@@ -105,6 +105,23 @@ export const commands = {
 	 *  Referencing `crate::GIT_SHA` here also guarantees the const is retained in the compiled binary.
 	 */
 	appGitSha: () => typedError<string, CommandErrorV1>(__TAURI_INVOKE("app_git_sha")),
+	/**
+	 *  Hydrate one selected list row with its full alignment/evidence payload. The database read runs
+	 *  off the Tauri main thread and every refusal is a stable renderer-safe code.
+	 */
+	getSegment: (segmentId: string) => typedError<SpeechSegment, CommandErrorV1>(__TAURI_INVOKE("get_segment", { segmentId })),
+	/**
+	 *  Read one stable keyset page from the owner library. Voice-focus resolution and SQLite work stay
+	 *  in the blocking worker; malformed policy files fail closed without exposing their private path.
+	 */
+	getSegmentsPage: (verified: boolean | null, query: string | null, sort: string | null, limit: number | null, cursor: string | null, focused: boolean | null) => typedError<SegmentsPage, CommandErrorV1>(__TAURI_INVOKE("get_segments_page", { verified, query, sort, limit, cursor, focused })),
+	// Read the exact id set for a contextual batch action without hydrating every segment row.
+	getSegmentIdsForView: (verified: boolean | null, query: string | null, transcriptState: string | null) => typedError<string[], CommandErrorV1>(__TAURI_INVOKE("get_segment_ids_for_view", { verified, query, transcriptState })),
+	/**
+	 *  Read the highest anomaly scores using a bounded public page. An untrusted renderer cannot turn
+	 *  this diagnostics view into an unbounded library hydration.
+	 */
+	getSignalAnomalySegments: (limit: number | null) => typedError<SpeechSegment[], CommandErrorV1>(__TAURI_INVOKE("get_signal_anomaly_segments", { limit })),
 };
 
 /* Types */
@@ -330,6 +347,26 @@ export type ReviewPageV1 = {
 };
 
 export type ReviewScope = { kind: "pending" } | { kind: "escalation" } | { kind: "search"; query: string } | { kind: "voiceFocus"; focusId: string };
+
+export type SegmentsPage = {
+	items: SpeechSegment[],
+	total: number,
+	nextCursor: string | null,
+	/**
+	 *  Database-owned revision paired with each list row by the same SQLite result row. Typed review
+	 *  IPC consumes this map; legacy list callers safely ignore the additive field.
+	 */
+	revisions?: { [key in string]: number },
+	/**
+	 *  True when a voice focus narrowed this page — i.e. `total` counts a SUBSET of the library.
+	 *
+	 *  The page needs this to tell the truth. Review mode measures progress against the corpus and
+	 *  fires an "all clips reviewed" banner when its queue empties, a rule it already suppresses for
+	 *  a SEARCH subset. A focus is a subset too, so without this flag draining 1,318 focused clips
+	 *  announced a 15,262-clip library as finished (review 2026-08-20).
+	 */
+	focusNarrowed?: boolean,
+};
 
 export type SetCloudConsentRequestV1 = {
 	expectedSettingsRevision: number,

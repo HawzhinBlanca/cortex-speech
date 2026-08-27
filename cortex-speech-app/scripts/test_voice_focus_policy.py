@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 
 from _couch_policy_util import couch_surface
+from _command_policy_util import command_surface
 from _db_policy_util import database_surface
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,14 @@ TRACKED = [
     REPO_ROOT / "src-tauri" / "src" / "voice_focus.rs",
     REPO_ROOT / "src-tauri" / "src" / "bin" / "host_voice_probe.rs",
 ]
+
+
+def _command(source: str, signature: str) -> str:
+    start = source.find(signature)
+    if start < 0:
+        raise AssertionError(f"missing command boundary {signature!r}")
+    end = source.find("\n#[tauri::command]", start + len(signature))
+    return source[start:] if end < 0 else source[start:end]
 
 
 def _fixture(tmp: Path) -> Path:
@@ -262,7 +271,7 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
 
       * couch.rs      — the phone queue passes the focus into its pending query;
       * db.rs         — the desktop page query joins the allow-list in SQL (json_each);
-      * commands.rs   — the desktop command fails CLOSED on a present-but-broken file, like couch;
+      * command surface — the desktop command fails CLOSED on a present-but-broken file, like couch;
       * ReviewMode    — the desktop review queue actually ASKS for the focus (curate must not).
     """
     src = REPO_ROOT / "src-tauri" / "src"
@@ -272,7 +281,6 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
         (src / "voice_focus.rs", "pub fn resolve("),
         (src / "voice_focus.rs", "POLICY_BROKEN_PREFIX"),
         (src / "couch.rs", "crate::voice_focus::resolve(dir.as_deref())"),
-        (src / "commands.rs", "crate::voice_focus::resolve(dir.as_deref())"),
         # The Inbox serves the escalation queue: it plays clips, mints receipts and records verdicts,
         # so it is a serving path and the focus governs it (review 2026-08-20 — narrowing the review
         # page alone still left the Inbox handing out guests).
@@ -291,6 +299,13 @@ def test_every_review_queue_serving_path_applies_the_focus() -> None:
         else:
             source = path.read_text(encoding="utf-8")
         assert needle in source, f"{path.name} lost its focus anchor: {needle!r}"
+    library_page = _command(command_surface(src), "pub async fn get_segments_page(")
+    for needle in (
+        "crate::voice_focus::resolve_binding(data_dir.as_deref())",
+        "focus_binding.as_ref()",
+        "ensure_library_focus_unchanged",
+    ):
+        assert needle in library_page, f"focused desktop page lost its generation-bound focus anchor: {needle!r}"
     review = (REPO_ROOT / "src" / "lib" / "ReviewMode.svelte").read_text(encoding="utf-8")
     assert "allReviewed: !subsetScoped" in review, (
         "the completion banner must exclude EVERY subset, not just a search — a drained focus queue "

@@ -49,6 +49,12 @@ const compileTimeContractProof = (): void => {
   void invokeLegacy<unknown>('get_recent_spans');
   // @ts-expect-error the one-shot crash notice is generated and renderer-safe
   void invokeLegacy<unknown>('take_last_crash');
+  // @ts-expect-error the library segment/page contract is generated and typed
+  void invokeLegacy<unknown>('get_segment');
+  // @ts-expect-error contextual batch ids cannot regress into handwritten IPC
+  void invokeLegacy<unknown>('get_segment_ids_for_view');
+  // @ts-expect-error anomaly hydration uses the bounded generated contract
+  void invokeLegacy<unknown>('get_signal_anomaly_segments');
   // @ts-expect-error destructive restore requires its exact source argument
   void invokeCritical('db_restore');
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings

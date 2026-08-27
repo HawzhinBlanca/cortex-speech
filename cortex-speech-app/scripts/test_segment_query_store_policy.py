@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from _command_policy_util import command_surface
+
 ROOT = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
 
 
@@ -22,6 +24,15 @@ def _command(source: str, signature: str) -> str:
         raise AssertionError(f"missing command boundary `{signature}`")
     end = source.find("\n#[tauri::command]", start + len(signature))
     return source[start:] if end < 0 else source[start:end]
+
+
+def _require_query_store_handler(source: str, name: str) -> None:
+    body = _command(source, f"pub async fn {name}(")
+    if "segment_queries" not in body:
+        raise AssertionError(f"{name} bypasses SegmentQueryStore")
+    for forbidden in ("state.db_arc()", "state.lock_db()", "state.db_runtime()"):
+        if forbidden in body:
+            raise AssertionError(f"{name} regained raw database authority: {forbidden}")
 
 
 def test_store_is_backend_only_and_connection_bounded() -> None:
@@ -56,34 +67,44 @@ def test_bounded_readers_do_not_take_the_writer_mutex_for_the_live_path() -> Non
 
 
 def test_migrated_command_handlers_use_only_the_query_store() -> None:
-    segments = _read("commands/segments_read.rs")
+    commands = command_surface(ROOT)
     for name in (
         "get_review_page_v1",
+        "get_segment",
+        "get_segments_page",
+        "get_segment_ids_for_view",
+        "get_signal_anomaly_segments",
         "get_segments",
         "get_segments_suspect_first",
         "search_segments",
         "get_audio_health",
         "get_active_learning_queue",
     ):
-        body = _command(segments, f"pub async fn {name}(")
-        if "segment_queries" not in body:
-            raise AssertionError(f"{name} bypasses SegmentQueryStore")
-        if "state.db_arc()" in body or "state.lock_db()" in body or "state.db_runtime()" in body:
-            raise AssertionError(f"{name} regained raw database authority")
+        _require_query_store_handler(commands, name)
 
-    commands = _read("commands.rs")
-    for name in ("get_segment", "get_segments_page", "get_segment_ids_for_view", "get_signal_anomaly_segments"):
-        body = _command(commands, f"pub fn {name}(")
-        if ".segment_queries()" not in body:
-            raise AssertionError(f"{name} bypasses SegmentQueryStore")
-        if "state.lock_db()" in body or "state.db_arc()" in body:
-            raise AssertionError(f"{name} regained raw database authority")
+
+def test_relocated_handler_cannot_hide_a_raw_database_regression() -> None:
+    unsafe = """
+#[tauri::command]
+pub async fn get_segment() {
+    let segment_queries = state.segment_queries();
+    let db = state.lock_db();
+}
+"""
+    try:
+        _require_query_store_handler(unsafe, "get_segment")
+    except AssertionError as error:
+        if "raw database authority" not in str(error):
+            raise
+    else:
+        raise AssertionError("policy accepted a relocated handler that reacquired the raw database")
 
 
 def main() -> None:
     test_store_is_backend_only_and_connection_bounded()
     test_bounded_readers_do_not_take_the_writer_mutex_for_the_live_path()
     test_migrated_command_handlers_use_only_the_query_store()
+    test_relocated_handler_cannot_hide_a_raw_database_regression()
     print("segment-query store architecture policy passed")
 
 
