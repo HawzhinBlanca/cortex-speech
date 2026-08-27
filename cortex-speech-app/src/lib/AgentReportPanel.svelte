@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AgentImportReport, AgentStageEvent } from './commands';
-  import { t } from './i18n';
+  import { t, type TranslationKey } from './i18n';
 
   let {
     report,
@@ -38,9 +38,9 @@
     const hash = reference.audioContentHash ? reference.audioContentHash.slice(0, 12) : '';
     const size =
       typeof reference.audioSizeBytes === 'number' && Number.isFinite(reference.audioSizeBytes)
-        ? `${reference.audioSizeBytes} bytes`
+        ? $t('agentReport.byteCount', { count: String(reference.audioSizeBytes) })
         : '';
-    return [hash ? `hash ${hash}` : '', size].filter(Boolean).join(' | ');
+    return [hash ? $t('agentReport.hashValue', { hash }) : '', size].filter(Boolean).join(' | ');
   }
 
   function topCounts(
@@ -86,6 +86,23 @@
     if (status === 'blocked') return 'text-red-300 bg-red-950/30 border-red-800/40';
     return 'text-cortex-300 bg-cortex-900/50 border-cortex-800/40';
   }
+
+  const statusKeys: Readonly<Record<string, TranslationKey>> = {
+    not_required: 'agentReport.status.notRequired',
+    ready: 'agentReport.status.ready',
+    completed: 'agentReport.status.completed',
+    failed: 'agentReport.status.failed',
+    running: 'agentReport.status.running',
+    degraded: 'agentReport.status.degraded',
+    needs_review: 'agentReport.status.needsReview',
+    blocked: 'agentReport.status.blocked',
+    unprocessed: 'agentReport.status.unprocessed',
+  };
+
+  function statusLabel(status: string): string {
+    const key = statusKeys[status];
+    return key ? $t(key) : status;
+  }
 </script>
 
 {#if report}
@@ -96,7 +113,7 @@
           {$t('agentReport.title')}
         </h2>
         <div class="mt-1 text-[10px] text-cortex-500 truncate" title={fmtDate(report.createdAt)}>
-          {$t('agentReport.created')}: {fmtDate(report.createdAt)}
+          {$t('agentReport.created')}: <bdi dir="ltr">{fmtDate(report.createdAt)}</bdi>
         </div>
       </div>
       <span
@@ -106,7 +123,7 @@
             : 'bg-red-950/50 text-red-300 border-red-800/40'
         }`}
       >
-        {report.status}
+        {statusLabel(report.status)}
       </span>
     </div>
 
@@ -143,6 +160,7 @@
       <div class="flex justify-between gap-2">
         <span>{$t('agentReport.referenceModels')}</span>
         <span
+          dir="ltr"
           class="text-cortex-200 text-end truncate"
           title={report.summary.sourceReferenceModels.join(', ')}
         >
@@ -152,6 +170,7 @@
       <div class="flex justify-between gap-2">
         <span>{$t('agentReport.requiredReferenceModels')}</span>
         <span
+          dir="ltr"
           class="text-cortex-200 text-end truncate"
           title={report.summary.requiredSourceReferenceModels.join(', ')}
         >
@@ -161,6 +180,7 @@
       <div class="flex justify-between gap-2">
         <span>{$t('agentReport.hypothesisModels')}</span>
         <span
+          dir="ltr"
           class="text-cortex-200 text-end truncate"
           title={report.summary.hypothesisModels.join(', ')}
         >
@@ -183,13 +203,14 @@
               report.summary.agenticReadiness.status,
             )}`}
           >
-            {report.summary.agenticReadiness.status}
+            {statusLabel(report.summary.agenticReadiness.status)}
           </span>
         </div>
         <div class="space-y-1 text-[10px] text-cortex-400">
           <div class="flex justify-between gap-2">
             <span>{$t('agentReport.referenceModels')}</span>
             <span
+              dir="ltr"
               class="text-cortex-200 text-end truncate"
               title={report.summary.agenticReadiness.sourceReferenceModels.join(', ')}
             >
@@ -199,6 +220,7 @@
           <div class="flex justify-between gap-2">
             <span>{$t('agentReport.readyHypothesisModels')}</span>
             <span
+              dir="ltr"
               class="text-cortex-200 text-end truncate"
               title={report.summary.agenticReadiness.availableHypothesisModels.join(', ')}
             >
@@ -221,7 +243,7 @@
                 <span
                   class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(check.status)}`}
                 >
-                  {check.status}
+                  {statusLabel(check.status)}
                 </span>
               </div>
               <div class="text-cortex-500 truncate">{check.detail}</div>
@@ -263,7 +285,7 @@
             class="grid grid-cols-[minmax(0,1fr)_auto] gap-2 text-[10px]"
             title={coverage.audioPath}
           >
-            <span class="text-cortex-300 truncate">{shortPath(coverage.audioPath)}</span>
+            <bdi class="text-cortex-300 truncate" dir="auto">{shortPath(coverage.audioPath)}</bdi>
             <span
               class={`font-mono border rounded px-1 py-0.5 shrink-0 ${
                 coverage.complete
@@ -299,11 +321,11 @@
         {#each longFileDossiers().slice(0, 3) as dossier}
           <div class="space-y-1 text-[10px]" title={dossier.audioPath}>
             <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-              <span class="text-cortex-300 truncate">{shortPath(dossier.audioPath)}</span>
+              <bdi class="text-cortex-300 truncate" dir="auto">{shortPath(dossier.audioPath)}</bdi>
               <span
                 class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(dossier.promotionStatus)}`}
               >
-                {dossier.promotionStatus}
+                {statusLabel(dossier.promotionStatus)}
               </span>
             </div>
             <div class="flex justify-between gap-2 text-cortex-500">
@@ -312,13 +334,17 @@
                 {$t('agentReport.chunks')} - {dossier.trainingReadySegments}
                 {$t('agentReport.readyShort')}
               </span>
-              <span class="truncate text-end" title={dossier.promotionBlockers.join(', ')}>
+              <bdi
+                class="truncate text-end"
+                dir="auto"
+                title={dossier.promotionBlockers.join(', ')}
+              >
                 {#if dossier.promotionBlockers.length}
                   {dossier.promotionBlockers.slice(0, 2).join(', ')}
                 {:else}
                   {$t('agentReport.noBlockers')}
                 {/if}
-              </span>
+              </bdi>
             </div>
           </div>
         {/each}
@@ -341,11 +367,11 @@
         {#each recentStageEvents().slice(-6) as event}
           <div class="space-y-0.5 text-[10px]" title={`${event.file}: ${event.detail}`}>
             <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-              <span class="text-cortex-300 truncate">{event.stage}</span>
+              <bdi class="text-cortex-300 truncate" dir="auto">{event.stage}</bdi>
               <span
                 class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(event.status)}`}
               >
-                {event.status}
+                {statusLabel(event.status)}
                 {#if event.total}
                   {event.current}/{event.total}
                 {/if}
@@ -370,15 +396,17 @@
             class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[10px]"
             title={`${reference.audioPath} | ${reference.transcriptPath} | ${sourceReferenceIdentity(reference)}`}
           >
-            <span class="text-cyan-300 font-mono shrink-0 row-span-2">{reference.modelId}</span>
-            <span class="text-cortex-300 text-end truncate min-w-0">
+            <bdi class="text-cyan-300 font-mono shrink-0 row-span-2" dir="ltr"
+              >{reference.modelId}</bdi
+            >
+            <bdi class="text-cortex-300 text-end truncate min-w-0" dir="auto">
               {shortPath(reference.transcriptPath)} - {reference.textChars}
               {$t('agentReport.chars')}
-            </span>
+            </bdi>
             {#if sourceReferenceIdentity(reference)}
-              <span class="text-cortex-500 text-end truncate min-w-0">
+              <bdi class="text-cortex-500 text-end truncate min-w-0" dir="ltr">
                 {sourceReferenceIdentity(reference)}
-              </span>
+              </bdi>
             {/if}
           </div>
         {/each}
@@ -417,11 +445,11 @@
         </div>
         {#each orchestrationStages().slice(0, 5) as stage}
           <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2 text-[10px]" title={stage.summary}>
-            <span class="text-cortex-300 truncate">{stage.stage}</span>
+            <bdi class="text-cortex-300 truncate" dir="auto">{stage.stage}</bdi>
             <span
               class={`font-mono border rounded px-1 py-0.5 shrink-0 ${stageTone(stage.status)}`}
             >
-              {stage.status}
+              {statusLabel(stage.status)}
               {#if stage.blockerCount}
                 - {stage.blockerCount}
               {/if}
@@ -468,7 +496,7 @@
         </div>
         {#each topCounts(report.summary.trainingGradeReasonCounts, 4) as [reason, count]}
           <div class="flex justify-between gap-2 text-[10px]">
-            <span class="text-cortex-300 truncate" title={reason}>{reason}</span>
+            <bdi class="text-cortex-300 truncate" dir="auto" title={reason}>{reason}</bdi>
             <span class="text-cortex-200 font-mono shrink-0">{count}</span>
           </div>
         {/each}
@@ -478,25 +506,25 @@
     <div class="grid grid-cols-4 gap-1 text-center">
       <div class="rounded bg-cortex-900/50 border border-cortex-800/30 px-1.5 py-2">
         <div class="text-xs font-semibold text-emerald-300">{countFor('jury_accept')}</div>
-        <div class="text-[9px] text-cortex-500">jury</div>
+        <div class="text-[9px] text-cortex-500">{$t('agentReport.jury')}</div>
       </div>
       <div class="rounded bg-cortex-900/50 border border-cortex-800/30 px-1.5 py-2">
         <div class="text-xs font-semibold text-cyan-300">{countFor('auto_accept')}</div>
-        <div class="text-[9px] text-cortex-500">auto</div>
+        <div class="text-[9px] text-cortex-500">{$t('agentReport.automatic')}</div>
       </div>
       <div class="rounded bg-cortex-900/50 border border-cortex-800/30 px-1.5 py-2">
         <div class="text-xs font-semibold text-amber-300">{countFor('escalated')}</div>
-        <div class="text-[9px] text-cortex-500">review</div>
+        <div class="text-[9px] text-cortex-500">{$t('agentReport.review')}</div>
       </div>
       <div class="rounded bg-cortex-900/50 border border-cortex-800/30 px-1.5 py-2">
         <div class="text-xs font-semibold text-cortex-300">{countFor('unprocessed')}</div>
-        <div class="text-[9px] text-cortex-500">open</div>
+        <div class="text-[9px] text-cortex-500">{$t('agentReport.open')}</div>
       </div>
     </div>
 
     {#if report.error}
       <div class="text-[10px] text-red-300 bg-red-950/30 border border-red-900/40 rounded p-2">
-        {report.error}
+        <span dir="auto">{report.error}</span>
       </div>
     {/if}
   </section>

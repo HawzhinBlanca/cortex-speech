@@ -14,10 +14,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_exe_freshness import (  # noqa: E402
+    SOURCE_DIRS,
+    SOURCE_FILES,
     SOURCE_PREFIXES,
+    _source_changed_since,
     evaluate_freshness,
     extract_baked_sha,
     newest_source,
+    worktree_source_changes,
     worktree_source_warnings,
 )
 
@@ -156,6 +160,127 @@ def test_short_sha_prefix_match_passes() -> None:
     assert problems == [], problems
 
 
+def _otherwise_fresh_with_status(status_lines: list[str]) -> list[str]:
+    return evaluate_freshness(
+        exe_exists=True,
+        exe_mtime=2000.0,
+        baked_sha=HEAD,
+        head_sha=HEAD,
+        newest_src_mtime=1000.0,
+        newest_src_file="src/App.svelte",
+        dirty_source_paths=worktree_source_changes(status_lines, SOURCE_PREFIXES),
+    )
+
+
+def test_dirty_tracked_rust_source_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status([" M cortex-speech-app/src-tauri/src/pipeline.rs"])
+    assert any("UNCOMMITTED COMPILED SOURCE" in problem for problem in problems), problems
+
+
+def test_dirty_tracked_frontend_source_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status([" M cortex-speech-app/src/App.svelte"])
+    assert any("src/App.svelte" in problem for problem in problems), problems
+
+
+def test_dirty_build_input_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status([" M cortex-speech-app/src-tauri/Cargo.toml"])
+    assert any("Cargo.toml" in problem for problem in problems), problems
+
+
+def test_compiled_pilot_focus_contract_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status(["?? cortex-speech-app/controlled_pilot_focus.json"])
+    assert any("controlled_pilot_focus.json" in problem for problem in problems), problems
+
+
+def test_vendored_http_source_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status(
+        [" M cortex-speech-app/src-tauri/vendor/tiny_http_fork/src/client.rs"]
+    )
+    assert any("tiny_http_fork/src/client.rs" in problem for problem in problems), problems
+
+
+def test_vendored_http_manifest_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status(
+        [" M cortex-speech-app/src-tauri/vendor/tiny_http_fork/Cargo.toml"]
+    )
+    assert any("tiny_http_fork/Cargo.toml" in problem for problem in problems), problems
+
+
+def test_repo_toolchain_input_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status([" M rust-toolchain.toml"])
+    assert any("rust-toolchain.toml" in problem for problem in problems), problems
+
+
+def test_packaged_champion_client_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status([" M cortex-speech-app/scripts/cortex_7b_client.py"])
+    assert any("cortex_7b_client.py" in problem for problem in problems), problems
+
+
+def test_tauri_capability_directory_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status(
+        ["?? cortex-speech-app/src-tauri/capabilities/reviewer.json"]
+    )
+    assert any("capabilities/reviewer.json" in problem for problem in problems), problems
+
+
+def test_cross_commit_diff_covers_every_external_compiled_input(tmp_path: Path) -> None:
+    """The HEAD-equivalence shortcut must not call these build changes "docs only"."""
+    import subprocess
+
+    compiled = {
+        "rust-toolchain.toml": "channel = '1.95.0'\n",
+        "cortex-speech-app/controlled_pilot_focus.json": "[]\n",
+        "cortex-speech-app/src-tauri/vendor/tiny_http_fork/Cargo.toml": "[package]\nname='fixture'\n",
+        "cortex-speech-app/src-tauri/vendor/tiny_http_fork/src/client.rs": "const DEADLINE: u64 = 10;\n",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "freshness@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Freshness Test"], cwd=tmp_path, check=True)
+    for relative, content in compiled.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    baked = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    for relative, content in compiled.items():
+        (tmp_path / relative).write_text(content + "# changed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "change compiled inputs"], cwd=tmp_path, check=True)
+
+    changed = _source_changed_since(tmp_path, baked, SOURCE_DIRS, SOURCE_FILES)
+    assert changed is not None
+    assert set(changed) == set(compiled), changed
+
+
+def test_relevant_untracked_source_fails_closed() -> None:
+    problems = _otherwise_fresh_with_status(["?? cortex-speech-app/src/lib/new_runtime.ts"])
+    assert any("new_runtime.ts" in problem for problem in problems), problems
+
+
+def test_docs_only_dirt_remains_nonblocking() -> None:
+    problems = _otherwise_fresh_with_status(
+        [" M docs/RELEASE_NOTES.md", "?? PROGRESS_LEDGER.md", " M cortex-speech-app/README.md"]
+    )
+    assert problems == [], problems
+
+
+def test_unavailable_worktree_status_fails_closed() -> None:
+    problems = evaluate_freshness(
+        exe_exists=True,
+        exe_mtime=2000.0,
+        baked_sha=HEAD,
+        head_sha=HEAD,
+        newest_src_mtime=1000.0,
+        newest_src_file="src/App.svelte",
+        source_status_available=False,
+    )
+    assert any("could not inspect" in problem for problem in problems), problems
+
+
 def test_newest_source_picks_latest_file(tmp_path: Path) -> None:
     app = tmp_path
     (app / "src").mkdir()
@@ -186,7 +311,7 @@ def test_worktree_warns_on_sibling_with_uncommitted_source() -> None:
 
 
 def test_worktree_skips_the_gated_checkout_itself() -> None:
-    # Uncommitted source in the checkout being gated is the freshness check's own job (mtime/SHA),
+    # Uncommitted source in the checkout being gated is the freshness check's own fail-closed job,
     # not a sibling warning — don't double-report it.
     worktrees = [("/repo/main", [" M cortex-speech-app/src/App.svelte"])]
     assert worktree_source_warnings(worktrees, "/repo/main", SOURCE_PREFIXES) == []

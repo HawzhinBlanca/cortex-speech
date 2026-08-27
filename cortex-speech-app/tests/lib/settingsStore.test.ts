@@ -14,7 +14,7 @@ describe('settingsStore', () => {
     expect(state.enableGpu).toBe(true);
     expect(state.asrModel).toBe('wsl-7b');
     expect(state.language).toBe('ckb');
-    expect(state.sourceReferenceModels).toEqual(['gemini-2.5-pro', 'gemini-2.5-flash']);
+    expect(state.sourceReferenceModels).toEqual(['gemini-2.5-pro']);
   });
 
   it('allows direct update', () => {
@@ -34,7 +34,6 @@ describe('settingsStore', () => {
       ...defaultSettings,
       theme: 'light' as const,
       autoNormalize: false,
-      asrModel: 'ctc-1b' as const,
       numThreads: 16,
       language: 'en',
     };

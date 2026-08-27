@@ -1,6 +1,5 @@
 import { readFileSync } from 'fs';
 import path from 'path';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-expect-error jsdom ships no bundled types. It is already a devDependency (vitest's own
 // environment), and pulling @types/jsdom in for one test file is not worth a dependency.
 import { JSDOM } from 'jsdom';
@@ -26,20 +25,26 @@ import { describe, it, expect } from 'vitest';
  */
 const PAGE = path.resolve(__dirname, '..', 'src-tauri', 'assets', 'couch.html');
 
-type Clip = { id: string; text: string; durationMs: number; speakerId: string; speakerChange?: boolean };
+type Clip = {
+  id: string;
+  text: string;
+  durationMs: number;
+  speakerId: string;
+  speakerChange?: boolean;
+};
 
 /** Load the page, let it boot offline, then render `clip` through its own code path. */
-function renderClip(clip: Clip): { text: string; badge: string | null } {
+async function renderClip(clip: Clip): Promise<{ text: string; badge: string | null }> {
   const dom = new JSDOM(readFileSync(PAGE, 'utf-8'), {
     runScripts: 'dangerously',
     url: 'http://127.0.0.1:8737/',
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     beforeParse(win: any) {
       // The bootstrap fetches its queue. There is no server here and there need not be — this is
-      // about rendering, not loading. A stub that never SETTLES parks the bootstrap on its await
-      // rather than running an error path that would race the assertions and surface as an unhandled
-      // rejection. Installed before parse, so no request is ever attempted.
-      win.fetch = () => new Promise(() => {});
+      // about rendering, not loading. Reject immediately, then explicitly JOIN that startup load
+      // below before tearing down the window. Leaving the fetch pending is unsafe: `window.close()`
+      // can let an earlier microtask resume into doLoad's catch/finally after the DOM is gone.
+      win.fetch = () => Promise.reject(new Error('offline speaker-badge test'));
       // jsdom ships no canvas, so `getContext('2d')` returns null and the waveform strip that show()
       // kicks off throws. An environment gap, not a page bug — the WebView always has a 2D context —
       // so it is stubbed here rather than guarded in shipping code for a test's benefit.
@@ -50,6 +55,9 @@ function renderClip(clip: Clip): { text: string; badge: string | null } {
       });
     },
   });
+  // The page starts load() while parsing. Join its shared in-flight promise so catch/finally has
+  // completely restored the controls before this test renders a synthetic clip or closes the DOM.
+  await dom.window.eval('load()');
   // `queue` / `i` / `show` are the page script's own top-level bindings. `exhausted` stops show()
   // from trying to refetch an empty batch. This is the page's REAL render — not a re-implementation,
   // which would keep passing while the page itself was broken.
@@ -64,8 +72,8 @@ function renderClip(clip: Clip): { text: string; badge: string | null } {
 const BASE: Clip = { id: 'c1', text: 'دەق', durationMs: 14200, speakerId: 'SPEAKER_03' };
 
 describe('couch.html — the speaker-change badge', () => {
-  it('warns on a clip measured to hold more than one speaker', () => {
-    const { text, badge } = renderClip({ ...BASE, speakerChange: true });
+  it('warns on a clip measured to hold more than one speaker', async () => {
+    const { text, badge } = await renderClip({ ...BASE, speakerChange: true });
     expect(badge, 'a measured speaker change must be DRAWN, not merely sent').not.toBeNull();
     expect(badge).toContain('⚠');
     // The Sorani string, byte-for-byte: this page is Kurdish-first, and a badge that silently fell
@@ -76,17 +84,17 @@ describe('couch.html — the speaker-change badge', () => {
     expect(text).toContain('SPEAKER_03');
   });
 
-  it('says nothing for a clip measured to hold one speaker', () => {
-    const { text, badge } = renderClip({ ...BASE, speakerChange: false });
+  it('says nothing for a clip measured to hold one speaker', async () => {
+    const { text, badge } = await renderClip({ ...BASE, speakerChange: false });
     expect(badge, 'a single-speaker clip must render as ordinary work').toBeNull();
     expect(text).toContain('SPEAKER_03');
   });
 
-  it('says nothing for a clip nobody measured — absence of evidence is not evidence', () => {
+  it('says nothing for a clip nobody measured — absence of evidence is not evidence', async () => {
     // No `speakerChange` field at all: a legacy row, or any future import (the import path does not
     // run the measurement). Indistinguishable from "one speaker" by design — and it must equally
     // never imply the clip WAS checked.
-    const { badge } = renderClip(BASE);
+    const { badge } = await renderClip(BASE);
     expect(badge).toBeNull();
   });
 });

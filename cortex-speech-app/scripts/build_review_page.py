@@ -111,7 +111,11 @@ def audio_src(p, embed: bool, per_clip_limit: int, budget: list):
     return f"data:{mime};base64,{b64}", ""
 
 
-def render(rows, engine_label, source_name, embed, audio_root, per_clip_limit, total_limit):
+DEFAULT_DRAFT_LABEL = "raw machine draft ({engine}) -- not human-verified:"
+
+
+def render(rows, engine_label, source_name, embed, audio_root, per_clip_limit, total_limit,
+           draft_label=DEFAULT_DRAFT_LABEL):
     budget = [total_limit]
     sections = []
     export_meta = []
@@ -157,7 +161,7 @@ def render(rows, engine_label, source_name, embed, audio_root, per_clip_limit, t
         <label class="approve"><input type="checkbox" class="ok" id="{sid}-ok"> approved</label>
       </div>
       <div class="player">{player}</div>
-      <div class="label">raw machine draft ({html.escape(engine)}) -- not human-verified:</div>
+      <div class="label">{html.escape(draft_label.format(engine=engine))}</div>
       <div class="draft" dir="rtl">{draft_html}</div>
       <div class="label">your corrected Sorani transcript:</div>
       <textarea id="{sid}-fix" dir="rtl" spellcheck="false" placeholder="Correct {html.escape(rid)}">{html.escape(draft)}</textarea>
@@ -306,6 +310,12 @@ def main() -> int:
     ap.add_argument("--audio-root", type=Path, default=None)
     ap.add_argument("--embed-audio", action="store_true")
     ap.add_argument("--engine", default="OmniASR CTC (local)")
+    ap.add_argument(
+        "--draft-label",
+        default=DEFAULT_DRAFT_LABEL,
+        help="provenance line above each draft; must state honestly WHOSE text this is. "
+             "'{engine}' is substituted. Default calls it raw machine output.",
+    )
     ap.add_argument("--max-embed-mb", type=float, default=8.0)
     ap.add_argument("--max-total-mb", type=float, default=200.0)
     args = ap.parse_args()
@@ -314,7 +324,8 @@ def main() -> int:
         print("Manifest has no rows; nothing to review.", file=sys.stderr)
         return 2
     out = render(rows, args.engine, args.manifest.name, args.embed_audio, args.audio_root,
-                 int(args.max_embed_mb * 1024 * 1024), int(args.max_total_mb * 1024 * 1024))
+                 int(args.max_embed_mb * 1024 * 1024), int(args.max_total_mb * 1024 * 1024),
+                 draft_label=args.draft_label)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(out, encoding="utf-8")
     print(f"Wrote {args.out} ({len(rows)} segments, embed={args.embed_audio})")

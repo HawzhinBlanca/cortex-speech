@@ -6,10 +6,13 @@
    * the M3.1 backend (computeLift) and is shown as a placeholder until then.
    */
   import { onMount } from 'svelte';
+  import { chooseFile } from './fileDialogs';
   import * as api from './commands';
   import type { EvalRun, EscalationTrendPoint, LabelQualityLift, EvalRunResult } from './types';
   import { notifications } from './stores/notificationStore';
   import { isTauriRuntime } from './runtime';
+  import { formatPublicErrorReference } from './errorText';
+  import { t } from './i18n';
 
   let evalRuns: EvalRun[] = [];
   let trend: EscalationTrendPoint[] = [];
@@ -19,12 +22,14 @@
 
   // Eval-action state (legacy reactivity — this component is not in runes mode).
   const tauriAvailable = isTauriRuntime();
-  let evalModelId = '';
   let evalResult: EvalRunResult | null = null;
   let scorecardMd = '';
   let evalBusy = false;
 
   const pct = (x: number): string => `${(x * 100).toFixed(1)}%`;
+  // FSI/PDI keeps interpolated model metrics and counts from reordering the surrounding Sorani text.
+  const isolate = (value: string | number): string =>
+    `${String.fromCodePoint(0x2068)}${String(value)}${String.fromCodePoint(0x2069)}`;
   // A WER/CER over ZERO scored segments is UNDEFINED, not 0% — the backend already refuses to read it as a
   // real rate (scorecard/render_markdown say "undefined (not 0%)"; the promotion gate returns "CANNOT
   // EVALUATE … undefined, not 0"). This panel is the one surface showing raw run.wer/run.cer, so mirror
@@ -44,30 +49,16 @@
     evalBusy = true;
     scorecardMd = '';
     try {
-      evalResult = await api.runGoldEvalAsr(evalModelId.trim() || null);
+      evalResult = await api.runGoldEvalAsr();
       await refreshRuns();
       notifications.success(
-        `Honest-CER eval done: CER ${metric(evalResult.run.cer, evalResult.run.numSegs)} (N=${evalResult.run.numSegs}).`,
+        $t('refinery.evalComplete', {
+          cer: metric(evalResult.run.cer, evalResult.run.numSegs),
+          n: String(evalResult.run.numSegs),
+        }),
       );
     } catch (e) {
-      notifications.error('Honest-CER eval failed', { detail: String(e) });
-    } finally {
-      evalBusy = false;
-    }
-  }
-
-  async function runLocalEval() {
-    if (evalBusy || !tauriAvailable || !evalModelId.trim()) return;
-    evalBusy = true;
-    scorecardMd = '';
-    try {
-      evalResult = await api.runGoldEvalLocal(evalModelId.trim());
-      await refreshRuns();
-      notifications.success(
-        `Local eval done: CER ${metric(evalResult.run.cer, evalResult.run.numSegs)} (N=${evalResult.run.numSegs}).`,
-      );
-    } catch (e) {
-      notifications.error('Local eval failed', { detail: String(e) });
+      notifications.error($t('refinery.evalFailed'), { cause: e });
     } finally {
       evalBusy = false;
     }
@@ -80,7 +71,7 @@
       const res = await api.buildScorecard(evalResult);
       scorecardMd = res.markdown;
     } catch (e) {
-      notifications.error('Build scorecard failed', { detail: String(e) });
+      notifications.error($t('refinery.scorecardFailed'), { cause: e });
     } finally {
       evalBusy = false;
     }
@@ -88,15 +79,14 @@
 
   async function importGoldFromFile() {
     if (evalBusy || !tauriAvailable) return;
-    const { open } = await import('@tauri-apps/plugin-dialog');
-    const picked = await open({ multiple: false, title: 'Select a verified audio file' });
-    if (typeof picked !== 'string') return;
+    const picked = await chooseFile({ title: $t('refinery.selectVerifiedAudio') });
+    if (!picked) return;
     evalBusy = true;
     try {
       const n = await api.createGoldFromFile(picked);
-      notifications.success(`Created ${n} gold segment(s) from the file.`);
+      notifications.success($t('refinery.goldCreated', { count: String(n) }));
     } catch (e) {
-      notifications.error('Create gold from file failed', { detail: String(e) });
+      notifications.error($t('refinery.goldCreateFailed'), { cause: e });
     } finally {
       evalBusy = false;
     }
@@ -110,90 +100,64 @@
         api.getLabelQualityLift(),
       ]);
     } catch (e) {
-      error = `Failed to load refinery data: ${e}`;
+      error = $t('refinery.loadFailed', {
+        error: formatPublicErrorReference(e) ?? $t('errors.unknown'),
+      });
     } finally {
       loading = false;
     }
   });
 </script>
 
-<section class="refinery-panel" data-testid="refinery-panel" aria-label="Refinery metrics">
-  <h2 class="panel-title">Disagreement Refinery</h2>
+<section class="refinery-panel" data-testid="refinery-panel" aria-label={$t('refinery.ariaLabel')}>
+  <h2 class="panel-title">{$t('refinery.title')}</h2>
 
   {#if loading}
-    <p class="muted">Loading refinery metrics…</p>
+    <p class="muted" role="status">{$t('refinery.loading')}</p>
   {:else if error}
     <p class="error" role="alert">{error}</p>
   {:else}
     <!-- Label-quality lift (pending M3.1 backend) -->
     <div class="card" data-testid="refinery-lift">
-      <h3 class="card-title">Label-quality lift (raw ASR → post-jury)</h3>
-      {#if lift && lift.n > 0 && lift.selfReferentialN >= lift.n}
-        <!-- CORRECTED 2026-08-04. The first version of this branch blamed accepting a clip, and told the
-             reviewer that editing instead would fix it. Both were wrong, and the codebase says so in
-             `corrections.rs`: "verdict_transcript ... is the human's ANSWER (the reference/target the
-             evidence is scored AGAINST), never the model draft". `load_lift_triples` passes that column
-             as the JURY hypothesis, so the metric compares the human's answer with the human's answer —
-             for every row, always, whatever the reviewer does. Measured: 34 of 35 EDITED clips are
-             self-referential too, so editing changes nothing.
-             The post-jury text is not persisted anywhere (segment_hypotheses holds per-ENGINE drafts,
-             not the jury consensus), so this card cannot be computed as specified. Say only what is
-             true and do not send the reviewer to do work that cannot help. -->
-        <p class="muted" data-testid="refinery-lift-self-referential">
-          Not measurable — the stored “post-jury” text for a decided clip is the human's own answer,
-          so this compares that answer with itself and can only ever report zero. It is not a
-          statement about the jury's accuracy, and no amount of reviewing changes it: measuring the
-          jury needs its verdict recorded separately from the human's, which this library does not
-          yet do.
-        </p>
-      {:else if lift && lift.n > 0}
+      <h3 class="card-title">{$t('refinery.liftTitle')}</h3>
+      {#if lift && lift.n > 0}
         <div class="lift-grid">
           <div class="lift-cell">
-            <span class="lift-label">Raw ASR CER</span>
-            <span class="lift-val">{pct(lift.rawMicroCer)}</span>
+            <span class="lift-label">{$t('refinery.rawAsrCer')}</span>
+            <bdi dir="ltr" class="lift-val">{pct(lift.rawMicroCer)}</bdi>
           </div>
           <div class="lift-cell">
-            <span class="lift-label">Post-jury CER</span>
-            <span class="lift-val">{pct(lift.juryMicroCer)}</span>
+            <span class="lift-label">{$t('refinery.postJuryCer')}</span>
+            <bdi dir="ltr" class="lift-val">{pct(lift.juryMicroCer)}</bdi>
           </div>
           <div class="lift-cell">
-            <span class="lift-label">CER lift</span>
-            <span
+            <span class="lift-label">{$t('refinery.cerLift')}</span>
+            <bdi
+              dir="ltr"
               class="lift-val"
               class:lift-pos={lift.cerLift > 0}
               class:lift-neg={lift.cerLift < 0}
             >
               {pct(lift.cerLift)}
-            </span>
+            </bdi>
           </div>
         </div>
-        <p class="muted">
-          n={lift.n} verified segments · 95% CI [{pct(lift.liftCiLow)}, {pct(lift.liftCiHigh)}]
-          {#if lift.selfReferentialN > 0}
-            <!-- The numbers above are real here, but partly diluted: an accepted clip's reference IS
-                 the jury verdict, so those rows can only ever contribute zero jury error. Naming the
-                 count lets the figure be read for what it is instead of taken at face value. -->
-            · {lift.selfReferentialN} of {lift.n} accepted verbatim, so those rows score the jury against
-            its own output
-          {/if}
+        <p class="muted" dir="auto">
+          {$t('refinery.liftEvidence', {
+            n: isolate(lift.n),
+            low: isolate(pct(lift.liftCiLow)),
+            high: isolate(pct(lift.liftCiHigh)),
+          })}
         </p>
       {:else}
-        <p class="muted">
-          No measured lift yet — needs human-verified segments that also carry a jury verdict.
-        </p>
+        <p class="muted">{$t('refinery.noMeasuredLift')}</p>
       {/if}
     </div>
 
-    <!-- Eval actions (honest-CER / local eval, scorecard, gold-from-file) -->
+    <!-- Champion eval, scorecard, and gold import. Auxiliary-engine eval stays offline-only. -->
     {#if tauriAvailable}
       <div class="card" data-testid="refinery-eval-actions">
-        <h3 class="card-title">Run evaluation</h3>
-        <input
-          class="input eval-input"
-          placeholder="model id (optional for honest-CER)"
-          aria-label="Eval model id"
-          bind:value={evalModelId}
-        />
+        <h3 class="card-title">{$t('refinery.runEvaluation')}</h3>
         <div class="action-row">
           <button
             class="btn btn-secondary"
@@ -201,15 +165,7 @@
             disabled={evalBusy}
             data-testid="eval-honest-cer"
           >
-            {evalBusy ? 'Running…' : 'Run honest-CER eval'}
-          </button>
-          <button
-            class="btn btn-secondary"
-            onclick={runLocalEval}
-            disabled={evalBusy || !evalModelId.trim()}
-            data-testid="eval-local"
-          >
-            {evalBusy ? 'Running…' : 'Run local-pipeline eval'}
+            {evalBusy ? $t('refinery.running') : $t('refinery.runHonestCer')}
           </button>
           <button
             class="btn btn-secondary"
@@ -217,22 +173,23 @@
             disabled={evalBusy}
             data-testid="eval-import-gold"
           >
-            {evalBusy ? 'Importing…' : 'Import gold from file…'}
+            {evalBusy ? $t('refinery.importing') : $t('refinery.importGold')}
           </button>
         </div>
         {#if evalResult}
-          <p class="muted" data-testid="eval-result">
-            Last eval: CER {metric(evalResult.run.cer, evalResult.run.numSegs)} · WER {metric(
-              evalResult.run.wer,
-              evalResult.run.numSegs,
-            )} · N={evalResult.run.numSegs}
+          <p class="muted" data-testid="eval-result" dir="auto">
+            {$t('refinery.lastEval', {
+              cer: isolate(metric(evalResult.run.cer, evalResult.run.numSegs)),
+              wer: isolate(metric(evalResult.run.wer, evalResult.run.numSegs)),
+              n: isolate(evalResult.run.numSegs),
+            })}
             <button
               class="btn btn-ghost"
               onclick={buildScorecardFromResult}
               disabled={evalBusy}
               data-testid="eval-build-scorecard"
             >
-              Build scorecard
+              {$t('refinery.buildScorecard')}
             </button>
           </p>
         {/if}
@@ -244,22 +201,25 @@
 
     <!-- Eval-run history -->
     <div class="card" data-testid="refinery-eval-runs">
-      <h3 class="card-title">Evaluation runs</h3>
+      <h3 class="card-title">{$t('refinery.evaluationRuns')}</h3>
       {#if evalRuns.length === 0}
-        <p class="muted">No eval runs yet — run the gold eval to populate this.</p>
+        <p class="muted">{$t('refinery.noEvalRuns')}</p>
       {:else}
         <table class="metrics-table">
           <thead>
-            <tr><th>Model</th><th>When</th><th>N</th><th>WER</th><th>CER</th></tr>
+            <tr
+              ><th>{$t('refinery.model')}</th><th>{$t('refinery.when')}</th><th>N</th><th>WER</th
+              ><th>CER</th></tr
+            >
           </thead>
           <tbody>
             {#each evalRuns as run (run.id)}
               <tr>
                 <td><bdi>{run.modelId}</bdi></td>
                 <td><bdi>{run.runAt}</bdi></td>
-                <td>{run.numSegs}</td>
-                <td>{metric(run.wer, run.numSegs)}</td>
-                <td>{metric(run.cer, run.numSegs)}</td>
+                <td><bdi dir="ltr">{run.numSegs}</bdi></td>
+                <td><bdi dir="ltr">{metric(run.wer, run.numSegs)}</bdi></td>
+                <td><bdi dir="ltr">{metric(run.cer, run.numSegs)}</bdi></td>
               </tr>
             {/each}
           </tbody>
@@ -269,20 +229,28 @@
 
     <!-- Escalation-rate trend -->
     <div class="card" data-testid="refinery-escalation-trend">
-      <h3 class="card-title">Escalation rate trend</h3>
+      <h3 class="card-title">{$t('refinery.escalationTrend')}</h3>
       {#if trend.length === 0}
-        <p class="muted">No escalation history yet.</p>
+        <p class="muted">{$t('refinery.noEscalationHistory')}</p>
       {:else}
         <ul class="trend-list">
           {#each trend as point (point.date)}
-            <li class="trend-row">
-              <span class="trend-date"><bdi>{point.date}</bdi></span>
+            <li
+              class="trend-row"
+              aria-label={$t('refinery.trendPoint', {
+                date: isolate(point.date),
+                rate: isolate(pct(point.escalationRate)),
+                escalated: isolate(point.escalated),
+                total: isolate(point.total),
+              })}
+            >
+              <span class="trend-date" aria-hidden="true"><bdi dir="ltr">{point.date}</bdi></span>
               <span class="trend-bar-wrap" aria-hidden="true">
                 <span class="trend-bar" style="width:{Math.min(100, point.escalationRate * 100)}%"
                 ></span>
               </span>
-              <span class="trend-val"
-                >{pct(point.escalationRate)} ({point.escalated}/{point.total})</span
+              <bdi class="trend-val" dir="ltr" aria-hidden="true"
+                >{pct(point.escalationRate)} ({point.escalated}/{point.total})</bdi
               >
             </li>
           {/each}
@@ -387,10 +355,6 @@
   .trend-val {
     width: 120px;
     text-align: right;
-  }
-  .eval-input {
-    width: 100%;
-    margin-bottom: 8px;
   }
   .action-row {
     display: flex;

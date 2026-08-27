@@ -5,6 +5,11 @@ ROADMAP_TO_10 / TRUE_10_REMAINING for sequencing; it does not change any canon i
 needs the owner, it says OWNER. Where a step would touch the model lock, it is explicitly
 promotion-by-owner, never automatic.
 
+> [!WARNING] Historical snapshot
+> This document predates the current model-attestation contract. Its duplication-weighted 7.03% CER
+> result is historical evidence on a different normalization/sampling basis, not current champion or
+> release proof. The current README/EVAL attestation is authoritative.
+
 ## Where we actually are (measured today)
 
 | Fact | Value |
@@ -14,7 +19,7 @@ promotion-by-owner, never automatic.
 | Labeled-data skew | **94.7 %** of labeled duration from ONE recording (Lamofull2) |
 | Distinct labeled speakers | 8 |
 | Frozen gold holdout | 348 clips (`gold_segments`) + FLEURS ckb |
-| Champion | OmniASR-7B + owner LoRA, **7.03 % CER** (Sorani SOTA), serving |
+| Historical champion snapshot | OmniASR-7B + owner LoRA, **7.03% CER** on the historical duplication-weighted FLEURS basis; not a current SOTA or release claim |
 | Cleaned corpus staged | **2,676 files / ~550 h**, provenance-declared (v54) |
 | Model registry | `adapters` / `dataset_runs` tables exist, **0 rows — not yet authoritative** |
 | Sweep | 39 gates; one red: `spot-check-pool` 21/24 (OWNER: 3 adjudications) |

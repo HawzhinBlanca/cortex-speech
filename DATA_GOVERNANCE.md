@@ -106,9 +106,9 @@ work. Re-read on every queue fetch, so the owner can change it without restartin
 whose dialect currently has no clips is told exactly that, rather than shown "all clips reviewed".
 
 Why this is an integrity control and not a convenience: someone judging a dialect they do not speak
-produces confident WRONG verdicts, and downstream those are indistinguishable from good ones. Roza,
-Alle and Sabat had already made 13 decisions on Hawleri clips purely because the queue held nothing
-else — those should be re-reviewed.
+produces confident WRONG verdicts, and downstream those are indistinguishable from good ones. Three
+Sorani-only reviewers had already made 13 decisions on Hawleri clips purely because the queue held
+nothing else — those should be re-reviewed.
 
 **Still open:** the EXPORT does not yet emit a dialect field, so a dataset exported today carries no
 dialect column. It does not carry a wrong one. Same map, applied at export, is the remaining step.

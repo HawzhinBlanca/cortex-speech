@@ -11,9 +11,17 @@ export default defineConfig({
     include: ['src/**/*.{test,spec}.{ts,js}', 'tests/**/*.{test,spec}.{ts,js}'],
     coverage: {
       provider: 'v8',
-      reporter: ['text', 'json', 'html'],
+      reporter: ['text', 'json-summary', 'json', 'html'],
       include: ['src/**/*.{ts,svelte}'],
       exclude: ['src/**/*.d.ts', 'src/**/*.test.*'],
+      // Product-certification contract. Keep this fail-closed even while the tree is red: an
+      // uncovered workstation cannot inherit a green verdict from a large passing test count.
+      thresholds: {
+        statements: 85,
+        branches: 80,
+        functions: 80,
+        lines: 85,
+      },
     },
   },
   resolve: {

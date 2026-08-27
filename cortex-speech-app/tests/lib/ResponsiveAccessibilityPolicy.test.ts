@@ -16,12 +16,18 @@ describe('320 CSS-pixel reflow policy', () => {
   });
 
   it('stacks the review queue rail above the focus card without clipping narrow content', () => {
-    const source = readFileSync(resolve(root, 'src/lib/ReviewInbox.svelte'), 'utf8');
-    const narrow = source.slice(source.indexOf('@media (max-width: 480px)'));
-    expect(narrow).toMatch(/\.inbox-body\s*{[^}]*flex-direction:\s*column;/s);
-    expect(narrow).toMatch(/\.queue-rail\s*{[^}]*width:\s*100%;/s);
-    expect(narrow).toMatch(/\.rail-list\s*{[^}]*overflow-x:\s*auto;/s);
-    expect(narrow).toMatch(
+    const owner = readFileSync(resolve(root, 'src/lib/ReviewInbox.svelte'), 'utf8');
+    const rail = readFileSync(resolve(root, 'src/lib/ReviewInboxQueueRail.svelte'), 'utf8');
+    const header = readFileSync(resolve(root, 'src/lib/ReviewInboxHeader.svelte'), 'utf8');
+    expect(owner).toContain("import ReviewInboxQueueRail from './ReviewInboxQueueRail.svelte'");
+    expect(owner).toContain('<ReviewInboxQueueRail');
+    expect(owner.slice(owner.indexOf('@media (max-width: 480px)'))).toMatch(
+      /\.inbox-body\s*{[^}]*flex-direction:\s*column;/s,
+    );
+    const narrowRail = rail.slice(rail.indexOf('@media (max-width: 480px)'));
+    expect(narrowRail).toMatch(/\.queue-rail\s*{[^}]*width:\s*100%;/s);
+    expect(narrowRail).toMatch(/\.rail-list\s*{[^}]*overflow-x:\s*auto;/s);
+    expect(header.slice(header.indexOf('@media (max-width: 480px)'))).toMatch(
       /\.autonomy-dial\s*{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/s,
     );
   });

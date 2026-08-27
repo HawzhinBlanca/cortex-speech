@@ -1,5 +1,8 @@
 <script lang="ts">
+  import ChartNoAxesColumnIncreasing from '@lucide/svelte/icons/chart-no-axes-column-increasing';
+  import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import { onMount } from 'svelte';
+  import { chooseDirectory, chooseFile } from './fileDialogs';
   import * as api from './commands';
   import type { DatasetStats, SpeechSegment } from './types';
   import { segments } from './stores/segmentStore';
@@ -12,6 +15,7 @@
   } from './segmentQuality';
   import { t } from './i18n';
   import { isTauriRuntime } from './runtime';
+  import { formatPublicErrorReference } from './errorText';
 
   // External review 2026-08-06, P2.3: "every blocker should have a deterministic next action".
   // `pendingReview` has declared `action: 'review'` since it was written, and the template only ever
@@ -245,8 +249,8 @@
         console.error('Failed to load eval runs', err);
       }
     } catch (e) {
-      errorMessage = String(e);
-      notifications.error($t('stats.failed'), { detail: String(e) });
+      errorMessage = formatPublicErrorReference(e) ?? $t('errors.unknown');
+      notifications.error($t('stats.failed'), { cause: e });
     } finally {
       loading = false;
     }
@@ -259,9 +263,8 @@
     if (!tauriAvailable || relinking) return;
     relinking = true;
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const dir = await open({ directory: true, multiple: false });
-      if (typeof dir !== 'string') return;
+      const dir = await chooseDirectory();
+      if (!dir) return;
       const result = await api.relinkAudio(dir);
       notifications.success(
         $t('stats.relinkDone')
@@ -270,7 +273,7 @@
       );
       await fetchStats();
     } catch (e) {
-      notifications.error($t('stats.relinkFailed'), { detail: String(e) });
+      notifications.error($t('stats.relinkFailed'), { cause: e });
     } finally {
       relinking = false;
     }
@@ -289,12 +292,11 @@
     if (!tauriAvailable || toolBusy) return null;
     toolBusy = id;
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const dir = await open({ directory: true, multiple: false });
-      if (typeof dir !== 'string') return null;
+      const dir = await chooseDirectory();
+      if (!dir) return null;
       return await run(dir);
     } catch (e) {
-      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      notifications.error($t('stats.toolFailed'), { cause: e });
       return null;
     } finally {
       toolBusy = null;
@@ -351,7 +353,7 @@
       const created = await api.importVerifiedSegmentsAsGold();
       notifications.success($t('stats.importGoldDone').replace('{n}', String(created)));
     } catch (e) {
-      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      notifications.error($t('stats.toolFailed'), { cause: e });
     } finally {
       toolBusy = null;
     }
@@ -367,7 +369,7 @@
       await api.dbVacuum();
       notifications.success($t('stats.compactDone'));
     } catch (e) {
-      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      notifications.error($t('stats.toolFailed'), { cause: e });
     } finally {
       toolBusy = null;
     }
@@ -388,7 +390,7 @@
     try {
       snapshots = await api.listDbSnapshots();
     } catch (e) {
-      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      notifications.error($t('stats.toolFailed'), { cause: e });
     } finally {
       toolBusy = null;
     }
@@ -406,7 +408,7 @@
       // Full reload: the restored DB invalidates every in-memory store.
       window.location.reload();
     } catch (e) {
-      notifications.error($t('stats.restoreFailed'), { detail: String(e) });
+      notifications.error($t('stats.restoreFailed'), { cause: e });
       toolBusy = null;
     }
   }
@@ -418,16 +420,13 @@
     if (!tauriAvailable || toolBusy) return;
     let src: string;
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const picked = await open({
-        directory: false,
-        multiple: false,
+      const picked = await chooseFile({
         filters: [{ name: 'Cortex backup', extensions: ['db'] }],
       });
-      if (typeof picked !== 'string') return;
+      if (!picked) return;
       src = picked;
     } catch (e) {
-      notifications.error($t('stats.toolFailed'), { detail: String(e) });
+      notifications.error($t('stats.toolFailed'), { cause: e });
       return;
     }
     if (!window.confirm($t('stats.restoreFileConfirm'))) return;
@@ -436,22 +435,7 @@
       await api.dbRestore(src);
       window.location.reload();
     } catch (e) {
-      notifications.error($t('stats.restoreFailed'), { detail: String(e) });
-      toolBusy = null;
-    }
-  }
-
-  // P3.4: full-SHA integrity check of the bundled fine-tuned model (a few seconds — hashes 970 MB).
-  // Surfaces the on-demand backend guard so the owner can confirm the champion is intact/uncorrupted.
-  async function verifyModelIntegrity() {
-    if (!tauriAvailable || toolBusy) return;
-    toolBusy = 'verify';
-    try {
-      const message = await api.verifyFinetunedModelIntegrity();
-      notifications.success($t('stats.verifyModelOk'), { detail: message });
-    } catch (e) {
-      notifications.error($t('stats.verifyModelFailed'), { detail: String(e) });
-    } finally {
+      notifications.error($t('stats.restoreFailed'), { cause: e });
       toolBusy = null;
     }
   }
@@ -932,25 +916,27 @@
                   <div class="text-lg font-bold text-cortex-200">
                     {Number.isFinite(cert.threshold) ? cert.threshold.toFixed(3) : '—'}
                   </div>
-                  <div class="text-[9px] text-cortex-400">Decision Threshold (τ)</div>
+                  <div class="text-[9px] text-cortex-400">
+                    {$t('stats.decisionThreshold')}
+                  </div>
                 </div>
               </div>
 
               <div class="text-[10px] text-cortex-400 space-y-1">
                 <div class="flex justify-between">
-                  <span>Target Error Bound (CER):</span>
+                  <span>{$t('stats.targetErrorBound')}</span>
                   <span class="font-semibold text-cortex-200"
                     >{(cert.targetError * 100).toFixed(0)}%</span
                   >
                 </div>
                 <div class="flex justify-between">
-                  <span>Confidence Level:</span>
+                  <span>{$t('stats.confidenceLevel')}</span>
                   <span class="font-semibold text-cortex-200"
                     >{(cert.confidenceLevel * 100).toFixed(0)}%</span
                   >
                 </div>
                 <div class="flex justify-between">
-                  <span>Expected Error Bound:</span>
+                  <span>{$t('stats.expectedErrorBound')}</span>
                   {#if cert.isCalibrated}
                     <span class="font-semibold text-emerald-400"
                       >{(cert.expectedErrorBound * 100).toFixed(1)}%</span
@@ -960,8 +946,8 @@
                      not a measured/achieved bound — never show it in success-green. -->
                     <span
                       class="font-semibold text-amber-400/90"
-                      title="Uncalibrated — this is the requested target, not a measured bound"
-                      >n/a (uncalibrated)</span
+                      title={$t('stats.uncalibratedTargetTitle')}
+                      >{$t('stats.uncalibratedValue')}</span
                     >
                   {/if}
                 </div>
@@ -971,9 +957,8 @@
                 <!-- The reason nothing certified is that NOTHING HAS A CONFIDENCE, not that too few clips are
                  verified. Saying "verify at least 10 segments" here sends the owner to do work that cannot
                  help: measured 2026-08-04, his library has 67 verified clips and 0/144 carry a confidence
-                 or a ctc_score, because the cloud engine returns none (pipeline.rs: "Scribe returns no
-                 per-segment confidence"). Naming the real cause is the difference between an honest empty
-                 state and a wild goose chase. -->
+                 or a ctc_score. Legacy hypotheses may legitimately lack posterior confidence; naming the real
+                 cause is the difference between an honest empty state and a wild goose chase. -->
                 <p
                   class="text-[9px] text-amber-400/90 leading-tight"
                   data-testid="conformal-no-confidence"
@@ -982,8 +967,7 @@
                 </p>
               {:else if !cert.isCalibrated}
                 <p class="text-[9px] text-amber-400/90 leading-tight">
-                  ⚠️ Uncalibrated fallback. Verify at least 10 segments to enable statistical risk
-                  bounds.
+                  {$t('stats.conformalUncalibrated')}
                 </p>
               {/if}
 
@@ -1180,15 +1164,6 @@
               <button
                 type="button"
                 class="btn btn-secondary !text-xs !justify-start"
-                data-testid="verify-model-btn"
-                disabled={toolBusy !== null}
-                onclick={verifyModelIntegrity}
-              >
-                {toolBusy === 'verify' ? $t('stats.toolWorking') : $t('stats.verifyModel')}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs !justify-start"
                 data-testid="backup-db-btn"
                 disabled={toolBusy !== null}
                 onclick={backupToFolder}
@@ -1234,8 +1209,12 @@
                     <div
                       class="flex items-center gap-2 text-xs bg-cortex-800/30 rounded-lg px-2 py-1"
                     >
-                      <span class="text-cortex-300 font-mono flex-1">
-                        {new Date(snap.timestamp * 1000).toLocaleString()}
+                      <span class="text-cortex-300 font-mono flex-1 min-w-0">
+                        <span class="block">{new Date(snap.timestamp * 1000).toLocaleString()}</span
+                        >
+                        <span class="block text-[9px] text-cortex-500 truncate" title={snap.name}>
+                          {snap.name}
+                        </span>
                       </span>
                       <span class="text-cortex-400">
                         {snap.segmentCount === null ? '?' : snap.segmentCount}
@@ -1265,27 +1244,17 @@
     </details>
   {:else if errorMessage}
     <div class="flex flex-col items-center justify-center py-8 text-red-400 space-y-2">
-      <svg class="w-10 h-10 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          stroke-width="1.5"
-          d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-        />
-      </svg>
+      <TriangleAlert class="h-10 w-10 opacity-60" strokeWidth={1.5} aria-hidden="true" />
       <span class="text-sm font-medium">{$t('stats.failed')}</span>
       <p class="text-xs text-red-500/80 max-w-xs text-center break-words">{errorMessage}</p>
     </div>
   {:else}
     <div class="flex flex-col items-center justify-center py-8 text-cortex-500 space-y-2">
-      <svg class="w-10 h-10 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          stroke-width="1.5"
-          d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
-        />
-      </svg>
+      <ChartNoAxesColumnIncreasing
+        class="h-10 w-10 opacity-30"
+        strokeWidth={1.5}
+        aria-hidden="true"
+      />
       <span class="text-sm">{$t('stats.noData')}</span>
       <p class="text-xs text-cortex-600">{$t('stats.loadHint')}</p>
     </div>

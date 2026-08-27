@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && node scripts/check_bundle_budget.mjs",
+    "build:vite": "vite build",
+    "check:bundle-budget": "node scripts/check_bundle_budget.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
@@ -28,14 +30,15 @@
     "test:real-audio:user": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-real-data.ps1 -SkipUnitTests -UserPodcastTest",
     "test:real-audio:integration": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-real-data.ps1 -Integration",
     "test:real-audio:integration:mp4": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-real-data.ps1 -Integration -Mp4Only",
-    "lint": "eslint src/",
-    "lint:fix": "eslint src/ --fix",
+    "lint": "eslint src/ e2e/ --max-warnings 0",
+    "lint:fix": "eslint src/ e2e/ --fix",
     "typecheck": "svelte-check && tsc --noEmit",
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",
     "prepare": "husky"
   },
   "dependencies": {
+    "@lucide/svelte": "1.34.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0"
   },

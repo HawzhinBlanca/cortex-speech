@@ -1,5 +1,4 @@
 import csv
-import hashlib
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -57,25 +56,40 @@ def write_ljspeech(path: Path, rows: list[dict]) -> None:
             f.write(f"{row['id']}|{text}|{text}\n")
 
 
-def stable_score(row: dict) -> int:
-    value = f"{row['source_audio']}::{row['id']}"
-    return int(hashlib.sha256(value.encode("utf-8")).hexdigest(), 16)
+HELD_OUT_SHARE = 0.10
 
 
 def split_rows(rows: list[dict]) -> dict[str, list[dict]]:
+    """Assign WHOLE source recordings to one split each — no recording on two sides.
+
+    Same law as `src-tauri/src/export.rs::assign_splits` ("No source-recording leakage"): every
+    clip cut from one recording shares its mic, room, prosody and single transcript, so slicing
+    ~5% of each recording into test — which this function used to do — hands the model
+    near-identical acoustic content it was trained on and reports the score as held-out.
+
+    Fewer than three recordings cannot fill three disjoint splits, so the result is TRAIN ONLY
+    with empty `validation`/`test`; `write_dataset_card` says so plainly rather than letting a
+    contaminated eval set be handed off as trusted.
+    """
     by_source: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         by_source[Path(row["source_audio"]).name].append(row)
 
-    splits = {"train": [], "validation": [], "test": []}
-    for _, source_rows in sorted(by_source.items()):
-        ordered = sorted(source_rows, key=stable_score)
-        n = len(ordered)
-        test_n = max(1, round(n * 0.05)) if n >= 20 else 0
-        val_n = max(1, round(n * 0.05)) if n >= 20 else 0
-        splits["test"].extend(ordered[:test_n])
-        splits["validation"].extend(ordered[test_n : test_n + val_n])
-        splits["train"].extend(ordered[test_n + val_n :])
+    splits: dict[str, list[dict]] = {"train": [], "validation": [], "test": []}
+    if len(by_source) < 3:
+        splits["train"] = list(rows)
+    else:
+        seconds = {name: sum(float(r["duration"]) for r in group) for name, group in by_source.items()}
+        # One recording each for test and validation: the two whose duration sits closest to the
+        # held-out target, name as the deterministic tie-break. A duration-proportional greedy fill
+        # needs many recordings to converge — with a handful it hands everything to train and emits
+        # EMPTY val/test (the failure documented in export.rs), so pick explicitly instead.
+        target = sum(seconds.values()) * HELD_OUT_SHARE
+        ranked = sorted(by_source, key=lambda name: (abs(seconds[name] - target), name))
+        splits["test"] = list(by_source[ranked[0]])
+        splits["validation"] = list(by_source[ranked[1]])
+        for name in ranked[2:]:
+            splits["train"].extend(by_source[name])
 
     for key in splits:
         splits[key].sort(key=lambda r: r["id"])
@@ -168,6 +182,17 @@ def write_dataset_card(summary: dict) -> None:
         f"- {name}: {stats.get('clip_count', 0)} clips, {stats.get('total_minutes', 0)} minutes"
         for name, stats in summary["splits"].items()
     )
+    train_only = not summary["splits"]["validation"] and not summary["splits"]["test"]
+    split_note = (
+        "**TRAIN ONLY.** Fewer than three source recordings exist, so there is no way to hold out\n"
+        "audio without putting the same recording on both sides. `validation` and `test` are\n"
+        "deliberately EMPTY — nothing here is an evaluation set, and no score measured on this\n"
+        "data is held-out."
+        if train_only
+        else "Splits are assigned per SOURCE RECORDING: every clip cut from one recording lands in\n"
+        "exactly one split, so no recording appears on two sides (the same rule as the app's\n"
+        "`assign_splits`). Sizes are therefore whole recordings, not exact percentages."
+    )
     text = f"""# Halwest Voice Dataset Card
 
 Speaker: `{SPEAKER_ID}`
@@ -182,6 +207,8 @@ Speaker: `{SPEAKER_ID}`
 - Median clip duration: {trusted['duration_p50']}s
 
 ## Splits
+
+{split_note}
 
 {split_lines}
 
@@ -216,7 +243,9 @@ def update_readme() -> None:
     marker = "## Training Splits And QC"
     addition = """## Training Splits And QC
 
-- `tts_voice_cloning/splits/`: deterministic trusted train/validation/test splits.
+- `tts_voice_cloning/splits/`: deterministic source-recording-disjoint train/validation/test
+  splits (train-only, with empty validation/test, when too few recordings exist to hold any out).
+  See `DATASET_CARD.md` for which case this build produced.
 - `quality_control/`: duration, character-rate, source-coverage, and split summaries.
 - `DATASET_CARD.md`: concise training handoff notes.
 - `review_pages/index.html`: browser pages for trusted transcript review, flagged segment review, and B7876 correction.

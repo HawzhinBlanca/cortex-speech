@@ -29,16 +29,10 @@ pub async fn export_dataset(path: String, format: String, state: State<'_, AppSt
     // otherwise freeze the UI. The DB guard is taken INSIDE the blocking task, never across an await.
     // Bracketed as a durable job so a crash mid-export is reaped as INTERRUPTED at the next startup and
     // the outcome shows up in get_jobs — the op's real work is unchanged.
-    let db = state.db_arc();
+    let store = state.job_store();
     let job_id = uuid::Uuid::new_v4().to_string();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.run_tracked(&job_id, "export_dataset", "EXPORT_FAILED", |d| {
-            crate::export::export_dataset(d, Path::new(&validated_path), &fmt)
-        })
-        .map_err(|e| e.to_string())
-    })
-    .await
+    run_blocking(move || store.export_dataset(&job_id, Path::new(&validated_path), &fmt).map_err(|e| e.to_string()))
+        .await
 }
 
 /// Export a plain, human-facing transcript / subtitle file (txt | srt | vtt) from the library —
@@ -48,12 +42,10 @@ pub async fn export_transcript(path: String, format: String, state: State<'_, Ap
     STRICT_RATE_LIMITER.check("export_transcript")?;
     let validated_path = validate::validate_output_path(&path)?;
     let fmt = crate::transcript_export::TranscriptFormat::from_str_lossy(&format);
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::transcript_export::export_transcript(&db, Path::new(&validated_path), fmt).map_err(|e| e.to_string())
-    })
-    .await
+    let store = state.job_store();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    run_blocking(move || store.export_transcript(&job_id, Path::new(&validated_path), fmt).map_err(|e| e.to_string()))
+        .await
 }
 
 #[tauri::command]
@@ -68,18 +60,19 @@ pub async fn export_dataset_bundle(
     let warning_threshold = warning_threshold.unwrap_or(0);
     let settings = state.lock_settings().clone();
     let model_manager = state.lock_model_manager().clone(); // ModelManager is Clone (a PathBuf)
-    let db = state.db_arc();
+    let store = state.job_store();
+    let job_id = uuid::Uuid::new_v4().to_string();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::export_bundle::export_dataset_bundle(
-            &db,
-            &model_manager,
-            Path::new(&validated_path),
-            &settings,
-            production,
-            warning_threshold,
-        )
-        .map_err(|e| e.to_string())
+        store
+            .export_dataset_bundle(
+                &job_id,
+                &model_manager,
+                Path::new(&validated_path),
+                &settings,
+                production,
+                warning_threshold,
+            )
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -91,14 +84,10 @@ pub async fn export_huggingface_dataset(path: String, state: State<'_, AppState>
     let settings = state.lock_settings().clone();
     // Bracketed as a durable job (same as export_dataset): a crash mid-export is reaped as INTERRUPTED
     // at the next startup and the outcome shows in get_jobs / the activity pill. Work is unchanged.
-    let db = state.db_arc();
+    let store = state.job_store();
     let job_id = uuid::Uuid::new_v4().to_string();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.run_tracked(&job_id, "export_huggingface_dataset", "HF_EXPORT_FAILED", |d| {
-            crate::export::export_huggingface_dataset(d, Path::new(&validated_path), &settings)
-        })
-        .map_err(|e| e.to_string())
+        store.export_huggingface_dataset(&job_id, Path::new(&validated_path), &settings).map_err(|e| e.to_string())
     })
     .await
 }
@@ -106,7 +95,7 @@ pub async fn export_huggingface_dataset(path: String, state: State<'_, AppState>
 #[tauri::command]
 pub async fn export_audio(
     segment_ids: Vec<String>,
-    options: crate::export_audio::AudioExportOptions,
+    mut options: crate::export_audio::AudioExportOptions,
     state: State<'_, AppState>,
 ) -> Result<crate::export_audio::AudioExportResult, String> {
     // Decodes + re-encodes one clip per segment to disk — throttle it like every sibling export
@@ -115,12 +104,10 @@ pub async fn export_audio(
     for id in &segment_ids {
         validate::validate_identifier(id)?;
     }
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::export_audio::export_audio_segments(&db, &segment_ids, &options).map_err(|e| e.to_string())
-    })
-    .await
+    options.output_dir = validate::validate_output_path(&options.output_dir)?;
+    let store = state.job_store();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    run_blocking(move || store.export_audio(&job_id, &segment_ids, &options).map_err(|e| e.to_string())).await
 }
 
 /// M2.7 / P1.6: export the gold set as a portable eval set (manifest.jsonl + 16 kHz WAV clips) under
@@ -138,12 +125,9 @@ pub async fn export_gold_eval_set(
     // (what this had) left that open. The dir comes from an OS folder picker in the real flow, so it
     // always exists → validate_output_path's parent-must-exist requirement never rejects a legit run.
     let validated = validate::validate_output_path(&out_dir)?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::eval::export_gold_eval_set(&db, std::path::Path::new(&validated)).map_err(|e| e.to_string())
-    })
-    .await
+    let store = state.job_store();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    run_blocking(move || store.export_gold_eval_set(&job_id, Path::new(&validated)).map_err(|e| e.to_string())).await
 }
 
 /// M5.1 / P5.1: export a fine-tune training pack (trainer manifest + 16 kHz clips) from human-verified
@@ -160,11 +144,10 @@ pub async fn export_finetune_pack(
     let validated = validate::validate_output_path(&out_dir)?;
     // P5.5: every pack export appends its provenance line to the durable corpus ledger.
     let ledger = state.lock_data_dir().clone().map(|d| d.join("corpus_ledger.jsonl"));
-    let db = state.db_arc();
+    let store = state.job_store();
+    let job_id = uuid::Uuid::new_v4().to_string();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::eval::export_finetune_pack(&db, std::path::Path::new(&validated), ledger.as_deref())
-            .map_err(|e| e.to_string())
+        store.export_finetune_pack(&job_id, Path::new(&validated), ledger.as_deref()).map_err(|e| e.to_string())
     })
     .await
 }

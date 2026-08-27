@@ -1,10 +1,16 @@
 from pathlib import Path
 
+from _db_policy_util import database_surface
+
+from _pipeline_policy_util import pipeline_surface
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def read(path: str) -> str:
+    if path == "src-tauri/src/db.rs":
+        return database_surface(ROOT / "src-tauri" / "src")
     return (ROOT / path).read_text(encoding="utf-8")
 
 
@@ -29,9 +35,8 @@ def main() -> None:
     learning = read("src-tauri/src/jury/learning.rs")
     integration = read("src-tauri/src/integration_runner.rs")
     runs = read("src-tauri/src/runs.rs")
-    # pipeline.rs's test module was split into pipeline_tests.rs (#[path]); scan both so a moved
-    # regression-test assertion still resolves (else this gate reads it as "missing").
-    pipeline = read("src-tauri/src/pipeline.rs")
+    # Scan the shipped composition root, extracted implementation modules and the #[path] tests.
+    pipeline = pipeline_surface(ROOT / "src-tauri" / "src")
     _pt = ROOT / "src-tauri" / "src" / "pipeline_tests.rs"
     if _pt.is_file():
         pipeline += "\n" + _pt.read_text(encoding="utf-8")
@@ -45,7 +50,8 @@ def main() -> None:
     migrations = read("src-tauri/src/migrations/mod.rs")
     lib_rs = read("src-tauri/src/lib.rs")
     commands_ts = read("src/lib/commands.ts")
-    app = read("src/App.svelte")
+    app = read("src/Workstation.svelte")
+    status_bar = read("src/lib/StatusBar.svelte")
     agent_report_panel = read("src/lib/AgentReportPanel.svelte")
     settings_store = read("src/lib/stores/settingsStore.ts")
     events = read("src/lib/events.ts")
@@ -70,7 +76,17 @@ def main() -> None:
     assert "agent_import_reports" in migrations, "agent import reports migration is required"
     assert "agent_stage_events" in migrations, "agent stage event persistence migration is required"
     assert "source_reference_models" in settings, "settings must expose source reference model list"
-    assert "gemini-2.5-flash" in settings, "default source references should include a second Gemini model"
+    settings_production = settings.split("#[cfg(test)]", 1)[0]
+    assert 'pub const ADVISORY_CLOUD_MODEL: &str = "gemini-2.5-pro";' in settings_production, (
+        "the one owner-approved cloud advisor must remain Gemini 2.5 Pro"
+    )
+    assert "fn default_source_reference_models() -> Vec<String>" in settings_production
+    assert "vec![ADVISORY_CLOUD_MODEL.to_string()]" in settings_production, (
+        "source-reference defaults must be the canonical singleton, not a second/fast model"
+    )
+    assert '"gemini-2.5-flash"' not in settings_production, (
+        "Gemini Flash must not re-enter production defaults or runtime policy"
+    )
     assert "sourceReferenceModels" in settings_store, "frontend settings must expose source reference model list"
     assert "get_latest_source_transcript_for_audio" in db, "jury must be able to reuse latest source reference"
     assert "get_source_transcripts_for_audio" in db, "jury must score against all stored source references"
@@ -111,8 +127,8 @@ def main() -> None:
     assert "configured_source_reference_failure_is_fatal_before_chunking" in pipeline, (
         "source-reference fail-closed behavior needs a Rust regression"
     )
-    assert "partial_source_reference_failure_is_fatal_before_chunking" in pipeline, (
-        "partial source-reference failures must not silently downgrade multi-reference evidence"
+    assert "stale_source_reference_failure_is_fatal_before_chunking" in pipeline, (
+        "stale canonical source-reference evidence must fail before chunking"
     )
     assert "refusing to continue with incomplete source-reference evidence" in pipeline, (
         "partial source-reference failures must be explicit before chunking"
@@ -124,8 +140,18 @@ def main() -> None:
         "configured source-reference failures must not be logged and ignored"
     )
     assert "run_primary_wsl_pass_for_import" in pipeline, "WSL 7B imports must attempt the primary ASR pass before jury"
-    assert "self.run_primary_wsl_pass_for_import(db, &mut persisted, cancel)?" in pipeline, (
-        "import must run the WSL 7B primary pass immediately after segment persistence"
+    champion_import_call = "self.run_primary_wsl_pass_for_import(&mut prepared, cancel)?"
+    assert pipeline.count(champion_import_call) == 2, (
+        "streaming and non-streaming imports must finish the WSL 7B primary pass in memory before publication"
+    )
+    champion_publish_call = (
+        "import_writes.publish_champion_segments(&prepared, deployment_sha256, Some(&identity))?"
+    )
+    assert pipeline.count(champion_publish_call) == 2, (
+        "streaming and non-streaming imports must atomically publish only fully champion-drafted segments"
+    )
+    assert pipeline.index(champion_import_call) < pipeline.index(champion_publish_call), (
+        "champion inference must precede the first canonical file publication"
     )
     assert "if !self.should_use_wsl_primary_asr() || segments.is_empty()" in pipeline, (
         "the WSL pass must be inert after an unconfigured champion has already been refused by preflight"
@@ -133,30 +159,47 @@ def main() -> None:
     assert "populate_wsl_hypothesis_if_configured" in pipeline, (
         "explicit non-champion experiments must retain their optional WSL hypothesis helper"
     )
-    assert 'insert_hypothesis_checked(db, segment_id, "omniasr-wsl-7b"' in pipeline, (
+    # Provenance is no longer a hardcoded string: the champion is content-addressed, so the helper
+    # binds the hypothesis to the REGISTRY champion identity and REFUSES a reply that does not match
+    # it. Strictly stronger than the old literal, which could not tell two deployments apart.
+    assert "crate::registry::champion_identity(db, crate::deployment::OMNIASR_7B_FAMILY)" in pipeline, (
         "the explicit optional WSL hypothesis helper must preserve provenance"
     )
-    assert "self.run_wsl_segment_transcript(segment_id" in pipeline, (
-        # Robust prefix: the call now also takes a cancel arg (None for the hypothesis pass). The
-        # invariant is that the pass uses the real external provider, not the exact argument list.
+    assert "result.model_version_id != expected.model_version_id" in pipeline, (
+        "the helper must REFUSE a reply whose producing identity is not the registry champion, or a "
+        "rotated-out model's draft would be stored as the champion's"
+    )
+    assert "self.run_wsl_segment_transcript(&seg.audio_path" in pipeline, (
+        # Robust prefix: the transport is now direct (path + offsets), so the call passes the row's
+        # audio path rather than a bare segment id. The invariant is unchanged — the pass uses the
+        # real external provider, not the exact argument list.
         "the explicit optional WSL hypothesis helper must use the real external provider"
     )
     assert "should_use_wsl_primary_asr" in pipeline, (
         "WSL 7B primary routing must require its configured client"
     )
-    assert "external_asr_script_path().is_some()" in pipeline, (
+    # The configured path is now one INPUT to client resolution rather than the whole answer: a client
+    # bundled beside the exe also counts, which is what makes an installed build work with no env var.
+    # The invariant is unchanged — WSL routing still requires a RESOLVABLE client.
+    assert "resolve_wsl_7b_client(self.settings.external_asr_script_path()).is_some()" in pipeline, (
         "configured-client detection is missing from the WSL route"
     )
     assert "wsl7b_primary_unresolved" in pipeline, (
         "an unconfigured champion needs a shared fail-closed guard"
     )
-    assert "wsl_without_script_preserves_champion_identity_and_never_falls_back" in pipeline, (
+    # Renamed with the bundled-client work: a missing CONFIGURED script is no longer fatal, because a
+    # client bundled beside the exe resolves instead — but it still must never fall back to a local
+    # engine. Same guarantee, wider resolution. (pipeline_tests.rs:451)
+    assert "wsl_without_explicit_script_uses_bundled_champion_and_never_falls_back" in pipeline, (
         "missing WSL script must preserve champion identity and never become a local fallback"
     )
     assert "public_preflight_fails_immediately_when_default_champion_is_unconfigured" in pipeline, (
         "the unconfigured factory champion needs an immediate preflight refusal regression"
     )
-    assert "wsl_primary_import_pass_is_inert_after_unconfigured_champion_preflight_refusal" in pipeline, (
+    # Renamed with the bundled-client work. Same scenario and same invariant: the pass runs after a
+    # refused preflight against a row holding a "pre-existing transcript" and must not mutate it
+    # (pipeline_tests.rs:656, segment id "preflight-refused").
+    assert "wsl_primary_import_pass_never_silently_skips_the_bundled_champion" in pipeline, (
         "the later WSL pass must not mutate rows after the fail-closed preflight path"
     )
     assert "self.settings.asr_model_size == crate::settings::AsrModelSize::WSL7B" in pipeline, (
@@ -165,8 +208,72 @@ def main() -> None:
     assert "parse_wsl_segment_result" in pipeline, (
         "WSL 7B stdout parsing must be centralized and regression-tested"
     )
-    assert "WSL 7B primary ASR unavailable before jury" in pipeline, (
-        "WSL 7B failures must be explicit before jury adjudication"
+    assert "WSL 7B primary ASR unavailable before publication" in pipeline, (
+        "WSL 7B failures must be explicit before canonical publication or jury adjudication"
+    )
+    # 2026-08-20 external review — the champion pipeline's crash/consistency contract:
+    assert "import HALTED at" in pipeline, (
+        "directory import must HALT on the first real failure (owner rule 2026-08-11), never tally and continue"
+    )
+    assert "halted before this file's {segment_count} segment(s) were published" in pipeline, (
+        "an exhausted-empty champion result must halt before publication, never store unresolved rows in a 'successful' import"
+    )
+    assert "resume_segment_has_authoritative_transcript" in pipeline, (
+        "resume must prove complete human/current-champion transcript authority from the rows; rows-exist is not done"
+    )
+    assert "resume_should_skip_file(resume_completed.is_some(), has_authoritative_segments)" in pipeline, (
+        "the resume journal must remain a hint and may skip only rows that independently prove transcript authority"
+    )
+    assert "resume_authority_rejects_placeholder_wrong_model_cloud_and_blank_drafts" in pipeline, (
+        "placeholder, wrong-model, cloud, and blank drafts need an adversarial resume-authority regression"
+    )
+    assert pipeline.count("committed_by_pipeline: commit_champion") == 1, (
+        "the champion result must report the exact conditional commit owner"
+    )
+    compact_pipeline = " ".join(pipeline.split())
+    bound_commit_call = (
+        "self.transcribe_with_champion_commit( Some(&source.snapshot.segment.id), "
+        "&source.snapshot.segment.audio_path, source.snapshot.segment.alignment_json.as_deref(), "
+        "cancel, true, Some(&source.snapshot), )"
+    )
+    assert bound_commit_call in compact_pipeline, (
+        "normal re-transcription must commit only through the immutable id/path/span/content source snapshot"
+    )
+    import_draft_call = (
+        "self.transcribe_with_champion_commit( Some(segment_id), audio_path, alignment_json, cancel, false, None, )"
+    )
+    assert import_draft_call in compact_pipeline, (
+        "import drafting must explicitly disable per-segment publication and carry no false source authority"
+    )
+    assert "if commit_champion && expected_source.is_none()" in pipeline, (
+        "the shared transcription primitive must reject every commit that lacks immutable source authority"
+    )
+    assert "E_TRANSCRIPTION_SOURCE_UNBOUND" in pipeline, (
+        "an unbound transcription commit needs a stable fail-closed error"
+    )
+    assert ".commit_bound_champion_transcript_if_unreviewed(" in pipeline, (
+        "the immediate champion writer must revalidate the bound source snapshot inside its transaction"
+    )
+    assert "expected_source.ok_or_else" in pipeline, (
+        "the final commit call must not synthesize or omit source authority"
+    )
+    assert "pipeline.bind_existing_transcription_source_cached(" in commands, (
+        "batch transcription must bind each segment to the current database/audio snapshot before inference"
+    )
+    assert "pipeline.transcribe_bound(&source, Some(cancel.as_atomic()))" in commands, (
+        "batch transcription must pass only the bound source into the committing pipeline path"
+    )
+    assert ".bind_existing_transcription_source(id, Some(&audio_path), alignment_json.as_deref())" in commands, (
+        "single transcription must refuse caller id/path substitution by binding server source truth"
+    )
+    assert "pipeline.transcribe_bound(&source, None)" in commands, (
+        "single transcription must use the same bound commit path as batch transcription"
+    )
+    assert "Ok(draft) if draft.committed_by_pipeline =>" in commands, (
+        "batch_transcribe must not re-write a draft the pipeline already committed (one inference, one commit, one owner)"
+    )
+    assert "run_wsl_segment_transcript_direct" in pipeline, (
+        "the champion transport is the direct Rust->server protocol, not a per-segment WSL subprocess with a DB copy"
     )
     assert "hypothesis_coverage_guard" in commands, (
         "jury must fail closed when fewer than two chunk-level model hypotheses are available"
@@ -259,8 +366,8 @@ def main() -> None:
     assert "AgentStageEvent" in commands_ts, "frontend must type persisted agent stage events"
     assert "agentRunId" in commands_ts, "frontend must type the report-to-stage run id"
     assert "AgentReportPanel" in app, "app must render the latest agent import report"
-    assert "agentPipelineStages" in app, "app must render live agent pipeline stages"
-    assert "data-testid=\"agent-pipeline-timeline\"" in app, "live agent timeline needs a stable UI hook"
+    assert "agentPipelineStages" in status_bar, "status bar must render live agent pipeline stages"
+    assert "data-testid=\"agent-pipeline-timeline\"" in status_bar, "live agent timeline needs a stable UI hook"
     assert "loadLatestAgentReport" in app, "app must refresh the latest agent import report"
     assert "loadLatestAgentStageEvents" in app, "app must refresh persisted agent stage events"
     assert "latestAgentReport?.agentRunId" in app, "app must load the stage log for the latest report run id"
@@ -398,7 +505,7 @@ def main() -> None:
         "learning_manifest.json",
         "learning_preferences.jsonl",
         "write_learning_artifacts",
-        "build_dpo_dataset(db)",
+        "build_dpo_dataset_for_segment_ids(db, &selected_segment_ids)",
         "draft_export_includes_self_learning_preference_artifacts",
         "agent_provenance.json",
         "long_file_dossiers.json",
@@ -418,7 +525,8 @@ def main() -> None:
         "list_agent_import_reports(db, Some(agent_import_report_limit))",
         "draft_export_preserves_agent_import_provenance",
         "bundle_path_label",
-        "sanitize_bundle_path_fields",
+        "sanitize_bundle_public_fields",
+        "sensitive_reviewer_identity_key",
         "sanitized_bundle_value",
         '"audioPath" | "transcriptPath" | "originalTranscriptPath" | "file"',
         '"audioPaths"',

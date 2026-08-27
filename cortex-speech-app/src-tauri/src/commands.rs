@@ -11,14 +11,31 @@
 
 use crate::aligner;
 use crate::audio;
-use crate::db::{SegmentsPage, SpeechSegment};
 use crate::health;
 use crate::history::Command;
 use crate::models;
 use crate::pipeline::PipelineEvent;
 use crate::quality;
+#[cfg(test)]
+use crate::recovery::{
+    apply_snapshot_pilot_policy, inspect_snapshot_pilot_policy, prepare_named_restore_artifacts,
+    preserve_live_asr_runtime_controls, restore_required_snapshot_state_atomic, take_mandatory_pre_restore_snapshot,
+    write_named_restore_pending, NamedRestorePending, SnapshotPilotPolicyRestore, NAMED_RESTORE_PENDING_SCHEMA,
+};
+use crate::recovery::{
+    clear_review_pilot_restore_pending, install_snapshot_restore_plan, load_named_restore_pending,
+    mark_named_restore_completed, prepare_restore_admission, refuse_bare_restore_during_controlled_pilot,
+};
+pub(crate) use crate::restore_service::recover_interrupted_named_restore_at_startup;
+#[cfg(test)]
+use crate::restore_service::{
+    has_durable_review_activity, recover_interrupted_named_restore_with_admission, require_active_pilot_policy_binding,
+    require_consent_revocation_superset, require_durable_review_history_superset, validate_active_pilot_semantics,
+    validate_playback_receipt_semantics, validate_restore_target_semantics, validate_review_compensation_semantics,
+    validate_review_effect_semantics,
+};
+use crate::restore_service::{prepare_and_restore_named_transaction, restore_with_mandatory_snapshot};
 use crate::settings::{AppSettings, AsrModelSize};
-use crate::stats;
 use crate::throttle::{RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::validation::input as validate;
 use crate::AppState;
@@ -55,6 +72,19 @@ mod infra;
 pub use infra::*;
 mod settings;
 pub use settings::*;
+mod ingest;
+pub use ingest::*;
+#[cfg(test)]
+use ingest::{batch_terminal_halt_cause, parse_batch_concurrency};
+use ingest::{emit_or_log, send_audio_duration_probe_result};
+mod system_ops;
+#[cfg(test)]
+use crate::database_runtime::RestoreAdmission;
+pub use system_ops::*;
+#[cfg(test)]
+use system_ops::{
+    drain_log_lines, segment_awaits_wsl7b, select_wsl_refinement_targets, wsl_log_preview, WSL_LOG_LINE_PREVIEW_CHARS,
+};
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,15 +233,12 @@ fn build_agentic_readiness(
             "blocked",
             "Gemini API key is not loaded in this session, so source-reference transcription would fail before chunking.",
         ));
-    } else if source_reference_models.len() < 2 {
+    } else if source_reference_models.is_empty() {
         checks.push(readiness_check(
             "source_reference",
             "Whole-file source references",
-            "degraded",
-            format!(
-                "Only {} source-reference model is configured; use at least two models for multi-reference agreement.",
-                source_reference_models.len()
-            ),
+            "blocked",
+            "No owner-approved source-reference model is configured.",
         ));
     } else {
         checks.push(readiness_check(
@@ -365,1230 +392,6 @@ pub(crate) fn build_agentic_readiness_snapshot(
     }
 }
 
-#[tauri::command]
-pub async fn open_audio_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    RATE_LIMITER.check("open_audio_file")?;
-    use tauri_plugin_dialog::DialogExt;
-    // MUST be async + non-blocking: this command runs on the main thread, and blocking_pick_file
-    // there freezes the ENTIRE app UI for as long as the picker is open (confirmed: a second
-    // command hangs while the dialog is up). pick_file schedules the native dialog on the event
-    // loop and delivers the result via a oneshot without ever blocking the main thread.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .add_filter("Audio", &["wav", "mp3", "flac", "m4a", "ogg", "aac", "opus", "mp4", "webm", "wma", "mov"])
-        .pick_file(move |picked| {
-            let _ = tx.send(picked);
-        });
-    let picked = rx.await.map_err(|_| "file dialog closed unexpectedly".to_string())?;
-    Ok(picked.and_then(|p| p.as_path().map(|p| p.to_string_lossy().to_string())))
-}
-
-fn emit_or_log<T>(app: &tauri::AppHandle, event: &str, payload: T)
-where
-    T: serde::Serialize + Clone,
-{
-    if let Err(error) = app.emit(event, payload) {
-        tracing::warn!("Failed to emit {event}: {error}");
-    }
-}
-
-fn send_audio_duration_probe_result(
-    tx: std::sync::mpsc::Sender<crate::error::AppResult<i64>>,
-    result: crate::error::AppResult<i64>,
-) {
-    if tx.send(result).is_err() {
-        tracing::warn!("Audio duration probe worker could not send result; receiver was dropped or timed out");
-    }
-}
-
-struct AgentStageEmission<'a> {
-    stage: &'a str,
-    status: &'a str,
-    file: &'a str,
-    detail: &'a str,
-    current: usize,
-    total: usize,
-}
-
-fn emit_agent_stage_event(app: &tauri::AppHandle, run_id: Option<&str>, source: &str, event: AgentStageEmission<'_>) {
-    if let Some(run_id) = run_id {
-        if let Some(app_state) = app.try_state::<AppState>() {
-            let db = app_state.lock_db();
-            if let Err(error) = crate::runs::record_agent_stage_event(
-                &db,
-                run_id,
-                source,
-                event.stage,
-                event.status,
-                event.file,
-                event.detail,
-                event.current,
-                event.total,
-            ) {
-                tracing::warn!("Failed to persist agent stage event {run_id}/{}: {error}", event.stage);
-            }
-        }
-    }
-
-    emit_or_log(
-        app,
-        "pipeline-agent-stage",
-        serde_json::json!({
-            "stage": event.stage,
-            "status": event.status,
-            "file": event.file,
-            "detail": event.detail,
-            "current": event.current,
-            "total": event.total,
-        }),
-    );
-}
-
-fn emit_pipeline_event(app: &tauri::AppHandle, event: &PipelineEvent, run_id: Option<&str>, source: &str) {
-    match event {
-        PipelineEvent::Started { total } => {
-            emit_or_log(app, "pipeline-started", serde_json::json!({ "total": total }));
-        }
-        PipelineEvent::Phase { phase } => {
-            emit_or_log(app, "pipeline-phase", serde_json::json!({ "phase": phase }));
-        }
-        PipelineEvent::AgentStage { stage, status, file, detail, current, total } => {
-            emit_agent_stage_event(
-                app,
-                run_id,
-                source,
-                AgentStageEmission { stage, status, file, detail, current: *current, total: *total },
-            );
-        }
-        PipelineEvent::Progress { current, total, file, status } => {
-            emit_or_log(
-                app,
-                "pipeline-progress",
-                serde_json::json!({
-                    "current": current, "total": total, "file": file, "status": status
-                }),
-            );
-        }
-        PipelineEvent::Completed { total, succeeded, failed } => {
-            // Use the caller's source label, not a hardcoded "directory" — this same mapper handles
-            // single-file imports (source "file"), where a stray source:"directory" completion would
-            // mislabel the event the UI routes on.
-            let payload = serde_json::json!({
-                "total": total, "succeeded": succeeded, "failed": failed,
-                "source": source,
-            });
-            emit_or_log(app, "pipeline-complete", payload.clone());
-            emit_or_log(app, "import-complete", payload);
-        }
-        PipelineEvent::Error { file, error } => {
-            tracing::warn!("Import error for {file}: {error}");
-            emit_or_log(
-                app,
-                "pipeline-error",
-                serde_json::json!({
-                    "file": file, "error": error
-                }),
-            );
-        }
-    }
-}
-
-fn log_jury_pipeline_failure(context: &str, error: &str) {
-    tracing::error!("Jury pipeline failed after {context}: {error}");
-}
-
-#[tauri::command]
-pub async fn import_directory(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("import_directory")?;
-    use tauri_plugin_dialog::DialogExt;
-    // async + non-blocking folder picker — blocking_pick_folder on this main-thread command froze
-    // the whole UI while the picker was open (same footgun as open_audio_file). State is fetched
-    // AFTER the await so no State borrow is held across it.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_folder(move |picked| {
-        let _ = tx.send(picked);
-    });
-    let dir = rx.await.map_err(|_| "folder dialog closed unexpectedly".to_string())?;
-    let dir_path = match dir.and_then(|p| p.as_path().map(|p| p.to_path_buf())) {
-        Some(p) => p,
-        None => return Err("No directory selected".into()),
-    };
-    validate::validate_file_path(&dir_path.to_string_lossy())?;
-
-    let state = app.state::<AppState>();
-    state.try_start_import()?;
-
-    let cancel = Some(state.start_cancel_token());
-
-    let pipeline = state.lock_pipeline().clone();
-
-    let agent_run_id = uuid::Uuid::new_v4().to_string();
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        struct ImportGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for ImportGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_import();
-                }
-            }
-        }
-        let _guard = ImportGuard { app: app_clone.clone() };
-
-        // Panic-guard the directory worker (same rationale as the single-file path): an unwound
-        // panic must not leave the import UI stuck "processing".
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pipeline.import_directory_with_agent_run_id(&dir_path, cancel, Some(&agent_run_id), None, |event| {
-                emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory");
-            })
-        }));
-        let result = match caught {
-            Ok(r) => r,
-            Err(_) => {
-                Err(crate::error::AppError::Other("Import failed unexpectedly (internal error); see logs.".to_string()))
-            }
-        };
-
-        if let Err(e) = result {
-            let error = e.to_string();
-            tracing::warn!("Import directory failed: {error}");
-            emit_or_log(
-                &app_clone,
-                "pipeline-error",
-                serde_json::json!({
-                    "file": dir_path.to_string_lossy(),
-                    "error": error,
-                }),
-            );
-            let payload = serde_json::json!({
-                "total": 0, "succeeded": 0, "failed": 1, "cancelled": false, "source": "directory"
-            });
-            emit_or_log(&app_clone, "import-complete", payload.clone());
-            emit_or_log(&app_clone, "pipeline-complete", payload);
-        }
-    });
-
-    Ok(serde_json::json!({ "status": "started" }))
-}
-
-/// P3.2: the crashed directory import to resume, if any. Query at STARTUP — when no import is active,
-/// a still-'running' job is a crash.
-#[tauri::command]
-pub fn get_interrupted_import(state: State<'_, AppState>) -> Result<Option<crate::db::ImportJob>, String> {
-    RATE_LIMITER.check("get_interrupted_import")?;
-    let db = state.lock_db();
-    db.find_interrupted_import_job().map_err(|e| e.to_string())
-}
-
-/// P3.2: discard an interrupted import job (the user chose not to resume).
-#[tauri::command]
-pub fn discard_interrupted_import(job_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("discard_interrupted_import")?;
-    validate::validate_identifier(&job_id)?;
-    let db = state.lock_db();
-    db.discard_import_job(&job_id).map_err(|e| e.to_string())
-}
-
-/// P3.2: resume the interrupted directory import — re-run its folder, skipping files already imported
-/// in the crashed run (their segments persisted per-file). Retires the old crashed job so it is not
-/// offered again; the fresh import job now tracks progress.
-#[tauri::command]
-pub fn resume_interrupted_import(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("resume_interrupted_import")?;
-    let job = {
-        let db = state.lock_db();
-        db.find_interrupted_import_job().map_err(|e| e.to_string())?
-    };
-    let Some(job) = job else { return Err("No interrupted import to resume".into()) };
-    let dir_path = std::path::PathBuf::from(&job.dir);
-    if !dir_path.is_dir() {
-        return Err(format!("The import folder no longer exists: {}", job.dir));
-    }
-    let completed: std::collections::HashSet<String> = job.completed_paths.into_iter().collect();
-
-    state.try_start_import()?;
-    {
-        // Retire the crashed job now that we are resuming it; the fresh import job supersedes it.
-        let db = state.lock_db();
-        let _ = db.discard_import_job(&job.id);
-    }
-    let cancel = Some(state.start_cancel_token());
-    let pipeline = state.lock_pipeline().clone();
-    let agent_run_id = uuid::Uuid::new_v4().to_string();
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        struct ImportGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for ImportGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_import();
-                }
-            }
-        }
-        let _guard = ImportGuard { app: app_clone.clone() };
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pipeline.import_directory_with_agent_run_id(
-                &dir_path,
-                cancel,
-                Some(&agent_run_id),
-                Some(&completed),
-                |event| emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "directory"),
-            )
-        }));
-        let result = match caught {
-            Ok(r) => r,
-            Err(_) => {
-                Err(crate::error::AppError::Other("Import failed unexpectedly (internal error); see logs.".to_string()))
-            }
-        };
-        if let Err(e) = result {
-            let error = e.to_string();
-            tracing::warn!("Resume import failed: {error}");
-            emit_or_log(
-                &app_clone,
-                "pipeline-error",
-                serde_json::json!({ "file": dir_path.to_string_lossy(), "error": error }),
-            );
-            let payload = serde_json::json!({ "total": 0, "succeeded": 0, "failed": 1, "cancelled": false, "source": "directory" });
-            emit_or_log(&app_clone, "import-complete", payload.clone());
-            emit_or_log(&app_clone, "pipeline-complete", payload);
-        }
-    });
-    Ok(serde_json::json!({ "status": "started", "resuming": true }))
-}
-
-#[tauri::command]
-pub fn import_audio_file(
-    path: String,
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("import_audio_file")?;
-    let validated = validate::validate_file_path(&path)?;
-    let file_path = Path::new(&validated).to_path_buf();
-
-    state.try_start_import()?;
-
-    // NOTE: do NOT pre-emit pipeline-started/-phase here. The worker emits them via
-    // PipelineEvent::Started/Phase (import_single_file_with_events), exactly like the directory path.
-    // Pre-emitting fired pipeline-started twice -> two stacked "Pipeline started" toasts per open.
-
-    let cancel = Some(state.start_cancel_token());
-
-    let pipeline = state.lock_pipeline().clone();
-
-    let agent_run_id = uuid::Uuid::new_v4().to_string();
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        struct ImportGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for ImportGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_import();
-                }
-            }
-        }
-        let _guard = ImportGuard { app: app_clone.clone() };
-
-        // Guard the decode/VAD/ASR worker against panics (e.g. a pathological tensor inside
-        // onnxruntime/sherpa-onnx). Without this, an unwound panic skips every terminal event
-        // below and leaves the import progress UI stuck "processing" forever.
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pipeline.import_single_file_with_events(&file_path, cancel, Some(&agent_run_id), |event| {
-                // This command OWNS the terminal import-complete/pipeline-complete events: it emits
-                // ready_payload right after segments exist (so the list renders immediately) and
-                // done_payload after the background jury finishes. Drop the pipeline's own terminal
-                // Completed event for the single-file path: emit_pipeline_event's Completed arm
-                // hard-codes source:"directory" and emits import-complete + pipeline-complete —
-                // forwarding it here would fire a SECOND, wrongly-sourced import-complete BEFORE the
-                // jury adjudication block below, producing a spurious "Successfully processed 1 file"
-                // toast, a premature idle/refresh, and an idle→adjudicating→complete flicker that tears
-                // down the pipeline UI (clears the agent stages, flips to idle) before adjudication even
-                // starts. The worker emits its own authoritative source:"file" import-complete +
-                // pipeline-complete after adjudication, so the frontend still gets exactly one of each.
-                // (The directory import path uses a different code path and keeps its Completed.)
-                // Forward every other event unchanged.
-                if matches!(event, PipelineEvent::Completed { .. }) {
-                    return;
-                }
-                emit_pipeline_event(&app_clone, &event, Some(&agent_run_id), "file");
-            })
-        }));
-        let result = match caught {
-            Ok(r) => r,
-            Err(_) => {
-                let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-                emit_or_log(
-                    &app_clone,
-                    "pipeline-error",
-                    serde_json::json!({
-                        "file": fname,
-                        "error": "Import failed unexpectedly (internal error); see logs.",
-                    }),
-                );
-                let payload = serde_json::json!({ "total": 1, "succeeded": 0, "failed": 1, "source": "file" });
-                emit_or_log(&app_clone, "import-complete", payload.clone());
-                emit_or_log(&app_clone, "pipeline-complete", payload);
-                return;
-            }
-        };
-        match result {
-            Ok(segments) => {
-                // This command — NOT the pipeline — runs the single-file post-import jury adjudication,
-                // exactly ONCE, on the background thread below. The pipeline's single-file path
-                // intentionally skips inline adjudication (see pipeline.rs import_single_file_with_events)
-                // so the jury runs here on its OWN WAL connection and never holds the shared DB lock
-                // across ASR — running it in both places would emit a duplicate adjudicating phase, a
-                // contradictory second jury count, a second agent_import_reports row, and double the jury
-                // work (and cloud T2 cost/latency under cloud opt-in). We emit the authoritative
-                // source:"file" import-complete here (the pipeline's terminal Completed event is dropped
-                // in the callback above).
-                let segment_ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
-                let source_paths = vec![file_path.to_string_lossy().to_string()];
-                let post_import_file =
-                    file_path.file_name().and_then(|n| n.to_str()).unwrap_or("post-import jury").to_string();
-                let seg_count = segments.len();
-
-                // Import is complete once VAD has produced segments — signal it NOW so the UI
-                // renders the segment list immediately, then run the heavy, ASR-bearing jury
-                // adjudication on a background thread. (Previously adjudication ran inline holding
-                // the global DB lock across ASR, starving the UI's get_segments so the list never
-                // rendered during import.) Adjudication enriches the segments and emits a refresh.
-                let ready_payload = serde_json::json!({
-                    "total": 1, "succeeded": 1, "failed": 0,
-                    "segmentCount": seg_count, "segmentIds": segment_ids.clone(), "source": "file",
-                });
-                emit_or_log(&app_clone, "import-complete", ready_payload.clone());
-                emit_or_log(&app_clone, "pipeline-complete", ready_payload);
-
-                let app_clone = app_clone.clone();
-                let agent_run_id = agent_run_id.clone();
-                let segment_ids = segment_ids.clone();
-                std::thread::spawn(move || {
-                    // Clones reserved for the panic path; the inner closure consumes the originals.
-                    let panic_app = app_clone.clone();
-                    let panic_run_id = agent_run_id.clone();
-                    let panic_file = post_import_file.clone();
-                    let panic_seg_count = seg_count;
-                    // The jury can call into ASR / onnxruntime; guard against an unwind so a crash here
-                    // leaves the adjudication stage settled (blocked + refresh) rather than stuck
-                    // "running". Import already emitted its terminal events before this thread spawned.
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        emit_or_log(&app_clone, "pipeline-phase", serde_json::json!({ "phase": "adjudicating" }));
-                        let adjudication_detail = format!("Adjudicating {} imported segment(s)", segment_ids.len());
-                        emit_agent_stage_event(
-                            &app_clone,
-                            Some(&agent_run_id),
-                            "file",
-                            AgentStageEmission {
-                                stage: "jury_adjudication",
-                                status: "running",
-                                file: &post_import_file,
-                                detail: &adjudication_detail,
-                                current: 0,
-                                total: segment_ids.len(),
-                            },
-                        );
-                        let adjudication_result = if let Some(app_state) = app_clone.try_state::<AppState>() {
-                            let settings = app_state.lock_settings().clone();
-                            // Snapshot agentic readiness the same way pipeline.rs and check_agentic_readiness do
-                            // (model status + external-provider status -> build_agentic_readiness_snapshot), so the
-                            // background-thread jury report carries an honest readiness state.
-                            let agentic_readiness = {
-                                let model_status = app_state.lock_model_manager().status();
-                                let external_provider = external_provider_status(&settings);
-                                build_agentic_readiness_snapshot(&settings, &model_status, &external_provider)
-                            };
-                            // Adjudication uses its OWN database connection (WAL mode) rather than the
-                            // shared Mutex<Database> guard, so the heavy ASR-bearing jury never starves the
-                            // UI's get_segments (which locks the shared connection) while it runs. WAL lets
-                            // the UI read concurrently while the jury writes verdicts on its own connection.
-                            let jury_conn = app_state
-                                .data_dir
-                                .lock()
-                                .ok()
-                                .and_then(|g| (*g).clone())
-                                .map(|dir| dir.join("cortex-speech.db"))
-                                .and_then(|p| crate::db::Database::open(p.to_string_lossy().as_ref()).ok());
-                            let Some(db) = jury_conn else {
-                                emit_agent_stage_event(
-                                    &app_clone,
-                                    Some(&agent_run_id),
-                                    "file",
-                                    AgentStageEmission {
-                                        stage: "jury_adjudication",
-                                        status: "blocked",
-                                        file: &post_import_file,
-                                        detail: "could not open a private DB connection for adjudication",
-                                        current: 0,
-                                        total: segment_ids.len(),
-                                    },
-                                );
-                                // Still emit the terminal refresh — adjudication is best-effort and the
-                                // import itself already succeeded, so the UI must not hang waiting for a
-                                // completion event that would otherwise never fire on this early return.
-                                let done_payload = serde_json::json!({
-                                    "total": 1,
-                                    "succeeded": 1,
-                                    "failed": 0,
-                                    "segmentCount": seg_count,
-                                    "segmentIds": segment_ids,
-                                    "source": "file",
-                                });
-                                emit_or_log(&app_clone, "import-complete", done_payload.clone());
-                                emit_or_log(&app_clone, "pipeline-complete", done_payload);
-                                return;
-                            };
-                            // R3: this background adjudication thread writes verdicts + the import report on
-                            // its OWN connection (opened above) AFTER import-complete fired — so the import
-                            // fence is already down. Arm the jury writer fence for its lifetime so a restore
-                            // cannot run while it writes into a possibly-just-restored library. (The
-                            // run_jury_pipeline COMMAND guards its path; this direct-core caller needs its own.)
-                            let _jury_writer = BgDbWriterGuard::new();
-                            let mut report_options = crate::runs::AgentImportReportOptions::from_settings(&settings);
-                            report_options.agent_run_id = Some(agent_run_id.clone());
-                            report_options.agentic_readiness = Some(agentic_readiness);
-                            let jury_data_dir = app_state.lock_data_dir().clone();
-                            match run_jury_pipeline_core_via(
-                                &db,
-                                &settings,
-                                segment_ids.clone(),
-                                jury_data_dir.as_deref(),
-                            ) {
-                                Ok(jury_report) => {
-                                    let completion_detail = format!(
-                                        "Reference commits: {}; review queue: {}",
-                                        jury_report["referenceCommitted"].as_u64().unwrap_or(0),
-                                        jury_report["humanInbox"].as_u64().unwrap_or(0)
-                                    );
-                                    emit_agent_stage_event(
-                                        &app_clone,
-                                        Some(&agent_run_id),
-                                        "file",
-                                        AgentStageEmission {
-                                            stage: "jury_adjudication",
-                                            status: "completed",
-                                            file: &post_import_file,
-                                            detail: &completion_detail,
-                                            current: segment_ids.len(),
-                                            total: segment_ids.len(),
-                                        },
-                                    );
-                                    crate::runs::record_agent_import_report_with_options(
-                                        &db,
-                                        "file",
-                                        &source_paths,
-                                        &segment_ids,
-                                        Some(&jury_report),
-                                        None,
-                                        report_options,
-                                    )
-                                    .map(|_| {
-                                        emit_agent_stage_event(
-                                            &app_clone,
-                                            Some(&agent_run_id),
-                                            "file",
-                                            AgentStageEmission {
-                                                stage: "agent_report",
-                                                status: "completed",
-                                                file: "agent import report",
-                                                detail: "Persisted auditable multi-agent import report",
-                                                current: segment_ids.len(),
-                                                total: segment_ids.len(),
-                                            },
-                                        );
-                                    })
-                                    .map_err(|error| {
-                                        format!(
-                                            "Agent import report persistence failed after single-file import: {error}"
-                                        )
-                                    })
-                                }
-                                Err(error) => {
-                                    let mut message = format!(
-                                        "Post-import jury adjudication failed after single-file import: {error}"
-                                    );
-                                    if let Err(report_error) = crate::runs::record_agent_import_report_with_options(
-                                        &db,
-                                        "file",
-                                        &source_paths,
-                                        &segment_ids,
-                                        None,
-                                        Some(&error),
-                                        report_options,
-                                    ) {
-                                        message.push_str(&format!(
-                                            "; additionally failed to persist agent import report: {report_error}"
-                                        ));
-                                    }
-                                    emit_agent_stage_event(
-                                        &app_clone,
-                                        Some(&agent_run_id),
-                                        "file",
-                                        AgentStageEmission {
-                                            stage: "jury_adjudication",
-                                            status: "blocked",
-                                            file: &post_import_file,
-                                            detail: &message,
-                                            current: 0,
-                                            total: segment_ids.len(),
-                                        },
-                                    );
-                                    Err(message)
-                                }
-                            }
-                        } else {
-                            let message = "App state unavailable for post-import jury adjudication".to_string();
-                            emit_agent_stage_event(
-                                &app_clone,
-                                Some(&agent_run_id),
-                                "file",
-                                AgentStageEmission {
-                                    stage: "jury_adjudication",
-                                    status: "blocked",
-                                    file: &post_import_file,
-                                    detail: &message,
-                                    current: 0,
-                                    total: segment_ids.len(),
-                                },
-                            );
-                            Err(message)
-                        };
-                        if let Err(error) = adjudication_result {
-                            // Adjudication is best-effort enrichment; the import already succeeded and the
-                            // UI already rendered the segments, so a failure here is a non-fatal notice
-                            // (the jury_adjudication stage event already carries the detail) — NOT an
-                            // import failure.
-                            log_jury_pipeline_failure("single-file import", &error);
-                            emit_or_log(
-                                &app_clone,
-                                "pipeline-error",
-                                serde_json::json!({ "file": &post_import_file, "error": error }),
-                            );
-                        }
-                        // Refresh the UI so any references/verdicts produced by adjudication appear.
-                        let done_payload = serde_json::json!({
-                            "total": 1,
-                            "succeeded": 1,
-                            "failed": 0,
-                            "segmentCount": seg_count,
-                            "segmentIds": segment_ids,
-                            "source": "file",
-                        });
-                        emit_or_log(&app_clone, "import-complete", done_payload.clone());
-                        emit_or_log(&app_clone, "pipeline-complete", done_payload);
-                    }));
-                    if outcome.is_err() {
-                        // Adjudication unwound (e.g. a panic deep in ASR/onnxruntime). Settle the stage
-                        // and refresh so the UI never hangs on "adjudicating" — the import itself
-                        // already succeeded and rendered; this enrichment is best-effort.
-                        emit_agent_stage_event(
-                            &panic_app,
-                            Some(&panic_run_id),
-                            "file",
-                            AgentStageEmission {
-                                stage: "jury_adjudication",
-                                status: "blocked",
-                                file: &panic_file,
-                                detail: "post-import adjudication crashed unexpectedly (internal error); see logs",
-                                current: 0,
-                                total: panic_seg_count,
-                            },
-                        );
-                        let done_payload = serde_json::json!({
-                            "total": 1, "succeeded": 1, "failed": 0,
-                            "segmentCount": panic_seg_count, "source": "file",
-                        });
-                        emit_or_log(&panic_app, "import-complete", done_payload.clone());
-                        emit_or_log(&panic_app, "pipeline-complete", done_payload);
-                    }
-                });
-            }
-            Err(e) => {
-                let fname = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-                emit_or_log(
-                    &app_clone,
-                    "pipeline-error",
-                    serde_json::json!({
-                        "file": fname,
-                        "error": e.to_string(),
-                    }),
-                );
-                let payload = serde_json::json!({
-                    "total": 1,
-                    "succeeded": 0,
-                    "failed": 1,
-                    "source": "file",
-                });
-                emit_or_log(&app_clone, "import-complete", payload.clone());
-                emit_or_log(&app_clone, "pipeline-complete", payload);
-            }
-        }
-    });
-
-    Ok(serde_json::json!({ "status": "started", "source": "file" }))
-}
-
-/// P0.2 — expose the git SHA baked into the running exe at build time so the frontend/e2e harness
-/// (and a curious user, via the About panel) can confirm the running binary matches a given commit.
-/// Referencing `crate::GIT_SHA` here also guarantees the const is retained in the compiled binary.
-#[tauri::command]
-pub fn app_git_sha() -> String {
-    crate::GIT_SHA.to_string()
-}
-
-#[tauri::command]
-pub fn app_health(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("app_health")?;
-    let data_dir = state.lock_data_dir().clone();
-    let settings = state.lock_settings().clone();
-    let db = state.lock_db();
-    let mm = state.lock_model_manager();
-    health::health_check(&db, &mm, &settings, data_dir.as_deref()).map_err(|e| e.to_string())
-}
-
-/// Decode ONLY a segment's clip window to 16 kHz mono PCM without loading the whole (possibly
-/// multi-hour) source file. Reads just the [source_start_ms, source_end_ms] span via the incremental
-/// window decoder, early-stopping once past the window. Falls back to a whole-file decode when there is
-/// no window (a single-segment file, which is small). Fixes the per-clip fine-tuned re-transcribe
-/// failing with "audio too large to decode in one pass" on long recordings.
-pub(crate) fn decode_finetuned_clip_16k(
-    audio_path: &str,
-    alignment_json: Option<&str>,
-    // ALIGNMENT PRESENT BUT OFFSET-LESS is ambiguous: a legitimately-aligned SINGLE-segment file
-    // carries `{"words":[...]}` with no source offsets (whole-file decode is CORRECT), while a
-    // clobbered CHUNK of a multi-segment source carries the same shape (whole-file decode ships the
-    // entire recording as one "clip" — the true-10 audit's training-data-corruption major, the exact
-    // shape the HF/audio exporters refuse). Only the CALLER can tell them apart, by whether the
-    // source has sibling segments in the DB — so it must say whether whole-file is permitted.
-    allow_whole_file_without_offsets: bool,
-) -> Result<Vec<i16>, String> {
-    let whole_file = || -> Result<Vec<i16>, String> {
-        let (rate, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
-        let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, pcm).map_err(|e| e.to_string())?;
-        Ok(pcm16)
-    };
-    let Some(alignment) = alignment_json.map(str::trim).filter(|a| !a.is_empty()) else {
-        // Truly absent alignment: a single-segment import — whole file is the clip.
-        return whole_file();
-    };
-    let Some(meta) = crate::chunking::SegmentSourceMeta::from_alignment_json(alignment) else {
-        if allow_whole_file_without_offsets {
-            return whole_file();
-        }
-        return Err("alignment_json is present but carries no source offsets (a legacy/clobbered \
-                    word-array blob) on a multi-segment source — refusing the whole-file fallback; \
-                    re-import the file through the current build to regenerate its slice offsets"
-            .to_string());
-    };
-    let start_ms = meta.source_start_ms.max(0);
-    let end_ms = meta.source_end_ms.max(start_ms);
-    let mut native: Vec<i16> = Vec::new();
-    let mut rate = crate::audio::TARGET_SAMPLE_RATE;
-    const CLIP_DONE: &str = "__clip_window_done__";
-    let res = crate::audio::decode_pcm_windows(audio_path, 30_000, |win| {
-        rate = win.sample_rate.max(1);
-        let win_start = win.offset_ms;
-        let dur_ms = (win.pcm.len() as i64 * 1000) / rate as i64;
-        let win_end = win_start + dur_ms;
-        if win_end > start_ms && win_start < end_ms {
-            let a_ms = (start_ms.max(win_start) - win_start).max(0);
-            let b_ms = (end_ms.min(win_end) - win_start).max(0);
-            let a = ((a_ms * rate as i64) / 1000) as usize;
-            let b = (((b_ms * rate as i64) / 1000) as usize).min(win.pcm.len());
-            if b > a {
-                native.extend_from_slice(&win.pcm[a..b]);
-            }
-        }
-        // Past the clip window — stop early rather than decode the rest of a long file (sentinel Err).
-        if win_start >= end_ms {
-            return Err(crate::error::AppError::Other(CLIP_DONE.to_string()));
-        }
-        Ok(())
-    });
-    match res {
-        Ok(()) => {}
-        Err(crate::error::AppError::Other(m)) if m == CLIP_DONE => {}
-        Err(e) => return Err(e.to_string()),
-    }
-    let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, native).map_err(|e| e.to_string())?;
-    Ok(pcm16)
-}
-
-/// One clip to slice out of a source recording during a grouped decode. `end_ms == i64::MAX` means
-/// "to the end of the file" — the whole-file case expressed as a span, so one walk covers both kinds.
-pub(crate) struct ClipSpan {
-    pub segment_id: String,
-    pub start_ms: i64,
-    pub end_ms: i64,
-}
-
-/// Decode MANY clips out of ONE source recording in a SINGLE streaming pass.
-///
-/// `decode_finetuned_clip_16k` walks the file from byte zero to the clip's end. That is right for one
-/// clip and QUADRATIC for a pack: this library keeps 416 verified clips inside a single podcast FLAC,
-/// so exporting it re-decoded that FLAC 416 times, each walk longer than the last. Measured
-/// 2026-08-18 on the live library: **87 rows in 56 minutes (~36 s/row)**, which puts a full pack in
-/// the hours and makes the challenger loop's "zero manual steps" unreachable in practice.
-///
-/// This walks the source once and hands each clip over the moment its window has passed, so peak
-/// memory is the clips overlapping the current 30 s window rather than the whole file — the same
-/// bound the streaming import already holds itself to. The PCM handed to `on_clip` is
-/// byte-for-byte what the per-clip decoder produced: same decoder, same window size, same slice
-/// arithmetic, so a pack's manifest hash (its snapshot id) does not move because of this change.
-pub(crate) fn decode_finetuned_clips_16k<F>(audio_path: &str, spans: &[ClipSpan], mut on_clip: F) -> Result<(), String>
-where
-    F: FnMut(&str, Vec<i16>) -> Result<(), String>,
-{
-    if spans.is_empty() {
-        return Ok(());
-    }
-    // Opened in start order so a clip can be closed and its buffer freed as soon as the walk passes it.
-    let mut order: Vec<usize> = (0..spans.len()).collect();
-    order.sort_by_key(|&i| (spans[i].start_ms, i));
-    let last_end = spans.iter().map(|s| s.end_ms).max().unwrap_or(0);
-
-    let mut next = 0_usize;
-    let mut open: Vec<(usize, Vec<i16>)> = Vec::new();
-    let mut rate = crate::audio::TARGET_SAMPLE_RATE;
-    const CLIPS_DONE: &str = "__clip_windows_done__";
-
-    let finish = |idx: usize, acc: Vec<i16>, rate: u32, on_clip: &mut F| -> Result<(), String> {
-        let (_r, pcm16) = crate::audio::ensure_pcm_16khz(rate, acc).map_err(|e| e.to_string())?;
-        on_clip(&spans[idx].segment_id, pcm16)
-    };
-
-    let res = crate::audio::decode_pcm_windows(audio_path, 30_000, |win| {
-        rate = win.sample_rate.max(1);
-        let win_start = win.offset_ms;
-        let dur_ms = (win.pcm.len() as i64 * 1000) / rate as i64;
-        let win_end = win_start + dur_ms;
-
-        while next < order.len() && spans[order[next]].start_ms < win_end {
-            open.push((order[next], Vec::new()));
-            next += 1;
-        }
-        for (idx, acc) in open.iter_mut() {
-            let span = &spans[*idx];
-            if win_end > span.start_ms && win_start < span.end_ms {
-                let a_ms = (span.start_ms.max(win_start) - win_start).max(0);
-                let b_ms = (span.end_ms.min(win_end) - win_start).max(0);
-                let a = ((a_ms * rate as i64) / 1000) as usize;
-                let b = (((b_ms * rate as i64) / 1000) as usize).min(win.pcm.len());
-                if b > a {
-                    acc.extend_from_slice(&win.pcm[a..b]);
-                }
-            }
-        }
-        // Hand over every clip the walk has now passed, so its buffer does not outlive its window.
-        let mut still_open = Vec::with_capacity(open.len());
-        for (idx, acc) in open.drain(..) {
-            if spans[idx].end_ms <= win_end {
-                finish(idx, acc, rate, &mut on_clip).map_err(crate::error::AppError::Other)?;
-            } else {
-                still_open.push((idx, acc));
-            }
-        }
-        open = still_open;
-
-        // Everything asked for has been delivered — stop rather than decode the rest of a long file.
-        if next >= order.len() && open.is_empty() && win_start >= last_end {
-            return Err(crate::error::AppError::Other(CLIPS_DONE.to_string()));
-        }
-        Ok(())
-    });
-    match res {
-        Ok(()) => {}
-        Err(crate::error::AppError::Other(m)) if m == CLIPS_DONE => return Ok(()),
-        // An `on_clip` failure travels back out as itself, not as a decode error.
-        Err(crate::error::AppError::Other(m)) => return Err(m),
-        Err(e) => return Err(e.to_string()),
-    }
-    // EOF with clips still open (a span running past the end of the file) or never opened at all:
-    // hand over what was actually decoded. An empty buffer reaches the caller as an empty clip, which
-    // is the same "undecodable, skip it" signal the per-clip decoder gives.
-    for (idx, acc) in std::mem::take(&mut open) {
-        finish(idx, acc, rate, &mut on_clip)?;
-    }
-    for &idx in &order[next..] {
-        finish(idx, Vec::new(), rate, &mut on_clip)?;
-    }
-    Ok(())
-}
-
-/// Resolve the fine-tuned model + vocab paths: `CORTEX_FINETUNED_ONNX`/`CORTEX_FINETUNED_VOCAB`
-/// (dev/testing) or `finetuned-mms-ckb/{model.onnx,vocab.json}` in the active then bundled models dir.
-fn resolve_finetuned_paths() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
-    if let (Ok(o), Ok(v)) = (std::env::var("CORTEX_FINETUNED_ONNX"), std::env::var("CORTEX_FINETUNED_VOCAB")) {
-        return Ok((std::path::PathBuf::from(o), std::path::PathBuf::from(v)));
-    }
-    // EVERY model root, not the all-or-nothing active/bundled pair this used to walk. That pair is
-    // keyed on OmniASR-CTC presence, so a partial copy beside the exe wins the root and orphans the
-    // fine-tuned model even when it is sitting in the full repo models dir — which is exactly what it
-    // did here: this command reported "not found" for a 970 MB model that was present, while the
-    // import path (which had already been fixed) loaded it fine. Same search as `pipeline.rs` now,
-    // because it IS the same function.
-    crate::models::finetuned_model_paths()
-        .ok_or_else(|| "fine-tuned model not found (models/finetuned-mms-ckb/{model.onnx,vocab.json})".to_string())
-}
-
-/// P3.4: verify the bundled fine-tuned model's integrity — the DEFINITIVE full model.onnx + vocab.json
-/// SHA-256 (hashes the full ~970 MB, so it is on demand, not per-load). The fast size+vocab guard runs
-/// at every model load. Returns a confirmation string or a mismatch error.
-#[tauri::command]
-pub async fn verify_finetuned_model_integrity() -> Result<String, String> {
-    STRICT_RATE_LIMITER.check("verify_finetuned_model_integrity")?;
-    // SHA-256 over a ~970 MB ONNX — off the main thread. No state needed.
-    run_blocking(move || {
-        let (onnx, vocab) = resolve_finetuned_paths()?;
-        crate::wav2vec2_asr::verify_finetuned_full(&onnx, &vocab)?;
-        Ok(format!("verified: {}", onnx.display()))
-    })
-    .await
-}
-
-/// Record the FIRST failure only, so the reported cause is the one that actually stopped the run.
-fn record_first_failure(slot: &std::sync::Mutex<Option<String>>, message: String) {
-    if let Ok(mut guard) = slot.lock() {
-        if guard.is_none() {
-            *guard = Some(message);
-        }
-    }
-}
-
-/// Worker count for a batch transcription, from `CORTEX_BATCH_CONCURRENCY`.
-///
-/// Anything absent, unparseable, zero, negative or absurd falls back to 1 — the strictly serial
-/// behaviour this command had before concurrency existed. A bad value must never silently become a
-/// 32-way fan-out at an ASR server, so the fallback is the SAFE end, not the fast one.
-fn parse_batch_concurrency(raw: Option<&str>) -> usize {
-    raw.and_then(|value| value.trim().parse::<usize>().ok()).filter(|n| (1..=32).contains(n)).unwrap_or(1)
-}
-
-#[tauri::command]
-pub fn batch_transcribe(
-    ids: Vec<String>,
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<serde_json::Value, String> {
-    STRICT_RATE_LIMITER.check("batch_transcribe")?;
-    for id in &ids {
-        validate::validate_identifier(id)?;
-    }
-    let total = ids.len();
-
-    // PREFLIGHT before claiming the job (owner rule 2026-08-11). Measured 2026-08-11: a 487-clip run
-    // was accepted, then HARD-STOPPED on the very first clip because the champion server was not
-    // running — the right outcome, but the caller had already been told "started". Failing here
-    // returns the reason immediately and leaves the queue untouched, rather than after a write cycle.
-    {
-        let pipeline = state.lock_pipeline().clone();
-        pipeline.preflight_primary_engine().map_err(|e| e.to_string())?;
-    }
-
-    state.try_start_batch()?;
-
-    let cancel = state.ensure_cancel_token()?;
-
-    let pipeline = state.lock_pipeline().clone();
-
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        struct BatchGuard {
-            app: tauri::AppHandle,
-        }
-        impl Drop for BatchGuard {
-            fn drop(&mut self) {
-                if let Some(app_state) = self.app.try_state::<AppState>() {
-                    app_state.finish_batch();
-                }
-            }
-        }
-        let _guard = BatchGuard { app: app_clone.clone() };
-
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({
-                "type": "started", "total": total, "operation": "transcribe"
-            }),
-        );
-
-        // CONCURRENCY (2026-08-11). This loop was strictly serial, which is invisible for a local ONNX
-        // batch and disastrous for the 7B+cloud path: measured 22.2 s in the WSL 7B and 52.1 s in
-        // Gemini refinement per clip — ~74 s of almost pure WAITING — putting 487 clips at ~8 hours
-        // with BOTH GPUs at 10-18%. Neither stage is throughput-bound.
-        //
-        // A bounded pool is enough; no explicit two-stage pipeline is needed. The 7B server is two
-        // pre-forked replicas (one per GPU) each serving ONE request at a time, so its accept queue
-        // self-throttles ASR to 2 however many workers ask, while the remaining workers overlap in the
-        // network-bound refinement. Throughput then lands at 2 clips per ~22 s instead of 1 per ~74 s.
-        //
-        // Default 1 — byte-identical behaviour to before for every local batch, opt in via
-        // CORTEX_BATCH_CONCURRENCY for the 7B+cloud path. Writes are NOT parallelised: every
-        // update_batch_transcription_if_unreviewed still runs under the single app_state.lock_db()
-        // mutex, and the pipeline's own connections are WAL with busy_timeout=10s.
-        let concurrency = parse_batch_concurrency(std::env::var("CORTEX_BATCH_CONCURRENCY").ok().as_deref());
-        if concurrency > 1 {
-            tracing::info!("Batch transcribe running {concurrency} clips concurrently");
-        }
-
-        let next_index = std::sync::atomic::AtomicUsize::new(0);
-        let done_count = std::sync::atomic::AtomicUsize::new(0);
-        let succeeded_n = std::sync::atomic::AtomicU32::new(0);
-        let failed_n = std::sync::atomic::AtomicU32::new(0);
-        let skipped_n = std::sync::atomic::AtomicU32::new(0);
-        let cancelled_flag = std::sync::atomic::AtomicBool::new(false);
-        let previous_segments_shared: std::sync::Mutex<Vec<crate::db::SpeechSegment>> =
-            std::sync::Mutex::new(Vec::new());
-        let transcribed_ids_shared: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        // The FIRST failure, kept verbatim: it is the one that explains the stop, and later workers
-        // finishing their in-flight clip must not overwrite it with a downstream symptom.
-        let first_failure: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-        // Pre-fetch all target segments in a SINGLE DB lock (one WHERE IN query)
-        // instead of re-locking on every loop iteration. For a 500-segment batch
-        // this drops mutex acquisitions from 500 → 1 for the read phase.
-        let seg_map: std::collections::HashMap<String, crate::db::SpeechSegment> = {
-            if let Some(app_state) = app_clone.try_state::<AppState>() {
-                let db = app_state.lock_db();
-                match db.get_segments_by_ids(&ids) {
-                    Ok(segments) => segments.into_iter().map(|s| (s.id.clone(), s)).collect(),
-                    Err(error) => {
-                        tracing::error!("Batch transcribe DB prefetch failed: {error}");
-                        std::collections::HashMap::new()
-                    }
-                }
-            } else {
-                std::collections::HashMap::new()
-            }
-        };
-        // Normalizer Arc cloned once, reused across iterations.
-        let normalizer_arc = app_clone.try_state::<AppState>().map(|s| Arc::clone(&s.normalizer));
-        // Shared across workers: each claims its own segment, so no two ever transcribe the same id.
-        let seg_map = std::sync::Mutex::new(seg_map);
-
-        let run_worker = || loop {
-            let i = next_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if i >= ids.len() {
-                break;
-            }
-            let id = &ids[i];
-            // Real backpressure (the old call discarded its result): under genuine memory pressure
-            // (<1 GiB available) warn loudly and pause briefly so the OS can reclaim, instead of
-            // marching a heavy ASR loop into an OOM kill mid-batch.
-            if i % 10 == 0 && health::check_memory_pressure() {
-                tracing::warn!(
-                    "memory pressure during batch transcribe ({} MiB available) — pausing 2s at segment {}/{}",
-                    health::available_memory_mb(),
-                    i,
-                    ids.len()
-                );
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-
-            if cancel.is_cancelled() {
-                cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                break;
-            }
-
-            let Some(app_state) = app_clone.try_state::<AppState>() else {
-                break;
-            };
-            // Use the pre-fetched normalizer (avoids re-cloning Arc on every iteration).
-            let normalizer = normalizer_arc.as_ref().unwrap_or_else(|| &app_state.normalizer);
-
-            let seg = seg_map.lock().ok().and_then(|mut map| map.remove(id.as_str()));
-
-            if let Some(seg) = seg {
-                // Capture full snapshot BEFORE transcription for complete undo.
-                let pre_transcription_snapshot = seg.clone();
-                match pipeline.transcribe(Some(id), &seg.audio_path, seg.alignment_json.as_deref(), None) {
-                    Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty() => {
-                        // A blank draft is NOT a transcript. update_batch_transcription_if_unreviewed would
-                        // overwrite an existing good (unreviewed) transcript with "" — e.g. a jury_accept 7B
-                        // draft re-batch-transcribed by the weaker offline CTC engine that returns Ok("") on
-                        // a quiet clip. Skip; keep the current text. (Recurring
-                        // blank-transcript-never-overwrites-good data-loss class; matches transcribe_segment.)
-                        tracing::info!(
-                            "Batch transcribe skipped {id}: empty transcript (silent clip) — existing transcript kept"
-                        );
-                        skipped_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    Ok(draft) => {
-                        let normalized = normalizer.normalize(&draft.final_text);
-                        // Guarded targeted write (NOT a full insert_segment of the stale snapshot): a
-                        // human may have verified/edited this row since the batch prefetched it. This
-                        // writes only the ASR fields — never `annotated_transcript` (human-only, by
-                        // law; the old seed-when-empty machine write is the 348-row 2026-08-12
-                        // incident) — never touches `verified`, and skips human-owned rows, so a
-                        // concurrent curator decision can never be silently lost.
-                        match app_state.lock_db().update_batch_transcription_if_unreviewed(
-                            id,
-                            &draft.raw_text,
-                            Some(normalized.as_str()),
-                            draft.confidence,
-                            draft.confidence_source.as_deref(),
-                            draft.model_version_id.as_deref(),
-                            draft.cloud_call,
-                        ) {
-                            Ok(true) => {
-                                // Guards named for what they hold, so the undo snapshot and the
-                                // jury's id list still read exactly as the runtime-panic policy
-                                // pins them — the collections moved behind a mutex, the obligation
-                                // to record both did not.
-                                if let Ok(mut previous_segments) = previous_segments_shared.lock() {
-                                    previous_segments.push(pre_transcription_snapshot);
-                                }
-                                if let Ok(mut transcribed_ids) = transcribed_ids_shared.lock() {
-                                    transcribed_ids.push(id.clone());
-                                }
-                                succeeded_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            Ok(false) => {
-                                // Row became human-verified/reviewed after the batch began — skip
-                                // rather than overwrite the curator's confirmed label.
-                                tracing::info!("Batch transcribe skipped {id}: human-reviewed since batch start");
-                                skipped_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            Err(error) => {
-                                tracing::error!("Batch transcribe DB update failed for {id}: {error}");
-                                failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Batch transcribe failed for {id}: {e}");
-                        failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        record_first_failure(&first_failure, format!("segment {id}: {e}"));
-                    }
-                }
-            } else {
-                failed_n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                record_first_failure(&first_failure, format!("segment {id}: not found in the database"));
-            }
-
-            // HARD STOP (owner rule, 2026-08-11 — AGENT_CHARTER "Stop on the first failure").
-            //
-            // This loop used to count a failure and carry on. Measured 2026-08-10: 25 clips whose
-            // source container the champion could not decode failed one by one, the batch ran to
-            // "completion", and the review queue ended up 462 clips at champion quality and 25 at a
-            // weaker engine — with no error surfaced anywhere. A partly-drafted dataset that LOOKS
-            // finished is worse than a run that stopped: the mixed provenance is invisible and
-            // silently poisons every measurement taken from it afterwards.
-            //
-            // So the first failure cancels the batch. Everything already written stays written and is
-            // reported; the run is reported as FAILED, never as done.
-            if first_failure.lock().map(|f| f.is_some()).unwrap_or(false) {
-                cancel.cancel();
-                break;
-            }
-
-            // Completion COUNT, not the claim index: with workers in flight the highest claimed index
-            // runs ahead of what is actually finished, and a progress bar must never report work that
-            // has not happened.
-            let current = done_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            emit_or_log(
-                &app_clone,
-                "batch-progress",
-                serde_json::json!({
-                    "type": "progress", "current": current, "total": total,
-                    "file": id, "status": "transcribing", "operation": "transcribe"
-                }),
-            );
-        };
-
-        if concurrency == 1 {
-            run_worker();
-        } else {
-            std::thread::scope(|scope| {
-                for _ in 0..concurrency {
-                    scope.spawn(run_worker);
-                }
-            });
-        }
-
-        let succeeded = succeeded_n.load(std::sync::atomic::Ordering::SeqCst);
-        let failed = failed_n.load(std::sync::atomic::Ordering::SeqCst);
-        let skipped = skipped_n.load(std::sync::atomic::Ordering::SeqCst);
-        let cancelled = cancelled_flag.load(std::sync::atomic::Ordering::SeqCst);
-        let previous_segments = previous_segments_shared.into_inner().unwrap_or_default();
-        let transcribed_ids = transcribed_ids_shared.into_inner().unwrap_or_default();
-
-        if !previous_segments.is_empty() {
-            if let Some(app_state) = app_clone.try_state::<AppState>() {
-                app_state.lock_history().push(Command::BatchTranscribe { previous_segments });
-            }
-        }
-
-        if !transcribed_ids.is_empty() {
-            if let Some(app_state) = app_clone.try_state::<AppState>() {
-                let settings = app_state.lock_settings().clone();
-                // Dedicated connection (not the shared lock_db guard) so the post-batch jury's
-                // possible T2 cloud calls don't hold the global db Mutex and starve the UI's
-                // get_segments while it runs. with_jury_db retries the dedicated open and only falls
-                // back to the shared handle on a hard failure (so a transient lock doesn't skip the
-                // jury entirely).
-                let jury_data_dir = app_state.lock_data_dir().clone();
-                if let Err(error) = with_jury_db(&app_state, |db| {
-                    run_jury_pipeline_core_via(db, &settings, transcribed_ids, jury_data_dir.as_deref())
-                }) {
-                    log_jury_pipeline_failure("batch transcription", &error);
-                }
-            }
-        }
-
-        // A run that stopped on a failure is reported as HALTED, with the first cause named. It must
-        // never arrive at the UI as an ordinary "completed" — that is precisely how a half-drafted
-        // dataset gets mistaken for a finished one.
-        let halted_by = first_failure.into_inner().ok().flatten();
-        if let Some(reason) = &halted_by {
-            tracing::error!(
-                "Batch transcribe HARD-STOPPED after {succeeded} succeeded, {skipped} skipped: {reason}. \
-                 Remaining clips were NOT transcribed; the dataset is incomplete, not finished."
-            );
-        }
-        emit_or_log(
-            &app_clone,
-            "batch-progress",
-            serde_json::json!({
-                "type": if halted_by.is_some() { "halted" } else { "completed" },
-                "total": total,
-                "succeeded": succeeded, "failed": failed, "skipped": skipped,
-                "cancelled": cancelled, "operation": "transcribe",
-                "haltedBy": halted_by,
-            }),
-        );
-    });
-
-    Ok(serde_json::json!({ "status": "started" }))
-}
-
-#[tauri::command]
-pub fn normalize_text(text: String, state: State<'_, AppState>) -> Result<String, String> {
-    RATE_LIMITER.check("normalize_text")?;
-    validate::validate_text(&text, 100000, "Normalization text")?;
-    let settings = state.lock_settings();
-    let config = crate::normalizer::NormalizationConfig {
-        normalize_numbers: settings.auto_normalize,
-        verbalize_numbers: settings.verbalize_numbers,
-        normalize_hamza: true,
-        remove_diacritics: false,
-    };
-    let normalizer = crate::normalizer::SoraniNormalizer::with_config(config);
-    Ok(normalizer.normalize(&text))
-}
-
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentConsensus {
@@ -1611,28 +414,73 @@ pub struct SegmentConsensus {
 /// older builds (300M/1B/MMS/Scribe) are historical artifacts, not voters. If a pre-provenance 7B row
 /// has no hypothesis record, synthesize the one honest vote from the segment's persisted champion
 /// transcript so review still works without allowing stale engines back into the decision.
+/// The provenance id written by the PRE-REGISTRY champion.
+///
+/// Production no longer names the champion by string — identity is content-addressed, and
+/// `pipeline::CHAMPION_MODEL_ID` is `#[cfg(test)]` for exactly that reason. But rows drafted before
+/// the registry existed still carry this id on disk, and champion review must keep recognising them
+/// as champion-produced or it would hide the evidence for most of the existing corpus. This is
+/// historical RECOGNITION only; nothing selects or serves a model by this string.
+const LEGACY_CHAMPION_MODEL_ID: &str = "omniasr-wsl-7b";
+
+/// Was this segment drafted by a champion-family model? Answers the DB question
+/// [`hypotheses_for_selected_asr`] deliberately does not ask itself, so that filter stays pure.
+/// The legacy constant covers rows written before the registry existed; the registry covers the rest.
+/// Unknown provenance is NOT champion — fail closed.
+fn segment_recorded_model_is_champion(db: &crate::db::Database, segment: &crate::db::SpeechSegment) -> bool {
+    let Some(recorded) = segment.model_version_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    if recorded == LEGACY_CHAMPION_MODEL_ID {
+        return true;
+    }
+    match crate::registry::is_family_model(db, recorded, crate::deployment::OMNIASR_7B_FAMILY) {
+        Ok(is_champion) => is_champion,
+        Err(error) => {
+            // Fail CLOSED (hide the votes) but never silently: a registry read that fails here would
+            // otherwise look identical to "this row was drafted by a weaker engine".
+            tracing::error!("champion-family lookup failed for model {recorded}: {error}");
+            false
+        }
+    }
+}
+
 fn hypotheses_for_selected_asr(
     selected: &crate::settings::AsrModelSize,
     segment: &crate::db::SpeechSegment,
     mut hypotheses: Vec<crate::db::SegmentHypothesis>,
+    recorded_model_is_champion: bool,
 ) -> Vec<crate::db::SegmentHypothesis> {
     if *selected != crate::settings::AsrModelSize::WSL7B {
         return hypotheses;
     }
 
+    let Some(recorded_model_id) = segment.model_version_id.as_deref().filter(|id| !id.trim().is_empty()) else {
+        // Without a persisted producing-version id, choosing the *current* champion would rewrite
+        // history after promotion. Return no attributable vote instead of inventing provenance.
+        return Vec::new();
+    };
+    // CHAMPION SUPREMACY (canon). Matching the row's own producing model is the right unit of
+    // provenance, but on its own it re-admits the very thing the fixed-string filter excluded: a clip
+    // drafted by a weaker engine BEFORE WSL7B was selected carries that engine's id, so a per-row
+    // match would surface its hypotheses during champion review. This library contains exactly such
+    // rows — 494/494 clips were once silently drafted by `finetuned-mms-ckb` while WSL7B was selected.
+    // A non-champion producer contributes NO auxiliary vote, as before.
+    if !recorded_model_is_champion {
+        return Vec::new();
+    }
     hypotheses.retain(|hypothesis| {
-        hypothesis.model_id == crate::pipeline::CHAMPION_MODEL_ID
+        hypothesis.model_id == recorded_model_id
             && !hypothesis.transcript.trim().is_empty()
             && !crate::quality::is_placeholder_transcript(&hypothesis.transcript)
     });
     if hypotheses.is_empty()
-        && segment.model_version_id.as_deref() == Some(crate::pipeline::CHAMPION_MODEL_ID)
         && !segment.raw_transcript.trim().is_empty()
         && !crate::quality::is_placeholder_transcript(&segment.raw_transcript)
     {
         hypotheses.push(crate::db::SegmentHypothesis {
             segment_id: segment.id.clone(),
-            model_id: crate::pipeline::CHAMPION_MODEL_ID.to_string(),
+            model_id: recorded_model_id.to_string(),
             transcript: segment.raw_transcript.clone(),
             confidence: segment.confidence,
         });
@@ -1648,16 +496,18 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
     RATE_LIMITER.check("get_segment_consensus")?;
     validate::validate_identifier(&segment_id)?;
     let selected = state.lock_settings().asr_model_size.clone();
-    let (segment, hyps) = {
+    let (segment, hyps, recorded_is_champion) = {
         let db = state.lock_db();
         let segment = db
             .get_segment_by_id(&segment_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))?;
         let hypotheses = db.get_hypotheses_for_segment(&segment_id).map_err(|e| e.to_string())?;
-        (segment, hypotheses)
+        // Answered while the lock is held; the filter itself stays pure and DB-free.
+        let is_champion = segment_recorded_model_is_champion(&db, &segment);
+        (segment, hypotheses, is_champion)
     };
-    let hyps = hypotheses_for_selected_asr(&selected, &segment, hyps);
+    let hyps = hypotheses_for_selected_asr(&selected, &segment, hyps, recorded_is_champion);
     // Distinct producing engines, in first-seen order, straight from the recorded hypotheses (never
     // inferred) so the review badge can honestly say which model(s) made the draft.
     let mut models: Vec<String> = Vec::new();
@@ -1678,139 +528,6 @@ pub fn get_segment_consensus(state: State<'_, AppState>, segment_id: String) -> 
         (min, mean)
     };
     Ok(SegmentConsensus { draft, words, model_count, min_agreement, mean_agreement, models })
-}
-
-/// Hydrate one selected list row with its full alignment/evidence payload.
-#[tauri::command]
-pub fn get_segment(segment_id: String, state: State<'_, AppState>) -> Result<SpeechSegment, String> {
-    RATE_LIMITER.check("get_segment")?;
-    validate::validate_identifier(&segment_id)?;
-    let db = state.lock_db();
-    db.get_segment_by_id(&segment_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Segment '{segment_id}' no longer exists"))
-}
-
-#[tauri::command]
-pub fn get_segments_page(
-    verified: Option<bool>,
-    query: Option<String>,
-    sort: Option<String>,
-    limit: Option<usize>,
-    cursor: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<SegmentsPage, String> {
-    RATE_LIMITER.check("get_segments_page")?;
-    if let Some(ref query) = query {
-        validate::validate_text(query, 1000, "Search query")?;
-    }
-    let sort = sort.unwrap_or_else(|| "newest".to_string());
-    validate::validate_text(&sort, 64, "Segment sort")?;
-    match sort.as_str() {
-        "newest" | "oldest" | "duration" | "verified" | "confidence" | "activeLearning" | "active_learning"
-        | "suspectFirst" | "suspect_first" => {}
-        _ => return Err(format!("Invalid segment sort: {sort}")),
-    }
-    if let Some(ref cursor) = cursor {
-        validate::validate_text(cursor, 2048, "Segment page cursor")?;
-        if !cursor.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
-            return Err("Invalid segment page cursor".to_string());
-        }
-    }
-    let limit = limit.unwrap_or(200).clamp(1, 500);
-    let db = state.lock_db();
-    db.get_segments_page(verified, query.as_deref(), &sort, limit, cursor.as_deref()).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_segment_ids_for_view(
-    verified: Option<bool>,
-    query: Option<String>,
-    transcript_state: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<Vec<String>, String> {
-    RATE_LIMITER.check("get_segment_ids_for_view")?;
-    if let Some(ref query) = query {
-        validate::validate_text(query, 1000, "Search query")?;
-    }
-    let transcript_state = transcript_state.unwrap_or_else(|| "any".into());
-    match transcript_state.as_str() {
-        "any" | "real" | "missing" => {}
-        _ => return Err("Invalid transcript state".into()),
-    }
-    let db = state.lock_db();
-    db.get_segment_ids_for_view(verified, query.as_deref(), &transcript_state).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_signal_anomaly_segments(
-    limit: Option<usize>,
-    state: State<'_, AppState>,
-) -> Result<Vec<SpeechSegment>, String> {
-    RATE_LIMITER.check("get_signal_anomaly_segments")?;
-    let db = state.lock_db();
-    db.get_signal_anomaly_segments(limit.unwrap_or(100)).map_err(|e| e.to_string())
-}
-
-/// Apply the whitelisted curation fields from an autosave `fields` object onto a segment row. Pure and
-/// unit-tested. Only the three fields the debounced curation autosave edits are accepted; an unknown
-/// key is a LOUD error (never silently dropped — a typo'd field must not look saved). Each value may
-/// be a string or `null` (all three columns are nullable).
-pub(crate) fn apply_curation_fields(
-    segment: &mut SpeechSegment,
-    fields: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    fn opt_string(key: &str, v: &serde_json::Value) -> Result<Option<String>, String> {
-        if v.is_null() {
-            Ok(None)
-        } else {
-            v.as_str().map(str::to_string).map(Some).ok_or_else(|| format!("{key} must be a string or null"))
-        }
-    }
-    for (key, value) in fields {
-        match key.as_str() {
-            "annotatedTranscript" => {
-                let v = opt_string(key, value)?;
-                if let Some(ref t) = v {
-                    validate::validate_text(t, 100000, "Annotated transcript")?;
-                }
-                segment.annotated_transcript = v;
-            }
-            "speakerId" => {
-                let v = opt_string(key, value)?;
-                if let Some(ref s) = v {
-                    if !s.is_empty() {
-                        validate::validate_text(s, 256, "Speaker ID")?;
-                    }
-                }
-                segment.speaker_id = v;
-            }
-            "alignmentJson" => {
-                let v = opt_string(key, value)?;
-                if let Some(ref aj) = v {
-                    validate::validate_alignment_json(aj)?;
-                }
-                segment.alignment_json = v;
-            }
-            "verified" => {
-                // Verifying is a single-field curation action. Routing it through this field-level path
-                // (update_segment_fields reads the FRESH row by id, applies only this field, persists) —
-                // instead of the whole-row api.updateSegment upsert handleToggleVerify used to send — means a
-                // concurrent writer that holds NO $isProcessing lock, notably the WSL-7B refinement loop
-                // (it emits wsl-log events, not batch-progress, so the Verify button stays live), cannot have
-                // its raw_transcript write reverted by a stale whole-row spread. Matches the sibling
-                // handleSaveAnnotation / handleSaveSpeaker conversions to field-level updates.
-                segment.verified = value.as_bool().ok_or_else(|| format!("{key} must be a boolean"))?;
-            }
-            other => {
-                return Err(format!(
-                    "update_segment_fields: unsupported field '{other}' — only curation fields \
-                     (annotatedTranscript, speakerId, alignmentJson, verified) may be partially updated"
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1835,1018 +552,111 @@ pub async fn merge_dataset_json(json_content: String, state: State<'_, AppState>
 /// Recent durable jobs (newest first) for a UI activity surface — a long op bracketed via
 /// `Database::run_tracked` shows here as running/succeeded/failed, and a crash residue reaped at
 /// startup shows as failed/INTERRUPTED. Cheap read; safe to poll.
-#[tauri::command]
-pub async fn get_jobs(state: State<'_, AppState>) -> Result<Vec<crate::jobs::Job>, String> {
-    RATE_LIMITER.check("get_jobs")?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.list_recent_jobs(50).map_err(|e| e.to_string())
-    })
-    .await
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStateV1 {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
 }
 
-#[derive(serde::Serialize)]
+impl From<crate::jobs::JobState> for JobStateV1 {
+    fn from(state: crate::jobs::JobState) -> Self {
+        match state {
+            crate::jobs::JobState::Queued => Self::Queued,
+            crate::jobs::JobState::Running => Self::Running,
+            crate::jobs::JobState::Succeeded => Self::Succeeded,
+            crate::jobs::JobState::Failed => Self::Failed,
+            crate::jobs::JobState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct EngineStatus {
-    /// The champion (OmniASR-7B) warm server is answering on its WSL loopback port.
-    pub ready: bool,
-    pub port: u16,
+pub struct JobV1 {
+    pub id: String,
+    pub kind: String,
+    pub state: JobStateV1,
+    pub progress: f64,
+    pub completed: i64,
+    pub total: Option<i64>,
+    pub error_code: Option<String>,
 }
 
-/// The model registry, newest-first within each family — what a registry panel lists.
-#[tauri::command]
-pub fn list_model_versions(state: State<'_, AppState>) -> Result<Vec<crate::registry::ModelVersion>, String> {
-    RATE_LIMITER.check("list_model_versions")?;
-    let db = state.lock_db();
-    crate::registry::list_model_versions(&db).map_err(|e| e.to_string())
-}
-
-/// Import an externally fine-tuned checkpoint into the registry as a gated candidate. The SHA is
-/// computed server-side from the file; the caller never supplies it. Promotion is a separate,
-/// gated step (not exposed yet — it must run through the eval gate), so this can only ever add a
-/// candidate, never crown a champion.
-#[tauri::command]
-pub async fn import_model_checkpoint(
-    id: String,
-    family: String,
-    checkpoint_path: String,
-    source: String,
-    license: String,
-    model_card_name: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    STRICT_RATE_LIMITER.check("import_model_checkpoint")?;
-    validate::validate_identifier(&id)?;
-    validate::validate_identifier(&family)?;
-    validate::validate_identifier(&source)?;
-    validate::validate_identifier(&license)?;
-    if let Some(ref card) = model_card_name {
-        validate::validate_text(card, 256, "model_card_name")?;
-    }
-    let checkpoint_path = validate::validate_file_path(&checkpoint_path)?;
-    let db = state.db_arc();
-    run_blocking(move || {
-        // Hash the (potentially multi-GB) checkpoint off the main thread AND before taking the DB lock
-        // — holding the global db mutex across the full-file SHA-256 would starve every UI DB poll.
-        let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::registry::register_checkpoint(
-            &db,
-            &id,
-            &family,
-            &checkpoint_path,
-            &source,
-            &license,
-            model_card_name,
-            sha,
-        )
-        .map_err(|e| e.to_string())
-    })
-    .await
-}
-
-/// The complete speaker list (not the truncated top-10 dashboard summary) so the speaker-management
-/// panel can rename every speaker, including low-frequency ones.
-#[tauri::command]
-pub fn get_speakers(state: State<'_, AppState>) -> Result<Vec<stats::SpeakerStat>, String> {
-    RATE_LIMITER.check("get_speakers")?;
-    let db = state.lock_db();
-    stats::list_speakers(&db).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn undo(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    RATE_LIMITER.check("undo")?;
-    let db = state.lock_db();
-    let history = state.lock_history();
-    history.undo(&db).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn redo(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    RATE_LIMITER.check("redo")?;
-    let db = state.lock_db();
-    let history = state.lock_history();
-    history.redo(&db).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn can_undo(state: State<'_, AppState>) -> bool {
-    state.lock_history().can_undo()
-}
-
-#[tauri::command]
-pub fn can_redo(state: State<'_, AppState>) -> bool {
-    state.lock_history().can_redo()
-}
-
-#[tauri::command]
-pub fn db_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let db = state.lock_db();
-    db.info().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn db_backup(dest: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let validated = validate::validate_output_path(&dest)?;
-    // Dedicated connection (true-10 audit 2026-07-09): holding the global DB mutex for the whole
-    // online backup froze every DB-touching command for the full copy duration on a slow external
-    // drive. Grab the path under a brief lock, then do the whole copy + verify OFF the main thread.
-    let db_path = {
-        let db = state.lock_db();
-        db.path().to_string()
-    };
-    run_blocking(move || {
-        let backup_db = crate::db::Database::open(&db_path).map_err(|e| e.to_string())?;
-        backup_db.backup(&validated).map_err(|e| e.to_string())?;
-        // Verify the file we WROTE — an off-disk "disaster copy" that is itself bad (destination volume
-        // corruption) must fail the backup NOW, not at the disaster. Read-only open: never mutate it.
-        let conn = rusqlite::Connection::open_with_flags(
-            &validated,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| format!("backup written but could not be opened for verification: {e}"))?;
-        let integrity: String = conn
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-            .map_err(|e| format!("backup written but failed verification: {e}"))?;
-        if integrity != "ok" {
-            return Err(format!("backup written but FAILED integrity check: {integrity}"));
-        }
-        let segment_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM speech_segments", [], |row| row.get(0))
-            .map_err(|e| format!("backup written but could not count segments: {e}"))?;
-        Ok(serde_json::json!({ "integrityOk": true, "segmentCount": segment_count }))
-    })
-    .await
-}
-
-/// P1.3b (audit): set for the whole DB restore (prepare_restore → page swap complete). `writers_active`
-/// is the FENCE (refuse a restore while a writer is already running); this is the RESERVATION (refuse a
-/// NEW writer while a restore is pending). Together they close the check-then-act window where a writer
-/// could start between prepare_restore's `writers_active()` check and the swap.
-pub(crate) static RESTORE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// True while a DB restore is reserved/in progress — consulted by every writer-START path.
-pub(crate) fn restore_pending() -> bool {
-    RESTORE_PENDING.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// The uniform error a writer-start returns while a restore is pending.
-pub(crate) const RESTORE_IN_PROGRESS_MSG: &str =
-    "A database restore is in progress — wait for it to finish before starting this operation.";
-
-/// RAII reservation: sets [`RESTORE_PENDING`] on construction, clears it on drop, so the reservation is
-/// released even if the restore errors or panics. Held by db_restore / restore_db_from_snapshot for the
-/// whole restore, and (crucially) dropped on prepare_restore's own early-return if a writer is active.
-pub(crate) struct RestoreReservation;
-impl RestoreReservation {
-    fn new() -> Self {
-        RESTORE_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
-        Self
-    }
-}
-impl Drop for RestoreReservation {
-    fn drop(&mut self) {
-        RESTORE_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-fn take_mandatory_pre_restore_snapshot(
-    db: &crate::db::Database,
-    data_dir: &Path,
-) -> Result<std::path::PathBuf, String> {
-    crate::snapshot::take_pinned_snapshot(db, data_dir, "prerestore", 3).map_err(|e| {
-        format!(
-            "Database restore refused because the mandatory pre-restore safety snapshot failed: {e}. \
-             The current library has not been overwritten. Free disk space or fix the destination permissions, then retry."
-        )
-    })
-}
-
-/// Shared restore precondition (true-10 audit 2026-07-09): refuse while an import/batch worker may
-/// be writing, and pin a rotation-exempt copy of the CURRENT live DB first so a mis-restore of the
-/// wrong snapshot is itself recoverable (previously only from a ≤10-min rolling snapshot that
-/// rotated out within ~100 minutes). Returns a RestoreReservation the caller MUST hold across the
-/// restore so no new writer can start mid-restore (P1.3b).
-fn prepare_restore(state: &State<'_, AppState>) -> Result<RestoreReservation, String> {
-    // Reserve FIRST: set RESTORE_PENDING before checking writers_active, so a writer racing this check
-    // observes the reservation and refuses. THEN verify none is already running (the fence). The
-    // reservation is closed by ONE OF TWO airtight mechanisms per writer, NOT a single shared lock:
-    //   • import/batch and couch::start check restore_pending() UNDER the same mutex writers_active()
-    //     reads (import_state / batch_state / COUCH), so their check+register is totally ordered against
-    //     the fence read — a concurrent restore either sees them registered or is seen by them.
-    //   • the atomic-flag writers (WSL refine, Scribe votes, jury via BG_DB_WRITERS) use publish-then-
-    //     recheck: they SET their flag, then RE-READ the reservation and roll back if set. Under SeqCst
-    //     the fence's {store RESTORE_PENDING; load flag} and the writer's {store flag; load RESTORE_PENDING}
-    //     can't both read stale, so one side always refuses.
-    // If a writer IS already running, the reservation drops on this early return.
-    let reservation = RestoreReservation::new();
-    if state.writers_active() {
-        return Err("A background write is in progress (import, batch, 7B refinement, jury, Scribe \
-                    votes, or the Couch Review server) — cancel it, let it finish, or stop Couch \
-                    Review before restoring. Restoring mid-write would mix pre-restore rows into the \
-                    restored library and re-arm stale undo history."
-            .to_string());
-    }
-    let data_dir = state
-        .lock_data_dir()
-        .clone()
-        .ok_or_else(|| "Database restore refused: the app data directory is unavailable, so a mandatory pre-restore safety snapshot cannot be created.".to_string())?;
-    let db = state.lock_db();
-    let pinned = take_mandatory_pre_restore_snapshot(&db, &data_dir)?;
-    tracing::info!("pre-restore snapshot pinned at {}", pinned.display());
-    Ok(reservation)
-}
-
-#[tauri::command]
-pub async fn db_restore(src: String, state: State<'_, AppState>) -> Result<(), String> {
-    // M0.4: Restore a previously backed-up database snapshot. The file must be a valid SQLite
-    // database (PRAGMA integrity_check on open verifies this). This completes the backup/restore
-    // pair so the app is never at risk of data loss mid-import or mid-review.
-    let validated = validate::validate_file_path(&src)?;
-    // Hold the reservation across the whole restore: RESTORE_PENDING stays set until this guard drops
-    // (after the page swap + history clear), so no new writer can start mid-restore (P1.3b).
-    let _restore_reservation = prepare_restore(&state)?;
-    // Heavy DB file-copy + reopen — off the main thread. The lock is taken INSIDE the task (never
-    // across the await); prepare_restore already refused if writers are active.
-    let db = state.db_arc();
-    let restore_result = run_blocking(move || {
-        let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-        guard.restore(&validated).map_err(|e| e.to_string())
-    })
-    .await;
-    // The in-memory undo/redo stack holds Commands (DeleteSegments, BatchTranscribe, ...) that
-    // reference rows from the PRE-restore database. Replaying one via Undo after the restore would
-    // apply a stale mutation to a different dataset — resurrecting or corrupting rows. Clear it on ANY
-    // restore attempt that reached the swap: restore() can return Err AFTER the pages were already
-    // copied (e.g. a forward-migration failure post-copy), so clearing only on Ok would leave a stale
-    // Undo able to cross the restore boundary. Clearing on a pre-swap rejection (bad/newer snapshot)
-    // too is harmless — the library is unchanged, only the undo stack resets.
-    state.lock_history().clear();
-    restore_result?;
-    Ok(())
-}
-
-/// Release the quarantine prune-pin EXPLICITLY: archive every `*.corrupt.*` artifact into
-/// `<data_dir>/quarantine/` (bytes stay salvageable via `.recover`) so pruning resumes. Previously
-/// the pin had NO in-app release — snapshots accumulated a full DB copy every 10 minutes forever
-/// (true-10 audit 2026-07-09). Returns how many files were archived.
-#[tauri::command]
-pub fn acknowledge_quarantine(state: State<'_, AppState>) -> Result<usize, String> {
-    STRICT_RATE_LIMITER.check("acknowledge_quarantine")?;
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    crate::snapshot::acknowledge_quarantine(&data_dir).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn db_vacuum(state: State<'_, AppState>) -> Result<(), String> {
-    let db = state.db_arc();
-    run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
-        db.vacuum().map_err(|e| e.to_string())
-    })
-    .await
-}
-
-/// B2: report whether a past corruption event quarantined a database (files named
-/// `cortex-speech.corrupt.<ts>` in the data dir), plus how many restore snapshots exist — so the
-/// frontend can show a loud banner instead of the owner silently working in an empty library.
-#[tauri::command]
-pub fn get_quarantine_notice(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("get_quarantine_notice")?;
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let mut quarantined: Vec<String> = std::fs::read_dir(&data_dir)
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // recover_database_at renames to `<stem>.corrupt.<ts>[.n]` (+ sidecars); count main files only.
-            (name.contains(".corrupt.") && !name.ends_with("-wal") && !name.ends_with("-shm")).then_some(name)
-        })
-        .collect();
-    quarantined.sort();
-    let snapshots = crate::snapshot::list_snapshots(&data_dir);
-    Ok(serde_json::json!({
-        "quarantinedFiles": quarantined,
-        "snapshotCount": snapshots.len(),
-        "newestSnapshotSegments": snapshots.first().and_then(|s| s.segment_count),
-    }))
-}
-
-/// B2: list the rotating auto-snapshots (newest first) for the restore picker.
-#[tauri::command]
-pub fn list_db_snapshots(state: State<'_, AppState>) -> Result<Vec<crate::snapshot::SnapshotInfo>, String> {
-    RATE_LIMITER.check("list_db_snapshots")?;
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    Ok(crate::snapshot::list_snapshots(&data_dir))
-}
-
-/// A dataset snapshot may restore dataset-coupled thresholds, but it must never change which ASR
-/// engine the operator is currently running or re-enable heavyweight background inference. Those
-/// are live machine/runtime decisions, not historical dataset state.
-fn preserve_live_asr_runtime_controls(restored: &mut AppSettings, live: &AppSettings) {
-    restored.asr_model_size = live.asr_model_size.clone();
-    restored.use_finetuned_asr = live.use_finetuned_asr;
-    restored.multi_engine_hypotheses = live.multi_engine_hypotheses;
-    restored.external_asr_script_path = live.external_asr_script_path.clone();
-    restored.champion_supervision_enabled = live.champion_supervision_enabled;
-}
-
-/// B2: restore the live database from a named auto-snapshot. The name must be a bare
-/// `snapshot_<digits>` component (no separators — cannot traverse), and the snapshot must contain a
-/// DB file. Restore goes through the same SQLite online-backup path as `db_restore`.
-#[tauri::command]
-pub async fn restore_db_from_snapshot(name: String, state: State<'_, AppState>) -> Result<(), String> {
-    STRICT_RATE_LIMITER.check("restore_db_from_snapshot")?;
-    let valid =
-        name.strip_prefix("snapshot_").is_some_and(|ts| !ts.is_empty() && ts.bytes().all(|b| b.is_ascii_digit()));
-    if !valid {
-        return Err(format!("invalid snapshot name '{name}'"));
-    }
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let src = data_dir.join("snapshots").join(&name).join("cortex-speech.db");
-    if !src.is_file() {
-        return Err(format!("snapshot '{name}' has no database file"));
-    }
-    // Hold the reservation across the whole restore: RESTORE_PENDING stays set until this guard drops
-    // (after the page swap + history clear), so no new writer can start mid-restore (P1.3b).
-    let _restore_reservation = prepare_restore(&state)?;
-    // Heavy DB file-copy + reopen — off the main thread; the lock is taken INSIDE the task.
-    let restore_result = {
-        let db = state.db_arc();
-        let restore_src = src.clone();
-        run_blocking(move || {
-            let mut guard = db.lock().unwrap_or_else(|p| p.into_inner());
-            guard.restore(&restore_src).map_err(|e| e.to_string())
-        })
-        .await
-    }; // release the db lock before touching the settings/pipeline locks
-       // Clear the undo/redo stack on ANY restore attempt that reached the swap: restore() can return Err
-       // AFTER the pages were copied (e.g. a forward-migration failure post-copy), and a stale Undo would
-       // then corrupt the restored dataset (see db_restore). Do it BEFORE propagating the error so it runs
-       // even on that post-swap-failure path.
-    state.lock_history().clear();
-    restore_result?;
-
-    // Restore the snapshot's captured config (settings.json / champion.json) so the app returns to a
-    // CONSISTENT known-good state — not a rolled-back library sitting beside post-disaster settings, or
-    // silently-defaulted settings if the live settings.json was corrupted alongside the DB. Best-effort
-    // per file (the DB is already restored; a config-copy failure only warns).
-    // Restore exactly the set the snapshot saved (crate::snapshot::EXTRA_STATE) — single source of truth,
-    // so save-side and restore-side can never drift out of sync.
-    let snap_dir = data_dir.join("snapshots").join(&name);
-    for &extra in crate::snapshot::EXTRA_STATE {
-        // settings.json is NOT plain-copied here — it is loaded from the snapshot, consent-narrowed, and
-        // saved below, so the snapshot's cloud opt-ins NEVER touch disk. A plain fs::copy would write the
-        // snapshot's (possibly cloud-ON) opt-ins to data_dir/settings.json first, and if the consent-narrowing
-        // re-save then failed or was interrupted (disk full during disaster recovery, or a process kill in the
-        // window), the revoked consent would silently come back on the next launch. Every OTHER extra copies.
-        if extra == "settings.json" {
-            continue;
-        }
-        let from = snap_dir.join(extra);
-        if from.is_file() {
-            if let Err(e) = std::fs::copy(&from, data_dir.join(extra)) {
-                tracing::warn!("snapshot restore: could not restore {extra}: {e}");
-            }
+impl From<crate::jobs::Job> for JobV1 {
+    fn from(job: crate::jobs::Job) -> Self {
+        Self {
+            id: job.id,
+            kind: job.kind,
+            state: job.state.into(),
+            progress: job.progress,
+            completed: job.completed,
+            total: job.total,
+            error_code: job.error_code,
         }
     }
-    // Apply the restored settings to memory AND the running pipeline (mirrors update_settings) so the
-    // engine / thresholds / consent flags take effect immediately, not only on the next launch. Load the
-    // SNAPSHOT's settings (it was intentionally not copied above), never the snapshot value straight to disk.
-    let snapshot_settings_path = snap_dir.join("settings.json");
-    let live_settings_path = data_dir.join("settings.json");
-    let mut restored = crate::settings::AppSettings::load(if snapshot_settings_path.is_file() {
-        &snapshot_settings_path
-    } else {
-        &live_settings_path
-    });
-    // LIVE CONTROLS: a DB snapshot restore must NEVER silently re-grant cloud consent or change the selected
-    // ASR runtime. Consent, engine routing, the champion client path, and 30 GB server supervision are current
-    // operator decisions, not dataset state. Carry them across instead of adopting the snapshot's values.
-    {
-        let live = state.lock_settings();
-        restored.cloud_llm_opt_in = live.cloud_llm_opt_in;
-        restored.cloud_stt_opt_in = live.cloud_stt_opt_in;
-        restored.jury_cloud_opt_in = live.jury_cloud_opt_in;
-        preserve_live_asr_runtime_controls(&mut restored, &live);
-    }
-    // Persist the live-control-preserving settings as the FIRST and ONLY write of settings.json to disk (the
-    // snapshot's file was deliberately NOT copied above). data_dir/settings.json still holds the PRE-restore
-    // settings until this write lands, so if it fails or is interrupted (disk full during recovery, or a kill
-    // in the window) the on-disk consent stays the user's current REVOKED value — a consent-safe partial
-    // restore — never the snapshot's cloud-ON opt-ins. AppSettings::load does NOT reset opt-ins, so this is
-    // exactly what the next launch reads. Best-effort: the DB is already restored and consent fails SAFE.
-    if let Err(e) = restored.save(&live_settings_path) {
-        tracing::warn!("snapshot restore: could not persist live-control-preserving settings to disk: {e}");
-    }
-    *state.lock_settings() = restored.clone();
-    state.update_pipeline_settings(restored);
-    // (undo/redo history was already cleared above, right after the DB swap.)
-    tracing::info!("database and config restored from auto-snapshot {name}");
-    Ok(())
+}
+
+fn public_job_read_error(_private_detail: &str) -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "JOB_CENTER_UNAVAILABLE",
+        "The Job Center could not read durable operation status. Open Health for recovery options.",
+        true,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+}
+
+fn public_job_rate_limited_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "JOB_CENTER_BUSY",
+        "The Job Center is refreshing too quickly. Retry in a moment.",
+        true,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
 }
 
 #[tauri::command]
-pub fn cancel_operation(state: State<'_, AppState>) -> Result<(), String> {
-    state.cancel_current_operation();
-    Ok(())
+#[specta::specta]
+pub async fn get_jobs(state: State<'_, AppState>) -> Result<Vec<JobV1>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_jobs").map_err(|_| public_job_rate_limited_error())?;
+    let store = state.job_store();
+    run_blocking(move || {
+        store.list_recent(50).map(|jobs| jobs.into_iter().map(JobV1::from).collect()).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| public_job_read_error(&error))
 }
 
-#[tauri::command]
-pub fn get_inference_stats() -> Result<serde_json::Value, String> {
-    Ok(crate::inference::get_inference_stats())
-}
+#[cfg(test)]
+mod typed_job_ipc_tests {
+    use super::*;
 
-const WSL_LOG_LINE_PREVIEW_CHARS: usize = 4096;
-
-/// True while a batch 7B refinement run is in flight. A plain flag (not a child handle) because the
-/// batch drives the per-segment warm client in a loop — there is no single long-lived child to hold.
-/// Guards against a second concurrent batch starting on top of the first.
-pub(crate) static WSL_REFINE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Set by `cancel_wsl_refinement`; polled between segments by the batch loop AND in-flight by the
-/// per-segment spawn so a cancel stops the run within ~50 ms. Reset to false when a new batch starts.
-static WSL_REFINE_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Clears the batch flags on drop so they reset even if the worker thread panics mid-batch.
-/// Resetting CANCEL here (at run END) — rather than at run start — means a new run never needs a
-/// start-of-run reset that could clobber a cancel racing the claim, and a late cancel can't leak
-/// into the next run.
-struct WslRefineRunningGuard;
-impl Drop for WslRefineRunningGuard {
-    fn drop(&mut self) {
-        WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-fn wsl_log_preview(line: &str) -> String {
-    let mut chars = line.chars();
-    let mut preview: String = chars.by_ref().take(WSL_LOG_LINE_PREVIEW_CHARS).collect();
-    if chars.next().is_some() {
-        preview.push_str(" [truncated WSL log line]");
-    }
-    preview
-}
-
-/// A segment needs (re)transcription by the 7B batch when it has no usable transcript yet — empty or
-/// any placeholder (`[Pending …]`, `[ASR unavailable …]`, `n/a`, `null`). Uses the same predicate as
-/// the rest of the app (`quality::is_placeholder_transcript`) so the batch recovers an import that
-/// failed under the local CTC engine too, not just the 7B-primary "[Pending]" case. We never target
-/// a segment that already has a real transcript, so the batch can't clobber good CTC output (and
-/// `update_asr_transcript_if_unreviewed` additionally refuses to overwrite a human decision).
-fn segment_awaits_wsl7b(raw_transcript: &str) -> bool {
-    let trimmed = raw_transcript.trim();
-    trimmed.is_empty() || crate::quality::is_placeholder_transcript(trimmed)
-}
-
-/// Within-file ordering key: the chunk's source start offset (ms) parsed from `alignment_json`, or 0
-/// when absent. Segments from one import share a 1-second `created_at` and are tie-broken only by a
-/// random UUID, so without this the batch would process an arbitrary chunk first.
-fn segment_chunk_offset_ms(segment: &crate::db::SpeechSegment) -> i64 {
-    segment
-        .alignment_json
-        .as_deref()
-        .and_then(crate::chunking::SegmentSourceMeta::from_alignment_json)
-        .map(|meta| meta.source_start_ms)
-        .unwrap_or(0)
-}
-
-/// Select which segments the batch 7B refinement should transcribe, honoring the panel's limits.
-/// Pure (no I/O) so it is unit-testable. Drains the backlog deterministically oldest-first and, WITHIN
-/// one import (segments sharing a `created_at`), in chunk order (source start offset) so `test_one`
-/// and capped runs process the FIRST chunk rather than an arbitrary UUID-ordered one. `limit_files`
-/// caps distinct source files; `limit_segments` caps total segments; `test_one` overrides to a single
-/// segment. Returns `(segment_id, audio_path)` pairs.
-fn select_wsl_refinement_targets(
-    segments: &[crate::db::SpeechSegment],
-    limit_files: Option<u32>,
-    limit_segments: Option<u32>,
-    test_one: bool,
-) -> Vec<(String, String)> {
-    // Pair each pending segment with its (parsed-once) chunk offset, then sort: oldest import first,
-    // same file grouped, earliest chunk first, UUID only as a final stable tiebreak.
-    let mut pending: Vec<(&crate::db::SpeechSegment, i64)> = segments
-        .iter()
-        .filter(|s| segment_awaits_wsl7b(&s.raw_transcript))
-        .map(|s| (s, segment_chunk_offset_ms(s)))
-        .collect();
-    pending.sort_by(|(a, a_offset), (b, b_offset)| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.audio_path.cmp(&b.audio_path))
-            .then_with(|| a_offset.cmp(b_offset))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    let mut targets: Vec<(String, String)> =
-        pending.iter().map(|(s, _)| (s.id.clone(), s.audio_path.clone())).collect();
-
-    if let Some(max_files) = limit_files.map(|n| n as usize) {
-        let mut kept_files: Vec<String> = Vec::new();
-        targets.retain(|(_, path)| {
-            if kept_files.iter().any(|p| p == path) {
-                true
-            } else if kept_files.len() < max_files {
-                kept_files.push(path.clone());
-                true
-            } else {
-                false
-            }
+    #[test]
+    fn job_wire_state_is_exact_and_private_failures_are_scrubbed() {
+        let job = JobV1::from(crate::jobs::Job {
+            id: "job-1".to_string(),
+            kind: "import".to_string(),
+            state: crate::jobs::JobState::Failed,
+            progress: 0.5,
+            completed: 1,
+            total: Some(2),
+            error_code: Some("INTERRUPTED".to_string()),
         });
-    }
+        let wire = serde_json::to_value(job).expect("serialize public job");
+        assert_eq!(wire["state"], "failed");
+        assert_eq!(wire["errorCode"], "INTERRUPTED");
 
-    if test_one {
-        targets.truncate(1);
-    } else if let Some(max_segments) = limit_segments.map(|n| n as usize) {
-        targets.truncate(max_segments);
-    }
-
-    targets
-}
-
-/// Drain a subprocess log stream line-by-line, decoding each line LOSSILY. `BufRead::lines()` yields
-/// `io::Result<String>` and returns `Err(InvalidData)` for any non-UTF-8 line, so the previous
-/// `lines().map_while(Result::ok)` permanently terminated the reader on the first such line —
-/// silently freezing the live WSL progress feed for the rest of a (possibly hour-long) run on a
-/// distro with a non-UTF-8 locale. Reading raw bytes and decoding with `from_utf8_lossy` survives
-/// any input (invalid bytes become U+FFFD) so every subsequent line still reaches the feed. The
-/// trailing `\r` of a `\r\n` line is trimmed. Retained (with its regression test) as the canonical
-/// subprocess-log drainer; the current per-segment warm-client batch streams progress directly, so
-/// it has no caller today — kept (allow(dead_code), paired with `join_wsl_log_reader`) so the
-/// subprocess log path can be restored without re-deriving the non-UTF-8 contract.
-#[allow(dead_code)]
-fn drain_log_lines<R: std::io::BufRead>(reader: R, mut on_line: impl FnMut(&str)) {
-    for line in reader.split(b'\n') {
-        let Ok(bytes) = line else { break }; // genuine I/O error (not an encoding error): stop
-        let text = String::from_utf8_lossy(&bytes);
-        on_line(text.trim_end_matches('\r'));
-    }
-}
-
-// Join a WSL subprocess log-reader thread, warning (never panicking) if it unwound. Paired with
-// drain_log_lines for the subprocess-spawning log path; the per-segment warm-client batch supersedes
-// the in-commands subprocess driver, so this currently has no caller here — kept (allow(dead_code))
-// so the subprocess path can be restored without re-deriving it.
-#[allow(dead_code)]
-fn join_wsl_log_reader(thread: std::thread::JoinHandle<()>, stream: &str) {
-    if thread.join().is_err() {
-        tracing::warn!("WSL {stream} log reader thread panicked");
-    }
-}
-
-#[tauri::command]
-pub fn run_wsl_refinement(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    limit_files: Option<u32>,
-    limit_segments: Option<u32>,
-    dry_run: bool,
-    test_one: bool,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("run_wsl_refinement")?;
-    // P1.3b: don't start the 7B refinement loop (a background DB writer) while a restore is reserved.
-    if restore_pending() {
-        return Err(RESTORE_IN_PROGRESS_MSG.into());
-    }
-
-    // Single-run guard: claim the running flag atomically. If it was already true, a batch is in
-    // flight — refuse rather than starting a second concurrent loop over the same segments.
-    if WSL_REFINE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Err("WSL 7B refinement batch transcription is already running.".into());
-    }
-    // P1.3b (publish-then-recheck): the running flag is now PUBLISHED; re-read the reservation. This
-    // closes the atomic check-then-set race with prepare_restore (which sets RESTORE_PENDING then reads
-    // this flag via writers_active): either it already observed our flag (the fence refuses the restore),
-    // or we observe its reservation here and roll back — the two orderings can no longer both slip.
-    if restore_pending() {
-        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-        return Err(RESTORE_IN_PROGRESS_MSG.into());
-    }
-    // The running flag is now OURS; every early return below MUST clear it or the guard would wedge.
-    // Reset CANCEL at the START of the run (standard cancellation-token pattern) rather than trusting
-    // the previous run's guard to have cleared it. The guard clears CANCEL then RUNNING as two separate
-    // atomic stores, so a `cancel` that read RUNNING==true just before the guard could set CANCEL=true
-    // AFTER the guard cleared it — leaking a stale cancel that would make THIS fresh batch abort
-    // immediately, doing zero work, with no error surfaced. Clearing it here, now that RUNNING is
-    // exclusively ours, drops that leaked value. (The only residual is a cancel landing in the tiny
-    // window between the claim above and this store; that is user-recoverable by clicking cancel again,
-    // whereas the leak was silent and unrecoverable.)
-    WSL_REFINE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    // Read everything the worker needs under the locks NOW, then release them so the long per-segment
-    // loop holds no AppState lock. A 7B call can take seconds; holding a lock across the loop would
-    // freeze the UI's get_segments exactly like the jury-starvation bug we already fixed. The
-    // poison-recovering lock_* accessors never panic.
-    let setup = {
-        let settings = state.lock_settings();
-        let external_script = settings.external_asr_script_path();
-        let auto_normalize = settings.auto_normalize;
-        let verbalize_numbers = settings.verbalize_numbers;
-        drop(settings);
-        external_script.map(|script| (script, auto_normalize, verbalize_numbers))
-    };
-    let (external_script, auto_normalize, verbalize_numbers) = match setup {
-        Some(values) => values,
-        None => {
-            WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-            return Err("External ASR provider script is not configured in Settings.".into());
-        }
-    };
-    let db_path = state.lock_pipeline().db_path().to_string();
-
-    // Builder::spawn returns Err on OS thread-creation failure instead of PANICKING like thread::spawn,
-    // so a failed spawn can't leave WSL_REFINE_RUNNING wedged true (the RAII guard lives inside the
-    // closure and would never run on a spawn panic).
-    let spawned = std::thread::Builder::new().name("wsl-7b-batch".into()).spawn(move || {
-        // Clears WSL_REFINE_RUNNING + WSL_REFINE_CANCEL on every exit path, including a panic.
-        let _running = WslRefineRunningGuard;
-        // catch_unwind so a panic in the loop still emits a terminal wsl-status — otherwise the panel
-        // would stay wedged at "Processing…" forever (it only clears `running` on a wsl-status event).
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_wsl_refinement_loop(
-                &app,
-                &db_path,
-                &external_script,
-                auto_normalize,
-                verbalize_numbers,
-                limit_files,
-                limit_segments,
-                dry_run,
-                test_one,
-            )
-        }));
-        // Carry transcribed AND failed so the UI can be honest: a run with any failures is reported
-        // "completed" with failed>0 (not a clean green success), and an all-failed run is "failed".
-        let (status, transcribed, failed, exit_code) = match outcome {
-            Ok(Ok(summary)) if summary.cancelled => {
-                ("cancelled", summary.transcribed as i64, summary.failed as i64, summary.transcribed as i64)
-            }
-            Ok(Ok(summary)) if summary.transcribed == 0 && summary.failed > 0 => {
-                ("failed", 0, summary.failed as i64, -1)
-            }
-            Ok(Ok(summary)) => ("completed", summary.transcribed as i64, summary.failed as i64, summary.transcribed as i64),
-            Ok(Err(message)) => {
-                emit_or_log(&app, "wsl-log", format!("[ERROR] {}", wsl_log_preview(&message)));
-                ("failed", 0, 0, -1)
-            }
-            Err(_panic) => {
-                emit_or_log(&app, "wsl-log", "[ERROR] WSL 7B batch worker panicked; the run was aborted.".to_string());
-                ("failed", 0, 0, -1)
-            }
-        };
-        emit_or_log(
-            &app,
-            "wsl-status",
-            serde_json::json!({ "status": status, "transcribed": transcribed, "failed": failed, "exit_code": exit_code }),
-        );
-    });
-    if let Err(error) = spawned {
-        WSL_REFINE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-        return Err(format!("Failed to start the WSL 7B batch worker thread: {error}"));
-    }
-
-    Ok(serde_json::json!({ "status": "started" }))
-}
-
-struct WslRefinementSummary {
-    transcribed: usize,
-    failed: usize,
-    cancelled: bool,
-}
-
-/// The detached batch worker: drive the per-segment warm 7B client over every pending segment, write
-/// each result through the human-decision-safe update, and stream progress as `wsl-log` events. No
-/// AppState lock is held here — it owns its own DB connection opened from `db_path`.
-#[allow(clippy::too_many_arguments)]
-fn run_wsl_refinement_loop(
-    app: &tauri::AppHandle,
-    db_path: &str,
-    external_script: &str,
-    auto_normalize: bool,
-    verbalize_numbers: bool,
-    limit_files: Option<u32>,
-    limit_segments: Option<u32>,
-    dry_run: bool,
-    test_one: bool,
-) -> Result<WslRefinementSummary, String> {
-    emit_or_log(
-        app,
-        "wsl-log",
-        ">>> Driving the Meta OmniASR 7B warm client over pending segments (one --segment-id call each)...".to_string(),
-    );
-
-    // Worker connection (background thread): plain `open`, NOT open_with_retry — the boot-time-only
-    // destructive quarantine must not be reachable from a live worker, and the DB was integrity-checked
-    // at boot. `open` sets WAL + busy_timeout for contention.
-    let db = crate::db::Database::open(db_path).map_err(|e| e.to_string())?;
-    // P1.3: the backlog, not the library. This used to read every segment ever imported and then throw
-    // away every one that already had a transcript. The SQL prefilter is a deliberate SUPERSET of
-    // `segment_awaits_wsl7b`, which stays the authority below — see PendingWork::Transcript.
-    let candidates = db.get_pending_segments(crate::db::PendingWork::Transcript).map_err(|e| e.to_string())?;
-    let targets = select_wsl_refinement_targets(&candidates, limit_files, limit_segments, test_one);
-
-    if targets.is_empty() {
-        emit_or_log(
-            app,
-            "wsl-log",
-            ">>> No segments are awaiting 7B transcription (every segment already has a transcript). Nothing to do."
-                .to_string(),
-        );
-        return Ok(WslRefinementSummary { transcribed: 0, failed: 0, cancelled: false });
-    }
-
-    let total = targets.len();
-    emit_or_log(app, "wsl-log", format!(">>> {total} segment(s) awaiting 7B transcription."));
-
-    if dry_run {
-        for (idx, (id, path)) in targets.iter().enumerate() {
-            let file = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path.as_str());
-            emit_or_log(
-                app,
-                "wsl-log",
-                format!("[dry-run] [{}/{}] would transcribe {} ({})", idx + 1, total, id, wsl_log_preview(file)),
-            );
-        }
-        emit_or_log(app, "wsl-log", ">>> Dry run complete — no transcripts were written.".to_string());
-        return Ok(WslRefinementSummary { transcribed: 0, failed: 0, cancelled: false });
-    }
-
-    let normalizer = crate::normalizer::SoraniNormalizer::with_config(crate::normalizer::NormalizationConfig {
-        normalize_numbers: auto_normalize,
-        verbalize_numbers,
-        normalize_hamza: true,
-        remove_diacritics: false,
-    });
-
-    let mut transcribed = 0usize;
-    let mut failed = 0usize;
-    for (idx, (id, _path)) in targets.iter().enumerate() {
-        if WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
-            emit_or_log(app, "wsl-log", format!(">>> Cancelled by user after {idx}/{total} segment(s)."));
-            return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
-        }
-        emit_or_log(app, "wsl-log", format!("[{}/{}] transcribing {}...", idx + 1, total, id));
-        match crate::pipeline::run_wsl_segment_transcript_with_script(
-            external_script,
-            id,
-            db_path,
-            Some(&WSL_REFINE_CANCEL),
-        ) {
-            Ok((raw_transcript, _)) if raw_transcript.trim().is_empty() => {
-                // A blank 7B result (silent/music/noise clip — parse_wsl_segment_result returns Ok(""))
-                // must NOT overwrite an existing good transcript: update_asr_transcript_if_unreviewed
-                // writes raw_transcript unconditionally (guarding only human-reviewed rows). Skip; keep the
-                // current text. Neither transcribed nor failed, like the human-reviewed skip below.
-                // (blank-transcript-never-overwrites-good; sibling of transcribe_segment / batch_transcribe.)
-                emit_or_log(
-                    app,
-                    "wsl-log",
-                    format!(
-                        "[{}/{}] {id} produced an empty transcript (silent clip) — existing transcript kept",
-                        idx + 1,
-                        total
-                    ),
-                );
-            }
-            Ok((raw_transcript, confidence)) => {
-                let normalized = if auto_normalize && !raw_transcript.is_empty() {
-                    Some(normalizer.normalize(&raw_transcript))
-                } else {
-                    None
-                };
-                let champion = crate::db::SegmentHypothesis {
-                    segment_id: id.to_string(),
-                    model_id: crate::pipeline::CHAMPION_MODEL_ID.to_string(),
-                    transcript: raw_transcript.clone(),
-                    confidence,
-                };
-                match db.commit_champion_transcript_if_unreviewed(
-                    &champion,
-                    normalized.as_deref(),
-                    Some("external_provider"),
-                    false,
-                ) {
-                    Ok(true) => {
-                        transcribed += 1;
-                        emit_or_log(
-                            app,
-                            "wsl-log",
-                            format!("[{}/{}] {} -> {}", idx + 1, total, id, wsl_log_preview(raw_transcript.trim())),
-                        );
-                    }
-                    Ok(false) => emit_or_log(
-                        app,
-                        "wsl-log",
-                        format!("[{}/{}] {} skipped (human-reviewed; transcript not overwritten)", idx + 1, total, id),
-                    ),
-                    Err(error) => {
-                        failed += 1;
-                        emit_or_log(
-                            app,
-                            "wsl-log",
-                            format!(
-                                "[ERROR] [{}/{}] {} db write failed: {}",
-                                idx + 1,
-                                total,
-                                id,
-                                wsl_log_preview(&error.to_string())
-                            ),
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                // A cancel mid-clip surfaces here as an error from the spawn; attribute it to the
-                // cancel, not to a failure, and stop the run.
-                if WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
-                    emit_or_log(app, "wsl-log", format!(">>> Cancelled by user during segment {}/{}.", idx + 1, total));
-                    return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
-                }
-                failed += 1;
-                emit_or_log(
-                    app,
-                    "wsl-log",
-                    format!("[ERROR] [{}/{}] {}: {}", idx + 1, total, id, wsl_log_preview(&error.to_string())),
-                );
-            }
+        let hostile = public_job_read_error(r"SQL token=secret D:\private\jobs.sqlite");
+        let wire = serde_json::to_string(&hostile).expect("serialize public job error");
+        assert!(wire.contains("JOB_CENTER_UNAVAILABLE"));
+        assert!(wire.contains("openHealth"));
+        for forbidden in ["SQL", "token", "secret", "D:\\", "private", "jobs.sqlite"] {
+            assert!(!wire.contains(forbidden));
         }
     }
-
-    // A cancel that arrives during the FINAL segment passes every in-loop check (there is no next
-    // iteration); re-check once here so it is honestly reported as cancelled, not completed.
-    if WSL_REFINE_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
-        emit_or_log(app, "wsl-log", format!(">>> Cancelled by user; {transcribed} transcribed before stopping."));
-        return Ok(WslRefinementSummary { transcribed, failed, cancelled: true });
-    }
-
-    emit_or_log(
-        app,
-        "wsl-log",
-        format!(">>> Complete! {transcribed} transcribed, {failed} failed of {total} pending."),
-    );
-    Ok(WslRefinementSummary { transcribed, failed, cancelled: false })
-}
-
-#[tauri::command]
-pub fn cancel_wsl_refinement() -> Result<(), String> {
-    // Only arm the cancel while a batch is actually running, so an idle cancel can't leak into and
-    // immediately abort the NEXT run. Signals the batch loop (checked between segments) and the
-    // in-flight per-segment spawn (which polls this same flag and kills its child) to stop; there is
-    // no single child handle to kill here — each per-segment child is owned and reaped in the helper.
-    if WSL_REFINE_RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
-        WSL_REFINE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, String> {
-    RATE_LIMITER.check("compute_acoustic_scores")?;
-    let settings_gpu = {
-        let s = state.lock_settings();
-        s.enable_gpu
-    };
-    let models_dir = state.lock_model_manager().models_dir.clone();
-    let db = state.db_arc();
-    run_blocking(move || {
-        // P1.3: `WHERE ctc_score IS NULL` instead of reading the whole library and `continue`-ing past
-        // every row that already has one. After the first pass this returns nothing at all.
-        let segments = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_pending_segments(crate::db::PendingWork::CtcScore).map_err(|e| e.to_string())?
-        };
-
-        let aligner = aligner::ForcedAligner::new(&models_dir, settings_gpu).map_err(|e| e.to_string())?;
-
-        if !aligner.is_available() {
-            return Err("MMS Forced Aligner model (mms_aligner.onnx) is not available.".to_string());
-        }
-
-        let mut count = 0;
-        for seg in &segments {
-            let text = seg.raw_transcript.clone();
-            if text.trim().is_empty() {
-                continue;
-            }
-
-            let audio_path = seg.audio_path.clone();
-            if !std::path::Path::new(&audio_path).exists() {
-                tracing::warn!("Skipping acoustic score for {}: audio path not found: {}", seg.id, audio_path);
-                continue;
-            }
-
-            let (sample_rate, pcm) = match audio::decode_to_pcm_with_timeout(&audio_path, Duration::from_secs(30)) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    tracing::warn!("Skipping acoustic score for {}: decode failed: {error}", seg.id);
-                    continue;
-                }
-            };
-            let (_sr, pcm_16k) = match audio::ensure_pcm_16khz(sample_rate, pcm) {
-                Ok(resampled) => resampled,
-                Err(error) => {
-                    tracing::warn!("Skipping acoustic score for {}: 16 kHz conversion failed: {error}", seg.id);
-                    continue;
-                }
-            };
-            // Score only THIS segment's clip, not the whole source file. Segments share the source
-            // audio_path (the per-segment range lives in alignment_json), so without slicing the acoustic
-            // ctc_score — which feeds the conformal jury gate — would be computed over the ENTIRE recording
-            // for every segment, a systematically wrong quality signal on any multi-segment import.
-            let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
-                &pcm_16k,
-                audio::TARGET_SAMPLE_RATE,
-                seg.alignment_json.as_deref(),
-            ) {
-                Ok((clip, _)) => clip,
-                Err(error) => {
-                    tracing::warn!("Skipping acoustic score for {}: clip slice failed: {error}", seg.id);
-                    continue;
-                }
-            };
-            let score = match aligner.score_consistency(&pcm_16k, audio::TARGET_SAMPLE_RATE, &text) {
-                Ok(score) => score,
-                Err(error) => {
-                    tracing::warn!("Skipping acoustic score for {}: scoring failed: {error}", seg.id);
-                    continue;
-                }
-            };
-
-            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
-            guard.update_ctc_score(&seg.id, score).map_err(|e| e.to_string())?;
-            count += 1;
-        }
-
-        Ok(count)
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result<usize, String> {
-    RATE_LIMITER.check("compute_signal_anomaly_scores")?;
-    let models_dir = state.lock_model_manager().models_dir.clone();
-    let db = state.db_arc();
-    run_blocking(move || {
-        // P1.3: `WHERE signal_anomaly_score IS NULL` — see the CTC sibling above.
-        let segments = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.get_pending_segments(crate::db::PendingWork::SignalAnomaly).map_err(|e| e.to_string())?
-        };
-
-        let detector = quality::signal_anomaly::SignalAnomalyDetector::new(&models_dir).map_err(|e| e.to_string())?;
-
-        let mut count = 0;
-        for seg in &segments {
-            let audio_path = seg.audio_path.clone();
-            if !std::path::Path::new(&audio_path).exists() {
-                continue;
-            }
-
-            let (sample_rate, pcm) = match audio::decode_to_pcm_with_timeout(&audio_path, Duration::from_secs(30)) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    tracing::warn!("Skipping signal-anomaly score for {}: decode failed: {error}", seg.id);
-                    continue;
-                }
-            };
-            let (_sr, pcm_16k) = match audio::ensure_pcm_16khz(sample_rate, pcm) {
-                Ok(resampled) => resampled,
-                Err(error) => {
-                    tracing::warn!("Skipping signal-anomaly score for {}: 16 kHz conversion failed: {error}", seg.id);
-                    continue;
-                }
-            };
-            // Score only THIS segment's clip, not the whole source file (same whole-file-vs-clip hazard as
-            // the acoustic-score loop): segments share the source audio_path, with the range in alignment_json.
-            let pcm_16k = match crate::chunking::slice_pcm_by_alignment(
-                &pcm_16k,
-                audio::TARGET_SAMPLE_RATE,
-                seg.alignment_json.as_deref(),
-            ) {
-                Ok((clip, _)) => clip,
-                Err(error) => {
-                    tracing::warn!("Skipping signal-anomaly score for {}: clip slice failed: {error}", seg.id);
-                    continue;
-                }
-            };
-            let score = match detector.compute_signal_anomaly_score(&pcm_16k) {
-                Ok(score) => score,
-                Err(error) => {
-                    tracing::warn!("Skipping signal-anomaly score for {}: scoring failed: {error}", seg.id);
-                    continue;
-                }
-            };
-
-            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
-            guard.update_signal_anomaly_score(&seg.id, score).map_err(|e| e.to_string())?;
-            count += 1;
-        }
-
-        Ok(count)
-    })
-    .await
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2950,17 +760,6 @@ pub fn export_agreement_sample(state: State<'_, AppState>) -> Result<Option<crat
     Ok(Some(sample))
 }
 
-/// Consent gate for any ElevenLabs Scribe upload. Voice is biometric data (GDPR Art. 9), so audio
-/// must NEVER be sent to a provider without the user's explicit cloud-STT opt-in. The pipeline path
-/// enforces this; the direct Scribe IPC commands must too, or they silently bypass consent.
-pub(crate) fn require_cloud_stt_consent(state: &AppState) -> Result<(), String> {
-    if state.lock_settings().cloud_stt_opt_in {
-        Ok(())
-    } else {
-        Err("Cloud STT opt-in is required to use ElevenLabs Scribe. Enable it in Settings.".into())
-    }
-}
-
 /// Consent gate for outbound cloud-LLM channels that POST private, transcript-derived data (e.g. the
 /// DPO preference-pair export). Same explicit opt-in the LLM-refine path requires — never ship the
 /// user's data to a cloud endpoint without it, even though the endpoint is also allow-list-validated.
@@ -2972,78 +771,12 @@ pub(crate) fn require_cloud_llm_consent(state: &AppState) -> Result<(), String> 
     }
 }
 
-/// Scribe-transcribe ONLY this segment's clip. Every VAD chunk shares the WHOLE-source audio_path (the
-/// per-segment range lives in alignment_json), so uploading `audio_path` directly would send the entire
-/// recording to ElevenLabs — billing for the whole file and returning the whole-recording transcript for
-/// one short segment. Decode, slice the clip by alignment, write a temp 16 kHz WAV, transcribe that, and
-/// delete the temp. `alignment_json` None (a single-segment file) sends the whole file, which is correct.
-fn scribe_transcribe_clip(audio_path: &str, alignment_json: Option<&str>, key: &str) -> Result<String, String> {
-    let (sr, pcm) = crate::audio::decode_to_pcm(audio_path).map_err(|e| e.to_string())?;
-    let (clip, _suffix) =
-        crate::chunking::slice_pcm_by_alignment(&pcm, sr, alignment_json).map_err(|e| e.to_string())?;
-    let tmp = std::env::temp_dir().join(format!("cortex-scribe-{}.wav", uuid::Uuid::new_v4()));
-    crate::export::write_wav_atomic(&tmp, sr, &clip).map_err(|e| e.to_string())?;
-    let result =
-        crate::scribe_api::transcribe(tmp.to_string_lossy().as_ref(), key, crate::scribe_api::DEFAULT_MODEL, "kur");
-    let _ = std::fs::remove_file(&tmp); // best-effort cleanup
-    result.map_err(|e| e.to_string())
-}
-
-/// Transcribe ONE imported segment's clip with ElevenLabs Scribe (verified working for Sorani). Uses the
-/// locally configured ELEVENLABS_API_KEY; errors clearly if it is absent. Returns the transcription text.
-#[tauri::command]
-pub async fn transcribe_audio_with_scribe(
-    audio_path: String,
-    alignment_json: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    STRICT_RATE_LIMITER.check("transcribe_audio_with_scribe")?;
-    // Enforce the cloud-STT privacy gate at the IPC trust boundary: audio must never leave the device
-    // for ElevenLabs unless the user explicitly opted in — require_cloud_stt_consent mirrors
-    // pipeline::scribe_api_key_if_enabled so every Scribe egress path honors the same toggle, not just
-    // the import path.
-    require_cloud_stt_consent(&state)?;
-    // Only audio already imported into THIS dataset may be uploaded to the cloud — never an
-    // arbitrary local file path handed in by the (untrusted) webview. ensure_imported both
-    // validates the path and confirms DB membership.
-    let audio_path = {
-        let db = state.lock_db();
-        crate::media::MediaRegistry::ensure_imported(&db, &audio_path)?
-    };
-    let data_dir = state.lock_data_dir().clone().ok_or_else(|| "App data directory is unavailable".to_string())?;
-    let key = crate::api_keys::ApiKeys::load(&data_dir)
-        .elevenlabs
-        .ok_or_else(|| "No ElevenLabs API key configured — add ELEVENLABS_API_KEY to secrets.env".to_string())?;
-    // The blocking ElevenLabs upload+POST runs on the blocking pool so the UI thread stays responsive.
-    // Every privacy/validation gate above (STT consent, DB-membership via ensure_imported, key present)
-    // already ran EAGERLY on the caller thread, so an un-opted-in or unvalidated request is rejected
-    // before any audio is offloaded or leaves the device.
-    run_blocking(move || scribe_transcribe_clip(&audio_path, alignment_json.as_deref(), &key)).await
-}
-
-/// Model id for the independent ElevenLabs Scribe vote. Scribe is architecturally INDEPENDENT of the
-/// OmniASR-CTC family, so (unlike the kin 300M/1B) its vote genuinely corroborates or contradicts the
-/// local consensus — the highest-value escalation signal and training pair per the research.
-///
-/// Round-23 #9: this label is stored as the hypothesis' provenance AND shown to the T2 judge, so it
-/// MUST name the model version ACTUALLY transmitted to ElevenLabs (`scribe_api::DEFAULT_MODEL`,
-/// currently `scribe_v1`) — never a version that was never invoked. The
-/// `scribe_vote_model_id_matches_the_model_actually_sent` test fails if the two ever drift.
-const SCRIBE_VOTE_MODEL_ID: &str = "scribe-v1";
-
-/// Serializes `add_scribe_votes` batches. The old sync command was physically serialized by the main
-/// thread; the async version could self-overlap (two rapid calls both passing the gather-time
-/// existing-vote check and double-POSTing the same consented audio — duplicate Scribe COST, never
-/// duplicate data: the (segment_id, model_id) upsert keeps one scribe-v1 row). This flag restores the
-/// old one-at-a-time behavior explicitly.
-pub(crate) static SCRIBE_VOTES_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Count of in-flight BACKGROUND DB writers that use their OWN dedicated connection (NOT the global db
 /// Mutex) and may run OUTSIDE the import/batch guards — so they escape the db-Mutex serialization the
 /// restore relies on, and `AppState::writers_active` must consult this to fence a restore while any is
 /// mid-write (R3). Registrants: the jury writers (run_jury_pipeline / run_t2_for_segment /
 /// run_dpo_update + the post-import adjudication thread) and the detached background-alignment thread.
-/// A COUNTER, not a bool: unlike the WSL/Scribe flags (which reject overlap), these may legitimately
+/// A COUNTER, not a bool: these writers may legitimately
 /// overlap, and a bool would clear the fence when the FIRST of two concurrent writers finished. This is
 /// the one place a NEW dedicated-connection writer registers — extend by taking a guard, not by growing
 /// the writers_active() || chain (the recurring "forgot the new writer" bug this closes twice over).
@@ -3474,7 +1207,8 @@ fn load_hypotheses_for_segment(
     seg: &crate::db::SpeechSegment,
 ) -> Result<Vec<crate::db::SegmentHypothesis>, String> {
     let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;
-    let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted);
+    let recorded_is_champion = segment_recorded_model_is_champion(db, seg);
+    let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted, recorded_is_champion);
     if hyps.is_empty() && settings.asr_model_size != crate::settings::AsrModelSize::WSL7B {
         hyps.push(crate::db::SegmentHypothesis {
             segment_id: seg_id.to_string(),
@@ -3515,7 +1249,7 @@ fn with_jury_db<R>(app_state: &AppState, f: impl FnOnce(&crate::db::Database) ->
 /// the fallback. Same semantics as `with_jury_db` — it IS `with_jury_db`'s implementation.
 struct JuryDbSource {
     db_path: String,
-    shared: Arc<std::sync::Mutex<crate::db::Database>>,
+    shared: crate::AppDatabaseHandle,
 }
 
 fn jury_db_source(app_state: &AppState) -> JuryDbSource {
@@ -3594,13 +1328,16 @@ fn resolve_t2_endpoint(
     settings: &crate::settings::AppSettings,
     gemini_key: &str,
     data_dir: Option<&std::path::Path>,
-) -> (crate::jury::t2_listener::T2Endpoint, String, String) {
+) -> Result<(crate::jury::t2_listener::T2Endpoint, String, String), String> {
     let openrouter_key = if settings.jury_provider.eq_ignore_ascii_case("openrouter") {
-        data_dir.and_then(|d| crate::api_keys::ApiKeys::load(d).openrouter)
+        match data_dir {
+            Some(directory) => crate::api_keys::ApiKeys::load(directory)?.openrouter,
+            None => None,
+        }
     } else {
         None
     };
-    resolve_t2_endpoint_from_keys(settings, gemini_key, openrouter_key.as_deref())
+    Ok(resolve_t2_endpoint_from_keys(settings, gemini_key, openrouter_key.as_deref()))
 }
 
 /// Direct-Gemini entry point (the default transport, used by tests and any caller without a data dir).
@@ -3619,11 +1356,20 @@ pub fn run_jury_pipeline_core_via(
     segment_ids: Vec<String>,
     data_dir: Option<&std::path::Path>,
 ) -> Result<serde_json::Value, String> {
-    // Champion-only production mode has exactly one ASR by design. Running a multi-ASR jury here
-    // either treats stale auxiliary rows as votes or immediately fails its two-model coverage guard.
-    // Both outcomes violate the owner's sole-champion contract. Leave every fresh draft for the human
-    // review flow and keep the stricter multi-model proof confined to explicit non-champion/export use.
-    if settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+    // Schema v60 retired every machine-verdict writer: paid review truth now crosses only the
+    // evidence-backed human-decision boundary. Continuing into the historical jury at v60+ would do
+    // expensive work and then fail the import on its first forbidden write. Champion-only production
+    // also has exactly one ASR, so a multi-ASR jury is meaningless even against an archival schema.
+    // Keep the old jury executable only for explicit pre-v60 diagnostics and leave current drafts for
+    // human review. This guard is deliberately at the shared core so directory, file, audiobook, and
+    // direct-command callers cannot drift apart.
+    let schema_version = crate::migrations::get_current_version(db).map_err(|error| error.to_string())?;
+    if schema_version >= 60 || settings.asr_model_size == crate::settings::AsrModelSize::WSL7B {
+        let reason = if schema_version >= 60 {
+            "Schema v60+ sends machine drafts directly to the evidence-backed human review flow; machine jury writes are retired"
+        } else {
+            "Champion-only mode sends OmniASR 7B drafts directly to human review; auxiliary-ASR jury is not run"
+        };
         return Ok(serde_json::json!({
             "mode": "not_required",
             "totalInput": segment_ids.len(),
@@ -3635,7 +1381,7 @@ pub fn run_jury_pipeline_core_via(
             "t1Committed": 0,
             "t2Committed": 0,
             "humanInbox": segment_ids.len(),
-            "reason": "Champion-only mode sends OmniASR 7B drafts directly to human review; auxiliary-ASR jury is not run"
+            "reason": reason
         }));
     }
 
@@ -3647,7 +1393,7 @@ pub fn run_jury_pipeline_core_via(
     let n_samples = (settings.jury_self_consistency_n as usize).max(3);
     // T2 transport: direct Gemini by default, or OpenRouter (with the OR key from secrets.env) when the
     // jury provider is set to "openrouter".
-    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(settings, &settings.llm_api_key, data_dir);
+    let (t2_endpoint, api_key, jury_model) = resolve_t2_endpoint(settings, &settings.llm_api_key, data_dir)?;
 
     // The Autonomy Dial governs EVERY machine-commit stage of this pipeline, not just T0
     // (round-24 hunt #1, HIGH). Observe/Propose previously gated only run_t0_gate; the SAME run then
@@ -4030,16 +1776,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scribe_vote_model_id_matches_the_model_actually_sent() {
-        // Round-23 #9: the stored provenance label must name the model VERSION actually transmitted to
-        // ElevenLabs, never a version that was never invoked. If DEFAULT_MODEL ever changes (e.g. to a
-        // real scribe_v2), this fails until SCRIBE_VOTE_MODEL_ID is updated to match.
-        let sent = crate::scribe_api::DEFAULT_MODEL; // e.g. "scribe_v1"
-        let version = sent.rsplit('_').next().unwrap_or(sent); // "v1"
-        assert!(
-            SCRIBE_VOTE_MODEL_ID.contains(version),
-            "Scribe vote label '{SCRIBE_VOTE_MODEL_ID}' must reflect the sent model version '{version}' (from '{sent}')"
+    fn a_post_batch_jury_failure_is_never_reported_as_a_completed_batch() {
+        // The failure was log-only while the terminal `batch-progress` event still said
+        // type:"completed" — the adjudication that decides what the review queue sees had failed and
+        // nothing above the log said so.
+        let jury = batch_terminal_halt_cause(None, Some("jury db unavailable".into()))
+            .expect("a jury failure must produce a halt cause, not a clean completion");
+        assert!(jury.contains("jury"), "{jury}");
+
+        // A per-clip hard stop still wins and keeps its own cause.
+        assert_eq!(
+            batch_terminal_halt_cause(Some("segment x: decode failed".into()), Some("jury db unavailable".into())),
+            Some("segment x: decode failed".to_string())
         );
+
+        // And a genuinely clean run is still allowed to report completion.
+        assert_eq!(batch_terminal_halt_cause(None, None), None);
     }
 
     fn test_segment(id: &str, audio_path: &str, raw_transcript: &str) -> crate::db::SpeechSegment {
@@ -4065,8 +1817,314 @@ mod tests {
         }
     }
 
+    fn legacy_machine_db() -> crate::db::Database {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        db
+    }
+
+    fn copied_database(source: &crate::db::Database) -> crate::db::Database {
+        let mut copy = crate::db::Database::open(":memory:").unwrap();
+        copy.initialize().unwrap();
+        copy.commit_staged_restore(source).unwrap();
+        copy
+    }
+
+    fn insert_canonical_pay_segment(db: &crate::db::Database, id: &str) {
+        db.insert_segment(&test_segment(id, &format!("{id}.wav"), "machine draft")).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?2,
+                        audio_fingerprint = ?3,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![id, "a".repeat(64), 424_242_i64],
+            )
+            .unwrap();
+    }
+
+    fn canonical_operation(index: u64) -> String {
+        format!("00000000-0000-4000-8000-{index:012x}")
+    }
+
+    fn canonical_phone_playback(
+        db: &crate::db::Database,
+        segment_id: &str,
+        reviewer: &str,
+    ) -> crate::db::PlaybackDecisionProof {
+        let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+        let audio_content_hash = db.segment_audio_content_hash(segment_id).unwrap().unwrap();
+        let (source_start_ms, source_end_ms) = db.segment_source_span(segment_id).unwrap().unwrap();
+        db.record_playback_receipt(&crate::db::PlaybackReceipt {
+            segment_id: segment_id.to_string(),
+            segment_revision: revision,
+            audio_content_hash: audio_content_hash.clone(),
+            reviewer: Some(reviewer.to_string()),
+            session_id: None,
+            started_at_ms: 1,
+            played_ms: 1_000,
+            clip_duration_ms: 1_000,
+            source_start_ms: Some(source_start_ms),
+            source_end_ms: Some(source_end_ms),
+        })
+        .unwrap();
+        crate::db::PlaybackDecisionProof {
+            segment_revision: revision,
+            audio_content_hash,
+            source_start_ms,
+            source_end_ms,
+            authority_session_id: None,
+            source_lease: None,
+        }
+    }
+
+    /// A real policy-4 Couch authority for restore characterizations. The temporary WAV remains
+    /// alive for the complete decision transaction through the proof's verified source lease; no
+    /// synthetic receipt row or cfg(test) writer bypass is involved.
+    struct CanonicalPolicy4Playback {
+        proof: crate::db::PlaybackDecisionProof,
+        _source: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for CanonicalPolicy4Playback {
+        type Target = crate::db::PlaybackDecisionProof;
+
+        fn deref(&self) -> &Self::Target {
+            &self.proof
+        }
+    }
+
+    fn canonical_policy4_phone_playback(
+        db: &crate::db::Database,
+        segment_id: &str,
+        reviewer: &str,
+    ) -> CanonicalPolicy4Playback {
+        let source = tempfile::tempdir().unwrap();
+        let source_path = source.path().join("canonical-policy4.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source_path, spec).unwrap();
+        for sample in 0..16_000_i32 {
+            writer.write_sample::<i16>(((sample % 257) - 128) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let content_hash = crate::export_bundle::current_canonical_pcm_blake3(&source_path).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_path = ?2,
+                        audio_content_hash = ?3,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![segment_id, source_path.to_string_lossy(), content_hash],
+            )
+            .unwrap();
+        let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+        let session_binding_sha256 = "c".repeat(64);
+        let issued_at_ms =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let authority = crate::db::CouchPlaybackAttemptAuthority {
+            playback_receipt_id: uuid::Uuid::new_v4().to_string(),
+            media_grant_id: uuid::Uuid::new_v4().to_string(),
+            client_attempt_id: uuid::Uuid::new_v4().to_string(),
+            session_binding_sha256: session_binding_sha256.clone(),
+            reviewer: reviewer.to_string(),
+            segment_id: segment_id.to_string(),
+            segment_revision: revision,
+            audio_content_hash: content_hash.clone(),
+            source_path,
+            clip_duration_ms: 1_000,
+            source_start_ms: 0,
+            source_end_ms: 1_000,
+            issued_at_ms,
+            expires_at_ms: issued_at_ms + 60_000,
+        };
+        let receipt = db
+            .finalize_couch_playback_attempt_v1(
+                &authority,
+                &[crate::db::DesktopPlaybackInterval { start_ms: 0, end_ms: 1_000 }],
+                1_000,
+            )
+            .unwrap();
+        let proof = db
+            .couch_playback_proof_v4(
+                segment_id,
+                revision,
+                &content_hash,
+                reviewer,
+                &session_binding_sha256,
+                &receipt.playback_receipt_id,
+            )
+            .unwrap()
+            .expect("canonical policy-4 receipt must resolve to its exact source lease");
+        CanonicalPolicy4Playback { proof, _source: source }
+    }
+
+    fn record_canonical_phone_edit(db: &crate::db::Database, segment_id: &str, operation_index: u64) -> (i64, String) {
+        insert_canonical_pay_segment(db, segment_id);
+        let proof = canonical_policy4_phone_playback(db, segment_id, "Reviewer");
+        let operation = canonical_operation(operation_index);
+        db.record_phone_human_decision_by_at_revision_with_operation_limit(
+            segment_id,
+            "edit",
+            Some("machine truth"),
+            "Reviewer",
+            proof.segment_revision,
+            &proof,
+            &operation,
+            &crate::db::review_operation_payload_hash(segment_id, "edit", "machine truth", "Reviewer"),
+            "edit",
+            "machine truth",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let effect_id = db.human_decision_effect_for_operation(&operation).unwrap().unwrap().0;
+        (effect_id, operation)
+    }
+
+    fn record_canonical_skip(db: &crate::db::Database, segment_id: &str, reviewer: &str, index: u64) {
+        db.record_review_event_with_operation(
+            segment_id,
+            reviewer,
+            "skip",
+            "couch",
+            i64::try_from(index).unwrap(),
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(segment_id, "skip", "", reviewer),
+        )
+        .unwrap();
+    }
+
+    fn insert_test_compensation_ledger(db: &crate::db::Database) {
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                    (id, entry_id, entry_key, policy_version, review_event_id,
+                     canonical_work_id, canonical_identity_kind, reviewer, segment_id, source,
+                     compensation_action, effective_decision, decision_revision, duration_ms,
+                     rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                     corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id, created_at)
+                 VALUES
+                    (1, 'entry-1', 'key-1', ?1, NULL,
+                     'work-1', 'test', 'Reviewer', 'ledger-segment', 'test',
+                     'skip', 'skip', NULL, 1000,
+                     0, 0, 0, 0, 0, NULL, '2026-08-22 00:00:00')",
+                [crate::db::REVIEW_PAY_POLICY_VERSION],
+            )
+            .unwrap();
+    }
+
+    fn test_pilot_policy(
+        after_review_event_id: i64,
+        first: &str,
+        second: &str,
+    ) -> crate::review_pilot::ReviewPilotPolicy {
+        crate::review_pilot::parse(
+            &serde_json::json!({
+                "schema_version": 1,
+                "after_review_event_id": after_review_event_id,
+                "max_total_corpus_actions": 20,
+                "reviewers": [
+                    { "name": first, "max_corpus_actions": 10 },
+                    { "name": second, "max_corpus_actions": 10 }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    fn pilot_restore_action(policy: &crate::review_pilot::ReviewPilotPolicy) -> SnapshotPilotPolicyRestore {
+        SnapshotPilotPolicyRestore::Install(serde_json::to_vec(policy).unwrap())
+    }
+
+    fn insert_test_review_event(
+        db: &crate::db::Database,
+        segment_id: &str,
+        reviewer: &str,
+        action: &str,
+        source: &str,
+        timestamp_ms: i64,
+    ) {
+        let paid_provenance = matches!(source, "couch" | "couch_spot_check");
+        let requested_action = match action {
+            "accept" | "edit" | "reject" | "skip" => action,
+            _ => "accept",
+        };
+        let requested_transcript = if requested_action == "skip" { "" } else { "expected" };
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let operation_payload_hash =
+            crate::db::review_operation_payload_hash(segment_id, requested_action, requested_transcript, reviewer);
+        db.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, created_at, app_git_sha, playback_guard_version,
+                     operation_id, operation_payload_hash, requested_action,
+                     requested_transcript, served_transcript, served_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1000, ?3, '2026-08-22 00:00:00', ?6, ?7,
+                         ?8, ?9, ?10, ?11, 'expected', 0)",
+                rusqlite::params![
+                    segment_id,
+                    reviewer,
+                    action,
+                    source,
+                    timestamp_ms,
+                    paid_provenance.then_some(crate::GIT_SHA),
+                    paid_provenance.then_some("content-hash-raw-counter-v3"),
+                    paid_provenance.then_some(operation_id),
+                    paid_provenance.then_some(operation_payload_hash),
+                    paid_provenance.then_some(requested_action),
+                    paid_provenance.then_some(requested_transcript),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_spot_result(db: &crate::db::Database, segment_id: &str, reviewer: &str, action: &str) {
+        db.connection()
+            .execute(
+                "INSERT INTO spot_checks
+                    (segment_id, reviewer, action, submitted_transcript, expected_transcript,
+                     noticed, cer, created_at)
+                 VALUES (?1, ?2, ?3, 'expected', 'expected', 1, 0.0,
+                         '2026-08-22 00:00:00')",
+                rusqlite::params![segment_id, reviewer, action],
+            )
+            .unwrap();
+    }
+
+    fn assert_floor_only_durable_row_rejected<Prepare, AddFloor>(
+        expected_label: &str,
+        prepare_shared: Prepare,
+        add_floor_only: AddFloor,
+    ) where
+        Prepare: FnOnce(&crate::db::Database),
+        AddFloor: FnOnce(&crate::db::Database),
+    {
+        let base = crate::db::Database::open(":memory:").unwrap();
+        base.initialize().unwrap();
+        prepare_shared(&base);
+        let target = copied_database(&base);
+        let floor = copied_database(&base);
+        add_floor_only(&floor);
+        let error = require_durable_review_history_superset(&floor, &target).unwrap_err();
+        assert!(error.contains(expected_label), "expected {expected_label} rejection, got: {error}");
+    }
+
     #[test]
     fn mandatory_pre_restore_snapshot_failure_aborts_before_live_data_can_change() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().expect("local restore reservation");
         let db = crate::db::Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         let segment = test_segment("restore-safety", "restore-safety.wav", "still live");
@@ -4076,14 +2134,2523 @@ mod tests {
         let invalid_data_dir = temp.path().join("not-a-directory");
         std::fs::write(&invalid_data_dir, b"blocks snapshot directory creation").unwrap();
 
-        let err = take_mandatory_pre_restore_snapshot(&db, &invalid_data_dir).unwrap_err();
+        let err = take_mandatory_pre_restore_snapshot(&reservation, &db, &invalid_data_dir).unwrap_err();
         assert!(err.contains("mandatory pre-restore safety snapshot failed"), "{err}");
         assert!(err.contains("has not been overwritten"), "{err}");
+        assert!(
+            !err.contains("requires an active exclusive restore reservation"),
+            "the capability must let this test reach the injected filesystem failure: {err}"
+        );
         assert_eq!(
             db.get_segment_by_id(&segment.id).unwrap().unwrap().raw_transcript,
             "still live",
             "a failed safety pin must leave the live library untouched"
         );
+    }
+
+    #[test]
+    fn durable_restore_floor_protects_all_pre_v60_authorities_by_exact_value() {
+        assert_floor_only_durable_row_rejected(
+            "review_pilot_hidden_keys",
+            |_| {},
+            |floor| {
+                floor
+                    .connection()
+                    .execute(
+                        "INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'Reviewer', 'hidden-1')",
+                        ["a".repeat(64)],
+                    )
+                    .unwrap();
+            },
+        );
+        assert_floor_only_durable_row_rejected(
+            "review_events",
+            |_| {},
+            |floor| {
+                floor
+                    .connection()
+                    .execute(
+                        "INSERT INTO review_events
+                            (id, segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                             compensation_action, created_at)
+                         VALUES (1, 'event-1', 'Reviewer', 'skip', 'test', 1, 1000, 'skip',
+                                 '2026-08-22 00:00:00')",
+                        [],
+                    )
+                    .unwrap();
+            },
+        );
+        assert_floor_only_durable_row_rejected(
+            "spot_checks",
+            |_| {},
+            |floor| {
+                floor
+                    .connection()
+                    .execute(
+                        "INSERT INTO spot_checks
+                            (segment_id, reviewer, action, submitted_transcript, expected_transcript,
+                             noticed, cer, created_at)
+                         VALUES ('spot-1', 'Reviewer', 'edit', 'submitted', 'expected', 1, 0.0,
+                                 '2026-08-22 00:00:00')",
+                        [],
+                    )
+                    .unwrap();
+            },
+        );
+        assert_floor_only_durable_row_rejected("review_compensation_ledger", |_| {}, insert_test_compensation_ledger);
+        assert_floor_only_durable_row_rejected(
+            "review_compensation_settlements",
+            insert_test_compensation_ledger,
+            |floor| {
+                floor
+                    .connection()
+                    .execute(
+                        "INSERT INTO review_compensation_settlements
+                            (id, settlement_id, policy_version, reviewer,
+                             from_ledger_id_exclusive, through_ledger_id_inclusive,
+                             allocated_micro_iqd, payout_reference, created_at)
+                         VALUES (1, 'settlement-1', ?1, 'Reviewer', 0, 1, 0, 'payout-1',
+                                 '2026-08-22 00:00:00')",
+                        [crate::db::REVIEW_PAY_POLICY_VERSION],
+                    )
+                    .unwrap();
+            },
+        );
+        assert_floor_only_durable_row_rejected(
+            "review_compensation_policies",
+            |_| {},
+            |floor| {
+                floor
+                    .connection()
+                    .execute(
+                        "INSERT INTO review_compensation_policies
+                            (policy_version, effective_after_event_id, base_rate_micro_iqd_per_hour,
+                             edit_basis_points, accept_basis_points, reject_basis_points,
+                             skip_basis_points, created_at)
+                         VALUES ('test-policy-v2', 0, 1, 10000, 1000, 1000, 0,
+                                 '2026-08-22 00:00:00')",
+                        [],
+                    )
+                    .unwrap();
+            },
+        );
+        // A legacy correction has to exist before v60 snapshots the immutable frontier. Build that
+        // floor first, then remove both the row and its snapshot from a trigger-disabled staged copy;
+        // rolling only the floor through v60 after the target was copied would also recreate
+        // review_effect_state with a different timestamp and test the wrong authority first.
+        let correction_floor = crate::db::Database::open(":memory:").unwrap();
+        correction_floor.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&correction_floor, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        correction_floor
+            .connection()
+            .execute(
+                "INSERT INTO corrections
+                    (id, segment_id, audio_content_hash, raw_hypothesis, human_fix,
+                     reviewer_id, decided_at)
+                 VALUES ('correction-1', NULL, ?1, 'wrong', 'right', 'Reviewer',
+                         '2026-08-22 00:00:00')",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        assert_eq!(crate::migrations::run_migrations(&correction_floor).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        let correction_target = copied_database(&correction_floor);
+        correction_target
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER corrections_v60_effect_immutable_delete;
+                 DROP TRIGGER legacy_corrections_v60_immutable_delete;
+                 DELETE FROM corrections WHERE id = 'correction-1';
+                 DELETE FROM legacy_corrections_v60 WHERE id = 'correction-1';",
+            )
+            .unwrap();
+        let correction_error =
+            require_durable_review_history_superset(&correction_floor, &correction_target).unwrap_err();
+        assert!(correction_error.contains("corrections"), "expected corrections rejection, got: {correction_error}");
+        assert_floor_only_durable_row_rejected(
+            "playback_receipts",
+            |base| {
+                base.insert_segment(&test_segment("receipt-1", "receipt.wav", "draft")).unwrap();
+            },
+            |floor| {
+                floor
+                    .connection()
+                    .execute(
+                        "INSERT INTO playback_receipts
+                            (id, segment_id, segment_revision, audio_fingerprint, reviewer, session_id,
+                             started_at_ms, played_ms, clip_duration_ms, coverage_ratio,
+                             policy_version, created_at)
+                         VALUES (1, 'receipt-1', 0, 'fingerprint', 'Reviewer', 'session',
+                                 1, 1000, 1000, 1.0, 1, '2026-08-22 00:00:00')",
+                        [],
+                    )
+                    .unwrap();
+            },
+        );
+
+        let floor = crate::db::Database::open(":memory:").unwrap();
+        floor.initialize().unwrap();
+        floor
+            .connection()
+            .execute(
+                "INSERT INTO review_events
+                    (id, segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, created_at)
+                 VALUES (1, 'value-1', 'Reviewer', 'skip', 'test', 1, 1000, 'skip',
+                         '2026-08-22 00:00:00')",
+                [],
+            )
+            .unwrap();
+        let target = copied_database(&floor);
+        require_durable_review_history_superset(&floor, &target).unwrap();
+        target.connection().execute("DROP TRIGGER review_events_v60_post_cutoff_immutable_update", []).unwrap();
+        target.connection().execute("UPDATE review_events SET reviewer = 'Changed' WHERE id = 1", []).unwrap();
+        let changed = require_durable_review_history_superset(&floor, &target).unwrap_err();
+        assert!(changed.contains("review_events"), "same identity with changed values must fail: {changed}");
+
+        let superset = copied_database(&floor);
+        superset
+            .connection()
+            .execute(
+                "INSERT INTO review_events
+                    (id, segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, created_at)
+                 VALUES (2, 'value-2', 'Reviewer', 'skip', 'test', 2, 1000, 'skip',
+                         '2026-08-22 00:00:01')",
+                [],
+            )
+            .unwrap();
+        require_durable_review_history_superset(&floor, &superset).unwrap();
+    }
+
+    #[test]
+    fn durable_restore_floor_protects_every_v60_effect_authority() {
+        fn assert_missing_is_refused(floor: &crate::db::Database, expected_label: &str, mutation_sql: &str) {
+            let target = copied_database(floor);
+            target.connection().execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            target.connection().execute_batch(mutation_sql).unwrap();
+            let error = require_durable_review_history_superset(floor, &target).unwrap_err();
+            assert!(error.contains(expected_label), "expected {expected_label} refusal, got: {error}");
+        }
+
+        let floor = crate::db::Database::open(":memory:").unwrap();
+        floor.initialize().unwrap();
+        record_canonical_phone_edit(&floor, "durable-effect-edit", 201);
+
+        insert_canonical_pay_segment(&floor, "durable-effect-undo");
+        canonical_phone_playback(&floor, "durable-effect-undo", "Reviewer");
+        let revision = floor.segment_review_revision("durable-effect-undo").unwrap().unwrap();
+        let operation = canonical_operation(202);
+        floor
+            .record_phone_human_decision_by_at_revision_with_operation(
+                "durable-effect-undo",
+                "reject",
+                None,
+                "Reviewer",
+                revision,
+                &operation,
+                &crate::db::review_operation_payload_hash("durable-effect-undo", "reject", "", "Reviewer"),
+            )
+            .unwrap()
+            .unwrap();
+        let effect_id = floor.human_decision_effect_for_operation(&operation).unwrap().unwrap().0;
+        assert!(matches!(
+            floor.undo_human_decision(effect_id, Some("Reviewer"), &operation).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+
+        insert_canonical_pay_segment(&floor, "durable-flag-undo");
+        let flag = floor
+            .record_review_flag("durable-flag-undo", "durable flag", "00000000-0000-4000-8000-000000000801")
+            .unwrap();
+        assert!(matches!(
+            floor.undo_review_flag(flag.effect_event_id, &canonical_operation(203)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+
+        for (table, predicate) in [
+            ("human_decision_effect_events", "1=1"),
+            ("human_decision_effect_reversals", "1=1"),
+            ("review_flag_effect_events", "1=1"),
+            ("review_flag_effect_reversals", "1=1"),
+            ("correction_memory", "legacy_seed=0"),
+            ("correction_memory_contributions", "1=1"),
+            ("corrections", "effect_event_id IS NOT NULL"),
+            ("agent_examples", "effect_event_id IS NOT NULL"),
+        ] {
+            let count: i64 = floor
+                .connection()
+                .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"), [], |row| row.get(0))
+                .unwrap();
+            assert!(count > 0, "writer fixture must populate {table}");
+        }
+        validate_restore_target_semantics(&floor).unwrap();
+        assert!(has_durable_review_activity(&floor).unwrap());
+
+        assert_missing_is_refused(
+            &floor,
+            "review_effect_state",
+            "DROP TRIGGER review_effect_state_immutable_delete;
+             DELETE FROM review_effect_state;",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "human_decision_effect_events",
+            "DROP TRIGGER human_decision_effect_events_immutable_delete;
+             DELETE FROM human_decision_effect_events
+              WHERE id = (SELECT MIN(id) FROM human_decision_effect_events);",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "human_decision_effect_reversals",
+            "DROP TRIGGER human_decision_effect_reversals_immutable_delete;
+             DELETE FROM human_decision_effect_reversals
+              WHERE effect_event_id = (SELECT MIN(effect_event_id) FROM human_decision_effect_reversals);",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "review_flag_effect_events",
+            "DROP TRIGGER review_flag_effect_events_immutable_delete;
+             DELETE FROM review_flag_effect_events
+              WHERE id = (SELECT MIN(id) FROM review_flag_effect_events);",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "review_flag_effect_reversals",
+            "DROP TRIGGER review_flag_effect_reversals_immutable_delete;
+             DELETE FROM review_flag_effect_reversals
+              WHERE flag_effect_event_id = (SELECT MIN(flag_effect_event_id) FROM review_flag_effect_reversals);",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "correction_memory",
+            "DROP TRIGGER correction_memory_v60_immutable_delete;
+             DELETE FROM correction_memory
+              WHERE id = (SELECT MIN(id) FROM correction_memory WHERE legacy_seed=0);",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "correction_memory_contributions",
+            "DROP TRIGGER correction_memory_contributions_immutable_delete;
+             DELETE FROM correction_memory_contributions
+              WHERE rowid = (SELECT MIN(rowid) FROM correction_memory_contributions);",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "corrections",
+            "DROP TRIGGER corrections_v60_effect_immutable_delete;
+             DELETE FROM corrections
+              WHERE effect_event_id = (SELECT MIN(effect_event_id) FROM corrections WHERE effect_event_id IS NOT NULL);",
+        );
+        assert_missing_is_refused(
+            &floor,
+            "effect-bound agent examples",
+            "DROP TRIGGER agent_examples_v60_effect_immutable_delete;
+             DELETE FROM agent_examples
+              WHERE effect_event_id = (SELECT MIN(effect_event_id) FROM agent_examples WHERE effect_event_id IS NOT NULL);",
+        );
+    }
+
+    #[test]
+    fn pristine_v60_state_is_not_activity_but_a_nonzero_frontier_is() {
+        let pristine = crate::db::Database::open(":memory:").unwrap();
+        pristine.initialize().unwrap();
+        assert!(!has_durable_review_activity(&pristine).unwrap());
+
+        pristine.connection().execute("DROP TRIGGER review_effect_state_immutable_update", []).unwrap();
+        pristine
+            .connection()
+            .execute("UPDATE review_effect_state SET effective_after_review_event_id = 1", [])
+            .unwrap();
+        assert!(
+            has_durable_review_activity(&pristine).unwrap(),
+            "a captured pre-v60 frontier remains durable activity even if legacy rows are later missing"
+        );
+    }
+
+    #[test]
+    fn durable_restore_floor_protects_reviewed_segment_export_and_pay_identity_projection() {
+        let base = crate::db::Database::open(":memory:").unwrap();
+        base.initialize().unwrap();
+        base.insert_segment(&test_segment("reviewed-1", "reviewed.wav", "machine draft")).unwrap();
+        base.insert_segment(&test_segment("desktop-accept", "desktop.wav", "desktop draft")).unwrap();
+        base.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?1,
+                        audio_fingerprint = 123456,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000,
+                        human_decision = 'edit', verdict = 'human_corrected',
+                        verdict_transcript = 'human truth', annotated_transcript = 'human truth',
+                        verified = 1, reviewed_by = 'Reviewer',
+                        corrected_at = '2026-08-22 00:00:00', escalated = 0
+                  WHERE id = 'reviewed-1'",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        base.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?1, audio_fingerprint = 654321,
+                        alignment_json = '{\"source_start_ms\":1000,\"source_end_ms\":2000}',
+                        duration_ms = 1000, human_decision = 'accept',
+                        verdict = 'human_verified', verdict_transcript = 'desktop truth',
+                        annotated_transcript = 'desktop truth', verified = 1,
+                        corrected_at = '2026-08-22 00:00:01', escalated = 0
+                  WHERE id = 'desktop-accept'",
+                ["b".repeat(64)],
+            )
+            .unwrap();
+        base.connection()
+            .execute(
+                "INSERT INTO review_events
+                    (id, segment_id, reviewer, action, source, timestamp_ms, duration_ms,
+                     compensation_action, created_at)
+                 VALUES (1, 'reviewed-1', 'Reviewer', 'edit', 'legacy', 1, 1000, 'edit',
+                         '2026-08-22 00:00:00')",
+                [],
+            )
+            .unwrap();
+        let floor = copied_database(&base);
+        let equal = copied_database(&base);
+        require_durable_review_history_superset(&floor, &equal).unwrap();
+
+        let modified = copied_database(&base);
+        modified
+            .connection()
+            .execute("UPDATE speech_segments SET duration_ms = 999 WHERE id = 'reviewed-1'", [])
+            .unwrap();
+        let error = require_durable_review_history_superset(&floor, &modified).unwrap_err();
+        assert!(error.contains("reviewed speech-segment export projection"), "{error}");
+
+        let missing = copied_database(&base);
+        missing.connection().execute("DROP TRIGGER speech_segments_v60_review_authority_immutable_delete", []).unwrap();
+        missing.delete_segment("reviewed-1").unwrap();
+        let error = require_durable_review_history_superset(&floor, &missing).unwrap_err();
+        assert!(error.contains("reviewed speech-segment export projection"), "{error}");
+
+        let unaudited_desktop_regression = copied_database(&base);
+        unaudited_desktop_regression
+            .connection()
+            .execute("DROP TRIGGER speech_segments_v60_review_authority_immutable_delete", [])
+            .unwrap();
+        unaudited_desktop_regression.delete_segment("desktop-accept").unwrap();
+        let error = require_durable_review_history_superset(&floor, &unaudited_desktop_regression).unwrap_err();
+        assert!(
+            error.contains("reviewed speech-segment export projection"),
+            "an unaudited desktop human decision must still be protected: {error}"
+        );
+    }
+
+    #[test]
+    fn consent_revocation_floor_follows_content_identity_across_relink_and_blocks_unrevoked_aliases() {
+        let floor = crate::db::Database::open(":memory:").unwrap();
+        floor.initialize().unwrap();
+        floor.insert_segment(&test_segment("withdrawn", "old-name.wav", "withdrawn recording")).unwrap();
+        let content_hash = "c".repeat(64);
+        floor
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?1, rights_revoked_at = '2026-08-26 00:00:00'
+                  WHERE id = 'withdrawn'",
+                [&content_hash],
+            )
+            .unwrap();
+
+        let renamed = copied_database(&floor);
+        renamed
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_path = 'renamed.wav', rights_revoked_at = NULL
+                  WHERE id = 'withdrawn'",
+                [],
+            )
+            .unwrap();
+        let error = require_consent_revocation_superset(&floor, &renamed).unwrap_err();
+        assert!(error.contains("resurrect 1 withdrawn recording"), "{error}");
+
+        renamed
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET rights_revoked_at = '2026-08-26 00:00:00'
+                  WHERE id = 'withdrawn'",
+                [],
+            )
+            .unwrap();
+        require_consent_revocation_superset(&floor, &renamed)
+            .expect("a relinked recording remains the same withdrawal authority through its canonical PCM hash");
+
+        renamed.insert_segment(&test_segment("unrevoked-alias", "alias.wav", "same withdrawn recording")).unwrap();
+        renamed
+            .connection()
+            .execute("UPDATE speech_segments SET audio_content_hash = ?1 WHERE id = 'unrevoked-alias'", [&content_hash])
+            .unwrap();
+        let alias_error = require_consent_revocation_superset(&floor, &renamed).unwrap_err();
+        assert!(
+            alias_error.contains("resurrect 1 withdrawn recording"),
+            "an unrevoked alias of withdrawn PCM must not become an export bypass: {alias_error}"
+        );
+    }
+
+    #[test]
+    fn staged_compensation_semantics_accept_writer_history_and_refuse_segment_deletion() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_canonical_pay_segment(&db, "pay-valid");
+        record_canonical_skip(&db, "pay-valid", "Reviewer", 1);
+        validate_review_compensation_semantics(&db).unwrap();
+
+        let deletion = db.delete_segment("pay-valid").unwrap_err();
+        assert!(matches!(deletion, crate::error::AppError::Validation(_)), "{deletion}");
+        assert!(db.get_segment_by_id("pay-valid").unwrap().is_some());
+        validate_review_compensation_semantics(&db)
+            .expect("a refused deletion must preserve immutable pay/event snapshots and their clip");
+    }
+
+    #[test]
+    fn staged_compensation_semantics_reject_forged_identity_source_and_entry_key() {
+        let base = crate::db::Database::open(":memory:").unwrap();
+        base.initialize().unwrap();
+        insert_canonical_pay_segment(&base, "pay-forge");
+        record_canonical_skip(&base, "pay-forge", "Reviewer", 2);
+
+        let split_work = copied_database(&base);
+        split_work.connection().execute("DROP TRIGGER review_compensation_ledger_immutable_update", []).unwrap();
+        split_work
+            .connection()
+            .execute(
+                "UPDATE review_compensation_ledger
+                    SET canonical_work_id = ?1",
+                [format!("reviewer-work-v1:8:reviewer:audio-segment-v1:{}:0:1000", "c".repeat(64))],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&split_work).unwrap_err();
+        assert!(error.contains("segment identity"), "forged work split must fail: {error}");
+
+        let wrong_source = copied_database(&base);
+        wrong_source.connection().execute("DROP TRIGGER review_compensation_ledger_immutable_update", []).unwrap();
+        wrong_source.connection().execute("DROP TRIGGER review_events_v60_post_cutoff_immutable_update", []).unwrap();
+        wrong_source.connection().execute("UPDATE review_events SET source = 'test'", []).unwrap();
+        wrong_source.connection().execute("UPDATE review_compensation_ledger SET source = 'test'", []).unwrap();
+        let error = validate_review_compensation_semantics(&wrong_source).unwrap_err();
+        assert!(error.contains("production Couch action"), "nonproduction pay source must fail: {error}");
+
+        let wrong_key = copied_database(&base);
+        wrong_key.connection().execute("DROP TRIGGER review_compensation_ledger_immutable_update", []).unwrap();
+        wrong_key
+            .connection()
+            .execute("UPDATE review_compensation_ledger SET entry_key = 'review-event:999'", [])
+            .unwrap();
+        let error = validate_review_compensation_semantics(&wrong_key).unwrap_err();
+        assert!(error.contains("disagrees with review event"), "forged event key must fail: {error}");
+
+        let duplicate_operation = crate::db::Database::open(":memory:").unwrap();
+        duplicate_operation.initialize().unwrap();
+        insert_canonical_pay_segment(&duplicate_operation, "duplicate-op-a");
+        insert_canonical_pay_segment(&duplicate_operation, "duplicate-op-b");
+        duplicate_operation.connection().execute("DROP INDEX idx_review_events_operation_id", []).unwrap();
+        record_canonical_skip(&duplicate_operation, "duplicate-op-a", "Reviewer", 11);
+        record_canonical_skip(&duplicate_operation, "duplicate-op-b", "Reviewer", 11);
+        let error = validate_review_compensation_semantics(&duplicate_operation).unwrap_err();
+        assert!(error.contains("unique canonical lowercase UUID"), "duplicate operation UUID must fail: {error}");
+    }
+
+    #[test]
+    fn staged_compensation_semantics_validate_undo_linkage_and_settlement_math() {
+        let undo_db = crate::db::Database::open(":memory:").unwrap();
+        undo_db.initialize().unwrap();
+        insert_canonical_pay_segment(&undo_db, "pay-undo");
+        canonical_phone_playback(&undo_db, "pay-undo", "Reviewer");
+        let served_revision = undo_db.segment_review_revision("pay-undo").unwrap().unwrap();
+        let operation = canonical_operation(3);
+        undo_db
+            .record_phone_human_decision_by_at_revision_with_operation(
+                "pay-undo",
+                "reject",
+                None,
+                "Reviewer",
+                served_revision,
+                &operation,
+                &crate::db::review_operation_payload_hash("pay-undo", "reject", "", "Reviewer"),
+            )
+            .unwrap()
+            .unwrap();
+        let effect_id = undo_db.human_decision_effect_for_operation(&operation).unwrap().unwrap().0;
+        assert!(matches!(
+            undo_db.undo_human_decision(effect_id, Some("Reviewer"), &operation).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        validate_review_compensation_semantics(&undo_db).unwrap();
+
+        let wrong_undo = copied_database(&undo_db);
+        wrong_undo.connection().execute("DROP TRIGGER review_compensation_ledger_immutable_update", []).unwrap();
+        wrong_undo
+            .connection()
+            .execute(
+                "UPDATE review_compensation_ledger SET entry_key = ?1
+                  WHERE compensation_action = 'undo'",
+                [format!("undo:{}", canonical_operation(4))],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&wrong_undo).unwrap_err();
+        assert!(error.contains("operation/event linkage"), "wrong undo operation must fail: {error}");
+
+        let settled = crate::db::Database::open(":memory:").unwrap();
+        settled.initialize().unwrap();
+        insert_canonical_pay_segment(&settled, "pay-settle");
+        canonical_phone_playback(&settled, "pay-settle", "Reviewer");
+        let revision = settled.segment_review_revision("pay-settle").unwrap().unwrap();
+        settled
+            .record_phone_human_decision_by_at_revision_with_operation(
+                "pay-settle",
+                "reject",
+                None,
+                "Reviewer",
+                revision,
+                &canonical_operation(5),
+                &crate::db::review_operation_payload_hash("pay-settle", "reject", "", "Reviewer"),
+            )
+            .unwrap()
+            .unwrap();
+        let through: i64 = settled
+            .connection()
+            .query_row("SELECT MAX(id) FROM review_compensation_ledger", [], |row| row.get(0))
+            .unwrap();
+        settled.record_review_compensation_settlement("Reviewer", through, "payout-1").unwrap();
+        validate_review_compensation_semantics(&settled).unwrap();
+
+        let forged_settlement = copied_database(&settled);
+        forged_settlement
+            .connection()
+            .execute("DROP TRIGGER review_compensation_settlement_immutable_update", [])
+            .unwrap();
+        forged_settlement
+            .connection()
+            .execute(
+                "UPDATE review_compensation_settlements
+                    SET allocated_micro_iqd = allocated_micro_iqd + 1",
+                [],
+            )
+            .unwrap();
+        let error = validate_review_compensation_semantics(&forged_settlement).unwrap_err();
+        assert!(error.contains("amount differs"), "forged settlement amount must fail: {error}");
+    }
+
+    #[test]
+    fn staged_playback_semantics_reject_no_listen_and_future_revision_receipts() {
+        let valid = crate::db::Database::open(":memory:").unwrap();
+        valid.initialize().unwrap();
+        insert_canonical_pay_segment(&valid, "playback-valid");
+        valid
+            .record_playback_receipt(&crate::db::PlaybackReceipt {
+                segment_id: "playback-valid".to_string(),
+                segment_revision: 0,
+                audio_content_hash: "f".repeat(64),
+                reviewer: Some("Reviewer".to_string()),
+                session_id: Some("session".to_string()),
+                started_at_ms: 1,
+                played_ms: 900,
+                clip_duration_ms: 1000,
+                source_start_ms: None,
+                source_end_ms: None,
+            })
+            .unwrap();
+        validate_playback_receipt_semantics(&valid).unwrap();
+
+        // Speaker/quality metadata is allowed to advance the review revision after listening.  It
+        // must not invalidate the immutable policy-3 audio identity the receipt actually proves.
+        valid.set_speaker_change_score("playback-valid", 0.37).unwrap();
+        validate_playback_receipt_semantics(&valid)
+            .expect("an unrelated metadata revision bump must preserve exact policy-3 evidence");
+
+        let mismatched_old_revision_hash = copied_database(&valid);
+        mismatched_old_revision_hash
+            .connection()
+            .execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_update", [])
+            .unwrap();
+        mismatched_old_revision_hash
+            .connection()
+            .execute("UPDATE playback_receipts SET audio_fingerprint = ?1", ["b".repeat(64)])
+            .unwrap();
+        let error = validate_playback_receipt_semantics(&mismatched_old_revision_hash).unwrap_err();
+        assert!(
+            error.contains("retained segment identity"),
+            "a metadata revision bump must not hide a forged historical BLAKE3 identity: {error}"
+        );
+
+        let wrong_span = copied_database(&valid);
+        wrong_span.connection().execute("DROP TRIGGER speech_segments_review_revision", []).unwrap();
+        wrong_span.connection().execute("DROP TRIGGER speech_segments_v60_paid_identity_immutable_update", []).unwrap();
+        wrong_span
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET alignment_json = json_object(
+                        'source_start_ms', 2000, 'source_end_ms', 3000,
+                        'chunk_index', 0, 'chunk_count', 1
+                    )
+                  WHERE id = 'playback-valid'",
+                [],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&wrong_span).unwrap_err();
+        assert!(
+            error.contains("playback receipt") && error.contains("segment identity"),
+            "same hash/revision/duration on a different source window must fail the actual restore gate: {error}"
+        );
+
+        let no_listen = copied_database(&valid);
+        no_listen.connection().execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_update", []).unwrap();
+        no_listen.connection().execute("UPDATE playback_receipts SET played_ms = 0, coverage_ratio = 1.0", []).unwrap();
+        let error = validate_playback_receipt_semantics(&no_listen).unwrap_err();
+        assert!(error.contains("writer invariants"), "forged no-listen receipt must fail: {error}");
+
+        let future = copied_database(&valid);
+        future.connection().execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_update", []).unwrap();
+        future
+            .connection()
+            .execute(
+                "UPDATE playback_receipts
+                    SET segment_revision = (
+                        SELECT review_revision + 1
+                          FROM speech_segments
+                         WHERE id = playback_receipts.segment_id
+                    )",
+                [],
+            )
+            .unwrap();
+        let error = validate_playback_receipt_semantics(&future).unwrap_err();
+        assert!(error.contains("future segment revision"), "pre-minted future receipt must fail: {error}");
+
+        let no_content_hash = copied_database(&valid);
+        no_content_hash
+            .connection()
+            .execute("DROP TRIGGER speech_segments_v60_paid_identity_immutable_update", [])
+            .unwrap();
+        no_content_hash
+            .connection()
+            .execute("UPDATE speech_segments SET audio_content_hash = NULL WHERE id = 'playback-valid'", [])
+            .unwrap();
+        let error = validate_playback_receipt_semantics(&no_content_hash).unwrap_err();
+        assert!(
+            error.contains("no canonical server-derived segment BLAKE3 identity"),
+            "a restore must not invent audio identity from a segment id: {error}"
+        );
+
+        let legacy = copied_database(&valid);
+        legacy.connection().execute("DROP TRIGGER playback_receipts_v60_policy3_immutable_update", []).unwrap();
+        legacy
+            .connection()
+            .execute(
+                "UPDATE playback_receipts
+                    SET policy_version = 1, audio_fingerprint = '424242',
+                        source_start_ms = NULL, source_end_ms = NULL",
+                [],
+            )
+            .unwrap();
+        validate_playback_receipt_semantics(&legacy)
+            .expect("policy-1 spectral receipts remain historical/readable but never authorize policy 3");
+    }
+
+    #[test]
+    fn restore_semantics_accept_exact_policy4_and_reject_interval_or_consumption_drift() {
+        let valid = crate::db::Database::open(":memory:").unwrap();
+        valid.initialize().unwrap();
+        record_canonical_phone_edit(&valid, "policy4-restore", 98);
+        validate_restore_target_semantics(&valid)
+            .expect("an exact writer-produced policy-4 review generation must remain restorable");
+
+        let forged_interval = copied_database(&valid);
+        forged_interval
+            .connection()
+            .execute("DROP TRIGGER playback_receipts_v67_policy4_immutable_update", [])
+            .unwrap();
+        forged_interval
+            .connection()
+            .execute(
+                "UPDATE playback_receipts
+                    SET interval_union_sha256 = ?1
+                  WHERE policy_version = ?2",
+                rusqlite::params!["0".repeat(64), crate::db::DESKTOP_PLAYBACK_POLICY_VERSION],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_interval).unwrap_err();
+        assert!(error.contains("policy-4 playback authority is invalid"), "{error}");
+
+        let forged_consumption = copied_database(&valid);
+        forged_consumption
+            .connection()
+            .execute("DROP TRIGGER playback_authority_consumptions_v4_immutable_update", [])
+            .unwrap();
+        forged_consumption
+            .connection()
+            .execute("UPDATE playback_authority_consumptions_v4 SET operation_id = ?1", [canonical_operation(999)])
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_consumption).unwrap_err();
+        assert!(error.contains("no exact consumed policy-3/4 playback authority"), "{error}");
+    }
+
+    #[test]
+    fn staged_review_effect_semantics_accept_every_current_writer_state() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        record_canonical_phone_edit(&db, "effect-active-edit", 101);
+
+        insert_canonical_pay_segment(&db, "effect-undone-reject");
+        let reject_revision = db.segment_review_revision("effect-undone-reject").unwrap().unwrap();
+        canonical_phone_playback(&db, "effect-undone-reject", "Reviewer");
+        let reject_operation = canonical_operation(102);
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "effect-undone-reject",
+            "reject",
+            None,
+            "Reviewer",
+            reject_revision,
+            &reject_operation,
+            &crate::db::review_operation_payload_hash("effect-undone-reject", "reject", "", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        let reject_effect = db.human_decision_effect_for_operation(&reject_operation).unwrap().unwrap().0;
+        assert!(matches!(
+            db.undo_human_decision(reject_effect, Some("Reviewer"), &reject_operation).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+
+        insert_canonical_pay_segment(&db, "effect-desktop-edit");
+        db.finalize_human_review("effect-desktop-edit", "edit", Some("desktop truth"), None, None).unwrap();
+
+        insert_canonical_pay_segment(&db, "effect-active-flag");
+        db.record_review_flag("effect-active-flag", "needs another listen", "00000000-0000-4000-8000-000000000802")
+            .unwrap();
+        db.set_speaker_change_score("effect-active-edit", 0.41).unwrap();
+        db.set_speaker_change_score("effect-active-flag", 0.42).unwrap();
+        insert_canonical_pay_segment(&db, "effect-undone-flag");
+        let undone_flag = db
+            .record_review_flag("effect-undone-flag", "temporary concern", "00000000-0000-4000-8000-000000000803")
+            .unwrap();
+        db.set_speaker_change_score("effect-undone-flag", 0.43).unwrap();
+        assert!(matches!(
+            db.undo_review_flag(undone_flag.effect_event_id, &canonical_operation(103)).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+
+        validate_restore_target_semantics(&db)
+            .expect("every current phone/desktop/flag writer state must pass the actual restore gate");
+    }
+
+    #[test]
+    fn staged_restore_rejects_orphaned_sequential_campaign_authority() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO review_campaign_registry
+                    (campaign_id, focus_segment_count, focus_sha256, first_reviewer, second_reviewer,
+                     after_review_event_id, activated_at_review_event_id)
+                 VALUES('123e4567-e89b-42d3-a456-426614174000', 1, ?1, 'Rezan', 'Aram', 0, 0)",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("campaign authority") && error.contains("without its base campaign policy"),
+            "orphaned campaign authority must fail the actual restore gate: {error}"
+        );
+    }
+
+    #[test]
+    fn staged_restore_rejects_effect_correction_with_wrong_but_valid_audio_content_hash() {
+        let base = crate::db::Database::open(":memory:").unwrap();
+        base.initialize().unwrap();
+        record_canonical_phone_edit(&base, "effect-wrong-content-hash", 104);
+        validate_restore_target_semantics(&base).unwrap();
+
+        let forged = copied_database(&base);
+        forged.connection().execute("DROP TRIGGER corrections_v60_effect_immutable_update", []).unwrap();
+        forged
+            .connection()
+            .execute(
+                "UPDATE corrections SET audio_content_hash = ?1 WHERE effect_event_id IS NOT NULL",
+                ["b".repeat(64)],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged).unwrap_err();
+        assert!(
+            error.contains("effect-bound correction") && error.contains("audio"),
+            "a different canonical decoded-PCM BLAKE3 hash must fail the real restore gate: {error}"
+        );
+    }
+
+    #[test]
+    fn staged_restore_rejects_forged_effect_artifacts_current_state_and_inverse() {
+        let active = crate::db::Database::open(":memory:").unwrap();
+        active.initialize().unwrap();
+        let (_effect_id, _operation) = record_canonical_phone_edit(&active, "effect-forgery", 105);
+        validate_restore_target_semantics(&active).unwrap();
+
+        let mismatched_example = copied_database(&active);
+        mismatched_example.connection().execute("DROP TRIGGER agent_examples_v60_effect_immutable_update", []).unwrap();
+        mismatched_example
+            .connection()
+            .execute("UPDATE agent_examples SET human_fix = 'forged truth' WHERE effect_event_id IS NOT NULL", [])
+            .unwrap();
+        let error = validate_restore_target_semantics(&mismatched_example).unwrap_err();
+        assert!(error.contains("agent example"), "example/correction split must fail: {error}");
+
+        let forged_memory = copied_database(&active);
+        forged_memory.connection().execute("DROP TRIGGER correction_memory_v60_baseline_immutable_update", []).unwrap();
+        forged_memory
+            .connection()
+            .execute("UPDATE correction_memory SET hit_count = 1 WHERE legacy_seed = 0", [])
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_memory).unwrap_err();
+        assert!(error.contains("zero-baseline"), "mutable memory evidence must fail: {error}");
+
+        let arbitrary_capture = copied_database(&active);
+        let effect_id: i64 = arbitrary_capture
+            .connection()
+            .query_row("SELECT id FROM human_decision_effect_events WHERE segment_id = 'effect-forgery'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        arbitrary_capture
+            .connection()
+            .execute(
+                "INSERT INTO correction_memory
+                    (id, wrong_token, human_token, slot_key, phonetic_key, source_segment,
+                     confidence, hit_count, confirm_count, override_count, legacy_seed)
+                 VALUES ('00000000-0000-4000-8000-000000000806', 'forged-wrong',
+                         'forged-fix', 'forged|slot', 'forged', 'effect-forgery',
+                         0.5, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        arbitrary_capture
+            .connection()
+            .execute(
+                "INSERT INTO correction_memory_contributions
+                    (effect_event_id, memory_id, capture_delta, confirm_delta, override_delta)
+                 VALUES (?1, '00000000-0000-4000-8000-000000000806', 1, 0, 0)",
+                [effect_id],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&arbitrary_capture).unwrap_err();
+        assert!(
+            error.contains("arbitrary or incomplete correction-memory captures"),
+            "an arbitrary effect-bound memory capture must fail: {error}"
+        );
+
+        let arbitrary_outcome = copied_database(&active);
+        arbitrary_outcome
+            .connection()
+            .execute("DROP TRIGGER correction_memory_contributions_immutable_update", [])
+            .unwrap();
+        arbitrary_outcome
+            .connection()
+            .execute(
+                "UPDATE correction_memory_contributions
+                    SET confirm_delta = 1, fired_at = '2026-08-22 00:00:00'
+                  WHERE capture_delta = 1",
+                [],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&arbitrary_outcome).unwrap_err();
+        assert!(
+            error.contains("not re-derived from the served/decision text"),
+            "a fabricated memory confirmation must fail: {error}"
+        );
+
+        let stale_current = copied_database(&active);
+        stale_current
+            .connection()
+            .execute("UPDATE speech_segments SET verdict = 'human_reject' WHERE id = 'effect-forgery'", [])
+            .unwrap();
+        let error = validate_restore_target_semantics(&stale_current).unwrap_err();
+        assert!(error.contains("latest active human-decision"), "forged current state must fail: {error}");
+
+        let undone = crate::db::Database::open(":memory:").unwrap();
+        undone.initialize().unwrap();
+        let (effect_id, operation) = record_canonical_phone_edit(&undone, "effect-inverse", 106);
+        assert!(matches!(
+            undone.undo_human_decision(effect_id, Some("Reviewer"), &operation).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        validate_restore_target_semantics(&undone).unwrap();
+        let forged_inverse = copied_database(&undone);
+        forged_inverse
+            .connection()
+            .execute("DROP TRIGGER human_decision_effect_reversals_immutable_update", [])
+            .unwrap();
+        forged_inverse
+            .connection()
+            .execute("UPDATE human_decision_effect_reversals SET operation_id = ?1", [canonical_operation(107)])
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_inverse).unwrap_err();
+        assert!(error.contains("operation-bound compensation inverse"), "wrong inverse identity must fail: {error}");
+    }
+
+    #[test]
+    fn staged_restore_rejects_forged_flag_state_and_reversal_identity() {
+        let active = crate::db::Database::open(":memory:").unwrap();
+        active.initialize().unwrap();
+        insert_canonical_pay_segment(&active, "flag-active-forgery");
+        active
+            .record_review_flag("flag-active-forgery", "listen again", "00000000-0000-4000-8000-000000000804")
+            .unwrap();
+        validate_restore_target_semantics(&active).unwrap();
+
+        let laundered_human_truth = copied_database(&active);
+        laundered_human_truth
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified = 1, annotated_transcript = 'forged unbound truth'
+                  WHERE id = 'flag-active-forgery'",
+                [],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&laundered_human_truth).unwrap_err();
+        assert!(
+            error.contains("unsnapshotted human review truth")
+                || error.contains("unbound human transcript/verification state"),
+            "a flag effect must not launder unrelated verified/annotated truth: {error}"
+        );
+
+        active
+            .connection()
+            .execute("UPDATE speech_segments SET verdict = NULL WHERE id = 'flag-active-forgery'", [])
+            .unwrap();
+        let error = validate_restore_target_semantics(&active).unwrap_err();
+        assert!(error.contains("latest active review-flag"), "forged active flag state must fail: {error}");
+
+        let undone = crate::db::Database::open(":memory:").unwrap();
+        undone.initialize().unwrap();
+        insert_canonical_pay_segment(&undone, "flag-undo-forgery");
+        let flag = undone
+            .record_review_flag("flag-undo-forgery", "temporary flag", "00000000-0000-4000-8000-000000000805")
+            .unwrap();
+        let undo_operation = canonical_operation(110);
+        assert!(matches!(
+            undone.undo_review_flag(flag.effect_event_id, &undo_operation).unwrap(),
+            crate::db::HumanFlagUndoOutcome::Applied { .. }
+        ));
+        validate_restore_target_semantics(&undone).unwrap();
+
+        let wrong_identity = copied_database(&undone);
+        wrong_identity.connection().execute("DROP TRIGGER review_flag_effect_reversals_immutable_update", []).unwrap();
+        wrong_identity
+            .connection()
+            .execute("UPDATE review_flag_effect_reversals SET operation_id = 'not-a-uuid'", [])
+            .unwrap();
+        let error = validate_restore_target_semantics(&wrong_identity).unwrap_err();
+        assert!(
+            error.contains("review-flag effect") && error.contains("operation"),
+            "forged flag undo must fail: {error}"
+        );
+
+        let stale_inverse = copied_database(&undone);
+        stale_inverse
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verdict = 'escalated', rationale = 'forged', escalated = 1
+                  WHERE id = 'flag-undo-forgery'",
+                [],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&stale_inverse).unwrap_err();
+        assert!(
+            error.contains("review-flag reversal") || error.contains("exact mixed decision/flag effect chain"),
+            "a stale flag after reversal must fail: {error}"
+        );
+
+        let legacy = crate::db::Database::open(":memory:").unwrap();
+        legacy.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&legacy, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        let mut legacy_segment = test_segment("flag-legacy-authority", "flag-legacy.wav", "machine draft");
+        legacy_segment.verified = true;
+        legacy_segment.annotated_transcript = Some("immutable legacy truth".into());
+        legacy.insert_segment_full(&legacy_segment).unwrap();
+        assert_eq!(crate::migrations::run_migrations(&legacy).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        legacy
+            .record_review_flag("flag-legacy-authority", "legacy concern", "00000000-0000-4000-8000-000000000807")
+            .unwrap();
+        validate_restore_target_semantics(&legacy)
+            .expect("an exact immutable pre-v60 reviewed baseline remains a valid first flag origin");
+    }
+
+    #[test]
+    fn mixed_flag_decision_chains_preserve_exact_rationale_through_undo_and_restore() {
+        let flag_then_decision = crate::db::Database::open(":memory:").unwrap();
+        flag_then_decision.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&flag_then_decision, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        insert_canonical_pay_segment(&flag_then_decision, "rationale-flag-decision");
+        flag_then_decision
+            .write_segment_verdict(
+                "rationale-flag-decision",
+                "jury_accept",
+                Some("machine draft"),
+                Some("machine rationale"),
+                None,
+                Some(0.9),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::migrations::run_migrations(&flag_then_decision).unwrap(),
+            vec![60, 61, 62, 63, 64, 65, 66, 67]
+        );
+        flag_then_decision
+            .record_review_flag("rationale-flag-decision", "flag rationale", "00000000-0000-4000-8000-000000000808")
+            .unwrap();
+        flag_then_decision.finalize_human_review("rationale-flag-decision", "accept", None, Some(1), None).unwrap();
+        validate_restore_target_semantics(&flag_then_decision)
+            .expect("flag-to-decision chain must retain the exact flag rationale");
+
+        let forged_decision_prior = copied_database(&flag_then_decision);
+        forged_decision_prior
+            .connection()
+            .execute("DROP TRIGGER human_decision_effect_events_immutable_update", [])
+            .unwrap();
+        forged_decision_prior
+            .connection()
+            .execute(
+                "UPDATE human_decision_effect_events
+                    SET prior_rationale = 'forged prior', decision_rationale = 'forged prior'
+                  WHERE segment_id = 'rationale-flag-decision'",
+                [],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_decision_prior).unwrap_err();
+        assert!(error.contains("rationale"), "a decision must not invent the flag rationale it inherited: {error}");
+
+        let decision_effect: i64 = flag_then_decision
+            .connection()
+            .query_row(
+                "SELECT id FROM human_decision_effect_events
+                  WHERE segment_id = 'rationale-flag-decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            flag_then_decision
+                .undo_human_decision(decision_effect, None, "00000000-0000-4000-8000-000000000809")
+                .unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            flag_then_decision.get_segment_by_id("rationale-flag-decision").unwrap().unwrap().rationale.as_deref(),
+            Some("flag rationale")
+        );
+        validate_restore_target_semantics(&flag_then_decision)
+            .expect("decision Undo must restore the exact preceding active flag state");
+
+        let decision_then_flag = crate::db::Database::open(":memory:").unwrap();
+        decision_then_flag.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&decision_then_flag, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        insert_canonical_pay_segment(&decision_then_flag, "rationale-decision-flag");
+        decision_then_flag
+            .write_segment_verdict(
+                "rationale-decision-flag",
+                "jury_accept",
+                Some("machine draft"),
+                Some("original rationale"),
+                None,
+                Some(0.9),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::migrations::run_migrations(&decision_then_flag).unwrap(),
+            vec![60, 61, 62, 63, 64, 65, 66, 67]
+        );
+        decision_then_flag.finalize_human_review("rationale-decision-flag", "accept", None, Some(2), None).unwrap();
+        let effect_id: i64 = decision_then_flag
+            .connection()
+            .query_row(
+                "SELECT id FROM human_decision_effect_events
+                  WHERE segment_id = 'rationale-decision-flag'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            decision_then_flag.undo_human_decision(effect_id, None, "00000000-0000-4000-8000-000000000810").unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        decision_then_flag
+            .record_review_flag(
+                "rationale-decision-flag",
+                "later flag rationale",
+                "00000000-0000-4000-8000-000000000811",
+            )
+            .unwrap();
+        validate_restore_target_semantics(&decision_then_flag)
+            .expect("a reversed decision followed by a flag must preserve the original rationale prior-state");
+
+        let forged_flag_prior = copied_database(&decision_then_flag);
+        forged_flag_prior.connection().execute("DROP TRIGGER review_flag_effect_events_immutable_update", []).unwrap();
+        forged_flag_prior
+            .connection()
+            .execute(
+                "UPDATE review_flag_effect_events
+                    SET prior_rationale = 'forged prior'
+                  WHERE segment_id = 'rationale-decision-flag'",
+                [],
+            )
+            .unwrap();
+        let error = validate_restore_target_semantics(&forged_flag_prior).unwrap_err();
+        assert!(
+            error.contains("rationale"),
+            "a flag must not invent the rationale inherited from a decision/Undo chain: {error}"
+        );
+    }
+
+    #[test]
+    fn staged_review_effect_semantics_require_zero_effects_for_skip_and_spot_check() {
+        for (source, action, operation_index) in [("couch", "skip", 108_u64), ("couch_spot_check", "edit", 109_u64)] {
+            let db = crate::db::Database::open(":memory:").unwrap();
+            db.initialize().unwrap();
+            insert_canonical_pay_segment(&db, &format!("zero-effect-{source}"));
+            let segment_id = format!("zero-effect-{source}");
+            if source == "couch_spot_check" {
+                db.record_spot_check(&segment_id, "Reviewer", action, "expected", "expected").unwrap();
+                validate_review_effect_semantics(&db).unwrap();
+            } else {
+                db.record_review_event_with_operation(
+                    &segment_id,
+                    "Reviewer",
+                    action,
+                    source,
+                    i64::try_from(operation_index).unwrap(),
+                    &canonical_operation(operation_index),
+                    &crate::db::review_operation_payload_hash(&segment_id, action, "", "Reviewer"),
+                )
+                .unwrap();
+                validate_restore_target_semantics(&db).unwrap();
+            }
+
+            let event_id: i64 =
+                db.connection().query_row("SELECT MAX(id) FROM review_events", [], |row| row.get(0)).unwrap();
+            let prior_revision = db.segment_review_revision(&segment_id).unwrap().unwrap();
+            db.connection()
+                .execute("DROP TRIGGER human_decision_effect_events_validate_review_event_insert", [])
+                .unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO human_decision_effect_events
+                        (review_event_id, segment_id, reviewer, source, action,
+                         served_transcript, decision_transcript, decision_annotated_transcript,
+                         decision_verified, decision_corrected_at,
+                         prior_revision, decision_revision, prior_verified,
+                         prior_escalated)
+                     VALUES (?1, ?2, 'Reviewer', 'couch', 'edit',
+                             'served transcript', 'forged edit', 'forged edit', 1,
+                             '2026-08-22 00:00:00',
+                             ?3, ?3 + 1, 0, 0)",
+                    rusqlite::params![event_id, segment_id, prior_revision],
+                )
+                .unwrap();
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("must not create a human-decision effect"),
+                "{source}/{action} forged effect must fail: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_restore_rejects_current_human_truth_without_legacy_or_effect_authority() {
+        for (segment_id, reviewed_by) in
+            [("forged-unbound-desktop", None), ("forged-unrostered-reviewer", Some("Mallory"))]
+        {
+            let db = crate::db::Database::open(":memory:").unwrap();
+            db.initialize().unwrap();
+            insert_canonical_pay_segment(&db, segment_id);
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments
+                        SET human_decision = 'accept', verdict = 'human_accept',
+                            verdict_transcript = raw_transcript,
+                            annotated_transcript = raw_transcript, verified = 1,
+                            reviewed_by = ?2, corrected_at = datetime('now')
+                      WHERE id = ?1",
+                    rusqlite::params![segment_id, reviewed_by],
+                )
+                .unwrap();
+            let error = validate_restore_target_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("neither immutable legacy authority nor a schema-v60 effect chain"),
+                "unbound current human truth must fail for {segment_id}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v60_machine_only_dataset_merge_remains_restore_safe() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let first = vec![crate::db::SpeechSegment {
+            id: "restore-machine-merge".to_string(),
+            created_at: Some("2026-08-22 01:02:03".to_string()),
+            audio_path: "restore-machine-merge.wav".to_string(),
+            raw_transcript: "machine draft one".to_string(),
+            normalized_transcript: Some("machine normalized one".to_string()),
+            duration_ms: 1_000,
+            confidence: Some(0.7),
+            model_version_id: Some("omniasr-7b-champion".to_string()),
+            confidence_source: Some("real_posterior".to_string()),
+            ..Default::default()
+        }];
+        assert_eq!(db.merge_dataset_json(&serde_json::to_string(&first).unwrap()).unwrap(), (1, 0));
+        validate_restore_target_semantics(&db).expect("machine-only inserted row is valid restore material");
+
+        let replacement = vec![crate::db::SpeechSegment {
+            id: "restore-machine-merge".to_string(),
+            audio_path: "restore-machine-merge.wav".to_string(),
+            raw_transcript: "machine draft two".to_string(),
+            normalized_transcript: Some("machine normalized two".to_string()),
+            duration_ms: 1_000,
+            confidence: Some(0.8),
+            model_version_id: Some("omniasr-7b-champion".to_string()),
+            confidence_source: Some("real_posterior".to_string()),
+            ..Default::default()
+        }];
+        assert_eq!(db.merge_dataset_json(&serde_json::to_string(&replacement).unwrap()).unwrap(), (0, 1));
+        validate_restore_target_semantics(&db).expect("machine-only updated row remains valid restore material");
+        let row = db.get_segment_by_id("restore-machine-merge").unwrap().unwrap();
+        assert_eq!(row.raw_transcript, "machine draft two");
+        assert!(row.annotated_transcript.is_none() && !row.verified && row.human_decision.is_none());
+    }
+
+    #[test]
+    fn generic_machine_history_after_human_effect_preserves_exact_review_state_and_restore() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        insert_canonical_pay_segment(&db, "restore-history-review");
+        let original = db.get_segment_by_id("restore-history-review").unwrap().unwrap();
+        let updated = crate::db::SpeechSegment {
+            raw_transcript: "machine draft two".to_string(),
+            speaker_id: Some("speaker-a".to_string()),
+            ..original.clone()
+        };
+        db.insert_segment(&updated).unwrap();
+        let history = crate::history::HistoryManager::new(10);
+        history.record_segment_update(original, updated);
+
+        db.finalize_human_review("restore-history-review", "accept", Some("machine draft two"), Some(123), None)
+            .unwrap();
+        let reviewed = db.get_segment_by_id("restore-history-review").unwrap().unwrap();
+        validate_restore_target_semantics(&db).expect("decision state is restore-safe before generic history");
+
+        history.undo(&db).expect("generic machine undo");
+        let undone = db.get_segment_by_id("restore-history-review").unwrap().unwrap();
+        assert_eq!(undone.raw_transcript, "machine draft");
+        assert_eq!(undone.annotated_transcript, reviewed.annotated_transcript);
+        assert_eq!(undone.verified, reviewed.verified);
+        assert_eq!(undone.human_decision, reviewed.human_decision);
+        assert_eq!(undone.verdict, reviewed.verdict);
+        assert_eq!(undone.rationale, reviewed.rationale);
+        assert_eq!(undone.reviewed_by, reviewed.reviewed_by);
+        validate_restore_target_semantics(&db).expect("machine undo must preserve a valid exact effect graph");
+
+        history.redo(&db).expect("generic machine redo");
+        let redone = db.get_segment_by_id("restore-history-review").unwrap().unwrap();
+        assert_eq!(redone.raw_transcript, "machine draft two");
+        assert_eq!(redone.annotated_transcript, reviewed.annotated_transcript);
+        assert_eq!(redone.verified, reviewed.verified);
+        assert_eq!(redone.human_decision, reviewed.human_decision);
+        assert_eq!(redone.verdict, reviewed.verdict);
+        assert_eq!(redone.rationale, reviewed.rationale);
+        assert_eq!(redone.reviewed_by, reviewed.reviewed_by);
+        validate_restore_target_semantics(&db).expect("machine redo must preserve a valid exact effect graph");
+    }
+
+    #[test]
+    fn staged_restore_rejects_a_forged_undo_of_a_shadowed_canonical_alias() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+
+        insert_canonical_pay_segment(&db, "restore-alias-a");
+        let proof_a = canonical_policy4_phone_playback(&db, "restore-alias-a", "Reviewer");
+        let operation_a = canonical_operation(120);
+        let commit_a = db
+            .record_phone_human_decision_by_at_revision_with_operation_limit(
+                "restore-alias-a",
+                "accept",
+                Some("machine draft"),
+                "Reviewer",
+                proof_a.segment_revision,
+                &proof_a,
+                &operation_a,
+                &crate::db::review_operation_payload_hash("restore-alias-a", "accept", "machine draft", "Reviewer"),
+                "accept",
+                "machine draft",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+
+        let (_effect_b, _operation_b) = record_canonical_phone_edit(&db, "restore-alias-b", 121);
+        validate_restore_target_semantics(&db).unwrap();
+
+        // Model a trigger-disabled staged target that tries to retract A after B became the latest
+        // entitlement mutation for the same reviewer/BLAKE3/source-span work identity.
+        db.connection()
+            .execute(
+                "INSERT INTO review_compensation_ledger
+                    (entry_id, entry_key, policy_version, canonical_work_id,
+                     canonical_identity_kind, reviewer, segment_id, source,
+                     compensation_action, effective_decision, decision_revision, duration_ms,
+                     rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                     corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id)
+                 SELECT '00000000-0000-4000-8000-000000000900',
+                        'undo:' || ?2, original.policy_version, original.canonical_work_id,
+                        original.canonical_identity_kind, original.reviewer,
+                        original.segment_id, 'couch_undo', 'undo', 'undo',
+                        original.decision_revision, original.duration_ms, 0, 0,
+                        -original.delta_micro_iqd,
+                        (SELECT COALESCE(SUM(delta_corrected_ms), 0)
+                           FROM review_compensation_ledger
+                          WHERE canonical_work_id = original.canonical_work_id)
+                            - original.delta_corrected_ms,
+                        -original.delta_corrected_ms, original.entry_id
+                   FROM review_compensation_ledger original
+                   JOIN human_decision_effect_events effect
+                     ON effect.review_event_id = original.review_event_id
+                  WHERE effect.id = ?1 AND original.reverses_entry_id IS NULL",
+                rusqlite::params![commit_a.effect_event_id, operation_a],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals (effect_event_id, operation_id)
+                 VALUES (?1, ?2)",
+                rusqlite::params![commit_a.effect_event_id, operation_a],
+            )
+            .unwrap();
+
+        let error = validate_restore_target_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("does not exactly bind its earlier decision entry"),
+            "a shadowed alias reversal must fail the actual restore gate: {error}"
+        );
+    }
+
+    #[test]
+    fn staged_restore_exact_schema_contract_rejects_weakened_hidden_key_trigger() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("weakened-hidden-trigger.db");
+        let candidate = crate::db::Database::open(path.to_string_lossy().as_ref()).unwrap();
+        candidate.initialize().unwrap();
+        candidate
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER review_pilot_hidden_keys_quota_insert;
+                 CREATE TRIGGER review_pilot_hidden_keys_quota_insert
+                 BEFORE INSERT ON review_pilot_hidden_keys
+                 BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        candidate.wal_checkpoint().unwrap();
+        drop(candidate);
+
+        let error = match crate::db::Database::stage_restore_source(&path) {
+            Ok(_) => panic!("weakened hidden-key trigger must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("changed=") && error.contains("review_pilot_hidden_keys_quota_insert"),
+            "staged restore must compare exact sqlite_schema SQL for hidden-key authority: {error}"
+        );
+    }
+
+    #[test]
+    fn staged_target_hidden_namespaces_and_used_policy_identity_are_fail_closed() {
+        let floor = crate::db::Database::open(":memory:").unwrap();
+        floor.initialize().unwrap();
+        let policy = test_pilot_policy(0, "ReviewerA", "ReviewerB");
+        let digest = policy.policy_sha256().unwrap();
+
+        let valid = crate::db::Database::open(":memory:").unwrap();
+        valid.initialize().unwrap();
+        valid
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'reviewera', 'valid-1')", [&digest])
+            .unwrap();
+        require_active_pilot_policy_binding(&floor, None, &valid, &pilot_restore_action(&policy)).unwrap();
+
+        let wrong_sha = crate::db::Database::open(":memory:").unwrap();
+        wrong_sha.initialize().unwrap();
+        wrong_sha
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'wrong-sha')", ["b".repeat(64)])
+            .unwrap();
+        let error =
+            require_active_pilot_policy_binding(&floor, None, &wrong_sha, &pilot_restore_action(&policy)).unwrap_err();
+        assert!(error.contains("SHA/baseline"), "{error}");
+
+        let wrong_baseline = crate::db::Database::open(":memory:").unwrap();
+        wrong_baseline.initialize().unwrap();
+        wrong_baseline
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 1, 'ReviewerA', 'wrong-baseline')", [&digest])
+            .unwrap();
+        let error = require_active_pilot_policy_binding(&floor, None, &wrong_baseline, &pilot_restore_action(&policy))
+            .unwrap_err();
+        assert!(error.contains("SHA/baseline"), "{error}");
+
+        let unauthorized = crate::db::Database::open(":memory:").unwrap();
+        unauthorized.initialize().unwrap();
+        unauthorized
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerC', 'unauthorized')", [&digest])
+            .unwrap();
+        let error = require_active_pilot_policy_binding(&floor, None, &unauthorized, &pilot_restore_action(&policy))
+            .unwrap_err();
+        assert!(error.contains("exact policy roster"), "{error}");
+
+        let over_quota = crate::db::Database::open(":memory:").unwrap();
+        over_quota.initialize().unwrap();
+        over_quota.connection().execute("DROP TRIGGER review_pilot_hidden_keys_quota_insert", []).unwrap();
+        for segment_id in ["over-1", "over-2", "over-3"] {
+            over_quota
+                .connection()
+                .execute(
+                    "INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', ?2)",
+                    rusqlite::params![&digest, segment_id],
+                )
+                .unwrap();
+        }
+        let error =
+            require_active_pilot_policy_binding(&floor, None, &over_quota, &pilot_restore_action(&policy)).unwrap_err();
+        assert!(error.contains("structural") || error.contains("quota"), "{error}");
+
+        let historical_conflict = crate::db::Database::open(":memory:").unwrap();
+        historical_conflict.initialize().unwrap();
+        historical_conflict.connection().execute("DROP TRIGGER review_pilot_hidden_keys_policy_insert", []).unwrap();
+        historical_conflict
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 17, 'PastReviewer', 'past-1')", ["c".repeat(64)])
+            .unwrap();
+        historical_conflict
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 17, 'PastReviewer', 'past-2')", ["d".repeat(64)])
+            .unwrap();
+        let error = require_active_pilot_policy_binding(
+            &floor,
+            None,
+            &historical_conflict,
+            &SnapshotPilotPolicyRestore::ExplicitlyAbsent,
+        )
+        .unwrap_err();
+        assert!(error.contains("one-policy-per-baseline"), "{error}");
+
+        let used_floor = crate::db::Database::open(":memory:").unwrap();
+        used_floor.initialize().unwrap();
+        insert_test_review_event(&used_floor, "pilot-work", "ReviewerA", "skip", "couch", 1);
+        let used_target = copied_database(&used_floor);
+        require_active_pilot_policy_binding(&used_floor, Some(&policy), &used_target, &pilot_restore_action(&policy))
+            .unwrap();
+        let replacement = test_pilot_policy(0, "ReviewerA", "ReviewerC");
+        let error = require_active_pilot_policy_binding(
+            &used_floor,
+            Some(&policy),
+            &used_target,
+            &pilot_restore_action(&replacement),
+        )
+        .unwrap_err();
+        assert!(error.contains("identity differs"), "{error}");
+    }
+
+    #[test]
+    fn staged_target_active_pilot_semantics_reject_corrupt_extras_and_keep_legacy_hidden_skip() {
+        let floor = crate::db::Database::open(":memory:").unwrap();
+        floor.initialize().unwrap();
+        let policy = test_pilot_policy(0, "ReviewerA", "ReviewerB");
+        let digest = policy.policy_sha256().unwrap();
+        let action = pilot_restore_action(&policy);
+        let validate =
+            |target: &crate::db::Database| require_active_pilot_policy_binding(&floor, None, target, &action);
+
+        let legacy_skip = crate::db::Database::open(":memory:").unwrap();
+        legacy_skip.initialize().unwrap();
+        legacy_skip
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'legacy-hidden')", [&digest])
+            .unwrap();
+        insert_test_review_event(&legacy_skip, "legacy-hidden", "ReviewerA", "skip", "couch", 1);
+        validate(&legacy_skip).unwrap();
+
+        let valid_hidden = crate::db::Database::open(":memory:").unwrap();
+        valid_hidden.initialize().unwrap();
+        valid_hidden
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'hidden-ok')", [&digest])
+            .unwrap();
+        insert_test_review_event(&valid_hidden, "hidden-ok", "ReviewerA", "edit", "couch_spot_check", 1);
+        insert_test_spot_result(&valid_hidden, "hidden-ok", "reviewera", "edit");
+        validate(&valid_hidden).unwrap();
+
+        let unauthorized = crate::db::Database::open(":memory:").unwrap();
+        unauthorized.initialize().unwrap();
+        insert_test_review_event(&unauthorized, "work", "Intruder", "skip", "couch", 1);
+        let error = validate(&unauthorized).unwrap_err();
+        assert!(error.contains("unauthorized reviewer"), "{error}");
+
+        let invalid_action = crate::db::Database::open(":memory:").unwrap();
+        invalid_action.initialize().unwrap();
+        insert_test_review_event(&invalid_action, "work", "ReviewerA", "approve", "couch", 1);
+        let error = validate(&invalid_action).unwrap_err();
+        assert!(error.contains("invalid action"), "{error}");
+
+        let ungranted_hidden = crate::db::Database::open(":memory:").unwrap();
+        ungranted_hidden.initialize().unwrap();
+        insert_test_review_event(&ungranted_hidden, "not-granted", "ReviewerA", "edit", "couch_spot_check", 1);
+        let error = validate(&ungranted_hidden).unwrap_err();
+        assert!(error.contains("no active durable grant"), "{error}");
+
+        let corpus_finalized_hidden = crate::db::Database::open(":memory:").unwrap();
+        corpus_finalized_hidden.initialize().unwrap();
+        corpus_finalized_hidden
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'hidden-corpus')", [&digest])
+            .unwrap();
+        insert_test_review_event(&corpus_finalized_hidden, "hidden-corpus", "ReviewerA", "accept", "couch", 1);
+        let error = validate(&corpus_finalized_hidden).unwrap_err();
+        assert!(error.contains("non-skip finalized"), "{error}");
+
+        let duplicate_resolution = crate::db::Database::open(":memory:").unwrap();
+        duplicate_resolution.initialize().unwrap();
+        duplicate_resolution
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'hidden-duplicate')", [&digest])
+            .unwrap();
+        insert_test_review_event(&duplicate_resolution, "hidden-duplicate", "ReviewerA", "edit", "couch_spot_check", 1);
+        insert_test_review_event(&duplicate_resolution, "hidden-duplicate", "ReviewerA", "edit", "couch_spot_check", 2);
+        insert_test_spot_result(&duplicate_resolution, "hidden-duplicate", "ReviewerA", "edit");
+        let error = validate(&duplicate_resolution).unwrap_err();
+        assert!(error.contains("resolved more than once"), "{error}");
+
+        let mismatched_result = crate::db::Database::open(":memory:").unwrap();
+        mismatched_result.initialize().unwrap();
+        mismatched_result
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'hidden-mismatch')", [&digest])
+            .unwrap();
+        insert_test_review_event(&mismatched_result, "hidden-mismatch", "ReviewerA", "edit", "couch_spot_check", 1);
+        insert_test_spot_result(&mismatched_result, "hidden-mismatch", "ReviewerA", "accept");
+        let error = validate(&mismatched_result).unwrap_err();
+        assert!(error.contains("event/result actions"), "{error}");
+
+        let impossible_score = crate::db::Database::open(":memory:").unwrap();
+        impossible_score.initialize().unwrap();
+        impossible_score
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'hidden-impossible')", [&digest])
+            .unwrap();
+        insert_test_review_event(&impossible_score, "hidden-impossible", "ReviewerA", "edit", "couch_spot_check", 1);
+        insert_test_spot_result(&impossible_score, "hidden-impossible", "ReviewerA", "edit");
+        impossible_score
+            .connection()
+            .execute(
+                "UPDATE spot_checks SET submitted_transcript = 'different', noticed = 1, cer = 0.0
+                  WHERE segment_id = 'hidden-impossible'",
+                [],
+            )
+            .unwrap();
+        let error = validate(&impossible_score).unwrap_err();
+        assert!(error.contains("impossible noticed/CER"), "{error}");
+
+        let orphan_result = crate::db::Database::open(":memory:").unwrap();
+        orphan_result.initialize().unwrap();
+        orphan_result
+            .connection()
+            .execute("INSERT INTO review_pilot_hidden_keys VALUES (?1, 0, 'ReviewerA', 'hidden-orphan')", [&digest])
+            .unwrap();
+        insert_test_spot_result(&orphan_result, "hidden-orphan", "ReviewerA", "edit");
+        let error = validate(&orphan_result).unwrap_err();
+        assert!(error.contains("orphan hidden-check result"), "{error}");
+
+        let over_corpus_cap = crate::db::Database::open(":memory:").unwrap();
+        over_corpus_cap.initialize().unwrap();
+        for index in 0..=crate::review_pilot::REVIEW_PILOT_CORPUS_ACTIONS_PER_REVIEWER {
+            insert_test_review_event(&over_corpus_cap, &format!("work-{index}"), "ReviewerA", "skip", "couch", index);
+        }
+        let error = validate(&over_corpus_cap).unwrap_err();
+        assert!(error.contains("per-reviewer corpus-action ceiling"), "{error}");
+
+        let half_written = crate::db::Database::open(":memory:").unwrap();
+        half_written.initialize().unwrap();
+        half_written.insert_segment(&test_segment("half-written", "half.wav", "draft")).unwrap();
+        half_written
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET human_decision = 'accept', reviewed_by = 'ReviewerA', verified = 1
+                  WHERE id = 'half-written'",
+                [],
+            )
+            .unwrap();
+        let error = validate(&half_written).unwrap_err();
+        assert!(error.contains("no matching active campaign event/ledger"), "{error}");
+
+        let missing_current_state = crate::db::Database::open(":memory:").unwrap();
+        missing_current_state.initialize().unwrap();
+        insert_canonical_pay_segment(&missing_current_state, "event-without-state");
+        canonical_phone_playback(&missing_current_state, "event-without-state", "ReviewerA");
+        let revision = missing_current_state.segment_review_revision("event-without-state").unwrap().unwrap();
+        missing_current_state
+            .record_phone_human_decision_by_at_revision_with_operation(
+                "event-without-state",
+                "reject",
+                None,
+                "ReviewerA",
+                revision,
+                &canonical_operation(20),
+                &crate::db::review_operation_payload_hash("event-without-state", "reject", "", "ReviewerA"),
+            )
+            .unwrap()
+            .unwrap();
+        // Model a self-consistent staged file whose event+ledger survived but whose same-revision
+        // corpus state did not. Recreate the exact trigger so only semantics—not schema drift—refuse.
+        missing_current_state.connection().execute("DROP TRIGGER speech_segments_review_revision", []).unwrap();
+        missing_current_state
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET human_decision = NULL, reviewed_by = NULL, verified = 0
+                  WHERE id = 'event-without-state'",
+                [],
+            )
+            .unwrap();
+        missing_current_state
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER speech_segments_review_revision
+                 AFTER UPDATE ON speech_segments
+                 WHEN new.review_revision = old.review_revision
+                 BEGIN
+                     UPDATE speech_segments
+                     SET review_revision = old.review_revision + 1
+                     WHERE id = old.id;
+                 END;",
+            )
+            .unwrap();
+        let error = validate(&missing_current_state).unwrap_err();
+        assert!(error.contains("no matching current-revision segment state"), "{error}");
+
+        let pre_pilot = crate::db::Database::open(":memory:").unwrap();
+        pre_pilot.initialize().unwrap();
+        insert_canonical_pay_segment(&pre_pilot, "pre-pilot-state");
+        canonical_phone_playback(&pre_pilot, "pre-pilot-state", "ReviewerA");
+        let revision = pre_pilot.segment_review_revision("pre-pilot-state").unwrap().unwrap();
+        pre_pilot
+            .record_phone_human_decision_by_at_revision_with_operation(
+                "pre-pilot-state",
+                "reject",
+                None,
+                "ReviewerA",
+                revision,
+                &canonical_operation(21),
+                &crate::db::review_operation_payload_hash("pre-pilot-state", "reject", "", "ReviewerA"),
+            )
+            .unwrap()
+            .unwrap();
+        let pre_pilot_policy = test_pilot_policy(1, "ReviewerA", "ReviewerB");
+        validate_active_pilot_semantics(&pre_pilot, &pre_pilot_policy, "pre-pilot regression")
+            .expect("an exact same-reviewer decision at the baseline is legitimate prior state");
+
+        let forged_after_undo = crate::db::Database::open(":memory:").unwrap();
+        forged_after_undo.initialize().unwrap();
+        insert_canonical_pay_segment(&forged_after_undo, "forged-after-undo");
+        canonical_phone_playback(&forged_after_undo, "forged-after-undo", "ReviewerA");
+        let revision = forged_after_undo.segment_review_revision("forged-after-undo").unwrap().unwrap();
+        let operation = canonical_operation(22);
+        forged_after_undo
+            .record_phone_human_decision_by_at_revision_with_operation(
+                "forged-after-undo",
+                "reject",
+                None,
+                "ReviewerA",
+                revision,
+                &operation,
+                &crate::db::review_operation_payload_hash("forged-after-undo", "reject", "", "ReviewerA"),
+            )
+            .unwrap()
+            .unwrap();
+        let effect_id = forged_after_undo.human_decision_effect_for_operation(&operation).unwrap().unwrap().0;
+        assert!(matches!(
+            forged_after_undo.undo_human_decision(effect_id, Some("ReviewerA"), &operation).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        forged_after_undo.connection().execute("DROP TRIGGER speech_segments_review_revision", []).unwrap();
+        forged_after_undo
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET human_decision = 'accept', reviewed_by = 'ReviewerA', verified = 1
+                  WHERE id = 'forged-after-undo'",
+                [],
+            )
+            .unwrap();
+        forged_after_undo
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER speech_segments_review_revision
+                 AFTER UPDATE ON speech_segments
+                 WHEN new.review_revision = old.review_revision
+                 BEGIN
+                     UPDATE speech_segments
+                     SET review_revision = old.review_revision + 1
+                     WHERE id = old.id;
+                 END;",
+            )
+            .unwrap();
+        let error = validate(&forged_after_undo).unwrap_err();
+        assert!(error.contains("no matching active campaign event/ledger"), "{error}");
+    }
+
+    #[test]
+    fn restore_admission_is_exclusive_and_releases_waiters_after_error_and_panic() {
+        let admission = RestoreAdmission::new();
+
+        let first = admission.try_reserve().expect("first restore owns the reservation");
+        assert!(admission.try_reserve().is_err(), "overlapping restores must fail instead of sharing a flag");
+        drop(first);
+        assert!(!admission.is_pending());
+
+        let failed: Result<(), &str> = {
+            let _reservation = admission.try_reserve().expect("reservation for failing restore");
+            Err("injected restore error")
+        };
+        assert_eq!(failed, Err("injected restore error"));
+        assert!(!admission.is_pending(), "an error path must release the restore reservation");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reservation = admission.try_reserve().expect("reservation for panicking restore");
+            panic!("injected restore panic");
+        }));
+        assert!(panicked.is_err());
+        assert!(!admission.is_pending(), "an unwind must release the restore reservation");
+
+        let capture = admission.begin_capture().expect("snapshot capture enters while no restore is pending");
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let admission_ref = &admission;
+            scope.spawn(move || {
+                let _ = started_tx.send(());
+                let reservation = admission_ref.try_reserve().expect("restore waits for active capture to drain");
+                let _ = acquired_tx.send(());
+                let _ = release_rx.recv();
+                drop(reservation);
+            });
+            started_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("restore waiter thread started");
+            let pending_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !admission.is_pending() && std::time::Instant::now() < pending_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(admission.is_pending(), "restore must publish pending before waiting for the capture");
+            assert!(admission.begin_capture().is_err(), "no new snapshot may cross a pending restore generation");
+            assert!(
+                acquired_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+                "restore publication must wait until the complete capture token drops"
+            );
+            drop(capture);
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("restore proceeds after the snapshot capture drains");
+            release_tx.send(()).unwrap();
+        });
+        assert!(!admission.is_pending());
+
+        let database = std::sync::Mutex::new(());
+        let reservation = admission.try_reserve().expect("reservation that fences a queued writer");
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let admission_ref = &admission;
+            let database_ref = &database;
+            scope.spawn(move || {
+                let _db = admission_ref.lock(database_ref).unwrap_or_else(|poisoned| poisoned.into_inner());
+                entered_tx.send(()).unwrap();
+            });
+            assert!(
+                entered_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+                "an ordinary AppState DB caller must remain fenced through the complete restore"
+            );
+            // Models the point after DB pages are restored but before history/config/pipeline work ends.
+            // The waiter must still be blocked until the outer command drops its reservation.
+            assert!(admission.is_pending());
+            drop(reservation);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the queued caller resumes after the complete restore");
+        });
+    }
+
+    #[test]
+    fn armed_restore_parks_on_error_and_exact_recovery_is_the_only_reentry() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().expect("new restore reservation");
+        reservation.arm_named_restore().expect("durable transaction arm");
+        drop(reservation); // models any error/unwind after the marker commit boundary
+
+        assert!(admission.is_pending(), "an armed error must keep ordinary DB/config work fenced");
+        assert!(admission.begin_mutation().is_err(), "no mutation may start in recovery-required state");
+        assert!(admission.try_reserve().is_err(), "an unrelated restore cannot claim a parked transaction");
+
+        let recovery = admission.claim_recovery().expect("the exact recovery path reclaims parked admission");
+        recovery.commit_named_restore().expect("coherent generation commit releases the fence");
+        let next = admission.try_reserve().expect("normal restore admission resumes after recovery commit");
+        drop(recovery); // a stale generation token must not clear the newer reservation
+        assert!(admission.is_pending(), "stale guard drop must not release a newer restore generation");
+        drop(next);
+        assert!(!admission.is_pending());
+    }
+
+    #[test]
+    fn full_operation_mutation_and_restore_admission_are_race_closed() {
+        let admission = RestoreAdmission::new();
+        let mutation = admission.begin_mutation().expect("mutation starts while idle");
+        assert!(admission.try_reserve().is_err(), "restore must refuse an already-running long mutation");
+        assert!(!admission.is_pending(), "a refused new restore must not strand the admission flag");
+        drop(mutation);
+
+        let restore = admission.try_reserve().expect("restore starts after mutation ends");
+        assert!(admission.begin_mutation().is_err(), "new long mutation must refuse a published restore");
+        drop(restore);
+        assert!(admission.begin_mutation().is_ok(), "mutations resume after an unarmed restore ends");
+    }
+
+    #[test]
+    fn restore_helper_pins_the_old_live_db_before_swapping_to_the_source() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().expect("local restore reservation");
+        let temp = tempfile::TempDir::new().unwrap();
+        let live_path = temp.path().join("live.db");
+        let source_path = temp.path().join("source.db");
+        let data_dir = temp.path().join("app-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let live = crate::db::Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("old-live", "old.wav", "must be recoverable")).unwrap();
+
+        // Derive the source from live so immutable compensation-policy provenance (including its
+        // database-owned timestamp) is truly the same generation; independent initialize() calls can
+        // straddle a one-second clock boundary and are not a legitimate restore-superset fixture.
+        live.backup(&source_path).unwrap();
+        let source = crate::db::Database::open(source_path.to_string_lossy().as_ref()).unwrap();
+        source.delete_segment("old-live").unwrap();
+        source.insert_segment(&test_segment("restored", "restored.wav", "from snapshot")).unwrap();
+        // A manifest-bound snapshot is a frozen, self-contained DB file. Immutable restore staging
+        // intentionally ignores live WAL sidecars, so finish this fixture like snapshot promotion
+        // does instead of asking raw-file verification to read an open writer's uncheckpointed WAL.
+        source.wal_checkpoint().unwrap();
+        drop(source);
+
+        let shared = std::sync::Mutex::new(live);
+        let pinned = {
+            // This is the exact production ownership shape: one DB mutex guard is held while the
+            // helper first snapshots and then restores. Rust cannot release/reacquire it in between.
+            let mut guard = shared.lock().unwrap();
+            restore_with_mandatory_snapshot(&reservation, &mut guard, &data_dir, &source_path).unwrap()
+        };
+
+        let restored = shared.lock().unwrap();
+        assert!(restored.get_segment_by_id("restored").unwrap().is_some());
+        assert!(restored.get_segment_by_id("old-live").unwrap().is_none());
+
+        assert!(
+            crate::snapshot::verify_snapshot_manifest_for_restore(&pinned).unwrap(),
+            "the mandatory pre-restore pin must be self-verifying"
+        );
+        let pinned_db = pinned.join("cortex-speech.db");
+        let read_only = rusqlite::Connection::open_with_flags(
+            pinned_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let old_rows: i64 = read_only
+            .query_row("SELECT COUNT(*) FROM speech_segments WHERE id = 'old-live'", [], |row| row.get(0))
+            .unwrap();
+        let new_rows: i64 = read_only
+            .query_row("SELECT COUNT(*) FROM speech_segments WHERE id = 'restored'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((old_rows, new_rows), (1, 0), "the mandatory pin must contain the exact pre-restore library");
+        // A WAL-mode read-only connection may keep transient -shm/-wal siblings open. Production
+        // staging closes its source before the final manifest re-verification; model that boundary.
+        drop(read_only);
+    }
+
+    #[test]
+    fn bare_restore_refuses_durable_review_activity_before_pin_or_swap() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("app-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let live_path = temp.path().join("live.db");
+        let source_path = temp.path().join("source.db");
+        let mut live = crate::db::Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        insert_canonical_pay_segment(&live, "reviewed");
+        live.backup(&source_path).unwrap();
+        live.record_review_event("reviewed", "Reviewer", "skip", "test", 1).unwrap();
+
+        let error = restore_with_mandatory_snapshot(&reservation, &mut live, &data_dir, &source_path).unwrap_err();
+        assert!(error.contains("Bare database restore is refused"), "{error}");
+        let events: i64 =
+            live.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        assert_eq!(events, 1, "the live audit row must remain in place");
+        assert!(!data_dir.join("snapshots").join("pinned").exists(), "refusal must happen before safety-pin I/O");
+    }
+
+    #[test]
+    fn bare_restore_refuses_target_only_durable_review_activity_before_pin_or_swap() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("app-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let live_path = temp.path().join("live.db");
+        let source_path = temp.path().join("source.db");
+        let mut live = crate::db::Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        insert_canonical_pay_segment(&live, "target-reviewed");
+        live.backup(&source_path).unwrap();
+        let target = crate::db::Database::open(source_path.to_string_lossy().as_ref()).unwrap();
+        target.record_review_event("target-reviewed", "Reviewer", "skip", "test", 1).unwrap();
+        target.wal_checkpoint().unwrap();
+        drop(target);
+
+        let error = restore_with_mandatory_snapshot(&reservation, &mut live, &data_dir, &source_path).unwrap_err();
+        assert!(error.contains("either the live or target generation"), "{error}");
+        let live_events: i64 =
+            live.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        assert_eq!(live_events, 0, "target-only audit history must not be imported through the bare path");
+        assert!(!data_dir.join("snapshots").join("pinned").exists());
+    }
+
+    #[test]
+    fn bare_restore_refuses_snapshot_that_predates_a_legacy_path_withdrawal_before_pin_or_swap() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("app-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let live_path = temp.path().join("live.db");
+        let source_path = temp.path().join("before-withdrawal.db");
+        let mut live = crate::db::Database::open(live_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("legacy-withdrawal", "legacy-withdrawal.wav", "private recording")).unwrap();
+        assert!(live.segment_audio_content_hash("legacy-withdrawal").unwrap().is_none());
+        live.backup(&source_path).unwrap();
+        assert_eq!(live.revoke_recording("legacy-withdrawal.wav").unwrap(), 1);
+
+        let error = restore_with_mandatory_snapshot(&reservation, &mut live, &data_dir, &source_path).unwrap_err();
+        assert!(error.contains("resurrect 1 withdrawn recording"), "{error}");
+        assert!(live.rights_for_segment("legacy-withdrawal").unwrap().is_revoked());
+        assert!(
+            !data_dir.join("snapshots").join("pinned").exists(),
+            "consent regression must be refused before safety-pin I/O or page publication"
+        );
+    }
+
+    #[test]
+    fn named_restore_rejects_missing_durable_rows_before_pin_marker_or_swap() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let mut live = crate::db::Database::open(":memory:").unwrap();
+        live.initialize().unwrap();
+        insert_canonical_pay_segment(&live, "reviewed");
+        let source_dir = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 1000).unwrap().unwrap();
+        let source = source_dir.join("cortex-speech.db");
+        live.record_review_event("reviewed", "Reviewer", "skip", "test", 1).unwrap();
+
+        let error = prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &source_dir,
+            &source,
+            "snapshot_0000001000",
+        )
+        .unwrap_err();
+        assert!(error.contains("review_events"), "{error}");
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let pins = data_dir.join("snapshots").join("pinned");
+        assert!(!pins.exists() || std::fs::read_dir(pins).unwrap().next().is_none());
+        let events: i64 =
+            live.connection().query_row("SELECT COUNT(*) FROM review_events", [], |row| row.get(0)).unwrap();
+        assert_eq!(events, 1, "the live generation must not be swapped on floor regression");
+    }
+
+    #[test]
+    fn named_restore_cannot_roll_a_reviewed_recording_back_across_consent_withdrawal() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let mut live = crate::db::Database::open(":memory:").unwrap();
+        live.initialize().unwrap();
+        insert_canonical_pay_segment(&live, "reviewed-withdrawal");
+        live.finalize_human_review("reviewed-withdrawal", "accept", Some("machine draft"), Some(1), None).unwrap();
+        // Fork the target before withdrawal. Give that old generation one unrelated metadata update
+        // after the fork so its review revision equals the withdrawal-updated live row. This defeats
+        // an accidental dependency on review_revision and proves the dedicated consent floor is what
+        // refuses the otherwise review-history-equivalent target.
+        let target = copied_database(&live);
+        assert_eq!(live.revoke_recording("reviewed-withdrawal.wav").unwrap(), 1);
+        target
+            .connection()
+            .execute("UPDATE speech_segments SET speaker_id = 'metadata-only' WHERE id = 'reviewed-withdrawal'", [])
+            .unwrap();
+        assert_eq!(
+            live.segment_review_revision("reviewed-withdrawal").unwrap(),
+            target.segment_review_revision("reviewed-withdrawal").unwrap(),
+            "the adversarial target must pass the reviewed-row revision projection"
+        );
+        let source_dir = crate::snapshot::take_snapshot_at(&target, data_dir, 5, 1_500).unwrap().unwrap();
+        let source = source_dir.join("cortex-speech.db");
+        let selector = snapshot_selector(&source_dir, false);
+
+        let error =
+            prepare_and_restore_named_transaction(&reservation, &mut live, data_dir, &source_dir, &source, &selector)
+                .unwrap_err();
+        assert!(error.contains("resurrect 1 withdrawn recording"), "{error}");
+        assert!(live.rights_for_segment("reviewed-withdrawal").unwrap().is_revoked());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let pins = data_dir.join("snapshots").join("pinned");
+        assert!(
+            !pins.exists() || std::fs::read_dir(pins).unwrap().next().is_none(),
+            "withdrawal regression must be refused before a restore marker or page swap"
+        );
+    }
+
+    #[test]
+    fn named_restore_rejects_target_only_half_written_pilot_state_before_pin_or_marker() {
+        let admission = RestoreAdmission::new();
+        let reservation = admission.try_reserve().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let mut live = crate::db::Database::open(":memory:").unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("half-target", "half.wav", "draft")).unwrap();
+
+        let target = copied_database(&live);
+        target
+            .connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET human_decision = 'accept', reviewed_by = 'Chiman', verified = 1
+                  WHERE id = 'half-target'",
+                [],
+            )
+            .unwrap();
+        // Snapshot creation must keep enforcing the real controlled-pilot authority contract. Use
+        // its exact roster so this fixture passes snapshot admission and reaches the independent
+        // named-restore semantic gate for the deliberately half-written corpus row below.
+        let policy = test_pilot_policy(0, "Chiman", "Karwan");
+        crate::review_pilot::install_test_focus(data_dir, ["half-target"]);
+        std::fs::write(
+            data_dir.join(crate::review_pilot::REVIEW_PILOT_FILE),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+        let snapshot = crate::snapshot::take_snapshot_at(&target, data_dir, 5, 6000).unwrap().unwrap();
+        let source = snapshot.join("cortex-speech.db");
+        let selector = snapshot.file_name().unwrap().to_string_lossy().to_string();
+
+        let error =
+            prepare_and_restore_named_transaction(&reservation, &mut live, data_dir, &snapshot, &source, &selector)
+                .unwrap_err();
+        assert!(error.contains("no matching active campaign event/ledger"), "{error}");
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let pins = data_dir.join("snapshots").join("pinned");
+        assert!(!pins.exists() || std::fs::read_dir(pins).unwrap().next().is_none());
+        let unchanged = live.get_segment_by_id("half-target").unwrap().unwrap();
+        assert!(unchanged.human_decision.is_none() && unchanged.reviewed_by.is_none());
+    }
+
+    #[test]
+    fn named_restore_reuses_original_transaction_pin_and_bad_source_creates_no_barrier() {
+        let admission = RestoreAdmission::new();
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let mut live = crate::db::Database::open(":memory:").unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("before-source", "before.wav", "source generation")).unwrap();
+        let source_dir = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 1000).unwrap().unwrap();
+        let source = source_dir.join("cortex-speech.db");
+        live.insert_segment(&test_segment("pre-restore-only", "later.wav", "must remain in original pin")).unwrap();
+
+        let reservation = admission.try_reserve().unwrap();
+        let first = prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &source_dir,
+            &source,
+            "snapshot_0000001000",
+        )
+        .unwrap();
+        assert_eq!(first.optional.len(), crate::snapshot::OPTIONAL_SNAPSHOT_STATE.len());
+        let pending = load_named_restore_pending(data_dir).unwrap().unwrap();
+        let original_pin = crate::snapshot::resolve_snapshot_dir(data_dir, &pending.pre_restore_pin_selector).unwrap();
+        let pin_db = rusqlite::Connection::open_with_flags(
+            original_pin.join("cortex-speech.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let original_only: i64 = pin_db
+            .query_row("SELECT COUNT(*) FROM speech_segments WHERE id='pre-restore-only'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(original_only, 1, "the transaction pin is the exact generation before the first page swap");
+
+        prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &source_dir,
+            &source,
+            "snapshot_0000001000",
+        )
+        .unwrap();
+        let pins = std::fs::read_dir(data_dir.join("snapshots").join("pinned"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("prerestore_"))
+            .count();
+        assert_eq!(pins, 1, "a retry must reuse, never rotate out, the original pre-restore generation");
+        assert_eq!(load_named_restore_pending(data_dir).unwrap().unwrap(), pending);
+        clear_review_pilot_restore_pending(data_dir).unwrap();
+        reservation.commit_named_restore().unwrap();
+        drop(reservation);
+
+        let broken_dir = data_dir.join("snapshots").join("snapshot_0000002000");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(broken_dir.join("cortex-speech.db"), b"not sqlite").unwrap();
+        let reservation = admission.try_reserve().unwrap();
+        let error = prepare_and_restore_named_transaction(
+            &reservation,
+            &mut live,
+            data_dir,
+            &broken_dir,
+            &broken_dir.join("cortex-speech.db"),
+            "snapshot_0000002000",
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let pins_after = std::fs::read_dir(data_dir.join("snapshots").join("pinned"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("prerestore_"))
+            .count();
+        assert_eq!(pins_after, 1, "invalid source validation happens before any new pin or barrier");
+        drop(reservation);
+    }
+
+    fn snapshot_selector(path: &Path, pinned: bool) -> String {
+        let name = path.file_name().and_then(|name| name.to_str()).expect("snapshot directory name");
+        if pinned {
+            format!("pinned/{name}")
+        } else {
+            name.to_string()
+        }
+    }
+
+    #[test]
+    fn interrupted_recovery_uses_original_pin_floor_not_possibly_swapped_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let mut live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        insert_canonical_pay_segment(&live, "original");
+        live.insert_segment(&test_segment("target-only", "target.wav", "target generation")).unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 2000).unwrap().unwrap();
+
+        live.delete_segment("target-only").unwrap();
+        record_canonical_skip(&live, "original", "Reviewer", 30);
+        let original_pin = crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "history-floor", 3, 3000).unwrap();
+
+        // Model a crash after target page publication: live now lacks the original floor's audit/pay
+        // rows. A broken implementation that compares against live would accept target again.
+        let staged_target = crate::db::Database::stage_restore_source(target.join("cortex-speech.db")).unwrap();
+        live.commit_staged_restore(&staged_target).unwrap();
+        drop(staged_target);
+        drop(live);
+
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: snapshot_selector(&target, false),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            completed_selector: None,
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        let events: i64 = recovered
+            .connection()
+            .query_row("SELECT COUNT(*) FROM review_events WHERE segment_id = 'original'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 1, "fallback must restore the original pin's durable review floor");
+        assert!(recovered.get_segment_by_id("original").unwrap().is_some());
+        assert!(
+            recovered.get_segment_by_id("target-only").unwrap().is_none(),
+            "the regressive target must be rejected and the original floor published"
+        );
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupted_recovery_rejects_a_pre_withdrawal_target_and_restores_the_revoked_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let mut live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("interrupted-withdrawal", "interrupted-withdrawal.wav", "private recording"))
+            .unwrap();
+        let content_hash = "d".repeat(64);
+        live.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash = ?1 WHERE id = 'interrupted-withdrawal'",
+                [&content_hash],
+            )
+            .unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 2_500).unwrap().unwrap();
+
+        assert_eq!(live.revoke_recording("interrupted-withdrawal.wav").unwrap(), 1);
+        let original_pin =
+            crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "withdrawal-floor", 3, 2_600).unwrap();
+
+        // Model a process death after the old target pages were swapped but before required state and
+        // the durable marker completed.  Startup recovery must compare against the original pin, not
+        // trust the now-unrevoked live pages.
+        let staged_target = crate::db::Database::stage_restore_source(target.join("cortex-speech.db")).unwrap();
+        live.commit_staged_restore(&staged_target).unwrap();
+        assert!(!live.rights_for_segment("interrupted-withdrawal").unwrap().is_revoked());
+        drop(staged_target);
+        drop(live);
+
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: snapshot_selector(&target, false),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            completed_selector: None,
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(
+            recovered.rights_for_segment("interrupted-withdrawal").unwrap().is_revoked(),
+            "startup fallback must republish the original withdrawal authority"
+        );
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_recovery_completes_the_recorded_target_before_any_normal_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("original", "original.wav", "original generation")).unwrap();
+        let original_pin =
+            crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "startup-original", 3, 1000).unwrap();
+        live.insert_segment(&test_segment("target", "target.wav", "target generation")).unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 2000).unwrap().unwrap();
+        live.delete_segment("target").unwrap(); // prove recovery publishes the target snapshot, not current pages
+        drop(live);
+
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: snapshot_selector(&target, false),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            completed_selector: None,
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+        assert!(!admission.is_pending());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(recovered.get_segment_by_id("original").unwrap().is_some());
+        assert!(recovered.get_segment_by_id("target").unwrap().is_some());
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_the_verified_full_original_when_target_preflight_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("original", "original.wav", "original generation")).unwrap();
+        let original_pin =
+            crate::snapshot::take_pinned_snapshot_at(&live, data_dir, "startup-rollback", 3, 3000).unwrap();
+        live.insert_segment(&test_segment("target", "target.wav", "must be rolled back")).unwrap();
+        let target = crate::snapshot::take_snapshot_at(&live, data_dir, 5, 4000).unwrap().unwrap();
+        drop(live);
+        std::fs::write(target.join("settings.json"), b"tampered after manifest").unwrap();
+
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: snapshot_selector(&target, false),
+            pre_restore_pin_selector: snapshot_selector(&original_pin, true),
+            completed_selector: None,
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+        assert!(!admission.is_pending());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(recovered.get_segment_by_id("original").unwrap().is_some());
+        assert!(recovered.get_segment_by_id("target").unwrap().is_none());
+    }
+
+    #[test]
+    fn completed_restore_marker_cleanup_never_replays_or_rolls_back_missing_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        AppSettings::default().save(&data_dir.join("settings.json")).unwrap();
+        let db_path = data_dir.join("cortex-speech.db");
+        let live = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        live.initialize().unwrap();
+        live.insert_segment(&test_segment("committed", "committed.wav", "already coherent")).unwrap();
+        drop(live);
+        let pending = NamedRestorePending {
+            schema: NAMED_RESTORE_PENDING_SCHEMA,
+            source_selector: "snapshot_0000009999".to_string(),
+            pre_restore_pin_selector: "pinned/missing_0000009998".to_string(),
+            completed_selector: Some("snapshot_0000009999".to_string()),
+        };
+        write_named_restore_pending(data_dir, &pending).unwrap();
+        let admission = RestoreAdmission::new();
+
+        assert!(recover_interrupted_named_restore_with_admission(data_dir, &admission).unwrap());
+        assert!(!admission.is_pending());
+        assert!(load_named_restore_pending(data_dir).unwrap().is_none());
+        let recovered = crate::db::Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        assert!(recovered.get_segment_by_id("committed").unwrap().is_some());
+    }
+
+    #[test]
+    fn named_restore_rehashes_after_plan_and_staging_and_never_mutates_invalid_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&test_segment("source", "source.wav", "source")).unwrap();
+        let source_dir = crate::snapshot::take_snapshot_at(&db, temp.path(), 5, 1000).unwrap().unwrap();
+        let source_db = source_dir.join("cortex-speech.db");
+        let settings = source_dir.join("settings.json");
+        let original = std::fs::read(&settings).unwrap();
+        let error = prepare_named_restore_artifacts(&source_dir, &source_db, || {
+            std::fs::write(&settings, b"tampered after plan capture").unwrap();
+        })
+        .err()
+        .expect("post-capture mutation must be rejected");
+        assert!(error.contains("mismatch"), "{error}");
+
+        // Restore the exact source, then make malformed settings honestly match the manifest. This
+        // reaches semantic preflight and proves it rejects without AppSettings::load renaming/mutating
+        // the frozen source or touching a live DB.
+        std::fs::write(&settings, &original).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source_dir.join(crate::snapshot::MANIFEST_FILE)).unwrap()).unwrap();
+        let invalid = b"{}";
+        std::fs::write(&settings, invalid).unwrap();
+        let row =
+            manifest["files"].as_array_mut().unwrap().iter_mut().find(|row| row["path"] == "settings.json").unwrap();
+        row["sizeBytes"] = serde_json::json!(invalid.len());
+        row["sha256"] = serde_json::json!(crate::models::compute_file_sha256(&settings).unwrap());
+        std::fs::write(source_dir.join(crate::snapshot::MANIFEST_FILE), serde_json::to_vec_pretty(&manifest).unwrap())
+            .unwrap();
+        let semantic = prepare_named_restore_artifacts(&source_dir, &source_db, || {})
+            .err()
+            .expect("correctly hashed malformed config must fail semantic preflight");
+        assert!(semantic.contains("settings.json is invalid"), "{semantic}");
+        assert_eq!(std::fs::read(&settings).unwrap(), invalid);
+        assert!(
+            std::fs::read_dir(&source_dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains("corrupt")),
+            "strict recovery parsing must not rename or repair the frozen source"
+        );
+    }
+
+    #[test]
+    fn required_snapshot_routing_state_is_atomic_and_failure_keeps_review_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let payloads = [
+            ("champion.json", b"snapshot champion".as_slice()),
+            ("reviewer_dialects.json", b"snapshot dialects".as_slice()),
+            ("voice_focus.json", b"snapshot focus".as_slice()),
+        ];
+        let plan = crate::snapshot::OPTIONAL_SNAPSHOT_STATE
+            .iter()
+            .copied()
+            .filter(|state| state.live_file != "settings.json")
+            .map(|state| {
+                let bytes = payloads.iter().find(|(name, _)| *name == state.live_file).unwrap().1.to_vec();
+                (state, crate::snapshot::OptionalSnapshotRestore::Install(bytes))
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+
+        // A non-file destination is an injected install failure. The helper must fail, and the
+        // command-level commit marker remains authoritative because only the successful tail clears it.
+        std::fs::create_dir(live.join("champion.json")).unwrap();
+        let error = restore_required_snapshot_state_atomic(&plan, &live).unwrap_err();
+        assert!(error.contains("champion.json") && error.contains("regular file or absent"), "{error}");
+        assert!(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE).is_file());
+
+        std::fs::remove_dir(live.join("champion.json")).unwrap();
+        restore_required_snapshot_state_atomic(&plan, &live).unwrap();
+        assert_eq!(std::fs::read(live.join("champion.json")).unwrap(), b"snapshot champion");
+        assert_eq!(std::fs::read(live.join("reviewer_dialects.json")).unwrap(), b"snapshot dialects");
+        assert_eq!(std::fs::read(live.join("voice_focus.json")).unwrap(), b"snapshot focus");
+        assert!(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE).is_file());
+
+        let stale = live.join("voice_focus.json.replace-bak-99999");
+        std::fs::write(&stale, b"stale focus").unwrap();
+        let absent = plan
+            .iter()
+            .map(|(state, _)| (*state, crate::snapshot::OptionalSnapshotRestore::ExplicitlyAbsent))
+            .collect::<Vec<_>>();
+        restore_required_snapshot_state_atomic(&absent, &live).unwrap();
+        for (state, _) in &absent {
+            assert!(!live.join(state.live_file).exists(), "{} must restore as explicit absence", state.live_file);
+        }
+        assert!(!stale.exists(), "explicit absence must not allow an atomic-recovery backup to resurrect old policy");
+        assert!(live.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE).is_file());
     }
 
     #[test]
@@ -4114,6 +4681,139 @@ mod tests {
         assert_eq!(restored.external_asr_script_path, live.external_asr_script_path);
         assert!(!restored.champion_supervision_enabled, "a restore must not auto-load the 30 GB server");
         assert_eq!(restored.vad_threshold, 0.77, "ordinary snapshot configuration should still restore");
+    }
+
+    #[test]
+    fn snapshot_pilot_policy_is_exact_atomic_and_fail_closed_during_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot_dir = temp.path().join("snapshot_1");
+        let live_dir = temp.path().join("live");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let snapshot_db = snapshot_dir.join("cortex-speech.db");
+        let source = crate::db::Database::open(snapshot_db.to_string_lossy().as_ref()).unwrap();
+        source.initialize().unwrap();
+        source.wal_checkpoint().unwrap();
+        drop(source);
+
+        let policy = br#"{
+          "schema_version": 1,
+          "after_review_event_id": 0,
+          "max_total_corpus_actions": 20,
+          "reviewers": [
+            {"name": "Karwan", "max_corpus_actions": 10},
+            {"name": "Chiman", "max_corpus_actions": 10}
+          ]
+        }"#;
+        std::fs::write(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE), policy).unwrap();
+        let legacy_policy = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap_err();
+        assert!(
+            legacy_policy.contains("requires a verified manifest"),
+            "a manifestless policy-bearing tree can never authorize a named restore: {legacy_policy}"
+        );
+        crate::review_pilot::install_test_focus(&snapshot_dir, ["snapshot-focus"]);
+        std::fs::write(
+            snapshot_dir.join(crate::voice_focus::VOICE_FOCUS_FILE),
+            br#"{"segment_ids":["snapshot-wrong"]}"#,
+        )
+        .unwrap();
+        let wrong_focus = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).unwrap_err();
+        assert!(wrong_focus.contains("digest mismatch"), "{wrong_focus}");
+        crate::review_pilot::install_test_focus(&snapshot_dir, ["snapshot-focus"]);
+        let install = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).unwrap();
+        assert!(matches!(install, SnapshotPilotPolicyRestore::Install(_)));
+        crate::review_pilot::install_test_focus(&live_dir, ["snapshot-focus"]);
+
+        // Both representations are ambiguous and must fail before any DB swap.
+        std::fs::write(
+            snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE),
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
+        )
+        .unwrap();
+        assert!(inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).is_err());
+        std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)).unwrap();
+
+        std::fs::write(live_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+        assert!(
+            crate::review_pilot::load(&live_dir).unwrap_err().contains("restore did not finish"),
+            "an interrupted cross-file restore must block paid review"
+        );
+        apply_snapshot_pilot_policy(&install, &live_dir).unwrap();
+        assert!(
+            crate::review_pilot::load(&live_dir).is_err(),
+            "installing policy is not the commit point; the pending barrier remains authoritative"
+        );
+        clear_review_pilot_restore_pending(&live_dir).unwrap();
+        assert_eq!(crate::review_pilot::load(&live_dir).unwrap().unwrap().reviewer_names(), vec!["Chiman", "Karwan"]);
+
+        // Explicit absence removes an existing policy only under the same fail-closed marker.
+        std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_FILE)).unwrap();
+        std::fs::write(
+            snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE),
+            crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_BYTES,
+        )
+        .unwrap();
+        let absent = inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap();
+        assert_eq!(absent, SnapshotPilotPolicyRestore::ExplicitlyAbsent);
+        std::fs::write(live_dir.join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+        let stale_policy_backup =
+            live_dir.join(format!("{}.replace-bak-99999", crate::review_pilot::REVIEW_PILOT_FILE));
+        std::fs::write(&stale_policy_backup, policy).unwrap();
+        apply_snapshot_pilot_policy(&absent, &live_dir).unwrap();
+        assert!(!stale_policy_backup.exists(), "explicit absence must remove recoverable stale policy bytes");
+        assert!(crate::review_pilot::load(&live_dir).is_err());
+        let stale_barrier_backup =
+            live_dir.join(format!("{}.replace-bak-99999", crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE));
+        std::fs::write(&stale_barrier_backup, b"stale pending").unwrap();
+        clear_review_pilot_restore_pending(&live_dir).unwrap();
+        assert!(!stale_barrier_backup.exists(), "a completed restore must not resurrect its barrier");
+        assert_eq!(crate::review_pilot::load(&live_dir), Ok(None));
+
+        // Legacy snapshots remain recoverable but can never delete or replace a current live policy.
+        std::fs::remove_file(snapshot_dir.join(crate::review_pilot::REVIEW_PILOT_ABSENT_MARKER_FILE)).unwrap();
+        assert!(
+            inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, true).is_err(),
+            "manifest-bearing snapshots can never infer unrestricted state from missing files"
+        );
+        assert_eq!(
+            inspect_snapshot_pilot_policy(&snapshot_dir, &snapshot_db, false).unwrap(),
+            SnapshotPilotPolicyRestore::PreserveLegacy
+        );
+    }
+
+    #[test]
+    fn bare_database_restore_refuses_active_or_uncertain_controlled_pilot_state() {
+        let live = tempfile::tempdir().unwrap();
+        assert!(refuse_bare_restore_during_controlled_pilot(live.path()).is_ok());
+
+        let policy = br#"{
+          "schema_version": 1,
+          "after_review_event_id": 0,
+          "max_total_corpus_actions": 20,
+          "reviewers": [
+            {"name": "Chiman", "max_corpus_actions": 10},
+            {"name": "Karwan", "max_corpus_actions": 10}
+          ]
+        }"#;
+        crate::review_pilot::install_test_focus(live.path(), ["live-focus"]);
+        std::fs::write(live.path().join(crate::review_pilot::REVIEW_PILOT_FILE), policy).unwrap();
+        let active = refuse_bare_restore_during_controlled_pilot(live.path()).unwrap_err();
+        assert!(active.contains("policy-bearing named snapshot"), "{active}");
+
+        std::fs::remove_file(live.path().join(crate::review_pilot::REVIEW_PILOT_FILE)).unwrap();
+        let remembered = serde_json::json!({
+            "reviewers": {},
+            "db_path": "remembered.db",
+            "pilot_policy": serde_json::from_slice::<serde_json::Value>(policy).unwrap(),
+        });
+        std::fs::write(live.path().join("couch_session.json"), serde_json::to_vec(&remembered).unwrap()).unwrap();
+        let durable = refuse_bare_restore_during_controlled_pilot(live.path()).unwrap_err();
+        assert!(durable.contains("durable Couch session"), "{durable}");
+        std::fs::remove_file(live.path().join("couch_session.json")).unwrap();
+
+        std::fs::write(live.path().join(crate::review_pilot::REVIEW_PILOT_RESTORE_PENDING_FILE), b"pending").unwrap();
+        let uncertain = refuse_bare_restore_during_controlled_pilot(live.path()).unwrap_err();
+        assert!(uncertain.contains("not provably safe"), "{uncertain}");
     }
 
     fn insert_hypothesis(
@@ -4245,57 +4945,6 @@ mod tests {
         s.jury_model = "example/future-approved-judge".into();
         let (_, _, model) = resolve_t2_endpoint_from_keys(&s, "gkey", Some("orkey"));
         assert_eq!(model, "example/future-approved-judge");
-    }
-
-    #[test]
-    fn apply_curation_fields_touches_only_whitelisted_fields_and_rejects_unknown_keys() {
-        // F10 root fix: the partial autosave path must be able to change ONLY the whitelisted curation
-        // fields (annotatedTranscript, speakerId, alignmentJson, verified); everything else in the row must
-        // be bit-identical after the apply, and an unknown key must be a loud error (a typo'd field must
-        // never look saved).
-        let mut seg = test_segment("s1", "/audio/a.wav", "raw text");
-        seg.verified = true;
-        seg.confidence = Some(0.42);
-        let before = seg.clone();
-
-        let fields: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"annotatedTranscript": "دەق", "speakerId": "SPEAKER_01"}"#).unwrap();
-        apply_curation_fields(&mut seg, &fields).unwrap();
-        assert_eq!(seg.annotated_transcript.as_deref(), Some("دەق"));
-        assert_eq!(seg.speaker_id.as_deref(), Some("SPEAKER_01"));
-        // Every non-curation column is untouched — the stale-store clobber class is closed by construction.
-        assert_eq!(seg.verified, before.verified);
-        assert_eq!(seg.confidence, before.confidence);
-        assert_eq!(seg.raw_transcript, before.raw_transcript);
-        assert_eq!(seg.audio_path, before.audio_path);
-        assert_eq!(seg.alignment_json, before.alignment_json, "unprovided field stays untouched");
-
-        // null clears a nullable field.
-        let clear: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"speakerId": null}"#).unwrap();
-        apply_curation_fields(&mut seg, &clear).unwrap();
-        assert_eq!(seg.speaker_id, None);
-
-        // `verified` IS a whitelisted curation field now — handleToggleVerify routes through this field-level
-        // path (not a whole-row upsert) so a concurrent WSL-7B refinement write is never reverted. It applies
-        // as a bool, and a non-bool is a loud error.
-        let ver: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"verified": false}"#).unwrap();
-        apply_curation_fields(&mut seg, &ver).unwrap();
-        assert!(!seg.verified, "verified applies as a bool");
-        assert_eq!(seg.raw_transcript, before.raw_transcript, "verifying must not touch raw_transcript");
-        let ver_bad: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"verified": "yes"}"#).unwrap();
-        assert!(apply_curation_fields(&mut seg, &ver_bad).is_err(), "a non-bool verified must be a loud error");
-
-        // A genuinely non-whitelisted key -> loud error, row unchanged.
-        let bad: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{"confidence": 0.9}"#).unwrap();
-        let err = apply_curation_fields(&mut seg, &bad).unwrap_err();
-        assert!(err.contains("unsupported field 'confidence'"), "{err}");
-        assert_eq!(seg.confidence, before.confidence, "non-whitelisted field must not change");
-
-        // Wrong value type -> loud error.
-        let wrong: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"annotatedTranscript": 7}"#).unwrap();
-        assert!(apply_curation_fields(&mut seg, &wrong).is_err());
     }
 
     #[test]
@@ -4457,7 +5106,7 @@ mod tests {
             jury_cloud_opt_in: true,
             llm_api_key: "session-key".to_string(),
             external_asr_script_path: "/root/cortex_env/omniasr.py".to_string(),
-            source_reference_models: vec!["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()],
+            source_reference_models: vec!["gemini-2.5-pro".to_string()],
             ..crate::settings::AppSettings::default()
         };
         let model_status = vec![
@@ -4572,8 +5221,7 @@ mod tests {
 
     #[test]
     fn source_reference_commit_runs_before_t0_auto_accept() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = real_source_audio(&dir, "source.wav", 4000);
         let mut segment = test_segment("seg-reference-first", &audio_path, "wrong local consensus");
@@ -4622,7 +5270,7 @@ mod tests {
             },
         ];
 
-        let filtered = hypotheses_for_selected_asr(&crate::settings::AsrModelSize::WSL7B, &segment, hypotheses);
+        let filtered = hypotheses_for_selected_asr(&crate::settings::AsrModelSize::WSL7B, &segment, hypotheses, true);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].model_id, crate::pipeline::CHAMPION_MODEL_ID);
@@ -4656,6 +5304,33 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_retires_machine_jury_even_for_an_auxiliary_diagnostic_selection() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let segment = test_segment("current-schema-no-jury", "/audio/diagnostic.wav", "diagnostic draft");
+        db.insert_segment(&segment).unwrap();
+
+        let settings = crate::settings::AppSettings {
+            asr_model_size: crate::settings::AsrModelSize::CTC300M,
+            multi_engine_hypotheses: true,
+            jury_cloud_opt_in: true,
+            llm_api_key: "must-not-be-used".to_string(),
+            ..crate::settings::AppSettings::default()
+        };
+        let report = run_jury_pipeline_core(&db, &settings, vec![segment.id.clone()]).unwrap();
+        let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
+
+        assert_eq!(report["mode"], "not_required");
+        assert_eq!(report["humanInbox"].as_u64(), Some(1));
+        assert!(
+            report["reason"].as_str().unwrap_or("").contains("Schema v60+"),
+            "the handoff must explain the current trust boundary: {report}"
+        );
+        assert!(fresh.verdict.is_none(), "the retired machine jury must not author review truth");
+        assert!(!fresh.escalated, "the retired machine jury must not rewrite queue state");
+    }
+
+    #[test]
     fn autonomy_dial_governs_every_machine_commit_stage_not_just_t0() {
         // Round-24 hunt #1 (HIGH): under Observe/Propose the dial was enforced only inside
         // run_t0_gate — the SAME pipeline run then machine-committed 'jury_accept' via the
@@ -4663,8 +5338,7 @@ mod tests {
         // segments the dial promised to stage.
 
         // ── Propose: a committable reference selection must STAGE, never commit. ──
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "propose.wav");
         let segment = test_segment("seg-propose", &audio_path, "wrong local consensus");
@@ -4691,8 +5365,7 @@ mod tests {
         // ── Observe: the pipeline writes NOTHING — a pre-staged verdict survives untouched. ──
         // (Before the fix, the T2-disabled fallback REWROTE the verdict rationale and NULLed the
         // IRT confidence of every escalated segment fed back through the review loop.)
-        let db2 = crate::db::Database::open(":memory:").unwrap();
-        db2.initialize().unwrap();
+        let db2 = legacy_machine_db();
         let seg2 = test_segment("seg-observe", "/audio/observe.wav", "draft");
         db2.insert_segment(&seg2).unwrap();
         insert_hypothesis(&db2, &seg2.id, "omniasr-wsl-7b", "draft", 0.9);
@@ -4736,8 +5409,7 @@ mod tests {
     /// join is sorted, whatever the query hands back.
     #[test]
     fn the_consensus_provenance_string_is_canonical_not_insertion_ordered() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = real_source_audio(&dir, "reference-order.wav", 4000);
         let mut segment = test_segment("seg-reference-order", &audio_path, "wrong local consensus");
@@ -4763,8 +5435,7 @@ mod tests {
 
     #[test]
     fn agreeing_source_references_preserve_per_model_evidence() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = real_source_audio(&dir, "agreeing-references.wav", 4000);
         let mut segment = test_segment("seg-reference-agreement", &audio_path, "wrong local consensus");
@@ -4799,8 +5470,7 @@ mod tests {
 
     #[test]
     fn source_reference_guard_blocks_t0_and_t1_auto_commit_when_inconclusive() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "guarded.wav");
         let segment = test_segment("seg-reference-guard", &audio_path, "fluent local phrase");
@@ -4823,15 +5493,16 @@ mod tests {
 
     #[test]
     fn incomplete_source_reference_model_coverage_blocks_auto_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "incomplete-reference-coverage.wav");
         let segment = test_segment("seg-incomplete-reference-coverage", &audio_path, "wrong local consensus");
         db.insert_segment(&segment).unwrap();
         insert_hypothesis(&db, &segment.id, "omniasr-wsl-7b", "correct reference phrase", 0.99);
         insert_hypothesis(&db, &segment.id, "omniasr-ctc-1b", "wrong local consensus", 0.98);
-        insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "correct reference phrase");
+        // The sole canonical advisory model exists but has no usable text: coverage must fail closed
+        // without inventing a second cloud model merely to exercise the guard.
+        insert_source_reference_with_model(&db, &audio_path, "gemini-2.5-pro", "");
 
         let report = run_jury_pipeline_core(&db, &settings_act_confirm(), vec![segment.id.clone()]).unwrap();
         let fresh = db.get_segment_by_id(&segment.id).unwrap().unwrap();
@@ -4844,14 +5515,13 @@ mod tests {
         assert_eq!(fresh.verdict.as_deref(), Some("escalated"));
         let rationale = fresh.rationale.as_deref().unwrap_or("");
         assert!(rationale.contains("Source-reference coverage guard blocked automatic adjudication"));
-        assert!(rationale.contains("gemini-2.5-flash"));
+        assert!(rationale.contains("gemini-2.5-pro"));
         assert!(rationale.contains("T2 disabled"));
     }
 
     #[test]
     fn stale_source_reference_audio_identity_blocks_automatic_jury_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio = dir.path().join("same-path-source.wav");
         std::fs::write(&audio, b"current-audio-bytes").unwrap();
@@ -4887,8 +5557,7 @@ mod tests {
 
     #[test]
     fn missing_source_reference_audio_identity_blocks_automatic_jury_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "legacy-source-reference.wav");
         let segment = test_segment("seg-legacy-source-reference", &audio_path, "wrong local consensus");
@@ -4922,8 +5591,7 @@ mod tests {
 
     #[test]
     fn incomplete_hypothesis_model_coverage_blocks_t0_and_t1_auto_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let audio_path = "/audio/one-hypothesis.wav";
         let segment = test_segment("seg-one-hypothesis", audio_path, "fluent single model phrase");
         db.insert_segment(&segment).unwrap();
@@ -4946,8 +5614,7 @@ mod tests {
 
     #[test]
     fn source_reference_disagreement_blocks_automatic_commit() {
-        let db = crate::db::Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         let dir = tempfile::TempDir::new().unwrap();
         let audio_path = test_source_audio(&dir, "conflicting-references.wav");
         let segment = test_segment("seg-reference-conflict", &audio_path, "fluent local phrase");

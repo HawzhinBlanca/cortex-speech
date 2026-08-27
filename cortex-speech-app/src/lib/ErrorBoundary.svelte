@@ -12,7 +12,7 @@
   } = $props();
 
   let hasError = $state(false);
-  let actionableError = $state<ActionableError>({ message: 'Unknown error' });
+  let actionableError = $state<ActionableError>({ message: '' });
 
   // Scoped, not global (2026-08-17). This used to listen for window 'error' events, which every
   // mounted instance received — so ONE uncaught error blanked all ten boundaries in App.svelte at
@@ -21,7 +21,7 @@
   // exactly where it happened. Uncaught async errors, which belong to no subtree, are surfaced as a
   // toast by installGlobalErrorTrap instead of by blanking a panel that did not fail.
   function fail(cause: unknown) {
-    actionableError = parseActionableError(cause ?? 'Unknown error');
+    actionableError = parseActionableError(cause);
     hasError = true;
   }
 
@@ -38,7 +38,9 @@
     <div class="p-4 bg-red-900/20 border border-red-500/30 rounded-lg space-y-2">
       <p class="text-sm text-red-300">{actionableError.message}</p>
       {#if actionableError.detail && actionableError.detail !== actionableError.message}
-        <p class="text-xs text-red-400/80 font-mono break-words">{actionableError.detail}</p>
+        <bdi class="block text-xs text-red-400/80 font-mono break-words" dir="ltr"
+          >{actionableError.detail}</bdi
+        >
       {/if}
       <div class="flex items-center gap-3">
         <button class="text-xs text-red-400 underline" onclick={retry}>{$t('retry')}</button>
@@ -54,7 +56,5 @@
     </div>
   {/if}
 {:else}
-  <svelte:boundary onerror={fail}>
-    {@render children()}
-  </svelte:boundary>
+  <svelte:boundary onerror={fail}>{@render children()}</svelte:boundary>
 {/if}

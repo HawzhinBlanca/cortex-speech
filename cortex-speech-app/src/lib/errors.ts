@@ -1,7 +1,12 @@
 import { get } from 'svelte/store';
 import { openSettings } from './stores/settingsStore';
 import { t } from './i18n';
-import { formatUnknownError } from './errorText';
+import {
+  formatPublicErrorReference,
+  formatUnknownError,
+  publicErrorReference,
+  type PublicSuggestedAction,
+} from './errorText';
 
 export type ErrorAction = {
   label: string;
@@ -12,6 +17,10 @@ export type ActionableError = {
   message: string;
   detail?: string;
   action?: ErrorAction;
+  code?: string;
+  operationId?: string;
+  retryable?: boolean;
+  suggestedAction?: PublicSuggestedAction;
 };
 
 const MODEL_PATTERNS = [
@@ -30,15 +39,24 @@ function openModelsSettings(): void {
   openSettings('models');
 }
 
-export function parseActionableError(error: unknown): ActionableError {
+export function parseActionableError(error: unknown, fallbackMessage?: string): ActionableError {
   // Never surface the literal string "undefined"/"null" to the user: a nullish error (e.g. a
   // resource event with no message) must degrade to a readable fallback, not String(undefined).
   const raw = formatUnknownError(error);
+  const reference = publicErrorReference(error);
+  const detail = formatPublicErrorReference(error);
+  const metadata = {
+    ...(detail ? { detail } : {}),
+    ...(reference.code ? { code: reference.code } : {}),
+    ...(reference.operationId ? { operationId: reference.operationId } : {}),
+    ...(typeof reference.retryable === 'boolean' ? { retryable: reference.retryable } : {}),
+    ...(reference.suggestedAction ? { suggestedAction: reference.suggestedAction } : {}),
+  };
 
-  if (isModelError(raw)) {
+  if (isModelError(raw) || reference.suggestedAction === 'openModels') {
     return {
       message: get(t)('errors.modelMissing'),
-      detail: raw,
+      ...metadata,
       action: {
         label: get(t)('errors.openModelsSettings'),
         handler: openModelsSettings,
@@ -49,19 +67,16 @@ export function parseActionableError(error: unknown): ActionableError {
   if (/import failed|failed to import/i.test(raw)) {
     return {
       message: get(t)('importFailed'),
-      detail: raw,
+      ...metadata,
     };
   }
 
   if (/transcription failed|transcribe/i.test(raw)) {
     return {
       message: get(t)('errors.transcriptionFailed'),
-      detail: raw,
-      action: isModelError(raw)
-        ? { label: get(t)('errors.openModelsSettings'), handler: openModelsSettings }
-        : undefined,
+      ...metadata,
     };
   }
 
-  return { message: raw, detail: raw };
+  return { message: fallbackMessage || get(t)('errors.unknown'), ...metadata };
 }

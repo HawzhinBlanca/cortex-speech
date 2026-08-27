@@ -10,8 +10,8 @@ const { chromium } = require('@playwright/test');
 // WSL-7B server), so the fix is not isolation but an explicit acknowledgement: a casual run must not
 // be able to quietly add clips to the corpus.
 //
-// e2e_constrained_ipc / e2e_finetuned_ipc / e2e_pipeline_ipc got disposable profiles instead, via
-// e2e_profile.cjs. Same hazard, different remedy, because those three spawn their own app.
+// e2e_pipeline_ipc gets a disposable profile instead, via e2e_profile.cjs. Same hazard, different
+// remedy, because that harness spawns its own app.
 if (process.env.CORTEX_ALLOW_LIVE_PROFILE !== '1') {
   console.error(
     'REFUSED: e2e_7b_connect attaches to an ALREADY-RUNNING app and imports into the library that app\n' +
@@ -25,7 +25,9 @@ if (process.env.CORTEX_ALLOW_LIVE_PROFILE !== '1') {
 // No hardcoded personal path (repo hygiene): the audio to import is supplied by the environment.
 const AUDIO = process.env.CORTEX_AUDIO;
 if (!AUDIO) {
-  console.error('Set CORTEX_AUDIO to the absolute path of the audio file to import (e.g. CORTEX_AUDIO=D:/clips/sample.wav).');
+  console.error(
+    'Set CORTEX_AUDIO to the absolute path of the audio file to import (e.g. CORTEX_AUDIO=D:/clips/sample.wav).',
+  );
   process.exit(2);
 }
 // PRIVATE, not 9222 — same latent collision the two verify-10 e2e harnesses hit (see
@@ -44,13 +46,35 @@ const dur = (s) => (s && (s.durationMs ?? s.duration_ms)) || 0;
   console.log('connected to app:', page.url());
 
   console.log('importing:', AUDIO);
-  const imp = await page.evaluate((p) => window.__TAURI_INTERNALS__.invoke('import_audio_file', { path: p }).then(() => 'ok').catch((e) => 'ERR:' + e), AUDIO);
+  const imp = await page.evaluate(
+    (p) =>
+      window.__TAURI_INTERNALS__
+        .invoke('import_audio_file', { path: p })
+        .then(() => 'ok')
+        .catch((e) => 'ERR:' + e),
+    AUDIO,
+  );
   console.log('import returned:', imp);
 
   console.log('polling get_segments until every segment has a 7B transcript (up to 8 min)...');
   let segs = [];
   for (let i = 0; i < 240; i++) {
-    segs = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('get_segments_page', { verified: null, query: null, sort: 'oldest', limit: 300, cursor: null }).then((p) => p.items)).catch((e) => { if (String(e).includes('not found')) throw e; return []; });
+    segs = await page
+      .evaluate(() =>
+        window.__TAURI_INTERNALS__
+          .invoke('get_segments_page', {
+            verified: null,
+            query: null,
+            sort: 'oldest',
+            limit: 300,
+            cursor: null,
+          })
+          .then((p) => p.items),
+      )
+      .catch((e) => {
+        if (String(e).includes('not found')) throw e;
+        return [];
+      });
     const pend = segs.filter((s) => !txt(s).trim() || txt(s).includes('Pending')).length;
     if (segs.length >= 1 && pend === 0) break;
     if (i % 8 === 0) console.log(`  ${segs.length} segs, ${pend} pending/blank... ${i * 2}s`);
@@ -59,8 +83,17 @@ const dur = (s) => (s && (s.durationMs ?? s.duration_ms)) || 0;
 
   console.log(`\n==== RESULT: ${segs.length} segment(s) ====`);
   for (const s of segs) console.log(`[${Math.round(dur(s) / 1000)}s] ${txt(s)}`);
-  const allGood = segs.length >= 1 && segs.every((s) => txt(s).trim() && !txt(s).includes('Pending'));
-  console.log('\n' + (allGood ? 'E2E_OK: the running app imported and 7B-transcribed every segment.' : 'E2E_INCOMPLETE: some segments never got a 7B transcript.'));
+  const allGood =
+    segs.length >= 1 && segs.every((s) => txt(s).trim() && !txt(s).includes('Pending'));
+  console.log(
+    '\n' +
+      (allGood
+        ? 'E2E_OK: the running app imported and 7B-transcribed every segment.'
+        : 'E2E_INCOMPLETE: some segments never got a 7B transcript.'),
+  );
   await b.close();
   process.exit(allGood ? 0 : 2);
-})().catch((e) => { console.error('E2E_FAIL:', e && e.message ? e.message : e); process.exit(1); });
+})().catch((e) => {
+  console.error('E2E_FAIL:', e && e.message ? e.message : e);
+  process.exit(1);
+});

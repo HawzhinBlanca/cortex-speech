@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import { openSettingsFromHeader } from './helpers/header';
 
 test.describe('App smoke tests', () => {
   test('loads and renders the three-panel layout', async ({ page }) => {
@@ -39,7 +40,7 @@ test.describe('App smoke tests', () => {
   test('settings panel opens and closes', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
     await expect(settings.getByText('Settings')).toBeVisible();
@@ -53,7 +54,7 @@ test.describe('App smoke tests', () => {
   }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
 
@@ -61,15 +62,40 @@ test.describe('App smoke tests', () => {
     // absent so a reviewer cannot accidentally switch transcript providers from ordinary Settings.
     await settings.getByRole('button', { name: 'Audio', exact: true }).click();
     await expect(settings.getByTestId('elevenlabs-key-status')).toHaveCount(0);
-    await expect(
-      settings.locator('label', { hasText: 'Cloud transcription (ElevenLabs Scribe)' }),
-    ).toHaveCount(0);
+    await expect(settings.getByText(/ElevenLabs|Scribe/i)).toHaveCount(0);
+
+    // Production engine selection is read-only and champion-only. This catches the old false green
+    // where the test looked for obsolete consent copy while the real provider selector still shipped.
+    await settings.getByRole('button', { name: 'ASR', exact: true }).click();
+    await expect(settings.getByTestId('production-asr-model')).toContainText(
+      'Meta OmniASR 7B Champion + LoRA',
+    );
+    await expect(settings.locator('option[value="ctc-300m"]')).toHaveCount(0);
+    await expect(settings.locator('option[value="ctc-1b"]')).toHaveCount(0);
+  });
+
+  test('cloud advisory settings expose only fixed Gemini 2.5 Pro', async ({ page }) => {
+    await page.goto('/');
+    await openSettingsFromHeader(page);
+    const panel = page.getByTestId('settings-panel');
+
+    await panel.getByRole('button', { name: 'AI Post-Processing', exact: true }).click();
+    await panel.getByTestId('llm-engine-select').selectOption('Gemini');
+    await expect(panel.getByTestId('cloud-llm-model-fixed')).toContainText('gemini-2.5-pro');
+
+    await panel.getByRole('button', { name: /Listening Jury/, exact: true }).click();
+    await panel.getByTestId('jury-cloud-opt-in').check();
+    await expect(panel.getByTestId('jury-model-fixed')).toContainText('gemini-2.5-pro');
+    await expect(panel.getByText(/Gemini 2\.5 Flash|gemini-2\.5-flash/i)).toHaveCount(0);
+    await expect(panel.locator('input[value*="gemini"], input[placeholder*="gemini"]')).toHaveCount(
+      0,
+    );
   });
 
   test('model registry lists registered models with a champion badge', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
 
@@ -80,15 +106,23 @@ test.describe('App smoke tests', () => {
 
     const rows = settings.getByTestId('model-registry-row');
     await expect(rows).toHaveCount(2);
-    await expect(rows.first()).toContainText('finetuned-mms-ckb');
+    await expect(rows.first()).toContainText('omniasr-7b-champion');
     await expect(rows.first()).toContainText('champion');
-    await expect(rows.first()).toContainText('CC-BY-NC-4.0');
+    await expect(rows.first()).toContainText('Apache-2.0');
+
+    // The shipped model-manager surface contains support models only. Optional ASR artifacts and
+    // their retired integrity action must not be discoverable through the production UI.
+    await expect(settings.getByText('Silero VAD v4')).toBeVisible();
+    await expect(settings.getByText('CAM++ Speaker Embedding')).toBeVisible();
+    await expect(settings.getByText('AI Audio Denoiser')).toBeVisible();
+    await expect(settings.getByText(/300M|CTC 1B|MMS|Scribe|ElevenLabs/i)).toHaveCount(0);
+    await expect(settings.getByTestId('verify-model-btn')).toHaveCount(0);
   });
 
   test('model registry can import a checkpoint as a candidate', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
     await settings.getByRole('button', { name: 'AI Models', exact: true }).click();
@@ -97,10 +131,9 @@ test.describe('App smoke tests', () => {
     const form = settings.getByTestId('model-import-form');
     await expect(form).toBeVisible();
 
-    await form.getByPlaceholder('id (e.g. mms-ckb-v2)').fill('test-candidate');
-    await form.getByPlaceholder('family (e.g. mms-ckb)').fill('mms-ckb');
-    await form.getByPlaceholder('source (e.g. fine-tune)').fill('fine-tune');
-    await form.getByPlaceholder('license (e.g. CC-BY-NC-4.0)').fill('CC-BY-NC-4.0');
+    await form.getByLabel('Model ID').fill('test-candidate');
+    await form.getByLabel('Model source').fill('fine-tune');
+    await form.getByLabel('Model license').fill('CC-BY-NC-4.0');
 
     // Submit is disabled until a checkpoint file is chosen.
     await expect(settings.getByTestId('model-import-submit')).toBeDisabled();
@@ -119,12 +152,15 @@ test.describe('App smoke tests', () => {
     await page.getByRole('button', { name: 'Insights' }).click();
     const actions = page.getByTestId('refinery-eval-actions');
     await expect(actions).toBeVisible();
+    await expect(actions.getByTestId('eval-local')).toHaveCount(0);
+    await expect(actions.getByLabel('Eval model id')).toHaveCount(0);
 
-    // Run the honest-CER eval (run_gold_eval_asr) and show the result.
+    // Run the champion-only honest-CER eval (run_gold_eval_asr) and show the result.
     await page.getByTestId('eval-honest-cer').click();
     const result = page.getByTestId('eval-result');
     await expect(result).toBeVisible();
-    await expect(result).toContainText('CER 29.0%');
+    await expect(result).toContainText('CER');
+    await expect(result).toContainText('29.0%');
 
     // Build a scorecard from that result (build_scorecard).
     await page.getByTestId('eval-build-scorecard').click();
@@ -136,7 +172,7 @@ test.describe('App smoke tests', () => {
   test('diagnostics panel shows tracing stats and recent spans', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.getByTestId('settings-panel');
     await expect(settings).toBeVisible();
 

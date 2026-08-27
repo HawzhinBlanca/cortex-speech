@@ -42,7 +42,7 @@ fn is_bundled_finetuned(onnx_path: &Path) -> bool {
 /// Verify a model/vocab pair against an expected model byte-size + vocab SHA. model.onnx gets only the
 /// (instant) size check here — it catches a truncated/incomplete copy, the realistic corruption — while
 /// the small vocab gets a full SHA. Extracted so the pass/fail logic is unit-testable without the 970 MB
-/// model. The definitive full model SHA is `verify_finetuned_full` (on-demand).
+/// model. The definitive full model SHA is `verify_finetuned_full` in explicit offline diagnostics.
 fn verify_integrity_against(
     onnx_path: &Path,
     expected_bytes: u64,
@@ -73,8 +73,8 @@ pub fn verify_finetuned_fast(onnx_path: &Path, vocab_path: &Path) -> Result<(), 
     verify_integrity_against(onnx_path, FINETUNED_MODEL_BYTES, vocab_path, FINETUNED_VOCAB_SHA256)
 }
 
-/// P3.4 definitive full-SHA verification of the bundled fine-tuned model + vocab (on demand — the
-/// `verify_finetuned_model_integrity` IPC). Hashes the full 970 MB model, so it is NOT run per-load.
+/// P3.4 definitive full-SHA verification of the bundled fine-tuned model + vocab for explicit
+/// offline verifier/tests. Hashes the full 970 MB model, so it is NOT run per-load.
 pub fn verify_finetuned_full(onnx_path: &Path, vocab_path: &Path) -> Result<(), String> {
     let model_sha = crate::models::compute_file_sha256(onnx_path)?;
     if model_sha != FINETUNED_MODEL_SHA256 {

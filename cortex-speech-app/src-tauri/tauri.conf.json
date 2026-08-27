@@ -14,33 +14,35 @@
         "title": "Cortex Kurdish Speech Processor",
         "width": 1400,
         "height": 900,
-        "minWidth": 1000,
-        "minHeight": 600,
+        "minWidth": 320,
+        "minHeight": 480,
         "resizable": true,
         "decorations": true,
         "center": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost; connect-src 'self' ipc: https://ipc.localhost http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; media-src 'self' blob: mediastream: asset: https://asset.localhost http://asset.localhost; worker-src 'self' blob:",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self' ipc: https://ipc.localhost http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; media-src 'self' blob: mediastream: cortex-media: http://cortex-media.localhost; worker-src 'self' blob:",
       "assetProtocol": {
-        "enable": true,
-        "scope": ["$DATA/cortex-speech/media-cache/**"]
+        "enable": false,
+        "scope": []
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "targets": ["msi", "nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "resources": [
       "models/silero_vad_v4.onnx",
-      "models/omniasr-ctc-300m/model.int8.onnx",
-      "models/omniasr-ctc-300m/tokens.txt",
       "models/onnxruntime.dll/onnxruntime.dll",
-      "models/onnxruntime.dll/onnxruntime_providers_shared.dll"
+      "models/onnxruntime.dll/onnxruntime_providers_shared.dll",
+      "../scripts/cortex_7b_server.py",
+      "../scripts/cortex_7b_client.py"
     ],
     "windows": {
+      "allowDowngrades": false,
       "webviewInstallMode": {
         "type": "offlineInstaller"
       },
@@ -50,12 +52,8 @@
       "nsis": {
         "installMode": "perMachine",
         "installerIcon": "icons/icon.ico",
-        "displayLanguageSelector": true
+        "displayLanguageSelector": false
       }
-    },
-    "macOS": {
-      "minimumSystemVersion": "11.0",
-      "exceptionDomain": ""
     }
   }
 }

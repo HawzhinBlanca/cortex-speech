@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import { openHeaderOverflow } from './helpers/header';
 
 test.describe('Accessibility smoke tests', () => {
   test('page has correct lang attribute for English accessibility fixture', async ({ page }) => {
@@ -9,6 +10,7 @@ test.describe('Accessibility smoke tests', () => {
 
   test('icon buttons have aria-labels', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     await expect(page.getByLabel('Open settings')).toBeVisible();
     await expect(page.getByLabel('Switch language')).toBeVisible();
@@ -18,6 +20,7 @@ test.describe('Accessibility smoke tests', () => {
 
   test('export button is present and labeled', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     await expect(page.getByLabel('Export', { exact: true })).toBeVisible();
   });
@@ -49,6 +52,7 @@ test.describe('Accessibility smoke tests', () => {
 
   test('settings modal has aria-modal and role', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     await page.getByLabel('Open settings').click();
     const settings = page.locator('role=dialog');
@@ -58,6 +62,7 @@ test.describe('Accessibility smoke tests', () => {
 
   test('keyboard navigation: Tab through interactive elements', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     await expect(page.getByLabel('Switch language')).toBeVisible();
 

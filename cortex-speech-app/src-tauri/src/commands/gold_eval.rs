@@ -1,9 +1,5 @@
-//! Gold-set + gold-eval IPC commands — slice 5 of the Week-4 `commands.rs` decomposition.
-//!
-//! Behaviour and command NAMES unchanged: `commands.rs` re-exports this module (`pub use gold_eval::*;`),
-//! so `lib.rs`'s invoke_handler still names `commands::run_gold_eval` and the frontend invokes are
-//! untouched. Same functions, only relocated. (The eval-adjacent list_eval_runs / build_scorecard stay
-//! in commands.rs for now.)
+//! Gold-set + shipped champion-eval IPC commands. Auxiliary-engine evaluation remains available to
+//! explicit offline diagnostic code and is deliberately not registered with the desktop renderer.
 //!
 //! Gold-set imports + the WER/CER eval runs are whole-dataset/model work, so the heavy ones run via
 //! `run_blocking` to keep the UI thread free.
@@ -40,6 +36,24 @@ pub async fn import_gold_segments(
     .await
 }
 
+/// Stamp on every `eval_runs` row whose hypotheses came from the renderer rather than from this app
+/// running an engine. Unstamped rows are reserved for the closed loop (`run_gold_eval_asr`), which
+/// derives both the text and the label from the registered champion.
+pub const EXTERNAL_HYPOTHESIS_MODEL_PREFIX: &str = "external-hypotheses:";
+
+/// Label an eval row built from caller-supplied text. `run_gold_eval` lets the caller choose the
+/// hypotheses AND the model label, so without this an XSS'd or scripted renderer mints a durable row
+/// reading `omniasr-wsl-7b — CER 0.00%` (hypotheses = the references) that is indistinguishable in the
+/// eval history from a measured champion run, and that `scorecard` would happily select as a baseline.
+/// The prefix keeps such a row readable and honest instead: visibly not a measurement.
+pub fn external_hypothesis_label(model_id: &str) -> String {
+    if model_id.starts_with(EXTERNAL_HYPOTHESIS_MODEL_PREFIX) {
+        model_id.to_string()
+    } else {
+        format!("{EXTERNAL_HYPOTHESIS_MODEL_PREFIX}{model_id}")
+    }
+}
+
 #[tauri::command]
 pub async fn run_gold_eval(
     state: State<'_, AppState>,
@@ -47,6 +61,7 @@ pub async fn run_gold_eval(
     hypotheses: Vec<(String, String)>,
 ) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval")?;
+    let model_id = external_hypothesis_label(&model_id);
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
@@ -55,31 +70,20 @@ pub async fn run_gold_eval(
     .await
 }
 
-/// Closed-loop gold eval: runs the real local ASR over the gold set's audio and scores
-/// the produced hypotheses (no caller-supplied text). This is the honest-CER entrypoint.
-/// `model_id` defaults to the active local model when omitted.
+/// Closed-loop gold eval: runs the exact registered WSL7B champion over gold audio and scores the
+/// produced hypotheses. The renderer supplies neither text nor a model label.
 #[tauri::command]
-pub async fn run_gold_eval_asr(
-    state: State<'_, AppState>,
-    model_id: Option<String>,
-) -> Result<crate::eval::EvalRunResult, String> {
+pub async fn run_gold_eval_asr(state: State<'_, AppState>) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval_asr")?;
+    let mutation = super::begin_mutation()?;
     // Clone the pipeline so the (potentially long) ASR loop does not hold the pipeline lock, and run
     // it OFF the main thread.
     let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || pipeline.run_gold_eval_asr(model_id.as_deref()).map_err(|e| e.to_string())).await
-}
-
-#[tauri::command]
-pub async fn run_gold_eval_local(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<crate::eval::EvalRunResult, String> {
-    RATE_LIMITER.check("run_gold_eval_local")?;
-    // Clone the pipeline and let it open its own DB connection, so neither global mutex is held
-    // across the multi-segment ASR eval loop, and run it OFF the main thread (was minutes of freeze).
-    let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || pipeline.run_gold_eval_local(&model_id).map_err(|e| e.to_string())).await
+    run_blocking(move || {
+        let _mutation = mutation;
+        pipeline.run_gold_eval_asr().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Turn the human-corrected segments of one source file into a holdout GOLD benchmark entry. Run it
@@ -109,4 +113,25 @@ pub async fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Res
         crate::eval::import_verified_segments_as_gold(&db).map_err(|e| e.to_string())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_supplied_eval_rows_cannot_wear_a_measured_model_label() {
+        // The champion's own registry id must never be reachable as a label for renderer-supplied text.
+        let stamped = external_hypothesis_label("omniasr-wsl-7b");
+        assert!(
+            stamped.starts_with(EXTERNAL_HYPOTHESIS_MODEL_PREFIX),
+            "an eval row built from caller text must be stamped, not labeled as a measurement: {stamped}"
+        );
+        assert_ne!(stamped, "omniasr-wsl-7b");
+        assert!(stamped.contains("omniasr-wsl-7b"), "the caller's claimed label stays readable: {stamped}");
+
+        // Idempotent: a re-submitted stamped label must not grow a second prefix, and a caller that
+        // spoofs the prefix buys nothing — the row still reads as caller-supplied either way.
+        assert_eq!(external_hypothesis_label(&stamped), stamped);
+    }
 }

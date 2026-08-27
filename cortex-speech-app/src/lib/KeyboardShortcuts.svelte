@@ -1,7 +1,7 @@
 <script lang="ts">
   import { showKeyboardHelp } from './stores/uiStore';
   import { globalKeyboardManager } from './keyboard';
-  import { t } from './i18n';
+  import { t, type TranslationKey } from './i18n';
   import Modal from './Modal.svelte';
 
   let shortcuts = $state<ReturnType<NonNullable<typeof globalKeyboardManager>['getAll']> | null>(
@@ -20,7 +20,7 @@
     { id: 'edit', labelKey: 'editing' },
     { id: 'navigation', labelKey: 'navigation' },
     { id: 'playback', labelKey: 'playback' },
-  ];
+  ] as const satisfies ReadonlyArray<{ id: string; labelKey: TranslationKey }>;
 
   function modLabel(s: { ctrl?: boolean; shift?: boolean; alt?: boolean; key: string }) {
     const parts: string[] = [];

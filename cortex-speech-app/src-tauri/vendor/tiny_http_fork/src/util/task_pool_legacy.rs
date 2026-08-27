@@ -4,6 +4,19 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::{io, thread};
 
+fn try_increment_below(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Manages a collection of threads.
 ///
 /// A new thread is created every time all the existing threads are full.
@@ -125,10 +138,9 @@ impl TaskPool {
     }
 
     fn add_thread(&self, initial_fn: Option<Box<dyn FnMut() + Send>>) -> io::Result<()> {
-        self.sharing
-            .thread_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < self.max_threads).then_some(count + 1))
-            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "task pool worker limit reached"))?;
+        if !try_increment_below(&self.sharing.thread_count, self.max_threads) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "task pool worker limit reached"));
+        }
 
         let sharing = self.sharing.clone();
         let rollback = self.sharing.clone();

@@ -8,7 +8,7 @@
 //! Each decodes audio + runs ONNX/WSL inference (or re-diarizes), so the heavy body runs via
 //! `run_blocking` to keep the UI thread free.
 
-use super::{decode_finetuned_clip_16k, resolve_finetuned_paths, run_blocking, RATE_LIMITER, STRICT_RATE_LIMITER};
+use super::{run_blocking, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::validation::input as validate;
 use crate::{aligner, audio, AppState};
 use tauri::State;
@@ -32,116 +32,6 @@ fn canonical_alignment_inputs(
     Ok((stored.audio_path, stored.alignment_json))
 }
 
-/// Opt-in: transcribe a segment with the CONSTRAINED Kurdish-token CTC decode (guarantees
-/// Kurdish-script output) via the `ort` raw-logits path, instead of the default sherpa-onnx
-/// decode. Additive — it does NOT touch the default `transcribe_segment` path. Loads a fresh ort
-/// session per call (fine for a user-initiated action; session caching is a perf follow-up).
-#[tauri::command]
-pub async fn transcribe_segment_constrained(
-    audio_path: String,
-    alignment_json: Option<String>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("transcribe_segment_constrained")?;
-    validate::validate_file_path(&audio_path)?;
-    if let Some(ref aj) = alignment_json {
-        validate::validate_alignment_json(aj)?;
-    }
-    // Decode + constrained CTC beam search — off the main thread.
-    run_blocking(move || {
-        let models = crate::models::active_models_dir();
-        let model = models.join(crate::models::OMNIASR_CTC_300M_MODEL);
-        let tokens = models.join(crate::models::OMNIASR_CTC_300M_TOKENS);
-        if !model.exists() || !tokens.exists() {
-            return Err("OmniASR model/tokens not found for constrained decode".to_string());
-        }
-        // Runtime integrity gate — the SAME SHA-256 pin the default ASR path enforces (asr.rs:288-311):
-        // a tampered/swapped same-line-count tokens.txt (wrong id->grapheme map) or ONNX still LOADS but
-        // decodes every clip to the WRONG graphemes, persisted as trustworthy. Verify BOTH the model and
-        // the tokens vocab before the constrained decode runs; the default path refuses on mismatch and so
-        // must this opt-in one. verify_model_path_runtime is a no-op for an unpinned file.
-        crate::models::verify_model_path_runtime(&model, crate::models::OMNIASR_CTC_300M_MODEL)?;
-        crate::models::verify_model_path_runtime(&tokens, crate::models::OMNIASR_CTC_300M_TOKENS)?;
-        // decode_to_pcm returns 16 kHz mono PCM (the model's expected input rate).
-        let (rate, pcm) = crate::audio::decode_to_pcm(&audio_path).map_err(|e| e.to_string())?;
-        // Slice only THIS segment's clip — every VAD chunk shares the whole-source audio_path (the range is
-        // in alignment_json), so decoding `pcm` directly would re-transcribe the ENTIRE recording into one
-        // segment. None alignment (single-segment file) = whole file. Mirrors the finetuned/Scribe paths.
-        let (clip, _suffix) = crate::chunking::slice_pcm_by_alignment(&pcm, rate, alignment_json.as_deref())
-            .map_err(|e| e.to_string())?;
-        let audio: Vec<f32> = clip.iter().map(|&s| s as f32 / 32768.0).collect();
-        let text = crate::constrained_decode::run_constrained(&model, &tokens, &audio, true)?;
-        // A blank decode is NOT a transcript. Returning it would let the frontend overwrite an existing
-        // good transcript with "" (a real result destroyed + a blank persisted, violating the no-blank
-        // honesty rule). Fail instead — the caller keeps the current transcript (opt-in path: no fallback).
-        if text.trim().is_empty() {
-            return Err(
-                "Constrained transcription produced no text (silent clip or no Kurdish speech) — the existing transcript is unchanged."
-                    .to_string(),
-            );
-        }
-        Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
-    })
-    .await
-}
-
-/// Opt-in: transcribe a segment with the fine-tuned Kurdish Wav2Vec2-CTC model (ONNX via `ort`),
-/// which roughly halves CER vs the stock OmniASR path (see docs/EVAL.md). Additive — the default
-/// `transcribe_segment` path is unchanged. Resolves the model from `CORTEX_FINETUNED_ONNX` +
-/// `CORTEX_FINETUNED_VOCAB` (dev/testing) or `<models>/finetuned-mms-ckb/{model.onnx,vocab.json}`.
-#[tauri::command]
-pub async fn transcribe_segment_finetuned(
-    audio_path: String,
-    alignment_json: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    RATE_LIMITER.check("transcribe_segment_finetuned")?;
-    validate::validate_file_path(&audio_path)?;
-    if let Some(ref aj) = alignment_json {
-        validate::validate_alignment_json(aj)?;
-    }
-    let db = state.db_arc();
-    // Windowed decode + fine-tuned ONNX inference — off the main thread.
-    run_blocking(move || {
-        let (onnx, vocab) = resolve_finetuned_paths()?;
-        // Offset-less alignment is only whole-file-safe when this source has NO sibling chunks (see
-        // decode_finetuned_clip_16k): on a multi-segment source it would silently re-transcribe the
-        // entire recording into one segment (true-10 audit 2026-07-09).
-        let sibling_count: i64 = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
-            db.connection()
-                .query_row(
-                    "SELECT COUNT(*) FROM speech_segments WHERE audio_path = ?1",
-                    rusqlite::params![audio_path],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?
-        };
-        // Decode ONLY this segment's clip window (16 kHz). Every VAD chunk shares the whole-source
-        // audio_path with its range in alignment_json; decoding the WHOLE source first (the old path) failed
-        // on long recordings ("audio too large to decode in one pass") even though the clip is a few
-        // seconds. The windowed decode reads just the clip, so re-transcribe works on any source length.
-        let clip = decode_finetuned_clip_16k(&audio_path, alignment_json.as_deref(), sibling_count <= 1)?;
-        // Route through the pipeline's shared windowed wrapper, NOT run_wav2vec2 directly: the model is
-        // trained on short utterances and a single unbounded pass over >15 s (a raised max-segment
-        // setting, or a whole-file/no-meta clip) duplicates text — the pipeline path sub-splits into
-        // ~15 s windows for exactly that reason (true-10 audit 2026-07-09: one engine, two call paths,
-        // two different qualities).
-        let text = crate::pipeline::ProcessingPipeline::transcribe_chunk_finetuned(&onnx, &vocab, &clip)?;
-        // transcribe_chunk_finetuned returns Ok("") on a silent/blank-decoding clip. Returning it would let
-        // the frontend overwrite an existing good transcript with "" (data loss + a blank persisted as a
-        // real result). Fail instead — the in-pipeline finetuned path guards this exact case (pipeline.rs);
-        // this standalone opt-in command must too (no fallback engine here).
-        if text.trim().is_empty() {
-            return Err(
-                "Fine-tuned transcription produced no text (the clip may be silent) — the existing transcript is unchanged."
-                    .to_string(),
-            );
-        }
-        Ok(serde_json::json!({ "text": text, "rawTranscript": text }))
-    })
-    .await
-}
-
 #[tauri::command]
 pub async fn transcribe_segment(
     segment_id: Option<String>,
@@ -157,18 +47,22 @@ pub async fn transcribe_segment(
     if let Some(ref aj) = alignment_json {
         validate::validate_alignment_json(aj)?;
     }
+    let mutation = super::begin_mutation()?;
     // Clone the pipeline (Arc-wrapped internals) so the global pipeline mutex is released before the
     // possibly-long WSL/ONNX transcription, and run it OFF the main thread so the UI stays responsive.
     let pipeline = state.lock_pipeline().clone();
     run_blocking(move || {
-        let draft = pipeline
-            .transcribe(segment_id.as_deref(), &audio_path, alignment_json.as_deref(), None)
-            .map_err(|e| e.to_string())?;
+        let _mutation = mutation;
+        let id = segment_id.as_deref().ok_or_else(|| {
+            "E_TRANSCRIPTION_SOURCE_UNBOUND: an imported segment id is required for transcription".to_string()
+        })?;
+        let source = pipeline
+            .bind_existing_transcription_source(id, Some(&audio_path), alignment_json.as_deref())
+            .map_err(|error| error.to_string())?;
+        let draft = pipeline.transcribe_bound(&source, None).map_err(|e| e.to_string())?;
         // A blank draft is NOT a transcript. Returning Ok("") lets the frontend upsert "" over an
-        // existing good transcript (App.svelte handleTranscribe: annotatedTranscript = result.text, then
-        // updateSegment), destroying it and persisting a blank. The two opt-in siblings
-        // (transcribe_segment_constrained/_finetuned) already refuse this exact case; the DEFAULT path
-        // must too — the frontend's try/catch then keeps the current transcript. (Memory:
+        // existing good transcript, destroying it and persisting a blank. The production command must
+        // fail closed so the frontend keeps the current transcript. (Memory:
         // blank-transcript-never-overwrites-good; recurring data-loss class.)
         if draft.final_text.trim().is_empty() {
             return Err(
@@ -183,6 +77,7 @@ pub async fn transcribe_segment(
             "confidenceSource": draft.confidence_source,
             "modelVersionId": draft.model_version_id,
             "cloudCall": draft.cloud_call
+            ,"segmentId": source.segment().id
         }))
     })
     .await
@@ -208,6 +103,7 @@ pub async fn align_segment(
         return Err("Alignment text cannot be empty".to_string());
     }
     validate::validate_text(&text, 100000, "Alignment text")?;
+    let mutation = super::begin_mutation()?;
     // Clone the pipeline OUT of the lock so the global mutex is released before the slow decode +
     // ONNX forced alignment, and run the whole align + persist OFF the main thread — holding either
     // lock (or blocking the UI thread) serializes every other pipeline command (get_import_status
@@ -216,6 +112,7 @@ pub async fn align_segment(
     let pipeline = state.lock_pipeline().clone();
     let db = state.db_arc();
     run_blocking(move || {
+        let _mutation = mutation;
         let stored_segment = if let Some(ref id) = segment_id {
             let db_guard = db.lock().unwrap_or_else(|p| p.into_inner());
             db_guard
@@ -260,11 +157,16 @@ pub async fn rediarize_segments(ids: Vec<String>, state: State<'_, AppState>) ->
     for id in &ids {
         validate::validate_identifier(id)?;
     }
+    let mutation = super::begin_mutation()?;
     // Clone the pipeline and let it open its own DB connection, so neither the global pipeline nor
     // db mutex is held across the per-file decode + diarization-inference loop, and run it OFF the
     // main thread so the UI stays responsive for the decode duration.
     let pipeline = state.lock_pipeline().clone();
-    run_blocking(move || pipeline.rediarize_segments(&ids).map_err(|e| e.to_string())).await
+    run_blocking(move || {
+        let _mutation = mutation;
+        pipeline.rediarize_segments(&ids).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]

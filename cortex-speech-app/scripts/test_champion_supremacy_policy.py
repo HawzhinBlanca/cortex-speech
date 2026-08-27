@@ -5,8 +5,8 @@ Both halves exist because BOTH failed silently on the same real run:
 
   * A 494-clip review queue was drafted 494/494 by `finetuned-mms-ckb` while `asr_model_size` said
     WSL7B and the champion sat up and idle on both GPUs. `use_finetuned_asr` diverted every clip and
-    nothing said so. Measured gap on identical FLEURS ckb clips: 7.03% CER vs 9.32%, and the app runs
-    the int8 build whose own baseline is 21.00%.
+    nothing said so. Historical duplication-weighted experiments showed material engine differences,
+    but they are not current model evidence; the operational defect is silent substitution itself.
   * 25 clips whose container the champion could not decode failed one at a time, were counted, and the
     batch ran to "completion" — leaving 462 clips at champion quality and 25 at a weaker engine,
     invisibly mixed.
@@ -21,10 +21,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface
+from _command_policy_util import command_surface
+
 SRC = Path(__file__).resolve().parents[1] / "src-tauri" / "src"
 PIPELINE = SRC / "pipeline.rs"
 COMMANDS = SRC / "commands.rs"
 SETTINGS = SRC / "settings.rs"
+EVENTS = Path(__file__).resolve().parents[1] / "src" / "lib" / "events.ts"
 
 
 def _fn_body(text: str, signature: str) -> str:
@@ -45,7 +49,7 @@ def test_selecting_the_champion_cannot_be_overridden_by_the_small_model() -> Non
     The removed clause was `&& !(use_finetuned_asr && finetuned_model_paths().is_some())` — the exact
     line that silently handed 494 clips to the smaller model.
     """
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     body = _fn_body(text, "fn should_use_wsl_primary_asr(&self) -> bool {")
     assert "use_finetuned_asr" not in body, (
         "should_use_wsl_primary_asr consults use_finetuned_asr again — selecting WSL7B must outrank "
@@ -68,11 +72,15 @@ def test_champion_is_the_factory_default_and_auxiliary_models_default_off() -> N
     assert re.search(r"\bfalse\b", multi_default), (
         "auxiliary 300M/1B/MMS hypotheses must default off so only the champion runs"
     )
+    assert "champion_supervision_enabled: false" in default_body, (
+        "starting the app must not auto-allocate the champion's GPUs; lifecycle supervision is an "
+        "explicit owner action"
+    )
 
 
 def test_legacy_auxiliary_flag_cannot_run_smaller_models_beside_champion() -> None:
     """Old settings may contain multi_engine_hypotheses=true; WSL7B must still remain single-engine."""
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     helper = _fn_body(text, "fn auxiliary_hypotheses_enabled(settings: &AppSettings) -> bool {")
     assert "multi_engine_hypotheses" in helper, "shared auxiliary-model opt-in guard is missing"
     assert "AsrModelSize::WSL7B" in helper and "!=" in helper, (
@@ -87,7 +95,7 @@ def test_legacy_auxiliary_flag_cannot_run_smaller_models_beside_champion() -> No
 
 def test_import_never_routes_through_scribe_or_cloud_fallback() -> None:
     """Cloud consent may reveal explicit tools, but it must never replace the champion during import."""
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     body = _fn_body(text, "pub fn import_single_file_with_events(")
     # Do not search for the bare substring "scribe": ordinary words such as "Transcribe" contain it.
     assert "scribe_api" not in body.lower() and "elevenlabs" not in body.lower(), (
@@ -100,11 +108,21 @@ def test_import_never_routes_through_scribe_or_cloud_fallback() -> None:
 
 def test_champion_review_cannot_consume_stale_auxiliary_votes() -> None:
     """Legacy hypothesis rows must not influence review or trigger a multi-ASR jury in champion mode."""
-    commands = COMMANDS.read_text(encoding="utf-8")
+    commands = command_surface(SRC)
     filter_body = _fn_body(commands, "fn hypotheses_for_selected_asr(")
     assert "AsrModelSize::WSL7B" in filter_body, "review hypothesis filtering is not selected-mode aware"
-    assert "CHAMPION_MODEL_ID" in filter_body and ".retain(" in filter_body, (
+    # Pins the BEHAVIOUR, not a symbol name. The champion is content-addressed now, so the filter no
+    # longer matches a fixed string — it matches the row's OWN producing model. That is the right unit
+    # of provenance but re-admits what the fixed string excluded: a clip drafted by a weaker engine
+    # BEFORE WSL7B was selected carries that engine's id. `recorded_model_is_champion` is the guard
+    # that keeps such a row contributing NO auxiliary vote, and dropping it would silently restore the
+    # 494/494 failure. Both halves are required.
+    assert "recorded_model_is_champion" in filter_body and ".retain(" in filter_body, (
         "champion review does not discard historical 300M/1B/MMS/Scribe hypotheses"
+    )
+    assert "if !recorded_model_is_champion" in filter_body, (
+        "the non-champion producer guard is gone — a weaker engine's stored draft would surface as an "
+        "auxiliary vote during champion review"
     )
 
     jury_body = _fn_body(commands, "pub fn run_jury_pipeline_core_via(")
@@ -113,7 +131,7 @@ def test_champion_review_cannot_consume_stale_auxiliary_votes() -> None:
         "the automatic multi-ASR jury can still run while the sole 7B champion is selected"
     )
 
-    pipeline = PIPELINE.read_text(encoding="utf-8")
+    pipeline = pipeline_surface(SRC)
     stage = _fn_body(pipeline, "fn multi_model_hypothesis_stage(")
     assert "AsrModelSize::WSL7B" in stage and '"not_required"' in stage, (
         "champion imports are still falsely blocked on optional multi-model coverage"
@@ -122,7 +140,7 @@ def test_champion_review_cannot_consume_stale_auxiliary_votes() -> None:
 
 def test_the_finetuned_override_yields_to_the_champion() -> None:
     """Every primary-drafter override goes through `finetuned_override_active`, which yields to WSL7B."""
-    text = PIPELINE.read_text(encoding="utf-8")
+    text = pipeline_surface(SRC)
     body = _fn_body(text, "fn finetuned_override_active(&self) -> bool {")
     assert "use_finetuned_asr" in body and "WSL7B" in body, (
         "finetuned_override_active must require the flag AND that the champion is not the selection"
@@ -140,7 +158,7 @@ def test_the_finetuned_override_yields_to_the_champion() -> None:
 
 def test_batch_transcribe_hard_stops_on_the_first_failure() -> None:
     """A failure must cancel the run and be reported as halted — never counted and carried past."""
-    text = COMMANDS.read_text(encoding="utf-8")
+    text = command_surface(SRC)
 
     assert "record_first_failure(&first_failure" in text, (
         "batch_transcribe no longer records the failure that stopped it"
@@ -158,6 +176,50 @@ def test_batch_transcribe_hard_stops_on_the_first_failure() -> None:
     assert "break;" in text[halt:halt + 300], "the hard-stop check does not actually stop the loop"
 
 
+def test_the_ui_surfaces_the_hard_stop_instead_of_swallowing_it() -> None:
+    """The frontend half of the hard stop. Only the Rust emit was pinned — which is why this shipped.
+
+    `batch_transcribe`'s terminal emit is `type: "halted"` + `haltedBy`, and it is the ONLY terminal
+    event for the run. `events.ts` typed the union as started|progress|completed and branched on
+    exactly those three, so "halted" matched nothing: the segment list never refreshed, isProcessing
+    stayed true, batchProgress stayed 'running' and pipelinePhase stayed 'transcribing' forever, and
+    the cause canon REQUIRES be reported was never shown. A hard stop the user cannot see is the
+    silent fallback this whole policy exists to forbid.
+    """
+    text = EVENTS.read_text(encoding="utf-8")
+
+    start = text.find("export interface BatchProgressEvent {")
+    assert start != -1, "BatchProgressEvent is gone — this gate would pass vacuously"
+    iface = text[start : text.index("\n}", start)]
+    # The `type:` line itself, not the interface text: the explanatory comment above it also spells
+    # 'halted', and a substring scan over the whole block passed while the union had lost the member.
+    union = re.search(r"(?m)^\s*type:\s*(.+);$", iface)
+    assert union and "'halted'" in union.group(1), "the BatchProgressEvent type union dropped 'halted'"
+    assert "haltedBy" in iface, "BatchProgressEvent no longer carries the halt cause"
+
+    body_start = text.find("async function refreshAfterBatch(")
+    assert body_start != -1, "refreshAfterBatch is gone — this gate would pass vacuously"
+    body = text[body_start : text.index("\n}", body_start)]
+    halted = body.find("payload.type === 'halted'")
+    assert halted != -1, "refreshAfterBatch no longer distinguishes a halted run from a completed one"
+    assert "notifications.error" in body and "payload.haltedBy" in body, (
+        "a halted batch must reach the user as an ERROR naming its cause, not a silent state reset"
+    )
+    for softer in ("notifications.success", "notifications.warning"):
+        assert halted < body.index(softer), (
+            f"{softer} is evaluated before the halted branch — a hard-stopped run would be reported "
+            "as a success or a partial tally, exactly the 'looks finished' failure this policy bans"
+        )
+
+    listen_start = text.find("listen<BatchProgressEvent>('batch-progress'")
+    assert listen_start != -1, "the batch-progress listener is gone — this gate would pass vacuously"
+    listener = text[listen_start : text.index("unlisteners.push(unlistenBatch)", listen_start)]
+    assert "'halted'" in listener and "refreshAfterBatch" in listener, (
+        "the batch-progress listener ignores 'halted' again — the terminal state (isProcessing, "
+        "pipelinePhase, batchProgress, endOperation) would never clear after a hard stop"
+    )
+
+
 def main() -> None:
     test_champion_is_the_factory_default_and_auxiliary_models_default_off()
     test_selecting_the_champion_cannot_be_overridden_by_the_small_model()
@@ -166,6 +228,7 @@ def main() -> None:
     test_champion_review_cannot_consume_stale_auxiliary_votes()
     test_the_finetuned_override_yields_to_the_champion()
     test_batch_transcribe_hard_stops_on_the_first_failure()
+    test_the_ui_surfaces_the_hard_stop_instead_of_swallowing_it()
     print("champion supremacy + hard stop policy passed")
 
 

@@ -22,10 +22,10 @@ verify-10:
 verify-10-quick:
 	python scripts/verify_10.py --quick
 
-## verify-10-status: full sweep + regenerate docs/STATUS.md (the generated gate-status file docs
-## link to). Deterministic per commit: re-running without a gate change produces a zero diff.
+## verify-10-status: compatibility alias for a full sweep. STATUS.md is now hash-bound inside the
+## immutable proof run; the tracked docs/STATUS.md is intentionally a static authority notice.
 verify-10-status:
-	python scripts/verify_10.py --status-md docs/STATUS.md
+	python scripts/verify_10.py
 
 ## coverage: line coverage for the core modules (cargo-llvm-cov; install: cargo install cargo-llvm-cov
 ## + rustup component add llvm-tools-preview). Charter target: >80% on normalizer/diff/audio parsers.

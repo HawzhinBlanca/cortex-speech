@@ -48,6 +48,23 @@ def resolve_for_safety(path: Path) -> Path:
     return path.expanduser().resolve(strict=False)
 
 
+def dataset_relpath(path: Path, root: Path | None = None) -> str:
+    """Path as it may appear in a shipped dataset artifact: never the curator's absolute path.
+
+    Same privacy rule the Rust exporters enforce and `scripts/test_windows_repo_hygiene.py`
+    blocks in tracked files — a manifest carrying the curator's home directory leaks his machine
+    layout and account name to everyone the dataset is handed to. Anything under the output
+    dir becomes an output-relative POSIX path (every consumer here already joins it back onto
+    `OUT_DIR`); anything outside it (source audio, source transcripts) becomes a basename.
+    `root` defaults to this module's `OUT_DIR`; callers with their own output global pass theirs.
+    """
+    resolved = resolve_for_safety(path)
+    try:
+        return resolved.relative_to(resolve_for_safety(root or OUT_DIR)).as_posix()
+    except ValueError:
+        return resolved.name
+
+
 def validate_output_paths(source_dir: Path | None = None, out_dir: Path | None = None) -> tuple[Path, Path]:
     source = resolve_for_safety(source_dir or SOURCE_DIR)
     output = resolve_for_safety(out_dir or OUT_DIR)
@@ -380,12 +397,30 @@ def extract_segment(source: Path, start: float, end: float, dest: Path, sample_r
     )
 
 
+def transcript_candidates(stem: str) -> list[Path]:
+    """The transcript for `<stem>.wav` is exactly `<stem>.txt`, or the Windows double-extension
+    `<stem>.txt.txt` the source folder actually ships.
+
+    The old map — `{p.stem.replace(".txt", ""): p for p in glob("*.txt*")}` — collapsed every
+    `<stem>.txt<anything>` onto one key, so glob order alone decided whether a stale sibling
+    (`X.txt.bak`, an editor's `X.txt.orig`) silently replaced `X.txt` as the TRUSTED transcript,
+    and `.replace(".txt", "")` also mangled any stem containing `.txt`.
+    """
+    return [p for p in (SOURCE_DIR / f"{stem}.txt", SOURCE_DIR / f"{stem}.txt.txt") if p.is_file()]
+
+
 def pair_sources() -> list[SourceItem]:
     wavs = sorted(SOURCE_DIR.glob("*.wav"))
-    txts = {p.stem.replace(".txt", ""): p for p in SOURCE_DIR.glob("*.txt*")}
     items: list[SourceItem] = []
     for wav in wavs:
-        exact = txts.get(wav.stem)
+        candidates = transcript_candidates(wav.stem)
+        if len(candidates) > 1:
+            names = ", ".join(p.name for p in candidates)
+            raise ValueError(
+                f"Ambiguous transcript pairing for {wav.name}: {names}. "
+                "Remove the stale file — refusing to guess which one is the trusted transcript."
+            )
+        exact = candidates[0] if candidates else None
         if exact and exact.stat().st_size > 0:
             items.append(SourceItem(wav, exact, "matched_by_basename"))
             continue
@@ -444,8 +479,9 @@ These rows are marked as draft and must be human-corrected before they are promo
 
 Speaker: `{SPEAKER_ID}`
 
-This dataset was generated from the WAV files in:
-`{SOURCE_DIR}`
+This dataset was generated from the WAV files in the source folder `{SOURCE_DIR.name}`
+(set per machine with `CORTEX_HALWEST_SOURCE_DIR`; the curator's absolute path is deliberately
+not recorded in this dataset).
 
 ## Outputs
 
@@ -541,10 +577,10 @@ def main() -> None:
         general_rows.append(
             {
                 "id": general_id,
-                "audio_48k": str(full_48),
-                "audio_24k": str(full_24),
-                "source_audio": str(item.audio),
-                "transcript_file": str(item.transcript) if item.transcript else "",
+                "audio_48k": dataset_relpath(full_48),
+                "audio_24k": dataset_relpath(full_24),
+                "source_audio": dataset_relpath(item.audio),
+                "transcript_file": dataset_relpath(item.transcript) if item.transcript else "",
                 "transcript_status": item.transcript_status,
                 "duration_sec": round(duration, 3),
                 "text": transcript,
@@ -554,8 +590,8 @@ def main() -> None:
             {
                 "id": general_id,
                 "speaker": SPEAKER_ID,
-                "audio_filepath": str(full_24),
-                "source_audio": str(item.audio),
+                "audio_filepath": dataset_relpath(full_24),
+                "source_audio": dataset_relpath(item.audio),
                 "duration": round(duration, 3),
                 "text": transcript,
                 "transcript_status": item.transcript_status,
@@ -581,9 +617,9 @@ def main() -> None:
             row = {
                 "id": seg_id,
                 "speaker": SPEAKER_ID,
-                "audio_file": str(wav_path),
-                "source_audio": str(item.audio),
-                "source_transcript": str(item.transcript) if item.transcript else "",
+                "audio_file": dataset_relpath(wav_path),
+                "source_audio": dataset_relpath(item.audio),
+                "source_transcript": dataset_relpath(item.transcript) if item.transcript else "",
                 "start_sec": round(start, 3),
                 "end_sec": round(end, 3),
                 "duration_sec": round(seg_dur, 3),
@@ -601,8 +637,8 @@ def main() -> None:
                     {
                         "id": seg_id,
                         "speaker": SPEAKER_ID,
-                        "audio_filepath": str(wav_path),
-                        "source_audio": str(item.audio),
+                        "audio_filepath": dataset_relpath(wav_path),
+                        "source_audio": dataset_relpath(item.audio),
                         "offset": round(start, 3),
                         "duration": round(seg_dur, 3),
                         "text": text,
@@ -686,13 +722,13 @@ def main() -> None:
     ref_candidates.sort(key=lambda r: (abs(float(r["duration_sec"]) - 9.0), -int(r["text_chars"])))
     reference_rows: list[dict] = []
     for idx, row in enumerate(ref_candidates[:20], start=1):
-        src = Path(row["audio_file"])
+        src = OUT_DIR / row["audio_file"]  # rows carry output-relative paths, not absolutes
         dest = OUT_DIR / "voice_cloning_reference" / "top_reference_clips" / f"ref_{idx:02d}_{src.name}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         ref_row = dict(row)
         ref_row["reference_rank"] = idx
-        ref_row["reference_audio_file"] = str(dest)
+        ref_row["reference_audio_file"] = dataset_relpath(dest)
         reference_rows.append(ref_row)
 
     write_csv(
@@ -732,8 +768,10 @@ def main() -> None:
         json.dumps(
             {
                 "speaker": SPEAKER_ID,
-                "source_dir": str(SOURCE_DIR),
-                "output_dir": str(OUT_DIR),
+                # Folder names only — the manifest ships with the dataset and must not carry
+                # the curator's absolute paths (see dataset_relpath).
+                "source_dir": SOURCE_DIR.name,
+                "output_dir": OUT_DIR.name,
                 "settings": {
                     "silence_db": SILENCE_DB,
                     "silence_min_duration": SILENCE_MIN_DUR,

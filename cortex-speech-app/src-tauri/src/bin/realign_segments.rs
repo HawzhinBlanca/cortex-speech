@@ -47,6 +47,16 @@ fn main() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("cortex-speech"));
 
+    // `--apply` reads every target before writing through a long-lived dedicated connection. Hold
+    // the desktop's lock for that whole operation so a restore cannot swap generations in between.
+    let _instance_lock = if apply {
+        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(&data_dir).map_err(|error| {
+            format!("Cannot apply re-alignment while Cortex is running: {error}. Stop review and close the app first.")
+        })?)
+    } else {
+        None
+    };
+
     let db_path = data_dir.join("cortex-speech.db");
     // Mirrors lib.rs exactly (settings.json beside the DB, models under <data>/models) so this tool
     // resolves the SAME engine and GPU choice the app would. A tool that aligned with different

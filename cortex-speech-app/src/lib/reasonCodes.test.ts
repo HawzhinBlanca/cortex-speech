@@ -61,7 +61,9 @@ describe('reason vocabulary', () => {
     // The reviewer reads Sorani. An untranslated code would surface English internals in the RTL UI,
     // which is precisely what having machine-stable codes plus human labels exists to avoid.
     for (const code of KNOWN_REASON_CODES) {
-      const key = `reason.${code}`;
+      const key = reasonLabelKey(code);
+      expect(key, `missing typed translation mapping for ${code}`).not.toBeNull();
+      if (!key) throw new Error(`missing typed translation mapping for ${code}`);
       expect(en[key], `en is missing ${key}`).toBeTruthy();
       expect(ckb[key], `ckb is missing ${key}`).toBeTruthy();
       expect(ckb[key], `${key} is untranslated (identical to en)`).not.toBe(en[key]);

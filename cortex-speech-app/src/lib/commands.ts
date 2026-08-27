@@ -1,11 +1,64 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invokeCritical, invokeLegacy } from './adapters/legacyIpc';
+import { commands as generatedCommands } from './generated/ipc';
+import { formatUnknownError } from './errorText';
 import type {
-  SpeechSegment,
-  SegmentsPage,
-  WordTimestamp,
-  DatasetStats,
-  SpeakerStat,
-} from './types';
+  ActiveVoiceFocusV1,
+  AssignedSpeakersV1,
+  AssignSpeakersRequestV1,
+  AppHealthV1,
+  CommandErrorV1,
+  DeletedSegmentsV1,
+  CommitReviewRequestV1,
+  CommittedReviewV1,
+  DesktopPlaybackReceiptV1,
+  DesktopPlaybackSessionV1,
+  HistoryMutationResultV1,
+  HistoryStatusV1,
+  EngineStatusV1,
+  MarkedSegmentUnusableV1,
+  MarkSegmentUnusableRequestV1,
+  InferenceStatsV1,
+  JobV1,
+  MediaGrant,
+  ModelDownloadSummaryV1,
+  ModelStatusEntryV1,
+  ModelVersionSummaryV1,
+  PlaybackIntervalV1,
+  RenamedSpeakerV1,
+  RenameSpeakerRequestV1,
+  ReviewDraftV1,
+  ReviewPageV1,
+  ReviewScope,
+  SegmentMetadataChangeV1,
+  SettingsPatchResultV1,
+  SettingsPatchV1,
+  SettingsSnapshotV1,
+  SpeakerInventoryItemV1,
+  TextDiff,
+  TracingSpanV1,
+  TracingStatsV1,
+  UpdatedSegmentMetadataV1,
+} from './generated/ipc';
+export type {
+  ActiveVoiceFocusV1,
+  AppHealthV1 as AppHealth,
+  DesktopPlaybackReceiptV1,
+  DesktopPlaybackSessionV1,
+  HistoryActionV1,
+  HistoryMutationResultV1,
+  HistoryStatusV1,
+  MarkedSegmentUnusableV1,
+  MarkSegmentUnusableRequestV1,
+  InferenceStatsV1 as InferenceStats,
+  PlaybackIntervalV1,
+  ReviewDraftV1,
+  ReviewPageV1,
+  SpeakerInventoryItemV1,
+  TechnicalUnusableReasonV1,
+  TracingSpanV1 as TracingSpan,
+  TracingStatsV1 as TracingStats,
+} from './generated/ipc';
+import type { SpeechSegment, SegmentsPage, WordTimestamp, DatasetStats } from './types';
 import type { AppSettings } from './stores/settingsStore';
 import {
   mapBackendToFrontend,
@@ -14,11 +67,11 @@ import {
 } from './settingsAdapter';
 
 export async function openAudioFile(): Promise<string | null> {
-  return invoke<string | null>('open_audio_file');
+  return invokeCritical('open_audio_file');
 }
 
 export async function importDirectory(): Promise<{ status: string }> {
-  return invoke('import_directory');
+  return invokeCritical('import_directory');
 }
 
 /** P3.2: a directory import interrupted by a crash, offered for resume at startup. */
@@ -31,23 +84,24 @@ export interface ImportJob {
 }
 
 export async function getInterruptedImport(): Promise<ImportJob | null> {
-  return invoke<ImportJob | null>('get_interrupted_import');
+  return invokeCritical('get_interrupted_import');
 }
 
 export async function resumeInterruptedImport(): Promise<{ status: string; resuming: boolean }> {
-  return invoke('resume_interrupted_import');
+  return invokeCritical('resume_interrupted_import');
 }
 
 export async function discardInterruptedImport(jobId: string): Promise<void> {
-  return invoke('discard_interrupted_import', { jobId });
+  return invokeCritical('discard_interrupted_import', { jobId });
 }
 
 export async function importAudioFile(path: string): Promise<{ status: string; source?: string }> {
-  return invoke('import_audio_file', { path });
+  return invokeCritical('import_audio_file', { path });
 }
 
 export async function cancelOperation(): Promise<void> {
-  return invoke<void>('cancel_operation');
+  const result = await generatedCommands.cancelOperation();
+  if (result.status === 'error') throw result.error;
 }
 
 /**
@@ -62,7 +116,10 @@ export const ASR_7B_UNAVAILABLE_TAG = 'E_ASR_7B_UNAVAILABLE';
 /** True when a transcription error is the "7B champion unavailable/failed" signal above. */
 export function is7bUnavailableError(e: unknown): boolean {
   const msg = typeof e === 'string' ? e : ((e as { message?: unknown } | null)?.message ?? '');
-  return String(msg).includes(ASR_7B_UNAVAILABLE_TAG) || String(e).includes(ASR_7B_UNAVAILABLE_TAG);
+  return (
+    formatUnknownError(msg, '').includes(ASR_7B_UNAVAILABLE_TAG) ||
+    formatUnknownError(e, '').includes(ASR_7B_UNAVAILABLE_TAG)
+  );
 }
 
 export async function transcribeSegment(
@@ -77,49 +134,28 @@ export async function transcribeSegment(
   modelVersionId?: string | null;
   cloudCall?: boolean;
 }> {
-  return invoke('transcribe_segment', {
+  return invokeLegacy<{
+    text: string;
+    rawTranscript: string;
+    confidence?: number | null;
+    confidenceSource?: string | null;
+    modelVersionId?: string | null;
+    cloudCall?: boolean;
+  }>('transcribe_segment', {
     segmentId: segmentId ?? null,
     audioPath,
     alignmentJson: alignmentJson ?? null,
   });
 }
 
-/**
- * Opt-in: transcribe with the CONSTRAINED Kurdish-token CTC decode (guaranteed Kurdish-script
- * output) via the ort raw-logits path, instead of the default sherpa-onnx decode.
- */
-export async function transcribeSegmentConstrained(
-  audioPath: string,
-  alignmentJson?: string | null,
-): Promise<{ text: string; rawTranscript: string }> {
-  // Pass alignmentJson so constrained decode transcribes only THIS segment's clip, not the whole file.
-  return invoke('transcribe_segment_constrained', {
-    audioPath,
-    alignmentJson: alignmentJson ?? null,
-  });
-}
-
-/**
- * Opt-in: transcribe with the embedded fine-tuned Kurdish Wav2Vec2-CTC model (measured 21.0% CER
- * [19.93, 22.04] N=900 vs stock OmniASR 29.4%). Falls back with an error if the model is not installed.
- */
-export async function transcribeSegmentFinetuned(
-  audioPath: string,
-  alignmentJson?: string | null,
-): Promise<{ text: string; rawTranscript: string }> {
-  // Pass alignmentJson so the fine-tuned model transcribes only THIS segment's clip, not the whole file.
-  return invoke('transcribe_segment_finetuned', {
-    audioPath,
-    alignmentJson: alignmentJson ?? null,
-  });
-}
-
 export async function batchTranscribe(ids: string[]): Promise<{ status: string }> {
-  return invoke('batch_transcribe', { ids });
+  return invokeLegacy<{ status: string }>('batch_transcribe', { ids });
 }
 
 export async function normalizeText(text: string): Promise<string> {
-  return invoke<string>('normalize_text', { text });
+  const result = await generatedCommands.normalizeText(text);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function alignSegment(
@@ -128,7 +164,7 @@ export async function alignSegment(
   alignmentJson?: string | null,
   segmentId?: string | null,
 ): Promise<WordTimestamp[]> {
-  return invoke<WordTimestamp[]>('align_segment', {
+  return invokeLegacy<WordTimestamp[]>('align_segment', {
     audioPath,
     text,
     alignmentJson: alignmentJson ?? null,
@@ -154,8 +190,8 @@ export interface SegmentConsensus {
   models: string[];
 }
 
-/** Map a recorded ASR engine id to a short, honest human label. Unknown ids show verbatim (never
- * invented) so the review badge always names exactly what produced the draft. */
+/** Render read-only historical provenance. These labels are not selectable engines; unknown ids show
+ * verbatim (never invented) so the review badge always names exactly what produced the stored draft. */
 export function engineLabel(modelId: string): string {
   const id = (modelId || '').toLowerCase();
   if (id.includes('wsl-7b') || id.includes('omniasr-7b') || id === 'omniasr-llm-7b')
@@ -164,14 +200,13 @@ export function engineLabel(modelId: string): string {
     return 'Fine-tuned MMS-1B';
   if (id.includes('ctc-1b') || id.includes('ctc_1b')) return 'OmniASR-CTC 1B (base)';
   if (id.includes('ctc-300m') || id.includes('ctc_300m')) return 'OmniASR-CTC 300M (base)';
-  if (id.includes('scribe')) return 'ElevenLabs Scribe (cloud)';
   if (id.startsWith('unknown@') || id === 'unknown') return 'unknown (pre-registry)';
   return modelId;
 }
 
 /** Offline best-of-N consensus draft for a segment (ability-weighted vote over its ASR hypotheses). */
 export async function getSegmentConsensus(segmentId: string): Promise<SegmentConsensus> {
-  return invoke<SegmentConsensus>('get_segment_consensus', { segmentId });
+  return invokeLegacy<SegmentConsensus>('get_segment_consensus', { segmentId });
 }
 
 export interface GetSegmentsPageOptions {
@@ -180,24 +215,70 @@ export interface GetSegmentsPageOptions {
   sort?: string;
   limit?: number;
   cursor?: string | null;
+  /** Apply the active voice-focus allow-list (review queue only — the library stays unfocused). */
+  focused?: boolean;
+}
+
+function isSpeechSegmentPayload(value: unknown): value is SpeechSegment {
+  if (!value || typeof value !== 'object') return false;
+  const segment = value as Partial<SpeechSegment>;
+  return (
+    typeof segment.id === 'string' &&
+    typeof segment.audioPath === 'string' &&
+    typeof segment.rawTranscript === 'string' &&
+    typeof segment.durationMs === 'number' &&
+    Number.isFinite(segment.durationMs) &&
+    typeof segment.verified === 'boolean'
+  );
+}
+
+function isSegmentsPagePayload(value: unknown): value is SegmentsPage {
+  if (!value || typeof value !== 'object') return false;
+  const page = value as Partial<SegmentsPage>;
+  if (
+    !Array.isArray(page.items) ||
+    !page.items.every(isSpeechSegmentPayload) ||
+    typeof page.total !== 'number' ||
+    !Number.isSafeInteger(page.total) ||
+    page.total < 0 ||
+    page.total < page.items.length ||
+    (page.nextCursor !== null && typeof page.nextCursor !== 'string') ||
+    (page.focusNarrowed !== undefined && typeof page.focusNarrowed !== 'boolean')
+  ) {
+    return false;
+  }
+  if (page.revisions === undefined) return true;
+  return (
+    !!page.revisions &&
+    typeof page.revisions === 'object' &&
+    !Array.isArray(page.revisions) &&
+    Object.values(page.revisions).every(
+      (revision) => Number.isSafeInteger(revision) && revision >= 0,
+    )
+  );
 }
 
 export async function getSegment(segmentId: string): Promise<SpeechSegment> {
-  const data = await invoke<SpeechSegment>('get_segment', { segmentId });
-  if (!data || typeof data.id !== 'string') {
-    throw new Error(`get_segment returned an invalid payload for ${segmentId}`);
+  const result = await generatedCommands.getSegment(segmentId);
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
+  if (!isSpeechSegmentPayload(data)) {
+    throw new Error('get_segment returned an invalid payload');
   }
   return data;
 }
 
 export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Promise<SegmentsPage> {
-  const data = await invoke<SegmentsPage>('get_segments_page', {
-    verified: options.verified ?? null,
-    query: options.query ?? null,
-    sort: options.sort ?? 'newest',
-    limit: options.limit ?? 300,
-    cursor: options.cursor ?? null,
-  });
+  const result = await generatedCommands.getSegmentsPage(
+    options.verified ?? null,
+    options.query ?? null,
+    options.sort ?? 'newest',
+    options.limit ?? 300,
+    options.cursor ?? null,
+    options.focused ?? false,
+  );
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
   // THROW, never a benign empty result. Returning [] here turned "the IPC payload was not what this
   // app understands" into "your library is empty" — a failure that looks exactly like success. Every
   // caller of these three already has a user-visible error path (segmentStore raises a PERSISTENT
@@ -205,12 +286,133 @@ export async function getSegmentsPage(options: GetSegmentsPageOptions = {}): Pro
   // silent fallback bypassed all of them and left console.error, which no user opens, as the only
   // record. An empty ValidationPanel reads as "no anomalies found" and an empty inbox as "nothing left
   // to review" — both are clean bills of health issued by a broken read.
-  if (!data || !Array.isArray(data.items)) {
+  if (!isSegmentsPagePayload(data)) {
     throw new Error(
       `get_segments_page returned ${typeof data}, not a page payload — the library could not be read`,
     );
   }
   return data;
+}
+
+export function isCommandErrorV1(error: unknown, code?: string): error is CommandErrorV1 {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as Partial<CommandErrorV1>;
+  return (
+    candidate.schema === 1 &&
+    typeof candidate.code === 'string' &&
+    typeof candidate.message === 'string' &&
+    typeof candidate.retryable === 'boolean' &&
+    (code === undefined || candidate.code === code)
+  );
+}
+
+export function reviewErrorMessage(_error: unknown, fallback: string): string {
+  // Backend messages are useful in explicit diagnostics, but ordinary review surfaces are localized.
+  // Typed callers can separately retain the structured code, action and operation ID.
+  return fallback;
+}
+
+/** Revision-paired queue read generated from the Rust contract. */
+export async function getReviewPageV1(
+  scope: ReviewScope,
+  cursor: string | null = null,
+  limit = 100,
+): Promise<ReviewPageV1> {
+  const result = await generatedCommands.getReviewPageV1(scope, limit, cursor);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Discover the opaque identity of the active file-owned focus without exposing its private label,
+ * segment ids or data-directory path. `null` means no focus policy is active. */
+export async function getActiveVoiceFocusV1(): Promise<ActiveVoiceFocusV1 | null> {
+  const result = await generatedCommands.getActiveVoiceFocusV1();
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Load only the exact focus generation previously returned by `getActiveVoiceFocusV1`. A changed,
+ * missing or malformed owner policy is rejected by the backend rather than silently widened. */
+export async function getVoiceFocusReviewPageV1(
+  focusId: string,
+  cursor: string | null = null,
+  limit = 100,
+): Promise<ReviewPageV1> {
+  return getReviewPageV1({ kind: 'voiceFocus', focusId }, cursor, limit);
+}
+
+/**
+ * Commit an exact versioned review request. A transport-level lost response gets one replay with the
+ * SAME operation id and payload; a structured backend refusal is never retried blindly.
+ */
+export async function commitReviewV1(request: CommitReviewRequestV1): Promise<CommittedReviewV1> {
+  const invokeExact = async (): Promise<CommittedReviewV1> => {
+    const result = await generatedCommands.commitReviewV1(request);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+/**
+ * Persist one closed technical media disposition. This is intentionally separate from
+ * `commitReviewV1`: it records no transcript verdict and carries no playback receipt. A lost
+ * transport response gets one replay with the byte-identical operation id and payload; a typed
+ * backend refusal is definitive and is never retried blindly.
+ */
+export async function markSegmentUnusableV1(
+  request: MarkSegmentUnusableRequestV1,
+): Promise<MarkedSegmentUnusableV1> {
+  const invokeExact = async (): Promise<MarkedSegmentUnusableV1> => {
+    const result = await generatedCommands.markSegmentUnusableV1(request);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+/** Load one crash-safe draft. Drafts are non-authoritative and never enter corpus truth. */
+export async function getReviewDraftV1(segmentId: string): Promise<ReviewDraftV1 | null> {
+  const result = await generatedCommands.getReviewDraftV1(segmentId);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Persist the exact clip/revision draft with a server-owned timestamp. */
+export async function saveReviewDraftV1(
+  segmentId: string,
+  baseRevision: number,
+  text: string,
+): Promise<ReviewDraftV1> {
+  const result = await generatedCommands.saveReviewDraftV1(segmentId, baseRevision, text);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** Revision-guarded explicit discard; returns false when no matching draft exists. */
+export async function deleteReviewDraftV1(
+  segmentId: string,
+  baseRevision: number,
+): Promise<boolean> {
+  const result = await generatedCommands.deleteReviewDraftV1(segmentId, baseRevision);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+export function reviewEffectId(decisionId: string): number | null {
+  const match = /^effect:([1-9][0-9]*)$/.exec(decisionId);
+  const value = match ? Number(match[1]) : Number.NaN;
+  return Number.isSafeInteger(value) ? value : null;
 }
 
 export async function getSegmentIdsForView(
@@ -220,11 +422,13 @@ export async function getSegmentIdsForView(
     transcriptState?: 'any' | 'real' | 'missing';
   } = {},
 ): Promise<string[]> {
-  const data = await invoke<string[]>('get_segment_ids_for_view', {
-    verified: options.verified ?? null,
-    query: options.query ?? null,
-    transcriptState: options.transcriptState ?? 'any',
-  });
+  const result = await generatedCommands.getSegmentIdsForView(
+    options.verified ?? null,
+    options.query ?? null,
+    options.transcriptState ?? 'any',
+  );
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
   if (!Array.isArray(data) || data.some((id) => typeof id !== 'string')) {
     throw new Error('get_segment_ids_for_view returned an invalid payload');
   }
@@ -232,87 +436,95 @@ export async function getSegmentIdsForView(
 }
 
 export async function getSignalAnomalySegments(limit = 100): Promise<SpeechSegment[]> {
-  const data = await invoke<SpeechSegment[]>('get_signal_anomaly_segments', { limit });
-  if (!Array.isArray(data))
+  const result = await generatedCommands.getSignalAnomalySegments(limit);
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
+  if (!Array.isArray(data) || !data.every(isSpeechSegmentPayload))
     throw new Error('get_signal_anomaly_segments returned an invalid payload');
   return data;
 }
 
-export async function updateSegment(segment: SpeechSegment): Promise<void> {
-  return invoke<void>('update_segment', { segment });
-}
+export type SegmentMetadataFields = Partial<Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>>;
+export type SegmentMetadataBaseline = Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>;
 
 /**
- * F10 root fix — partial autosave update. Sends ONLY the edited curation fields
- * (annotatedTranscript / speakerId / alignmentJson); the backend reads the FRESH row and applies them
- * under its lock, so a debounced save during a long batch can never merge against a stale store row
- * and revert concurrently-written columns. Resolves false when the row no longer exists (deleted
- * mid-debounce — a safe no-op, never a resurrecting upsert).
+ * Compare-and-set only library-owned metadata against the exact server values last observed by the
+ * renderer. Human transcript and verification truth are deliberately unrepresentable here.
  */
-/**
- * Lossless review-undo restore: writes the WHOLE pre-decision snapshot back, including the
- * jury/decision columns that updateSegment deliberately omits — so undoing a re-decision can never
- * erase the earlier human decision (the 2026-07-14 live-test data loss, reproduced + fixed).
- */
-export async function restoreSegmentSnapshot(segment: SpeechSegment): Promise<void> {
-  return invoke<void>('restore_segment_snapshot', { segment });
-}
-
-export async function updateSegmentFields(
+export async function updateSegmentMetadataV1(
   segmentId: string,
-  fields: Partial<
-    Pick<SpeechSegment, 'annotatedTranscript' | 'speakerId' | 'alignmentJson' | 'verified'>
-  >,
-): Promise<boolean> {
-  return invoke<boolean>('update_segment_fields', { segmentId, fields });
+  expected: SegmentMetadataBaseline,
+  fields: SegmentMetadataFields,
+): Promise<UpdatedSegmentMetadataV1> {
+  const changes: SegmentMetadataChangeV1[] = [];
+  if ('speakerId' in fields) {
+    changes.push({
+      field: 'speakerId',
+      expected: expected.speakerId,
+      value: fields.speakerId ?? null,
+    });
+  }
+  if ('alignmentJson' in fields) {
+    changes.push({
+      field: 'alignmentJson',
+      expected: expected.alignmentJson,
+      value: fields.alignmentJson ?? null,
+    });
+  }
+  if (changes.length === 0) {
+    throw new Error('Refusing an empty segment metadata update');
+  }
+  const result = await generatedCommands.updateSegmentMetadataV1({ segmentId, changes });
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function deleteSegment(id: string): Promise<void> {
-  return invoke<void>('delete_segment', { id });
+  await deleteSegmentsV1([id]);
 }
 
 export async function deleteSegmentsBatch(ids: string[]): Promise<void> {
-  return invoke<void>('delete_segments_batch', { ids });
+  await deleteSegmentsV1(ids);
+}
+
+export async function deleteSegmentsV1(ids: string[]): Promise<DeletedSegmentsV1> {
+  const result = await generatedCommands.deleteSegmentsV1({ ids });
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function exportDataset(path: string, format: string): Promise<void> {
-  return invoke<void>('export_dataset', { path, format });
+  return invokeCritical('export_dataset', { path, format });
 }
 
 /** Plain human transcript / subtitle export (format: 'txt' | 'srt' | 'vtt'). */
 export async function exportTranscript(path: string, format: 'txt' | 'srt' | 'vtt'): Promise<void> {
-  return invoke<void>('export_transcript', { path, format });
+  return invokeCritical('export_transcript', { path, format });
 }
 
-export interface EngineStatus {
-  ready: boolean;
-  port: number;
-}
+export type EngineStatus = EngineStatusV1;
 
 /** Health of the champion (OmniASR-7B) warm server, for the engine-status pill. */
 export async function getChampionEngineStatus(): Promise<EngineStatus> {
-  return invoke<EngineStatus>('get_champion_engine_status');
+  const result = await generatedCommands.getChampionEngineStatus();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-/** A durable background job (P0 #3 Job Supervisor). Mirrors crate::jobs::Job (camelCase). */
-export interface Job {
-  id: string;
-  kind: string;
-  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
-  progress: number;
-  completed: number;
-  total: number | null;
-  errorCode: string | null;
-}
+/** A durable background job (P0 #3 Job Supervisor). */
+export type Job = JobV1;
 
 /** Recent durable jobs (newest first) for the activity surface. Cheap read; safe to poll. */
 export async function getJobs(): Promise<Job[]> {
-  return invoke<Job[]>('get_jobs');
+  const result = await generatedCommands.getJobs();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Start the champion 7B server (WSL) from the app; returns immediately, then poll status. */
 export async function startChampionEngine(): Promise<void> {
-  return invoke<void>('start_champion_engine');
+  const result = await generatedCommands.startChampionEngine();
+  if (result.status === 'error') throw result.error;
 }
 
 export interface AgentSourceReferenceSummary {
@@ -421,38 +633,80 @@ export interface AgentStageEvent {
   createdAt: string;
 }
 
-export interface MediaGrant {
-  id: string;
-  path: string;
-  expiresAt: string;
-}
-
 export async function listAgentImportReports(limit = 25): Promise<AgentImportReport[]> {
-  return invoke<AgentImportReport[]>('list_agent_import_reports', { limit });
+  return invokeLegacy<AgentImportReport[]>('list_agent_import_reports', { limit });
 }
 
 export async function listAgentStageEvents(
   runId?: string | null,
   limit = 50,
 ): Promise<AgentStageEvent[]> {
-  return invoke<AgentStageEvent[]>('list_agent_stage_events', { runId: runId ?? null, limit });
+  return invokeLegacy<AgentStageEvent[]>('list_agent_stage_events', {
+    runId: runId ?? null,
+    limit,
+  });
 }
 
 export async function registerMediaAsset(audioPath: string): Promise<MediaGrant> {
-  return invoke<MediaGrant>('register_media_asset', { audioPath });
+  const result = await generatedCommands.registerMediaAsset(audioPath);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/** A decoded-PCM-verified immutable grant. Only review workstations request this stronger authority. */
+export async function registerReviewMediaAsset(audioPath: string): Promise<MediaGrant> {
+  const result = await generatedCommands.registerReviewMediaAsset(audioPath);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function getMediaAssetUrl(id: string): Promise<string> {
-  return invoke<string>('get_media_asset_url', { id });
+  const result = await generatedCommands.getMediaAssetUrl(id);
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+export async function beginDesktopPlaybackSessionV1(
+  segmentId: string,
+  mediaGrantId: string,
+  expectedRevision: number,
+  clientAttemptId: string,
+): Promise<DesktopPlaybackSessionV1> {
+  const result = await generatedCommands.beginDesktopPlaybackSessionV1(
+    segmentId,
+    mediaGrantId,
+    expectedRevision,
+    clientAttemptId,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/**
+ * Retire one exact renderer playback attempt only while it has not produced an immutable receipt.
+ * Replaying a successful cancellation returns false; finalized authority is refused by the backend.
+ */
+export async function cancelDesktopPlaybackSessionV1(
+  playbackReceiptId: string,
+  clientAttemptId: string,
+): Promise<boolean> {
+  const result = await generatedCommands.cancelDesktopPlaybackSessionV1(
+    playbackReceiptId,
+    clientAttemptId,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
  * Lowercase names of cloud providers whose API key is present in `secrets.env`
- * (e.g. "elevenlabs", "gemini", "openrouter"). Returns names only — never key
+ * ("gemini" and/or "openrouter"). Returns names only — never key
  * values — so it is safe to surface in the UI.
  */
 export async function getConfiguredProviders(): Promise<string[]> {
-  return invoke<string[]>('get_configured_providers');
+  const result = await generatedCommands.getConfiguredProviders();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -460,11 +714,10 @@ export async function getConfiguredProviders(): Promise<string[]> {
  * straight to the backend and is never logged or echoed back; the resolved list of configured
  * provider NAMES is returned so the UI can refresh its set/unset badges.
  */
-export async function setApiKey(
-  provider: 'gemini' | 'elevenlabs' | 'openrouter',
-  key: string,
-): Promise<string[]> {
-  return invoke<string[]>('set_api_key', { provider, key });
+export async function setApiKey(provider: 'gemini' | 'openrouter', key: string): Promise<string[]> {
+  const result = await generatedCommands.setApiKey(provider, key);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** One reviewer's private way in. Each named reviewer gets their own token, so two people never share
@@ -479,6 +732,7 @@ export interface CouchReviewer {
    * end-to-end encrypted between devices in the tailnet. Null when no tailnet is up.
    */
   tailscaleUrl: string | null;
+  funnelUrl: string | null;
 }
 
 /** Couch Review: the token-gated phone review server (off by default, per-session). */
@@ -492,15 +746,15 @@ export interface CouchStatus {
 
 /** Start the server. An empty list starts a single-reviewer session under the default name. */
 export async function startCouchReview(reviewers: string[] = []): Promise<CouchStatus> {
-  return invoke<CouchStatus>('start_couch_review', { reviewers });
+  return invokeCritical('start_couch_review', { reviewers });
 }
 
 export async function stopCouchReview(): Promise<CouchStatus> {
-  return invoke<CouchStatus>('stop_couch_review');
+  return invokeCritical('stop_couch_review');
 }
 
 export async function couchReviewStatus(): Promise<CouchStatus> {
-  return invoke<CouchStatus>('couch_review_status');
+  return invokeCritical('couch_review_status');
 }
 
 /** How one remote reviewer scored on clips whose answer was already known. */
@@ -516,7 +770,7 @@ export interface SpotCheckScore {
 
 /** Worst `noticed` rate first — the reviewer who may not be listening comes top, not last. */
 export async function spotCheckReport(): Promise<SpotCheckScore[]> {
-  return invoke<SpotCheckScore[]>('spot_check_report');
+  return invokeCritical('spot_check_report');
 }
 
 /** One reviewer's measured throughput, from the append-only review trail. */
@@ -532,12 +786,12 @@ export interface ReviewerThroughput {
 
 /** Busiest reviewer first. Partitioned per reviewer, unlike the global stats.rs timing. */
 export async function reviewerThroughput(): Promise<ReviewerThroughput[]> {
-  return invoke<ReviewerThroughput[]>('reviewer_throughput');
+  return invokeCritical('reviewer_throughput');
 }
 
 /** Revoke ONE reviewer's link; everyone else's keeps working. */
 export async function revokeCouchReviewer(reviewer: string): Promise<CouchStatus> {
-  return invoke<CouchStatus>('revoke_couch_reviewer', { reviewer });
+  return invokeCritical('revoke_couch_reviewer', { reviewer });
 }
 
 /** A two-rater agreement sample, ready for `scripts/agreement_kappa.py`. */
@@ -554,25 +808,17 @@ export interface AgreementExport {
 
 /** Null when no clip has been answered by two different people yet. */
 export async function exportAgreementSample(): Promise<AgreementExport | null> {
-  return invoke<AgreementExport | null>('export_agreement_sample');
+  return invokeCritical('export_agreement_sample');
 }
 
-/** A row of the model-version registry (snake_case, as serialized by the backend). */
-export interface ModelVersion {
-  id: string;
-  family: string;
-  model_card_name: string | null;
-  checkpoint_sha256: string;
-  checkpoint_path: string;
-  source: string;
-  license: string;
-  /** "candidate" or "champion". */
-  status: string;
-}
+/** A versioned, renderer-safe row of the model-version registry. */
+export type ModelVersion = ModelVersionSummaryV1;
 
 /** The registered model versions, newest-first within each family. */
 export async function listModelVersions(): Promise<ModelVersion[]> {
-  return invoke<ModelVersion[]>('list_model_versions');
+  const result = await generatedCommands.listModelVersions();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -581,20 +827,63 @@ export async function listModelVersions(): Promise<ModelVersion[]> {
  */
 export async function importModelCheckpoint(args: {
   id: string;
-  family: string;
   checkpointPath: string;
   source: string;
   license: string;
   modelCardName?: string | null;
 }): Promise<string> {
-  return invoke<string>('import_model_checkpoint', {
-    id: args.id,
-    family: args.family,
-    checkpointPath: args.checkpointPath,
-    source: args.source,
-    license: args.license,
-    modelCardName: args.modelCardName ?? null,
-  });
+  const result = await generatedCommands.importModelCheckpoint(
+    args.id,
+    args.checkpointPath,
+    args.source,
+    args.license,
+    args.modelCardName ?? null,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/**
+ * Register a complete OmniASR-7B deployment manifest as a candidate. The backend derives model,
+ * family and component identities from the verified file; renderer input cannot override them.
+ */
+export async function importModelDeployment(args: {
+  manifestPath: string;
+  expectedDeploymentSha256: string;
+  expectedModelId: string;
+  source: string;
+  license: string;
+}): Promise<ModelVersion> {
+  const result = await generatedCommands.importModelDeployment(
+    args.manifestPath,
+    args.expectedDeploymentSha256,
+    args.expectedModelId,
+    args.source,
+    args.license,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+/**
+ * One-time registration of the measured pre-flywheel OmniASR-7B incumbent. The backend accepts only
+ * the exact pinned legacy composite and only while the family has no rows; this is not a general
+ * promotion shortcut.
+ */
+export async function bootstrapLegacyChampion(args: {
+  manifestPath: string;
+  expectedDeploymentSha256: string;
+  expectedModelId: string;
+  license: string;
+}): Promise<ModelVersion> {
+  const result = await generatedCommands.bootstrapLegacyChampion(
+    args.manifestPath,
+    args.expectedDeploymentSha256,
+    args.expectedModelId,
+    args.license,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Persisted session view-state (snake_case, as serialized by the backend). */
@@ -611,7 +900,9 @@ export interface SessionState {
 
 /** Restore the last session's view-state, or null if there is no recent session. */
 export async function restoreSession(): Promise<SessionState | null> {
-  return invoke<SessionState | null>('restore_session');
+  const result = await generatedCommands.restoreSession();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Persist the current search query + sort order so they survive a restart. */
@@ -620,65 +911,33 @@ export async function saveSession(
   sortOrder: string,
   filterVerified: boolean | null = null,
 ): Promise<void> {
-  return invoke('save_session', { searchQuery, sortOrder, filterVerified });
+  const result = await generatedCommands.saveSession(searchQuery, sortOrder, filterVerified);
+  if (result.status === 'error') throw result.error;
 }
 
 /** Number of audio fingerprints stored for duplicate-import detection. */
 export async function getFingerprintCount(): Promise<number> {
-  return invoke<number>('get_fingerprint_count');
+  const result = await generatedCommands.getFingerprintCount();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Aggregate telemetry stats (snake_case, as serialized by the backend Tracer). */
-export interface TracingStats {
-  total_spans: number;
-  failures: number;
-  total_duration_ms: number;
-  avg_duration_ms: number;
+export async function getTracingStats(): Promise<TracingStatsV1> {
+  const result = await generatedCommands.getTracingStats();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-/** A single recorded operation span. */
-export interface TracingSpan {
-  operation: string;
-  start: string;
-  duration_ms: number;
-  metadata: Record<string, string>;
-  success: boolean;
-  error: string | null;
-}
-
-export async function getTracingStats(): Promise<TracingStats> {
-  return invoke<TracingStats>('get_tracing_stats');
-}
-
-export async function getRecentSpans(count?: number): Promise<TracingSpan[]> {
-  return invoke<TracingSpan[]>('get_recent_spans', { count: count ?? null });
+export async function getRecentSpans(count?: number): Promise<TracingSpanV1[]> {
+  const result = await generatedCommands.getRecentSpans(count ?? null);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function clearTracingSpans(): Promise<void> {
-  return invoke('clear_tracing_spans');
-}
-
-/**
- * Transcribe one audio clip with ElevenLabs Scribe (cloud STT). Consent-gated server-side: errors
- * unless cloud-STT opt-in is enabled. Returns the transcription text.
- */
-export async function transcribeWithScribe(
-  audioPath: string,
-  alignmentJson?: string | null,
-): Promise<string> {
-  // Pass alignmentJson so Scribe transcribes only THIS segment's clip, not the whole source file.
-  return invoke<string>('transcribe_audio_with_scribe', {
-    audioPath,
-    alignmentJson: alignmentJson ?? null,
-  });
-}
-
-/**
- * Add an independent ElevenLabs Scribe hypothesis (jury vote) for the given segments. Consent-gated
- * server-side. Skips segments that already have a Scribe vote; returns the number of votes added.
- */
-export async function addScribeVotes(ids: string[]): Promise<number> {
-  return invoke<number>('add_scribe_votes', { ids });
+  const result = await generatedCommands.clearTracingSpans();
+  if (result.status === 'error') throw result.error;
 }
 
 export async function getWaveform(
@@ -686,7 +945,7 @@ export async function getWaveform(
   numPoints: number,
   alignmentJson?: string | null,
 ): Promise<number[]> {
-  return invoke<number[]>('get_waveform', {
+  return invokeLegacy<number[]>('get_waveform', {
     path,
     numPoints,
     alignmentJson: alignmentJson ?? null,
@@ -694,7 +953,9 @@ export async function getWaveform(
 }
 
 export async function getDatasetStats(): Promise<DatasetStats> {
-  return invoke<DatasetStats>('get_dataset_stats');
+  const result = await generatedCommands.getDatasetStats();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** P3.3: which distinct source audio files are missing on disk. */
@@ -711,12 +972,12 @@ export interface RelinkResult {
 }
 
 export async function getAudioHealth(): Promise<AudioHealth> {
-  return invoke<AudioHealth>('get_audio_health');
+  return invokeCritical('get_audio_health');
 }
 
 /** P3.3: relink missing source audio by basename against a folder the owner picks. */
 export async function relinkAudio(searchDir: string): Promise<RelinkResult> {
-  return invoke<RelinkResult>('relink_audio', { searchDir });
+  return invokeCritical('relink_audio', { searchDir });
 }
 
 /** Intelligence read-side: LOOP-0 shadow precision (C5 go-live evidence) + auto-accept precision (C4). */
@@ -748,7 +1009,7 @@ export interface IntelligenceReport {
 }
 
 export async function getIntelligenceReport(): Promise<IntelligenceReport> {
-  return invoke<IntelligenceReport>('get_intelligence_report');
+  return invokeLegacy<IntelligenceReport>('get_intelligence_report');
 }
 
 /** B2: a past corruption quarantine, if any, plus how many restore snapshots exist. */
@@ -759,7 +1020,7 @@ export interface QuarantineNotice {
 }
 
 export async function getQuarantineNotice(): Promise<QuarantineNotice> {
-  return invoke<QuarantineNotice>('get_quarantine_notice');
+  return invokeCritical('get_quarantine_notice');
 }
 
 /** B2: one rotating auto-snapshot in the restore picker (newest first). */
@@ -771,17 +1032,19 @@ export interface SnapshotInfo {
 }
 
 export async function listDbSnapshots(): Promise<SnapshotInfo[]> {
-  return invoke<SnapshotInfo[]>('list_db_snapshots');
+  return invokeCritical('list_db_snapshots');
 }
 
 /** B2: restore the live database from a named auto-snapshot (destructive — confirm first). */
 export async function restoreDbFromSnapshot(name: string): Promise<void> {
-  return invoke<void>('restore_db_from_snapshot', { name });
+  return invokeCritical('restore_db_from_snapshot', { name });
 }
 
-/** Complete speaker list (not the truncated top-10 dashboard summary) for the speaker manager. */
-export async function getSpeakers(): Promise<SpeakerStat[]> {
-  return invoke<SpeakerStat[]>('get_speakers');
+/** Complete speaker inventory; SQL NULL/unassigned is distinct from every literal speaker id. */
+export async function getSpeakerInventoryV1(): Promise<SpeakerInventoryItemV1[]> {
+  const result = await generatedCommands.getSpeakerInventoryV1();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export interface DatasetQuality {
@@ -819,7 +1082,9 @@ export interface DatasetQuality {
 }
 
 export async function getDatasetQuality(): Promise<DatasetQuality> {
-  return invoke<DatasetQuality>('get_dataset_quality');
+  const result = await generatedCommands.getDatasetQuality();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -844,7 +1109,9 @@ export interface TrainingGradeBreakdown {
 }
 
 export async function getTrainingGradeBreakdown(): Promise<TrainingGradeBreakdown> {
-  const data = await invoke<TrainingGradeBreakdown>('get_training_grade_breakdown');
+  const result = await generatedCommands.getTrainingGradeBreakdown();
+  if (result.status === 'error') throw result.error;
+  const data = result.data;
   // THROW on a malformed payload, exactly like the library reads above. A caller that receives `{}`
   // and reads `.summary.trainingReadySegments` dies with a TypeError instead of showing "readiness
   // unknown" — which is what happened: the dev IPC mock has no case for this command, so it fell
@@ -864,18 +1131,204 @@ export async function getTrainingGradeBreakdown(): Promise<TrainingGradeBreakdow
   return data;
 }
 
-export async function getSettings(): Promise<AppSettings> {
-  const raw = await invoke<BackendSettings>('get_settings');
-  return mapBackendToFrontend(raw);
+interface CachedSettingsSnapshot {
+  revision: number;
+  backend: BackendSettings;
 }
 
+let cachedSettingsSnapshot: CachedSettingsSnapshot | null = null;
+
+const FRONTEND_PATCH_FIELDS = [
+  'vad_threshold',
+  'min_segment_duration_ms',
+  'max_segment_duration_ms',
+  'num_asr_threads',
+  'enable_gpu',
+  'language',
+  'export_format',
+  'auto_normalize',
+  'verbalize_numbers',
+  'auto_align',
+  'assign_speaker_from_filename',
+  'enable_diarization',
+  'enable_denoising',
+  'autoplay_segments',
+  'max_speakers',
+  'max_wer_threshold',
+  'max_cer_threshold',
+  'enforce_quality_gates',
+  'theme',
+  'llm_mode',
+  'llm_endpoint',
+  'llm_system_prompt',
+  'llm_model',
+  'external_asr_script_path',
+  'hf_train_ratio',
+  'hf_val_ratio',
+  'hf_test_ratio',
+  'hf_split_seed',
+  'hf_speaker_disjoint',
+  'hf_license',
+  'jury_model',
+  'jury_provider',
+  'jury_self_consistency_n',
+  'jury_autonomy_level',
+  'jury_t1_threshold',
+] as const satisfies readonly (keyof BackendSettings)[];
+
+function checkedSettingsSnapshot(snapshot: SettingsSnapshotV1): CachedSettingsSnapshot {
+  if (!Number.isSafeInteger(snapshot.settingsRevision) || snapshot.settingsRevision < 0) {
+    throw new Error('The generated settings contract returned an invalid revision token.');
+  }
+  return {
+    revision: snapshot.settingsRevision,
+    backend: { ...snapshot.settings },
+  };
+}
+
+async function loadSettingsSnapshotV1(): Promise<CachedSettingsSnapshot> {
+  const result = await generatedCommands.getSettingsV1();
+  if (result.status === 'error') throw result.error;
+  const snapshot = checkedSettingsSnapshot(result.data);
+  cachedSettingsSnapshot = snapshot;
+  return snapshot;
+}
+
+function cacheSettingsResult(result: SettingsPatchResultV1): CachedSettingsSnapshot {
+  const snapshot = checkedSettingsSnapshot({
+    settingsRevision: result.settingsRevision,
+    settings: result.settings,
+  });
+  cachedSettingsSnapshot = snapshot;
+  return snapshot;
+}
+
+function changedSettingsFields(
+  current: BackendSettings,
+  desired: BackendSettings,
+): SettingsPatchV1['changedFields'] {
+  const currentRecord = current as unknown as Record<string, unknown>;
+  const desiredRecord = desired as unknown as Record<string, unknown>;
+  const changed: SettingsPatchV1['changedFields'] = {};
+  for (const field of FRONTEND_PATCH_FIELDS) {
+    const value = desiredRecord[field];
+    if (Object.is(value, currentRecord[field])) continue;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      changed[field] = value;
+    }
+  }
+  return changed;
+}
+
+async function patchSettingsExact(patch: SettingsPatchV1): Promise<SettingsPatchResultV1> {
+  const invokeExact = async (): Promise<SettingsPatchResultV1> => {
+    const result = await generatedCommands.patchSettingsV1(patch);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    // `Error` means the invoke transport did not establish whether the backend committed. Replay the
+    // exact CAS payload once; the backend returns alreadyApplied only when the whole requested effect
+    // is already authoritative. Structured backend refusals are definitive and never retried.
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+async function setCloudConsentExact(
+  expectedSettingsRevision: number,
+  consent: 'llm' | 'jury',
+  granted: boolean,
+): Promise<SettingsPatchResultV1> {
+  const request = { expectedSettingsRevision, consent, granted } as const;
+  const invokeExact = async (): Promise<SettingsPatchResultV1> => {
+    const result = await generatedCommands.setCloudConsentV1(request);
+    if (result.status === 'error') throw result.error;
+    return result.data;
+  };
+  try {
+    return await invokeExact();
+  } catch (error) {
+    if (error instanceof Error) return invokeExact();
+    throw error;
+  }
+}
+
+/** A settings write failed after the renderer had optimistic state. When available, the attached
+ * snapshot is a fresh server read and is the only safe rollback target after partial/stale writes. */
+export class SettingsWriteError extends Error {
+  readonly authoritativeSettings: AppSettings | null;
+  readonly backendError: unknown;
+
+  constructor(backendError: unknown, authoritativeSettings: AppSettings | null) {
+    super('The settings change could not be confirmed.');
+    this.name = 'SettingsWriteError';
+    this.backendError = backendError;
+    this.authoritativeSettings = authoritativeSettings;
+  }
+}
+
+export function authoritativeSettingsFromWriteError(error: unknown): AppSettings | null {
+  return error instanceof SettingsWriteError ? error.authoritativeSettings : null;
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  const snapshot = await loadSettingsSnapshotV1();
+  return mapBackendToFrontend(snapshot.backend);
+}
+
+/** Persist changed settings through generated revision-guarded contracts. Secrets remain on
+ * `setApiKey`; cloud grants/withdrawals are explicit consent transactions and never enter the
+ * generic changed-field patch. The legacy whole-object command is compatibility-only. */
 export async function updateSettings(
   settings: AppSettings,
   existingBackend?: BackendSettings,
 ): Promise<void> {
-  const existing = existingBackend ?? (await invoke<BackendSettings>('get_settings'));
-  const backend = mapFrontendToBackend(settings, existing);
-  return invoke<void>('update_settings', { settings: backend });
+  let active = cachedSettingsSnapshot ?? (await loadSettingsSnapshotV1());
+  const desired = mapFrontendToBackend(settings, existingBackend ?? active.backend);
+
+  try {
+    // Withdrawals are stop instructions and therefore happen before ordinary preferences. Grants
+    // happen last so a preference-save failure can never accidentally enable cloud work.
+    for (const [consent, field] of [
+      ['llm', 'cloud_llm_opt_in'],
+      ['jury', 'jury_cloud_opt_in'],
+    ] as const) {
+      if (active.backend[field] && !desired[field]) {
+        active = cacheSettingsResult(await setCloudConsentExact(active.revision, consent, false));
+      }
+    }
+
+    const changedFields = changedSettingsFields(active.backend, desired);
+    if (Object.keys(changedFields).length > 0) {
+      active = cacheSettingsResult(
+        await patchSettingsExact({
+          expectedSettingsRevision: active.revision,
+          changedFields,
+        }),
+      );
+    }
+
+    for (const [consent, field] of [
+      ['llm', 'cloud_llm_opt_in'],
+      ['jury', 'jury_cloud_opt_in'],
+    ] as const) {
+      if (!active.backend[field] && desired[field]) {
+        active = cacheSettingsResult(await setCloudConsentExact(active.revision, consent, true));
+      }
+    }
+  } catch (error) {
+    let authoritative: AppSettings | null = null;
+    try {
+      authoritative = mapBackendToFrontend((await loadSettingsSnapshotV1()).backend);
+    } catch {
+      // Keep the original mutation failure authoritative. A failed recovery read means the UI must
+      // retain its previous confirmed state; it must never invent server truth.
+    }
+    throw new SettingsWriteError(error, authoritative);
+  }
 }
 
 export const ValidationSeverity = {
@@ -916,7 +1369,7 @@ export interface ValidationReport {
 }
 
 export async function validateDataset(): Promise<ValidationReport> {
-  return invoke<ValidationReport>('validate_dataset_cmd');
+  return invokeCritical('validate_dataset_cmd');
 }
 
 export const AudioExportFormat = {
@@ -941,74 +1394,63 @@ export async function exportAudio(
   files: string[];
   errors: string[];
 }> {
-  return invoke('export_audio', { segmentIds, options });
+  return invokeCritical('export_audio', { segmentIds, options });
 }
 
-export async function batchVerify(ids: string[], verified: boolean): Promise<{ status: string }> {
-  return invoke('batch_verify', { ids, verified });
-}
-
-export async function batchAssignSpeaker(
-  ids: string[],
-  speakerId: string,
-): Promise<{ status: string }> {
-  return invoke('batch_assign_speaker', { ids, speakerId });
+export async function assignSpeakersV1(
+  request: AssignSpeakersRequestV1,
+): Promise<AssignedSpeakersV1> {
+  const result = await generatedCommands.assignSpeakersV1(request);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function batchNormalize(ids: string[]): Promise<{ status: string }> {
-  return invoke('batch_normalize', { ids });
+  return invokeLegacy<{ status: string }>('batch_normalize', { ids });
 }
 
 export async function rediarizeSegments(ids: string[]): Promise<number> {
-  return invoke<number>('rediarize_segments', { ids });
+  return invokeLegacy<number>('rediarize_segments', { ids });
 }
 
-export async function renameSpeaker(oldId: string, newId: string): Promise<number> {
-  return invoke<number>('rename_speaker', { oldId, newId });
+export async function renameSpeakerV1(request: RenameSpeakerRequestV1): Promise<RenamedSpeakerV1> {
+  const result = await generatedCommands.renameSpeakerV1(request);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function mergeDatasetJson(
   jsonContent: string,
 ): Promise<{ created: number; updated: number }> {
-  return invoke<{ created: number; updated: number }>('merge_dataset_json', { jsonContent });
+  return invokeCritical('merge_dataset_json', { jsonContent });
 }
 
 export async function exportHuggingfaceDataset(outputDir: string): Promise<void> {
-  return invoke<void>('export_huggingface_dataset', { path: outputDir });
+  return invokeCritical('export_huggingface_dataset', { path: outputDir });
 }
 
-export async function undo(): Promise<string | null> {
-  return invoke<string | null>('undo');
+export async function undo(): Promise<HistoryMutationResultV1> {
+  const result = await generatedCommands.undo();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export async function redo(): Promise<string | null> {
-  return invoke<string | null>('redo');
+export async function redo(): Promise<HistoryMutationResultV1> {
+  const result = await generatedCommands.redo();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export async function canUndo(): Promise<boolean> {
-  return invoke<boolean>('can_undo');
+export async function getHistoryStatusV1(): Promise<HistoryStatusV1> {
+  const result = await generatedCommands.getHistoryStatusV1();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export async function canRedo(): Promise<boolean> {
-  return invoke<boolean>('can_redo');
-}
-
-export async function computeDiff(
-  raw: string,
-  annotated: string,
-): Promise<{
-  raw: string;
-  annotated: string;
-  changes: Array<{ op: string; value: string }>;
-  stats: {
-    added_words: number;
-    removed_words: number;
-    changed_words: number;
-    unchanged_words: number;
-    similarity: number;
-  };
-}> {
-  return invoke('compute_diff', { raw, annotated });
+export async function computeDiff(raw: string, annotated: string): Promise<TextDiff> {
+  const result = await generatedCommands.computeDiff(raw, annotated);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then
@@ -1017,80 +1459,58 @@ export async function computeDiff(
 export async function dbBackup(
   dest: string,
 ): Promise<{ integrityOk: boolean; segmentCount: number }> {
-  return invoke('db_backup', { dest });
+  return invokeCritical('db_backup', { dest });
 }
 
 /** Archive every quarantined `*.corrupt.*` artifact into `<data_dir>/quarantine/`, releasing the
  * snapshot prune-pin explicitly (bytes stay salvageable). Returns how many files were archived. */
 export async function acknowledgeQuarantine(): Promise<number> {
-  return invoke('acknowledge_quarantine');
+  return invokeCritical('acknowledge_quarantine');
 }
 
 /** Restore the live library from a backup .db file (the counterpart to dbBackup). Destructive — the
  *  backend PRAGMA integrity_check's the source before overwriting, so a corrupt file fails fast. */
 export async function dbRestore(src: string): Promise<void> {
-  return invoke('db_restore', { src });
+  return invokeCritical('db_restore', { src });
 }
 
 export async function dbVacuum(): Promise<void> {
-  return invoke('db_vacuum');
+  return invokeCritical('db_vacuum');
 }
 
-export async function modelsStatus(): Promise<
-  Array<{
-    name: string;
-    filename: string;
-    downloaded: boolean;
-    exists?: boolean;
-    size_bytes: number | null;
-    min_size_bytes: number;
-    source?: 'user' | 'bundled' | 'missing';
-    downloadable?: boolean;
-  }>
-> {
-  return invoke('models_status');
+export type ModelStatusEntry = ModelStatusEntryV1;
+
+export async function modelsStatus(): Promise<ModelStatusEntry[]> {
+  const result = await generatedCommands.modelsStatus();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export async function modelsDownloadAll(): Promise<{
-  downloaded: number;
-  failed: number;
-  total: number;
-  skipped: number;
-}> {
-  return invoke('models_download_all');
+export type ModelDownloadSummary = ModelDownloadSummaryV1;
+
+export async function modelsDownloadAll(): Promise<ModelDownloadSummary> {
+  const result = await generatedCommands.modelsDownloadAll();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export async function getInferenceStats(): Promise<{
-  vad: { calls: number; failures: number; p50_ms: number; p99_ms: number };
-  asr: { calls: number; failures: number; p50_ms: number; p99_ms: number };
-  model_load_ms: number;
-}> {
-  return invoke('get_inference_stats');
+export async function getInferenceStats(): Promise<InferenceStatsV1> {
+  const result = await generatedCommands.getInferenceStats();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
-export interface AppHealth {
-  status: string;
-  db_size: number;
-  uptime: number;
-  segment_count: number;
-  memory_mb: number;
-  missing_models: string[];
-  missing_optional_models?: string[];
-  /** Epoch seconds of the last successful auto-snapshot, or 0 if none yet this session. */
-  snapshot_last_success_epoch_secs?: number;
-  /** Consecutive auto-snapshot failures — a rising streak means the safety net is silently down. */
-  snapshot_consecutive_failures?: number;
-  /** Free bytes on the volume holding the data dir, or null when it couldn't be determined. */
-  free_disk_bytes?: number | null;
-}
-
-export async function appHealth(): Promise<AppHealth> {
-  return invoke('app_health');
+export async function appHealth(): Promise<AppHealthV1> {
+  const result = await generatedCommands.appHealth();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** One-line summary of the previous session's crash (surfaced once), or null if it exited cleanly. */
 export async function takeLastCrash(): Promise<string | null> {
-  return invoke('take_last_crash');
+  const result = await generatedCommands.takeLastCrash();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export interface AgenticReadinessCheck {
@@ -1110,7 +1530,7 @@ export interface AgenticReadiness {
 }
 
 export async function checkAgenticReadiness(): Promise<AgenticReadiness> {
-  return invoke<AgenticReadiness>('check_agentic_readiness');
+  return invokeLegacy<AgenticReadiness>('check_agentic_readiness');
 }
 
 export interface WslRefinementOptions {
@@ -1121,7 +1541,7 @@ export interface WslRefinementOptions {
 }
 
 export async function runWslRefinement(options: WslRefinementOptions): Promise<{ status: string }> {
-  return invoke('run_wsl_refinement', {
+  return invokeLegacy<{ status: string }>('run_wsl_refinement', {
     limitFiles: options.limit_files ?? null,
     limitSegments: options.limit_segments ?? null,
     dryRun: options.dry_run,
@@ -1130,7 +1550,8 @@ export async function runWslRefinement(options: WslRefinementOptions): Promise<{
 }
 
 export async function cancelWslRefinement(): Promise<void> {
-  return invoke('cancel_wsl_refinement');
+  const result = await generatedCommands.cancelWslRefinement();
+  if (result.status === 'error') throw result.error;
 }
 
 export interface ConformalCertificate {
@@ -1156,11 +1577,13 @@ export async function getDatasetCertificate(
   targetError: number,
   confidenceLevel: number,
 ): Promise<ConformalCertificate> {
-  return invoke<ConformalCertificate>('get_dataset_certificate', { targetError, confidenceLevel });
+  const result = await generatedCommands.getDatasetCertificate(targetError, confidenceLevel);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function computeSignalAnomalyScores(): Promise<number> {
-  return invoke<number>('compute_signal_anomaly_scores');
+  return invokeLegacy<number>('compute_signal_anomaly_scores');
 }
 
 export async function getActiveLearningQueue(
@@ -1168,7 +1591,7 @@ export async function getActiveLearningQueue(
   confidenceLevel: number,
   limit: number,
 ): Promise<SpeechSegment[]> {
-  return invoke<SpeechSegment[]>('get_active_learning_queue', {
+  return invokeLegacy<SpeechSegment[]>('get_active_learning_queue', {
     targetError,
     confidenceLevel,
     limit,
@@ -1179,19 +1602,14 @@ export async function getActiveLearningQueue(
 
 import type { EvalRun, EvalRunResult, EscalationTrendPoint, LabelQualityLift } from './types';
 
-/** The honest-CER entrypoint: runs the real ASR over the gold set (no caller-supplied hypotheses). */
-export async function runGoldEvalAsr(modelId?: string | null): Promise<EvalRunResult> {
-  return invoke<EvalRunResult>('run_gold_eval_asr', { modelId: modelId ?? null });
-}
-
-/** Run the gold eval against the local pipeline for a specific model id. */
-export async function runGoldEvalLocal(modelId: string): Promise<EvalRunResult> {
-  return invoke<EvalRunResult>('run_gold_eval_local', { modelId });
+/** Run the real pinned champion over the gold set; the renderer cannot supply a model label. */
+export async function runGoldEvalAsr(): Promise<EvalRunResult> {
+  return invokeLegacy<EvalRunResult>('run_gold_eval_asr');
 }
 
 /** Create gold-eval segments from a verified file. Returns the number created. */
 export async function createGoldFromFile(audioPath: string): Promise<number> {
-  return invoke<number>('create_gold_from_file', { audioPath });
+  return invokeCritical('create_gold_from_file', { audioPath });
 }
 
 /** M2.7 / P1.6: summary of an export_gold_eval_set run. */
@@ -1204,12 +1622,12 @@ export interface GoldEvalExport {
 
 /** M2.7 / P1.6: bulk-promote every reviewed source file into the gold set; returns rows created. */
 export async function importVerifiedSegmentsAsGold(): Promise<number> {
-  return invoke<number>('import_verified_segments_as_gold');
+  return invokeCritical('import_verified_segments_as_gold');
 }
 
 /** M2.7 / P1.6: export the gold set (manifest.jsonl + 16 kHz WAV clips) under outDir. */
 export async function exportGoldEvalSet(outDir: string): Promise<GoldEvalExport> {
-  return invoke<GoldEvalExport>('export_gold_eval_set', { outDir });
+  return invokeCritical('export_gold_eval_set', { outDir });
 }
 
 /** M5.1 / P5.1: summary of an export_finetune_pack run. */
@@ -1227,18 +1645,14 @@ export interface FinetunePackResult {
 
 /** M5.1 / P5.1: export a fine-tune training pack from verified segments (holdout-excluded) under outDir. */
 export async function exportFinetunePack(outDir: string): Promise<FinetunePackResult> {
-  return invoke<FinetunePackResult>('export_finetune_pack', { outDir });
-}
-
-/** P3.4: on-demand full-SHA integrity check of the bundled fine-tuned model + vocab. Resolves to a
- *  "verified: <path>" message; rejects with a mismatch message if the model is corrupt/replaced. */
-export async function verifyFinetunedModelIntegrity(): Promise<string> {
-  return invoke<string>('verify_finetuned_model_integrity');
+  return invokeCritical('export_finetune_pack', { outDir });
 }
 
 /** P0.2: the git SHA the running binary was built from (baked at build time). Used for build-info display. */
 export async function appGitSha(): Promise<string> {
-  return invoke<string>('app_git_sha');
+  const result = await generatedCommands.appGitSha();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** A reproducible scorecard built from already-computed gold-eval results. */
@@ -1252,71 +1666,128 @@ export async function buildScorecard(
   system: EvalRunResult,
   baseline?: EvalRunResult | null,
 ): Promise<ScorecardResponse> {
-  return invoke<ScorecardResponse>('build_scorecard', { system, baseline: baseline ?? null });
+  return invokeLegacy<ScorecardResponse>('build_scorecard', { system, baseline: baseline ?? null });
 }
 
 export async function listEvalRuns(): Promise<EvalRun[]> {
-  return invoke<EvalRun[]>('list_eval_runs');
+  return invokeLegacy<EvalRun[]>('list_eval_runs');
 }
 
 export async function getLabelQualityLift(): Promise<LabelQualityLift> {
-  return invoke<LabelQualityLift>('get_label_quality_lift');
+  const result = await generatedCommands.getLabelQualityLift();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 // ── Phase 2 — T0 Gate + Jury ───────────────────────────────────────────────
 
 export async function getEscalationQueue(limit: number): Promise<SpeechSegment[]> {
-  return invoke<SpeechSegment[]>('get_escalation_queue', { limit });
+  return invokeLegacy<SpeechSegment[]>('get_escalation_queue', { limit });
 }
+
+/** Cumulative canonical MEDIA time the authorized renderer reported traversing for one clip revision.
+ *
+ * Not wall-clock, not a `play()` call, not a download, and not proof of human attention or
+ * comprehension. The backend binds the receipt to the segment, revision, exact source span, and
+ * decoded-PCM content hash, so it cannot be replayed against a different clip or survive the audio
+ * changing.
+ */
+export async function recordPlaybackReceipt(args: {
+  playbackReceiptId: string;
+  mediaGrantId: string;
+  intervals: readonly PlaybackIntervalV1[];
+}): Promise<DesktopPlaybackReceiptV1> {
+  // Policy 4 accepts no scalar duration claim. The backend checks this exact canonical interval
+  // union against its short-lived media-grant session and server elapsed time, stores every interval,
+  // and returns the immutable receipt identity consumed by commitReviewV1.
+  const intervals = args.intervals.map((interval) => ({
+    startMs: Math.max(0, Math.round(interval.startMs)),
+    endMs: Math.max(0, Math.round(interval.endMs)),
+  }));
+  const result = await generatedCommands.finalizeDesktopPlaybackSessionV1(
+    args.playbackReceiptId,
+    args.mediaGrantId,
+    intervals,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
+}
+
+export interface HumanDecisionCommit {
+  effectEventId: number;
+  segmentId: string;
+  effectiveAction: 'accept' | 'edit' | 'reject';
+  priorRevision: number;
+  decidedRevision: number;
+  segment: SpeechSegment;
+}
+
+export type HumanDecisionUndoOutcome =
+  | { status: 'applied'; restoredRevision: number; segment: SpeechSegment }
+  | { status: 'alreadyApplied'; restoredRevision: number; segment: SpeechSegment }
+  | { status: 'conflict'; segment: SpeechSegment };
 
 export async function recordHumanDecision(
+  _segmentId: string,
+  _decision: 'accept' | 'edit' | 'reject',
+  _correctedTranscript?: string | null,
+  _timestampMs: number = Date.now(),
+): Promise<HumanDecisionCommit> {
+  throw {
+    schema: 1,
+    code: 'TYPED_REVIEW_REQUIRED',
+    message: 'This legacy review writer is retired. Reload the review workstation and try again.',
+    retryable: false,
+    suggestedAction: 'reloadClip',
+    operationId: null,
+  } satisfies CommandErrorV1;
+}
+
+/** Exact server-owned inverse of one committed human decision. */
+export async function undoHumanDecision(
+  effectEventId: number,
+  operationId: string,
+): Promise<HumanDecisionUndoOutcome> {
+  return invokeCritical('undo_human_decision', { effectEventId, operationId });
+}
+
+export interface HumanFlagCommit {
+  effectEventId: number;
+  segmentId: string;
+  priorRevision: number;
+  flagRevision: number;
+  segment: SpeechSegment;
+}
+
+export type HumanFlagUndoOutcome =
+  | { status: 'applied'; restoredRevision: number; segment: SpeechSegment }
+  | { status: 'alreadyApplied'; segment: SpeechSegment }
+  | { status: 'conflict'; segment: SpeechSegment };
+
+/** Atomically flag one undecided row and retain a database-owned exact inverse. */
+export async function recordReviewFlag(
   segmentId: string,
-  decision: 'accept' | 'edit' | 'reject',
-  correctedTranscript?: string | null,
-  timestampMs: number = Date.now(),
-): Promise<void> {
-  // M2.1 / P1.1: send the decision timestamp so decision_log is actually populated (it was dead
-  // before — the backend only inserts `if let Some(ts_ms)`, and this wrapper never passed one).
-  return invoke<void>('record_human_decision', {
-    segmentId,
-    decision,
-    correctedTranscript: correctedTranscript ?? null,
-    timestampMs,
-  });
+  rationale: string,
+): Promise<HumanFlagCommit> {
+  const operationId = crypto.randomUUID();
+  const args = { segmentId, rationale, operationId };
+  try {
+    return await invokeCritical('record_review_flag', args);
+  } catch {
+    return invokeCritical('record_review_flag', args);
+  }
 }
 
-/** P3-3: Revert a segment to unreviewed state. Use this for undo instead of re-recording a decision. */
-export async function clearHumanDecision(segmentId: string): Promise<void> {
-  return invoke<void>('clear_human_decision', { segmentId });
-}
-
-/** Undo a review-inbox flag(): clear the escalation it set (inverse of flag, unlike clearHumanDecision). */
-export async function clearEscalation(segmentId: string): Promise<void> {
-  return invoke<void>('clear_escalation', { segmentId });
-}
-
-export async function writeSegmentVerdict(
-  segmentId: string,
-  verdict: string,
-  transcript?: string | null,
-  rationale?: string | null,
-  evidenceJson?: string | null,
-  agreementScore?: number | null,
-  escalated?: boolean,
-): Promise<void> {
-  return invoke<void>('write_segment_verdict', {
-    segmentId,
-    verdict,
-    transcript: transcript ?? null,
-    rationale: rationale ?? null,
-    evidenceJson: evidenceJson ?? null,
-    agreementScore: agreementScore ?? null,
-    escalated: escalated ?? false,
-  });
+/** Exact server-owned inverse of one committed review flag. */
+export async function undoReviewFlag(
+  effectEventId: number,
+  operationId: string,
+): Promise<HumanFlagUndoOutcome> {
+  return invokeCritical('undo_review_flag', { effectEventId, operationId });
 }
 
 export async function getEscalationRateTrend(): Promise<EscalationTrendPoint[]> {
-  return invoke<EscalationTrendPoint[]>('get_escalation_rate_trend');
+  return invokeLegacy<EscalationTrendPoint[]>('get_escalation_rate_trend');
 }
 
 // ── Jury Pipeline (Items 1 & 2) ───────────────────────────────────────────────
@@ -1332,7 +1803,7 @@ export interface JuryPipelineReport {
 
 /** Run the full T0→T1→T2 cascade on a batch of segment IDs. */
 export async function runJuryPipeline(segmentIds: string[]): Promise<JuryPipelineReport> {
-  return invoke<JuryPipelineReport>('run_jury_pipeline', { segmentIds });
+  return invokeLegacy<JuryPipelineReport>('run_jury_pipeline', { segmentIds });
 }
 
 export interface T2Verdict {
@@ -1352,5 +1823,5 @@ export interface T2Result {
 
 /** Run Gemini audio T2 judge directly on a single segment. */
 export async function runT2ForSegment(segmentId: string, apiKey: string): Promise<T2Result> {
-  return invoke<T2Result>('run_t2_for_segment', { segmentId, apiKey });
+  return invokeLegacy<T2Result>('run_t2_for_segment', { segmentId, apiKey });
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { beforeEach, describe, it, expect } from 'vitest';
 import {
   parseSourceMeta,
   parseWordTimestamps,
@@ -9,6 +9,9 @@ import {
 } from '../../src/lib/alignment';
 import type { WordTimestamp } from '../../src/lib/types';
 import { isModelError, parseActionableError } from '../../src/lib/errors';
+import { locale } from '../../src/lib/i18n';
+
+beforeEach(() => locale.set('en'));
 
 const sampleWords: WordTimestamp[] = [
   { word: 'hello', start: 0, end: 0.4, confidence: 0.95 },
@@ -39,12 +42,14 @@ describe('alignment helpers', () => {
   });
 
   it('parses source metadata', () => {
-    const meta = parseSourceMeta(JSON.stringify({
-      source_start_ms: 1000,
-      source_end_ms: 4000,
-      chunk_index: 0,
-      chunk_count: 2,
-    }));
+    const meta = parseSourceMeta(
+      JSON.stringify({
+        source_start_ms: 1000,
+        source_end_ms: 4000,
+        chunk_index: 0,
+        chunk_count: 2,
+      }),
+    );
     expect(meta?.sourceStartMs).toBe(1000);
     expect(meta?.chunkCount).toBe(2);
   });
@@ -67,16 +72,16 @@ describe('alignment helpers', () => {
 
   it('fails closed on malformed, non-finite, or out-of-order timing data', () => {
     expect(parseWordTimestamps('[{"word":"x","start":2,"end":1,"confidence":0.9}]')).toEqual([]);
-    expect(
-      parseWordTimestamps('[{"word":"x","start":0,"end":1,"confidence":2}]'),
-    ).toEqual([]);
+    expect(parseWordTimestamps('[{"word":"x","start":0,"end":1,"confidence":2}]')).toEqual([]);
     expect(
       parseWordTimestamps(
         '[{"word":"a","start":1,"end":2,"confidence":0.9},{"word":"b","start":0,"end":1,"confidence":0.8}]',
       ),
     ).toEqual([]);
     expect(
-      parseSourceMeta('{"source_start_ms":5000,"source_end_ms":1000,"chunk_index":2,"chunk_count":2}'),
+      parseSourceMeta(
+        '{"source_start_ms":5000,"source_end_ms":1000,"chunk_index":2,"chunk_count":2}',
+      ),
     ).toBeNull();
   });
 
@@ -99,7 +104,9 @@ describe('alignment helpers', () => {
   });
 
   it('mergeWordTimestamps ignores invalid existing JSON', () => {
-    const merged = JSON.parse(mergeWordTimestamps('[1,2]', sampleWords)) as { words: WordTimestamp[] };
+    const merged = JSON.parse(mergeWordTimestamps('[1,2]', sampleWords)) as {
+      words: WordTimestamp[];
+    };
     expect(merged.words).toEqual(sampleWords);
   });
 });
@@ -111,9 +118,12 @@ describe('errors', () => {
   });
 
   it('returns actionable model error guidance', () => {
-    const parsed = parseActionableError(new Error('Model not found at /models: Missing models: foo'));
+    const parsed = parseActionableError(
+      new Error('Model not found at /models: Missing models: foo'),
+    );
     expect(parsed.action).toBeDefined();
     expect(parsed.action?.handler).toBeTypeOf('function');
-    expect(parsed.detail).toContain('Missing models');
+    expect(parsed.message).toContain('models are missing');
+    expect(parsed.detail).toBeUndefined();
   });
 });

@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+from _pipeline_policy_util import pipeline_surface as shipped_pipeline_surface
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # Week-4 decomposes commands.rs into slices under src/commands/. Every command-CONTENT check here
@@ -20,6 +22,17 @@ def command_surface() -> str:
     return text
 
 
+def recovery_surface() -> str:
+    """The Tauri-free recovery module owns restore admission and typed state publication."""
+    path = REPO_ROOT / "src-tauri" / "src" / "recovery.rs"
+    text = path.read_text(encoding="utf-8")
+    if "install_snapshot_restore_plan" not in text:
+        raise AssertionError(
+            "recovery.rs missing typed snapshot restore-plan installation — this gate would pass vacuously"
+        )
+    return text
+
+
 from _policy_util import strip_comments  # noqa: E402
 
 
@@ -28,20 +41,24 @@ def db_surface() -> str:
     db.rs under the size target, so both the production checks AND the test-name assertions below must
     scan the whole db module, or a moved test would read as "missing" and a forbidden pattern could hide
     in the test file."""
-    parts = [(REPO_ROOT / "src-tauri" / "src" / "db.rs").read_text(encoding="utf-8")]
+    db_root = REPO_ROOT / "src-tauri" / "src"
+    parts = [(db_root / "db.rs").read_text(encoding="utf-8")]
+    db_modules = db_root / "db"
+    if not db_modules.is_dir():
+        raise AssertionError("db module directory is missing — this gate would pass vacuously")
+    parts += [path.read_text(encoding="utf-8") for path in sorted(db_modules.rglob("*.rs"))]
     db_tests = REPO_ROOT / "src-tauri" / "src" / "db_tests.rs"
     if db_tests.is_file():
         parts.append(db_tests.read_text(encoding="utf-8"))
     text = "\n".join(parts)
-    if "impl Database" not in text:
+    if "impl Database" not in text or "pub fn record_review_event(" not in text:
         raise AssertionError("db.rs surface missing `impl Database` — this gate would pass vacuously")
     return text
 
 
 def pipeline_surface() -> str:
-    """pipeline.rs PLUS pipeline_tests.rs — the test module was split out via #[path], so both the
-    production checks AND the test-name assertions below must scan the whole pipeline module."""
-    parts = [(REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")]
+    """The shipped decomposed pipeline surface plus its #[path] regression module."""
+    parts = [shipped_pipeline_surface(REPO_ROOT / "src-tauri" / "src")]
     pt = REPO_ROOT / "src-tauri" / "src" / "pipeline_tests.rs"
     if pt.is_file():
         parts.append(pt.read_text(encoding="utf-8"))
@@ -287,9 +304,12 @@ def test_wsl_refinement_batch_is_panic_safe_and_cancellable() -> None:
         # flag is passed to it.)
         "run_wsl_segment_transcript_with_script(",
         "Some(&WSL_REFINE_CANCEL)",
-        # Transcript + sole champion hypothesis share the human-decision-safe atomic commit, so the
-        # batch can neither clobber reviewed text nor leave provenance half-written.
-        "db.commit_champion_transcript_if_unreviewed(",
+        # Transcript + sole champion hypothesis share the human-decision-safe, source-bound atomic
+        # commit, so the batch can neither clobber reviewed text, publish against replaced audio,
+        # nor leave provenance half-written.
+        "db.commit_bound_champion_transcript_if_unreviewed(",
+        "&source_snapshot",
+        "verify_current_source_lease(",
         'Some("external_provider")',
         "crate::pipeline::CHAMPION_MODEL_ID.to_string()",
     ]
@@ -572,16 +592,23 @@ def test_instance_lock_cleanup_reports_failures() -> None:
     forbidden = [
         "let _ = std::fs::remove_file(&lock_path);",
         "let _ = std::fs::remove_file(&self.path);",
+        # ONLY THE HOLDER MAY UNLINK. The Unix refusal branch used to delete the file it had just
+        # failed to flock — the LIVE holder's own lockfile — so the next launch created a fresh inode,
+        # locked that instead, and two processes ran on one SQLite database. Deleting on refusal is
+        # the defect; this pin used to REQUIRE the very call it now forbids.
+        'remove_lock_file(&lock_path, "failed Unix instance lock acquisition");',
     ]
     present = [pattern for pattern in forbidden if pattern in flock]
     if present:
         formatted = "\n".join(f"- {entry}" for entry in present)
-        raise AssertionError(f"flock.rs silently discards instance lock cleanup failures:\n{formatted}")
+        raise AssertionError(
+            "flock.rs mishandles the instance lockfile — a silently discarded cleanup failure, or a "
+            f"REFUSED instance deleting the live holder's lockfile:\n{formatted}"
+        )
 
     required = [
         "fn remove_lock_file(path: &Path, context: &str)",
         'remove_lock_file(&lock_path, "stale Windows instance lock");',
-        'remove_lock_file(&lock_path, "failed Unix instance lock acquisition");',
         'remove_lock_file(&PathBuf::from(&self.path), "released instance lock");',
         "Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}",
         'tracing::warn!("Failed to remove {context} file {}: {error}", path.display()),',
@@ -596,12 +623,9 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
     commands = command_surface()
     required = [
         'tracing::error!("Batch transcribe DB prefetch failed: {error}")',
-        'let segments = db.get_segments_by_ids(&ids).map_err(|e| e.to_string())?;',
-        'tracing::error!("Batch verify DB update failed for {id}: {error}")',
-        'tracing::error!("Batch speaker assignment DB update failed for {id}: {error}")',
         '.get_segments_by_ids(&segment_ids)\n        .map_err(|e| e.to_string())?',
         'let persisted = db.get_hypotheses_for_segment(seg_id).map_err(|e| e.to_string())?;',
-        'let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted);',
+        'let mut hyps = hypotheses_for_selected_asr(&settings.asr_model_size, seg, persisted, recorded_is_champion);',
         'let few_shots = crate::jury::get_few_shot_examples(db, seg_id, 5).map_err(|e| e.to_string())?;',
         'let few_shots = crate::jury::get_few_shot_examples(&db, &segment_id, 5).map_err(|e| e.to_string())?;',
     ]
@@ -609,6 +633,27 @@ def test_commands_do_not_silently_default_critical_db_failures() -> None:
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"commands.rs is missing explicit DB failure handling:\n{formatted}")
+    if 'Batch speaker assignment DB update failed for {id}: {error}' in commands:
+        raise AssertionError(
+            "the retired per-row batch speaker assignment failure path must not remain in the command surface"
+        )
+
+    segment_store = (REPO_ROOT / "src-tauri" / "src" / "stores" / "segment_write.rs").read_text(encoding="utf-8")
+    store_required = [
+        "let segments = database.get_segments_by_ids(ids).map_err(SegmentDeleteError::from)?;",
+        "database.delete_segments_batch(ids).map_err(SegmentDeleteError::from)?;",
+        "impl From<AppError> for SegmentDeleteError",
+        "AppError::Validation(_) => Self::Invalid",
+        "AppError::Database(rusqlite::Error::SqliteFailure(code, _))",
+        "rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked",
+        "database.assign_speaker_batch_atomic(ids, target_speaker_id).map_err(SpeakerAssignmentError::from)?;",
+    ]
+    store_missing = [pattern for pattern in store_required if pattern not in segment_store]
+    if store_missing:
+        formatted = "\n".join(f"- {entry}" for entry in store_missing)
+        raise AssertionError(f"segment_write.rs is missing explicit batch-delete DB failure propagation:\n{formatted}")
+    if "unwrap_or_default" in segment_store:
+        raise AssertionError("segment_write.rs must not silently default batch-delete DB failures")
 
 
 def test_commands_batch_transcribe_reports_insert_failures() -> None:
@@ -811,17 +856,24 @@ def test_alignment_json_and_quality_are_written_as_one_atomic_statement() -> Non
         raise AssertionError(f"commands.rs must keep observable CAS-protected atomic alignment persistence:\n{formatted}")
 
     required_pipeline = [
-        "if let Err(error) = db.update_segment_alignment(",
+        "match import_writes.update_alignment_if_unchanged(",
+        "source_alignment.as_deref(),",
+        "Ok(false) => {",
+        "canonical alignment changed during inference",
         'tracing::warn!("background alignment: persist failed for {seg_id}: {error}");',
     ]
     missing = [pattern for pattern in required_pipeline if pattern not in pipeline]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"pipeline.rs background aligner must report atomic alignment persist failures:\n{formatted}")
+        raise AssertionError(
+            "pipeline.rs background aligner must keep observable, serialized CAS-protected "
+            f"alignment persistence:\n{formatted}"
+        )
 
 
 def test_media_cache_cleanup_reports_failures() -> None:
     media = (REPO_ROOT / "src-tauri/src/media.rs").read_text(encoding="utf-8")
+    infra = (REPO_ROOT / "src-tauri/src/commands/infra.rs").read_text(encoding="utf-8")
     forbidden = [
         "let _ = std::fs::remove_file(record.cached_path);",
     ]
@@ -832,8 +884,9 @@ def test_media_cache_cleanup_reports_failures() -> None:
 
     required = [
         "fn remove_cached_media_file(path: &Path, context: &str)",
-        'remove_cached_media_file(&record.cached_path, "stale grant");',
-        'remove_cached_media_file(&record.cached_path, "expired grant");',
+        "pub(crate) fn cleanup_retired_media_artifacts(",
+        "self.retired_artifacts.push(RetiredMediaArtifact::from_grant(record));",
+        "remove_cached_media_file(&cached_path, context);",
         "Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}",
         'tracing::warn!("Failed to remove {context} cached media file {}: {error}", path.display()),',
     ]
@@ -841,6 +894,10 @@ def test_media_cache_cleanup_reports_failures() -> None:
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
         raise AssertionError(f"media.rs must keep observable cached media cleanup handling:\n{formatted}")
+    if 'cleanup_retired_media_artifacts(retired, "expired media grant")' not in infra:
+        raise AssertionError(
+            "media resolution must drain expired artifacts after releasing the registry mutex"
+        )
 
 
 def test_jury_db_and_export_paths_do_not_silently_drop_errors() -> None:
@@ -888,13 +945,23 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
     db = db_surface()
     required = [
         "pub fn get_segments_by_ids(&self, ids: &[String]) -> AppResult<Vec<SpeechSegment>>",
-        "pub fn get_escalation_queue(&self, limit: usize) -> AppResult<Vec<SpeechSegment>>",
+        # The signature grew a focus parameter (review 2026-08-20: the Inbox is a serving path, so the
+        # voice focus governs it). This pin is about error PROPAGATION, so it anchors the return type
+        # and the collect below, not the argument list that a policy change may legitimately widen.
+        "pub fn get_escalation_queue(",
+        "focus: Option<&std::collections::HashSet<String>>,",
         "Ok(rows.collect::<Result<Vec<_>, _>>()?)",
         "fn human_verdict_for_decision(decision: &str) -> AppResult<&'static str>",
         "fn rejected_transcript_for_learning(corrected: &str, candidates: &[Option<String>]) -> Option<String>",
-        "SELECT COALESCE(is_gold, 0), raw_transcript, normalized_transcript, annotated_transcript,\n                        verdict_transcript",
-        "verdict_transcript.clone(),",
-        "Some(raw_transcript.clone()),",
+        # v60 widened the authority from a hand-mapped decision tuple to the complete SpeechSegment,
+        # revision and canonical PCM hash in one statement.  `map_row` and both `row.get` calls must
+        # retain `?`, or a malformed database row could be silently treated as absent/defaulted.
+        "fn decision_snapshot_on(",
+        ") -> AppResult<Option<(SpeechSegment, i64, Option<String>)>>",
+        "Ok(Some((Self::map_row(row)?, row.get(37)?, row.get(38)?)))",
+        "let Some((prior, prior_revision, stored_content_hash)) = Self::decision_snapshot_on(&tx, segment_id)?",
+        "prior.verdict_transcript.clone(),",
+        "Some(prior.raw_transcript.clone()),",
     ]
     missing = [pattern for pattern in required if pattern not in db]
     if missing:
@@ -902,7 +969,7 @@ def test_database_read_paths_do_not_silently_drop_rows() -> None:
         raise AssertionError(f"db.rs is missing explicit DB read error propagation:\n{formatted}")
     if db.count("Ok(rows.collect::<Result<Vec<_>, _>>()?)") < 2:
         raise AssertionError("db.rs must propagate row-mapping errors from batch segment and escalation reads")
-    if "): HumanDecisionContext =" not in db:
+    if "Self::decision_snapshot_on(&tx, segment_id)?" not in db:
         raise AssertionError("Database::record_human_decision must read a full segment snapshot before updating it")
     if "human_edit_learning_uses_agent_proposal_before_raw_asr" not in db:
         raise AssertionError("Database::record_human_decision needs a regression for agent proposal learning examples")
@@ -1154,39 +1221,62 @@ def test_wsl_import_pass_does_not_roll_back_the_file_on_a_benign_empty_result() 
         )
 
 
-def test_probe_wsl_7b_server_reaps_child_on_wait_error() -> None:
-    """probe_wsl_7b_server polls child.try_wait() in a loop; on a wait-status error its Err arm must
-    reap the child (kill_and_reap_wsl_child) before returning false — exactly like the sibling
-    try_wait loops (run_wsl_segment_transcript and the 7B preflight probe both reap on their Err
-    arm). std::process::Child does NOT kill/reap on drop, so a bare `return false` on the Err arm
-    leaks a WSL process on every failed status poll, and this probe is called on a poll.
-    Regression guard: iter-65."""
-    pipeline = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
-    marker = "fn probe_wsl_7b_server(timeout_secs: u64) -> bool {"
-    start = pipeline.find(marker)
-    if start == -1:
-        raise AssertionError("probe_wsl_7b_server not found — this gate would pass vacuously")
-    # Scope the check to this function body: slice to the start of the next free function.
-    rest = pipeline[start + len(marker):]
-    end = rest.find("\nfn ")
-    next_pub = rest.find("\npub(crate) fn ")
-    if next_pub != -1 and (end == -1 or next_pub < end):
-        end = next_pub
-    body = rest if end == -1 else rest[:end]
+def test_wsl_try_wait_loops_always_reap_the_child() -> None:
+    """A try_wait loop must never return without reaping. `std::process::Child` does NOT kill/reap on
+    drop, so a bare return on the Err arm leaks a WSL process on every failed status poll — and these
+    loops run on a poll.
 
-    # Forbidden: a try_wait Err arm that returns without reaping.
-    if "Err(_) => return false" in body:
+    Was scoped to `probe_wsl_7b_server`, which the exact-identity health check replaced. The guarantee
+    did not go away, it moved and split, so this guards BOTH surviving loops:
+
+      * `pipeline.rs` — the WSL transcript loop, which still reaps through `kill_and_reap_wsl_child`
+        on cancel, timeout and failure;
+      * `engine_runtime.rs::terminate_and_reap` — closes the Windows Job Object (the tree-kill), then
+        BREAKS out of every not-yet-exited arm into an UNCONDITIONAL kill + wait. That is the same
+        guarantee made structural: one exit path instead of two call sites that can drift apart.
+
+    Regression guard: iter-65; re-pointed 2026-08-18 when the probe was replaced.
+    """
+    pipeline = pipeline_surface()
+    if "fn kill_and_reap_wsl_child(" not in pipeline:
+        raise AssertionError("kill_and_reap_wsl_child not found — this gate would pass vacuously")
+    reaps = pipeline.count("kill_and_reap_wsl_child(&mut child,")
+    if reaps < 3:
         raise AssertionError(
-            "probe_wsl_7b_server's try_wait Err arm returns false without reaping the child — it "
-            "leaks a WSL process on every failed status poll. Reap via kill_and_reap_wsl_child like "
-            "the sibling loops."
+            "the WSL transcript loop must reap on cancel, timeout AND failure "
+            f"(found {reaps} reap call(s); expected >= 3)"
         )
-    # Required: reap on BOTH the deadline branch AND the try_wait Err branch.
-    reaps = body.count('kill_and_reap_wsl_child(&mut child, "engine-status probe");')
-    if reaps < 2:
+    if "Err(_) => return false" in pipeline:
         raise AssertionError(
-            "probe_wsl_7b_server must reap the child on both the timeout branch and the try_wait Err "
-            f"branch (found {reaps} reap call(s); expected >= 2)"
+            "a try_wait Err arm in pipeline.rs returns without reaping the child — it leaks a WSL "
+            "process on every failed status poll. Reap via kill_and_reap_wsl_child."
+        )
+
+    runtime = (REPO_ROOT / "src-tauri" / "src" / "engine_runtime.rs").read_text(encoding="utf-8")
+    marker = "fn terminate_and_reap(&mut self) {"
+    start = runtime.find(marker)
+    if start == -1:
+        raise AssertionError("terminate_and_reap not found — this gate would pass vacuously")
+    rest = runtime[start + len(marker) :]
+    candidates = [offset for offset in (rest.find("\n    fn "), rest.find("\n}")) if offset != -1]
+    body = rest[: min(candidates)] if candidates else rest
+
+    if "try_wait()" not in body:
+        raise AssertionError("terminate_and_reap no longer polls try_wait — re-point this gate")
+    if re.search(r"Err\(_\)\s*=>\s*return", body):
+        raise AssertionError(
+            "terminate_and_reap's try_wait Err arm returns without reaping — it must fall through to "
+            "the unconditional kill + wait below the loop"
+        )
+    if "Ok(None) | Err(_) => break" not in body:
+        raise AssertionError(
+            "terminate_and_reap must BREAK out of both the deadline and the try_wait Err arm so every "
+            "not-yet-exited path reaches the unconditional reap"
+        )
+    if "self.child.kill()" not in body or "self.child.wait()" not in body:
+        raise AssertionError(
+            "terminate_and_reap must end in an unconditional kill + wait; without it a launcher that "
+            "never reports exit is leaked"
         )
 
 
@@ -1284,14 +1374,29 @@ def test_save_session_is_rate_limited() -> None:
     rest = infra[start:]
     nxt = rest.find("#[tauri::command]")
     body = rest if nxt == -1 else rest[:nxt]
-    # A STRICT_RATE_LIMITER.check("save_session") superstring would satisfy this too (either limiter is
-    # acceptable throttling); the substring match accepts both.
-    if 'RATE_LIMITER.check("save_session")' not in body:
+    # rustfmt is free to place the receiver and method call on separate lines. Match the actual call
+    # expression rather than one incidental layout; a comment containing the old single-line spelling
+    # must not satisfy the gate. STRICT_RATE_LIMITER is also acceptable throttling.
+    code_without_line_comments = re.sub(r"//[^\n]*", "", body)
+    limiter_call = re.compile(
+        r"\b(?:STRICT_)?RATE_LIMITER\s*\.\s*check\s*\(\s*\"save_session\"\s*\)"
+    )
+    if limiter_call.search(code_without_line_comments) is None:
         raise AssertionError(
             'save_session must throttle through RATE_LIMITER.check("save_session") — it is a '
             "webview-reachable DB write under the global db lock and was the lone infra.rs command "
             "without a rate limiter (local DoS gap)."
         )
+
+
+def test_save_session_rate_limit_scanner_accepts_rustfmt_and_rejects_comment_only() -> None:
+    limiter_call = re.compile(
+        r"\b(?:STRICT_)?RATE_LIMITER\s*\.\s*check\s*\(\s*\"save_session\"\s*\)"
+    )
+    formatted = 'RATE_LIMITER\n    .check(\n        "save_session"\n    )?;'
+    comment_only = '// RATE_LIMITER.check("save_session")\nlet db = state.lock_db();'
+    assert limiter_call.search(re.sub(r"//[^\n]*", "", formatted)) is not None
+    assert limiter_call.search(re.sub(r"//[^\n]*", "", comment_only)) is None
 
 
 def test_atomic_replace_post_swap_backup_cleanup_is_best_effort() -> None:
@@ -1336,14 +1441,22 @@ def test_t0_calibration_excludes_human_rejected_from_the_conformal_set() -> None
     must too. This is the 7th instance of the "rejected/empty counted as real" class and can't be
     unit-injected cheaply (a full jury run), so it is source-pinned. Scoped to the all_verified statement."""
     jury = (REPO_ROOT / "src-tauri" / "src" / "jury" / "mod.rs").read_text(encoding="utf-8")
+    quality = (REPO_ROOT / "src-tauri" / "src" / "quality.rs").read_text(encoding="utf-8")
     idx = jury.find("let all_verified")
     if idx == -1:
         raise AssertionError("jury/mod.rs `all_verified` not found — this gate would pass vacuously")
     stmt = jury[idx : jury.index(";", idx)]
-    if "is_human_rejected" not in stmt:
+    direct_rejection_guard = "is_human_rejected" in stmt
+    shared_export_guard = "is_excluded_from_exports" in stmt and (
+        "pub fn is_excluded_from_exports(seg: &SpeechSegment) -> bool {\n"
+        "    is_human_rejected(seg) || is_technically_unusable(seg)\n"
+        "}" in quality
+    )
+    if not direct_rejection_guard and not shared_export_guard:
         raise AssertionError(
             "jury/mod.rs `all_verified` (the T0 conformal calibration set) must exclude is_human_rejected "
-            "clips — a mark-bad clip is verified=true and would contaminate the auto-accept threshold."
+            "clips directly or through the pinned shared export-exclusion predicate — a mark-bad clip is "
+            "verified=true and would contaminate the auto-accept threshold."
         )
 
 
@@ -1371,45 +1484,23 @@ def test_run_t2_for_segment_respects_the_autonomy_dial() -> None:
         )
 
 
-def test_optin_transcribe_commands_reject_a_blank_decode() -> None:
-    """transcribe_segment_constrained and transcribe_segment_finetuned run an opt-in engine and return its
-    text to the frontend, which OVERWRITES the segment's transcript with it. Both callees return an empty
-    string on a silent/blank-decoding clip (run_constrained -> ""; transcribe_chunk_finetuned -> Ok("")),
-    so shipping it destroys an existing good transcript and persists a blank as a real result — the
-    no-blank-transcript honesty rule + data loss. Each must reject a blank decode (return Err) before
-    returning the text. Cloud/ONNX commands (can't be unit-injected without the model), so source-pinned."""
-    src = (REPO_ROOT / "src-tauri" / "src" / "commands" / "transcribe.rs").read_text(encoding="utf-8")
-    for fn in ("transcribe_segment_constrained", "transcribe_segment_finetuned"):
-        start = src.find(f"pub async fn {fn}")
-        if start == -1:
-            raise AssertionError(f"{fn} not found — this gate would pass vacuously")
-        rest = src[start:]
-        nxt = rest.find("\n#[tauri::command]", 1)
-        body = rest if nxt == -1 else rest[:nxt]
-        if "text.trim().is_empty()" not in body:
-            raise AssertionError(
-                f"{fn} returns its decode text without a blank guard — a silent clip's empty decode would "
-                "overwrite the existing transcript with a blank. Reject a blank decode with an Err first."
-            )
-
-
 def test_pipeline_wsl_retranscribe_rejects_an_empty_result() -> None:
-    """The in-pipeline WSL-7B branch of transcribe() is the twin of the opt-in transcribe commands guarded
-    above: run_wsl_segment_transcript returns Ok("") on a TRANSIENT empty result (server up but under load
-    — documented in-code, observed 1-of-3 under stress), so map_err(tag_7b_unavailable) does NOT catch it.
+    """The in-pipeline WSL-7B branch of transcribe() receives Ok("") on a TRANSIENT empty result (server
+    up but under load — documented in-code, observed 1-of-3 under stress), so
+    map_err(tag_7b_unavailable) does NOT catch it.
     Without an explicit empty guard, the champion commit with an empty draft overwrites a good,
     unverified stored transcript with "" — silent data loss on both re-transcribe entry points (per-segment
     IPC + batch_transcribe), unlike the import path which retries/escalates. The branch must reject an empty
     raw_transcript (return a tagged 7B-unavailable Err) BEFORE the DB write. transcribe() needs the WSL
     server + audio + DB, so it is not unit-injectable — source-pinned."""
     pipeline = pipeline_surface()
-    anchor = "self.run_wsl_segment_transcript(&id, cancel).map_err(tag_7b_unavailable)?;"
+    anchor = "self.run_wsl_segment_transcript(audio_path, alignment_json, cancel).map_err(tag_7b_unavailable)?;"
     start = pipeline.find(anchor)
     if start == -1:
         raise AssertionError("run_wsl_segment_transcript call not found — this gate would pass vacuously")
     # Match the METHOD CALL, not a prose mention in the guard's own comment — otherwise the search
     # lands on the comment and excludes the guard below it.
-    write = pipeline.find(".commit_champion_transcript_if_unreviewed(", start)
+    write = pipeline.find(".commit_bound_champion_transcript_if_unreviewed(", start)
     if write == -1:
         raise AssertionError("atomic champion commit not found after the WSL call — gate vacuous")
     between = pipeline[start:write]
@@ -1432,6 +1523,9 @@ def test_champion_transcript_and_provenance_commit_atomically() -> None:
     db = db_surface()
     required_db = [
         "pub fn commit_champion_transcript_if_unreviewed(",
+        "pub(crate) fn commit_bound_champion_transcript_if_unreviewed(",
+        "fn commit_champion_transcript_inner(",
+        "expected_source: Option<&ChampionTranscriptionSourceSnapshot>",
         'self.conn.execute("SAVEPOINT champion_commit", [])?',
         "AND verified = 0",
         "AND (human_decision IS NULL OR human_decision = '')",
@@ -1445,8 +1539,14 @@ def test_champion_transcript_and_provenance_commit_atomically() -> None:
         raise AssertionError(f"atomic champion DB commit is missing contracts: {missing}")
 
     for name, source in (("pipeline.rs", pipeline_surface()), ("commands.rs", command_surface())):
-        if ".commit_champion_transcript_if_unreviewed(" not in source:
-            raise AssertionError(f"{name} does not route champion writes through the atomic DB helper")
+        if ".commit_bound_champion_transcript_if_unreviewed(" not in source:
+            raise AssertionError(
+                f"{name} does not route champion writes through the source-bound atomic DB helper"
+            )
+        if ".commit_champion_transcript_if_unreviewed(" in source:
+            raise AssertionError(
+                f"{name} routes a production champion write through the unbound test-only helper"
+            )
         for retired in (".update_asr_transcript_if_unreviewed(", ".replace_hypotheses_with("):
             if retired in source:
                 raise AssertionError(
@@ -1556,7 +1656,8 @@ def test_pipeline_rediarize_reports_db_update_failures() -> None:
     # rediarize_segments() snapshots its segments up front, then spends a per-file decode + ONNX speaker
     # embedding pass (the decode timeout alone clamps up to 3600s) DELIBERATELY holding no AppState lock,
     # so concurrent human edits are expected BY DESIGN. It must therefore write the speaker back with the
-    # TARGETED single-column update_speaker_id (db.rs documents it as "without touching any other field").
+    # TARGETED single-column update_speaker_id through the serialized processing store (db.rs documents
+    # it as "without touching any other field").
     # The previous whole-row insert_segment upsert of the stale snapshot silently reverted every column a
     # human changed during the pass and — since insert_segment is an UPSERT — resurrected segments deleted
     # mid-pass. Same anti-clobber discipline as batch transcribe above. The write outcome must still never
@@ -1565,7 +1666,8 @@ def test_pipeline_rediarize_reports_db_update_failures() -> None:
     required = [
         "pub fn rediarize_segments(&self, ids: &[String]) -> AppResult<usize>",
         "let db = self.open_db()?;",
-        "match db.update_speaker_id(seg_id, Some(label.as_str()))",
+        "let import_writes = self.import_write_store(db.path())?;",
+        "match import_writes.update_machine_speaker(seg_id, label.as_str())",
         'tracing::error!("Rediarize speaker update failed for {seg_id}: {error}")',
         # A row deleted during the long pass is a no-op, never a revival.
         'tracing::warn!("Rediarize speaker update skipped: segment {seg_id} no longer exists")',
@@ -1578,7 +1680,7 @@ def test_pipeline_rediarize_reports_db_update_failures() -> None:
     if "seg.speaker_id = Some(label);" in pipeline:
         raise AssertionError(
             "pipeline.rs rediarize is mutating a stale segment snapshot again — that is the whole-row "
-            "clobber this gate exists to prevent; use db.update_speaker_id(id, ...) instead"
+            "clobber this gate exists to prevent; use the store-owned targeted speaker update instead"
         )
 
 
@@ -1620,17 +1722,40 @@ def test_file_dialog_commands_do_not_block_the_main_thread() -> None:
 
 
 def test_batch_processor_asr_errors_are_not_blank_transcripts() -> None:
+    """The legacy processor is now a fail-closed tombstone.
+
+    It cannot satisfy the champion-only provenance contract, so preserving its former bundled-ASR
+    implementation would be worse than checking that implementation's error arms: an old scheduled
+    task could still write non-champion drafts. Keep the historical executable name for an actionable
+    operator error, but never let it regain an ASR or database path.
+    """
     batch = (REPO_ROOT / "src-tauri/src/bin/batch_processor.rs").read_text(encoding="utf-8")
+    runtime = strip_comments(batch)
     required = [
-        "let asr_result: Result<(String, Option<f64>, cortex_speech_app_lib::asr::ConfidenceSource), String>",
-        "ASR service is unavailable; models may not be downloaded",
-        "ASR transcription failed for segment",
-        "return Err(std::io::Error::other(error).into());",
+        "fn main() -> Result<(), Box<dyn std::error::Error>>",
+        "HARD STOP: batch_processor is retired",
+        "pinned OmniASR-7B champion",
     ]
-    missing = [pattern for pattern in required if pattern not in batch]
+    missing = [pattern for pattern in required if pattern not in runtime]
     if missing:
         formatted = "\n".join(f"- {entry}" for entry in missing)
-        raise AssertionError(f"batch_processor.rs is missing explicit ASR failure handling:\n{formatted}")
+        raise AssertionError(f"batch_processor.rs is no longer an explicit fail-closed tombstone:\n{formatted}")
+    reachable = [
+        token
+        for token in (
+            "Database::",
+            "Pipeline::",
+            "AsrService",
+            "transcribe(",
+            "delete_segment",
+            "to_delete",
+        )
+        if token in runtime
+    ]
+    if reachable:
+        raise AssertionError(
+            "retired batch_processor regained production data/ASR reachability: " + ", ".join(reachable)
+        )
 
 
 def test_pipeline_hypothesis_population_reports_failures() -> None:
@@ -1752,9 +1877,9 @@ def test_normalizer_cache_recovers_poisoned_lock() -> None:
 
 def test_history_manager_recovers_poisoned_stacks() -> None:
     history = (REPO_ROOT / "src-tauri/src/history/mod.rs").read_text(encoding="utf-8")
-    if "fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<Command>>" not in history:
+    if "fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>>" not in history:
         raise AssertionError("HistoryManager must centralize undo locking behind lock_undo_stack()")
-    if "fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<Command>>" not in history:
+    if "fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>>" not in history:
         raise AssertionError("HistoryManager must centralize redo locking behind lock_redo_stack()")
     if "Recovering poisoned undo history stack" not in history:
         raise AssertionError("HistoryManager must warn when recovering a poisoned undo stack")
@@ -1764,6 +1889,8 @@ def test_history_manager_recovers_poisoned_stacks() -> None:
         raise AssertionError("HistoryManager must recover poisoned stack locks with poisoned.into_inner()")
     if "history_operations_recover_poisoned_stacks" not in history:
         raise AssertionError("history/mod.rs must keep a unit test for poisoned stack recovery")
+    if "history_memory_budget_evicts_old_batches_but_keeps_the_latest_action_recoverable" not in history:
+        raise AssertionError("history/mod.rs must keep a regression for bounded retained batch-history bytes")
 
 
 def test_inference_metrics_recover_poisoned_locks() -> None:
@@ -1981,14 +2108,13 @@ def test_asr_load_gate_verifies_the_tokens_vocab_not_only_the_model() -> None:
 
 
 def test_snapshot_restore_preserves_live_cloud_consent() -> None:
-    """restore_db_from_snapshot copies the SNAPSHOT's settings.json over the live one and applies it to memory
-    AND the running pipeline. A snapshot captured while the cloud opt-ins were ON would then silently re-grant
-    consent the user has since revoked — subsequent transcribe/refine/jury could transmit audio/transcript to a
-    cloud provider with no fresh acknowledgment, violating the hard guardrail 'never send without acknowledged
-    consent'. Consent is a LIVE per-session privacy decision, not dataset state a rollback should change, so the
-    restore must carry the CURRENT opt-ins across (a restore may narrow consent, never escalate it). Needs
-    AppState + DB + files, so source-pinned."""
+    """A snapshot captured while the cloud opt-ins were ON must never silently re-grant consent the user has
+    since revoked. Consent is a LIVE per-session privacy decision, not dataset state a rollback should change,
+    so restore must carry the CURRENT opt-ins across and atomically persist the narrowed typed settings before
+    publishing them to the running pipeline. The command owns runtime publication while the Tauri-free
+    recovery module owns typed state-file publication, so both surfaces remain source-pinned."""
     surface = command_surface()
+    recovery = recovery_surface()
     start = surface.find("fn restore_db_from_snapshot(")
     if start == -1:
         raise AssertionError("restore_db_from_snapshot not found — this gate would pass vacuously")
@@ -1999,38 +2125,56 @@ def test_snapshot_restore_preserves_live_cloud_consent() -> None:
         if idx != -1:
             end = min(end, idx)
     body = rest[:end]
-    # Strip comment-only lines so a commented-out call can't satisfy the substring checks below (a
-    # commented `// restored.save(...)` must NOT count as persisting).
+    # Strip comment-only lines so commented-out calls cannot satisfy the executable ordering checks.
     code_body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("//"))
-    for flag in ("cloud_llm_opt_in", "cloud_stt_opt_in", "jury_cloud_opt_in"):
-        if flag not in code_body:
+    helper_start = recovery.find("fn install_snapshot_restore_plan(")
+    if helper_start == -1:
+        raise AssertionError("typed snapshot restore-plan installer not found — consent gate would pass vacuously")
+    helper_rest = recovery[helper_start:]
+    helper_end = helper_rest.find("\nfn ", 1)
+    helper = helper_rest if helper_end == -1 else helper_rest[:helper_end]
+    helper_code = "\n".join(ln for ln in helper.splitlines() if not ln.lstrip().startswith("//"))
+    for flag in ("cloud_llm_opt_in", "jury_cloud_opt_in"):
+        assignment = f"restored.{flag} = live_controls.{flag};"
+        if assignment not in helper_code:
             raise AssertionError(
-                f"restore_db_from_snapshot does not preserve the live consent flag {flag} — restoring a "
+                f"snapshot restore does not preserve the live consent flag {flag} — restoring a "
                 "cloud-ON-era snapshot silently re-enables cloud consent the user revoked. Carry the current "
-                "state.lock_settings() opt-ins across the restore instead of adopting the snapshot's."
+                "live_controls opt-ins across the typed restore-plan installer instead of adopting the snapshot's."
             )
-    # The in-memory narrowing above is NOT enough: the fs::copy of the snapshot's settings.json already
-    # overwrote the on-disk file with the snapshot's (possibly cloud-ON) opt-ins, and AppSettings::load does
-    # not reset opt-ins — so without persisting the narrowed struct back to disk, the NEXT launch silently
-    # re-grants the revoked consent. The restore MUST save the narrowed settings to disk (hunt-3 / iter 157).
-    if "restored.save(" not in code_body:
+    # In-memory narrowing alone is not durable. The typed, narrowed settings must be persisted before runtime
+    # publication and before the restore-pending marker is cleared (hunt-3 / iter 157).
+    if "restored.save(&live_settings_path)" not in helper_code:
         raise AssertionError(
-            "restore_db_from_snapshot narrows consent IN MEMORY but never persists the narrowed settings to "
+            "snapshot restore narrows consent IN MEMORY but never persists the narrowed settings to "
             "disk. The snapshot's settings.json was already copied over the live one, so the next launch's "
             "AppSettings::load re-grants the revoked cloud consent. Call restored.save(&data_dir.join("
             "\"settings.json\")) after narrowing the opt-ins."
         )
-    # The persist-back alone is not enough: the EXTRA_STATE copy loop must SKIP settings.json, so the
-    # snapshot's (possibly cloud-ON) opt-ins never touch data_dir/settings.json in the first place. Otherwise a
-    # plain fs::copy writes the cloud-ON value and, if the best-effort re-save then fails/is-interrupted (disk
-    # full during recovery, or a process kill in the window), the revoked consent silently returns on the next
-    # launch. The narrowed struct must be the FIRST and ONLY settings.json write (hunt-9 / iter 165).
-    if 'if extra == "settings.json"' not in code_body:
+    capture = code_body.find("let live_controls = state.lock_settings().clone();")
+    install = code_body.find("install_snapshot_restore_plan(&restore_plan, &data_dir, &live_controls)?")
+    runtime = code_body.find("*state.lock_settings() = restored.clone();")
+    completed = code_body.find("mark_named_restore_completed(&data_dir, &name)?;")
+    clear = code_body.find("clear_review_pilot_restore_pending(&data_dir)?;", completed)
+    if -1 in (capture, install, runtime, completed, clear) or not (capture < install < runtime < completed < clear):
         raise AssertionError(
-            "restore_db_from_snapshot's EXTRA_STATE loop plain-copies settings.json — the snapshot's cloud "
-            "opt-ins reach disk before the consent-narrowing re-save, so a failed/interrupted re-save re-grants "
-            "revoked consent on the next launch. Skip settings.json in the copy loop (`if extra == "
-            "\"settings.json\" { continue; }`) and load the snapshot's settings for narrowing instead."
+            "restore_db_from_snapshot must capture current consent, persist the typed narrowed settings, then "
+            "publish runtime state before marking/clearing the durable restore barrier"
+        )
+    # The typed consent-narrowing save must be the first and only settings.json write. Routing-state install
+    # therefore explicitly excludes settings, while the restore plan supplies its strictly parsed value to the
+    # typed settings path (hunt-9 / iter 165).
+    routing_start = recovery.find("fn restore_required_snapshot_state_atomic(")
+    routing_helper = recovery[routing_start : routing_start + 2400] if routing_start != -1 else ""
+    atomic_routing = (
+        "restore_required_snapshot_state_atomic(&restore_plan.optional, data_dir)?;" in helper_code
+        and 'state.live_file == "settings.json"' in routing_helper
+        and "atomic_write_restore_state(&destination, bytes)" in routing_helper
+    )
+    if not atomic_routing:
+        raise AssertionError(
+            "restore_db_from_snapshot must route dataset state through the atomic helper that explicitly "
+            "excludes settings.json; only the typed consent-narrowing path may write live settings."
         )
 
 
@@ -2070,13 +2214,9 @@ def test_bundle_runconfig_reflects_stored_per_segment_provenance_not_export_day_
 
 
 def test_default_transcribe_segment_refuses_blank_draft() -> None:
-    """The DEFAULT `transcribe_segment` command must refuse a blank draft (return Err before the Ok
-    json), exactly as its two opt-in siblings transcribe_segment_constrained/_finetuned already do.
-    Otherwise App.svelte's handleTranscribe upserts "" over an existing good transcript
-    (annotatedTranscript = result.text, then updateSegment) — silent, irreversible data loss (the
-    recurring blank-transcript-never-overwrites-good class). Exercising it needs a real pipeline + models
-    (WSL/ONNX), so it is source-pinned. `transcribe_segment(` matches only the default (the siblings are
-    `transcribe_segment_constrained(` / `_finetuned(`)."""
+    """The production `transcribe_segment` command must refuse a blank draft before returning success.
+    The pipeline's champion path commits server-side, so an empty result must fail closed instead of being
+    represented as a real transcript. Exercising it needs a live champion + audio, so it is source-pinned."""
     src = (COMMANDS_DIR / "transcribe.rs").read_text(encoding="utf-8")
     start = src.find("pub async fn transcribe_segment(")
     if start == -1:
@@ -2086,9 +2226,8 @@ def test_default_transcribe_segment_refuses_blank_draft() -> None:
     body = src[start:end] if end != -1 else src[start:]
     if ".trim().is_empty()" not in body or "return Err" not in body:
         raise AssertionError(
-            "default transcribe_segment does not guard a blank draft — an empty ASR result would upsert "
-            '"" over a good transcript (data loss). Return Err when draft.final_text.trim().is_empty(), '
-            "matching transcribe_segment_constrained/_finetuned."
+            "default transcribe_segment does not guard a blank draft — an empty ASR result would be "
+            "reported as a successful transcript. Return Err when draft.final_text.trim().is_empty()."
         )
 
 
@@ -2099,7 +2238,7 @@ def test_batch_transcribe_refuses_blank_draft() -> None:
     re-batch-transcribed by the offline CTC engine that returns Ok("") on a quiet clip). Recurring
     blank-transcript-never-overwrites-good data-loss class. The runtime path needs a full app + pipeline,
     so it is source-pinned."""
-    src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
+    src = command_surface()
     if "update_batch_transcription_if_unreviewed" not in src:
         raise AssertionError("batch_transcribe persist call not found in commands.rs")
     guard = "Ok(draft) if draft.final_text.trim().is_empty() && draft.raw_text.trim().is_empty()"
@@ -2112,43 +2251,21 @@ def test_batch_transcribe_refuses_blank_draft() -> None:
 
 
 def test_batch_processor_never_deletes_a_segment_with_an_existing_transcript() -> None:
-    """The headless batch_processor prunes fresh placeholder segments (VAD false-positives), but must
-    NEVER delete a segment that already holds a real transcript just because THIS run's bundled-engine
-    re-transcription is empty/silent/unsliceable — that destroys a good draft (e.g. a stronger WSL-7B
-    draft), silent data loss. Every `to_delete.push` must be guarded by `has_existing_transcript`. The
-    runtime path needs real ONNX models + a DB, so it is source-pinned."""
+    """The retired binary must have no segment-deletion surface at all.
+
+    Its old conditional-delete guards are obsolete together with the non-champion writer. Pinning the
+    stronger invariant catches both accidental resurrection and the original data-loss class.
+    """
     src = (REPO_ROOT / "src-tauri" / "src" / "bin" / "batch_processor.rs").read_text(encoding="utf-8")
-    if "has_existing_transcript" not in src:
+    runtime = strip_comments(src)
+    forbidden = [
+        token
+        for token in ("delete", "remove", "to_delete", "speech_segments", "Database::open")
+        if token in runtime
+    ]
+    if forbidden:
         raise AssertionError(
-            "batch_processor computes no has_existing_transcript guard — an empty/silent re-transcription "
-            "can delete a segment that already holds a good draft."
-        )
-    deletes = src.count("to_delete.push(seg.id.clone())")
-    guards = src.count("if !has_existing_transcript {")
-    if deletes == 0 or guards < deletes:
-        raise AssertionError(
-            f"batch_processor has {deletes} to_delete.push site(s) but only {guards} has_existing_transcript "
-            "guard(s) — an unguarded delete can destroy a segment that already has a good transcript."
-        )
-
-
-def test_constrained_transcribe_verifies_model_and_tokens_pin() -> None:
-    """The opt-in constrained decode loads model.int8.onnx + tokens.txt via ort with NO built-in SHA check
-    (constrained_decode::run_constrained), so its command must enforce the SAME runtime integrity pin the
-    default ASR path does (asr.rs:288-311): a tampered/swapped same-line-count tokens.txt still loads but
-    decodes every clip to the WRONG graphemes, persisted as trustworthy. Runtime needs the real ONNX, so
-    it is source-pinned. `transcribe_segment_constrained(` matches only the constrained command."""
-    src = (COMMANDS_DIR / "transcribe.rs").read_text(encoding="utf-8")
-    start = src.find("pub async fn transcribe_segment_constrained(")
-    if start == -1:
-        raise AssertionError("transcribe_segment_constrained command not found in commands/transcribe.rs")
-    end = src.find("#[tauri::command]", start)
-    body = src[start:end] if end != -1 else src[start:]
-    if body.count("verify_model_path_runtime(") < 2:  # call form only (a comment mention has no '(')
-        raise AssertionError(
-            "constrained transcribe command does not verify BOTH the model and tokens SHA-256 pin before "
-            "decoding — a tampered/swapped tokens.txt would decode to the wrong graphemes, persisted as "
-            "trustworthy. Add verify_model_path_runtime for the model AND the tokens (mirror asr.rs)."
+            "retired batch_processor regained a dataset-mutation surface: " + ", ".join(forbidden)
         )
 
 
@@ -2179,7 +2296,7 @@ def test_bundled_only_models_resolve_per_file_not_all_or_nothing() -> None:
     the whole root — orphans them once the user downloads an OmniASR model (silent VAD→energy /
     no-denoise / no-diarization degradation). They must resolve PER FILE via `resolve_root_for`. Recurring
     class (VAD, denoiser, aligner+campp). Runtime path needs real models, so source-pinned."""
-    src = (REPO_ROOT / "src-tauri" / "src" / "pipeline.rs").read_text(encoding="utf-8")
+    src = pipeline_surface()
     for bad in (
         "SpeakerEmbeddingService::new(&self.model_manager.resolved_dir()",
         "ForcedAligner::new(&self.model_manager.resolved_dir()",
@@ -2237,10 +2354,13 @@ def test_wsl_refinement_loop_refuses_blank_draft() -> None:
     silent/music/noise clip, per parse_wsl_segment_result) would overwrite a good existing transcript. It
     must SKIP a blank draft. Runtime path needs the WSL server, so source-pinned. (blank-transcript-never-
     overwrites-good class; siblings transcribe_segment / batch_transcribe / batch_processor.)"""
-    src = (REPO_ROOT / "src-tauri" / "src" / "commands.rs").read_text(encoding="utf-8")
-    if "commit_champion_transcript_if_unreviewed" not in src:
-        raise AssertionError("atomic WSL refinement persist call not found in commands.rs")
-    if "Ok((raw_transcript, _)) if raw_transcript.trim().is_empty()" not in src:
+    src = command_surface()
+    if "commit_bound_champion_transcript_if_unreviewed" not in src:
+        raise AssertionError("source-bound atomic WSL refinement persist call not found in commands.rs")
+    # parse_wsl_segment_result now returns a Wsl7bResult STRUCT (it carries the serving identity too),
+    # so the guard destructures a field instead of a tuple. The behaviour is unchanged: a blank draft
+    # is skipped before the commit and the existing transcript is kept.
+    if "Ok(result) if result.raw_transcript.trim().is_empty()" not in src:
         raise AssertionError(
             "the WSL-7B refinement loop does not guard a blank draft before the atomic champion commit "
             '— an empty 7B result would overwrite a good transcript with "". Add the guarded match arm.'
@@ -2354,15 +2474,15 @@ def main() -> None:
     test_audio_decode_reset_required_fails_loud_not_silent_truncation()
     test_pipeline_wsl_subprocess_send_failures_are_reported()
     test_wsl_import_pass_does_not_roll_back_the_file_on_a_benign_empty_result()
-    test_probe_wsl_7b_server_reaps_child_on_wait_error()
+    test_wsl_try_wait_loops_always_reap_the_child()
     test_aligner_score_consistency_caps_clip_and_dp()
     test_finish_import_clears_cancel_token_before_opening_the_gate()
     test_batch_normalize_uses_a_targeted_update_not_a_whole_row_upsert()
     test_save_session_is_rate_limited()
+    test_save_session_rate_limit_scanner_accepts_rustfmt_and_rejects_comment_only()
     test_atomic_replace_post_swap_backup_cleanup_is_best_effort()
     test_t0_calibration_excludes_human_rejected_from_the_conformal_set()
     test_run_t2_for_segment_respects_the_autonomy_dial()
-    test_optin_transcribe_commands_reject_a_blank_decode()
     test_pipeline_wsl_retranscribe_rejects_an_empty_result()
     test_champion_transcript_and_provenance_commit_atomically()
     test_finetuned_fallback_counter_excludes_the_wsl_7b_primary_path()
@@ -2377,7 +2497,6 @@ def main() -> None:
     test_default_transcribe_segment_refuses_blank_draft()
     test_batch_transcribe_refuses_blank_draft()
     test_batch_processor_never_deletes_a_segment_with_an_existing_transcript()
-    test_constrained_transcribe_verifies_model_and_tokens_pin()
     test_check_audio_and_get_duration_share_the_decode_fallback()
     test_bundled_only_models_resolve_per_file_not_all_or_nothing()
     test_wsl_refinement_loop_refuses_blank_draft()

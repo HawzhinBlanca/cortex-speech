@@ -31,9 +31,6 @@ pub enum Verdict {
     JuryAccept,
     JuryEdit,
     Escalated,
-    HumanAccept,
-    HumanEdit,
-    HumanReject,
 }
 
 impl std::fmt::Display for Verdict {
@@ -43,9 +40,6 @@ impl std::fmt::Display for Verdict {
             Verdict::JuryAccept => "jury_accept",
             Verdict::JuryEdit => "jury_edit",
             Verdict::Escalated => "escalated",
-            Verdict::HumanAccept => "human_accept",
-            Verdict::HumanEdit => "human_edit",
-            Verdict::HumanReject => "human_reject",
         };
         write!(f, "{s}")
     }
@@ -281,7 +275,7 @@ pub fn run_t0_gate(
     // (nonconformity score, committed-CER) contaminates the conformal coverage guarantee for the gate that
     // decides auto-accept WITHOUT human review. Every export/gate path drops these via is_human_rejected.
     let all_verified: Vec<_> =
-        db.get_segments(Some(true))?.into_iter().filter(|s| !crate::quality::is_human_rejected(s)).collect();
+        db.get_segments(Some(true))?.into_iter().filter(|s| !crate::quality::is_excluded_from_exports(s)).collect();
 
     // 2. Run IRT over all hypotheses. When ability-learning is enabled (opt-in, F7), warm-start the
     //    consensus from the persisted per-model abilities and persist the freshly-fit ones so the jury
@@ -454,7 +448,7 @@ pub fn run_t0_gate(
 // Verdict helpers (shared by T1, T2, learning)
 // ────────────────────────────────────────────────────────────────────────────
 
-pub fn write_verdict(
+pub(crate) fn write_verdict(
     db: &Database,
     segment_id: &str,
     verdict: Verdict,
@@ -463,75 +457,25 @@ pub fn write_verdict(
     evidence_json: Option<&str>,
     agreement_score: Option<f64>,
 ) -> AppResult<()> {
-    // Never let this MACHINE verdict overwrite a HUMAN decision. The T0/T1/T2 jury runs on a SEPARATE
-    // WAL connection from the human path (record_human_decision), snapshots its segments once, then can
-    // lag a multi-second T2 cloud call — so a curator may accept/edit the same segment mid-run, and the
-    // in-memory "already has a verdict" skip reads the STALE snapshot. The same guard as db::
-    // write_segment_verdict and the consensus/ASR write paths makes a verdict for an already-human-decided
-    // segment a 0-row no-op, keeping the human's verdict/gold transcript authoritative.
-    // SAVEPOINT (write-path audit, Week 2): the verdict UPDATE and its decision_verdicts record are one
-    // invariant — a failure between them left a verdict with no C4 denominator row. Same idiom as
-    // db::write_segment_verdict / delete_segment. The best-effort flywheel capture below stays OUTSIDE
-    // the savepoint on purpose: its failure must not fail (or roll back) the verdict write.
-    db.connection().execute("SAVEPOINT jury_verdict", [])?;
-    let affected_result: AppResult<usize> = (|| {
-        let affected = db.connection().execute(
-            // `AND verified = 0` (text-provenance audit #17): a flag-verified row is one the human
-            // deliberately closed out at the desktop — the machine jury must not restamp its verdict
-            // columns any more than the batch/consensus writers may touch its transcripts.
-            // `jury_transcript` (#18): parity with db::write_segment_verdict — the machine's own
-            // committed text is preserved on BOTH machine-verdict writers, so a later human decision
-            // replacing verdict_transcript never erases what the model actually proposed.
-            "UPDATE speech_segments
-             SET verdict           = ?2,
-                 verdict_transcript = ?3,
-                 jury_transcript   = ?3,
-                 rationale         = ?4,
-                 evidence_json     = ?5,
-                 agreement_score  = ?6,
-                 escalated         = ?7,
-                 updated_at        = datetime('now')
-             WHERE id = ?1
-               AND verified = 0
-               AND (human_decision IS NULL OR human_decision = '')
-               AND (verdict IS NULL OR verdict NOT IN ('human_accept', 'human_edit', 'human_reject'))",
-            params![
-                segment_id,
-                verdict.to_string(),
-                transcript,
-                rationale,
-                evidence_json,
-                agreement_score,
-                (verdict == Verdict::Escalated) as i32,
-            ],
-        )?;
-
-        // M2.2/P1.2: record the T0/T1 classification in decision_verdicts for the C4 auto-accept-precision
-        // denominator. This path (the IRT-consensus jury) previously recorded NOTHING, so auto-accepts from
-        // the main jury were invisible to C4. Gated on affected > 0 so a verdict the guard above did NOT
-        // write (human-decided segment) never plants a phantom machine verdict.
-        if affected > 0 {
-            db.record_decision_verdict(segment_id, &verdict.to_string(), verdict == Verdict::Escalated)?;
-        }
-        Ok(affected)
-    })();
-    let affected = match affected_result {
-        Ok(n) => {
-            db.release_savepoint("jury_verdict")?;
-            n
-        }
-        Err(e) => {
-            db.cleanup_savepoint_after_error("jury_verdict");
-            return Err(e);
-        }
-    };
+    // Schema v60 deliberately refuses this legacy machine writer before mutation. The pre-v60
+    // branch remains for historical compatibility; the paid-review release uses only the
+    // evidence-backed human decision flow.
+    let affected = db.write_segment_verdict(
+        segment_id,
+        &verdict.to_string(),
+        transcript,
+        rationale,
+        evidence_json,
+        agreement_score,
+        verdict == Verdict::Escalated,
+    )?;
 
     // Flywheel capture: when the jury ACCEPTS a transcript that differs from the raw ASR, the model
     // corrected OmniASR — record it as a provenance-tagged PSEUDO example (never auto-trained; gated
     // behind human review). Best-effort: a capture failure must not fail the verdict write. Gated on
     // `affected > 0` so we never capture a "model correction" for a verdict the guard above did NOT
     // write (the segment was human-decided) — that would tag the human's row with a phantom pseudo-label.
-    if affected > 0 && matches!(verdict, Verdict::AutoAccept | Verdict::JuryAccept) {
+    if affected && matches!(verdict, Verdict::AutoAccept | Verdict::JuryAccept) {
         if let Some(corrected) = transcript {
             let raw: Option<String> = db
                 .connection()
@@ -551,6 +495,7 @@ pub fn write_verdict(
 
 /// Record the final human decision and write to `agent_examples` for few-shot
 /// memory (skipped if the segment is gold-holdout). M2.1: Accepts optional timestamp_ms for decision timing.
+#[cfg(test)]
 pub fn record_human_decision(
     db: &Database,
     segment_id: &str,
@@ -561,9 +506,9 @@ pub fn record_human_decision(
     db.record_human_decision(segment_id, decision, corrected_transcript, timestamp_ms)
 }
 
-/// [`record_human_decision`] attributed to a named reviewer (Migration v43). Used by the multi-reviewer
-/// Couch Review server, where the token identifies WHICH human decided; `None` is the desktop's single
-/// unnamed reviewer.
+/// Legacy forwarding wrapper. Named reviewers are rejected here and must use the atomic Couch writer,
+/// where the session token identifies which human decided. `None` remains the desktop/batch boundary.
+#[cfg(test)]
 pub fn record_human_decision_by(
     db: &Database,
     segment_id: &str,
@@ -596,6 +541,18 @@ fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<
     a.intersection(b).count() as f64 / union as f64
 }
 
+/// Whether a pre-v60, unbound human-learning artifact is still supported by the segment's current
+/// retained human edit.  This intentionally shares the same loose comparison key as the decision
+/// writer and DPO no-op guard: case and whitespace differences are not a retraction, but a genuinely
+/// different correction is.
+fn legacy_human_fix_is_current(retained_human_text: Option<&str>, human_fix: &str) -> bool {
+    let Some(retained) = retained_human_text.map(str::trim).filter(|text| !text.is_empty()) else {
+        return false;
+    };
+    let fix = human_fix.trim();
+    !fix.is_empty() && crate::normalizer::learning_text_key(retained) == crate::normalizer::learning_text_key(fix)
+}
+
 /// Retrieve k few-shot examples for a segment, ranked by lexical relevance to that segment's text
 /// (not mere recency), so the LLM is primed on ON-TOPIC corrections. Falls back to recency when the
 /// segment has no text. A bounded recent pool is re-ranked, and ties keep recency order (the SQL
@@ -626,25 +583,75 @@ pub fn get_few_shot_examples(db: &Database, segment_id: &str, k: usize) -> AppRe
         // path must too. A clip promoted to holdout keeps its audio_path, so excluding examples whose
         // segment audio_path is a holdout gold path (plus the defensive is_gold=0) closes the leak in
         // SQL without re-hashing every candidate in the jury hot loop.
-        "SELECT ae.id, ae.segment_id, ae.wrong_transcript, ae.human_fix, ae.created_at
+        "SELECT ae.id, ae.segment_id, ae.wrong_transcript, ae.human_fix, ae.created_at,
+                ae.effect_event_id,
+                COALESCE(NULLIF(TRIM(ss.verdict_transcript), ''),
+                         NULLIF(TRIM(ss.annotated_transcript), '')) AS retained_human_text
          FROM agent_examples ae
          JOIN speech_segments ss ON ae.segment_id = ss.id
          WHERE ae.verified_by_human = 1
            AND ss.is_gold = 0
            AND ss.audio_path NOT IN (SELECT audio_path FROM gold_segments WHERE is_holdout = 1)
+           AND (
+                (ae.effect_event_id IS NOT NULL AND EXISTS (
+                     SELECT 1
+                       FROM effective_human_decision_effects_v60 effect
+                      WHERE effect.id = ae.effect_event_id
+                        AND effect.segment_id = ae.segment_id
+                        AND effect.action = 'edit'
+                ))
+                OR
+                (ae.effect_event_id IS NULL
+                 AND ss.verified = 1
+                 AND ss.human_decision = 'edit')
+           )
+           AND (?2 IS NULL
+                OR ae.created_at < ?2
+                OR (ae.created_at = ?2 AND ae.id > ?3))
          ORDER BY ae.created_at DESC, ae.id ASC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![pool as i64], |row| {
-        Ok(FewShotExample {
-            id: row.get(0)?,
-            segment_id: row.get(1)?,
-            wrong_transcript: row.get(2)?,
-            human_fix: row.get(3)?,
-            created_at: row.get(4)?,
-        })
-    })?;
-    let mut examples: Vec<FewShotExample> = rows.collect::<Result<Vec<_>, _>>()?;
+    let mut examples = Vec::with_capacity(pool);
+    let page_size = i64::try_from(pool).unwrap_or(i64::MAX);
+    let mut cursor_created_at: Option<String> = None;
+    let mut cursor_id = String::new();
+    while examples.len() < pool {
+        let rows = stmt.query_map(params![page_size, cursor_created_at.as_deref(), cursor_id], |row| {
+            Ok((
+                FewShotExample {
+                    id: row.get(0)?,
+                    segment_id: row.get(1)?,
+                    wrong_transcript: row.get(2)?,
+                    human_fix: row.get(3)?,
+                    created_at: row.get(4)?,
+                },
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let candidates = rows.collect::<Result<Vec<_>, _>>()?;
+        let Some((last_example, _, _)) = candidates.last() else {
+            break;
+        };
+        cursor_created_at = last_example.created_at.clone();
+        cursor_id.clone_from(&last_example.id);
+        for (example, effect_event_id, retained_human_text) in candidates {
+            if effect_event_id.is_none()
+                && !legacy_human_fix_is_current(retained_human_text.as_deref(), &example.human_fix)
+            {
+                continue;
+            }
+            examples.push(example);
+            if examples.len() == pool {
+                break;
+            }
+        }
+        if cursor_created_at.is_none() {
+            // `created_at` is NOT NULL in every supported schema. Fail closed if a damaged external
+            // database violates that invariant instead of looping forever on an unusable cursor.
+            break;
+        }
+    }
 
     if let Some(text) = segment_text.filter(|t| !t.trim().is_empty()) {
         let query = relevance_token_set(&text);
@@ -731,6 +738,118 @@ pub struct FewShotExample {
     pub created_at: Option<String>,
 }
 
+#[cfg(test)]
+fn insert_human_effect_fixture(db: &Database, segment_id: &str, action: &str, corrected_text: Option<&str>) -> i64 {
+    assert!(matches!(action, "accept" | "edit" | "reject"));
+    let before = db.get_segment_by_id(segment_id).unwrap().expect("fixture segment");
+    let served_transcript =
+        crate::corrections::loop0_draft_text(before.annotated_transcript.as_deref(), &before.raw_transcript)
+            .trim()
+            .to_string();
+    assert!(!served_transcript.is_empty(), "fixture served transcript must be non-blank");
+    let prior_revision = db.segment_review_revision(segment_id).unwrap().expect("fixture prior revision");
+    let human_verdict = format!("human_{action}");
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET verified = 1,
+                    annotated_transcript = CASE WHEN ?2 = 'edit' THEN ?4 ELSE annotated_transcript END,
+                    verdict = ?3,
+                    verdict_transcript = CASE WHEN ?2 = 'edit' THEN ?4 ELSE verdict_transcript END,
+                    escalated = 0,
+                    human_decision = ?2,
+                    corrected_at = datetime('now'),
+                    reviewed_by = NULL
+              WHERE id = ?1",
+            params![segment_id, action, human_verdict, corrected_text],
+        )
+        .expect("fixture human decision");
+    let decided_revision = db.segment_review_revision(segment_id).unwrap().expect("fixture revision");
+    assert_eq!(decided_revision, prior_revision + 1, "fixture must model one atomic decision revision");
+    let after = db.get_segment_by_id(segment_id).unwrap().expect("fixture post-state");
+    let requested_transcript = (action == "edit").then_some(corrected_text).flatten();
+    let requested_timestamp_ms = 1_i64;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let operation_payload_hash = crate::db::desktop_decision_payload_hash(
+        segment_id,
+        action,
+        requested_transcript,
+        Some(requested_timestamp_ms),
+    );
+    let decision_transcript = match action {
+        "reject" => None,
+        "edit" => corrected_text.map(str::to_string),
+        "accept" => Some(served_transcript.clone()),
+        _ => unreachable!(),
+    };
+    let decision_corrected_at = after.corrected_at.clone().expect("fixture corrected_at");
+    db.connection()
+        .execute(
+            "INSERT INTO human_decision_effect_events
+                (segment_id, reviewer, source, operation_id, operation_payload_hash,
+                 action, served_transcript, decision_transcript,
+                 decision_annotated_transcript, decision_verified, decision_corrected_at,
+                 decision_rationale,
+                 requested_action, requested_transcript, requested_timestamp_ms,
+                 prior_revision, decision_revision,
+                 prior_verified, prior_annotated_transcript, prior_verdict,
+                 prior_verdict_transcript, prior_rationale, prior_escalated, prior_human_decision,
+                 prior_corrected_at, prior_reviewed_by)
+             VALUES (?1, NULL, 'desktop', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                     ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+            params![
+                segment_id,
+                operation_id,
+                operation_payload_hash,
+                action,
+                served_transcript,
+                decision_transcript,
+                after.annotated_transcript,
+                i64::from(after.verified),
+                decision_corrected_at,
+                after.rationale,
+                action,
+                requested_transcript,
+                requested_timestamp_ms,
+                prior_revision,
+                decided_revision,
+                i64::from(before.verified),
+                before.annotated_transcript,
+                before.verdict,
+                before.verdict_transcript,
+                before.rationale,
+                i64::from(before.escalated),
+                before.human_decision,
+                before.corrected_at,
+                before.reviewed_by,
+            ],
+        )
+        .expect("fixture effect");
+    db.connection().last_insert_rowid()
+}
+
+#[cfg(test)]
+fn insert_active_human_example_fixture(
+    db: &Database,
+    example_id: &str,
+    segment_id: &str,
+    wrong_transcript: &str,
+    human_fix: &str,
+    created_at: Option<&str>,
+) -> i64 {
+    let effect_event_id = insert_human_effect_fixture(db, segment_id, "edit", Some(human_fix));
+    db.connection()
+        .execute(
+            "INSERT INTO agent_examples
+                (id, segment_id, wrong_transcript, human_fix, created_at, source,
+                 verified_by_human, effect_event_id)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(?5, datetime('now')), 'human', 1, ?6)",
+            params![example_id, segment_id, wrong_transcript, human_fix, created_at, effect_event_id],
+        )
+        .expect("fixture effect-bound human example");
+    effect_event_id
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EscalatedItem {
@@ -802,6 +921,13 @@ mod tests {
             alignment_quality: None,
             ..SpeechSegment::default()
         }
+    }
+
+    fn legacy_machine_db() -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        db
     }
 
     /// The four escalation causes must be DISTINGUISHABLE, and each must fire only on its own cause.
@@ -917,6 +1043,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn machine_jury_verdict_type_cannot_deserialize_human_truth() {
+        for forbidden in ["human_accept", "human_edit", "human_reject", "reject"] {
+            let encoded = serde_json::to_string(forbidden).unwrap();
+            assert!(
+                serde_json::from_str::<Verdict>(&encoded).is_err(),
+                "{forbidden} must be unrepresentable in the machine jury writer domain"
+            );
+        }
+        for allowed in ["auto_accept", "jury_accept", "jury_edit", "escalated"] {
+            let encoded = serde_json::to_string(allowed).unwrap();
+            assert!(serde_json::from_str::<Verdict>(&encoded).is_ok(), "{allowed} remains a machine verdict");
+        }
+    }
+
     /// An unmeasured signal is not a veto. Absence of a measurement is not evidence of bad audio.
     #[test]
     fn an_unmeasured_snr_or_clipping_never_vetoes() {
@@ -1006,25 +1147,23 @@ mod tests {
         }
         // The RELEVANT example is the OLDEST; two irrelevant examples are newer. Recency alone would
         // surface the newer ones.
-        let conn = db.connection();
-        conn.execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
-             VALUES ('a-rel', 'e-rel', 'ساڵی نوێ پیرۆز', 'ساڵی نوێ پیرۆز بێت', '2020-01-01')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
-             VALUES ('a-new1', 'e-old1', 'کتێبی مێژوو', 'کتێبی مێژووی کورد', '2025-01-01')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
-             VALUES ('a-new2', 'e-old2', 'ئاو هەوا', 'ئاو و هەوا', '2025-06-01')",
-            [],
-        )
-        .unwrap();
+        insert_active_human_example_fixture(
+            &db,
+            "a-rel",
+            "e-rel",
+            "ساڵی نوێ پیرۆز",
+            "ساڵی نوێ پیرۆز بێت",
+            Some("2020-01-01"),
+        );
+        insert_active_human_example_fixture(
+            &db,
+            "a-new1",
+            "e-old1",
+            "کتێبی مێژوو",
+            "کتێبی مێژووی کورد",
+            Some("2025-01-01"),
+        );
+        insert_active_human_example_fixture(&db, "a-new2", "e-old2", "ئاو هەوا", "ئاو و هەوا", Some("2025-06-01"));
 
         let top = get_few_shot_examples(&db, "seg-q", 1).unwrap();
         assert_eq!(top.len(), 1);
@@ -1034,6 +1173,90 @@ mod tests {
         db.insert_segment(&make_seg("seg-empty", "")).unwrap();
         let recency = get_few_shot_examples(&db, "seg-empty", 1).unwrap();
         assert_eq!(recency[0].id, "a-new2", "no segment text -> recency fallback returns the newest");
+    }
+
+    #[test]
+    fn few_shot_effect_bound_example_requires_an_effective_edit() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_segment(&make_seg("effect-example", "دەقی غەڵەت")).unwrap();
+        db.insert_segment(&make_seg("effect-query", "دەقی ڕاست")).unwrap();
+        let effect_event_id = insert_active_human_example_fixture(
+            &db,
+            "effect-example-row",
+            "effect-example",
+            "دەقی غەڵەت",
+            "دەقی ڕاست",
+            None,
+        );
+
+        assert_eq!(get_few_shot_examples(&db, "effect-query", 10).unwrap().len(), 1);
+
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_reversals(effect_event_id, operation_id)
+                 VALUES (?1, 'few-shot-effect-undo')",
+                [effect_event_id],
+            )
+            .unwrap();
+        assert!(
+            get_few_shot_examples(&db, "effect-query", 10).unwrap().is_empty(),
+            "an append-only example whose owning effect was reversed must not remain learnable"
+        );
+    }
+
+    #[test]
+    fn few_shot_legacy_example_requires_current_verified_edit_with_matching_text() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        db.insert_segment(&make_seg("legacy-example", "wrong draft")).unwrap();
+        db.insert_segment(&make_seg("legacy-query", "human fix")).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET verified = 1, human_decision = 'edit', verdict_transcript = 'Human   Fix'
+                  WHERE id = 'legacy-example'",
+                [],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
+                 VALUES ('legacy-example-row', 'legacy-example', 'wrong draft', 'human fix')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+
+        assert_eq!(get_few_shot_examples(&db, "legacy-query", 10).unwrap().len(), 1);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET verdict_transcript = 'different correction'
+                  WHERE id = 'legacy-example'",
+                [],
+            )
+            .unwrap();
+        assert!(get_few_shot_examples(&db, "legacy-query", 10).unwrap().is_empty());
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET verdict_transcript = '  HUMAN fix  '
+                  WHERE id = 'legacy-example'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            get_few_shot_examples(&db, "legacy-query", 10).unwrap().len(),
+            1,
+            "the shared semantic key must tolerate case and whitespace-only differences"
+        );
+        db.connection()
+            .execute("UPDATE speech_segments SET human_decision = 'accept' WHERE id = 'legacy-example'", [])
+            .unwrap();
+        assert!(get_few_shot_examples(&db, "legacy-query", 10).unwrap().is_empty());
+        let physical_rows: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM agent_examples", [], |row| row.get(0)).unwrap();
+        assert_eq!(physical_rows, 1, "legacy evidence remains physically preserved");
     }
 
     #[test]
@@ -1052,19 +1275,9 @@ mod tests {
         db.insert_segment(&ok).unwrap();
         db.insert_segment(&make_seg("seg-q", "کوردی باشە")).unwrap();
 
+        insert_active_human_example_fixture(&db, "a-held", "seg-held", "کوردی", "کوردی باشە", Some("2024-01-01"));
+        insert_active_human_example_fixture(&db, "a-ok", "seg-ok", "کوردی", "کوردی باشە", Some("2024-01-02"));
         let conn = db.connection();
-        conn.execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
-             VALUES ('a-held', 'seg-held', 'کوردی', 'کوردی باشە', '2024-01-01')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix, created_at)
-             VALUES ('a-ok', 'seg-ok', 'کوردی', 'کوردی باشە', '2024-01-02')",
-            [],
-        )
-        .unwrap();
         // Promote the first clip to a HOLDOUT gold reference (same audio_path).
         conn.execute(
             "INSERT INTO gold_segments (id, audio_path, reference, is_holdout)
@@ -1141,8 +1354,7 @@ mod tests {
     #[test]
     fn run_t0_gate_observe_writes_no_verdict_unlike_actconfirm() {
         use crate::settings::AutonLevel;
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         db.insert_segment(&make_seg("s-dial", "کوردستان")).unwrap();
         // Two disagreeing hypotheses -> the base gate escalates this segment.
         for (m, t) in [("gemini", "کوردستان"), ("asr-1b", "ئێران")] {
@@ -1179,7 +1391,10 @@ mod tests {
         db.insert_segment(&make_seg("s-hv", "raw text")).unwrap();
         db.record_human_decision("s-hv", "accept", None, None).unwrap();
 
-        write_verdict(&db, "s-hv", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        assert!(
+            write_verdict(&db, "s-hv", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).is_err(),
+            "schema-v60+ machine verdicts fail before touching human truth"
+        );
 
         let seg = db.get_segment_by_id("s-hv").unwrap().unwrap();
         assert_eq!(seg.verdict.as_deref(), Some("human_accept"), "T0 write_verdict clobbered the human decision");
@@ -1194,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn write_verdict_never_touches_a_flag_verified_row_and_preserves_its_own_proposal() {
+    fn write_verdict_is_disabled_for_flag_verified_and_open_rows() {
         // Audit #17: the guard checked human_decision/verdict but not `verified` — a clip the human
         // closed out with the verify flag alone still had its verdict columns restamped by the jury.
         // Audit #18: parity with db::write_segment_verdict — the machine's own committed text is
@@ -1204,22 +1419,24 @@ mod tests {
         db.initialize().unwrap();
 
         db.insert_segment(&make_seg("s-flag", "raw text")).unwrap();
-        db.update_verified("s-flag", true).unwrap();
-        write_verdict(&db, "s-flag", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        db.update_verified_for_test("s-flag", true).unwrap();
+        assert!(write_verdict(&db, "s-flag", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9))
+            .is_err());
         let seg = db.get_segment_by_id("s-flag").unwrap().unwrap();
         assert_eq!(seg.verdict, None, "a flag-verified row must not be restamped by the machine jury");
 
         db.insert_segment(&make_seg("s-open", "raw text")).unwrap();
-        write_verdict(&db, "s-open", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9)).unwrap();
+        assert!(write_verdict(&db, "s-open", Verdict::AutoAccept, Some("machine consensus"), None, None, Some(0.9))
+            .is_err());
         let jt: Option<String> = db
             .connection()
             .query_row("SELECT jury_transcript FROM speech_segments WHERE id = 's-open'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(jt.as_deref(), Some("machine consensus"), "the jury's own proposal is preserved (v48 parity)");
+        assert_eq!(jt, None, "a disabled writer must leave the open row untouched");
     }
 
     #[test]
-    fn write_verdict_records_t0_t1_in_decision_verdicts() {
+    fn disabled_write_verdict_records_no_t0_t1_classification() {
         // P1.2: the IRT-consensus jury path previously wrote NO decision_verdicts row, so auto-accepts
         // from the main jury were invisible to the C4 auto-accept-precision denominator. Now
         // AutoAccept -> T0_ACCEPT, Escalated -> T1_ESCALATE, and a late write over a human decision
@@ -1231,9 +1448,9 @@ mod tests {
         db.insert_segment(&make_seg("hv", "raw c")).unwrap();
         db.record_human_decision("hv", "accept", None, None).unwrap();
 
-        write_verdict(&db, "t0", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).unwrap();
-        write_verdict(&db, "t1", Verdict::Escalated, None, None, None, None).unwrap();
-        write_verdict(&db, "hv", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).unwrap();
+        assert!(write_verdict(&db, "t0", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).is_err());
+        assert!(write_verdict(&db, "t1", Verdict::Escalated, None, None, None, None).is_err());
+        assert!(write_verdict(&db, "hv", Verdict::AutoAccept, Some("machine"), None, None, Some(0.9)).is_err());
 
         let count_of = |id: &str, verd: &str| -> i64 {
             db.connection()
@@ -1244,8 +1461,8 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(count_of("t0", "T0_ACCEPT"), 1, "AutoAccept must record a T0 verdict row");
-        assert_eq!(count_of("t1", "T1_ESCALATE"), 1, "Escalated must record a T1 verdict row");
+        assert_eq!(count_of("t0", "T0_ACCEPT"), 0, "a disabled writer records no T0 verdict row");
+        assert_eq!(count_of("t1", "T1_ESCALATE"), 0, "a disabled writer records no T1 verdict row");
         let hv_rows: i64 = db
             .connection()
             .query_row("SELECT COUNT(*) FROM decision_verdicts WHERE segment_id = 'hv'", [], |r| r.get(0))
@@ -1260,8 +1477,7 @@ mod tests {
         // calibrate ANY SNR bucket, the gate must fail closed (escalate) rather than auto-accept against
         // an uncalibrated/clean-dominated threshold borrowed from another condition.
         use crate::settings::AutonLevel;
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
+        let db = legacy_machine_db();
         db.insert_segment(&make_seg("s-uncal", "کوردستان")).unwrap(); // snr_db None → unknown bucket (4)
         for (m, t) in [("omniasr-ctc-300m", "کوردستان"), ("omniasr-ctc-1b", "کوردستان")] {
             db.insert_hypothesis(&SegmentHypothesis {

@@ -1,8 +1,10 @@
-use crate::db::SpeechSegment;
+use crate::db::{SpeakerAssignmentChange, SpeechSegment};
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
+
+const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Represents a reversible change to the dataset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,46 +18,72 @@ pub enum Command {
         segments: Vec<SpeechSegment>,
     },
     BatchTranscribe {
-        /// Full snapshots of each segment *before* transcription ran.
-        /// Used to fully restore raw_transcript, normalized_transcript,
-        /// annotated_transcript, and confidence on undo.
+        /// Full snapshots immediately before and after the batch's durable ASR writes. Both endpoints
+        /// are required for compare-and-set Undo and deterministic Redo.
         previous_segments: Vec<SpeechSegment>,
+        current_segments: Vec<SpeechSegment>,
+    },
+    SpeakerAssignment {
+        changes: Vec<SpeakerAssignmentChange>,
     },
 }
 
+/// Stable, locale-neutral identity of a reversible action. Human-readable copy belongs to the
+/// renderer's typed i18n catalog; backend implementation strings must never cross IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAction {
+    UpdateSegment,
+    DeleteSegments,
+    BatchTranscribe,
+    SpeakerAssignment,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryEntry {
+    command: Command,
+    estimated_bytes: usize,
+}
+
 impl Command {
-    pub fn description(&self) -> &str {
+    pub fn action(&self) -> HistoryAction {
         match self {
-            Command::UpdateSegment { .. } => "Update segment",
-            Command::DeleteSegments { .. } => "Delete segments",
-            Command::BatchTranscribe { .. } => "Batch transcribe",
+            Command::UpdateSegment { .. } => HistoryAction::UpdateSegment,
+            Command::DeleteSegments { .. } => HistoryAction::DeleteSegments,
+            Command::BatchTranscribe { .. } => HistoryAction::BatchTranscribe,
+            Command::SpeakerAssignment { .. } => HistoryAction::SpeakerAssignment,
         }
     }
 }
 
 pub struct HistoryManager {
-    undo_stack: Mutex<VecDeque<Command>>,
-    redo_stack: Mutex<VecDeque<Command>>,
+    undo_stack: Mutex<VecDeque<HistoryEntry>>,
+    redo_stack: Mutex<VecDeque<HistoryEntry>>,
     max_history: usize,
+    max_bytes: usize,
 }
 
 impl HistoryManager {
     pub fn new(max_history: usize) -> Self {
+        Self::with_limits(max_history, MAX_HISTORY_BYTES)
+    }
+
+    fn with_limits(max_history: usize, max_bytes: usize) -> Self {
         Self {
             undo_stack: Mutex::new(VecDeque::with_capacity(max_history.min(256))),
             redo_stack: Mutex::new(VecDeque::new()),
             max_history,
+            max_bytes,
         }
     }
 
-    fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<Command>> {
+    fn lock_undo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>> {
         self.undo_stack.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned undo history stack");
             poisoned.into_inner()
         })
     }
 
-    fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<Command>> {
+    fn lock_redo_stack(&self) -> MutexGuard<'_, VecDeque<HistoryEntry>> {
         self.redo_stack.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned redo history stack");
             poisoned.into_inner()
@@ -65,10 +93,18 @@ impl HistoryManager {
     pub fn push(&self, cmd: Command) {
         {
             let mut stack = self.lock_undo_stack();
-            stack.push_back(cmd);
+            // Serialized size is a conservative, schema-aware proxy for retained heap. Measure once
+            // when the command enters history; large batch inverses must not multiply into gigabytes
+            // merely because the count-based history limit is 500.
+            let estimated_bytes = serde_json::to_vec(&cmd).map_or(usize::MAX, |bytes| bytes.len());
+            stack.push_back(HistoryEntry { command: cmd, estimated_bytes });
             // VecDeque::pop_front is O(1); was O(N) with Vec::remove(0).
-            while stack.len() > self.max_history {
-                stack.pop_front();
+            let mut retained_bytes =
+                stack.iter().fold(0usize, |total, entry| total.saturating_add(entry.estimated_bytes));
+            while stack.len() > self.max_history || (stack.len() > 1 && retained_bytes > self.max_bytes) {
+                if let Some(removed) = stack.pop_front() {
+                    retained_bytes = retained_bytes.saturating_sub(removed.estimated_bytes);
+                }
             }
         }
         // Clear redo stack on new action.
@@ -90,34 +126,44 @@ impl HistoryManager {
         history: &HistoryManager,
         segment: &SpeechSegment,
     ) -> AppResult<()> {
+        let effect_bound_schema = crate::migrations::get_current_version(db)? >= 60;
         if let Some(previous) = db.get_segment_by_id(&segment.id)? {
-            db.insert_segment(segment)?;
-            history.record_segment_update(previous, segment.clone());
+            if effect_bound_schema {
+                db.persist_machine_segment_snapshot(&previous, segment)?;
+            } else {
+                db.insert_segment(segment)?;
+            }
+            let current = db.get_segment_by_id(&segment.id)?.ok_or_else(|| {
+                crate::error::AppError::Other(format!("segment {} disappeared after its update", segment.id))
+            })?;
+            history.record_segment_update(previous, current);
+        } else if effect_bound_schema {
+            db.insert_machine_segment_snapshot(segment)?;
         } else {
             db.insert_segment(segment)?;
         }
         Ok(())
     }
 
-    pub fn undo(&self, db: &crate::db::Database) -> AppResult<Option<String>> {
+    pub fn undo(&self, db: &crate::db::Database) -> AppResult<Option<HistoryAction>> {
         let cmd = {
             let mut stack = self.lock_undo_stack();
             stack.pop_back()
         };
         match cmd {
-            Some(cmd) => {
-                let description = cmd.description().to_string();
+            Some(entry) => {
+                let action = entry.command.action();
                 // Apply BEFORE moving the command to the redo stack, and on failure put it BACK on the
                 // undo stack it came from — never drop it from BOTH stacks. Popping first and pushing only
                 // on success means a failing apply (e.g. a DB error) would destroy the command and desync
                 // the stacks, corrupting history and mis-ordering future undo/redo.
-                match self.apply_undo(db, &cmd) {
+                match self.apply_undo(db, &entry.command) {
                     Ok(()) => {
-                        self.lock_redo_stack().push_back(cmd);
-                        Ok(Some(description))
+                        self.lock_redo_stack().push_back(entry);
+                        Ok(Some(action))
                     }
                     Err(e) => {
-                        self.lock_undo_stack().push_back(cmd);
+                        self.lock_undo_stack().push_back(entry);
                         Err(e)
                     }
                 }
@@ -126,27 +172,27 @@ impl HistoryManager {
         }
     }
 
-    pub fn redo(&self, db: &crate::db::Database) -> AppResult<Option<String>> {
+    pub fn redo(&self, db: &crate::db::Database) -> AppResult<Option<HistoryAction>> {
         let cmd = {
             let mut stack = self.lock_redo_stack();
             stack.pop_back()
         };
         match cmd {
-            Some(cmd) => {
-                let description = cmd.description().to_string();
+            Some(entry) => {
+                let action = entry.command.action();
                 // Same invariant as undo: only move the command to the undo stack if the redo actually
                 // applied, and keep it on the redo stack if apply_redo fails. An unsupported redo
                 // (Command::BatchTranscribe returns Err) would otherwise DESTROY the popped command,
                 // leaving can_redo()=false and the DB stranded in the undone state with no recovery, and
                 // corrupting the stacks. Re-pushing on failure preserves the entry so the user is never
                 // silently stranded.
-                match self.apply_redo(db, &cmd) {
+                match self.apply_redo(db, &entry.command) {
                     Ok(()) => {
-                        self.lock_undo_stack().push_back(cmd);
-                        Ok(Some(description))
+                        self.lock_undo_stack().push_back(entry);
+                        Ok(Some(action))
                     }
                     Err(e) => {
-                        self.lock_redo_stack().push_back(cmd);
+                        self.lock_redo_stack().push_back(entry);
                         Err(e)
                     }
                 }
@@ -157,42 +203,21 @@ impl HistoryManager {
 
     fn apply_undo(&self, db: &crate::db::Database, cmd: &Command) -> AppResult<()> {
         match cmd {
-            Command::UpdateSegment { previous, .. } => {
-                if db.get_segment_by_id(&previous.id)?.is_some() {
-                    db.insert_segment(previous)?;
-                } else {
-                    // The segment was deleted (by a divergent/external path) after this edit, so there is
-                    // nothing to revert to its previous state. FAIL the undo instead of silently reporting
-                    // success and pushing a no-op onto the redo stack — undo()/redo() keep the command on
-                    // the undo stack on Err, so the user sees an honest failure, not a phantom "undone".
-                    return Err(crate::error::AppError::Validation(format!(
-                        "Cannot undo the edit of segment {}: it no longer exists",
-                        previous.id
-                    )));
-                }
+            Command::UpdateSegment { previous, current, .. } => {
+                // The atomic compare-and-set refuses missing or stale rows and leaves the command on
+                // the undo stack on failure; a no-op can never be reported as a successful Undo.
+                db.apply_history_machine_snapshot_atomic(current, previous)?;
             }
             Command::DeleteSegments { segments } => {
-                for seg in segments {
-                    if db.get_segment_by_id(&seg.id)?.is_none() {
-                        // The row was HARD-deleted, so this is a fresh INSERT (NOT a normal edit) — use
-                        // the full-column restore so the jury/review columns (verdict, human_decision,
-                        // is_gold, ...) and the original created_at survive. insert_segment only writes 17
-                        // columns and omits them, so on a from-nothing resurrect it would silently wipe the
-                        // human's verdict / gold flag / curated provenance and re-stamp created_at to now,
-                        // making undo destructive.
-                        db.insert_segment_full(seg)?;
-                    }
-                }
+                // Validate and restore every row inside one writer-held savepoint. A trigger, disk
+                // error, stale id, or commit failure must restore zero rows rather than a prefix.
+                db.apply_deleted_segments_history(segments, false)?;
             }
-            Command::BatchTranscribe { previous_segments } => {
-                for prev in previous_segments {
-                    // Restore the full pre-transcription state — not just raw_transcript.
-                    // This ensures normalized_transcript, annotated_transcript, and
-                    // confidence are also reverted, not silently left dirty.
-                    if db.get_segment_by_id(&prev.id)?.is_some() {
-                        db.insert_segment(prev)?;
-                    }
-                }
+            Command::BatchTranscribe { previous_segments, current_segments } => {
+                db.apply_batch_transcription_history(previous_segments, current_segments, false)?;
+            }
+            Command::SpeakerAssignment { changes } => {
+                db.apply_speaker_assignment_history(changes, false)?;
             }
         }
         Ok(())
@@ -200,22 +225,19 @@ impl HistoryManager {
 
     fn apply_redo(&self, db: &crate::db::Database, cmd: &Command) -> AppResult<()> {
         match cmd {
-            Command::UpdateSegment { current, .. } => {
-                if db.get_segment_by_id(&current.id)?.is_some() {
-                    db.insert_segment(current)?;
-                }
+            Command::UpdateSegment { previous, current, .. } => {
+                db.apply_history_machine_snapshot_atomic(previous, current)?;
             }
             Command::DeleteSegments { segments } => {
-                for seg in segments {
-                    if db.get_segment_by_id(&seg.id)?.is_some() {
-                        db.delete_segment(&seg.id)?;
-                    }
-                }
+                // Redo is compare-and-set against the exact restored snapshots. If any row was
+                // edited, removed, or gained authority after Undo, delete none of them.
+                db.apply_deleted_segments_history(segments, true)?;
             }
-            Command::BatchTranscribe { .. } => {
-                // BatchTranscribe redo is not supported — the original ASR result
-                // would need to be stored in the command for deterministic replay.
-                return Err(crate::error::AppError::Other("BatchTranscribe redo is not supported".into()));
+            Command::BatchTranscribe { previous_segments, current_segments } => {
+                db.apply_batch_transcription_history(previous_segments, current_segments, true)?;
+            }
+            Command::SpeakerAssignment { changes } => {
+                db.apply_speaker_assignment_history(changes, true)?;
             }
         }
         Ok(())
@@ -234,12 +256,12 @@ impl HistoryManager {
         self.lock_redo_stack().clear();
     }
 
-    pub fn undo_description(&self) -> Option<String> {
-        self.lock_undo_stack().back().map(|c| c.description().to_string())
+    pub fn undo_action(&self) -> Option<HistoryAction> {
+        self.lock_undo_stack().back().map(|entry| entry.command.action())
     }
 
-    pub fn redo_description(&self) -> Option<String> {
-        self.lock_redo_stack().back().map(|c| c.description().to_string())
+    pub fn redo_action(&self) -> Option<HistoryAction> {
+        self.lock_redo_stack().back().map(|entry| entry.command.action())
     }
 }
 
@@ -312,6 +334,84 @@ mod tests {
     }
 
     #[test]
+    fn stale_machine_history_preserves_a_later_human_effect_on_undo_and_redo() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let original = make_segment("history-after-review", "machine before");
+        db.insert_segment(&original).unwrap();
+        let updated = SpeechSegment {
+            raw_transcript: "machine after".to_string(),
+            speaker_id: Some("speaker-a".to_string()),
+            ..original.clone()
+        };
+        db.insert_segment(&updated).unwrap();
+        history.record_segment_update(original, updated);
+
+        db.finalize_human_review("history-after-review", "accept", Some("machine after"), Some(10), None)
+            .expect("server-owned decision effect");
+        let reviewed = db.get_segment_by_id("history-after-review").unwrap().unwrap();
+        let effect_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='history-after-review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effect_count, 1);
+
+        history.undo(&db).expect("machine undo after review");
+        let undone = db.get_segment_by_id("history-after-review").unwrap().unwrap();
+        assert_eq!(undone.raw_transcript, "machine before");
+        assert!(crate::db::review_owned_projection_matches(&undone, &reviewed));
+        assert_eq!(
+            db.connection()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='history-after-review'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            1,
+            "generic undo must not rewrite or duplicate the decision effect"
+        );
+
+        history.redo(&db).expect("machine redo after review");
+        let redone = db.get_segment_by_id("history-after-review").unwrap().unwrap();
+        assert_eq!(redone.raw_transcript, "machine after");
+        assert_eq!(redone.speaker_id.as_deref(), Some("speaker-a"));
+        assert!(crate::db::review_owned_projection_matches(&redone, &reviewed));
+    }
+
+    #[test]
+    fn history_refuses_review_or_source_identity_endpoints_without_mutation() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        let original = make_segment("history-protected", "machine before");
+        db.insert_segment(&original).unwrap();
+        let machine_current = SpeechSegment { raw_transcript: "machine after".to_string(), ..original.clone() };
+        db.insert_segment(&machine_current).unwrap();
+
+        let mut forged_review_endpoint = machine_current.clone();
+        forged_review_endpoint.annotated_transcript = Some("stale annotation".to_string());
+        forged_review_endpoint.verified = true;
+        history.record_segment_update(forged_review_endpoint, machine_current.clone());
+        let review_error = history.undo(&db).unwrap_err();
+        assert!(review_error.to_string().contains("review-owned truth"), "unexpected refusal: {review_error}");
+        let retained = db.get_segment_by_id("history-protected").unwrap().unwrap();
+        assert_eq!(retained.raw_transcript, "machine after");
+        assert!(retained.annotated_transcript.is_none() && !retained.verified);
+
+        history.clear();
+        let mut different_source = original.clone();
+        different_source.audio_path = "other-source.wav".to_string();
+        history.record_segment_update(different_source, machine_current);
+        let source_error = history.undo(&db).unwrap_err();
+        assert!(source_error.to_string().contains("protected source identity"), "unexpected refusal: {source_error}");
+        assert_eq!(db.get_segment_by_id("history-protected").unwrap().unwrap().raw_transcript, "machine after");
+    }
+
+    #[test]
     fn undo_of_an_update_fails_when_the_segment_was_deleted_rather_than_silently_succeeding() {
         let db = setup_db();
         let history = HistoryManager::new(100);
@@ -336,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_delete_restores_full_jury_and_gold_state() {
+    fn reviewed_gold_state_cannot_enter_delete_undo_history() {
         let db = setup_db();
         let history = HistoryManager::new(100);
         // A reviewed, gold segment carrying jury/human state.
@@ -347,21 +447,18 @@ mod tests {
         seg.is_gold = true;
         seg.agreement_score = Some(0.9);
         seg.rationale = Some("reviewed".to_string());
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
 
-        // Snapshot exactly what the delete command captures, delete, then undo.
-        let snapshot = db.get_segment_by_id("g1").unwrap().unwrap();
-        assert_eq!(snapshot.verdict.as_deref(), Some("human_accept"));
-        db.delete_segment("g1").unwrap();
-        history.push(Command::DeleteSegments { segments: vec![snapshot] });
-        assert!(db.get_segment_by_id("g1").unwrap().is_none());
+        let err = db.delete_segment("g1").expect_err("reviewed/gold authority must be append-only");
+        assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
+        assert!(!history.can_undo(), "a refused delete must never create a fictitious history command");
 
-        history.undo(&db).unwrap();
-        let restored = db.get_segment_by_id("g1").unwrap().unwrap();
-        assert_eq!(restored.verdict.as_deref(), Some("human_accept"), "verdict must survive undo of delete");
-        assert_eq!(restored.human_decision.as_deref(), Some("human_edit"), "human_decision must survive");
-        assert!(restored.is_gold, "is_gold must survive undo of delete");
-        assert_eq!(restored.agreement_score, Some(0.9), "agreement_score must survive");
+        let retained = db.get_segment_by_id("g1").unwrap().unwrap();
+        assert_eq!(retained.verdict.as_deref(), Some("human_accept"));
+        assert_eq!(retained.human_decision.as_deref(), Some("human_edit"));
+        assert!(retained.is_gold);
+        assert_eq!(retained.agreement_score, Some(0.9));
+        assert_eq!(retained.rationale.as_deref(), Some("reviewed"));
     }
 
     #[test]
@@ -380,22 +477,31 @@ mod tests {
         // foreign key so the trail survives deletion of the audited row. This asserts spot_checks
         // holds the same line.
         let db = setup_db();
-        let history = HistoryManager::new(100);
         let mut seg = make_segment("sc1", "دەقی هەڵە");
         seg.verified = true;
         seg.human_decision = Some("edit".to_string());
         seg.verdict = Some("human_edit".to_string());
         seg.verdict_transcript = Some("دەقی ڕاست".to_string());
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?1,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}'
+                  WHERE id = 'sc1'",
+                [blake3::hash(b"history-spot-check-sc1").to_hex().to_string()],
+            )
+            .unwrap();
         db.record_spot_check("sc1", "Sara", "edit", "دەقی ڕاست", "دەقی ڕاست").unwrap();
         assert_eq!(db.spot_check_report().unwrap().len(), 1, "the score exists before the delete");
 
-        let snapshot = db.get_segment_by_id("sc1").unwrap().unwrap();
-        db.delete_segment("sc1").unwrap();
-        history.push(Command::DeleteSegments { segments: vec![snapshot] });
-        history.undo(&db).unwrap();
+        let error = db.delete_segment("sc1").unwrap_err();
+        assert!(
+            error.to_string().contains("FOREIGN KEY") || error.to_string().contains("review"),
+            "durable reviewer evidence must make deletion fail closed: {error}"
+        );
 
-        assert!(db.get_segment_by_id("sc1").unwrap().is_some(), "the clip itself comes back");
+        assert!(db.get_segment_by_id("sc1").unwrap().is_some(), "the refused deletion preserves the clip");
         let report = db.spot_check_report().unwrap();
         assert_eq!(
             report.len(),
@@ -422,7 +528,7 @@ mod tests {
         let mut seg = make_segment("mx1", "دەق");
         // 0.4121: a clip the owner heard as turn-taking in the blind listening pass.
         seg.speaker_change_score = Some(0.4121);
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
 
         let snapshot = db.get_segment_by_id("mx1").unwrap().unwrap();
         assert_eq!(snapshot.speaker_change_score, Some(0.4121), "the score is stored before the delete");
@@ -439,18 +545,21 @@ mod tests {
     }
 
     #[test]
-    fn redo_of_unsupported_batch_transcribe_keeps_the_command() {
+    fn batch_transcribe_redo_reapplies_the_exact_recorded_endpoint() {
         let db = setup_db();
         let history = HistoryManager::new(100);
         let prev = make_segment("b1", "old");
         db.insert_segment(&prev).unwrap();
-        history.push(Command::BatchTranscribe { previous_segments: vec![prev] });
+        let previous = db.get_segment_by_id("b1").unwrap().unwrap();
+        let mut updated = previous.clone();
+        updated.raw_transcript = "champion draft".into();
+        db.insert_segment(&updated).unwrap();
+        let current = db.get_segment_by_id("b1").unwrap().unwrap();
+        history.push(Command::BatchTranscribe { previous_segments: vec![previous], current_segments: vec![current] });
         history.undo(&db).unwrap(); // moves it to the redo stack
         assert!(history.can_redo());
-        // BatchTranscribe redo is unsupported (returns Err) — but the command must NOT vanish from the
-        // stacks, or future undo/redo would mis-order.
-        assert!(history.redo(&db).is_err());
-        assert!(history.can_redo(), "the unredoable command must remain on the redo stack, not be lost");
+        assert_eq!(history.redo(&db).unwrap(), Some(HistoryAction::BatchTranscribe));
+        assert_eq!(db.get_segment_by_id("b1").unwrap().unwrap().raw_transcript, "champion draft");
     }
 
     #[test]
@@ -481,7 +590,7 @@ mod tests {
     // insert_segment would drop every jury/gold/created_at column to its default, silently wiping the
     // curated decision and gold-anchor status. This pins insert_segment_full so the restore is lossless.
     #[test]
-    fn test_undo_delete_preserves_jury_gold_and_created_at() {
+    fn reviewed_jury_gold_and_created_at_survive_a_refused_delete() {
         let db = setup_db();
         let history = HistoryManager::new(100);
 
@@ -505,55 +614,56 @@ mod tests {
             ..SpeechSegment::default()
         };
         // Persist the fully-provenanced row, then read it back as the snapshot the delete would capture.
-        db.insert_segment_full(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
         let snapshot = db.get_segment_by_id("prov1").unwrap().unwrap();
         assert_eq!(snapshot.verdict.as_deref(), Some("human_edit"));
         assert_eq!(snapshot.created_at.as_deref(), Some("2020-01-02 03:04:05"));
 
-        // Hard-delete, then undo via the command holding the full snapshot.
-        db.delete_segment("prov1").unwrap();
-        assert!(db.get_segment_by_id("prov1").unwrap().is_none());
-        history.push(Command::DeleteSegments { segments: vec![snapshot] });
-        history.undo(&db).unwrap();
+        let err = db.delete_segment("prov1").expect_err("reviewed/gold authority must refuse deletion");
+        assert!(err.to_string().contains("durable review authority"), "unexpected refusal: {err}");
+        assert!(!history.can_undo(), "a refused delete must not add an undo entry");
 
-        let restored = db.get_segment_by_id("prov1").unwrap().expect("row restored");
-        assert_eq!(restored.verdict.as_deref(), Some("human_edit"), "verdict must survive undo");
+        let retained = db.get_segment_by_id("prov1").unwrap().expect("authoritative row retained");
+        assert_eq!(retained.verdict.as_deref(), Some("human_edit"), "verdict must survive refusal");
         assert_eq!(
-            restored.verdict_transcript.as_deref(),
+            retained.verdict_transcript.as_deref(),
             Some("dîtina rast a mirov"),
-            "human-corrected transcript must survive undo"
+            "human-corrected transcript must survive refusal"
         );
-        assert_eq!(restored.human_decision.as_deref(), Some("edit"), "human_decision must survive undo");
-        assert_eq!(restored.corrected_at.as_deref(), Some("2020-01-03 09:00:00"));
-        assert!(restored.is_gold, "gold-anchor status must survive undo");
-        assert!(restored.escalated, "escalated flag must survive undo");
-        assert_eq!(restored.agreement_score, Some(0.91));
-        assert_eq!(restored.rationale.as_deref(), Some("human corrected the failed ASR"));
-        assert_eq!(restored.evidence_json.as_deref(), Some("{\"src\":\"human\"}"));
+        assert_eq!(retained.human_decision.as_deref(), Some("edit"));
+        assert_eq!(retained.corrected_at.as_deref(), Some("2020-01-03 09:00:00"));
+        assert!(retained.is_gold);
+        assert!(retained.escalated);
+        assert_eq!(retained.agreement_score, Some(0.91));
+        assert_eq!(retained.rationale.as_deref(), Some("human corrected the failed ASR"));
+        assert_eq!(retained.evidence_json.as_deref(), Some("{\"src\":\"human\"}"));
         assert_eq!(
-            restored.created_at.as_deref(),
+            retained.created_at.as_deref(),
             Some("2020-01-02 03:04:05"),
-            "created_at must be preserved, not re-stamped to now() (it orders every export)"
+            "created_at must remain unchanged because it orders every export"
         );
     }
 
     #[test]
     fn failed_redo_keeps_the_command_on_the_redo_stack() {
-        // Round-18: redo() popped the command BEFORE apply_redo, so an unsupported BatchTranscribe redo
-        // (apply_redo returns Err) DROPPED the command — leaving can_redo()=false and the DB stranded in
-        // the undone state with no recovery. A failed redo must keep the command so the user is never
-        // silently stranded.
+        // A stale compare-and-set failure must keep the command so the user is never silently stranded.
         let db = setup_db();
         let history = HistoryManager::new(100);
         let seg = make_segment("bt1", "before");
         db.insert_segment(&seg).unwrap();
-
-        history.push(Command::BatchTranscribe { previous_segments: vec![seg.clone()] });
+        let previous = db.get_segment_by_id("bt1").unwrap().unwrap();
+        let mut updated = previous.clone();
+        updated.raw_transcript = "batch endpoint".into();
+        db.insert_segment(&updated).unwrap();
+        let current = db.get_segment_by_id("bt1").unwrap().unwrap();
+        history.push(Command::BatchTranscribe { previous_segments: vec![previous], current_segments: vec![current] });
         history.undo(&db).unwrap(); // moves the command onto the redo stack
         assert!(history.can_redo(), "redo is available after undo");
 
-        // BatchTranscribe redo is unsupported -> Err, but the command must survive.
-        assert!(history.redo(&db).is_err(), "BatchTranscribe redo is unsupported and errors");
+        let mut later = db.get_segment_by_id("bt1").unwrap().unwrap();
+        later.raw_transcript = "later machine edit".into();
+        db.insert_segment(&later).unwrap();
+        assert!(history.redo(&db).is_err(), "stale batch Redo must fail closed");
         assert!(history.can_redo(), "a failed redo must NOT drop the command from the redo stack");
     }
 
@@ -565,6 +675,32 @@ mod tests {
         }
         // VecDeque evicts oldest (front) entries; should have exactly max_history items.
         assert_eq!(history.undo_stack.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn history_memory_budget_evicts_old_batches_but_keeps_the_latest_action_recoverable() {
+        let history = HistoryManager::with_limits(100, 1);
+        history.push(Command::SpeakerAssignment {
+            changes: vec![SpeakerAssignmentChange {
+                segment_id: "older".into(),
+                previous_speaker_id: Some("a".into()),
+                current_speaker_id: Some("b".into()),
+            }],
+        });
+        history.push(Command::SpeakerAssignment {
+            changes: vec![SpeakerAssignmentChange {
+                segment_id: "latest".into(),
+                previous_speaker_id: Some("b".into()),
+                current_speaker_id: Some("c".into()),
+            }],
+        });
+
+        let stack = history.undo_stack.lock().unwrap();
+        assert_eq!(stack.len(), 1, "the byte budget must evict the older retained batch");
+        assert!(matches!(
+            stack.back().map(|entry| &entry.command),
+            Some(Command::SpeakerAssignment { changes }) if changes[0].segment_id == "latest"
+        ));
     }
 
     #[test]
@@ -582,7 +718,7 @@ mod tests {
         history.push(Command::DeleteSegments { segments: vec![make_segment("poisoned", "")] });
 
         assert!(history.can_undo());
-        assert_eq!(history.undo_description(), Some("Delete segments".to_string()));
+        assert_eq!(history.undo_action(), Some(HistoryAction::DeleteSegments));
         history.clear();
         assert!(!history.can_undo());
         assert!(!history.can_redo());
@@ -601,7 +737,7 @@ mod tests {
         HistoryManager::persist_segment_update(&db, &history, &updated).unwrap();
 
         assert!(history.can_undo());
-        assert_eq!(history.undo_description(), Some("Update segment".to_string()));
+        assert_eq!(history.undo_action(), Some(HistoryAction::UpdateSegment));
 
         history.undo(&db).unwrap();
         let restored = db.get_segment_by_id("persist1").unwrap().unwrap();
@@ -640,9 +776,13 @@ mod tests {
         updated.normalized_transcript = Some("new normalized".to_string());
         updated.confidence = Some(0.5);
         db.insert_segment(&updated).unwrap();
+        let updated = db.get_segment_by_id("bt1").unwrap().unwrap();
 
         // Record undo with full snapshot of original.
-        history.push(Command::BatchTranscribe { previous_segments: vec![original.clone()] });
+        history.push(Command::BatchTranscribe {
+            previous_segments: vec![original.clone()],
+            current_segments: vec![updated],
+        });
 
         // Undo — should restore ALL fields.
         let desc = history.undo(&db).unwrap();
@@ -651,5 +791,92 @@ mod tests {
         assert_eq!(restored.raw_transcript, "old raw");
         assert_eq!(restored.normalized_transcript.as_deref(), Some("old normalized"));
         assert!((restored.confidence.unwrap() - 0.9).abs() < 1e-9, "confidence not fully restored");
+    }
+
+    #[test]
+    fn multi_row_delete_undo_rolls_back_the_complete_restore_on_late_failure() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        for id in ["restore-a", "restore-b"] {
+            db.insert_segment(&make_segment(id, id)).unwrap();
+        }
+        let ids = vec!["restore-a".to_string(), "restore-b".to_string()];
+        let snapshots = db.get_segments_by_ids(&ids).unwrap();
+        db.delete_segments_batch(&ids).unwrap();
+        history.push(Command::DeleteSegments { segments: snapshots });
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_second_history_restore
+                 BEFORE INSERT ON speech_segments
+                 WHEN NEW.id = 'restore-b'
+                 BEGIN SELECT RAISE(ABORT, 'injected history restore failure'); END;",
+            )
+            .unwrap();
+
+        assert!(history.undo(&db).is_err());
+        assert!(db.get_segment_by_id("restore-a").unwrap().is_none());
+        assert!(db.get_segment_by_id("restore-b").unwrap().is_none());
+        assert!(history.can_undo(), "the failed atomic inverse must remain retryable");
+
+        db.connection().execute_batch("DROP TRIGGER fail_second_history_restore;").unwrap();
+        assert_eq!(history.undo(&db).unwrap(), Some(HistoryAction::DeleteSegments));
+        assert!(db.get_segment_by_id("restore-a").unwrap().is_some());
+        assert!(db.get_segment_by_id("restore-b").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_redo_refuses_the_complete_batch_when_one_restored_row_changed() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        for id in ["redo-a", "redo-b"] {
+            db.insert_segment(&make_segment(id, id)).unwrap();
+        }
+        let ids = vec!["redo-a".to_string(), "redo-b".to_string()];
+        let snapshots = db.get_segments_by_ids(&ids).unwrap();
+        db.delete_segments_batch(&ids).unwrap();
+        history.push(Command::DeleteSegments { segments: snapshots });
+        history.undo(&db).unwrap();
+        assert!(db.update_speaker_id("redo-b", Some("later-human-label")).unwrap());
+
+        assert!(history.redo(&db).is_err());
+        assert!(db.get_segment_by_id("redo-a").unwrap().is_some());
+        assert!(db.get_segment_by_id("redo-b").unwrap().is_some());
+        assert!(history.can_redo(), "a stale redo must remain available after its honest refusal");
+    }
+
+    #[test]
+    fn multi_row_batch_transcription_undo_rolls_back_on_late_failure() {
+        let db = setup_db();
+        let history = HistoryManager::new(100);
+        for id in ["batch-a", "batch-b"] {
+            db.insert_segment(&make_segment(id, &format!("old-{id}"))).unwrap();
+        }
+        let ids = vec!["batch-a".to_string(), "batch-b".to_string()];
+        let previous = db.get_segments_by_ids(&ids).unwrap();
+        for id in &ids {
+            let mut updated = db.get_segment_by_id(id).unwrap().unwrap();
+            updated.raw_transcript = format!("new-{id}");
+            db.insert_segment(&updated).unwrap();
+        }
+        let current = db.get_segments_by_ids(&ids).unwrap();
+        history.push(Command::BatchTranscribe { previous_segments: previous, current_segments: current });
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_second_batch_history_restore
+                 BEFORE UPDATE ON speech_segments
+                 WHEN OLD.id = 'batch-b' AND NEW.raw_transcript = 'old-batch-b'
+                 BEGIN SELECT RAISE(ABORT, 'injected batch history failure'); END;",
+            )
+            .unwrap();
+
+        assert!(history.undo(&db).is_err());
+        assert_eq!(db.get_segment_by_id("batch-a").unwrap().unwrap().raw_transcript, "new-batch-a");
+        assert_eq!(db.get_segment_by_id("batch-b").unwrap().unwrap().raw_transcript, "new-batch-b");
+        assert!(history.can_undo());
+
+        db.connection().execute_batch("DROP TRIGGER fail_second_batch_history_restore;").unwrap();
+        assert_eq!(history.undo(&db).unwrap(), Some(HistoryAction::BatchTranscribe));
+        assert_eq!(db.get_segment_by_id("batch-a").unwrap().unwrap().raw_transcript, "old-batch-a");
+        assert_eq!(db.get_segment_by_id("batch-b").unwrap().unwrap().raw_transcript, "old-batch-b");
     }
 }

@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import { openHeaderOverflow } from './helpers/header';
 
 test.describe('Dataset validation panel', () => {
   test('opens validation modal from toolbar', async ({ page }) => {
@@ -6,6 +7,7 @@ test.describe('Dataset validation panel', () => {
 
     await expect(page.getByTestId('segments-empty-state')).not.toBeVisible({ timeout: 15_000 });
 
+    await openHeaderOverflow(page);
     const validateBtn = page.getByTestId('validate-btn');
     await expect(validateBtn).toBeEnabled();
     await validateBtn.click();
@@ -30,6 +32,7 @@ test.describe('Dataset validation panel', () => {
     });
 
     await page.goto('/');
+    await openHeaderOverflow(page);
     await expect(page.getByTestId('validate-btn')).toBeDisabled();
   });
 });

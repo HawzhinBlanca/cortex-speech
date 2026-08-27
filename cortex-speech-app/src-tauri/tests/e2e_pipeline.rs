@@ -158,8 +158,23 @@ fn test_e2e_model_manager_status() {
     let status = mgr.status();
     assert!(!status.is_empty(), "Should have model entries");
 
-    let missing = mgr.missing_models();
-    assert!(!missing.is_empty(), "Should have missing models in empty dir");
+    // An empty user directory deliberately falls back to the bundled runtime models.  Whether any
+    // optional model is missing therefore depends on the exact build being tested and must not be
+    // asserted here.  What is invariant is that `status()` and `missing_models()` report the same
+    // availability truth, and that the empty user directory is never falsely named as the source.
+    let mut missing_from_api = mgr.missing_models().into_iter().map(|model| model.name).collect::<Vec<_>>();
+    missing_from_api.sort_unstable();
+    let mut missing_from_status = status
+        .iter()
+        .filter(|entry| entry.get("downloaded").and_then(serde_json::Value::as_bool) == Some(false))
+        .map(|entry| entry.get("name").and_then(serde_json::Value::as_str).expect("model status has a name"))
+        .collect::<Vec<_>>();
+    missing_from_status.sort_unstable();
+    assert_eq!(missing_from_status, missing_from_api, "status and missing-model APIs must agree");
+    assert!(
+        status.iter().all(|entry| entry.get("source").and_then(serde_json::Value::as_str) != Some("user")),
+        "an empty user model directory must not be reported as the model source"
+    );
 }
 
 #[test]
@@ -185,11 +200,8 @@ fn test_e2e_health_check() {
     let mgr = ModelManager::new(tmp.path().to_path_buf());
     let health =
         health::health_check(&db, &mgr, &cortex_speech_app_lib::settings::AppSettings::default(), None).unwrap();
-    assert!(
-        health["status"] == "ok" || health["status"] == "models_needed",
-        "Health status should be ok or models_needed"
-    );
-    assert!(health.get("uptime").is_some(), "Health should include uptime");
+    assert!(health.status == "ok" || health.status == "models_needed", "Health status should be ok or models_needed");
+    assert_eq!(health.segment_count, 0, "fresh health database should be empty");
 }
 
 #[test]

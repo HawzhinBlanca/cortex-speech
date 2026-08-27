@@ -9,28 +9,25 @@
  *   CORTEX_AUDIO       (optional) absolute path to a real audio file to import; default: the
  *                       committed FLEURS ckb fixture, so this gate runs instead of skipping
  *   CORTEX_APP_EXE     (optional) path to cortex-speech-app.exe; default: repo release build
- *   CORTEX_APP_DATA_DIR (optional) app profile dir for THIS RUN; default: a fresh disposable temp
- *                       dir. The owner's real %APPDATA%\cortex-speech profile is REFUSED — a
- *                       verification run must be incapable of touching the production library.
+ *   CORTEX_APP_DATA_DIR must be UNSET. This harness always mints its own run-bound disposable
+ *                       profile; every caller-supplied path is refused before Tauri starts.
  *   CORTEX_OUT         (optional) output dir for debug log + run.jsonl; default: repo root
  *   CORTEX_DEBUG_PORT  (optional) WebView2 remote-debug port; default 9271 (private, see below)
  *   CORTEX_LOCALE      (optional) 'en' | 'ckb'; default 'en'
  *   CORTEX_ASR_ENGINE  (optional) engine to provision in the DISPOSABLE profile before import:
- *                       'CTC300M' (default: fully offline, runnable on any dev box), 'CTC1B',
- *                       'WSL7B' (needs the owner's warm 7B server + a seeded client script path —
- *                       the fresh profile's WSL7B default otherwise fail-hards the import BEFORE
- *                       any decode, and this harness would blame VAD), or 'keep' to leave the
- *                       profile's settings untouched.
- *   CORTEX_SKIP_DB_CLEAR (optional) '1' to keep existing DB rows (default: clear for a clean run)
+ *                       'WSL7B' (default; requires the already-running pinned champion), or an
+ *                       explicitly requested diagnostic engine ('CTC300M' / 'CTC1B'). There is no
+ *                       automatic smaller-model fallback. 'keep' leaves profile settings untouched.
  *
  * Exit code 0 only when: the app launched, VAD produced >=1 segment, the first segment
  * transcribed to NON-EMPTY text, and run.jsonl was written. Anything else is a hard failure.
  */
-const { spawn, execSync } = require('child_process');
+const { spawn, execFileSync, execSync } = require('child_process');
 const { chromium } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { resolveDisposableProfile } = require('./e2e_profile.cjs');
 
 const REPO = __dirname;
 const APP_EXE = process.env.CORTEX_APP_EXE
@@ -55,32 +52,13 @@ const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9271';
 // Deliberately NOT the real 8737 — see the spawn env below.
 const COUCH_PORT = Number(process.env.CORTEX_COUCH_PORT || 18737);
 const LOCALE = process.env.CORTEX_LOCALE === 'ckb' ? 'ckb' : 'en';
-// Clearing the DB is OPT-IN (default: keep the existing library). A verification run must never be
-// able to erase the owner's real %APPDATA% library by simply being run — the old opt-out default did.
-const CLEAR_DB = process.env.CORTEX_DB_CLEAR === '1' && process.env.CORTEX_SKIP_DB_CLEAR !== '1';
-
 // ── Profile isolation (P0): this test runs against a DISPOSABLE profile, never the real library. ──
-// The app honors CORTEX_APP_DATA_DIR (lib.rs get_app_data_dir), so pointing it at a temp dir gives
-// the run its own DB, settings, lock, and media cache. Models still resolve via the bundled/repo
-// fallback (models.rs active_models_dir), so ASR works in a fresh profile.
-const PROD_PROFILE = process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech') : null;
-const normPath = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
-let DATA_DIR = process.env.CORTEX_APP_DATA_DIR;
-if (DATA_DIR) {
-  if (
-    PROD_PROFILE &&
-    (normPath(DATA_DIR) === normPath(PROD_PROFILE) ||
-      normPath(DATA_DIR).startsWith(normPath(PROD_PROFILE) + path.sep))
-  ) {
-    console.error(
-      'REFUSED: CORTEX_APP_DATA_DIR points at the REAL profile (' + PROD_PROFILE + '). ' +
-        'This harness must never run against the production library — use a disposable directory.',
-    );
-    process.exit(1);
-  }
-} else {
-  DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-e2e-'));
-}
+// A caller-supplied path is not evidence of disposability: production can be relocated anywhere and
+// junctions defeat string-prefix checks. The shared mint creates a canonical child of TEMP, writes a
+// run-bound sentinel, and initializes the matching SQLite application_id before this file can launch
+// or mutate the app. Models still resolve via the bundled/repo fallback.
+const PROFILE = resolveDisposableProfile('e2e_real_app.cjs');
+const DATA_DIR = PROFILE.dataDir;
 
 // The WebView2 browser profile is a SECOND shared resource, and isolating only CORTEX_APP_DATA_DIR
 // left it shared. Tauri keys it on the bundle identity (%LOCALAPPDATA%\com.cortex.kurdish-speech
@@ -94,9 +72,7 @@ if (DATA_DIR) {
 const WEBVIEW2_DIR = process.env.WEBVIEW2_USER_DATA_FOLDER || path.join(DATA_DIR, 'webview2');
 fs.mkdirSync(WEBVIEW2_DIR, { recursive: true });
 
-// True only when THIS run minted the profile above. A caller-supplied CORTEX_APP_DATA_DIR is never
-// ours to delete, whatever it points at.
-const DATA_DIR_IS_OURS = !process.env.CORTEX_APP_DATA_DIR;
+const DATA_DIR_IS_OURS = PROFILE.ours;
 
 /// Remove the disposable profile — ONLY on success, ONLY when we created it, ONLY under the temp root.
 //
@@ -196,20 +172,22 @@ function dumpRunManifest() {
   // Export the imported/transcribed segments to run.jsonl for build_review_page.py.
   // Honest by construction: it copies exactly what THIS RUN's isolated DB holds (never the
   // production %APPDATA% database).
-  const out = path.join(OUT_DIR, 'run.jsonl').replace(/\\/g, '\\\\');
-  const dbPath = path.join(DATA_DIR, 'cortex-speech.db').replace(/\\/g, '\\\\');
+  const out = path.join(OUT_DIR, 'run.jsonl');
+  const dbPath = path.join(DATA_DIR, 'cortex-speech.db');
   const py = [
     'import sqlite3, os, json, sys',
-    "db=r'" + dbPath + "'",
+    'db, out = sys.argv[1:]',
     'c=sqlite3.connect(db)',
     "rows=c.execute('SELECT id,audio_path,raw_transcript,duration_ms,speaker_id FROM speech_segments ORDER BY created_at').fetchall()",
     'c.close()',
-    "f=open(r'" + out + "','w',encoding='utf-8')",
+    "f=open(out,'w',encoding='utf-8')",
     "[f.write(json.dumps({'id':r[0],'audio_path':r[1],'raw_transcript':r[2] or '','duration_ms':r[3] or 0,'speaker_id':r[4] or ''},ensure_ascii=False)+chr(10)) for r in rows]",
     'f.close()',
     "print(len(rows))",
   ].join('; ');
-  const n = execSync(`python -c "${py}"`, { cwd: REPO }).toString().trim();
+  const n = execFileSync(process.env.PYTHON || 'python', ['-c', py, dbPath, out], { cwd: REPO })
+    .toString()
+    .trim();
   console.log(`==> Wrote run.jsonl with ${n} segments -> ${path.join(OUT_DIR, 'run.jsonl')}`);
 }
 
@@ -225,17 +203,6 @@ async function run() {
         'Close it (or set CORTEX_DEBUG_PORT to a free port); this harness only kills processes it spawned.',
     );
   }
-  if (CLEAR_DB) {
-    console.log('==> Clearing the ISOLATED profile DB for a clean run (CORTEX_DB_CLEAR=1; snapshots first)...');
-    // clear_db.py honors CORTEX_APP_DATA_DIR, snapshots first, and refuses without this confirm.
-    try {
-      execSync('python clear_db.py --yes', {
-        cwd: REPO,
-        env: { ...process.env, CORTEX_APP_DATA_DIR: DATA_DIR, CORTEX_DB_CLEAR_CONFIRM: '1' },
-      });
-    } catch (e) { console.log('   db clear skipped:', e.message); }
-  }
-
   console.log(`==> Launching ${path.basename(APP_EXE)} with remote-debugging-port=${DEBUG_PORT}...`);
   appProcess = spawn(APP_EXE, [], {
     env: {
@@ -271,23 +238,74 @@ async function run() {
   await page.evaluate((loc) => { localStorage.setItem('cortex-locale', loc); window.location.reload(); }, LOCALE);
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 30000 });
 
-  // Provision a RUNNABLE engine in the disposable profile. A fresh profile boots with the
-  // WSL7B default + no client script, so import fail-hards at the engine-unresolved gate BEFORE
-  // any decode — and this harness would then poll get_segments for 12 minutes and misreport the
-  // failure as "VAD produced 0 segments" (2026-07-11 root-cause). Round-trip the real settings
-  // object so only the engine field changes.
-  const ENGINE = process.env.CORTEX_ASR_ENGINE || 'CTC300M';
+  // Standard release proof is the production champion. A caller may name a smaller diagnostic
+  // engine explicitly, but absence/busyness of WSL7B never changes this selection.
+  // verify_10 sets CORTEX_GATE=1 globally. In that mode an inherited shell override must not turn a
+  // production proof into a small-model benchmark; manual runs retain the explicit diagnostic flag.
+  const ENGINE = process.env.CORTEX_GATE === '1' ? 'WSL7B' : (process.env.CORTEX_ASR_ENGINE || 'WSL7B');
+  if (!new Set(['WSL7B', 'CTC300M', 'CTC1B', 'keep']).has(ENGINE)) {
+    throw new Error(`Unsupported CORTEX_ASR_ENGINE ${JSON.stringify(ENGINE)}`);
+  }
   if (ENGINE !== 'keep') {
     console.log(`==> Provisioning ASR engine '${ENGINE}' in the disposable profile...`);
-    await page.evaluate(async (engine) => {
+    // WSL7B (2026-08-20, external review blocker #8): the CHAMPION path is now a first-class E2E
+    // mode, not a forced-CTC substitute. The disposable profile needs the client-script path — the
+    // "champion is configured" signal — which a fresh profile lacks.
+    const championScript = require('path').join(__dirname, 'scripts', 'cortex_7b_client.py');
+    await page.evaluate(async (cfg) => {
       const s = await window.__TAURI_INTERNALS__.invoke('get_settings');
-      s.asr_model_size = engine;
-      // Refinement off, same rationale as e2e_profile.cjs::provisionEngine: the default llm_mode
-      // (Local) makes this gate's verdict depend on an LLM server the machine may not be running,
-      // and a refinement failure hard-stops the clip by design.
+      s.asr_model_size = cfg.engine;
+      // Refinement off, same rationale as e2e_profile.cjs::provisionEngine: a configured refiner
+      // that fails hard-stops the clip by design, and this gate is about the ASR engine.
       s.llm_mode = 'None';
+      s.multi_engine_hypotheses = false;
+      s.use_finetuned_asr = false;
+      s.cloud_stt_opt_in = false;
+      s.cloud_llm_opt_in = false;
+      s.jury_cloud_opt_in = false;
+      s.champion_supervision_enabled = false;
+      if (cfg.engine === 'WSL7B') s.external_asr_script_path = cfg.script;
       await window.__TAURI_INTERNALS__.invoke('update_settings', { settings: s });
-    }, ENGINE).catch((e) => { throw new Error('Could not provision the ASR engine: ' + e.message); });
+    }, { engine: ENGINE, script: championScript }).catch((e) => { throw new Error('Could not provision the ASR engine: ' + e.message); });
+    if (ENGINE === 'WSL7B') {
+      // The preflight and health checks verify the server against the REGISTRY champion; a fresh
+      // profile's registry is empty, so every identity check fails and the champion path can only
+      // hang or refuse (measured 2026-08-20: the import sat in source_reference forever). Register
+      // the LIVE machine's champion identity, exactly as the Rust preflight test does.
+      console.log('==> Registering the live champion identity in the disposable registry...');
+      const pointerPath = process.env.CORTEX_CHAMPION_POINTER ||
+        (process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech', 'champion.json') : '');
+      if (!pointerPath || !fs.existsSync(pointerPath)) {
+        throw new Error('WSL7B proof requires champion.json (set CORTEX_CHAMPION_POINTER)');
+      }
+      const pointer = JSON.parse(fs.readFileSync(pointerPath, 'utf-8')).champions?.['omniasr-7b'];
+      for (const key of ['modelVersionId', 'deploymentSha256', 'deploymentManifestPath']) {
+        if (!pointer || typeof pointer[key] !== 'string' || !pointer[key].trim()) {
+          throw new Error(`champion.json has no valid champions.omniasr-7b.${key}`);
+        }
+      }
+      const registerCode = [
+        'import sqlite3, sys',
+        'db, model_id, deployment_sha, manifest = sys.argv[1:]',
+        'con = sqlite3.connect(db, timeout=30)',
+        'con.execute("PRAGMA busy_timeout=30000")',
+        'try:',
+        '    con.execute("BEGIN IMMEDIATE")',
+        "    con.execute(\"UPDATE model_versions SET status = 'rolled_back' WHERE family = 'omniasr-7b' AND status = 'champion' AND id <> ?\", (model_id,))",
+        "    con.execute(\"INSERT OR REPLACE INTO model_versions (id, family, model_card_name, checkpoint_sha256, checkpoint_path, source, license, status) VALUES (?, 'omniasr-7b', 'soranivoice_omniASR_LLM_7B_v2_local', ?, ?, 'user-finetuned', 'owner-full-rights', 'champion')\", (model_id, deployment_sha, manifest))",
+        '    con.commit()',
+        'except:',
+        '    con.rollback()',
+        '    raise',
+        'finally:',
+        '    con.close()',
+      ].join('\n');
+      execFileSync(process.env.PYTHON || 'python', [
+        '-c', registerCode, path.join(DATA_DIR, 'cortex-speech.db'), pointer.modelVersionId,
+        pointer.deploymentSha256, pointer.deploymentManifestPath,
+      ], { stdio: 'pipe' });
+      console.log('   registered the pinned live champion in the disposable registry');
+    }
   }
 
   console.log('==> Importing real audio:', AUDIO);
@@ -319,7 +337,7 @@ async function run() {
     throw new Error(
       'no segments appeared within the 12-min window (backend get_segments empty) — the import ' +
         'failed or never persisted. Check the [App] log above for the import error; a fresh ' +
-        "profile needs a runnable engine (see CORTEX_ASR_ENGINE, default 'CTC300M').",
+        "profile needs the pinned WSL7B champion (or an explicitly requested diagnostic CORTEX_ASR_ENGINE).",
     );
   }
   console.log(`==> VAD produced ${backendSegs.length} segment(s) (backend). Reloading UI to render from DB...`);
@@ -329,7 +347,7 @@ async function run() {
   const segCount = await page.locator('[data-testid="segment-card"]').count();
   console.log(`==> UI rendered ${segCount} segment-card(s).`);
 
-  console.log('==> Selecting first segment and running local ASR (OmniASR CTC)...');
+  console.log(`==> Selecting first segment and running ASR (${ENGINE})...`);
   await page.locator('[data-testid="segment-card"]').first().click();
   await page.waitForTimeout(800);
 
@@ -513,13 +531,34 @@ async function reviewOverHttp(page, draftText) {
   }
   console.log(`   skip: nothing written, clip out of this reviewer's queue, backlog still ${afterSkip.pendingTotal}`);
 
+  // ENFORCEMENT IS LIVE (2026-08-19): a verdict without listening evidence is refused 428, and this
+  // harness is a CLIENT like any other — it must report its playback. It genuinely fetched the full
+  // clip above (RIFF asserted); heardMs declares that playback against the served duration, exactly
+  // as the phone page reports its media time. Sending none was this harness silently testing a
+  // pre-enforcement world.
+  const heardMs = Math.max(1, Number(item.durationMs) || 0);
+
+  // Refusal FIRST, as its own assertion: an unheard verdict must bounce with 428 and write nothing.
+  const unheard = await http(`${base}/api/decision`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ id: item.id, action: 'edit', text: 'unheard', rowVersion: item.rowVersion }),
+  });
+  if (unheard.status !== 428) {
+    throw new Error(`an evidence-free verdict returned ${unheard.status}, expected 428 — enforcement is not enforcing`);
+  }
+  console.log('   enforcement: evidence-free verdict refused with 428, as deployed');
+
   // The SAME clip, decided for real. A skip must not poison a clip: it is the absence of a verdict,
   // not a refusal, so the reviewer who skipped it can still come back and judge it.
   const corrected = draftText + ' ✔';
   const decision = await http(`${base}/api/decision`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', cookie },
-    body: JSON.stringify({ id: item.id, action: 'edit', text: corrected }),
+    body: JSON.stringify({
+      id: item.id, action: 'edit', text: corrected, rowVersion: item.rowVersion,
+      heardMs, clipDurationMs: heardMs,
+    }),
   });
   if (decision.status !== 200) {
     throw new Error(`POST /api/decision -> ${decision.status} ${await decision.text()}, expected 200`);

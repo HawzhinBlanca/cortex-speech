@@ -46,8 +46,24 @@ describe('globalErrorTrap (P2.2 / audit F3)', () => {
     const list = get(notifications);
     expect(list).toHaveLength(1);
     expect(list[0].type).toBe('error');
-    // The real backend message is carried in the detail so the failure is diagnosable, not silent.
-    expect(list[0].detail).toBe('invoke failed: database is locked');
+    expect(list[0].message).toBeTruthy();
+    expect(list[0].detail).toBeUndefined();
+    expect(JSON.stringify(list[0])).not.toContain('database is locked');
+  });
+
+  it('retains a typed code/action/operation reference without its backend prose', () => {
+    notifyUnhandledRejection({
+      schema: 1,
+      code: 'WRITE_FAILED',
+      message: 'SQL error at C:\\private\\library.db',
+      retryable: true,
+      suggestedAction: 'retry',
+      operationId: '018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10',
+    });
+    const notification = get(notifications)[0];
+    expect(notification.detail).toBe('WRITE_FAILED · 018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10');
+    expect(notification.suggestedAction).toBe('retry');
+    expect(JSON.stringify(notification)).not.toMatch(/SQL|private|library\.db/);
   });
 
   /**

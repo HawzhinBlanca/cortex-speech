@@ -8,19 +8,19 @@ import { locale } from '../../src/lib/i18n';
 import { ckb } from '../../src/lib/i18n/ckb';
 
 const invokeMock = vi.mocked(invoke);
+const MEDIA_GRANT_ID = '2f2d9b66-8566-4d1c-8c14-e18d006b776f';
+const MEDIA_URL = `http://cortex-media.localhost/${MEDIA_GRANT_ID}`;
 
-function mockMediaResolution(path = 'C:\\media\\sample.wav') {
+function mockMediaResolution() {
   invokeMock.mockImplementation(<T>(command: string, args?: unknown): Promise<T> => {
-    const invokeArgs = args as { audioPath?: unknown } | undefined;
     if (command === 'register_media_asset') {
       return Promise.resolve({
-        id: 'grant-1',
-        path: invokeArgs?.audioPath,
+        id: MEDIA_GRANT_ID,
         expiresAt: '2099-01-01T00:00:00Z',
       } as T);
     }
     if (command === 'get_media_asset_url') {
-      return Promise.resolve(path as T);
+      return Promise.resolve(MEDIA_URL as T);
     }
     return Promise.reject(new Error(`Unexpected command: ${command}`));
   });
@@ -60,19 +60,19 @@ describe('AudioPlayer', () => {
   });
 
   it('registers and loads a granted media asset before showing controls', async () => {
-    mockMediaResolution('C:\\media\\sample.wav');
+    mockMediaResolution();
 
     render(AudioPlayer, { props: { audioPath: 'C:\\input\\sample.wav' } });
     const audio = document.querySelector('audio') as HTMLAudioElement;
 
     await waitFor(() => {
-      expect(audio.src).toContain('asset://localhost/C:/media/sample.wav');
+      expect(audio.src).toBe(MEDIA_URL);
     });
     expect(loadMock).toHaveBeenCalledOnce();
     expect(invokeMock).toHaveBeenCalledWith('register_media_asset', {
       audioPath: 'C:\\input\\sample.wav',
     });
-    expect(invokeMock).toHaveBeenCalledWith('get_media_asset_url', { id: 'grant-1' });
+    expect(invokeMock).toHaveBeenCalledWith('get_media_asset_url', { id: MEDIA_GRANT_ID });
 
     Object.defineProperty(audio, 'duration', { configurable: true, value: 42 });
     await fireEvent.loadedMetadata(audio);
@@ -88,10 +88,10 @@ describe('AudioPlayer', () => {
   });
 
   it('gives the seek slider a localized name and uses a wrap-safe control layout', async () => {
-    mockMediaResolution('C:\\media\\sample.wav');
+    mockMediaResolution();
     render(AudioPlayer, { props: { audioPath: 'C:\\input\\sample.wav' } });
     const audio = document.querySelector('audio') as HTMLAudioElement;
-    await waitFor(() => expect(audio.src).toContain('asset://localhost/C:/media/sample.wav'));
+    await waitFor(() => expect(audio.src).toBe(MEDIA_URL));
     Object.defineProperty(audio, 'duration', { configurable: true, value: 42 });
     await fireEvent.loadedMetadata(audio);
 
@@ -123,17 +123,17 @@ describe('AudioPlayer', () => {
       expect(screen.getByText('Failed to load audio file')).toBeInTheDocument();
     });
 
-    mockMediaResolution('C:\\media\\recovered.wav');
+    mockMediaResolution();
     await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
     const audio = document.querySelector('audio') as HTMLAudioElement;
     await waitFor(() => {
-      expect(audio.src).toContain('asset://localhost/C:/media/recovered.wav');
+      expect(audio.src).toBe(MEDIA_URL);
     });
   });
 
   it('starts playback from clip start when current time is outside clip bounds', async () => {
-    mockMediaResolution('C:\\media\\clip.wav');
+    mockMediaResolution();
     render(AudioPlayer, {
       props: {
         audioPath: 'C:\\input\\clip.wav',
@@ -144,7 +144,7 @@ describe('AudioPlayer', () => {
 
     const audio = document.querySelector('audio') as HTMLAudioElement;
     await waitFor(() => {
-      expect(audio.src).toContain('asset://localhost/C:/media/clip.wav');
+      expect(audio.src).toBe(MEDIA_URL);
     });
     Object.defineProperty(audio, 'duration', { configurable: true, value: 30 });
     await fireEvent.loadedMetadata(audio);
@@ -157,12 +157,12 @@ describe('AudioPlayer', () => {
   });
 
   it('shows a clip-relative scrubber (0 → clip length), not the whole-file duration', async () => {
-    mockMediaResolution('C:\\media\\clip.wav');
+    mockMediaResolution();
     render(AudioPlayer, {
       props: { audioPath: 'C:\\input\\clip.wav', startTime: 10, endTime: 20 },
     });
     const audio = document.querySelector('audio') as HTMLAudioElement;
-    await waitFor(() => expect(audio.src).toContain('asset://localhost/C:/media/clip.wav'));
+    await waitFor(() => expect(audio.src).toBe(MEDIA_URL));
     Object.defineProperty(audio, 'duration', { configurable: true, value: 30 });
     await fireEvent.loadedMetadata(audio);
     // The slider spans the 10s clip window, never the 30s source file.
@@ -174,12 +174,12 @@ describe('AudioPlayer', () => {
   });
 
   it('reschedules the precise clip stop when endTime is retargeted mid-play (tap-a-word)', async () => {
-    mockMediaResolution('C:\\media\\clip.wav');
+    mockMediaResolution();
     const { rerender } = render(AudioPlayer, {
       props: { audioPath: 'C:\\input\\clip.wav', startTime: 10, endTime: 20 },
     });
     const audio = document.querySelector('audio') as HTMLAudioElement;
-    await waitFor(() => expect(audio.src).toContain('asset://localhost/C:/media/clip.wav'));
+    await waitFor(() => expect(audio.src).toBe(MEDIA_URL));
     Object.defineProperty(audio, 'duration', { configurable: true, value: 30 });
     await fireEvent.loadedMetadata(audio);
     audio.currentTime = 10.5;
@@ -206,7 +206,7 @@ describe('AudioPlayer', () => {
 
   it('reports loop replay failures instead of silently swallowing them', async () => {
     locale.set('ckb');
-    mockMediaResolution('C:\\media\\clip.wav');
+    mockMediaResolution();
     playMock.mockRejectedValueOnce(new Error('autoplay denied'));
     render(AudioPlayer, {
       props: {
@@ -218,7 +218,7 @@ describe('AudioPlayer', () => {
 
     const audio = document.querySelector('audio') as HTMLAudioElement;
     await waitFor(() => {
-      expect(audio.src).toContain('asset://localhost/C:/media/clip.wav');
+      expect(audio.src).toBe(MEDIA_URL);
     });
     Object.defineProperty(audio, 'duration', { configurable: true, value: 30 });
     await fireEvent.loadedMetadata(audio);

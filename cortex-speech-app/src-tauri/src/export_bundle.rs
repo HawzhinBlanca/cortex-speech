@@ -1,5 +1,5 @@
 use crate::atomic_file::{remove_file_on_error, replace_file};
-use crate::db::{Database, SourceTranscriptRecord};
+use crate::db::{Database, RecordingRights, SourceTranscriptRecord, SpeechSegment};
 use crate::error::{AppError, AppResult};
 use crate::models::ModelManager;
 use crate::settings::{AppSettings, ExportFormat};
@@ -134,6 +134,102 @@ struct BundledSourceReference {
     transcript_chars: usize,
 }
 
+/// Exact-file binding for every source recording referenced by this bundle. The hash is over the
+/// source file's bytes (not decoded/resampled PCM), so a future consumer can prove which concrete
+/// recording the segment rows referred to without receiving the curator's absolute path.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SourceAudioBinding {
+    #[serde(skip_serializing)]
+    source_audio_path: String,
+    source_audio_name: String,
+    source_recording_id: Option<String>,
+    source_file_blake3: Option<String>,
+    source_size_bytes: Option<i64>,
+    stored_pcm_blake3: Option<String>,
+    /// `Some(true)` only when the current file's canonical decoded PCM matches the one persisted at
+    /// import. `Some(false)` is a production blocker; `None` means a local draft did not pay the
+    /// bounded decode cost.
+    stored_pcm_identity_verified: Option<bool>,
+    segment_ids: Vec<String>,
+    byte_identity_bound: bool,
+    identity_issue: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceAudioBindingManifest {
+    generated_at: String,
+    schema_version: u32,
+    hash_algorithm: &'static str,
+    recording_count: usize,
+    all_sources_bound: bool,
+    all_stored_pcm_identities_verified: bool,
+    recordings: Vec<SourceAudioBinding>,
+}
+
+type PublicationRightsSnapshot = BTreeMap<String, RecordingRights>;
+
+const PUBLICATION_RIGHTS_MANIFEST: &str = "publication_rights_manifest.json";
+const PUBLICATION_RIGHTS_DIGEST_ALGORITHM: &str = "blake3-serde-json-bytes-v1";
+const PUBLICATION_RIGHTS_DIGEST_SCOPE: &str = "recordings";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicationRightsManifest {
+    generated_at: String,
+    schema_version: u32,
+    state_digest: String,
+    digest_algorithm: &'static str,
+    digest_scope: &'static str,
+    recording_count: usize,
+    recordings: Vec<PublicationRightsRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PublicationRightsRecord {
+    source_audio_name: String,
+    source_recording_id: String,
+    segment_ids: Vec<String>,
+    license: String,
+    permitted_use: String,
+    attribution: Option<String>,
+}
+
+fn segment_snapshot_digest(segments: &[SpeechSegment]) -> AppResult<String> {
+    let mut ordered = segments.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(blake3::hash(&serde_json::to_vec(&ordered)?).to_hex().to_string())
+}
+
+fn verify_segment_snapshot_at_commit(
+    db: &Database,
+    expected_digest: &str,
+    expected_selected: &[SpeechSegment],
+) -> AppResult<Vec<SpeechSegment>> {
+    let current = db.get_segments(None)?;
+    if segment_snapshot_digest(&current)? != expected_digest {
+        return Err(AppError::Validation(
+            "Production export not sealed: dataset rows changed while the bundle was being generated. Retry so validation, reports, and all data formats describe one snapshot."
+                .to_string(),
+        ));
+    }
+    // Selection also depends on mutable holdout tables and rights, neither of which is embedded in
+    // SpeechSegment. Re-run the shared fail-closed policy and require identical membership so a gold
+    // holdout registration during export cannot be sealed into training data.
+    let current_selected = export::exclude_unexportable_segments(db, current)?;
+    let expected_ids = expected_selected.iter().map(|segment| segment.id.as_str()).collect::<BTreeSet<_>>();
+    let current_ids = current_selected.iter().map(|segment| segment.id.as_str()).collect::<BTreeSet<_>>();
+    if current_ids != expected_ids {
+        return Err(AppError::Validation(
+            "Production export not sealed: export eligibility changed while the bundle was being generated. Retry after holdout and consent changes settle."
+                .to_string(),
+        ));
+    }
+    Ok(current_selected)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LearningBundleManifest {
@@ -229,13 +325,11 @@ impl ProvenanceCounts {
 }
 
 /// Count a nullable per-segment label over the exported rows, bucketing `None` separately rather than
-/// inventing a value for it. Used for two stored provenance columns:
+/// inventing a value for it. Used for stored categorical processing provenance:
 ///
 ///   * `vad_backend` (P0.4, Migration v42) — how each region was ACTUALLY detected ("silero" / "energy"
 ///     fallback / "none" for the short whole-buffer path), read from the stored column, never a probe.
 ///     `None` is a legacy row or the cloud Scribe path, where no local VAD runs.
-///   * `reviewed_by` (Migration v43) — WHICH human decided each row. `None` is an undecided row, a
-///     desktop decision, or a pre-v43 row.
 ///
 /// Returns (count-by-label, none-count). BTreeMap so the manifest is byte-stable across runs.
 fn tally_labels<'a>(
@@ -252,6 +346,442 @@ fn tally_labels<'a>(
     (by_label, unlabelled)
 }
 
+fn capture_publication_rights(db: &Database, segments: &[SpeechSegment]) -> AppResult<PublicationRightsSnapshot> {
+    let mut snapshot = BTreeMap::new();
+    for segment in segments {
+        snapshot.insert(segment.id.clone(), db.rights_for_segment(&segment.id)?);
+    }
+    Ok(snapshot)
+}
+
+fn publication_rights_blockers(snapshot: &PublicationRightsSnapshot) -> Vec<String> {
+    snapshot
+        .iter()
+        .filter(|(_, rights)| !rights.permits_redistribution())
+        .map(|(segment_id, _)| segment_id.clone())
+        .collect()
+}
+
+fn license_allows_no_attribution(license: &str) -> bool {
+    // Licence metadata is unrestricted free text. Only exact, well-known aliases whose legal grant
+    // does not require credit may omit it; every typo, custom licence, compound expression, and
+    // unrecognized URL fails closed and can still publish with an explicit visible credit such as
+    // "No attribution required".
+    const EXACT_NO_ATTRIBUTION_ALIASES: &[&str] = &[
+        // CC0 / Creative Commons Zero, including SPDX identifier and official URL forms.
+        "CC0",
+        "CC0-1.0",
+        "CC0 1.0 Universal",
+        "Creative Commons Zero",
+        "Creative Commons Zero 1.0",
+        "Creative Commons Zero 1.0 Universal",
+        "Creative Commons CC Zero",
+        "Creative Commons CC Zero 1.0",
+        "http://creativecommons.org/publicdomain/zero/1.0/",
+        "https://creativecommons.org/publicdomain/zero/1.0/",
+        "http://www.creativecommons.org/publicdomain/zero/1.0/",
+        "https://www.creativecommons.org/publicdomain/zero/1.0/",
+        "http://creativecommons.org/publicdomain/zero/1.0/legalcode",
+        "https://creativecommons.org/publicdomain/zero/1.0/legalcode",
+        // Explicit public-domain declarations / Creative Commons Public Domain Mark.
+        "Public Domain",
+        "public-domain",
+        "Public Domain Declaration",
+        "Public Domain Mark",
+        "Public Domain Mark 1.0",
+        "CC-PDM-1.0",
+        "CC PDM 1.0",
+        "CCPDDC",
+        "http://creativecommons.org/publicdomain/mark/1.0/",
+        "https://creativecommons.org/publicdomain/mark/1.0/",
+        "http://www.creativecommons.org/publicdomain/mark/1.0/",
+        "https://www.creativecommons.org/publicdomain/mark/1.0/",
+        // Other established no-attribution identifiers and their precise common aliases.
+        "Unlicense",
+        "The Unlicense",
+        "http://unlicense.org/",
+        "https://unlicense.org/",
+        "0BSD",
+        "Zero-Clause BSD",
+        "BSD Zero Clause",
+        "BSD Zero Clause License",
+        "https://spdx.org/licenses/0BSD.html",
+        "PDDL",
+        "PDDL-1.0",
+        "ODC-PDDL",
+        "ODC-PDDL-1.0",
+        "Open Data Commons Public Domain Dedication and License",
+        "Open Data Commons Public Domain Dedication and License 1.0",
+        "http://opendatacommons.org/licenses/pddl/1.0/",
+        "https://opendatacommons.org/licenses/pddl/1.0/",
+        "http://opendatacommons.org/licenses/pddl/1-0/",
+        "https://opendatacommons.org/licenses/pddl/1-0/",
+    ];
+
+    let license = license.trim();
+    EXACT_NO_ATTRIBUTION_ALIASES.iter().any(|alias| license.eq_ignore_ascii_case(alias))
+}
+
+fn license_requires_attribution(license: &str) -> bool {
+    !license_allows_no_attribution(license)
+}
+
+fn is_invisible_credit_format(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180D}'
+            | '\u{180E}'
+            | '\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+fn has_recipient_visible_credit(credit: &str) -> bool {
+    credit.chars().any(|character| {
+        character.is_alphanumeric()
+            && !character.is_whitespace()
+            && !character.is_control()
+            && !is_invisible_credit_format(character)
+    })
+}
+
+fn publication_attribution_blockers(snapshot: &PublicationRightsSnapshot) -> Vec<String> {
+    snapshot
+        .iter()
+        .filter(|(_, rights)| {
+            let credit_is_visible = rights.attribution.as_deref().is_some_and(has_recipient_visible_credit);
+            let invalid_credit_was_supplied = rights.attribution.is_some() && !credit_is_visible;
+            let credit_is_required = rights.license.as_deref().map_or(true, license_requires_attribution);
+            invalid_credit_was_supplied || (credit_is_required && !credit_is_visible)
+        })
+        .map(|(segment_id, _)| segment_id.clone())
+        .collect()
+}
+
+fn publication_rights_digest(records: &[PublicationRightsRecord]) -> AppResult<String> {
+    // Public and independently recomputable: the digest input is exactly serde_json v1 bytes of the
+    // emitted `recordings` DTO, not the private DB snapshot containing omitted consent/source fields.
+    let bytes = serde_json::to_vec(records)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn build_publication_rights_manifest(
+    snapshot: &PublicationRightsSnapshot,
+    source_bindings: &[SourceAudioBinding],
+) -> AppResult<PublicationRightsManifest> {
+    let mut recordings = Vec::with_capacity(source_bindings.len());
+    for binding in source_bindings {
+        let first_segment_id = binding.segment_ids.first().ok_or_else(|| {
+            AppError::Validation("Production rights manifest cannot describe a recording with no segments".to_string())
+        })?;
+        let rights = snapshot.get(first_segment_id).ok_or_else(|| {
+            AppError::Validation(format!(
+                "Production rights manifest is missing rights for selected segment {first_segment_id}"
+            ))
+        })?;
+        if binding.segment_ids.iter().any(|segment_id| snapshot.get(segment_id) != Some(rights)) {
+            return Err(AppError::Validation(format!(
+                "Production rights manifest found inconsistent rights within source recording {}",
+                binding.source_audio_name
+            )));
+        }
+        let required = |field: &Option<String>, label: &str| {
+            field.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "Production rights manifest is missing {label} for selected segment {first_segment_id}"
+                ))
+            })
+        };
+        let attribution = match rights.attribution.as_deref() {
+            Some(credit) if has_recipient_visible_credit(credit) => Some(credit.trim().to_string()),
+            Some(_) => {
+                return Err(AppError::Validation(format!(
+                    "Production rights manifest has a non-visible attribution credit for selected segment {first_segment_id}"
+                )));
+            }
+            None => None,
+        };
+        recordings.push(PublicationRightsRecord {
+            // Both values are already public-safe source identifiers: a basename and the exact-file
+            // BLAKE3 recording ID. Never serialize the curator's path, rights.source, or consent basis.
+            source_audio_name: binding.source_audio_name.clone(),
+            source_recording_id: binding.source_recording_id.clone().ok_or_else(|| {
+                AppError::Validation(format!(
+                    "Production rights manifest is missing a source recording ID for {first_segment_id}"
+                ))
+            })?,
+            segment_ids: binding.segment_ids.clone(),
+            license: required(&rights.license, "license")?,
+            permitted_use: required(&rights.permitted_use, "permitted use")?,
+            attribution,
+        });
+    }
+    recordings.sort_by(|left, right| left.source_recording_id.cmp(&right.source_recording_id));
+    let state_digest = publication_rights_digest(&recordings)?;
+    Ok(PublicationRightsManifest {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        schema_version: 1,
+        state_digest,
+        digest_algorithm: PUBLICATION_RIGHTS_DIGEST_ALGORITHM,
+        digest_scope: PUBLICATION_RIGHTS_DIGEST_SCOPE,
+        recording_count: recordings.len(),
+        recordings,
+    })
+}
+
+/// Re-read consent at the sealing point. The initial gate prevents an unauthorized export from
+/// starting; this second gate prevents a withdrawal or rights edit that lands while files are being
+/// generated from becoming a completed, checksummed public bundle.
+fn verify_publication_rights_at_commit(
+    db: &Database,
+    segments: &[SpeechSegment],
+    expected: &PublicationRightsSnapshot,
+) -> AppResult<()> {
+    let current = capture_publication_rights(db, segments)?;
+    if &current != expected {
+        return Err(AppError::Validation(
+            "Production export not sealed: recording rights changed while the bundle was being generated. Review the current consent state and retry."
+                .to_string(),
+        ));
+    }
+    let blockers = publication_rights_blockers(&current);
+    if !blockers.is_empty() {
+        return Err(AppError::Validation(format!(
+            "Production export not sealed: {} selected clip(s) no longer permit redistribution: {}",
+            blockers.len(),
+            segment_id_preview(&blockers)
+        )));
+    }
+    let attribution_blockers = publication_attribution_blockers(&current);
+    if !attribution_blockers.is_empty() {
+        return Err(AppError::Validation(format!(
+            "Production export not sealed: {} selected clip(s) have a missing or non-visible recipient attribution credit: {}",
+            attribution_blockers.len(),
+            segment_id_preview(&attribution_blockers)
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredPcmHashState {
+    Missing,
+    Unique(String),
+    Conflicting,
+}
+
+fn stored_pcm_hash_state(db: &Database, audio_path: &str) -> AppResult<StoredPcmHashState> {
+    // Query the source recording directly. `load_audio_identities` intentionally omits rows whose
+    // spectral bucket is NULL and collapses by path, which is fine for dedup rehydration but unsafe
+    // for a publication gate: missing or conflicting definitive hashes must be visible here.
+    let mut stmt = db.connection().prepare(
+        "SELECT DISTINCT TRIM(audio_content_hash)
+           FROM speech_segments
+          WHERE audio_path = ?1
+            AND audio_content_hash IS NOT NULL
+            AND TRIM(audio_content_hash) <> ''
+          ORDER BY TRIM(audio_content_hash)",
+    )?;
+    let hashes = stmt.query_map([audio_path], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(match hashes.as_slice() {
+        [] => StoredPcmHashState::Missing,
+        [hash] => StoredPcmHashState::Unique(hash.clone()),
+        _ => StoredPcmHashState::Conflicting,
+    })
+}
+
+pub(crate) fn current_canonical_pcm_blake3(audio_path: &Path) -> AppResult<String> {
+    // Match the import/backfill identity exactly: BLAKE3(sample_rate LE || canonical 16 kHz mono i16
+    // PCM). Decode in bounded windows so a multi-hour recording is never materialized in RAM.
+    let mut identity = crate::fingerprint::StreamingIdentity::new();
+    let mut saw_audio = false;
+    crate::audio::decode_pcm_windows(audio_path, crate::audio::DECODE_WINDOW_MS, |window| {
+        saw_audio = true;
+        identity.push(&window.pcm, window.sample_rate);
+        Ok(())
+    })?;
+    if !saw_audio {
+        return Err(AppError::Validation(format!("Source audio decoded to no samples: {}", audio_path.display())));
+    }
+    Ok(identity.finish().content)
+}
+
+fn capture_source_audio_bindings(
+    db: &Database,
+    segments: &[SpeechSegment],
+    verify_stored_pcm: bool,
+) -> AppResult<Vec<SourceAudioBinding>> {
+    let mut segment_ids_by_path = BTreeMap::<String, Vec<String>>::new();
+    for segment in segments {
+        segment_ids_by_path.entry(segment.audio_path.clone()).or_default().push(segment.id.clone());
+    }
+
+    let mut bindings = Vec::with_capacity(segment_ids_by_path.len());
+    for (audio_path, mut segment_ids) in segment_ids_by_path {
+        segment_ids.sort();
+        segment_ids.dedup();
+        let audio_path_ref = Path::new(&audio_path);
+        let current = crate::pipeline::source_audio_identity(audio_path_ref);
+        let (source_recording_id, source_file_blake3, source_size_bytes, byte_identity_bound, mut identity_issue) =
+            match current {
+                Ok(identity) => {
+                    let recording_id = format!("blake3-file:{}", identity.content_hash);
+                    (Some(recording_id), Some(identity.content_hash), Some(identity.size_bytes), true, None)
+                }
+                Err(error) => {
+                    tracing::warn!("Cannot bind bundle source audio bytes for {audio_path}: {error}");
+                    (None, None, None, false, Some("source_audio_missing_or_unreadable".to_string()))
+                }
+            };
+        let stored_state = stored_pcm_hash_state(db, &audio_path)?;
+        let stored_pcm_blake3 = match &stored_state {
+            StoredPcmHashState::Unique(hash) => Some(hash.clone()),
+            StoredPcmHashState::Missing | StoredPcmHashState::Conflicting => None,
+        };
+        let stored_pcm_identity_verified = if verify_stored_pcm {
+            let verified = match &stored_state {
+                StoredPcmHashState::Missing => {
+                    identity_issue.get_or_insert_with(|| "stored_pcm_identity_missing".to_string());
+                    false
+                }
+                StoredPcmHashState::Conflicting => {
+                    identity_issue.get_or_insert_with(|| "stored_pcm_identity_conflict".to_string());
+                    false
+                }
+                StoredPcmHashState::Unique(stored_hash) if byte_identity_bound => {
+                    match current_canonical_pcm_blake3(audio_path_ref) {
+                        Ok(current_hash) if &current_hash == stored_hash => true,
+                        Ok(_) => {
+                            identity_issue.get_or_insert_with(|| "stored_pcm_identity_mismatch".to_string());
+                            false
+                        }
+                        Err(error) => {
+                            tracing::warn!("Cannot verify canonical PCM identity for {audio_path}: {error}");
+                            identity_issue.get_or_insert_with(|| "source_audio_decode_failed".to_string());
+                            false
+                        }
+                    }
+                }
+                StoredPcmHashState::Unique(_) => false,
+            };
+            Some(verified)
+        } else {
+            None
+        };
+        bindings.push(SourceAudioBinding {
+            source_audio_path: audio_path.clone(),
+            source_audio_name: export::export_audio_ref(&audio_path).to_string(),
+            source_recording_id,
+            source_file_blake3,
+            source_size_bytes,
+            stored_pcm_blake3,
+            stored_pcm_identity_verified,
+            segment_ids,
+            byte_identity_bound,
+            identity_issue,
+        });
+    }
+    Ok(bindings)
+}
+
+fn source_audio_binding_blockers(bindings: &[SourceAudioBinding]) -> Vec<String> {
+    let mut blockers: Vec<String> = bindings
+        .iter()
+        .filter(|binding| !binding.byte_identity_bound || binding.stored_pcm_identity_verified != Some(true))
+        .flat_map(|binding| binding.segment_ids.iter().cloned())
+        .collect();
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+
+fn verify_source_audio_bindings_at_commit(
+    db: &Database,
+    segments: &[SpeechSegment],
+    expected: &[SourceAudioBinding],
+) -> AppResult<Vec<SourceAudioBinding>> {
+    // Preflight already performed the expensive canonical-PCM comparison. At seal, re-read the
+    // persisted hash and the raw bytes; equality of both proves the same bytes still decode to the
+    // verified PCM without decoding a multi-hour source twice.
+    let current = capture_source_audio_bindings(db, segments, false)?;
+    let seal_state_matches = current.iter().zip(expected).all(|(current, expected)| {
+        current.source_audio_name == expected.source_audio_name
+            && current.source_audio_path == expected.source_audio_path
+            && current.source_recording_id == expected.source_recording_id
+            && current.source_file_blake3 == expected.source_file_blake3
+            && current.source_size_bytes == expected.source_size_bytes
+            && current.stored_pcm_blake3 == expected.stored_pcm_blake3
+            && current.segment_ids == expected.segment_ids
+            && current.byte_identity_bound == expected.byte_identity_bound
+    });
+    if current.len() != expected.len() || !seal_state_matches {
+        return Err(AppError::Validation(
+            "Production export not sealed: selected source-audio bytes changed while the bundle was being generated. Re-validate the sources and retry."
+                .to_string(),
+        ));
+    }
+    Ok(expected.to_vec())
+}
+
+fn verify_stored_pcm_hashes_at_commit(db: &Database, expected: &[SourceAudioBinding]) -> AppResult<()> {
+    for binding in expected {
+        let current = stored_pcm_hash_state(db, &binding.source_audio_path)?;
+        if current != binding.stored_pcm_blake3.clone().map_or(StoredPcmHashState::Missing, StoredPcmHashState::Unique)
+        {
+            return Err(AppError::Validation(
+                "Production export not sealed: stored canonical audio identity changed while the bundle was being generated. Retry after the library update completes."
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_bundle_dataset_files(
+    output_dir: &Path,
+    segments: &[SpeechSegment],
+    processed_audio: &[export::ProcessedAudioNotice],
+) -> AppResult<Vec<String>> {
+    let data_files = [
+        ("dataset.json", ExportFormat::Json),
+        ("dataset.jsonl", ExportFormat::Jsonl),
+        ("dataset.csv", ExportFormat::Csv),
+        ("dataset.parquet", ExportFormat::Parquet),
+    ];
+    let mut files = Vec::with_capacity(data_files.len());
+    for (filename, format) in data_files {
+        export::export_dataset_from_snapshot(&output_dir.join(filename), &format, segments, processed_audio)?;
+        files.push(filename.to_string());
+    }
+    Ok(files)
+}
+
 pub fn export_dataset_bundle(
     db: &Database,
     model_manager: &ModelManager,
@@ -260,7 +790,129 @@ pub fn export_dataset_bundle(
     production: bool,
     warning_threshold: usize,
 ) -> AppResult<BundleExportResult> {
-    let validation_report = validation::validate_dataset_with_settings(db, settings)?;
+    crate::review_campaign::require_export_unblocked(db, "dataset bundle export")?;
+    if production {
+        return export_production_bundle_staged(output_dir, |staging_dir| {
+            export_dataset_bundle_inner(db, model_manager, staging_dir, settings, production, warning_threshold)
+        });
+    }
+
+    // Preserve the existing local-draft workflow, including deliberate re-export into the same
+    // working directory. Only a production/publication boundary needs the stronger fresh-tree and
+    // atomic-promotion contract below.
+    export_dataset_bundle_inner(db, model_manager, output_dir, settings, production, warning_threshold)
+}
+
+fn require_absent_or_empty_production_target(output_dir: &Path) -> AppResult<()> {
+    match std::fs::symlink_metadata(output_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(AppError::Validation(format!(
+            "Production export target must be an absent or empty directory: {}",
+            output_dir.display()
+        ))),
+        Ok(_) => {
+            if std::fs::read_dir(output_dir)?.next().transpose()?.is_some() {
+                Err(AppError::Validation(format!(
+                    "Production export target must be absent or empty; refusing to reuse or seal existing files in {}",
+                    output_dir.display()
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cleanup_generated_bundle_stage(staging_dir: &Path, parent_dir: &Path, staging_prefix: &str) {
+    if !staging_dir.exists() {
+        return;
+    }
+    // Recursive cleanup is allowed only for the exact sibling directory this exporter generated.
+    // Resolve both paths first so a malformed output path can never widen the deletion target.
+    let safe = staging_dir.canonicalize().ok().zip(parent_dir.canonicalize().ok()).is_some_and(
+        |(resolved_stage, resolved_parent)| {
+            resolved_stage.parent() == Some(resolved_parent.as_path())
+                && resolved_stage
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(staging_prefix))
+        },
+    );
+    if !safe {
+        tracing::error!(
+            "Refusing unsafe production-bundle staging cleanup outside the resolved parent: {}",
+            staging_dir.display()
+        );
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(staging_dir) {
+        tracing::warn!("Failed to remove production-bundle staging directory after error: {error}");
+    }
+}
+
+fn export_production_bundle_staged<F>(output_dir: &Path, build: F) -> AppResult<BundleExportResult>
+where
+    F: FnOnce(&Path) -> AppResult<BundleExportResult>,
+{
+    // Never let a public export inherit arbitrary artifacts from a prior run. A fresh sibling tree
+    // is the complete unit sealed by SHA256SUMS, then a single same-parent rename publishes it.
+    require_absent_or_empty_production_target(output_dir)?;
+    let parent_dir = output_dir.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent_dir)?;
+    let output_name = output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| AppError::Validation("Production export target must have a directory name".to_string()))?;
+    let staging_prefix = format!(".{output_name}.cortex-stage-");
+    let staging_dir = parent_dir.join(format!("{staging_prefix}{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&staging_dir)?;
+
+    let mut result = match build(&staging_dir) {
+        Ok(result) => result,
+        Err(error) => {
+            cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
+            return Err(error);
+        }
+    };
+
+    // Recheck immediately before promotion: another process must not be able to place an artifact
+    // in the final target while this run is hashing its sources. Never delete a non-empty target.
+    if let Err(error) = require_absent_or_empty_production_target(output_dir) {
+        cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
+        return Err(error);
+    }
+    if output_dir.exists() {
+        if let Err(error) = std::fs::remove_dir(output_dir) {
+            cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
+            return Err(error.into());
+        }
+    }
+    if let Err(error) = std::fs::rename(&staging_dir, output_dir) {
+        cleanup_generated_bundle_stage(&staging_dir, parent_dir, &staging_prefix);
+        return Err(error.into());
+    }
+
+    result.output_dir = output_dir.to_string_lossy().to_string();
+    result.manifest_path = output_dir.join("manifest.json").to_string_lossy().to_string();
+    Ok(result)
+}
+
+fn export_dataset_bundle_inner(
+    db: &Database,
+    model_manager: &ModelManager,
+    output_dir: &Path,
+    settings: &AppSettings,
+    production: bool,
+    warning_threshold: usize,
+) -> AppResult<BundleExportResult> {
+    // One immutable library snapshot feeds validation, quality, policy selection, and every shipped
+    // table. A live re-query per artifact allowed concurrent inserts/edits to bypass preflight and
+    // made JSON/JSONL/CSV/Parquet disagree with one another and with the manifest.
+    let library_snapshot = db.get_segments(None)?;
+    let library_snapshot_digest = segment_snapshot_digest(&library_snapshot)?;
+    let validation_report = validation::validate_segments_with_settings(&library_snapshot, settings)?;
     let validation_gate = BlockingValidationIssues {
         blocked: !validation_report.errors.is_empty() || validation_report.warnings.len() > warning_threshold,
         error_count: validation_report.errors.len(),
@@ -285,7 +937,7 @@ pub fn export_dataset_bundle(
     // source_transcripts/*.txt + source_reference_manifest.json + training_grade_details.json, and the
     // manifest counts still include it — re-contaminating the exact eval set the promotion gate measures
     // against.
-    let segments = export::exclude_unexportable_segments(db, db.get_segments(None)?)?;
+    let segments = export::exclude_unexportable_segments(db, library_snapshot)?;
     // Drop human-REJECTED clips ("mark bad") from the whole bundle the same way the plain export and the
     // training path do — a discarded draft must never be published or counted as verified/training-ready.
     let segments: Vec<crate::db::SpeechSegment> =
@@ -298,6 +950,17 @@ pub fn export_dataset_bundle(
     // data files (and with dataset.json's embedded total_segments), a dishonest number the honesty law forbids.
     let segments: Vec<crate::db::SpeechSegment> =
         segments.into_iter().filter(|s| !quality::is_effective_placeholder(s)).collect();
+    // The SHIPPED quality_report.json describes what this bundle CONTAINS, so it is computed from the
+    // selected rows — after the holdout/rejected/placeholder filters above. Computed from the raw
+    // library snapshot it reported a totalSegments (plus empty/low-confidence counts and duration
+    // quartiles) over rows the bundle deliberately drops, contradicting dataset.json's own
+    // total_segments and the manifest inside the very same artifact. The validation GATE above keeps
+    // reading the whole library on purpose: it is a check on the library, not a description of the
+    // bundle.
+    let quality_report = quality::compute_quality_from_segments_with_settings(&segments, settings);
+    let processed_audio_notices = export::processed_audio_notices(db, &segments)?;
+    let selected_segment_ids = segments.iter().map(|segment| segment.id.clone()).collect::<BTreeSet<_>>();
+    let dpo_export = crate::jury::learning::build_dpo_dataset_for_segment_ids(db, &selected_segment_ids)?;
     let training_grade_summary = quality::training_grade_summary(&segments);
     let training_ready_machine_segment_ids = training_ready_machine_segment_ids(&segments);
     let source_reference_records = collect_source_reference_bundle_records(db, &segments)?;
@@ -305,6 +968,8 @@ pub fn export_dataset_bundle(
     let agent_stage_event_limit = 500usize;
     let agent_import_reports = crate::runs::list_agent_import_reports(db, Some(agent_import_report_limit))?;
     let agent_promotion_readiness = build_agent_promotion_readiness(&agent_import_reports);
+    let mut initial_publication_rights: Option<PublicationRightsSnapshot> = None;
+    let mut initial_source_audio_bindings: Option<Vec<SourceAudioBinding>> = None;
     if production && training_grade_summary.training_ready_segments == 0 {
         return Err(AppError::Validation(
             "Production export blocked: no training-ready segments. Review or correct segments until at least one row grades gold or silver.".into(),
@@ -348,12 +1013,8 @@ pub fn export_dataset_bundle(
         // Placed LAST among the production gates on purpose: the earlier ones each name a specific
         // repairable defect, and firing ahead of them would replace those diagnostics with this one
         // message for every blocked export. Ordering does not change WHAT is publishable.
-        let mut undeclared: Vec<String> = Vec::new();
-        for segment in &segments {
-            if !db.rights_for_segment(&segment.id)?.permits_redistribution() {
-                undeclared.push(segment.id.clone());
-            }
-        }
+        let rights_snapshot = capture_publication_rights(db, &segments)?;
+        let undeclared = publication_rights_blockers(&rights_snapshot);
         if !undeclared.is_empty() {
             return Err(AppError::Validation(format!(
                 "Production export blocked: {} of {} clips have no declared redistribution rights. \
@@ -364,27 +1025,33 @@ pub fn export_dataset_bundle(
                 segment_id_preview(&undeclared)
             )));
         }
+        let missing_attribution = publication_attribution_blockers(&rights_snapshot);
+        if !missing_attribution.is_empty() {
+            return Err(AppError::Validation(format!(
+                "Production export blocked: {} selected clip(s) have a missing or non-visible recipient attribution credit: {}",
+                missing_attribution.len(),
+                segment_id_preview(&missing_attribution)
+            )));
+        }
+        let source_bindings = capture_source_audio_bindings(db, &segments, true)?;
+        let unbound = source_audio_binding_blockers(&source_bindings);
+        if !unbound.is_empty() {
+            return Err(AppError::Validation(format!(
+                "Production export blocked: {} selected clip(s) lack a verified source-audio binding (readable raw bytes plus matching stored canonical PCM): {}",
+                unbound.len(),
+                segment_id_preview(&unbound)
+            )));
+        }
+        initial_publication_rights = Some(rights_snapshot);
+        initial_source_audio_bindings = Some(source_bindings);
     }
 
     std::fs::create_dir_all(output_dir)?;
 
-    let quality_report = quality::compute_quality_with_settings(db, settings)?;
     let model_status = model_manager.status();
     let (model_meta, model_meta_load_error) = load_model_metadata_for_manifest(model_manager);
 
-    let data_files = [
-        ("dataset.json", ExportFormat::Json),
-        ("dataset.jsonl", ExportFormat::Jsonl),
-        ("dataset.csv", ExportFormat::Csv),
-        ("dataset.parquet", ExportFormat::Parquet),
-    ];
-
-    let mut files = Vec::new();
-    for (filename, format) in data_files {
-        let path = output_dir.join(filename);
-        export::export_dataset(db, &path, &format)?;
-        files.push(filename.to_string());
-    }
+    let mut files = write_bundle_dataset_files(output_dir, &segments, &processed_audio_notices)?;
 
     write_json(&output_dir.join("validation_report.json"), &validation_report)?;
     files.push("validation_report.json".into());
@@ -400,7 +1067,7 @@ pub fn export_dataset_bundle(
     write_json(&output_dir.join("source_reference_manifest.json"), &source_reference_manifest)?;
     files.push("source_reference_manifest.json".into());
     files.extend(source_reference_files);
-    let (learning_manifest, learning_files) = write_learning_artifacts(db, output_dir)?;
+    let (learning_manifest, learning_files) = write_learning_artifacts(output_dir, &dpo_export)?;
     write_json(&output_dir.join("learning_manifest.json"), &learning_manifest)?;
     files.push("learning_manifest.json".into());
     files.extend(learning_files);
@@ -417,6 +1084,7 @@ pub fn export_dataset_bundle(
     let long_file_dossiers_value = sanitized_bundle_value(&long_file_dossiers)?;
     let agent_import_reports_value = sanitized_bundle_value(&agent_import_reports)?;
     let agent_stage_events_value = sanitized_bundle_value(&agent_stage_events)?;
+    let agent_promotion_readiness_value = sanitized_bundle_value(&agent_promotion_readiness)?;
     write_json(
         &output_dir.join("long_file_dossiers.json"),
         &serde_json::json!({
@@ -440,7 +1108,7 @@ pub fn export_dataset_bundle(
             "agentStageEventCount": agent_stage_event_count,
             "sourceReferenceCount": source_reference_count,
             "longFileDossierCount": long_file_dossier_count,
-            "agentPromotionReadiness": &agent_promotion_readiness,
+            "agentPromotionReadiness": &agent_promotion_readiness_value,
         }),
     )?;
     files.push("agent_provenance.json".into());
@@ -466,11 +1134,14 @@ pub fn export_dataset_bundle(
     let diarized_provenance = ProvenanceCounts::tally(segments.iter().map(|s| s.diarized));
     let (vad_backend_counts, vad_backend_not_recorded) =
         tally_labels(segments.iter().map(|s| s.vad_backend.as_deref()));
-    // v43: WHO labelled this dataset. A corpus reviewed by several named people must say so — the
-    // per-reviewer counts are what makes a label attributable (and are the honest place to see that, say,
-    // one reviewer produced 90% of the gold). `notAttributed` covers desktop and pre-v43 decisions; it is
-    // reported as its own bucket rather than folded under the owner's name, which would be a fabrication.
-    let (reviewer_counts, reviewer_not_attributed) = tally_labels(segments.iter().map(|s| s.reviewed_by.as_deref()));
+    // A shared/public artifact needs to state how much review attribution exists without publishing
+    // worker identities. Names remain in the private operational database for payment/audit; only
+    // aggregate attributed/not-attributed counts cross the dataset boundary.
+    let reviewer_attributed = segments
+        .iter()
+        .filter(|segment| segment.reviewed_by.as_deref().is_some_and(|name| !name.trim().is_empty()))
+        .count();
+    let reviewer_not_attributed = segments.len().saturating_sub(reviewer_attributed);
     let run_config = {
         // The two capability args to config_from_settings are inert here (immediately overridden below):
         // runConfig's denoising/diarization now report STORED per-segment truth, not export-day
@@ -483,8 +1154,51 @@ pub fn export_dataset_bundle(
         rc
     };
 
+    // PUBLICATION COMMIT GATE. Re-read both mutable external truths immediately before the bundle's
+    // manifest and SHA256SUMS completion markers are written. If consent or source bytes changed since
+    // preflight, this run remains unsealed and must be retried against one coherent state.
+    let (source_audio_bindings, publication_rights_manifest) = if production {
+        let expected_bindings = initial_source_audio_bindings.as_ref().ok_or_else(|| {
+            AppError::Other("production export is missing its source-binding preflight snapshot".to_string())
+        })?;
+        // Raw source hashing can take minutes for a large corpus, so it runs BEFORE the final DB
+        // snapshot/rights gate. A human decision or withdrawal that lands while hashing is therefore
+        // observed by the last, cheap database reads immediately before completion markers.
+        let current_bindings = verify_source_audio_bindings_at_commit(db, &segments, expected_bindings)?;
+        verify_stored_pcm_hashes_at_commit(db, expected_bindings)?;
+        let selected_now = verify_segment_snapshot_at_commit(db, &library_snapshot_digest, &segments)?;
+        let expected_rights = initial_publication_rights.as_ref().ok_or_else(|| {
+            AppError::Other("production export is missing its publication-rights preflight snapshot".to_string())
+        })?;
+        verify_publication_rights_at_commit(db, &selected_now, expected_rights)?;
+        let rights_manifest = build_publication_rights_manifest(expected_rights, &current_bindings)?;
+        (current_bindings, Some(rights_manifest))
+    } else {
+        (capture_source_audio_bindings(db, &segments, false)?, None)
+    };
+    let source_audio_manifest = SourceAudioBindingManifest {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        schema_version: 1,
+        hash_algorithm: "blake3-file-bytes",
+        recording_count: source_audio_bindings.len(),
+        all_sources_bound: source_audio_bindings.iter().all(|binding| binding.byte_identity_bound),
+        all_stored_pcm_identities_verified: source_audio_bindings
+            .iter()
+            .all(|binding| binding.stored_pcm_identity_verified == Some(true)),
+        recordings: source_audio_bindings,
+    };
+    write_json(&output_dir.join("source_audio_manifest.json"), &source_audio_manifest)?;
+    files.push("source_audio_manifest.json".to_string());
+
+    if let Some(rights_manifest) = &publication_rights_manifest {
+        write_json(&output_dir.join(PUBLICATION_RIGHTS_MANIFEST), rights_manifest)?;
+        files.push(PUBLICATION_RIGHTS_MANIFEST.to_string());
+    }
+
     let manifest = serde_json::json!({
-        "schemaVersion": 1,
+        // v2 removes the public reviewer-name map in favor of aggregate attribution counts and adds
+        // source/row sealing evidence. Keeping v1 would silently break consumers of reviewedBy.
+        "schemaVersion": 2,
         "app": "cortex-speech-app",
         "appVersion": env!("CARGO_PKG_VERSION"),
         "exportedAt": chrono::Utc::now().to_rfc3339(),
@@ -494,11 +1208,28 @@ pub fn export_dataset_bundle(
         "verifiedSegments": verified_segments,
         "trainingReadySegments": training_ready_segments,
         "trainingGradeSummary": training_grade_summary.clone(),
-        "agentPromotionReadiness": &agent_promotion_readiness,
+        "agentPromotionReadiness": &agent_promotion_readiness_value,
         "agentImportReportCount": agent_import_report_count,
         "agentStageEventCount": agent_stage_event_count,
         "longFileDossierCount": long_file_dossier_count,
         "totalDurationMs": total_duration_ms,
+        "publicationRights": {
+            "manifest": publication_rights_manifest.as_ref().map(|_| PUBLICATION_RIGHTS_MANIFEST),
+            "recordingCount": publication_rights_manifest.as_ref().map(|manifest| manifest.recording_count),
+            "stateDigest": publication_rights_manifest.as_ref().map(|manifest| manifest.state_digest.as_str()),
+            "digestAlgorithm": publication_rights_manifest
+                .as_ref()
+                .map(|manifest| manifest.digest_algorithm),
+            "digestScope": publication_rights_manifest.as_ref().map(|manifest| manifest.digest_scope),
+            "recheckedAtSeal": production,
+        },
+        "sourceAudioBindings": {
+            "manifest": "source_audio_manifest.json",
+            "recordingCount": source_audio_manifest.recording_count,
+            "allSourcesBound": source_audio_manifest.all_sources_bound,
+            "allStoredPcmIdentitiesVerified": source_audio_manifest.all_stored_pcm_identities_verified,
+            "hashAlgorithm": source_audio_manifest.hash_algorithm,
+        },
         // H3 (P0.4 read side): runConfig.denoising/diarization report STORED per-segment truth (whether
         // the model actually ran at import), and processingProvenance carries the full per-segment
         // distribution — instead of recomputing from export-day model loadability and stamping one flag on
@@ -512,8 +1243,8 @@ pub fn export_dataset_bundle(
                 "byBackend": vad_backend_counts,
                 "notRecorded": vad_backend_not_recorded,
             },
-            "reviewedBy": {
-                "byReviewer": reviewer_counts,
+            "reviewAttribution": {
+                "attributed": reviewer_attributed,
                 "notAttributed": reviewer_not_attributed,
             },
         },
@@ -534,7 +1265,7 @@ pub fn export_dataset_bundle(
     // Same reason, and this is the bundle that actually gets published: any recording whose audio was
     // rebuilt by the pre-import cleaner says so here, or the card presents machine-separated audio as
     // an original field recording.
-    let processed_audio_md = export::processed_audio_markdown(&export::processed_audio_notices(db, &segments)?);
+    let processed_audio_md = export::processed_audio_markdown(&processed_audio_notices);
 
     let card = format!(
         "# Cortex Kurdish Speech Dataset\n\n\
@@ -622,8 +1353,10 @@ fn build_agent_promotion_readiness(reports: &[crate::runs::AgentImportReport]) -
     }
 }
 
-fn write_learning_artifacts(db: &Database, output_dir: &Path) -> AppResult<(LearningBundleManifest, Vec<String>)> {
-    let dpo_export = crate::jury::learning::build_dpo_dataset(db)?;
+fn write_learning_artifacts(
+    output_dir: &Path,
+    dpo_export: &crate::jury::learning::DpoExportResult,
+) -> AppResult<(LearningBundleManifest, Vec<String>)> {
     let mut files = Vec::new();
     // Re-exporting into a REUSED directory must not leave a stale learning_preferences.jsonl ORPHAN.
     // Unlike the bundle's other fixed-name files (rewritten every run), this one is written CONDITIONALLY —
@@ -1064,10 +1797,31 @@ fn bundle_path_label(path: &str) -> String {
     label.to_string()
 }
 
-fn sanitize_bundle_path_fields(value: &mut serde_json::Value) {
+fn sensitive_reviewer_identity_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.contains("reviewer")
+        || normalized.starts_with("reviewedby")
+        || normalized.contains("annotator")
+        || normalized.starts_with("annotatedby")
+        || normalized.starts_with("rater")
+        || normalized.starts_with("ratedby")
+}
+
+fn sanitize_bundle_public_fields(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, item) in map.iter_mut() {
+                // Agent reports/readiness are intentionally extensible JSON. Treat identity-shaped
+                // keys as private regardless of nesting or casing; redacting the whole value also
+                // removes name-keyed maps such as {"byReviewer":{"Sara": 12}}.
+                if sensitive_reviewer_identity_key(key) {
+                    *item = serde_json::Value::Null;
+                    continue;
+                }
                 match key.as_str() {
                     "audioPath" | "transcriptPath" | "originalTranscriptPath" | "file" => {
                         if let serde_json::Value::String(path) = item {
@@ -1080,20 +1834,20 @@ fn sanitize_bundle_path_fields(value: &mut serde_json::Value) {
                                 if let serde_json::Value::String(path) = entry {
                                     *path = bundle_path_label(path);
                                 } else {
-                                    sanitize_bundle_path_fields(entry);
+                                    sanitize_bundle_public_fields(entry);
                                 }
                             }
                         } else {
-                            sanitize_bundle_path_fields(item);
+                            sanitize_bundle_public_fields(item);
                         }
                     }
-                    _ => sanitize_bundle_path_fields(item),
+                    _ => sanitize_bundle_public_fields(item),
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                sanitize_bundle_path_fields(item);
+                sanitize_bundle_public_fields(item);
             }
         }
         _ => {}
@@ -1102,7 +1856,7 @@ fn sanitize_bundle_path_fields(value: &mut serde_json::Value) {
 
 fn sanitized_bundle_value<T: Serialize + ?Sized>(value: &T) -> AppResult<serde_json::Value> {
     let mut value = serde_json::to_value(value)?;
-    sanitize_bundle_path_fields(&mut value);
+    sanitize_bundle_public_fields(&mut value);
     Ok(value)
 }
 
@@ -1137,3 +1891,69 @@ fn write_text(path: &Path, text: &str) -> AppResult<()> {
 #[cfg(test)]
 #[path = "export_bundle_tests.rs"]
 mod tests;
+
+/// Regression for the shipped quality report's scope. A separate module from the `#[path]`-included
+/// `export_bundle_tests.rs` only so the fix and its gate stay in one file.
+#[cfg(test)]
+mod quality_report_scope_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn quality_report_describes_the_bundle_not_the_whole_library() {
+        // quality_report.json was computed from the RAW library snapshot, before the holdout, rejected
+        // and placeholder filters — so the bundle shipped a totalSegments (plus empty/low-confidence
+        // counts and duration quartiles) over rows its own dataset.json and manifest exclude. Two
+        // numbers, one population: the artifacts must not contradict each other.
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        let tmp = TempDir::new().unwrap();
+
+        for (id, name, text, decision) in [
+            ("keep-1", "keep.wav", "دەقی مانەوە", Some("accept")),
+            ("rejected-1", "rejected.wav", "دەقی خراپ", None),
+            ("pending-1", "pending.wav", "[Pending WSL 7B ASR]", None),
+        ] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, b"audio").unwrap();
+            db.insert_legacy_segment_fixture(&SpeechSegment {
+                id: id.into(),
+                audio_path: path.to_string_lossy().to_string(),
+                raw_transcript: text.into(),
+                // Human-only field by canon: only the reviewed row carries one.
+                annotated_transcript: decision.map(|_| text.to_string()),
+                duration_ms: 1200,
+                speaker_id: Some("spk1".into()),
+                verified: true,
+                human_decision: decision.map(str::to_string),
+                clipping_ratio: Some(0.0),
+                rms_db: Some(-20.0),
+                snr_db: Some(20.0),
+                ..SpeechSegment::default()
+            })
+            .unwrap();
+        }
+        // Reject through the production path, so the row carries exactly the columns "mark bad" writes.
+        db.record_human_decision("rejected-1", "reject", None, None).unwrap();
+
+        let models = ModelManager::new(tmp.path().join("models"));
+        let out = tmp.path().join("bundle");
+        export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+
+        let quality_report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("quality_report.json")).unwrap()).unwrap();
+        let dataset: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("dataset.json")).unwrap()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+
+        let rows = dataset["segments"].as_array().expect("dataset.json carries a segments array").len();
+        assert_eq!(rows, 1, "only the accepted clip may be written");
+        assert_eq!(manifest["segmentCount"].as_u64(), Some(rows as u64));
+        assert_eq!(
+            quality_report["totalSegments"].as_u64(),
+            Some(rows as u64),
+            "the shipped quality report must describe the rows this bundle contains: {quality_report}"
+        );
+    }
+}

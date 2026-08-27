@@ -7,6 +7,91 @@ use super::*;
 use crate::db::{SegmentHypothesis, SourceTranscriptRecord, SpeechSegment};
 use tempfile::TempDir;
 
+fn write_test_wav(path: &Path, sample: i16) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).unwrap();
+    for _ in 0..16_000 {
+        writer.write_sample(sample).unwrap();
+    }
+    writer.finalize().unwrap();
+}
+
+fn persist_current_pcm_identity(db: &Database, audio_path: &str) {
+    let content = current_canonical_pcm_blake3(Path::new(audio_path)).unwrap();
+    db.set_audio_identity(audio_path, &crate::fingerprint::AudioIdentity { spectral: 1, content }).unwrap();
+}
+
+fn record_test_phone_accept(db: &Database, segment_id: &str, reviewer: &str) {
+    let content_hash = blake3::hash(segment_id.as_bytes()).to_hex().to_string();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments
+                SET audio_content_hash = ?2,
+                    alignment_json = json_object(
+                        'source_start_ms', 0,
+                        'source_end_ms', duration_ms,
+                        'chunk_index', 0,
+                        'chunk_count', 1
+                    )
+              WHERE id = ?1",
+            rusqlite::params![segment_id, content_hash],
+        )
+        .unwrap();
+    let revision = db.segment_review_revision(segment_id).unwrap().unwrap();
+    assert!(db
+        .record_phone_human_decision_by_at_revision(segment_id, "accept", None, reviewer, revision)
+        .unwrap()
+        .is_some());
+}
+
+fn record_test_desktop_edit(db: &Database, segment_id: &str, human_fix: &str) -> i64 {
+    let content_hash = blake3::hash(segment_id.as_bytes()).to_hex().to_string();
+    db.connection()
+        .execute(
+            "UPDATE speech_segments SET audio_content_hash = ?2 WHERE id = ?1",
+            rusqlite::params![segment_id, content_hash],
+        )
+        .unwrap();
+    db.record_human_decision(segment_id, "edit", Some(human_fix), None).unwrap();
+    db.connection()
+        .query_row(
+            "SELECT id FROM human_decision_effect_events WHERE segment_id = ?1 ORDER BY id DESC LIMIT 1",
+            [segment_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn insert_publishable_human_gold_segment(db: &Database, tmp: &TempDir, segment_id: &str) -> String {
+    let audio = tmp.path().join(format!("{segment_id}.wav"));
+    write_test_wav(&audio, 900);
+    let audio_path = audio.to_string_lossy().to_string();
+    db.insert_legacy_segment_fixture(&SpeechSegment {
+        id: segment_id.to_string(),
+        audio_path: audio_path.clone(),
+        raw_transcript: "human checked text".into(),
+        annotated_transcript: Some("human checked text".into()),
+        duration_ms: 1200,
+        speaker_id: Some("spk1".into()),
+        verified: true,
+        human_decision: Some("accept".into()),
+        confidence: Some(0.95),
+        clipping_ratio: Some(0.0),
+        rms_db: Some(-20.0),
+        snr_db: Some(20.0),
+        split: Some("train".into()),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    persist_current_pcm_identity(db, &audio_path);
+    audio_path
+}
+
 /// Declare full redistribution rights on a source recording.
 ///
 /// A PRODUCTION bundle is the artifact that leaves the machine, so it refuses clips whose rights are
@@ -43,9 +128,52 @@ fn assert_json_strings_do_not_contain(value: &serde_json::Value, needle: &str, a
     assert!(!json_string_values_contain(value, needle), "{artifact} leaked private path fragment: {needle}");
 }
 
+fn assert_no_generated_bundle_stages(parent: &Path, output_name: &str) {
+    let prefix = format!(".{output_name}.cortex-stage-");
+    let leaked = std::fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    assert!(leaked.is_empty(), "production export leaked staging directories: {leaked:?}");
+}
+
+fn assert_parquet_has_no_private_reviewer_identity(path: &Path, private_values: &[&str]) {
+    use arrow_array::Array;
+
+    let file = std::fs::File::open(path).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+    for batch in reader {
+        let batch = batch.unwrap();
+        for field in batch.schema().fields() {
+            assert!(
+                !sensitive_reviewer_identity_key(field.name()),
+                "public Parquet schema exposes reviewer identity column {}",
+                field.name()
+            );
+        }
+        for column in batch.columns() {
+            if let Some(strings) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
+                for index in 0..strings.len() {
+                    if strings.is_null(index) {
+                        continue;
+                    }
+                    for private_value in private_values {
+                        assert!(
+                            !strings.value(index).contains(private_value),
+                            "public Parquet string value leaked reviewer identity {private_value}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn insert_machine_silver_segment_with_coverage(db: &Database, tmp: &TempDir, segment_id: &str) -> (String, String) {
     let audio = tmp.path().join(format!("{segment_id}.wav"));
-    std::fs::write(&audio, b"audio").unwrap();
+    write_test_wav(&audio, 1200);
     let audio_path = audio.to_string_lossy().to_string();
     let evidence_json = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
@@ -84,8 +212,8 @@ fn insert_machine_silver_segment_with_coverage(db: &Database, tmp: &TempDir, seg
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
-    db.write_segment_verdict(
+    db.insert_legacy_segment_fixture(&segment).unwrap();
+    db.write_legacy_machine_verdict_for_test(
         &segment.id,
         "jury_accept",
         Some("reference candidate"),
@@ -162,7 +290,7 @@ fn record_ready_agentic_promotion_report(
 fn production_export_blocks_on_validation_errors() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "missing-audio".into(),
         created_at: None,
         audio_path: "C:\\definitely\\missing\\audio.wav".into(),
@@ -191,13 +319,59 @@ fn production_export_blocks_on_validation_errors() {
 }
 
 #[test]
+fn production_export_refuses_a_nonempty_target_without_sealing_stale_files() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+    std::fs::create_dir(&out).unwrap();
+    let stale = out.join("reviewer_report.json");
+    std::fs::write(&stale, br#"{"reviewer":"Private Reviewer Alpha"}"#).unwrap();
+    let models = ModelManager::new(tmp.path().join("models"));
+
+    let error = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), true, usize::MAX).unwrap_err();
+
+    assert!(error.to_string().contains("absent or empty"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&stale).unwrap(),
+        r#"{"reviewer":"Private Reviewer Alpha"}"#,
+        "the exporter must not recursively delete an arbitrary existing target"
+    );
+    assert!(!out.join("manifest.json").exists(), "a refused target must receive no completion manifest");
+    assert!(!out.join("SHA256SUMS").exists(), "a stale artifact must never be sealed by this run");
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
+fn failed_staged_production_build_leaves_no_final_markers_or_staging_tree() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("bundle");
+
+    let error = export_production_bundle_staged(&out, |staging_dir| -> AppResult<BundleExportResult> {
+        // Model a failure at the last mutable-state gate after substantial output already exists.
+        // None of these bytes may become visible under the final production directory.
+        std::fs::write(staging_dir.join("reviewer_report.json"), b"Private Reviewer Alpha")?;
+        std::fs::write(staging_dir.join("manifest.json"), b"partial manifest")?;
+        std::fs::write(staging_dir.join("SHA256SUMS"), b"partial sums")?;
+        Err(AppError::Validation("simulated late publication gate failure".to_string()))
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("simulated late publication gate failure"));
+    assert!(!out.exists(), "a late failure must not publish even a partial final directory");
+    assert!(!out.join("manifest.json").exists());
+    assert!(!out.join("SHA256SUMS").exists());
+    assert_no_generated_bundle_stages(tmp.path(), "bundle");
+}
+
+#[test]
 fn production_export_blocks_when_warnings_exceed_threshold() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "empty-transcript".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -234,7 +408,7 @@ fn production_export_blocks_when_no_segments_are_training_ready() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "review-only".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -309,7 +483,7 @@ fn production_export_blocks_machine_ready_rows_without_hypothesis_coverage() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     let weak_evidence = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -317,7 +491,7 @@ fn production_export_blocks_machine_ready_rows_without_hypothesis_coverage() {
         "shouldCommit": true
     })
     .to_string();
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         &segment.id,
         "jury_accept",
         Some("reference candidate"),
@@ -351,8 +525,8 @@ fn production_export_allows_human_gold_without_hypothesis_coverage() {
     db.initialize().unwrap();
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("human-gold.wav");
-    std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    write_test_wav(&audio, 900);
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "human-gold-seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -375,6 +549,7 @@ fn production_export_allows_human_gold_without_hypothesis_coverage() {
         ..SpeechSegment::default()
     })
     .unwrap();
+    persist_current_pcm_identity(&db, &audio.to_string_lossy());
     declare_redistribution_rights(&db, &audio.to_string_lossy());
 
     let models = ModelManager::new(tmp.path().join("models"));
@@ -386,6 +561,48 @@ fn production_export_allows_human_gold_without_hypothesis_coverage() {
         serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["trainingReadySegments"].as_u64(), Some(1));
     assert_eq!(manifest["trainingGradeSummary"]["goldSegments"].as_u64(), Some(1));
+}
+
+#[test]
+fn production_export_blocks_when_current_pcm_disagrees_with_import_identity() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio = tmp.path().join("changed-after-import.wav");
+    write_test_wav(&audio, 500);
+    let audio_path = audio.to_string_lossy().to_string();
+    db.insert_legacy_segment_fixture(&SpeechSegment {
+        id: "pcm-mismatch".into(),
+        audio_path: audio_path.clone(),
+        raw_transcript: "human checked text".into(),
+        annotated_transcript: Some("human checked text".into()),
+        duration_ms: 1000,
+        verified: true,
+        human_decision: Some("accept".into()),
+        confidence: Some(0.95),
+        clipping_ratio: Some(0.0),
+        rms_db: Some(-20.0),
+        snr_db: Some(20.0),
+        split: Some("train".into()),
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    persist_current_pcm_identity(&db, &audio_path);
+    declare_redistribution_rights(&db, &audio_path);
+
+    // Same WAV shape, different decoded samples: export-time raw hashing alone would happily bind
+    // this replacement. The persisted canonical PCM identity must stop publication.
+    write_test_wav(&audio, -500);
+    let selected = db.get_segments(None).unwrap();
+    let bindings = capture_source_audio_bindings(&db, &selected, true).unwrap();
+    assert_eq!(bindings[0].identity_issue.as_deref(), Some("stored_pcm_identity_mismatch"));
+    assert!(!source_audio_binding_blockers(&bindings).is_empty());
+
+    let out = tmp.path().join("bundle");
+    let models = ModelManager::new(tmp.path().join("models"));
+    let err = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), true, usize::MAX).unwrap_err();
+    assert!(err.to_string().contains("lack a verified source-audio binding"), "{err}");
+    assert!(!out.join("manifest.json").exists());
 }
 
 #[test]
@@ -479,7 +696,7 @@ fn a_revoked_clip_is_absent_from_the_bundles_data_files_manifest_and_card_alike(
     std::fs::write(&revoked, b"audio").unwrap();
     for (id, path, text) in [("keep-1", &keep, "دەقی مانەوە"), ("revoked-1", &revoked, "دەقی سڕاوە")]
     {
-        db.insert_segment_full(&SpeechSegment {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
             id: id.into(),
             audio_path: path.to_string_lossy().to_string(),
             raw_transcript: text.into(),
@@ -607,6 +824,254 @@ fn production_export_blocks_rights_that_stop_short_of_redistribution() {
     }
 }
 
+#[test]
+fn production_cc_by_blocks_when_attribution_credit_is_missing() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio_path = insert_publishable_human_gold_segment(&db, &tmp, "cc-by-missing-credit");
+    db.set_recording_rights(
+        &audio_path,
+        &crate::db::RecordingRights {
+            license: Some("CC-BY-4.0".into()),
+            consent_basis: Some("explicit_written_consent".into()),
+            permitted_use: Some("train,redistribute".into()),
+            attribution: Some("   ".into()),
+            source: Some("private operational provenance".into()),
+            revoked_at: None,
+        },
+    )
+    .unwrap();
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    let error = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), true, usize::MAX).unwrap_err();
+
+    assert!(error.to_string().contains("missing or non-visible"), "{error}");
+    assert!(error.to_string().contains("recipient attribution credit"), "{error}");
+    assert!(!out.exists(), "an attribution-invalid production bundle must not be published");
+}
+
+#[test]
+fn production_cc_by_emits_recipient_readable_credit_and_sanitized_source_identity() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio_path = insert_publishable_human_gold_segment(&db, &tmp, "cc-by-credited");
+    db.set_recording_rights(
+        &audio_path,
+        &crate::db::RecordingRights {
+            license: Some("CC-BY-SA-4.0".into()),
+            consent_basis: Some("explicit_written_consent".into()),
+            permitted_use: Some("train,redistribute".into()),
+            attribution: Some("Kurdish Speech Contributor Collective".into()),
+            source: Some(r"C:\Private\Curator\rights-ledger.csv".into()),
+            revoked_at: None,
+        },
+    )
+    .unwrap();
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    let result = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), true, usize::MAX).unwrap();
+
+    assert!(result.files.contains(&PUBLICATION_RIGHTS_MANIFEST.to_string()));
+    let rights: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join(PUBLICATION_RIGHTS_MANIFEST)).unwrap()).unwrap();
+    assert_eq!(rights["schemaVersion"].as_u64(), Some(1));
+    assert_eq!(rights["digestAlgorithm"].as_str(), Some(PUBLICATION_RIGHTS_DIGEST_ALGORITHM));
+    assert_eq!(rights["digestScope"].as_str(), Some(PUBLICATION_RIGHTS_DIGEST_SCOPE));
+    assert_eq!(rights["recordingCount"].as_u64(), Some(1));
+    let recording = &rights["recordings"][0];
+    assert_eq!(recording["sourceAudioName"].as_str(), Some("cc-by-credited.wav"));
+    assert!(recording["sourceRecordingId"].as_str().is_some_and(|value| value.starts_with("blake3-file:")));
+    assert_eq!(recording["license"].as_str(), Some("CC-BY-SA-4.0"));
+    assert_eq!(recording["permittedUse"].as_str(), Some("train,redistribute"));
+    assert_eq!(recording["attribution"].as_str(), Some("Kurdish Speech Contributor Collective"));
+    assert!(recording.get("consentBasis").is_none(), "private lawful-basis metadata is not a recipient field");
+    assert!(recording.get("source").is_none(), "operational provenance paths are not a recipient field");
+    let rights_text = std::fs::read_to_string(out.join(PUBLICATION_RIGHTS_MANIFEST)).unwrap();
+    assert!(!rights_text.contains(tmp.path().to_string_lossy().as_ref()));
+    assert!(!rights_text.contains(r"C:\Private\Curator"));
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["publicationRights"]["manifest"].as_str(), Some(PUBLICATION_RIGHTS_MANIFEST));
+    assert_eq!(manifest["publicationRights"]["digestAlgorithm"].as_str(), Some(PUBLICATION_RIGHTS_DIGEST_ALGORITHM));
+    assert_eq!(manifest["publicationRights"]["digestScope"].as_str(), Some(PUBLICATION_RIGHTS_DIGEST_SCOPE));
+    assert_eq!(manifest["publicationRights"]["stateDigest"], rights["stateDigest"]);
+    let public_records: Vec<PublicationRightsRecord> =
+        serde_json::from_value(rights["recordings"].clone()).expect("public rights DTO is self-contained");
+    assert_eq!(
+        rights["stateDigest"].as_str(),
+        Some(publication_rights_digest(&public_records).unwrap().as_str()),
+        "recipient must be able to recompute the state digest from the emitted public records alone"
+    );
+    let sums = std::fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+    assert!(sums.contains(PUBLICATION_RIGHTS_MANIFEST), "recipient rights manifest must be integrity-sealed");
+}
+
+#[test]
+fn production_cc0_allows_absent_credit() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio_path = insert_publishable_human_gold_segment(&db, &tmp, "cc0-no-credit");
+    db.set_recording_rights(
+        &audio_path,
+        &crate::db::RecordingRights {
+            license: Some("CC0-1.0".into()),
+            consent_basis: Some("public_domain_dedication".into()),
+            permitted_use: Some("train,redistribute".into()),
+            attribution: None,
+            source: None,
+            revoked_at: None,
+        },
+    )
+    .unwrap();
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), true, usize::MAX).unwrap();
+
+    let rights: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join(PUBLICATION_RIGHTS_MANIFEST)).unwrap()).unwrap();
+    assert_eq!(rights["recordings"][0]["license"].as_str(), Some("CC0-1.0"));
+    assert!(rights["recordings"][0]["attribution"].is_null());
+}
+
+#[test]
+fn attribution_requirement_is_fail_closed_with_a_precise_no_credit_allowlist() {
+    for license in [
+        "CC-BY-4.0",
+        "CC BY-SA 3.0",
+        "CC-BY-NC-ND-4.0",
+        "SPDX: CC-BY-4.0",
+        "https://spdx.org/licenses/CC-BY-4.0.html",
+        "https://creativecommons.org/licenses/by/4.0/",
+        "https://creativecommons.org/licenses/by-sa/4.0/",
+        "Creative Commons Attribution 4.0",
+        "Attribution-ShareAlike 4.0 International",
+        "owner-custom-redistribution",
+        "Internal permissive licence",
+        "CCO-1.0",
+        "CC0-1.0 OR Proprietary",
+        "CC0-1.0 یان مافی تایبەت",
+        "CC0-1.0 私有",
+        "CC0-1.0!!!",
+    ] {
+        assert!(license_requires_attribution(license), "must require credit: {license}");
+    }
+    for license in [
+        "CC0-1.0",
+        "Creative Commons Zero 1.0 Universal",
+        "https://creativecommons.org/publicdomain/zero/1.0/",
+        "public-domain",
+        "Public Domain Declaration",
+        "Public Domain Mark 1.0",
+        "CC-PDM-1.0",
+        "https://creativecommons.org/publicdomain/mark/1.0/",
+        "Unlicense",
+        "https://unlicense.org/",
+        "0BSD",
+        "BSD Zero Clause License",
+        "PDDL-1.0",
+        "ODC-PDDL-1.0",
+        "Open Data Commons Public Domain Dedication and License 1.0",
+        "https://opendatacommons.org/licenses/pddl/1-0/",
+    ] {
+        assert!(!license_requires_attribution(license), "must not invent a credit requirement: {license}");
+    }
+}
+
+#[test]
+fn attribution_gate_rejects_invisible_values_and_accepts_recipient_visible_credit() {
+    for credit in [
+        "",
+        " \t\r\n",
+        "\0\u{0007}",
+        "\u{200B}\u{200C}\u{200D}\u{FEFF}",
+        "\u{061C}\u{202A}\u{202E}\u{2066}\u{2069}",
+        "\u{115F}\u{1160}\u{3164}\u{FFA0}",
+        "\u{034F}\u{17B4}\u{180B}\u{180F}\u{FE00}\u{1BCA0}\u{1D173}\u{E0100}",
+        "© —",
+    ] {
+        assert!(!has_recipient_visible_credit(credit), "invisible credit accepted: {credit:?}");
+        let snapshot = BTreeMap::from([(
+            "segment".to_string(),
+            crate::db::RecordingRights {
+                license: Some("CC-BY-4.0".into()),
+                consent_basis: Some("explicit_written_consent".into()),
+                permitted_use: Some("redistribute".into()),
+                attribution: Some(credit.to_string()),
+                ..crate::db::RecordingRights::default()
+            },
+        )]);
+        assert_eq!(publication_attribution_blockers(&snapshot), vec!["segment"]);
+    }
+
+    for filler in ['\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}'] {
+        assert!(filler.is_alphanumeric(), "test precondition: Hangul filler must bypass a bare alphanumeric check");
+        assert!(is_invisible_credit_format(filler), "Hangul filler must be explicitly classified invisible");
+    }
+    for default_ignorable in [
+        '\u{034F}',
+        '\u{17B4}',
+        '\u{17B5}',
+        '\u{180B}',
+        '\u{180C}',
+        '\u{180D}',
+        '\u{180F}',
+        '\u{FE00}',
+        '\u{FE0F}',
+        '\u{1BCA0}',
+        '\u{1BCA3}',
+        '\u{1D173}',
+        '\u{1D17A}',
+        '\u{E0100}',
+        '\u{E01EF}',
+    ] {
+        assert!(
+            is_invisible_credit_format(default_ignorable),
+            "default-ignorable U+{:04X} must not satisfy public credit visibility",
+            default_ignorable as u32
+        );
+    }
+
+    for credit in ["هەژین", "Sara", "123", "© Sara", "No attribution required"] {
+        assert!(has_recipient_visible_credit(credit), "visible credit rejected: {credit:?}");
+    }
+    let custom_with_explicit_credit = BTreeMap::from([(
+        "custom".to_string(),
+        crate::db::RecordingRights {
+            license: Some("owner-custom-redistribution".into()),
+            consent_basis: Some("owner_declaration".into()),
+            permitted_use: Some("redistribute".into()),
+            attribution: Some("No attribution required".into()),
+            ..crate::db::RecordingRights::default()
+        },
+    )]);
+    assert!(publication_attribution_blockers(&custom_with_explicit_credit).is_empty());
+
+    for supplied_blank in ["", " \t\n"] {
+        let cc0_with_invalid_supplied_credit = BTreeMap::from([(
+            "cc0".to_string(),
+            crate::db::RecordingRights {
+                license: Some("CC0-1.0".into()),
+                consent_basis: Some("public_domain_dedication".into()),
+                permitted_use: Some("redistribute".into()),
+                attribution: Some(supplied_blank.to_string()),
+                ..crate::db::RecordingRights::default()
+            },
+        )]);
+        assert_eq!(
+            publication_attribution_blockers(&cc0_with_invalid_supplied_credit),
+            vec!["cc0"],
+            "a no-credit licence must omit attribution rather than supply a blank value"
+        );
+    }
+}
+
 /// The gate is scoped to PUBLICATION. Local dataset preparation must keep working on undeclared
 /// clips, or this change would silently redefine what the owner's everyday export command does.
 #[test]
@@ -626,6 +1091,199 @@ fn local_export_still_works_without_declared_rights() {
 }
 
 #[test]
+fn bundle_binds_each_source_recording_to_exact_file_bytes_without_leaking_its_absolute_path() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio = tmp.path().join("shared-source.wav");
+    std::fs::write(&audio, b"source-bytes-v1").unwrap();
+    let audio_path = audio.to_string_lossy().to_string();
+    for id in ["bound-b", "bound-a"] {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
+            id: id.to_string(),
+            audio_path: audio_path.clone(),
+            raw_transcript: format!("text for {id}"),
+            duration_ms: 1000,
+            ..SpeechSegment::default()
+        })
+        .unwrap();
+    }
+
+    let models = ModelManager::new(tmp.path().join("models"));
+    let out = tmp.path().join("bundle");
+    let result = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    assert!(result.files.contains(&"source_audio_manifest.json".to_string()));
+
+    let expected = crate::pipeline::source_audio_identity(&audio).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("source_audio_manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schemaVersion"].as_u64(), Some(1));
+    assert_eq!(manifest["hashAlgorithm"].as_str(), Some("blake3-file-bytes"));
+    assert_eq!(manifest["recordingCount"].as_u64(), Some(1));
+    assert_eq!(manifest["allSourcesBound"].as_bool(), Some(true));
+    let binding = &manifest["recordings"][0];
+    assert_eq!(binding["sourceAudioName"].as_str(), Some("shared-source.wav"));
+    assert_eq!(binding["sourceFileBlake3"].as_str(), Some(expected.content_hash.as_str()));
+    assert_eq!(binding["sourceSizeBytes"].as_i64(), Some(expected.size_bytes));
+    assert_eq!(binding["sourceRecordingId"].as_str(), Some(format!("blake3-file:{}", expected.content_hash).as_str()));
+    assert_eq!(binding["segmentIds"], serde_json::json!(["bound-a", "bound-b"]));
+    let body = std::fs::read_to_string(out.join("source_audio_manifest.json")).unwrap();
+    assert!(!body.contains(tmp.path().to_string_lossy().as_ref()), "absolute source path leaked into binding manifest");
+}
+
+#[test]
+fn processed_audio_provenance_is_captured_once_and_never_leaks_private_paths() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let private_dir = tmp.path().join("private-owner-root");
+    std::fs::create_dir_all(&private_dir).unwrap();
+    let audio = private_dir.join("processed.wav");
+    std::fs::write(&audio, b"audio").unwrap();
+    let audio_path = audio.to_string_lossy().to_string();
+    db.insert_legacy_segment_fixture(&SpeechSegment {
+        id: "processed-private-path".into(),
+        audio_path: audio_path.clone(),
+        raw_transcript: "reviewed text".into(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    db.upsert_source_audio_provenance(&crate::db::SourceAudioProvenance {
+        audio_path: audio_path.clone(),
+        processing: "speech-preserving cleanup".into(),
+        separator_model: Some("separator-v1".into()),
+        timeline_preserved: true,
+        manifest_path: Some(private_dir.join("cleanup-manifest.json").to_string_lossy().to_string()),
+    })
+    .unwrap();
+
+    let out = tmp.path().join("bundle");
+    let models = ModelManager::new(tmp.path().join("models"));
+    let result = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    let dataset: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(dataset["metadata"]["processed_audio"][0]["audio_path"], "processed.wav");
+    assert_eq!(dataset["metadata"]["processed_audio"][0]["manifest_path"], "cleanup-manifest.json");
+    let card = std::fs::read_to_string(out.join("dataset_card.md")).unwrap();
+    assert!(card.contains("processed.wav"));
+
+    let private_root = private_dir.to_string_lossy();
+    for artifact in &result.files {
+        let bytes = std::fs::read(out.join(artifact)).unwrap();
+        assert!(
+            !bytes.windows(private_root.len()).any(|window| window == private_root.as_bytes()),
+            "{artifact} leaked processed-audio private path"
+        );
+    }
+}
+
+#[test]
+fn publication_commit_gate_detects_a_withdrawal_after_preflight() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio = tmp.path().join("consent-race.wav");
+    std::fs::write(&audio, b"audio").unwrap();
+    let audio_path = audio.to_string_lossy().to_string();
+    db.insert_legacy_segment_fixture(&SpeechSegment {
+        id: "consent-race".to_string(),
+        audio_path: audio_path.clone(),
+        raw_transcript: "reviewed text".to_string(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+    declare_redistribution_rights(&db, &audio_path);
+    let segments = db.get_segments(None).unwrap();
+    let preflight = capture_publication_rights(&db, &segments).unwrap();
+    assert!(publication_rights_blockers(&preflight).is_empty());
+
+    db.revoke_recording(&audio_path).unwrap();
+    let err = verify_publication_rights_at_commit(&db, &segments, &preflight).unwrap_err();
+    assert!(err.to_string().contains("rights changed while the bundle was being generated"), "{err}");
+}
+
+#[test]
+fn source_commit_gate_detects_same_size_byte_replacement_after_preflight() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let audio = tmp.path().join("byte-race.wav");
+    write_test_wav(&audio, 700);
+    let segment = SpeechSegment {
+        id: "byte-race".to_string(),
+        audio_path: audio.to_string_lossy().to_string(),
+        raw_transcript: "reviewed text".to_string(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    };
+    db.insert_legacy_segment_fixture(&segment).unwrap();
+    persist_current_pcm_identity(&db, &audio.to_string_lossy());
+    let segments = db.get_segments(None).unwrap();
+    let preflight = capture_source_audio_bindings(&db, &segments, true).unwrap();
+    assert!(source_audio_binding_blockers(&preflight).is_empty());
+
+    // Same length defeats size-only checks; the byte digest must still change.
+    write_test_wav(&audio, -700);
+    let err = verify_source_audio_bindings_at_commit(&db, &segments, &preflight).unwrap_err();
+    assert!(err.to_string().contains("source-audio bytes changed"), "{err}");
+}
+
+#[test]
+fn bundle_tables_stay_on_one_preflight_snapshot_after_insert_and_transcript_mutation() {
+    let db = Database::open(":memory:").unwrap();
+    db.initialize().unwrap();
+    let tmp = TempDir::new().unwrap();
+    let original = SpeechSegment {
+        id: "snapshot-original".to_string(),
+        audio_path: tmp.path().join("original.wav").to_string_lossy().to_string(),
+        raw_transcript: "preflight transcript".to_string(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    };
+    db.insert_legacy_segment_fixture(&original).unwrap();
+    let snapshot = db.get_segments(None).unwrap();
+    let digest = segment_snapshot_digest(&snapshot).unwrap();
+
+    let mut changed = original.clone();
+    changed.raw_transcript = "mutated live transcript".to_string();
+    db.insert_legacy_segment_fixture(&changed).unwrap();
+    db.insert_legacy_segment_fixture(&SpeechSegment {
+        id: "late-row".to_string(),
+        audio_path: tmp.path().join("late.wav").to_string_lossy().to_string(),
+        raw_transcript: "late unvalidated transcript".to_string(),
+        duration_ms: 1000,
+        ..SpeechSegment::default()
+    })
+    .unwrap();
+
+    let out = tmp.path().join("snapshot-files");
+    let processed_audio = export::processed_audio_notices(&db, &snapshot).unwrap();
+    write_bundle_dataset_files(&out, &snapshot, &processed_audio).unwrap();
+    for artifact in ["dataset.json", "dataset.jsonl", "dataset.csv"] {
+        let body = std::fs::read_to_string(out.join(artifact)).unwrap();
+        assert!(body.contains("preflight transcript"), "{artifact} lost the preflight row");
+        assert!(!body.contains("mutated live transcript"), "{artifact} re-read a changed row");
+        assert!(!body.contains("late unvalidated transcript"), "{artifact} admitted a post-preflight row");
+    }
+    let file = std::fs::File::open(out.join("dataset.parquet")).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+    let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+    let transcript = batches[0]
+        .column_by_name("raw_transcript")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    assert_eq!(transcript.value(0), "preflight transcript");
+
+    let err = verify_segment_snapshot_at_commit(&db, &digest, &snapshot).unwrap_err();
+    assert!(err.to_string().contains("dataset rows changed"), "{err}");
+}
+
+#[test]
 fn production_export_allows_machine_ready_rows_with_ready_agentic_promotion_report() {
     let db = Database::open(":memory:").unwrap();
     db.initialize().unwrap();
@@ -636,6 +1294,7 @@ fn production_export_allows_machine_ready_rows_with_ready_agentic_promotion_repo
     }
     let agent_report =
         record_ready_agentic_promotion_report(&db, &audio_path, &segment_id, "run-ready-agentic-production");
+    persist_current_pcm_identity(&db, &audio_path);
     declare_redistribution_rights(&db, &audio_path);
 
     let models = ModelManager::new(tmp.path().join("models"));
@@ -752,8 +1411,8 @@ fn bundle_excludes_holdout_gold_from_all_artifacts() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&mk("keep-seg", "/data/keep.wav", "KEEPMARKERTEXT")).unwrap();
-    db.insert_segment_full(&mk("hold-seg", "/data/holdout.wav", "HOLDOUTMARKERTEXT")).unwrap();
+    db.insert_legacy_segment_fixture(&mk("keep-seg", "/data/keep.wav", "KEEPMARKERTEXT")).unwrap();
+    db.insert_legacy_segment_fixture(&mk("hold-seg", "/data/holdout.wav", "HOLDOUTMARKERTEXT")).unwrap();
     db.upsert_source_transcript(&SourceTranscriptRecord {
         audio_path: "/data/holdout.wav".to_string(),
         model_id: "gemini-2.5-pro".to_string(),
@@ -816,8 +1475,8 @@ fn bundle_manifest_count_excludes_placeholders_matching_the_shipped_data_files()
         verified,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&mk("real", "/data/real.wav", "دەقی ڕاست", true)).unwrap();
-    db.insert_segment_full(&mk("pending", "/data/pending.wav", "[Pending WSL 7B ASR]", false)).unwrap();
+    db.insert_legacy_segment_fixture(&mk("real", "/data/real.wav", "دەقی ڕاست", true)).unwrap();
+    db.insert_legacy_segment_fixture(&mk("pending", "/data/pending.wav", "[Pending WSL 7B ASR]", false)).unwrap();
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -915,7 +1574,7 @@ fn draft_export_writes_complete_release_bundle() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -954,6 +1613,7 @@ fn draft_export_writes_complete_release_bundle() {
         "training_grade_summary.json",
         "training_grade_details.json",
         "source_reference_manifest.json",
+        "source_audio_manifest.json",
         "learning_manifest.json",
         "long_file_dossiers.json",
         "agent_provenance.json",
@@ -974,6 +1634,7 @@ fn draft_export_writes_complete_release_bundle() {
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schemaVersion"].as_u64(), Some(2));
     let manifest_files = manifest["files"]
         .as_array()
         .expect("manifest files")
@@ -1051,7 +1712,7 @@ fn training_grade_details_records_hypothesis_coverage_evidence() {
         signal_anomaly_score: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     for (model_id, transcript, confidence) in [
         ("omniasr-ctc-300m", "coverage transcript", Some(0.91)),
         ("omniasr-ctc-1b", "[ASR unavailable: model missing]", Some(0.0)),
@@ -1131,7 +1792,7 @@ fn draft_export_preserves_agent_import_provenance() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     let evidence_json = serde_json::json!({
         "referenceModelId": "multi-reference-consensus:gemini-2.5-pro+gemini-2.5-flash",
         "selectedModelId": "omniasr-wsl-7b",
@@ -1142,7 +1803,7 @@ fn draft_export_preserves_agent_import_provenance() {
         "shouldCommit": true
     })
     .to_string();
-    db.write_segment_verdict(
+    db.write_legacy_machine_verdict_for_test(
         &segment.id,
         "jury_accept",
         Some("reference candidate"),
@@ -1177,6 +1838,16 @@ fn draft_export_preserves_agent_import_provenance() {
         Some(&serde_json::json!({
             "referenceCommitted": 1,
             "humanInbox": 0,
+            "reviewer": "Private Reviewer Alpha",
+            "nested": {
+                "reviewedBy": {"Private Reviewer Beta": 1},
+                "annotator": "Private Annotator Gamma",
+                "reviewedByName": "Private Reviewed-By Delta",
+                "annotatedBy": "Private Annotated-By Epsilon",
+                "raterId": "private-rater-id-55",
+                "raterName": "Private Rater Zeta",
+                "ratedBy": "Private Rated-By Eta"
+            }
         })),
         None,
         crate::runs::AgentImportReportOptions {
@@ -1187,6 +1858,7 @@ fn draft_export_preserves_agent_import_provenance() {
                 "sourceReferenceModels": ["gemini-2.5-pro", "gemini-2.5-flash"],
                 "availableHypothesisModels": ["omniasr-wsl-7b", "omniasr-ctc-300m"],
                 "requiredHypothesisModels": 2,
+                "reviewerId": "private-reviewer-id-44",
                 "checks": [{
                     "id": "hypothesis_coverage",
                     "label": "Multi-model hypothesis coverage",
@@ -1198,6 +1870,21 @@ fn draft_export_preserves_agent_import_provenance() {
         },
     )
     .unwrap();
+    let private_input = serde_json::to_string(&agent_report).unwrap();
+    let private_identities = [
+        "Private Reviewer Alpha",
+        "Private Reviewer Beta",
+        "Private Annotator Gamma",
+        "Private Reviewed-By Delta",
+        "Private Annotated-By Epsilon",
+        "private-rater-id-55",
+        "Private Rater Zeta",
+        "Private Rated-By Eta",
+        "private-reviewer-id-44",
+    ];
+    for expected_private_value in private_identities {
+        assert!(private_input.contains(expected_private_value), "test precondition missing {expected_private_value}");
+    }
     crate::runs::record_agent_stage_event(
         &db,
         "run-agent-1",
@@ -1249,7 +1936,17 @@ fn draft_export_preserves_agent_import_provenance() {
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
-    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    let result = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    for artifact in &result.files {
+        let bytes = std::fs::read(out.join(artifact)).unwrap();
+        for private_identity in private_identities {
+            assert!(
+                !bytes.windows(private_identity.len()).any(|window| window == private_identity.as_bytes()),
+                "{artifact} leaked structured reviewer identity {private_identity}"
+            );
+        }
+    }
+    assert_parquet_has_no_private_reviewer_identity(&out.join("dataset.parquet"), &private_identities);
 
     let agent_provenance: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("agent_provenance.json")).unwrap()).unwrap();
@@ -1471,7 +2168,7 @@ fn draft_export_includes_self_learning_preference_artifacts() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: segment.id.clone(),
         model_id: "omniasr-wsl-7b".to_string(),
@@ -1489,13 +2186,24 @@ fn draft_export_includes_self_learning_preference_artifacts() {
         created_at: None,
     })
     .unwrap();
+    record_test_desktop_edit(&db, "learning-seg-1", "human corrected text");
+
+    // A preference pair elsewhere in the live library must not hitchhike into this bundle when its
+    // source is policy-excluded. This row remains in agent_examples after revocation on purpose.
+    let private_audio_path = tmp.path().join("revoked-learning.wav").to_string_lossy().to_string();
+    let mut private_segment = segment.clone();
+    private_segment.id = "revoked-learning-seg".into();
+    private_segment.audio_path = private_audio_path.clone();
+    db.insert_legacy_segment_fixture(&private_segment).unwrap();
     db.connection()
         .execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["learning-example-1", "learning-seg-1", "agent wrong text", "human corrected text"],
+            "UPDATE speech_segments SET verdict_transcript = 'PRIVATE REVOKED WRONG TEXT'
+              WHERE id = 'revoked-learning-seg'",
+            [],
         )
         .unwrap();
+    record_test_desktop_edit(&db, "revoked-learning-seg", "PRIVATE REVOKED HUMAN TEXT");
+    db.revoke_recording(&private_audio_path).unwrap();
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -1508,6 +2216,7 @@ fn draft_export_includes_self_learning_preference_artifacts() {
     assert_eq!(learning_manifest["pairCount"].as_u64(), Some(1));
     assert_eq!(learning_manifest["preferencesPath"].as_str(), Some("learning_preferences.jsonl"));
     let jsonl = std::fs::read_to_string(out.join("learning_preferences.jsonl")).unwrap();
+    assert!(!jsonl.contains("PRIVATE REVOKED"), "a revoked, unselected preference pair leaked into the bundle");
     let pair: serde_json::Value = serde_json::from_str(jsonl.lines().next().expect("jsonl row")).unwrap();
     assert_eq!(pair["chosen"].as_str(), Some("human corrected text"));
     assert_eq!(pair["rejected"].as_str(), Some("agent wrong text"));
@@ -1579,7 +2288,7 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
         alignment_quality: None,
         ..SpeechSegment::default()
     };
-    db.insert_segment_full(&segment).unwrap();
+    db.insert_legacy_segment_fixture(&segment).unwrap();
     db.insert_hypothesis(&SegmentHypothesis {
         segment_id: segment.id.clone(),
         model_id: "omniasr-wsl-7b".to_string(),
@@ -1597,13 +2306,7 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
         created_at: None,
     })
     .unwrap();
-    db.connection()
-        .execute(
-            "INSERT INTO agent_examples (id, segment_id, wrong_transcript, human_fix)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["learning-example-1", "learning-seg-1", "agent wrong text", "human corrected text"],
-        )
-        .unwrap();
+    let effect_id = record_test_desktop_edit(&db, "learning-seg-1", "human corrected text");
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
@@ -1613,8 +2316,12 @@ fn re_export_into_reused_dir_removes_stale_learning_preferences_orphan() {
     assert!(first.files.contains(&"learning_preferences.jsonl".to_string()));
     assert!(out.join("learning_preferences.jsonl").exists());
 
-    // Withdraw the human edit so the next export has zero pairs.
-    db.connection().execute("DELETE FROM agent_examples WHERE id = 'learning-example-1'", []).unwrap();
+    // Withdraw the human edit through its exact immutable effect. Raw learning history remains;
+    // the effective view retracts it from the next export.
+    assert!(matches!(
+        db.undo_human_decision(effect_id, None, "123e4567-e89b-42d3-a456-426614174055").unwrap(),
+        crate::db::HumanDecisionUndoOutcome::Applied { .. }
+    ));
 
     // Second export into the SAME directory: the stale file must be gone, not re-shipped.
     let second = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
@@ -1638,7 +2345,7 @@ fn draft_export_records_model_metadata_load_errors() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -1685,7 +2392,7 @@ fn draft_export_replaces_bundle_metadata_atomically() {
     let tmp = TempDir::new().unwrap();
     let audio = tmp.path().join("sample.wav");
     std::fs::write(&audio, b"audio").unwrap();
-    db.insert_segment_full(&SpeechSegment {
+    db.insert_legacy_segment_fixture(&SpeechSegment {
         id: "seg-1".into(),
         created_at: None,
         audio_path: audio.to_string_lossy().to_string(),
@@ -1775,13 +2482,13 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
     // no human-decision column — correctly, since a freshly imported clip has no reviewer). Attribution
     // exists only once someone actually decides a clip, so drive it through the real decision path.
     // -> Sara=2, notAttributed=1 (s-c is undecided — the same bucket a desktop or pre-v43 decision lands in).
-    db.record_human_decision_by("s-a", "accept", None, None, Some("Sara")).unwrap();
-    db.record_human_decision_by("s-b", "accept", None, None, Some("Sara")).unwrap();
+    record_test_phone_accept(&db, "s-a", "Sara");
+    record_test_phone_accept(&db, "s-b", "Sara");
 
     let models = ModelManager::new(tmp.path().join("models"));
     let out = tmp.path().join("bundle");
     // Non-production so the training-ready gate does not block; the manifest is written regardless.
-    export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
+    let result = export_dataset_bundle(&db, &models, &out, &AppSettings::default(), false, usize::MAX).unwrap();
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
 
@@ -1797,10 +2504,20 @@ fn manifest_reads_stored_per_segment_provenance_not_export_day_model_state() {
     assert_eq!(prov["vadBackend"]["byBackend"]["silero"].as_u64(), Some(2));
     assert_eq!(prov["vadBackend"]["byBackend"]["energy"].as_u64(), Some(1));
     assert_eq!(prov["vadBackend"]["notRecorded"].as_u64(), Some(0));
-    // v43 reviewer attribution reaches the exported manifest — a corpus labelled by named people must
-    // say WHO, and the unattributed rows must be counted separately, never folded under a reviewer.
-    assert_eq!(prov["reviewedBy"]["byReviewer"]["Sara"].as_u64(), Some(2));
-    assert_eq!(prov["reviewedBy"]["notAttributed"].as_u64(), Some(1));
+    // Public/shared artifacts retain attribution completeness without publishing worker identities.
+    assert_eq!(prov["reviewAttribution"]["attributed"].as_u64(), Some(2));
+    assert_eq!(prov["reviewAttribution"]["notAttributed"].as_u64(), Some(1));
+    assert!(prov.get("reviewedBy").is_none(), "the old name-keyed map must not survive");
+    for artifact in &result.files {
+        let body = std::fs::read(out.join(artifact)).unwrap();
+        assert!(
+            !body.windows("Sara".len()).any(|window| window == b"Sara"),
+            "{artifact} leaked a private reviewer name"
+        );
+    }
+    // Parquet payloads are compressed, so a raw-byte scan alone cannot prove the logical columns or
+    // decoded strings are private. Decode the batches and assert both schema and values explicitly.
+    assert_parquet_has_no_private_reviewer_identity(&out.join("dataset.parquet"), &["Sara"]);
     // The single runConfig boolean reflects STORED unanimity, not export-day loadability (no models on
     // disk here — the old code would have computed denoising/diarization from failed load probes).
     assert_eq!(manifest["runConfig"]["denoising"].as_bool(), Some(false), "mixed denoising -> false");

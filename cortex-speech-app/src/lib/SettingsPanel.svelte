@@ -1,5 +1,11 @@
 <script lang="ts">
-  import { settings, showSettings, settingsTab, type AppSettings } from './stores/settingsStore';
+  import {
+    ADVISORY_CLOUD_MODEL,
+    settings,
+    showSettings,
+    settingsTab,
+    type AppSettings,
+  } from './stores/settingsStore';
   import { focusTrap } from './actions/focusTrap';
   import * as api from './commands';
   import { notifications } from './stores/notificationStore';
@@ -10,9 +16,11 @@
   import ModelDownload from './ModelDownload.svelte';
   import ModelRegistry from './ModelRegistry.svelte';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
-  import { t } from './i18n';
+  import ApiKeyField from './ApiKeyField.svelte';
+  import { autonomyLabelKey, autonomyValues, t } from './i18n';
   import { get } from 'svelte/store';
   import { onDestroy, onMount } from 'svelte';
+  import { chooseDirectory } from './fileDialogs';
   import { isTauriRuntime } from './runtime';
 
   let localSettings: AppSettings = $state({ ...$settings });
@@ -24,8 +32,7 @@
   // Seeded ONCE from the store here (like localSettings above). It must NOT be re-mirrored from
   // $settings on every store change — see the removed $effect: saveQuietly()/toggles write the store
   // mid-edit, and re-seeding would revert whatever the user is currently typing (silent data loss).
-  let sourceReferenceModelsInput = $state(($settings.sourceReferenceModels ?? []).join(', '));
-  // Lowercase provider names whose key is present in secrets.env (e.g. "elevenlabs").
+  // Lowercase provider names whose key is present in secrets.env (Gemini/OpenRouter).
   // Read-only signal so cloud opt-ins can warn when their key is missing; never holds key values.
   let configuredProviders = $state<string[]>([]);
   const tauriAvailable = isTauriRuntime();
@@ -69,7 +76,7 @@
               .filter(Boolean),
           );
     } catch (e) {
-      notifications.error($t('settings.couchFailed'), { detail: String(e) });
+      notifications.error($t('settings.couchFailed'), { cause: e });
     } finally {
       couchBusy = false;
     }
@@ -89,7 +96,7 @@
     try {
       couchStatus = await api.revokeCouchReviewer(name);
     } catch (e) {
-      notifications.error($t('settings.couchRevoke'), { detail: String(e) });
+      notifications.error($t('settings.couchRevoke'), { cause: e });
     } finally {
       couchBusy = false;
     }
@@ -103,7 +110,7 @@
       agreement = await api.exportAgreementSample();
       if (!agreement) notifications.info($t('settings.couchAgreementNone'));
     } catch (e) {
-      notifications.error($t('settings.couchAgreement'), { detail: String(e) });
+      notifications.error($t('settings.couchAgreement'), { cause: e });
     } finally {
       agreementBusy = false;
     }
@@ -137,22 +144,43 @@
   // only ever reflects set/unset (configuredProviders holds provider NAMES, never values).
   let openrouterKeyInput = $state('');
   let savingOpenrouterKey = $state(false);
-  async function saveOpenrouterKey() {
-    if (!tauriAvailable || savingOpenrouterKey) return;
+  let openrouterKeySave: Promise<void> | null = null;
+
+  class ApiKeySaveFailure extends Error {
+    constructor(provider: string) {
+      super(`The ${provider} API key was not saved`);
+      this.name = 'ApiKeySaveFailure';
+    }
+  }
+
+  async function saveOpenrouterKey(): Promise<void> {
+    if (!tauriAvailable) return;
+    if (openrouterKeySave) return openrouterKeySave;
+    const requested = openrouterKeyInput.trim();
     savingOpenrouterKey = true;
+    const operation = (async () => {
+      try {
+        configuredProviders = await api.setApiKey('openrouter', requested);
+        // If a paste/input event raced the IPC, clear only the value actually acknowledged by the
+        // backend. A newer value remains visible and pending instead of disappearing.
+        if (openrouterKeyInput.trim() === requested) openrouterKeyInput = '';
+        notifications.success(
+          configuredProviders.includes('openrouter')
+            ? $t('settings.apiKeySavedToast', { provider: 'OpenRouter' })
+            : $t('settings.apiKeyClearedToast', { provider: 'OpenRouter' }),
+        );
+      } catch (e) {
+        notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'OpenRouter' }), {
+          cause: e,
+        });
+        throw new ApiKeySaveFailure('OpenRouter');
+      }
+    })();
+    openrouterKeySave = operation;
     try {
-      configuredProviders = await api.setApiKey('openrouter', openrouterKeyInput.trim());
-      openrouterKeyInput = '';
-      notifications.success(
-        configuredProviders.includes('openrouter')
-          ? $t('settings.apiKeySavedToast', { provider: 'OpenRouter' })
-          : $t('settings.apiKeyClearedToast', { provider: 'OpenRouter' }),
-      );
-    } catch (e) {
-      notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'OpenRouter' }), {
-        detail: String(e),
-      });
+      await operation;
     } finally {
+      if (openrouterKeySave === operation) openrouterKeySave = null;
       savingOpenrouterKey = false;
     }
   }
@@ -168,22 +196,33 @@
   // set_api_key already accepted 'gemini'; nothing in the UI ever called it. This does.
   let geminiKeyInput = $state('');
   let savingGeminiKey = $state(false);
-  async function saveGeminiKey() {
-    if (!tauriAvailable || savingGeminiKey) return;
+  let geminiKeySave: Promise<void> | null = null;
+  async function saveGeminiKey(): Promise<void> {
+    if (!tauriAvailable) return;
+    if (geminiKeySave) return geminiKeySave;
+    const requested = geminiKeyInput.trim();
     savingGeminiKey = true;
+    const operation = (async () => {
+      try {
+        configuredProviders = await api.setApiKey('gemini', requested);
+        if (geminiKeyInput.trim() === requested) geminiKeyInput = '';
+        notifications.success(
+          configuredProviders.includes('gemini')
+            ? $t('settings.apiKeySavedToast', { provider: 'Gemini' })
+            : $t('settings.apiKeyClearedToast', { provider: 'Gemini' }),
+        );
+      } catch (e) {
+        notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'Gemini' }), {
+          cause: e,
+        });
+        throw new ApiKeySaveFailure('Gemini');
+      }
+    })();
+    geminiKeySave = operation;
     try {
-      configuredProviders = await api.setApiKey('gemini', geminiKeyInput.trim());
-      geminiKeyInput = '';
-      notifications.success(
-        configuredProviders.includes('gemini')
-          ? $t('settings.apiKeySavedToast', { provider: 'Gemini' })
-          : $t('settings.apiKeyClearedToast', { provider: 'Gemini' }),
-      );
-    } catch (e) {
-      notifications.error($t('settings.apiKeySaveFailedToast', { provider: 'Gemini' }), {
-        detail: String(e),
-      });
+      await operation;
     } finally {
+      if (geminiKeySave === operation) geminiKeySave = null;
       savingGeminiKey = false;
     }
   }
@@ -201,15 +240,17 @@
   // reaches for does the right thing. Awaited in save() (which then closes the panel); fire-and-forget
   // in onDestroy, where the component is already going away and there is nothing left to await for.
   async function flushPendingKeys() {
-    if (openrouterKeyInput.trim()) await saveOpenrouterKey();
-    if (geminiKeyInput.trim()) await saveGeminiKey();
+    if (openrouterKeyInput.trim() || openrouterKeySave) await saveOpenrouterKey();
+    if (geminiKeyInput.trim() || geminiKeySave) await saveGeminiKey();
   }
 
   onDestroy(() => {
     // Cancel must discard: don't persist unsaved edits when the user explicitly cancelled.
     if (cancelled) return;
-    void flushPendingKeys();
-    applySourceReferenceModelsInput();
+    void flushPendingKeys().catch(() => {
+      // Explicit close/Save paths are admission-blocking below. onDestroy cannot keep an already
+      // removed component alive; consume the rejection so it cannot become an unhandled promise.
+    });
     // Close-to-save for theme/sliders (they have no per-field auto-save). Route through saveQuietly so
     // this path gets the SAME NaN coercion + rollback-on-failure + error toast as every other persist.
     // The old bare fire-and-forget updateSettings here skipped coerceSettingsForRuntime: clearing a
@@ -231,9 +272,10 @@
     const finite = (v: number, fallback: number): number => (Number.isFinite(v) ? v : fallback);
     localSettings = {
       ...localSettings,
-      // A stale optional-model toggle must not travel beside the selected champion. Rust already
-      // gives WSL7B precedence; normalize the persisted UI state too so it never claims otherwise.
-      useFinetuned: localSettings.asrModel === 'wsl-7b' ? false : localSettings.useFinetuned,
+      // Production is champion-only. Clamp stale local state too; the Rust trust boundary repeats
+      // this check before persistence so a forged webview payload cannot bypass it.
+      asrModel: 'wsl-7b',
+      useFinetuned: false,
       vadThreshold: finite(localSettings.vadThreshold, prev.vadThreshold),
       minSegmentSec: finite(localSettings.minSegmentSec, prev.minSegmentSec),
       maxSegmentSec: finite(localSettings.maxSegmentSec, prev.maxSegmentSec),
@@ -250,40 +292,95 @@
   // instantly while Cancel skipped the save — so cancelling left cloud consent ON with no way back,
   // misleading transaction behaviour for a privacy-sensitive permission (external audit 2026-08-17).
   // Strictly LESS persistence than before, so it cannot introduce a surprise write.
-  function consentToggled(field: 'cloudSttOptIn' | 'cloudLlmOptIn' | 'juryCloudOptIn') {
+  function consentToggled(field: 'cloudLlmOptIn' | 'juryCloudOptIn') {
     const wasGranted = get(settings)[field];
     if (wasGranted && !localSettings[field]) void saveQuietly();
   }
   // Named, not inline arrows in the markup: SettingsLocalizationPolicy scrapes these sections for
   // visible Latin text, and an inline `consentToggled('cloudLlmOptIn')` reads to it as untranslated
   // prose. Named handlers keep the markup free of quoted strings — and read better.
-  const sttConsentToggled = () => consentToggled('cloudSttOptIn');
   const llmConsentToggled = () => consentToggled('cloudLlmOptIn');
   const juryConsentToggled = () => consentToggled('juryCloudOptIn');
 
-  async function saveQuietly() {
-    coerceSettingsForRuntime();
-    if (!tauriAvailable) {
-      settings.set(publishable());
-      return;
-    }
-    const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
-    settings.set(publishable());
-    try {
-      await api.updateSettings(localSettings);
-    } catch (e) {
-      console.error('Auto-save settings failed:', e);
-      // Roll BACK so the UI can't show a consent toggle (or any setting) as applied when the backend
-      // REJECTED the write. A silent consent mismatch — the user believes cloud STT/LLM is on (or off)
-      // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
-      // to the last-persisted state and surface the failure instead of only logging it.
-      rollbackTo(prev);
-      notifications.error($t('settingsSaveFailed'), { detail: String(e) });
-    }
+  // ONE settings write in flight at a time (audit fix 2026-08-20). saveQuietly fires from dozens of
+  // onblur/onchange handlers, consent withdrawal, and close-to-save — and two overlapping runs each
+  // capture their own `prev` snapshot. If the OLDER write then fails after a NEWER one succeeded,
+  // its rollbackTo(prev) reverts the store and every input past the newer persisted state; for the
+  // consent toggles that is the worst case — re-granting a cloud consent the user had successfully
+  // withdrawn, silently. Serialized, every job's `prev` really is the last-persisted state, so a
+  // rollback can only ever land where the backend actually is.
+  // Idle → the job starts SYNCHRONOUSLY, exactly as the unqueued code did: a consent withdrawal is
+  // a stop instruction and must reach the backend now, not a microtask later. Only a genuinely
+  // overlapping save waits.
+  let persistQueue: Promise<void> = Promise.resolve();
+  let persistBusy = false;
+  // Jobs enqueued and not yet settled, the failing one included. A failed save whose count is >1
+  // has been SUPERSEDED: a newer save is already queued carrying the user's current intent, so
+  // rolling the inputs back would erase edits the very next write is about to persist — the queued
+  // save re-asserts the truth either way, succeeding or surfacing its own failure.
+  let persistPending = 0;
+  function enqueuePersist(job: () => Promise<void>): Promise<void> {
+    const run = persistBusy ? persistQueue.then(job) : job();
+    persistBusy = true;
+    persistPending += 1;
+    const settled = run.catch(() => {}); // a failed save must not wedge every later one
+    persistQueue = settled;
+    void settled.then(() => {
+      persistPending -= 1;
+      if (persistQueue === settled) persistBusy = false; // still the tail: the queue is drained
+    });
+    return run;
   }
 
+  // The last state the BACKEND confirmed, maintained across the persist queue. `get(settings)` is
+  // NOT that: the store is set optimistically before each write, so a failed job's phantom values
+  // could become the next failure's "rollback target" — the UI then rolls back to a state that was
+  // never on disk and diverges from the backend until restart (2026-08-20 hunt). Every rollback
+  // lands HERE, and only a confirmed write moves it.
+  let lastPersisted: AppSettings = { ...get(settings) };
+
+  // The two cloud-consent permissions, clamped by autosavable() below.
+  const CONSENT_FIELDS = ['cloudLlmOptIn', 'juryCloudOptIn'] as const;
+
+  // What an AUTO-save may publish and persist: everything the panel holds, except that a consent
+  // GRANT stays at its last-persisted value until the user presses Save. The consent transaction
+  // (2026-08-17) promises Cancel genuinely cancels a grant — but saveQuietly fires from dozens of
+  // unrelated handlers, and the 2026-08-20 hunt measured the leak: check juryCloudOptIn, tap the
+  // model quick-select (an auto-save), press Cancel — the grant was already on disk. A WITHDRAWAL
+  // (false) always goes through immediately: `local && persisted` can only ever clamp toward OFF.
+  function autosavable(): AppSettings {
+    const clamped = { ...localSettings };
+    for (const field of CONSENT_FIELDS)
+      clamped[field] = localSettings[field] && lastPersisted[field];
+    return clamped;
+  }
+
+  function saveQuietly(): Promise<void> {
+    return enqueuePersist(async () => {
+      coerceSettingsForRuntime();
+      const payload = autosavable();
+      if (!tauriAvailable) {
+        settings.set(payload);
+        return;
+      }
+      const prev = { ...lastPersisted };
+      settings.set({ ...payload });
+      try {
+        await api.updateSettings(payload);
+        lastPersisted = { ...payload };
+      } catch (e) {
+        console.error('Auto-save settings failed:', e);
+        if (persistPending > 1) return; // superseded — the queued save re-asserts current intent (see enqueuePersist)
+        // Roll BACK so the UI can't show a consent toggle (or any setting) as applied when the backend
+        // REJECTED the write. A silent consent mismatch — the user believes advisory cloud work is on (or off)
+        // while the backend disagrees — is safety-critical for an offline-first app. Revert local + store
+        // to the last-persisted state and surface the failure instead of only logging it.
+        rollbackTo(prev, e);
+        notifications.error($t('settingsSaveFailed'), { cause: e });
+      }
+    });
+  }
   // What the store may hold: a COPY, never the object the panel's inputs are bound to.
-  //
   // `settings.set(localSettings)` handed the store the very object `bind:` keeps mutating, so after
   // any save every later keystroke edited the store's value in place — no subscriber notified, the
   // rest of the app silently running on half-typed settings, and the close-to-save diff below
@@ -291,39 +388,16 @@
   function publishable(): AppSettings {
     return { ...localSettings };
   }
-
-  // Put the last-persisted state back after the backend REJECTED a write, so the UI and the rest of
-  // the app can never keep running on values that were never saved.
-  function rollbackTo(prev: AppSettings) {
-    localSettings = { ...prev };
-    sourceReferenceModelsInput = (prev.sourceReferenceModels ?? []).join(', ');
-    settings.set({ ...prev });
+  // Roll back to fresh server truth when a stale/partial write supplied it, otherwise the last confirmation.
+  function rollbackTo(prev: AppSettings, error?: unknown) {
+    const authoritative =
+      error && typeof error === 'object' && 'authoritativeSettings' in error
+        ? ((error as { authoritativeSettings?: AppSettings | null }).authoritativeSettings ?? null)
+        : null;
+    if (authoritative) lastPersisted = { ...authoritative };
+    localSettings = { ...(authoritative ?? prev) };
+    settings.set({ ...localSettings });
   }
-
-  function parseSourceReferenceModels(value: string): string[] {
-    const seen = new Set<string>();
-    const models = value
-      .split(',')
-      .map((model) => model.trim())
-      .filter((model) => model.length > 0)
-      .filter((model) => {
-        if (seen.has(model)) return false;
-        seen.add(model);
-        return true;
-      });
-    return models.length > 0 ? models : ['gemini-2.5-pro'];
-  }
-
-  function saveSourceReferenceModels() {
-    applySourceReferenceModelsInput();
-    saveQuietly();
-  }
-
-  function applySourceReferenceModelsInput() {
-    localSettings.sourceReferenceModels = parseSourceReferenceModels(sourceReferenceModelsInput);
-    sourceReferenceModelsInput = localSettings.sourceReferenceModels.join(', ');
-  }
-
   const tabs = [
     { id: 'general', labelKey: 'general' },
     { id: 'asr', labelKey: 'asr' },
@@ -336,29 +410,42 @@
   ] as const;
 
   async function save() {
+    if (saving) return;
     saving = true;
-    const prev = get(settings); // authoritative last-persisted state, kept for rollback on failure
     try {
-      applySourceReferenceModelsInput();
-      coerceSettingsForRuntime();
-      settings.set(publishable());
-      if (!tauriAvailable) {
-        notifications.info($t('settingsPreviewOnly'));
-        showSettings.set(false);
-        return;
-      }
-      // BEFORE update_settings: its load() scrubs llm_api_key, so a key still sitting in an input when
-      // the user presses Save would otherwise be dropped without a word. See flushPendingKeys.
-      await flushPendingKeys();
-      await api.updateSettings(localSettings);
-      notifications.success($t('settingsSaved'));
-      showSettings.set(false);
-    } catch (e) {
-      // The store was set optimistically above and the backend then REFUSED the write. Without this
-      // the panel stayed open showing rejected values while the whole app read them as current —
-      // the same lie `saveQuietly` already rolls back, on the path the user actually presses.
-      rollbackTo(prev);
-      notifications.error($t('settingsSaveFailed'), { detail: String(e) });
+      // Through the SAME queue as saveQuietly: a Save pressed while an auto-save is in flight must
+      // not interleave with it (see enqueuePersist — a stale rollback past a newer write is the race).
+      await enqueuePersist(async () => {
+        const prev = { ...lastPersisted }; // the true last-persisted state, never an optimistic store value
+        try {
+          coerceSettingsForRuntime();
+          settings.set(publishable());
+          if (!tauriAvailable) {
+            notifications.info($t('settingsPreviewOnly'));
+            showSettings.set(false);
+            return;
+          }
+          // BEFORE update_settings: its load() scrubs llm_api_key, so a key still sitting in an input when
+          // the user presses Save would otherwise be dropped without a word. See flushPendingKeys.
+          await flushPendingKeys();
+          await api.updateSettings(localSettings);
+          lastPersisted = { ...localSettings }; // Save is the one path that persists consent GRANTS
+          notifications.success($t('settingsSaved'));
+          showSettings.set(false);
+        } catch (e) {
+          console.error('Save settings failed:', e);
+          if (persistPending > 1) return; // superseded — the queued save re-asserts current intent (see enqueuePersist)
+          // The store was set optimistically above and the backend then REFUSED the write. Without this
+          // the panel stayed open showing rejected values while the whole app read them as current —
+          // the same lie `saveQuietly` already rolls back, on the path the user actually presses.
+          rollbackTo(prev, e);
+          // The provider-specific failure was already surfaced without exposing the secret. Avoid
+          // a second generic toast while keeping the panel and typed key open for retry.
+          if (!(e instanceof ApiKeySaveFailure)) {
+            notifications.error($t('settingsSaveFailed'), { cause: e });
+          }
+        }
+      });
     } finally {
       saving = false;
     }
@@ -379,9 +466,8 @@
       return;
     }
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const dir = await open({ directory: true, multiple: false });
-      if (!dir || typeof dir !== 'string') return;
+      const dir = await chooseDirectory();
+      if (!dir) return;
 
       exportingAudio = true;
       startOperation('export-audio');
@@ -408,7 +494,7 @@
         });
       }
     } catch (e) {
-      notifications.error($t('exportAudio.failed'), { detail: String(e) });
+      notifications.error($t('exportAudio.failed'), { cause: e });
     } finally {
       exportingAudio = false;
       isProcessing.set(false);
@@ -418,8 +504,18 @@
     }
   }
 
+  function requestClose() {
+    // Pending/in-flight keys require an awaited admission path. The historical onDestroy flush was
+    // too late to keep the panel/input alive after DPAPI or disk failure.
+    if (openrouterKeyInput.trim() || geminiKeyInput.trim() || openrouterKeySave || geminiKeySave) {
+      void save();
+      return;
+    }
+    showSettings.set(false);
+  }
+
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') showSettings.set(false);
+    if (e.key === 'Escape') requestClose();
   }
 </script>
 
@@ -428,6 +524,7 @@
   data-testid="settings-panel"
   role="dialog"
   aria-modal="true"
+  aria-labelledby="settings-title"
   tabindex="-1"
   use:focusTrap
   onkeydown={handleKeydown}
@@ -439,13 +536,14 @@
     onclick={(e) => e.stopPropagation()}
   >
     <div class="flex items-center justify-between px-6 py-4 border-b border-cortex-800/50">
-      <h2 class="text-lg font-semibold text-default">{$t('settings')}</h2>
+      <h2 id="settings-title" class="text-lg font-semibold text-default">{$t('settings')}</h2>
       <button
         data-testid="settings-close-btn"
-        class="text-muted hover:text-default transition-colors"
-        onclick={() => showSettings.set(false)}
-        aria-label={$t('close')}>✕</button
+        class="text-muted hover:text-default transition-colors text-xs"
+        onclick={requestClose}
       >
+        {$t('close')}
+      </button>
     </div>
 
     <div class="flex gap-0 flex-1 min-h-0">
@@ -529,7 +627,7 @@
                The URL carries a random session token; audio never leaves the local network. -->
           <div class="rounded-md border border-cortex-700/40 bg-cortex-900/30 p-3 space-y-2">
             <div class="flex items-center justify-between">
-              <span class="text-sm text-default">📱 {$t('settings.couchTitle')}</span>
+              <span class="text-sm text-default">{$t('settings.couchTitle')}</span>
               <button
                 type="button"
                 class="btn-secondary text-xs px-3"
@@ -537,7 +635,7 @@
                 onclick={() => void toggleCouch()}
               >
                 {couchBusy
-                  ? '…'
+                  ? $t('settings.couchWorking')
                   : couchStatus?.running
                     ? $t('settings.couchStop')
                     : $t('settings.couchStart')}
@@ -549,7 +647,7 @@
                   <span class="text-[10px] text-subtle block"
                     >{$t('settings.couchTlsFingerprint')}</span
                   >
-                  <code class="block break-all text-[10px] text-default select-all"
+                  <code class="block break-all text-[10px] text-default select-all" dir="ltr"
                     >{couchStatus.certificateFingerprint}</code
                   >
                   <span class="text-[10px] text-subtle block"
@@ -565,7 +663,7 @@
                   class="space-y-1 border-t border-cortex-700/30 pt-2 first:border-t-0 first:pt-0"
                 >
                   <div class="flex items-center justify-between">
-                    <span class="text-xs text-default font-semibold">{reviewer.name}</span>
+                    <bdi class="text-xs text-default font-semibold" dir="auto">{reviewer.name}</bdi>
                     {#if couchStatus.reviewers.length > 1}
                       <!-- Revoking one link leaves every other reviewer working. Their completed work,
                            scores and audit trail are untouched - a record, not a permission. -->
@@ -583,6 +681,7 @@
                     class="input w-full !text-xs font-mono"
                     readonly
                     value={reviewer.url}
+                    dir="ltr"
                     onfocus={(e) => (e.target as HTMLInputElement).select()}
                   />
                   {#if reviewer.tailscaleUrl}
@@ -593,6 +692,19 @@
                       class="input w-full !text-xs font-mono"
                       readonly
                       value={reviewer.tailscaleUrl}
+                      dir="ltr"
+                      onfocus={(e) => (e.target as HTMLInputElement).select()}
+                    />
+                  {/if}
+                  {#if reviewer.funnelUrl}
+                    <span class="text-[10px] text-subtle block"
+                      >{$t('settings.couchFunnelUrl')}</span
+                    >
+                    <input
+                      class="input w-full !text-xs font-mono"
+                      readonly
+                      value={reviewer.funnelUrl}
+                      dir="ltr"
                       onfocus={(e) => (e.target as HTMLInputElement).select()}
                     />
                   {/if}
@@ -616,10 +728,10 @@
                 <span class="text-[10px] text-subtle">{$t('settings.couchThroughput')}</span>
                 {#each throughput as r (r.reviewer)}
                   <div class="flex items-center justify-between text-xs">
-                    <span class="text-default">{r.reviewer}</span>
-                    <span class="text-muted">
+                    <bdi class="text-default" dir="auto">{r.reviewer}</bdi>
+                    <bdi class="text-muted" dir="ltr">
                       {r.clips}{r.medianSeconds !== null ? ` · ${r.medianSeconds.toFixed(1)}s` : ''}
-                    </span>
+                    </bdi>
                   </div>
                 {/each}
               </div>
@@ -633,14 +745,15 @@
                 <span class="text-[10px] text-subtle">{$t('settings.couchSpotChecks')}</span>
                 {#each spotChecks as s (s.reviewer)}
                   <div class="flex items-center justify-between text-xs">
-                    <span class="text-default">{s.reviewer}</span>
-                    <span
+                    <bdi class="text-default" dir="auto">{s.reviewer}</bdi>
+                    <bdi
+                      dir="ltr"
                       class={s.noticed < s.checks / 2
                         ? 'text-rose-300 font-semibold'
                         : 'text-muted'}
                     >
                       {s.noticed}/{s.checks} · CER {(s.meanCer * 100).toFixed(1)}%
-                    </span>
+                    </bdi>
                   </div>
                 {/each}
                 <p class="text-[10px] text-subtle">{$t('settings.couchSpotChecksHint')}</p>
@@ -657,16 +770,19 @@
                   {$t('settings.couchAgreement')}
                 </button>
                 {#if agreement}
-                  <p class="text-[10px] text-subtle">
-                    {agreement.raterA} · {agreement.raterB} — {agreement.items}
-                    {#if agreement.otherReviewers.length}· +{agreement.otherReviewers.join(
-                        ', ',
-                      )}{/if}
+                  <p class="text-[10px] text-subtle" dir="auto">
+                    <bdi dir="auto">{agreement.raterA}</bdi> ·
+                    <bdi dir="auto">{agreement.raterB}</bdi>
+                    — <bdi dir="ltr">{agreement.items}</bdi>
+                    {#if agreement.otherReviewers.length}· +<bdi dir="auto"
+                        >{agreement.otherReviewers.join(', ')}</bdi
+                      >{/if}
                   </p>
                   <input
                     class="input w-full !text-[10px] font-mono"
                     readonly
                     value={agreement.path}
+                    dir="ltr"
                     onfocus={(e) => (e.target as HTMLInputElement).select()}
                   />
                   <p class="text-[10px] text-subtle">{$t('settings.couchAgreementHint')}</p>
@@ -675,26 +791,10 @@
             {/if}
           </div>
         {:else if activeTab === 'asr'}
-          <label class="flex items-center gap-3">
+          <div class="flex items-center gap-3" data-testid="production-asr-model">
             <span class="text-sm text-muted w-32">{$t('asrModel')}</span>
-            <select class="input flex-1" bind:value={localSettings.asrModel}>
-              <option value="ctc-300m">Meta OmniASR CTC 300M</option>
-              <option value="ctc-1b">Meta OmniASR CTC 1B</option>
-              <option value="wsl-7b">Meta OmniASR 7B Champion + LoRA (WSL GPU)</option>
-            </select>
-          </label>
-          {#if localSettings.asrModel !== 'wsl-7b'}
-            <label class="flex items-center gap-3 cursor-pointer">
-              <input
-                type="checkbox"
-                bind:checked={localSettings.useFinetuned}
-                class="accent-cortex-500"
-                data-testid="use-finetuned-toggle"
-              />
-              <span class="text-sm text-muted">{$t('settings.useFinetuned')}</span>
-            </label>
-            <p class="-mt-1 ms-8 text-xs text-subtle">{$t('settings.useFinetunedHint')}</p>
-          {/if}
+            <bdi class="input flex-1" dir="ltr">Meta OmniASR 7B Champion + LoRA</bdi>
+          </div>
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('threads')}</span>
             <input
@@ -754,40 +854,13 @@
             />
             <span class="text-xs text-cortex-400">{$t('seconds')}</span>
           </label>
-          <label
-            class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3 cursor-pointer"
-          >
-            <input
-              type="checkbox"
-              class="mt-1 accent-cortex-500"
-              bind:checked={localSettings.cloudSttOptIn}
-              onchange={sttConsentToggled}
-            />
-            <!-- Consent copy MUST be in the user's language (true-10 audit): voice is biometric,
-                 and the opt-in text is where clarity matters most. -->
-            <span class="text-xs text-amber-100">
-              {$t('settings.cloudSttConsent')}
-            </span>
-          </label>
-          {#if tauriAvailable && localSettings.cloudSttOptIn}
-            {#if configuredProviders.includes('elevenlabs')}
-              <p class="text-[10px] text-emerald-300 -mt-1" data-testid="elevenlabs-key-status">
-                ✓ ElevenLabs key detected in secrets.env.
-              </p>
-            {:else}
-              <p class="text-[10px] text-amber-300 -mt-1" data-testid="elevenlabs-key-status">
-                ⚠ No ElevenLabs key found in secrets.env — cloud transcription will fail until you
-                add one.
-              </p>
-            {/if}
-          {/if}
           <label class="flex items-center gap-3 cursor-pointer">
             <input
               type="checkbox"
               bind:checked={localSettings.enableDenoising}
               class="accent-cortex-500"
             />
-            <span class="text-sm text-muted">AI Audio Cleanup (Denoise before ASR)</span>
+            <span class="text-sm text-muted">{$t('settings.aiAudioCleanup')}</span>
           </label>
           <label class="flex items-center gap-3 cursor-pointer">
             <input
@@ -860,8 +933,8 @@
           <label class="flex items-center gap-3">
             <span class="text-sm text-muted w-32">{$t('exportFormat')}</span>
             <select class="input flex-1" bind:value={localSettings.exportFormat}>
-              <option value="json">JSON (COCO-style manifest)</option>
-              <option value="jsonl">JSONL (one segment per line)</option>
+              <option value="json">{$t('settings.exportJson')}</option>
+              <option value="jsonl">{$t('settings.exportJsonl')}</option>
               <option value="csv">CSV</option>
               <option value="parquet">Parquet</option>
             </select>
@@ -905,12 +978,17 @@
                 onblur={saveQuietly}
                 onchange={saveQuietly}
                 placeholder="/mnt/c/path/to/provider_refine.py"
+                dir="ltr"
               />
               <span class="text-[10px] text-subtle">{$t('settings.externalAsrScriptHint')}</span>
             </label>
             <label class="flex items-center gap-3">
               <span class="text-sm text-muted w-32">{$t('settings.llmEngine')}</span>
-              <select class="input flex-1" bind:value={localSettings.llmMode}>
+              <select
+                data-testid="llm-engine-select"
+                class="input flex-1"
+                bind:value={localSettings.llmMode}
+              >
                 <option value="None">{$t('settings.llmDisabledOption')}</option>
                 <option value="Local">{$t('settings.llmLocalOption')}</option>
                 <option value="Gemini">{$t('settings.llmCloudOption')}</option>
@@ -927,6 +1005,7 @@
                   onblur={saveQuietly}
                   onchange={saveQuietly}
                   placeholder="http://127.0.0.1:11434/v1/chat/completions"
+                  dir="ltr"
                 />
                 <span class="text-[10px] text-subtle">{$t('settings.localEndpointHint')}</span>
               </label>
@@ -939,6 +1018,7 @@
                   onblur={saveQuietly}
                   onchange={saveQuietly}
                   placeholder="heretic-final:latest"
+                  dir="ltr"
                 />
                 <span class="text-[10px] text-subtle">
                   {$t('settings.quickSelect')}
@@ -948,7 +1028,8 @@
                     onclick={() => {
                       localSettings.llmModel = 'heretic-final:latest';
                       saveQuietly();
-                    }}>heretic-final:latest</button
+                    }}
+                    dir="ltr">heretic-final:latest</button
                   >
                   <button
                     type="button"
@@ -956,7 +1037,8 @@
                     onclick={() => {
                       localSettings.llmModel = 'qwen2.5-coder:7b';
                       saveQuietly();
-                    }}>qwen2.5-coder:7b</button
+                    }}
+                    dir="ltr">qwen2.5-coder:7b</button
                   >
                 </span>
               </label>
@@ -974,71 +1056,33 @@
                   {$t('settings.cloudLlmConsent')}
                 </span>
               </label>
-              <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">
-                  {$t('settings.geminiApiKey')}
-                  {#if configuredProviders.includes('gemini')}
-                    <span class="ms-2 text-[10px] text-emerald-400"
-                      >● {$t('settings.apiKeySaved')}</span
-                    >
-                  {:else}
-                    <span class="ms-2 text-[10px] text-amber-400"
-                      >○ {$t('settings.apiKeyMissing')}</span
-                    >
-                  {/if}
-                </span>
-                <div class="flex gap-2">
-                  <input
-                    type="password"
-                    class="input flex-1"
-                    bind:value={geminiKeyInput}
-                    placeholder="AIzaSy..."
-                    autocomplete="off"
-                    onkeydown={(e) => {
-                      if (e.key === 'Enter') void saveGeminiKey();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    class="btn-secondary text-xs px-3"
-                    disabled={savingGeminiKey}
-                    onclick={() => void saveGeminiKey()}
-                  >
-                    {savingGeminiKey ? $t('settings.savingKey') : $t('settings.saveKey')}
-                  </button>
-                </div>
-                <span class="text-[10px] text-subtle">{$t('settings.apiKeyStorageHint')}</span>
-              </label>
-              <label class="flex flex-col gap-1 mt-2">
+              <ApiKeyField
+                labelKey="settings.geminiApiKey"
+                hintKey="settings.apiKeyStorageHint"
+                placeholder="AIzaSy..."
+                configured={configuredProviders.includes('gemini')}
+                bind:value={geminiKeyInput}
+                saving={savingGeminiKey}
+                disabled={savingGeminiKey || savingOpenrouterKey}
+                onSave={saveGeminiKey}
+              />
+              <div class="flex flex-col gap-1 mt-2">
                 <span class="text-sm text-muted">{$t('settings.geminiModel')}</span>
-                <input
-                  type="text"
-                  class="input w-full"
-                  bind:value={localSettings.llmModel}
-                  onblur={saveQuietly}
-                  onchange={saveQuietly}
-                  placeholder="gemini-2.5-pro"
-                />
-                <span class="text-[10px] text-subtle">
-                  {$t('settings.quickSelect')}
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => {
-                      localSettings.llmModel = 'gemini-2.5-pro';
-                      saveQuietly();
-                    }}>{$t('settings.geminiProRecommended')}</button
+                <div
+                  data-testid="cloud-llm-model-fixed"
+                  class="rounded-md border border-cortex-700/50 bg-cortex-900/40 px-3 py-2"
+                >
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="text-sm font-medium text-default"
+                      >{$t('settings.advisoryModelName')}</span
+                    >
+                    <span class="text-[10px] text-subtle">{$t('settings.modelFixedByPolicy')}</span>
+                  </div>
+                  <span class="mt-0.5 block font-mono text-[10px] text-cortex-400"
+                    >{ADVISORY_CLOUD_MODEL}</span
                   >
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => {
-                      localSettings.llmModel = 'gemini-2.5-flash';
-                      saveQuietly();
-                    }}>{$t('settings.geminiFlash')}</button
-                  >
-                </span>
-              </label>
+                </div>
+              </div>
             {/if}
 
             <label class="flex flex-col gap-1 mt-4">
@@ -1062,6 +1106,7 @@
               class="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-950/20 p-3"
             >
               <input
+                data-testid="jury-cloud-opt-in"
                 type="checkbox"
                 class="mt-1 accent-cortex-500"
                 bind:checked={localSettings.juryCloudOptIn}
@@ -1081,21 +1126,21 @@
                 role="group"
                 aria-label={$t('settings.autonomyLevel')}
               >
-                {#each [['observe', '👁', 'inbox.autonomy.observe'], ['propose', '💡', 'inbox.autonomy.propose'], ['act_confirm', '✅', 'inbox.autonomy.actConfirm'], ['act_auto', '🤖', 'inbox.autonomy.actAuto']] as [val, emoji, labelKey]}
+                {#each autonomyValues as value (value)}
                   <button
                     type="button"
-                    aria-pressed={localSettings.juryAutonomyLevel === val}
+                    aria-pressed={localSettings.juryAutonomyLevel === value}
                     class="px-3 py-1.5 rounded-lg border text-xs font-medium transition-all
-                      {localSettings.juryAutonomyLevel === val
+                      {localSettings.juryAutonomyLevel === value
                       ? 'bg-purple-700 border-purple-500 text-white'
                       : 'bg-cortex-900/40 border-cortex-700/50 text-cortex-300 hover:border-cortex-500'}"
                     onclick={() => {
                       localSettings = {
                         ...localSettings,
-                        juryAutonomyLevel: val as typeof localSettings.juryAutonomyLevel,
+                        juryAutonomyLevel: value,
                       };
                       saveQuietly();
-                    }}>{emoji} {$t(labelKey)}</button
+                    }}>{$t(autonomyLabelKey(value))}</button
                   >
                 {/each}
               </div>
@@ -1122,66 +1167,26 @@
 
             <!-- T2 model + self-consistency -->
             {#if localSettings.juryCloudOptIn}
-              <label class="flex flex-col gap-1">
+              <div class="flex flex-col gap-1">
                 <span class="text-sm text-muted">{$t('settings.juryModelLabel')}</span>
-                <input
-                  type="text"
-                  class="input w-full"
-                  bind:value={localSettings.juryModel}
-                  onblur={saveQuietly}
-                  placeholder="gemini-2.5-pro"
-                />
+                <div
+                  data-testid="jury-model-fixed"
+                  class="rounded-md border border-cortex-700/50 bg-cortex-900/40 px-3 py-2"
+                >
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="text-sm font-medium text-default"
+                      >{$t('settings.advisoryModelName')}</span
+                    >
+                    <span class="text-[10px] text-subtle">{$t('settings.modelFixedByPolicy')}</span>
+                  </div>
+                  <span class="mt-0.5 block font-mono text-[10px] text-cortex-400"
+                    >{ADVISORY_CLOUD_MODEL}</span
+                  >
+                </div>
                 <span class="text-[10px] text-subtle">
-                  {$t('settings.quickSelect')}
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => {
-                      localSettings.juryModel = 'gemini-2.5-pro';
-                      saveQuietly();
-                    }}>{$t('settings.modelProRecommended')}</button
-                  >
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => {
-                      localSettings.juryModel = 'gemini-2.5-flash';
-                      saveQuietly();
-                    }}>{$t('settings.modelFlashFaster')}</button
-                  >
+                  {$t('settings.sourceReferenceFixedHint')}
                 </span>
-              </label>
-
-              <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">{$t('settings.sourceReferenceModels')}</span>
-                <input
-                  type="text"
-                  class="input w-full"
-                  bind:value={sourceReferenceModelsInput}
-                  onblur={saveSourceReferenceModels}
-                  onchange={saveSourceReferenceModels}
-                  placeholder="gemini-2.5-pro, gemini-2.5-flash"
-                />
-                <span class="text-[10px] text-subtle">
-                  {$t('settings.quickSelect')}
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300 me-2"
-                    onclick={() => {
-                      sourceReferenceModelsInput = 'gemini-2.5-pro, gemini-2.5-flash';
-                      saveSourceReferenceModels();
-                    }}>{$t('settings.sourceModelsBoth')}</button
-                  >
-                  <button
-                    type="button"
-                    class="underline text-cortex-400 hover:text-cortex-300"
-                    onclick={() => {
-                      sourceReferenceModelsInput = 'gemini-2.5-pro';
-                      saveSourceReferenceModels();
-                    }}>{$t('settings.sourceModelsProOnly')}</button
-                  >
-                </span>
-              </label>
+              </div>
 
               <label class="flex items-center gap-3">
                 <span class="text-sm text-muted w-36">{$t('settings.selfConsistencyLabel')}</span>
@@ -1203,41 +1208,16 @@
 
             <!-- API key (shared with LLM) — same secrets.env route as the AI Post-Processing tab. -->
             {#if localSettings.juryCloudOptIn}
-              <label class="flex flex-col gap-1">
-                <span class="text-sm text-muted">
-                  {$t('settings.geminiApiKey')}
-                  {#if configuredProviders.includes('gemini')}
-                    <span class="ms-2 text-[10px] text-emerald-400"
-                      >● {$t('settings.apiKeySaved')}</span
-                    >
-                  {:else}
-                    <span class="ms-2 text-[10px] text-amber-400"
-                      >○ {$t('settings.apiKeyMissing')}</span
-                    >
-                  {/if}
-                </span>
-                <div class="flex gap-2">
-                  <input
-                    type="password"
-                    class="input flex-1"
-                    bind:value={geminiKeyInput}
-                    placeholder="AIzaSy…"
-                    autocomplete="off"
-                    onkeydown={(e) => {
-                      if (e.key === 'Enter') void saveGeminiKey();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    class="btn-secondary text-xs px-3"
-                    disabled={savingGeminiKey}
-                    onclick={() => void saveGeminiKey()}
-                  >
-                    {savingGeminiKey ? $t('settings.savingKey') : $t('settings.saveKey')}
-                  </button>
-                </div>
-                <span class="text-[10px] text-subtle">{$t('settings.jurySharedKeyHint')}</span>
-              </label>
+              <ApiKeyField
+                labelKey="settings.geminiApiKey"
+                hintKey="settings.jurySharedKeyHint"
+                placeholder="AIzaSy…"
+                configured={configuredProviders.includes('gemini')}
+                bind:value={geminiKeyInput}
+                saving={savingGeminiKey}
+                disabled={savingGeminiKey || savingOpenrouterKey}
+                onSave={saveGeminiKey}
+              />
 
               <!-- T2 transport: direct Gemini REST, or the SAME Gemini 2.5 Pro via OpenRouter -->
               <label class="flex flex-col gap-1">
@@ -1258,41 +1238,16 @@
               </label>
 
               {#if localSettings.juryProvider === 'openrouter'}
-                <div class="flex flex-col gap-1">
-                  <span class="text-sm text-muted">
-                    {$t('settings.openRouterApiKey')}
-                    {#if configuredProviders.includes('openrouter')}
-                      <span class="ms-2 text-[10px] text-emerald-400"
-                        >● {$t('settings.apiKeySaved')}</span
-                      >
-                    {:else}
-                      <span class="ms-2 text-[10px] text-amber-400"
-                        >○ {$t('settings.apiKeyMissing')}</span
-                      >
-                    {/if}
-                  </span>
-                  <div class="flex gap-2">
-                    <input
-                      type="password"
-                      class="input flex-1"
-                      bind:value={openrouterKeyInput}
-                      placeholder="sk-or-…"
-                      autocomplete="off"
-                      onkeydown={(e) => {
-                        if (e.key === 'Enter') void saveOpenrouterKey();
-                      }}
-                    />
-                    <button
-                      type="button"
-                      class="btn-secondary text-xs px-3"
-                      disabled={savingOpenrouterKey}
-                      onclick={() => void saveOpenrouterKey()}
-                    >
-                      {savingOpenrouterKey ? $t('settings.savingKey') : $t('settings.saveKey')}
-                    </button>
-                  </div>
-                  <span class="text-[10px] text-subtle">{$t('settings.openRouterKeyHint')}</span>
-                </div>
+                <ApiKeyField
+                  labelKey="settings.openRouterApiKey"
+                  hintKey="settings.openRouterKeyHint"
+                  placeholder="sk-or-…"
+                  configured={configuredProviders.includes('openrouter')}
+                  bind:value={openrouterKeyInput}
+                  saving={savingOpenrouterKey}
+                  disabled={savingGeminiKey || savingOpenrouterKey}
+                  onSave={saveOpenrouterKey}
+                />
               {/if}
             {/if}
           </div>

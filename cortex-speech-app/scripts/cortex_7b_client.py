@@ -3,7 +3,7 @@
 
 Reads the segment's audio_path + alignment from the app DB, asks the warm cortex_7b_server.py to
 transcribe it, and prints the one line the app parses:
-    __RESULT__={"raw_transcript": "...", "confidence": null}
+    __RESULT__={"raw_transcript":"...","confidence":null,"model_version_id":"...","deployment_sha256":"..."}
 Stdlib only (sqlite3 + socket + subprocess), so it runs under the same python the app invokes.
 
 Failure contract (so the app never stores a silent blank — see pipeline.rs `run_primary_wsl_pass_for_import`):
@@ -26,16 +26,35 @@ import socket
 import sqlite3
 import argparse
 import subprocess
+import time
 
 HOST = os.environ.get("CORTEX_7B_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORTEX_7B_PORT", "8799"))
 MAX_RESPONSE_BYTES = 1024 * 1024
+HEALTH_TIMEOUT_SECONDS = float(os.environ.get("CORTEX_7B_HEALTH_TIMEOUT_SECONDS", "5"))
+TRANSCRIPTION_TIMEOUT_SECONDS = float(os.environ.get("CORTEX_7B_TRANSCRIPTION_TIMEOUT_SECONDS", "280"))
+PROTOCOL = "cortex-omniasr-adapter"
+PROTOCOL_VERSION = 1
+FAMILY = "omniasr-7b"
 
 # Exit codes for the app's stderr preview (any non-zero => marked unavailable / import cancelled).
 EX_DB = 4        # could not locate or read the app DB
 EX_NOSEG = 5     # segment id not present in the DB
 EX_UNREACHABLE = 2  # 7B server not listening
 EX_SERVER = 3    # server replied with an error
+
+
+class DuplicateKeyError(ValueError):
+    pass
+
+
+def _object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateKeyError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
 
 
 def win_to_wsl(p):
@@ -70,8 +89,80 @@ def resolve_db_path():
     return None
 
 
-def emit(text):
-    print("__RESULT__=" + json.dumps({"raw_transcript": text or "", "confidence": None}, ensure_ascii=False))
+def _is_sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def validate_identity_response(response):
+    """Return the exact served identity or refuse a reachable but untrustworthy service."""
+    if not isinstance(response, dict):
+        raise ValueError("reply is not a JSON object")
+    if response.get("protocol") != PROTOCOL or response.get("protocolVersion") != PROTOCOL_VERSION:
+        raise ValueError("reply is not from the compatible Cortex OmniASR deployment protocol")
+    if response.get("family") != FAMILY:
+        raise ValueError(f"reply has unexpected model family {response.get('family')!r}")
+    model_id = response.get("modelVersionId")
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("reply has no modelVersionId")
+    deployment_sha = response.get("deploymentSha256")
+    if not _is_sha256(deployment_sha):
+        raise ValueError("reply has no canonical deploymentSha256")
+    component_sha = response.get("componentSha256")
+    if not isinstance(component_sha, dict) or set(component_sha) != {
+        "base", "adapter", "adapterConfig", "tokenizer"
+    }:
+        raise ValueError("reply has no complete componentSha256 identity")
+    if any(not _is_sha256(value) for value in component_sha.values()):
+        raise ValueError("reply contains a non-canonical component SHA-256")
+    if response.get("language") != "ckb_Arab":
+        raise ValueError(f"reply has unexpected language {response.get('language')!r}")
+    if not _is_sha256(response.get("manifestSha256")):
+        raise ValueError("reply has no canonical manifestSha256")
+    if response.get("provenanceKind") not in {"flywheel", "legacy_bootstrap"}:
+        raise ValueError(f"reply has unexpected provenanceKind {response.get('provenanceKind')!r}")
+    if not isinstance(response.get("worker"), str) or not response["worker"].strip():
+        raise ValueError("reply has no worker identity")
+    return model_id, deployment_sha
+
+
+def validate_health_response(response):
+    validate_identity_response(response)
+    if type(response.get("schema")) is not int or response.get("schema") != 1 or response.get("status") != "ready":
+        raise ValueError("health reply does not declare schema=1/status=ready")
+    return response
+
+
+def validate_transcription_response(response):
+    text = response.get("transcript")
+    if not isinstance(text, str):
+        raise ValueError("transcription reply has no string transcript")
+    model_id, deployment_sha = validate_identity_response(response)
+    return text, model_id, deployment_sha
+
+
+def emit(text, model_version_id, deployment_sha256):
+    print(
+        "__RESULT__="
+        + json.dumps(
+            {
+                "raw_transcript": text or "",
+                "confidence": None,
+                "model_version_id": model_version_id,
+                "deployment_sha256": deployment_sha256,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+
+
+def emit_health(response):
+    print("__HEALTH__=" + json.dumps(response, ensure_ascii=False, separators=(",", ":")))
 
 
 def fail(code, msg):
@@ -80,6 +171,93 @@ def fail(code, msg):
     sys.stderr.write(msg.rstrip("\n") + "\n")
     sys.stderr.flush()
     sys.exit(code)
+
+
+class ClientFailure(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class ServerBusy(Exception):
+    pass
+
+
+def _request_server_once(request, timeout_seconds):
+    """Send one bounded line request and return one bounded JSON object."""
+    payload = (json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+            connection.settimeout(max(0.001, deadline - time.monotonic()))
+            connection.connect((HOST, PORT))
+            connection.settimeout(max(0.001, deadline - time.monotonic()))
+            connection.sendall(payload)
+            buf = bytearray()
+            while b"\n" not in buf:
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    raise socket.timeout()
+                connection.settimeout(remaining_time)
+                remaining = MAX_RESPONSE_BYTES + 1 - len(buf)
+                if remaining <= 0:
+                    raise ClientFailure(EX_SERVER, f"7B engine reply exceeded {MAX_RESPONSE_BYTES} bytes")
+                chunk = connection.recv(min(65536, remaining))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > MAX_RESPONSE_BYTES:
+                    raise ClientFailure(EX_SERVER, f"7B engine reply exceeded {MAX_RESPONSE_BYTES} bytes")
+    except socket.timeout as exc:
+        raise ClientFailure(
+            EX_UNREACHABLE,
+            f"7B server reachable but timed out after {timeout_seconds:g}s on {HOST}:{PORT}",
+        ) from exc
+    except ClientFailure:
+        raise
+    except (ConnectionRefusedError, OSError) as exc:
+        raise ClientFailure(
+            EX_UNREACHABLE,
+            f"7B engine not running: cannot reach the OmniASR-7B server on {HOST}:{PORT} ({exc})",
+        ) from exc
+
+    if not buf:
+        raise ClientFailure(EX_SERVER, f"7B engine returned no data from {HOST}:{PORT}")
+    if b"\n" not in buf:
+        raise ClientFailure(EX_SERVER, "7B engine reply was not newline-terminated")
+    line, trailing = bytes(buf).split(b"\n", 1)
+    if trailing.strip():
+        raise ClientFailure(EX_SERVER, "7B engine sent more than one reply")
+    try:
+        response = json.loads(line.decode("utf-8"), object_pairs_hook=_object_without_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateKeyError) as exc:
+        raise ClientFailure(EX_SERVER, f"7B engine sent an unparseable reply: {exc}") from exc
+    if not isinstance(response, dict):
+        raise ClientFailure(EX_SERVER, "7B engine reply is not a JSON object")
+    if response.get("code") == "BUSY":
+        raise ServerBusy(str(response.get("error") or "replica busy"))
+    if "error" in response:
+        error = response["error"]
+        if not isinstance(error, str) or not error:
+            error = "unknown server error"
+        raise ClientFailure(EX_SERVER, f"7B engine error: {error}")
+    return response
+
+
+def request_server(request, timeout_seconds):
+    """Retry BUSY replicas within one total deadline; other protocol/transport failures are final."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ClientFailure(
+                EX_UNREACHABLE,
+                f"7B server stayed busy for {timeout_seconds:g}s on {HOST}:{PORT}",
+            )
+        try:
+            return _request_server_once(request, remaining)
+        except ServerBusy:
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
 class ClobberedAlignment(Exception):
@@ -111,9 +289,21 @@ def resolve_clip_offsets(alignment):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--segment-id", required=True)
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--segment-id")
+    mode.add_argument("--health", action="store_true", help="query the exact loaded deployment; never reads the DB")
     ap.add_argument("--stdout-only", action="store_true")
     a = ap.parse_args()
+
+    if a.health:
+        try:
+            response = validate_health_response(request_server({"op": "health"}, HEALTH_TIMEOUT_SECONDS))
+        except ClientFailure as exc:
+            fail(exc.code, str(exc))
+        except ValueError as exc:
+            fail(EX_SERVER, f"7B engine identity error: {exc}")
+        emit_health(response)
+        return
 
     db = resolve_db_path()
     if not db:
@@ -126,7 +316,6 @@ def main():
     # so we see fresh segments. (audio_path + alignment never change once a segment exists.)
     import shutil
     import tempfile
-    import time
     row = None
     read_err = None
     # The app writes the WAL while we copy, so a single-shot copy can be torn (page copied mid-write)
@@ -174,47 +363,25 @@ def main():
             f"against the whole source file rather than storing a whole-file transcript for one clip",
         )
 
-    req = {"audio_path": win_to_wsl(audio_path), "start_ms": start_ms, "end_ms": end_ms}
+    req = {"op": "transcribe", "audio_path": win_to_wsl(audio_path), "start_ms": start_ms, "end_ms": end_ms}
     # 280 s: below the app's own 300 s per-attempt budget (pipeline.rs) but no longer 120 s shorter —
     # the old 180 s made the client the effective (and mislabeled) timeout authority.
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(280)
-        s.connect((HOST, PORT))
-        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        buf = b""
-        while not buf.endswith(b"\n"):
-            d = s.recv(min(65536, MAX_RESPONSE_BYTES + 1 - len(buf)))
-            if not d:
-                break
-            buf += d
-            if len(buf) > MAX_RESPONSE_BYTES:
-                fail(EX_SERVER, f"7B engine reply exceeded {MAX_RESPONSE_BYTES} bytes")
-        s.close()
-    except socket.timeout:
-        # Distinct from "not running": the server ACCEPTED the connection but did not answer in time
-        # (GPU busy with a training run, or the 31 GB model still warming). Saying "not running" here
-        # sent the owner to restart a healthy server (true-10 audit 2026-07-09).
-        fail(EX_UNREACHABLE,
-             f"7B server reachable but timed out after 280 s on {HOST}:{PORT} - it is likely busy "
-             f"(GPU shared with a training run?) or still loading the model. Wait and re-transcribe; "
-             f"do not restart the server.")
-    except (ConnectionRefusedError, OSError) as e:
-        fail(EX_UNREACHABLE,
-             f"7B engine not running: cannot reach the OmniASR-7B server on {HOST}:{PORT} ({e}). "
-             f"Start the 7B server (e.g. 'Start 7B server.bat') and re-transcribe.")
-
-    if not buf.strip():
-        fail(EX_SERVER, f"7B engine returned no data from {HOST}:{PORT} (server may be loading or crashed).")
-    try:
-        resp = json.loads(buf.decode("utf-8").strip())
-    except Exception as e:
-        fail(EX_SERVER, f"7B engine sent an unparseable reply: {e}")
-    if "error" in resp:
-        fail(EX_SERVER, f"7B engine error: {resp['error']}")
+        response = request_server(req, TRANSCRIPTION_TIMEOUT_SECONDS)
+        text, model_version_id, deployment_sha256 = validate_transcription_response(response)
+    except ClientFailure as exc:
+        detail = str(exc)
+        if exc.code == EX_UNREACHABLE and "timed out" in detail:
+            detail += (
+                " - the engine may be busy or still loading. Wait and re-transcribe; "
+                "do not restart a server merely because one transcription timed out."
+            )
+        fail(exc.code, detail)
+    except ValueError as exc:
+        fail(EX_SERVER, f"7B engine identity error: {exc}")
 
     # Reachable server, valid reply: a real transcript (possibly legitimately empty for a silent clip).
-    emit(resp.get("transcript", ""))
+    emit(text, model_version_id, deployment_sha256)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,33 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
+struct IntegrationImportGuard {
+    app: tauri::AppHandle,
+}
+
+impl Drop for IntegrationImportGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.app.try_state::<AppState>() {
+            state.finish_import();
+        }
+    }
+}
+
 pub fn run(app: &tauri::AppHandle) -> Result<(), String> {
+    // The environment-gated real-binary paths bypass the renderer commands, so they must claim the
+    // same import admission gate explicitly. In particular, an unavailable startup dedup index must
+    // stop these diagnostics before their direct ProcessingPipeline calls can decode or journal data.
+    {
+        let state = app.state::<AppState>();
+        state.try_start_import()?;
+    }
+    let _import_guard = IntegrationImportGuard { app: app.clone() };
+
+    // These env-gated diagnostics are registered in the real desktop lifecycle and write through
+    // ProcessingPipeline's dedicated connections. Bind their entire import -> adjudicate -> report
+    // -> export lifetime to one database generation, not only the moments they happen to hold a DB
+    // mutex. The guard lives on this OS thread, so async caller cancellation cannot detach it.
+    let _mutation = crate::database_runtime::begin_mutation()?;
     if std::env::var("CORTEX_AUDIOBOOK_PIPELINE").ok().as_deref() == Some("1") {
         return run_audiobook_pipeline(app);
     }

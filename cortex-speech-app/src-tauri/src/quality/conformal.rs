@@ -1,8 +1,9 @@
 use crate::db::SpeechSegment;
 use crate::wer::compute_cer;
 use serde::Serialize;
+use specta::Type;
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ConformalCertificate {
     pub target_error: f64,
@@ -184,7 +185,7 @@ impl ConformalTally {
         // would be compared against was invented, not measured. And NEVER a human-rejected clip: 'mark
         // bad' keeps verified=true + the draft, so it would otherwise pass the nonconformity gate and be
         // vouched as good over the reviewer's explicit rejection.
-        if !crate::quality::is_human_rejected(s) && has_scoreable_confidence(s) {
+        if !crate::quality::is_excluded_from_exports(s) && has_scoreable_confidence(s) {
             self.certifiable.push((s.id.clone(), compute_nonconformity_score(s)));
         }
 
@@ -194,7 +195,7 @@ impl ConformalTally {
         // membership. It must NOT calibrate the certificate (its ~0 CER tightens the error bound over
         // data the human discarded) — matching every sibling gate (export/export_bundle/jury) and the
         // db.rs C3 count, which apply this exact exclusion.
-        if !s.verified || crate::quality::is_human_rejected(s) {
+        if !s.verified || crate::quality::is_excluded_from_exports(s) {
             return;
         }
         // No measured confidence and no acoustic score => the nonconformity would be a constant

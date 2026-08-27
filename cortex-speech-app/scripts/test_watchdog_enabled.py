@@ -28,11 +28,20 @@ present-but-off is a failure. A guard that cannot tell those two apart is worse 
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
-TASK = "CortexWatchdog"
+LEGACY_TASK = "CortexWatchdog"
+PRIVATE_TASK = "CortexPrivateProductionWatchdog"
+_appdata = os.environ.get("APPDATA")
+TASK = (
+    PRIVATE_TASK
+    if _appdata and (Path(_appdata) / "cortex-speech" / "active-private-production-release.json").is_file()
+    else LEGACY_TASK
+)
 REENABLE = f"schtasks /change /tn {TASK} /enable"
 
 

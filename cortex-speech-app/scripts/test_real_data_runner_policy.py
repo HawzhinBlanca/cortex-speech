@@ -72,21 +72,24 @@ def test_package_real_audio_scripts_use_the_checked_runner() -> None:
 
 
 def test_e2e_never_clears_the_real_db_by_default() -> None:
-    # A reliability test must never be CAPABLE of erasing the owner's real library just by being run.
-    # DB-clear is opt-in (CORTEX_DB_CLEAR=1), never the old opt-out default.
+    # The harness always mints a brand-new marked profile, so clearing is unnecessary. Removing the
+    # clear path entirely is stronger than an opt-in: no containment/refusal error can be caught and
+    # ignored before the workflow continues mutating a caller-supplied profile.
     e2e = E2E.read_text(encoding="utf-8")
-    assert_contains(e2e, "process.env.CORTEX_DB_CLEAR === '1'", E2E.name)
-    if "if (!SKIP_DB_CLEAR)" in e2e:
-        raise AssertionError("e2e_real_app.cjs must not clear the DB by default (opt-out); make it opt-in")
+    for forbidden in ("CORTEX_DB_CLEAR", "clear_db.py --yes", "db clear skipped"):
+        if forbidden in e2e:
+            raise AssertionError(f"e2e_real_app.cjs must not carry a destructive DB-clear path: {forbidden}")
 
 
 def test_e2e_is_isolated_from_the_production_profile() -> None:
     # P0 isolation contract: the harness runs against a DISPOSABLE profile, refuses the real one,
     # kills only the process tree it spawned, and reads its manifest from the isolated DB.
     e2e = E2E.read_text(encoding="utf-8")
-    # 1. Disposable profile by default + production-profile refusal.
-    assert_contains(e2e, "mkdtempSync", E2E.name)
-    assert_contains(e2e, "REFUSED: CORTEX_APP_DATA_DIR points at the REAL profile", E2E.name)
+    # 1. A shared run-bound mint is mandatory. It refuses EVERY caller-supplied path, including a
+    # relocated production profile that a conventional %APPDATA% prefix check cannot recognize.
+    assert_contains(e2e, "resolveDisposableProfile('e2e_real_app.cjs')", E2E.name)
+    if "let DATA_DIR = process.env.CORTEX_APP_DATA_DIR" in e2e:
+        raise AssertionError("e2e_real_app.cjs must not trust a caller-supplied profile path")
     # 2. The spawned exe is pointed at the isolated profile.
     assert_contains(e2e, "CORTEX_APP_DATA_DIR: DATA_DIR", E2E.name)
     # 3. Never kill by image name — that would kill the owner's own running app.
@@ -126,7 +129,7 @@ def test_e2e_profile_cleanup_is_guarded_and_keeps_evidence_on_failure() -> None:
     # its own `fs.rmSync` with its own copy of the guards, and this gate caught it. Pinning the
     # helper's existence stops the next person re-inlining either one.
     assert_contains(e2e, "function removeDisposableProfile()", E2E.name)
-    assert_contains(e2e, "const DATA_DIR_IS_OURS = !process.env.CORTEX_APP_DATA_DIR;", E2E.name)
+    assert_contains(e2e, "const DATA_DIR_IS_OURS = PROFILE.ours;", E2E.name)
     assert_contains(e2e, "if (!DATA_DIR_IS_OURS) return;", E2E.name)
     # Must refuse anything that is not strictly BELOW the temp root (equality included, or a bare
     # tmpdir would be removable).
@@ -140,29 +143,47 @@ def test_e2e_profile_cleanup_is_guarded_and_keeps_evidence_on_failure() -> None:
     assert_contains(e2e, "Profile kept for diagnosis", E2E.name)
 
 
+def test_run_manifest_uses_argv_not_shell_or_python_interpolation() -> None:
+    e2e = E2E.read_text(encoding="utf-8")
+    assert_contains(
+        e2e,
+        "execFileSync(process.env.PYTHON || 'python', ['-c', py, dbPath, out]",
+        E2E.name,
+    )
+    for forbidden in ("execSync(`python -c", "db=r'\" + dbPath", "f=open(r'\" + out"):
+        if forbidden in e2e:
+            raise AssertionError(f"run manifest still interpolates an attacker-controlled path: {forbidden}")
+
+
 def test_clear_db_snapshots_before_deleting_and_requires_confirmation() -> None:
     clr = CLEAR_DB.read_text(encoding="utf-8")
     # Refuses without explicit confirmation.
     assert_contains(clr, "CORTEX_DB_CLEAR_CONFIRM", CLEAR_DB.name)
     assert_contains(clr, "REFUSING to clear", CLEAR_DB.name)
-    # Snapshot MUST happen before any DELETE — a clear is always recoverable.
-    snap_at = clr.find("shutil.copy2")
+    # Both independently-minted capabilities are mandatory before a destructive connection opens.
+    assert_contains(clr, "SENTINEL_NAME", CLEAR_DB.name)
+    assert_contains(clr, "PRAGMA application_id", CLEAR_DB.name)
+    assert_contains(clr, "immutable=1", CLEAR_DB.name)
+    # Snapshot MUST use SQLite's WAL-aware backup API and happen before any DELETE.
+    snap_at = clr.find("source.backup(destination)")
     del_at = clr.find("DELETE FROM")
     if snap_at < 0 or del_at < 0 or snap_at > del_at:
-        raise AssertionError("clear_db.py must snapshot the DB (shutil.copy2) BEFORE any DELETE FROM")
+        raise AssertionError("clear_db.py must use SQLite backup() BEFORE any DELETE FROM")
+    if "shutil.copy2" in clr:
+        raise AssertionError("clear_db.py must not copy only the main DB file; that omits committed WAL pages")
 
 
 def test_every_spawning_harness_is_isolated_from_the_production_library() -> None:
     """EVERY harness that launches the exe, not just e2e_real_app.cjs.
 
     The profile isolation, the PID-tree kill and the WebView2 folder were built for one harness and
-    its siblings were left behind — `e2e_constrained_ipc`, `e2e_finetuned_ipc` and `e2e_pipeline_ipc`
-    all spawned the app with a bare `{...process.env}`, so they ran against the owner's real
+    its sibling was left behind — `e2e_pipeline_ipc` spawned the app with a bare `{...process.env}`,
+    so it ran against the owner's real
     %APPDATA% library and imported audio into a corpus holding human review decisions, then killed
     by IMAGE NAME, taking his own running Cortex with them. Same shape as a guard applied at one call
     site instead of the shared one, which is why this checks the whole set.
 
-    e2e_real_app.cjs keeps its own (pinned above); the other three share e2e_profile.cjs.
+    e2e_real_app.cjs keeps its own (pinned above); the diagnostic harness shares e2e_profile.cjs.
     """
     for path in sorted(REPO_ROOT.glob("e2e_*.cjs")):
         src = path.read_text(encoding="utf-8")
@@ -201,7 +222,9 @@ def test_the_shared_profile_guard_refuses_the_production_directory() -> None:
     """The refusal must live in the shared module, not be re-derived per harness."""
     guard = (REPO_ROOT / "e2e_profile.cjs").read_text(encoding="utf-8")
     for needle in (
-        "REFUSED: CORTEX_APP_DATA_DIR points at the REAL profile",
+        "REFUSED: caller-supplied CORTEX_APP_DATA_DIR",
+        ".cortex-e2e-disposable.json",
+        "--initialize-test-profile",
         "taskkill /F /T /PID",
         "WEBVIEW2_USER_DATA_FOLDER",
         "target === root || !target.startsWith(root + path.sep)",
@@ -255,6 +278,7 @@ def main() -> None:
     test_e2e_never_clears_the_real_db_by_default()
     test_e2e_is_isolated_from_the_production_profile()
     test_e2e_profile_cleanup_is_guarded_and_keeps_evidence_on_failure()
+    test_run_manifest_uses_argv_not_shell_or_python_interpolation()
     test_clear_db_snapshots_before_deleting_and_requires_confirmation()
     test_every_spawning_harness_is_isolated_from_the_production_library()
     test_the_shared_profile_guard_refuses_the_production_directory()

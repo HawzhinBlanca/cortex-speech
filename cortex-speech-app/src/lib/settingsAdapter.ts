@@ -1,9 +1,13 @@
 import type { AppSettings } from './stores/settingsStore';
+import { ADVISORY_CLOUD_MODEL } from './stores/settingsStore';
 
 /** Backend settings shape returned by Tauri `get_settings` / `update_settings`. */
 export interface BackendSettings {
-  model_dir: string;
-  output_dir: string;
+  // Internal model/output paths are deliberately absent from the generated renderer snapshot.
+  // They remain optional here only so legacy adapter tests and compatibility callers can preserve
+  // an already-held value; the revision-guarded patch never transmits either field.
+  model_dir?: string;
+  output_dir?: string;
   asr_model_size: string;
   use_finetuned_asr?: boolean;
   vad_threshold: number;
@@ -27,10 +31,10 @@ export interface BackendSettings {
   theme: string;
   llm_mode: string;
   llm_endpoint: string;
-  llm_api_key: string;
+  // Secret values never cross the generated settings contract. Key writes use set_api_key.
+  llm_api_key?: string;
   llm_api_key_configured: boolean;
   cloud_llm_opt_in: boolean;
-  cloud_stt_opt_in?: boolean;
   llm_system_prompt: string;
   llm_model: string;
   external_asr_script_path: string;
@@ -98,15 +102,11 @@ function exportFormatToBackend(value: AppSettings['exportFormat']): string {
   }
 }
 
-function asrModelFromBackend(value: string): AppSettings['asrModel'] {
-  if (value === 'CTC300M') return 'ctc-300m';
-  if (value === 'CTC1B') return 'ctc-1b';
+function asrModelFromBackend(_value: string): AppSettings['asrModel'] {
   return 'wsl-7b';
 }
 
-function asrModelToBackend(value: AppSettings['asrModel']): string {
-  if (value === 'ctc-300m') return 'CTC300M';
-  if (value === 'ctc-1b') return 'CTC1B';
+function asrModelToBackend(_value: AppSettings['asrModel']): string {
   return 'WSL7B';
 }
 
@@ -131,7 +131,7 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     autoAlign: raw.auto_align,
     exportFormat: exportFormatFromBackend(raw.export_format),
     asrModel: asrModelFromBackend(raw.asr_model_size),
-    useFinetuned: raw.use_finetuned_asr ?? false,
+    useFinetuned: false,
     vadThreshold: raw.vad_threshold,
     minSegmentSec: Math.round(raw.min_segment_duration_ms / 1000),
     maxSegmentSec: Math.round(raw.max_segment_duration_ms / 1000),
@@ -154,20 +154,22 @@ export function mapBackendToFrontend(raw: BackendSettings): AppSettings {
     hfLicense: raw.hf_license ?? 'mit',
     llmMode: llmModeFromBackend(raw.llm_mode),
     llmEndpoint: raw.llm_endpoint ?? 'http://127.0.0.1:11434/v1/chat/completions',
-    llmApiKey: raw.llm_api_key ?? '',
+    llmApiKey: '',
     llmApiKeyConfigured: raw.llm_api_key_configured ?? false,
     cloudLlmOptIn: raw.cloud_llm_opt_in ?? false,
-    cloudSttOptIn: raw.cloud_stt_opt_in ?? false,
     llmSystemPrompt:
       raw.llm_system_prompt ??
       'You are an expert Kurdish linguist. Fix the phonetic transcription errors in the following text, preserving the exact meaning. Output ONLY the corrected text, no explanations.',
-    llmModel: raw.llm_model ?? 'omniASR_LLM_7B_v2',
+    llmModel:
+      llmModeFromBackend(raw.llm_mode) === 'Gemini'
+        ? ADVISORY_CLOUD_MODEL
+        : (raw.llm_model ?? 'heretic-final:latest'),
     externalAsrScriptPath: raw.external_asr_script_path ?? '',
     // Listening Jury
     juryCloudOptIn: raw.jury_cloud_opt_in ?? false,
-    juryModel: raw.jury_model ?? 'gemini-2.5-pro',
+    juryModel: ADVISORY_CLOUD_MODEL,
     juryProvider: raw.jury_provider === 'openrouter' ? 'openrouter' : 'gemini',
-    sourceReferenceModels: raw.source_reference_models ?? ['gemini-2.5-pro', 'gemini-2.5-flash'],
+    sourceReferenceModels: [ADVISORY_CLOUD_MODEL],
     jurySelfConsistencyN: raw.jury_self_consistency_n ?? 3,
     juryAutonomyLevel: (raw.jury_autonomy_level as AppSettings['juryAutonomyLevel']) ?? 'propose',
     juryT1Threshold: raw.jury_t1_threshold ?? 0.75,
@@ -189,7 +191,7 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     auto_align: ui.autoAlign,
     export_format: exportFormatToBackend(ui.exportFormat),
     asr_model_size: asrModelToBackend(ui.asrModel),
-    use_finetuned_asr: ui.useFinetuned,
+    use_finetuned_asr: false,
     vad_threshold: num(ui.vadThreshold, existing.vad_threshold),
     min_segment_duration_ms: Number.isFinite(ui.minSegmentSec)
       ? ui.minSegmentSec * 1000
@@ -213,9 +215,8 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     llm_api_key: ui.llmApiKey,
     llm_api_key_configured: ui.llmApiKeyConfigured || ui.llmApiKey.length > 0,
     cloud_llm_opt_in: ui.cloudLlmOptIn,
-    cloud_stt_opt_in: ui.cloudSttOptIn,
     llm_system_prompt: ui.llmSystemPrompt,
-    llm_model: ui.llmModel,
+    llm_model: ui.llmMode === 'Gemini' ? ADVISORY_CLOUD_MODEL : ui.llmModel,
     external_asr_script_path: ui.externalAsrScriptPath,
     hf_train_ratio: num(ui.hfTrainRatio, existing.hf_train_ratio),
     hf_val_ratio: num(ui.hfValRatio, existing.hf_val_ratio),
@@ -225,9 +226,9 @@ export function mapFrontendToBackend(ui: AppSettings, existing: BackendSettings)
     hf_license: ui.hfLicense,
     // Listening Jury
     jury_cloud_opt_in: ui.juryCloudOptIn,
-    jury_model: ui.juryModel,
+    jury_model: ADVISORY_CLOUD_MODEL,
     jury_provider: ui.juryProvider,
-    source_reference_models: ui.sourceReferenceModels,
+    source_reference_models: [ADVISORY_CLOUD_MODEL],
     jury_self_consistency_n: num(ui.jurySelfConsistencyN, existing.jury_self_consistency_n ?? 3),
     jury_autonomy_level: ui.juryAutonomyLevel,
     jury_t1_threshold: num(ui.juryT1Threshold, existing.jury_t1_threshold ?? 0.75),

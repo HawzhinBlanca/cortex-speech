@@ -541,12 +541,12 @@ fn test_omniasr_on_real_audio() {
     assert!(conf > 0.0 && conf <= 1.0, "ASR confidence score {} should be in (0.0, 1.0]", conf);
 }
 
-/// Default real-ASR gate on a COMMITTED, CC-BY-licensed fixture (Google FLEURS `ckb_iq`, see
-/// tests/fixtures/ATTRIBUTION.md). Unlike the `#[ignore]`d tests above, this needs no external
-/// CORTEX_REAL_AUDIO_DIR — the audio is in-repo — so it runs from a fresh clone once the OmniASR
-/// model is present (`npm run fetch-models`). It skips cleanly when the model isn't fetched, and
-/// asserts the real OmniASR produces a non-blank Kurdish (Arabic-script) transcript (no-fabrication).
+/// Explicit offline diagnostic for the retired optional OmniASR-CTC-300M engine on a committed,
+/// CC-BY-licensed fixture (Google FLEURS `ckb_iq`; see tests/fixtures/ATTRIBUTION.md). Production and
+/// default validation use only the fine-tuned OmniASR-7B champion, so an installed optional 300M file
+/// must never make the ordinary CPU/GPU-safe suite initialize this model.
 #[test]
+#[ignore = "offline optional-model diagnostic; production/default ASR is fine-tuned OmniASR-7B"]
 fn omniasr_on_committed_fleurs_ckb_fixture() {
     let _crash_breadcrumb = fixtures::crash_breadcrumb("real_audio", "omniasr_on_committed_fleurs_ckb_fixture");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fleurs_ckb_sample.wav");
@@ -1226,12 +1226,20 @@ fn champion_selected_refuses_to_downgrade_to_the_finetuned_model() {
     let db_path = tmp.path().join("sup.db").to_string_lossy().to_string();
     let db = Database::open(&db_path).unwrap();
     db.initialize().unwrap();
-    drop(db);
 
     // Champion selected AND the fine-tuned flag on: the flag must lose.
+    //
+    // The champion must be genuinely UNREACHABLE for this to test anything. It used to rely on the
+    // ambient machine having no client script, so the moment the owner's real 7B server was running
+    // the pipeline succeeded and the test failed with "a draft came back anyway" — it was asserting
+    // the environment, not the invariant. `resolve_wsl_7b_client` accepts a configured path that
+    // starts with '/' WITHOUT stat-ing it (WSL paths cannot be stat-ed from Windows), so pointing it
+    // at an absolute POSIX path that does not exist makes the champion resolvable-but-dead
+    // deterministically, per-instance, with no env mutation to race other tests.
     let settings = AppSettings {
         use_finetuned_asr: true,
         asr_model_size: cortex_speech_app_lib::settings::AsrModelSize::WSL7B,
+        external_asr_script_path: "/nonexistent/cortex_7b_client_absent_for_test.py".to_string(),
         ..AppSettings::default()
     };
     let pipeline = ProcessingPipeline::new(
@@ -1248,6 +1256,21 @@ fn champion_selected_refuses_to_downgrade_to_the_finetuned_model() {
         eprintln!("[champion-supremacy] fixture absent; skipping");
         return;
     }
+
+    // The pipeline resolves a SEGMENT before it ever selects an engine. Without one it failed with
+    // "Segment not found in database" — which reads like a refusal and is not: the ASR path was never
+    // reached, so this test asserted nothing about downgrading for as long as it has existed. Seed the
+    // row so the run actually gets as far as choosing a model.
+    let segment = cortex_speech_app_lib::db::SpeechSegment {
+        id: "supremacy-1".to_string(),
+        audio_path: fixture.to_string_lossy().to_string(),
+        raw_transcript: "seed".to_string(),
+        duration_ms: 1000,
+        ..Default::default()
+    };
+    db.insert_segment(&segment).unwrap();
+    drop(db);
+
     let result = pipeline.transcribe(None, fixture.to_str().unwrap(), None, None);
     let error = match result {
         Err(e) => e.to_string(),

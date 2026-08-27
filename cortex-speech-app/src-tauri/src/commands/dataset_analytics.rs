@@ -9,23 +9,61 @@
 //! library never freezes the UI thread.
 
 use super::{run_blocking, RATE_LIMITER};
+use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
 use crate::{quality, stats, AppState};
 use tauri::State;
 
+fn analytics_rate_limited(message: &str) -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", message, true).suggested(SuggestedActionV1::Retry)
+}
+
+fn analytics_failed(code: &str, message: &str) -> CommandErrorV1 {
+    CommandErrorV1::new(code, message, false).suggested(SuggestedActionV1::OpenHealth)
+}
+
+fn validate_certificate_request(target_error: f64, confidence_level: f64) -> Result<(), CommandErrorV1> {
+    if !target_error.is_finite()
+        || target_error <= 0.0
+        || target_error > 1.0
+        || !confidence_level.is_finite()
+        || confidence_level <= 0.0
+        || confidence_level >= 1.0
+    {
+        return Err(CommandErrorV1::new(
+            "INVALID_CERTIFICATE_PARAMETERS",
+            "Certificate error and confidence values must be valid probabilities.",
+            false,
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub async fn get_dataset_stats(state: State<'_, AppState>) -> Result<stats::DatasetStats, String> {
-    RATE_LIMITER.check("get_dataset_stats")?;
+#[specta::specta]
+pub async fn get_dataset_stats(state: State<'_, AppState>) -> Result<stats::DatasetStats, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_dataset_stats")
+        .map_err(|_| analytics_rate_limited("The dataset summary is busy. Retry in a moment."))?;
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
         stats::compute_stats(&db).map_err(|e| e.to_string())
     })
     .await
+    .map_err(|_| {
+        analytics_failed(
+            "DATASET_STATS_FAILED",
+            "The dataset summary could not be computed. Open Health for recovery options.",
+        )
+    })
 }
 
 #[tauri::command]
-pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::DatasetQuality, String> {
-    RATE_LIMITER.check("get_dataset_quality")?;
+#[specta::specta]
+pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::DatasetQuality, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_dataset_quality")
+        .map_err(|_| analytics_rate_limited("The quality audit is busy. Retry in a moment."))?;
     let settings = state.lock_settings().clone(); // snapshot before moving into the blocking task
     let db = state.db_arc();
     run_blocking(move || {
@@ -33,6 +71,12 @@ pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::
         quality::compute_quality_with_settings(&db, &settings).map_err(|e| e.to_string())
     })
     .await
+    .map_err(|_| {
+        analytics_failed(
+            "DATASET_QUALITY_FAILED",
+            "The dataset quality audit could not be computed. Open Health for recovery options.",
+        )
+    })
 }
 
 /// Library-wide training grade + the reasons behind it, for the Insights readiness verdict.
@@ -43,10 +87,13 @@ pub async fn get_dataset_quality(state: State<'_, AppState>) -> Result<quality::
 /// exactly when it matters most: a library can be 100% human-verified and still export zero rows
 /// (e.g. every clip carries `energy_heuristic_alignment` because no word aligner is installed).
 #[tauri::command]
+#[specta::specta]
 pub async fn get_training_grade_breakdown(
     state: State<'_, AppState>,
-) -> Result<quality::TrainingGradeBreakdown, String> {
-    RATE_LIMITER.check("get_training_grade_breakdown")?;
+) -> Result<quality::TrainingGradeBreakdown, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_training_grade_breakdown")
+        .map_err(|_| analytics_rate_limited("The training-readiness summary is busy. Retry in a moment."))?;
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
@@ -60,6 +107,12 @@ pub async fn get_training_grade_breakdown(
         Ok(tally.finish())
     })
     .await
+    .map_err(|_| {
+        analytics_failed(
+            "TRAINING_GRADE_FAILED",
+            "Training readiness could not be computed. Open Health for recovery options.",
+        )
+    })
 }
 
 #[tauri::command]
@@ -90,12 +143,16 @@ pub async fn get_intelligence_report(state: State<'_, AppState>) -> Result<serde
 }
 
 #[tauri::command]
+#[specta::specta]
 pub async fn get_dataset_certificate(
     state: State<'_, AppState>,
     target_error: f64,
     confidence_level: f64,
-) -> Result<crate::quality::conformal::ConformalCertificate, String> {
-    RATE_LIMITER.check("get_dataset_certificate")?;
+) -> Result<crate::quality::conformal::ConformalCertificate, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_dataset_certificate")
+        .map_err(|_| analytics_rate_limited("The dataset certificate is busy. Retry in a moment."))?;
+    validate_certificate_request(target_error, confidence_level)?;
     let db = state.db_arc();
     run_blocking(move || {
         // P1.3: folded from a stream. See get_training_grade_breakdown — same reasoning, and the
@@ -109,12 +166,23 @@ pub async fn get_dataset_certificate(
         Ok(tally.finish(target_error, confidence_level))
     })
     .await
+    .map_err(|_| {
+        analytics_failed(
+            "DATASET_CERTIFICATE_FAILED",
+            "The dataset certificate could not be computed. Open Health for recovery options.",
+        )
+    })
 }
 
 /// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
 #[tauri::command]
-pub async fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate::eval::LabelQualityLift, String> {
-    RATE_LIMITER.check("get_label_quality_lift")?;
+#[specta::specta]
+pub async fn get_label_quality_lift(
+    state: State<'_, AppState>,
+) -> Result<crate::eval::LabelQualityLift, CommandErrorV1> {
+    RATE_LIMITER
+        .check("get_label_quality_lift")
+        .map_err(|_| analytics_rate_limited("The label-quality analysis is busy. Retry in a moment."))?;
     let db = state.db_arc();
     run_blocking(move || {
         let db = db.lock().unwrap_or_else(|p| p.into_inner());
@@ -122,4 +190,38 @@ pub async fn get_label_quality_lift(state: State<'_, AppState>) -> Result<crate:
         Ok(crate::eval::compute_label_quality_lift(&triples, 2000, 1234))
     })
     .await
+    .map_err(|_| {
+        analytics_failed(
+            "LABEL_QUALITY_LIFT_FAILED",
+            "Label-quality lift could not be computed. Open Health for recovery options.",
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analytics_failures_are_stable_and_never_forward_internal_details() {
+        let error = analytics_failed(
+            "DATASET_STATS_FAILED",
+            "The dataset summary could not be computed. Open Health for recovery options.",
+        );
+        let wire = serde_json::to_string(&error).expect("serialize analytics error");
+        assert!(wire.contains("DATASET_STATS_FAILED"));
+        assert!(!wire.contains("C:\\"));
+        assert!(!wire.contains("SQL"));
+        assert!(!wire.contains("token"));
+
+        let busy = serde_json::to_value(analytics_rate_limited("Busy. Retry in a moment.")).unwrap();
+        assert_eq!(busy["retryable"], true);
+        assert_eq!(busy["suggestedAction"], "retry");
+
+        for (target, confidence) in [(0.0, 0.95), (1.1, 0.95), (0.05, 0.0), (0.05, 1.0)] {
+            let invalid = validate_certificate_request(target, confidence).expect_err("invalid probability");
+            assert_eq!(invalid.code, "INVALID_CERTIFICATE_PARAMETERS");
+        }
+        validate_certificate_request(0.05, 0.95).expect("normal certificate request");
+    }
 }

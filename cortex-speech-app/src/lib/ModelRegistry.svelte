@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { chooseFile } from './fileDialogs';
   import { listModelVersions, importModelCheckpoint, type ModelVersion } from './commands';
   import { notifications } from './stores/notificationStore';
   import { isTauriRuntime } from './runtime';
+  import { t } from './i18n';
 
   // Provenance view of the model registry: what is registered, each model's license + checkpoint
   // checksum, which version is the champion, plus an import form to register a new checkpoint.
@@ -15,7 +17,6 @@
   let importing = $state(false);
   let form = $state({
     id: '',
-    family: '',
     source: '',
     license: '',
     modelCardName: '',
@@ -30,7 +31,7 @@
     try {
       models = await listModelVersions();
     } catch (e: unknown) {
-      notifications.error('Failed to load the model registry', { detail: String(e) });
+      notifications.error($t('modelRegistry.loadFailed'), { cause: e });
     } finally {
       loading = false;
     }
@@ -43,14 +44,12 @@
   }
 
   async function pickCheckpoint() {
-    const { open } = await import('@tauri-apps/plugin-dialog');
-    const picked = await open({ multiple: false, title: 'Select a model checkpoint' });
-    if (typeof picked === 'string') form.checkpointPath = picked;
+    const picked = await chooseFile({ title: $t('modelRegistry.selectCheckpoint') });
+    if (picked) form.checkpointPath = picked;
   }
 
   const canSubmit = $derived(
     form.id.trim() !== '' &&
-      form.family.trim() !== '' &&
       form.source.trim() !== '' &&
       form.license.trim() !== '' &&
       form.checkpointPath.trim() !== '' &&
@@ -63,18 +62,17 @@
     try {
       const newId = await importModelCheckpoint({
         id: form.id.trim(),
-        family: form.family.trim(),
         checkpointPath: form.checkpointPath.trim(),
         source: form.source.trim(),
         license: form.license.trim(),
         modelCardName: form.modelCardName.trim() || null,
       });
-      notifications.success(`Imported checkpoint "${newId}" as a candidate.`);
-      form = { id: '', family: '', source: '', license: '', modelCardName: '', checkpointPath: '' };
+      notifications.success($t('modelRegistry.importedCandidate', { id: newId }));
+      form = { id: '', source: '', license: '', modelCardName: '', checkpointPath: '' };
       showImport = false;
       await load();
     } catch (e: unknown) {
-      notifications.error('Failed to import checkpoint', { detail: String(e) });
+      notifications.error($t('modelRegistry.importFailed'), { cause: e });
     } finally {
       importing = false;
     }
@@ -82,13 +80,12 @@
 </script>
 
 <section class="space-y-2" data-testid="model-registry">
-  <h3 class="text-sm font-medium text-cortex-100">Registered models</h3>
+  <h3 class="text-sm font-medium text-cortex-100">{$t('modelRegistry.title')}</h3>
   {#if loading}
-    <p class="text-xs text-muted">Loading registry…</p>
+    <p class="text-xs text-muted">{$t('modelRegistry.loading')}</p>
   {:else if models.length === 0}
     <p class="text-xs text-muted" data-testid="model-registry-empty">
-      No models are registered yet. An imported fine-tuned checkpoint appears here with its license
-      and checkpoint checksum so its provenance stays auditable.
+      {$t('modelRegistry.empty')}
     </p>
   {:else}
     <ul class="space-y-1" data-testid="model-registry-list">
@@ -98,17 +95,24 @@
           data-testid="model-registry-row"
         >
           <div class="flex flex-wrap items-center gap-2">
-            <span class="font-medium text-cortex-100">{m.id}</span>
+            <bdi dir="ltr" class="font-medium text-cortex-100">{m.id}</bdi>
             <span class="text-muted">·</span>
-            <span class="text-muted">{m.family}</span>
+            <bdi dir="ltr" class="text-muted">{m.family}</bdi>
             {#if m.status === 'champion'}
-              <span class="rounded bg-emerald-700/50 px-1.5 py-0.5 text-emerald-100">champion</span>
+              <span class="rounded bg-emerald-700/50 px-1.5 py-0.5 text-emerald-100">
+                {$t('modelRegistry.champion')}
+              </span>
             {:else}
-              <span class="rounded bg-cortex-700/50 px-1.5 py-0.5 text-cortex-200">{m.status}</span>
+              <bdi dir="ltr" class="rounded bg-cortex-700/50 px-1.5 py-0.5 text-cortex-200">
+                {m.status}
+              </bdi>
             {/if}
           </div>
-          <div class="mt-1 text-muted">
-            license {m.license} · sha {shortSha(m.checkpoint_sha256)}
+          <div class="mt-1 text-muted" dir="auto">
+            {$t('modelRegistry.licenseLabel')}
+            <bdi dir="ltr">{m.license}</bdi>
+            · {$t('modelRegistry.shaLabel')}
+            <bdi dir="ltr">{shortSha(m.checkpointSha256)}</bdi>
           </div>
         </li>
       {/each}
@@ -122,40 +126,34 @@
         onclick={() => (showImport = !showImport)}
         data-testid="model-import-toggle"
       >
-        {showImport ? '− Cancel import' : '+ Import checkpoint'}
+        {showImport ? $t('modelRegistry.cancelImport') : $t('modelRegistry.importCheckpoint')}
       </button>
       {#if showImport}
         <div class="mt-2 space-y-2" data-testid="model-import-form">
           <div class="grid grid-cols-2 gap-2">
             <input
               class="input text-xs"
-              placeholder="id (e.g. mms-ckb-v2)"
-              aria-label="Model id"
+              placeholder={$t('modelRegistry.idPlaceholder')}
+              aria-label={$t('modelRegistry.idLabel')}
               bind:value={form.id}
             />
             <input
               class="input text-xs"
-              placeholder="family (e.g. mms-ckb)"
-              aria-label="Model family"
-              bind:value={form.family}
-            />
-            <input
-              class="input text-xs"
-              placeholder="source (e.g. fine-tune)"
-              aria-label="Model source"
+              placeholder={$t('modelRegistry.sourcePlaceholder')}
+              aria-label={$t('modelRegistry.sourceLabel')}
               bind:value={form.source}
             />
             <input
               class="input text-xs"
-              placeholder="license (e.g. CC-BY-NC-4.0)"
-              aria-label="Model license"
+              placeholder={$t('modelRegistry.licensePlaceholder')}
+              aria-label={$t('modelRegistry.licenseFieldLabel')}
               bind:value={form.license}
             />
           </div>
           <input
             class="input text-xs w-full"
-            placeholder="model card name (optional)"
-            aria-label="Model card name (optional)"
+            placeholder={$t('modelRegistry.modelCardPlaceholder')}
+            aria-label={$t('modelRegistry.modelCardLabel')}
             bind:value={form.modelCardName}
           />
           <div class="flex items-center gap-2">
@@ -164,10 +162,12 @@
               onclick={pickCheckpoint}
               data-testid="model-import-pick"
             >
-              Choose file…
+              {$t('modelRegistry.chooseFile')}
             </button>
-            <span class="text-[10px] text-muted truncate flex-1" title={form.checkpointPath}>
-              {form.checkpointPath || 'No checkpoint selected'}
+            <span class="text-[10px] text-muted truncate flex-1">
+              {form.checkpointPath
+                ? $t('modelRegistry.checkpointSelected')
+                : $t('modelRegistry.noCheckpointSelected')}
             </span>
           </div>
           <button
@@ -176,7 +176,7 @@
             disabled={!canSubmit}
             data-testid="model-import-submit"
           >
-            {importing ? 'Importing…' : 'Import as candidate'}
+            {importing ? $t('modelRegistry.importing') : $t('modelRegistry.importAsCandidate')}
           </button>
         </div>
       {/if}

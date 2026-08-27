@@ -27,6 +27,23 @@ pub static API_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .build()
 });
 
+/// Local fine-tuning submissions carry human correction pairs. They must never follow a redirect:
+/// even when the configured URL is loopback, a hostile or compromised local service could otherwise
+/// return `Location: https://attacker.example` and turn the client into an egress proxy for private
+/// transcripts. Callers also validate that the original destination is a literal loopback address.
+pub static LOCAL_DPO_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(120))
+        .timeout_write(Duration::from_secs(60))
+        .timeout(API_CALL_DEADLINE)
+        .redirects(0)
+        // A loopback URL routed through HTTP_PROXY would still disclose the request body to the
+        // proxy. This agent is local-only by contract, so environment/system proxies are forbidden.
+        .try_proxy_from_env(false)
+        .build()
+});
+
 /// Ceiling on ONE cloud API call, start to finish. Cloud work here is a single request/response —
 /// no streaming, no long polls — so a call still running after this has failed, whatever the socket
 /// thinks.
@@ -72,6 +89,7 @@ mod tests {
         // panic here) — the guarantee being that no call site uses the timeout-less
         // global agent anymore.
         let _api = &*API_AGENT;
+        let _dpo = &*LOCAL_DPO_AGENT;
         let _dl = &*DOWNLOAD_AGENT;
         // Cloning is cheap (Arc) — call sites can clone freely without re-building config.
         let _cloned = API_AGENT.clone();

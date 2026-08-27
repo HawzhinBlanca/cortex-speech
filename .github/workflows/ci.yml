@@ -42,14 +42,64 @@ jobs:
       - name: Verify 10/10 gates (manifests, ledger schema, license compatibility)
         run: python "${{ github.workspace }}/scripts/verify_10.py" --static
 
-  windows-release-gate:
-    name: Windows Release Gate
+  rust-coverage-prerequisite:
+    name: Rust Coverage Prerequisite
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     defaults:
       run:
         working-directory: cortex-speech-app
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cortex-speech-app/package-lock.json
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: { python-version: '3.12' }
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install exact nightly used only for branch coverage
+        run: rustup toolchain install nightly-2026-07-11 --profile minimal --component llvm-tools-preview
+      - name: Cache exact Rust dependency inputs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cortex-speech-app/src-tauri/target
+          key: windows-coverage-cargo-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock', 'cortex-speech-app/scripts/rust_coverage_toolchain.json') }}
+      - name: Install pinned coverage tool
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+      - name: Provision locked build inputs
+        run: |
+          npm ci
+          npm run fetch-models
+          npm run build
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+      - name: Run separately supervised, no-retry coverage authority
+        run: python "${{ github.workspace }}/scripts/verify_10.py" --rust-coverage-prerequisite
+
+  windows-release-gate:
+    name: Windows Release Gate
+    needs: rust-coverage-prerequisite
+    if: ${{ always() }}
+    runs-on: windows-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: cortex-speech-app
+    steps:
+      - name: Require successful immutable Rust coverage prerequisite
+        shell: pwsh
+        env:
+          RUST_COVERAGE_RESULT: ${{ needs.rust-coverage-prerequisite.result }}
+        run: |
+          if ($env:RUST_COVERAGE_RESULT -ne 'success') {
+            throw "Windows Release Gate refuses a missing, skipped, cancelled, or failed Rust coverage prerequisite."
+          }
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -81,12 +131,10 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
-      # Download + SHA-256-verify the gitignored BASE models into src-tauri/models/ so tauri-build
+      # Provision + SHA-256-verify the gitignored VAD/ORT runtime support into src-tauri/models/ so tauri-build
       # finds the declared bundle.resources when `cargo` compiles the crate (clippy/test run build.rs
-      # -> tauri-build, which validates resource existence). The USER-PROVIDED fine-tuned model is not
-      # publicly fetchable and is intentionally excluded from the default bundle (see
-      # tauri.finetuned.conf.json); it is not needed here.
-      - name: Fetch + verify base models (bundle.resources)
+      # -> tauri-build, which validates resource existence). No auxiliary ASR is fetched or bundled.
+      - name: Fetch + verify runtime support (bundle.resources)
         run: npm run fetch-models
 
       - name: Install Playwright browser
@@ -107,6 +155,9 @@ jobs:
       - name: Python policy regressions
         run: npm run test:python-policies
 
+      - name: Fail-closed Rust production-module architecture
+        run: python scripts/rust_quality_gate.py architecture
+
       - name: Lint
         run: npm run lint
 
@@ -114,10 +165,10 @@ jobs:
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
 
       - name: Rust clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 
       # This is a UI smoke test against a MOCKED Tauri backend (e2e/helpers/tauri-mock.ts): it
       # exercises Svelte wiring against canned IPC data and does NOT run the real Rust pipeline
@@ -150,9 +201,21 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Linux system deps
+        # READ FROM THE LOG, not inferred (fifth failure 2026-08-19): the runner's apt mirror list
+        # puts azure.archive.ubuntu.com first, and that host was DOWN -- every index fetch printed
+        # `Ign:` against it, waited out its timeout, retried, and only then fell back to
+        # archive.ubuntu.com (which answered instantly). Four suites x many index files x
+        # timeout x retries burned the whole step budget inside `apt-get update`; the install
+        # loop never ran. My earlier "Acquire::Retries=5" made it WORSE: more retries against
+        # a dead host. So: point apt straight at the canonical archive, skip the dead mirror
+        # entirely, keep one short retry for genuine hiccups.
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+          # Replace the runner's mirror list with the canonical archive only. The file holds
+          # one mirror per line; apt tries them in order and waits for each.
+          printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15                -o DPkg::Lock::Timeout=120 install -y --no-install-recommends                libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -169,8 +232,7 @@ jobs:
           components: clippy, rustfmt
 
       - run: npm ci
-      # Base models must exist before cargo build: tauri-build (build.rs) validates bundle.resources.
-      # The fine-tuned model is excluded from the default bundle (see tauri.finetuned.conf.json).
+      # Runtime support must exist before cargo build: tauri-build validates bundle.resources.
       - run: npm run fetch-models
       - run: npm run test:python-policies
       - run: npm run build
@@ -201,8 +263,7 @@ jobs:
           components: clippy, rustfmt
 
       - run: npm ci
-      # Base models must exist before cargo build: tauri-build (build.rs) validates bundle.resources.
-      # The fine-tuned model is excluded from the default bundle (see tauri.finetuned.conf.json).
+      # Runtime support must exist before cargo build: tauri-build validates bundle.resources.
       - run: npm run fetch-models
       - run: npm run test:python-policies
       - run: npm run build

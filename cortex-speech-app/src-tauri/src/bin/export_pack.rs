@@ -8,10 +8,9 @@
 //! first link had no command: `export_finetune_pack` existed only behind a Tauri IPC, so sealing a
 //! snapshot meant clicking through the desktop app. This is that link.
 //!
-//! Deliberately does NOT take the instance lock. The export is read-heavy plus ONE
-//! `INSERT OR IGNORE` for the seal, which SQLite's WAL and busy_timeout handle alongside a running
-//! app — and requiring the app to be closed would mean dropping every reviewer's link to produce a
-//! training snapshot, which is a trade the corpus should never have to make.
+//! Takes the same instance lock as the desktop for the complete read + seal operation. The seal is a
+//! write, and a concurrent restore could otherwise export old-generation rows then attach the seal
+//! to the restored generation. Close the app before running this maintenance binary.
 
 use cortex_speech_app_lib::db::Database;
 use std::path::PathBuf;
@@ -28,6 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let out_dir = std::env::args().nth(1).map(PathBuf::from).ok_or("Usage: export_pack <output-dir>")?;
     let data_dir = app_data_dir();
+    let _instance_lock = cortex_speech_app_lib::flock::InstanceLock::try_lock(&data_dir).map_err(|error| {
+        format!("Cannot export a sealed pack while Cortex is running: {error}. Stop review and close the app first.")
+    })?;
     let db_path = data_dir.join("cortex-speech.db");
     let db = Database::open_with_retry(&db_path.to_string_lossy())?;
 

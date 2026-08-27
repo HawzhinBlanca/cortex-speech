@@ -111,8 +111,9 @@ suite to green with the server serving.)
 
 - **Spot-check volume is small, and it is capped by how much you have verified yourself.** A clip can
   serve as an answer key only if you verified it on the desktop (`reviewed_by IS NULL`) and the raw
-  ASR draft actually differs from your answer — a draft that was already right cannot tell a reviewer
-  who listened from one who tapped accept. At the time of writing the live library yields **15**
+  ASR draft actually differs from your answer — a draft that was already right cannot distinguish a
+  careful judgement from a blind accept. Playback telemetry proves only bounded renderer-reported
+  traversal, never human attention or comprehension. At the time of writing the live library yields **15**
   usable answer keys, so early scores rest on a handful of checks. `SpotCheckScore.checks` reports
   the real count; do not read a verdict into two or three.
 

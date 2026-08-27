@@ -10,16 +10,21 @@ pub mod asr;
 pub mod atomic_file;
 pub mod audio;
 pub mod audio_quality;
+mod backup_service;
 pub mod cache;
 pub mod cancel;
+pub mod champion_promotion;
+pub mod champion_promotion_runtime;
 pub mod chunking;
 pub mod commands;
 pub mod constrained_decode;
 pub mod corrections;
 pub mod couch;
 pub mod crash;
+mod database_runtime;
 pub mod db;
 pub mod denoiser;
+pub mod deployment;
 pub mod dialect;
 pub mod diarization;
 pub mod diff;
@@ -31,6 +36,7 @@ pub mod eval;
 pub mod export;
 pub mod export_audio;
 pub mod export_bundle;
+pub mod voice_focus;
 // REMOVED (iteration 231): `features` — an 80-bin mel-filterbank extractor, 473 lines, and the sole
 // user of the `rustfft` dependency. Its production consumer was the fbank diarization fallback, deleted
 // earlier for not being speaker-discriminative; after that its ONLY caller was an #[ignore]d test that
@@ -44,19 +50,27 @@ pub mod history;
 pub mod http;
 pub mod inference;
 pub mod integration_runner;
+pub mod ipc_contract;
 pub mod jobs;
 pub mod jury;
 pub mod llm_refiner;
 pub mod media;
+pub mod media_materialization_worker;
 pub mod migrations;
 pub mod models;
 pub mod normalizer;
 pub mod pipeline;
+pub mod production_dataset;
 pub mod quality;
+mod recovery;
 pub mod registry;
+mod restore_service;
+pub mod review_campaign;
+pub mod review_pilot;
+pub mod review_pool;
+pub mod review_pool_export;
 pub mod runs;
 pub mod scorecard;
-pub mod scribe_api;
 pub mod secret_redaction;
 pub mod session;
 pub mod settings;
@@ -64,6 +78,8 @@ pub mod significance;
 pub mod snapshot;
 pub mod source_provenance;
 pub mod stats;
+mod stores;
+pub mod technical_audio_probe;
 pub mod telemetry;
 pub mod throttle;
 pub mod transcript_export;
@@ -85,6 +101,7 @@ static GIT_SHA_MARKER: &str = concat!("CORTEX_BUILD_SHA:", env!("GIT_SHA"));
 
 use cache::TranscriptCache;
 use cancel::CancellationToken;
+use database_runtime::DatabaseRuntime;
 use db::Database;
 use fingerprint::AudioFingerprint;
 use history::HistoryManager;
@@ -96,6 +113,39 @@ use session::SessionManager;
 use settings::AppSettings;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+// A nine-minute monotonic schedule leaves one minute for capture and ordinary scheduler jitter while
+// preserving the private-production RPO <= 10 minutes. Advancing from the prior deadline (rather than
+// sleeping after each completed backup) prevents snapshot duration from accumulating as cadence drift.
+const SNAPSHOT_TARGET_RPO_SECS: u64 = 10 * 60;
+const SNAPSHOT_CAPTURE_JITTER_MARGIN_SECS: u64 = 60;
+const SNAPSHOT_INTERVAL_SECS: u64 = SNAPSHOT_TARGET_RPO_SECS - SNAPSHOT_CAPTURE_JITTER_MARGIN_SECS;
+
+fn next_snapshot_deadline(previous_deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    let mut next = previous_deadline + interval;
+    while next <= now {
+        next += interval;
+    }
+    next
+}
+
+/// Clonable access to the AppState database for blocking worker tasks.
+///
+/// Unlike exposing the raw `Arc<Mutex<Database>>`, every lock acquisition passes through the
+/// restore admission gate. This matters for work queued before a restore: it must not acquire the
+/// database between the mandatory safety snapshot / page swap and the snapshot restore's final
+/// configuration + history updates.
+#[derive(Clone)]
+pub(crate) struct AppDatabaseHandle {
+    inner: DatabaseRuntime,
+}
+
+impl AppDatabaseHandle {
+    pub(crate) fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, Database>> {
+        self.inner.lock()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportState {
@@ -109,17 +159,109 @@ pub enum BatchState {
     Running,
 }
 
+/// Stable machine code returned by every production audio-import entry point when the cross-run
+/// duplicate index could not be proved authoritative at startup.
+pub const DEDUP_INDEX_UNAVAILABLE_CODE: &str = "DEDUP_INDEX_UNAVAILABLE";
+
+/// Keep this message stable while import commands still use their legacy string-error adapter. The
+/// leading machine code is deliberately separate from the human action text so callers never need to
+/// classify a database error or a localized sentence.
+pub const DEDUP_INDEX_UNAVAILABLE_MESSAGE: &str = "DEDUP_INDEX_UNAVAILABLE: Audio import is disabled because the cross-run duplicate index could not be verified. Repair or backfill audio identities, then restart Cortex.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupUnavailableReason {
+    IdentityReadFailed,
+    IncompleteAudioIdentities { recordings: usize },
+}
+
+/// Startup-owned import admission state. An unavailable index degrades only audio import; the app is
+/// still allowed to open the library, review existing work, recover data, and export eligible rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupReadiness {
+    Ready { rehydrated_recordings: usize },
+    Unavailable(DedupUnavailableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupIndexUnavailable;
+
+impl DedupIndexUnavailable {
+    pub const fn code(self) -> &'static str {
+        DEDUP_INDEX_UNAVAILABLE_CODE
+    }
+}
+
+impl std::fmt::Display for DedupIndexUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(DEDUP_INDEX_UNAVAILABLE_MESSAGE)
+    }
+}
+
+impl std::error::Error for DedupIndexUnavailable {}
+
+impl DedupReadiness {
+    pub fn require_import_ready(&self) -> Result<(), DedupIndexUnavailable> {
+        match self {
+            Self::Ready { .. } => Ok(()),
+            Self::Unavailable(_) => Err(DedupIndexUnavailable),
+        }
+    }
+}
+
+/// Rehydrate only after one snapshot has proved that every active recording has both durable identity
+/// tiers. A read fault or even one incomplete recording leaves the cache empty and import fail-closed.
+pub fn rehydrate_dedup_index(db: &Database, fingerprint: &AudioFingerprint) -> DedupReadiness {
+    // This function is intentionally replacement, not merge, semantics. Startup passes a fresh map,
+    // while a future lifecycle caller may not; retaining identities from another database generation
+    // would create false duplicate refusals just as surely as omitting current identities creates
+    // false admissions.
+    fingerprint.clear();
+    match db.load_audio_identity_inventory() {
+        Ok((_known, incomplete_recordings)) if incomplete_recordings > 0 => {
+            tracing::error!(
+                incomplete_recordings,
+                dedup_error_code = DEDUP_INDEX_UNAVAILABLE_CODE,
+                "Audio import disabled: active recordings have incomplete durable identities"
+            );
+            DedupReadiness::Unavailable(DedupUnavailableReason::IncompleteAudioIdentities {
+                recordings: incomplete_recordings,
+            })
+        }
+        Ok((known, _)) => {
+            let rehydrated_recordings = fingerprint.rehydrate(known);
+            tracing::info!(
+                rehydrated_recordings,
+                "Audio dedup: rehydrated authoritative recording identities from the library"
+            );
+            DedupReadiness::Ready { rehydrated_recordings }
+        }
+        Err(error) => {
+            tracing::error!(
+                dedup_error_code = DEDUP_INDEX_UNAVAILABLE_CODE,
+                %error,
+                "Audio import disabled: durable recording identities could not be read"
+            );
+            DedupReadiness::Unavailable(DedupUnavailableReason::IdentityReadFailed)
+        }
+    }
+}
+
 pub struct AppState {
     // Arc so a slow command can clone the handle and move DB work into `spawn_blocking` (off the
     // main/UI thread) without borrowing `State` across an await. lock_db() still returns a guard.
-    pub db: Arc<Mutex<Database>>,
+    pub(crate) db: DatabaseRuntime,
     pub pipeline: Mutex<ProcessingPipeline>,
     pub normalizer: Arc<SoraniNormalizer>,
     pub cache: Arc<TranscriptCache>,
     pub fingerprint: Arc<AudioFingerprint>,
+    pub(crate) dedup_readiness: DedupReadiness,
     pub history: HistKeyMgr,
     pub session: Mutex<SessionManager>,
     pub settings: Mutex<AppSettings>,
+    /// Serializes the complete compare/save/publish settings transaction. `settings` alone cannot
+    /// cover the pipeline update without violating the pipeline-before-settings lock hierarchy;
+    /// this operation gate preserves writer order while each inner lock remains short-lived.
+    settings_write: Mutex<()>,
     pub data_dir: Mutex<Option<PathBuf>>,
     pub model_manager: Mutex<ModelManager>,
     /// Separate cancellation slots per long-running operation kind. Imports (start_cancel_token) and
@@ -131,10 +273,11 @@ pub struct AppState {
     pub batch_cancel_token: Mutex<Option<CancellationToken>>,
     pub import_state: Mutex<ImportState>,
     pub batch_state: Mutex<BatchState>,
-    pub media_registry: Mutex<MediaRegistry>,
+    pub media_registry: Arc<Mutex<MediaRegistry>>,
+    pub(crate) media_materializer: Arc<crate::media::MediaMaterializationCoordinator>,
 }
 
-type HistKeyMgr = Mutex<HistoryManager>;
+type HistKeyMgr = Arc<Mutex<HistoryManager>>;
 
 impl AppState {
     fn lock_import_state(&self) -> MutexGuard<'_, ImportState> {
@@ -179,6 +322,13 @@ impl AppState {
         })
     }
 
+    pub(crate) fn lock_settings_write(&self) -> MutexGuard<'_, ()> {
+        self.settings_write.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned settings write gate");
+            poisoned.into_inner()
+        })
+    }
+
     pub(crate) fn lock_model_manager(&self) -> MutexGuard<'_, ModelManager> {
         self.model_manager.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned model manager lock");
@@ -207,6 +357,13 @@ impl AppState {
         })
     }
 
+    /// Raw history access for restore publication only. A restore worker must clear old-generation
+    /// undo/redo entries before its reservation can leave that worker: if the async IPC future is
+    /// cancelled after SQLite publication, command-local cleanup will never run.
+    pub(crate) fn history_arc_for_restore(&self) -> Arc<Mutex<HistoryManager>> {
+        Arc::clone(&self.history)
+    }
+
     pub(crate) fn lock_session(&self) -> MutexGuard<'_, SessionManager> {
         self.session.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("Recovering poisoned session lock");
@@ -221,16 +378,61 @@ impl AppState {
         })
     }
 
-    /// A clonable handle to the DB, for moving blocking work into `spawn_blocking`. Lock it the same
-    /// poison-tolerant way `lock_db` does: `db.lock().unwrap_or_else(|p| p.into_inner())`.
-    pub(crate) fn db_arc(&self) -> Arc<Mutex<Database>> {
-        Arc::clone(&self.db)
+    /// A clonable, restore-gated DB handle for moving blocking work into `spawn_blocking`.
+    pub(crate) fn db_arc(&self) -> AppDatabaseHandle {
+        AppDatabaseHandle { inner: self.db.clone() }
+    }
+
+    /// Bounded query-only connection authority for read-heavy blocking work.
+    pub(crate) fn db_runtime(&self) -> DatabaseRuntime {
+        self.db.clone()
+    }
+
+    /// Query-domain store for segment/library/review reads. Command handlers retain validation and
+    /// DTO mapping but do not receive a raw connection for this migrated domain.
+    pub(crate) fn segment_queries(&self) -> crate::stores::SegmentQueryStore {
+        crate::stores::SegmentQueryStore::new(self.db.clone())
+    }
+
+    pub(crate) fn review_drafts(&self) -> crate::stores::ReviewDraftStore {
+        crate::stores::ReviewDraftStore::new(self.db.clone())
+    }
+
+    /// Serialized human-review writer for desktop decisions, exact undo and review flags.
+    pub(crate) fn review_writes(&self) -> crate::stores::ReviewWriteStore {
+        crate::stores::ReviewWriteStore::new(self.db.clone())
+    }
+
+    /// Recording-scoped rights, consent withdrawal and provenance query boundary.
+    pub(crate) fn rights_store(&self) -> crate::stores::RightsStore {
+        crate::stores::RightsStore::new(self.db.clone())
+    }
+
+    /// Durable job-center and interrupted-import query/write boundary.
+    pub(crate) fn job_store(&self) -> crate::stores::JobStore {
+        crate::stores::JobStore::new(self.db.clone())
+    }
+
+    /// Segment deletion/history and speaker-rename mutation boundary.
+    pub(crate) fn segment_writes(&self) -> crate::stores::SegmentWriteStore {
+        crate::stores::SegmentWriteStore::new(self.db.clone(), Arc::clone(&self.history))
     }
 
     pub fn session_save(&self) {
         let db = self.lock_db();
         if let Err(error) = self.lock_session().save(&db) {
             tracing::error!("Session save failed: {error}");
+        }
+    }
+
+    /// Best-effort navigation breadcrumb after durable review truth commits. Commands do not need
+    /// raw database authority merely to keep restart position current.
+    pub(crate) fn persist_review_cursor(&self, segment_id: &str) {
+        let db = self.lock_db();
+        let mut session = self.lock_session();
+        session.set_current_segment(segment_id);
+        if let Err(error) = session.save(&db) {
+            tracing::warn!("Review cursor save failed after durable commit: {error}");
         }
     }
 
@@ -287,12 +489,20 @@ impl AppState {
             || self.lock_batch_cancel_token().as_ref().is_some_and(|t| t.is_cancelled())
     }
 
+    pub(crate) fn require_audio_import_ready(&self) -> Result<(), DedupIndexUnavailable> {
+        self.dedup_readiness.require_import_ready()
+    }
+
     pub fn try_start_import(&self) -> Result<(), String> {
+        // Import alone degrades when startup could not prove the durable cross-run identity index.
+        // This check precedes the Running transition, cancellation-token creation, worker spawn,
+        // decoding, and durable import-journal creation for every desktop audio-import command.
+        self.require_audio_import_ready().map_err(|error| error.to_string())?;
         let mut import = self.lock_import_state();
         // P1.3b: refuse to start while a DB restore is reserved. Checked UNDER the import_state lock (and
         // set-Running is under the same lock) so it can't race prepare_restore's writers_active() read.
-        if crate::commands::restore_pending() {
-            return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.into());
+        if crate::database_runtime::restore_pending() {
+            return Err(crate::database_runtime::RESTORE_IN_PROGRESS_MSG.into());
         }
         if *import == ImportState::Running {
             return Err("Import already in progress".into());
@@ -316,8 +526,8 @@ impl AppState {
     pub fn try_start_batch(&self) -> Result<(), String> {
         let mut batch = self.lock_batch_state();
         // P1.3b: refuse to start a batch while a DB restore is reserved (checked under the batch_state lock).
-        if crate::commands::restore_pending() {
-            return Err(crate::commands::RESTORE_IN_PROGRESS_MSG.into());
+        if crate::database_runtime::restore_pending() {
+            return Err(crate::database_runtime::RESTORE_IN_PROGRESS_MSG.into());
         }
         if *batch == BatchState::Running {
             return Err("Batch operation already in progress".into());
@@ -358,16 +568,11 @@ impl AppState {
             // The WSL-7B refinement loop is a background DB WRITER too (update_asr_transcript_if_unreviewed),
             // tracked by its own atomic — restoring a snapshot while it writes tears the DB (round-26 hunt).
             || crate::commands::WSL_REFINE_RUNNING.load(SeqCst)
-            // R3: the OTHER background writers that use dedicated connections (or land a write after a
-            // lock-free cloud window) and so also escape the db-Mutex serialization the restore relies on:
-            //   - Scribe vote batches (add_scribe_votes) — SCRIBE_VOTES_IN_FLIGHT,
-            //   - every dedicated-connection background writer that registers a BgDbWriterGuard: the jury
-            //     pipeline / T2 / DPO / post-import adjudication writers AND the detached background-
-            //     alignment thread (which outlives the import guard) — one BG_DB_WRITERS counter,
-            //   - the Couch phone-review server — a running server can persist a decision on submit.
+            // R3: other background writers can escape the db-Mutex serialization the restore relies
+            // on. Dedicated jury/alignment writers register one shared BgDbWriterGuard counter; the
+            // Couch phone-review server is fenced separately because it can persist on submit.
             // Each was a real "restore mixes late writes into the just-restored library" hole. New
             // dedicated-connection writers register a BgDbWriterGuard rather than growing this chain.
-            || crate::commands::SCRIBE_VOTES_IN_FLIGHT.load(SeqCst)
             || crate::commands::bg_db_writers_active()
             || crate::couch::is_running()
     }
@@ -486,41 +691,32 @@ pub fn run() {
         }
     };
 
+    // A named snapshot restore spans SQLite plus several dataset-coupled files. If a crash or a
+    // post-page-swap error left its durable marker, recover that exact transaction synchronously
+    // under the single-instance lock BEFORE schema initialization, the startup job reaper, snapshots,
+    // Couch resume, or any background writer can observe/mutate a mixed generation. The recovery path
+    // retries the recorded target and falls back to the verified full pre-restore pin; uncertainty is
+    // fatal rather than permission to start normally.
+    match crate::commands::recover_interrupted_named_restore_at_startup(&data_dir) {
+        Ok(true) => tracing::warn!("interrupted database/config restore was recovered before startup"),
+        Ok(false) => {}
+        Err(error) => {
+            fatal_app_error(format!("Recovery-required database restore could not be completed safely: {error}"))
+        }
+    }
+
     let db_path = data_dir.join("cortex-speech.db");
     let db = match Database::open_with_retry(db_path.to_string_lossy().as_ref()) {
         Ok(db) => db,
         Err(e) => fatal_app_error(format!("Failed to open database at {:?}: {e}", db_path)),
     };
-    // PRE-MIGRATION pinned snapshot (true-10 audit 2026-07-09): a semantically-buggy migration (a
-    // wrong UPDATE predicate, a lossy rewrite) commits cleanly — the all-or-nothing transaction only
-    // protects against SQL errors — and the post-migration startup snapshot then rotates every
-    // pre-upgrade copy out within ~90 minutes of first launch, exactly when the user is most
-    // exposed. Before running any pending migration on a NON-empty library, pin a rotation-exempt
-    // copy under snapshots/pinned/. Best-effort: a pin failure warns, never blocks startup.
-    {
-        let current = crate::migrations::get_current_version(&db).unwrap_or(0);
-        let max_known = crate::migrations::max_supported_version();
-        if current > 0 && current < max_known {
-            match crate::snapshot::take_pinned_snapshot(
-                &db,
-                &data_dir,
-                &format!("premigration_v{current}_to_v{max_known}"),
-                3,
-            ) {
-                Ok(path) => tracing::info!("pre-migration snapshot pinned at {}", path.display()),
-                Err(e) => tracing::warn!("pre-migration snapshot failed (continuing): {e}"),
-            }
-        }
-    }
-    if let Err(e) = db.initialize() {
-        fatal_app_error(format!("Failed to initialize database schema: {e}"));
-    }
-
-    // P5.2: mirror the registry's champions to <data_dir>/champion.json at startup so external
-    // consumers (the WSL 7B server) resolve the CURRENT champion — promotion is no longer a no-op
-    // at its final step. Best-effort: a pointer-write failure never blocks startup.
-    if let Err(e) = crate::registry::sync_champion_pointer(&db, &data_dir) {
-        tracing::warn!("champion pointer sync failed: {e}");
+    // Any pending migration on an established profile is allowed only after a rotation-exempt copy
+    // of the exact pre-upgrade DB has been promoted successfully. This is fail-closed because a
+    // semantically wrong migration can commit cleanly; SQL atomicity cannot make that data recoverable.
+    match crate::snapshot::initialize_with_required_pre_migration_pin(&db, &data_dir) {
+        Ok(Some(path)) => tracing::info!("pre-migration snapshot pinned at {}", path.display()),
+        Ok(None) => {}
+        Err(e) => fatal_app_error(format!("Failed to safely initialize database schema: {e}")),
     }
 
     // P0 #3 Job Supervisor: any durable job still `running` at startup is a crash residue (a clean run
@@ -533,10 +729,10 @@ pub fn run() {
     }
 
     // P3.1/M0.4b: rotating auto-snapshots of the DB + config state. One on startup (so a corruption is
-    // recoverable from the moment the app runs), then every 10 minutes — protecting the marathon's
-    // irreplaceable review labor without any user action. Skipped in headless test modes.
+    // recoverable from the moment the app runs), then on a fixed nine-minute monotonic cadence. The
+    // one-minute capture/jitter margin keeps the measured recovery point within the ten-minute target
+    // without cumulative drift. Skipped in headless test modes.
     const SNAPSHOT_KEEP: usize = 10;
-    const SNAPSHOT_INTERVAL_SECS: u64 = 600;
     if !smoke_test {
         match crate::snapshot::take_snapshot(&db, &data_dir, SNAPSHOT_KEEP) {
             Ok(Some(_)) => {}
@@ -545,53 +741,63 @@ pub fn run() {
         }
         let snap_db_path = db_path.clone();
         let snap_data_dir = data_dir.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
-            // catch_unwind (true-10 audit 2026-07-09): a panic in the loop body silently killed the
-            // safety-net thread for the rest of the session — the failure counter only saw Err, not
-            // panics. A panic now counts as a failure (health surfaces it) and the loop survives.
-            let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
-                match Database::open(snap_db_path.to_string_lossy().as_ref()) {
-                    Ok(snap_db) => {
-                        match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
-                        }
-                        // Second-directory backup (Week-2): re-read settings.json each interval so the
-                        // owner can point backups at another drive without a restart. Failure here is
-                        // warn-only — it must never break the primary snapshot safety net above.
-                        let second = AppSettings::load(&snap_data_dir.join("settings.json")).backup_second_dir;
-                        if !second.trim().is_empty() {
-                            // Quarantine files live in the PRIMARY data dir — thread it in so the
-                            // off-drive tree's prune-pin and accumulation cap see the corruption too
-                            // (its own parent never holds *.corrupt.* files).
-                            // take_offsite_snapshot (NOT ..._with_quarantine_source): the off-drive tree
-                            // must not touch the shared health counters, or its success masks a failing
-                            // primary snapshot tree and health_check reads a false green (round-25 hunt).
-                            match crate::snapshot::take_offsite_snapshot(
-                                &snap_db,
-                                std::path::Path::new(second.trim()),
-                                &snap_data_dir,
-                                SNAPSHOT_KEEP,
-                            ) {
+        std::thread::spawn(move || {
+            let interval = Duration::from_secs(SNAPSHOT_INTERVAL_SECS);
+            let mut deadline = Instant::now() + interval;
+            loop {
+                if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+                // catch_unwind (true-10 audit 2026-07-09): a panic in the loop body silently killed the
+                // safety-net thread for the rest of the session — the failure counter only saw Err, not
+                // panics. A panic now counts as a failure (health surfaces it) and the loop survives.
+                let iteration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // A fresh read connection avoids holding the app's DB mutex for the backup's duration.
+                    match Database::open(snap_db_path.to_string_lossy().as_ref()) {
+                        Ok(snap_db) => {
+                            match crate::snapshot::take_snapshot(&snap_db, &snap_data_dir, SNAPSHOT_KEEP) {
                                 Ok(_) => {}
-                                Err(e) => tracing::warn!("second-directory snapshot failed ({second}): {e}"),
+                                Err(e) => tracing::warn!("periodic DB snapshot failed: {e}"),
+                            }
+                            // Second-directory backup (Week-2): re-read settings.json each interval so the
+                            // owner can point backups at another drive without a restart. Failure here is
+                            // warn-only — it must never break the primary snapshot safety net above.
+                            let second = AppSettings::load(&snap_data_dir.join("settings.json")).backup_second_dir;
+                            if !second.trim().is_empty() {
+                                // Quarantine files live in the PRIMARY data dir — thread it in so the
+                                // off-drive tree's prune-pin and accumulation cap see the corruption too
+                                // (its own parent never holds *.corrupt.* files).
+                                // take_offsite_snapshot (NOT ..._with_quarantine_source): the off-drive tree
+                                // must not touch the shared health counters, or its success masks a failing
+                                // primary snapshot tree and health_check reads a false green (round-25 hunt).
+                                match crate::snapshot::take_offsite_snapshot(
+                                    &snap_db,
+                                    std::path::Path::new(second.trim()),
+                                    &snap_data_dir,
+                                    SNAPSHOT_KEEP,
+                                ) {
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!("second-directory snapshot failed ({second}): {e}"),
+                                }
                             }
                         }
+                        Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
                     }
-                    Err(e) => tracing::warn!("periodic snapshot: could not open db: {e}"),
+                }));
+                if iteration.is_err() {
+                    crate::snapshot::record_snapshot_panic();
+                    tracing::error!("periodic snapshot iteration PANICKED — counted as a failure; loop continues");
                 }
-            }));
-            if iteration.is_err() {
-                crate::snapshot::record_snapshot_panic();
-                tracing::error!("periodic snapshot iteration PANICKED — counted as a failure; loop continues");
+                deadline = next_snapshot_deadline(deadline, interval, Instant::now());
             }
         });
     }
 
     let settings_path = data_dir.join("settings.json");
-    let mut settings = AppSettings::load(&settings_path);
+    // Clamp stale/on-disk alternatives before any warm-up or pipeline construction. The debug-only
+    // integration override below remains the one explicit desktop diagnostic escape hatch.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let mut settings = AppSettings::load_production(&settings_path);
     // Test-only override: a release process must never be able to downgrade the champion through an
     // inherited environment variable. Integration binaries are debug builds and still get their
     // explicitly requested local fixture engine.
@@ -608,39 +814,20 @@ pub fn run() {
     // started empty every launch and cross-session duplicate detection did not exist (external review
     // 2026-08-06 #4).
     //
-    // Best-effort by design: a failed read must not block startup. It costs this session cross-run
-    // dedup — exactly the behaviour that shipped before v50 — and says so loudly rather than degrading
-    // silently. Rows predating v50 have a NULL fingerprint and are simply absent until backfilled.
-    //
-    // v51: a row that has a spectral bucket but no content hash (imported between v50 and v51) IS
-    // loaded, but can never reject an import, because a value that cannot distinguish content must not
-    // discard a legitimate recording. The count is reported separately so the gap is visible in the log
-    // rather than implied by silence.
-    match db.load_audio_identities() {
-        Ok(known) => {
-            let unhashed = known.iter().filter(|k| k.content.is_none()).count();
-            let n = fingerprint.rehydrate(known);
-            tracing::info!("Audio dedup: rehydrated {n} recording identity/identities from the library");
-            if unhashed > 0 {
-                tracing::warn!(
-                    "Audio dedup: {unhashed} recording(s) predate v51 and have no content hash — they \
-                     cannot prove a duplicate and will never reject an import. Run \
-                     `backfill_fingerprints --apply` to close the gap."
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Audio dedup: could not rehydrate identities ({e}) — within-run dedup only");
-        }
-    }
+    // Import is a degradable capability, not a startup prerequisite. A read fault or legacy unhashed
+    // recording keeps review/library/export available but makes every audio import fail closed with a
+    // stable code before it can decode, journal, or publish anything.
+    let dedup_readiness = rehydrate_dedup_index(&db, &fingerprint);
 
-    let pipeline = ProcessingPipeline::new(
+    let database_runtime = DatabaseRuntime::new(db);
+    let pipeline = ProcessingPipeline::new_with_runtime(
         db_path.to_string_lossy().to_string(),
         Arc::clone(&normalizer),
         Arc::clone(&cache),
         Arc::clone(&fingerprint),
         Arc::new(settings.clone()),
         Arc::new(ModelManager::new(data_dir.join("models"))),
+        database_runtime.clone(),
     );
 
     let history = HistoryManager::new(500);
@@ -671,24 +858,43 @@ pub fn run() {
         tracing::info!("Session restored: {} segments, {} verified", state.segment_count, state.verified_count);
     }
 
+    let media_registry = Arc::new(Mutex::new(MediaRegistry::default()));
+    let protocol_media_registry = Arc::clone(&media_registry);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .register_asynchronous_uri_scheme_protocol(
+            crate::media::MEDIA_PROTOCOL_SCHEME,
+            move |_context, request, responder| {
+                let Some(permit) = crate::media::try_acquire_media_protocol_worker() else {
+                    responder.respond(crate::media::media_protocol_busy_response());
+                    return;
+                };
+                let registry = Arc::clone(&protocol_media_registry);
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _permit = permit;
+                    responder.respond(crate::media::serve_media_protocol_request(&registry, request));
+                });
+            },
+        )
         .manage(AppState {
-            db: Arc::new(Mutex::new(db)),
+            db: database_runtime,
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,
             fingerprint,
-            history: Mutex::new(history),
+            dedup_readiness,
+            history: Arc::new(Mutex::new(history)),
             session: Mutex::new(session),
             settings: Mutex::new(settings),
+            settings_write: Mutex::new(()),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
             import_cancel_token: Mutex::new(None),
             batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
             batch_state: Mutex::new(BatchState::Idle),
-            media_registry: Mutex::new(MediaRegistry::default()),
+            media_registry,
+            media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_health,
@@ -701,9 +907,6 @@ pub fn run() {
             commands::discard_interrupted_import,
             commands::import_audio_file,
             commands::transcribe_segment,
-            commands::transcribe_segment_constrained,
-            commands::transcribe_segment_finetuned,
-            commands::verify_finetuned_model_integrity,
             commands::batch_transcribe,
             commands::normalize_text,
             commands::align_segment,
@@ -713,10 +916,9 @@ pub fn run() {
             commands::get_segment_ids_for_view,
             commands::get_signal_anomaly_segments,
             commands::update_segment,
-            commands::update_segment_fields,
-            commands::restore_segment_snapshot,
-            commands::delete_segment,
-            commands::delete_segments_batch,
+            commands::update_segment_metadata_v1,
+            commands::delete_segments_v1,
+            commands::rename_speaker_v1,
             commands::merge_dataset_json,
             commands::export_dataset,
             commands::export_transcript,
@@ -729,6 +931,8 @@ pub fn run() {
             commands::list_agent_stage_events,
             commands::list_model_versions,
             commands::import_model_checkpoint,
+            commands::import_model_deployment,
+            commands::bootstrap_legacy_champion,
             commands::create_gold_from_file,
             commands::import_verified_segments_as_gold,
             commands::export_gold_eval_set,
@@ -742,17 +946,15 @@ pub fn run() {
             commands::spot_check_report,
             commands::reviewer_throughput,
             commands::export_agreement_sample,
-            commands::transcribe_audio_with_scribe,
-            commands::add_scribe_votes,
             commands::register_media_asset,
+            commands::register_review_media_asset,
             commands::get_media_asset_url,
             commands::check_agentic_readiness,
             commands::rediarize_segments,
-            commands::rename_speaker,
             commands::get_audio_duration,
             commands::get_waveform,
             commands::get_dataset_stats,
-            commands::get_speakers,
+            commands::get_speaker_inventory_v1,
             commands::get_dataset_quality,
             commands::get_training_grade_breakdown,
             commands::set_recording_rights,
@@ -760,16 +962,18 @@ pub fn run() {
             commands::list_recording_rights,
             commands::get_settings,
             commands::update_settings,
+            commands::get_settings_v1,
+            commands::patch_settings_v1,
+            commands::set_cloud_consent_v1,
             commands::get_fingerprint_count,
             commands::undo,
             commands::redo,
-            commands::can_undo,
-            commands::can_redo,
+            commands::get_history_status_v1,
             commands::compute_diff,
             commands::validate_dataset_cmd,
             commands::export_audio,
             commands::batch_verify,
-            commands::batch_assign_speaker,
+            commands::assign_speakers_v1,
             commands::batch_normalize,
             commands::get_tracing_stats,
             commands::get_recent_spans,
@@ -789,7 +993,6 @@ pub fn run() {
             commands::get_audio_health,
             commands::relink_audio,
             commands::models_status,
-            commands::models_download,
             commands::models_download_all,
             commands::cancel_operation,
             commands::get_inference_stats,
@@ -802,7 +1005,6 @@ pub fn run() {
             // Phase 1 — Gold-Set Eval Harness
             commands::import_gold_segments,
             commands::run_gold_eval,
-            commands::run_gold_eval_local,
             commands::run_gold_eval_asr,
             commands::build_scorecard,
             commands::list_eval_runs,
@@ -811,10 +1013,21 @@ pub fn run() {
             // Phase 2 — T0 Gate + Jury
             commands::run_t0_gate,
             commands::get_escalation_queue,
+            commands::get_active_voice_focus_v1,
+            commands::get_review_page_v1,
             commands::record_human_decision,
-            commands::clear_human_decision,
-            commands::clear_escalation,
-            commands::write_segment_verdict,
+            commands::commit_review_v1,
+            commands::mark_segment_unusable_v1,
+            commands::get_review_draft_v1,
+            commands::save_review_draft_v1,
+            commands::delete_review_draft_v1,
+            commands::undo_human_decision,
+            commands::record_review_flag,
+            commands::undo_review_flag,
+            commands::begin_desktop_playback_session_v1,
+            commands::cancel_desktop_playback_session_v1,
+            commands::finalize_desktop_playback_session_v1,
+            commands::record_playback_receipt,
             commands::get_few_shot_examples,
             commands::get_escalation_rate_trend,
             commands::run_dpo_update,
@@ -824,25 +1037,90 @@ pub fn run() {
         ])
         .setup(|app| {
             use tauri::Manager;
-            // Authorize the asset protocol to read the media-cache directory the registry actually
-            // writes into. The static `$APPDATA/media-cache/**` scope in tauri.conf.json resolves
-            // (Tauri v2) to the bundle-identifier-qualified app-data dir
-            // (%APPDATA%\com.cortex.kurdish-speech\media-cache), which is NOT where get_app_data_dir()
-            // writes (%APPDATA%\cortex-speech\media-cache). Without this runtime grant every
-            // convertFileSrc(asset://) playback URL is refused (403) and no imported clip can be
-            // played in the review UI — the core listen-and-approve step. Grant the REAL directory,
-            // derived from the same data_dir source of truth via media::media_cache_dir, so playback
-            // works regardless of how the static scope token would resolve.
+            // The renderer receives no filesystem scope. Startup owns private-cache maintenance;
+            // playable bytes leave only through the live UUID-bound `cortex-media` protocol.
             if let Some(data_dir) = app.state::<AppState>().lock_data_dir().clone() {
                 let media_cache = crate::media::media_cache_dir(&data_dir);
                 if let Err(e) = std::fs::create_dir_all(&media_cache) {
                     tracing::warn!("Could not create media cache dir {}: {e}", media_cache.display());
+                } else {
+                    // No media command can run before setup completes. This is the only safe point
+                    // for directory-wide orphan cleanup; runtime builders prune only exact grants so
+                    // one parallel materialization can never delete another's unpublished file.
+                    crate::media::prune_media_cache_on_startup(&media_cache);
                 }
-                match app.asset_protocol_scope().allow_directory(&media_cache, true) {
-                    Ok(()) => {
-                        tracing::info!("Asset protocol scope authorized for media cache: {}", media_cache.display())
+            }
+
+            // Promotion recovery MUST precede ordinary pointer publication and supervision. The job's
+            // durable saga payload is the only source that can say whether a crash left the candidate
+            // or incumbent authoritative. Publishing the current DB row first could overwrite that
+            // evidence boundary and start a half-promoted model. Recovery uses independent DB
+            // connections and never holds AppState's mutex across restart/warm-up/canary work.
+            {
+                let state = app.state::<AppState>();
+                let data_dir = state.lock_data_dir().clone();
+                let db_path = state.lock_db().path().to_string();
+                let running = {
+                    let db = state.lock_db();
+                    crate::champion_promotion::running_promotions(&db)
+                };
+                match (data_dir, running) {
+                    (Some(dir), Ok(jobs)) if jobs.is_empty() => {
+                        let db = state.lock_db();
+                        match crate::registry::sync_champion_pointer(&db, &dir) {
+                            Ok(_) => crate::engine_runtime::set_promotion_recovery_blocked(false),
+                            Err(error) => {
+                                crate::engine_runtime::set_promotion_recovery_blocked(true);
+                                tracing::error!("champion pointer publication failed at startup: {error}");
+                            }
+                        }
                     }
-                    Err(e) => tracing::warn!("Failed to authorize media cache dir in asset scope: {e}"),
+                    (Some(dir), Ok(_)) => {
+                        // A 30-GB worker can need minutes to restart. Keep setup responsive, but fence
+                        // every engine start until the background recovery and final pointer sync pass.
+                        crate::engine_runtime::set_promotion_recovery_blocked(true);
+                        let recovery_app = app.handle().clone();
+                        match crate::database_runtime::begin_mutation() {
+                            Ok(mutation) => {
+                                std::thread::spawn(move || {
+                                    let _mutation = mutation;
+                                    match crate::champion_promotion_runtime::recover_running_promotions(
+                                        &recovery_app,
+                                        db_path.clone(),
+                                        dir.clone(),
+                                    ) {
+                                        Ok(recovered) => match Database::open(&db_path)
+                                            .and_then(|db| crate::registry::sync_champion_pointer(&db, &dir))
+                                        {
+                                            Ok(_) => {
+                                                tracing::info!(
+                                                    "recovered {recovered} interrupted champion promotion"
+                                                );
+                                                crate::engine_runtime::set_promotion_recovery_blocked(false);
+                                            }
+                                            Err(error) => tracing::error!(
+                                                "champion pointer publication failed after recovery; engine remains blocked: {error}"
+                                            ),
+                                        },
+                                        Err(error) => tracing::error!(
+                                            "champion promotion recovery is unverified; engine remains blocked: {error}"
+                                        ),
+                                    }
+                                });
+                            }
+                            Err(error) => tracing::error!(
+                                "champion promotion recovery could not acquire the mutation fence; engine remains blocked: {error}"
+                            ),
+                        }
+                    }
+                    (None, _) => {
+                        crate::engine_runtime::set_promotion_recovery_blocked(true);
+                        tracing::error!("champion promotion recovery cannot run: application data directory is missing");
+                    }
+                    (_, Err(error)) => {
+                        crate::engine_runtime::set_promotion_recovery_blocked(true);
+                        tracing::error!("champion promotion inventory failed; engine remains blocked: {error}");
+                    }
                 }
             }
 
@@ -981,9 +1259,8 @@ fn is_headless_mode() -> bool {
         || matches!(std::env::var("CORTEX_AUDIOBOOK_PIPELINE").ok().as_deref(), Some("1"))
 }
 
-/// The explicit `CORTEX_APP_DATA_DIR` override, if set. Shared with the `bin/*` CLI tools
-/// (batch_importer/batch_processor/download_model/test_file) so the app and its batch utilities ALWAYS
-/// resolve to the SAME data dir — they share the live DB and the single-instance lock. Pure for testing.
+/// The explicit `CORTEX_APP_DATA_DIR` override, if set. Shared with supported `bin/*` CLI tools so
+/// the app and its batch utilities resolve to the same data dir and single-instance lock. Pure for testing.
 fn data_dir_override(env_val: Option<std::ffi::OsString>) -> Option<PathBuf> {
     env_val.map(PathBuf::from) // matches the bin/*.rs override exactly (no empty-string filtering)
 }
@@ -1023,6 +1300,28 @@ fn dirs_fallback(suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_snapshot_deadlines_do_not_accumulate_capture_time_or_missed_ticks() {
+        let interval = Duration::from_secs(SNAPSHOT_INTERVAL_SECS);
+        let first = Instant::now() + interval;
+
+        let after_fast_capture = first + Duration::from_secs(7);
+        assert_eq!(
+            next_snapshot_deadline(first, interval, after_fast_capture),
+            first + interval,
+            "a completed capture must advance from the scheduled deadline, not its completion time"
+        );
+
+        let after_two_missed_ticks = first + interval * 2 + Duration::from_secs(7);
+        assert_eq!(
+            next_snapshot_deadline(first, interval, after_two_missed_ticks),
+            first + interval * 3,
+            "a suspended or overrun process must skip expired ticks without introducing cadence drift"
+        );
+        assert_eq!(SNAPSHOT_INTERVAL_SECS, 9 * 60);
+        assert_eq!(SNAPSHOT_TARGET_RPO_SECS, 10 * 60);
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1084,22 +1383,104 @@ mod tests {
         );
 
         AppState {
-            db: Arc::new(Mutex::new(Database::open(":memory:").unwrap())),
+            db: DatabaseRuntime::new(Database::open(":memory:").unwrap()),
             pipeline: Mutex::new(pipeline),
             normalizer,
             cache,
             fingerprint,
-            history: Mutex::new(HistoryManager::new(10)),
+            dedup_readiness: DedupReadiness::Ready { rehydrated_recordings: 0 },
+            history: Arc::new(Mutex::new(HistoryManager::new(10))),
             session: Mutex::new(SessionManager::new(data_dir.join("session"))),
             settings: Mutex::new(settings),
+            settings_write: Mutex::new(()),
             data_dir: Mutex::new(Some(data_dir)),
             model_manager: Mutex::new(model_manager),
             import_cancel_token: Mutex::new(None),
             batch_cancel_token: Mutex::new(None),
             import_state: Mutex::new(ImportState::Idle),
             batch_state: Mutex::new(BatchState::Idle),
-            media_registry: Mutex::new(MediaRegistry::default()),
+            media_registry: Arc::new(Mutex::new(MediaRegistry::default())),
+            media_materializer: Arc::new(crate::media::MediaMaterializationCoordinator::default()),
         }
+    }
+
+    #[test]
+    fn dedup_identity_read_failure_degrades_import_only_with_the_stable_code() {
+        // An open connection without schema is a deterministic identity-query failure. Startup must
+        // retain that as typed readiness state instead of silently treating the library as empty.
+        let db = Database::open(":memory:").unwrap();
+        let fingerprint = AudioFingerprint::new();
+        let readiness = rehydrate_dedup_index(&db, &fingerprint);
+        assert_eq!(readiness, DedupReadiness::Unavailable(DedupUnavailableReason::IdentityReadFailed));
+        assert_eq!(fingerprint.count(), 0, "a failed inventory read must leave no partially trusted cache");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_app_state(dir.path().to_path_buf());
+        state.dedup_readiness = readiness;
+        assert_eq!(
+            state.try_start_import(),
+            Err(DEDUP_INDEX_UNAVAILABLE_MESSAGE.to_string()),
+            "all desktop import entry points share this pre-worker gate"
+        );
+        assert_eq!(DedupIndexUnavailable.code(), DEDUP_INDEX_UNAVAILABLE_CODE);
+        assert_eq!(*state.lock_import_state(), ImportState::Idle, "a refusal must not claim the import gate");
+        assert!(state.lock_import_cancel_token().is_none(), "a refusal must not arm a worker cancellation token");
+
+        // The degraded state is deliberately capability-scoped: the application remains usable for
+        // existing-library work. Batch state is an independent gate and is representative of the app
+        // not entering a global fatal/maintenance mode merely because new audio cannot be admitted.
+        state.try_start_batch().expect("non-import capability remains available");
+        state.finish_batch();
+    }
+
+    #[test]
+    fn active_incomplete_recording_identity_blocks_before_any_rehydration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dedup-readiness.db");
+        let db = Database::open(db_path.to_string_lossy().as_ref()).unwrap();
+        crate::snapshot::initialize_with_required_pre_migration_pin(&db, dir.path()).unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "legacy-unhashed".into(),
+            audio_path: "C:/audio/legacy.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "degenerate-identity".into(),
+            audio_path: "C:/audio/degenerate.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.set_audio_identity(
+            "C:/audio/degenerate.wav",
+            &crate::fingerprint::AudioIdentity { spectral: 0, content: "a".repeat(64) },
+        )
+        .unwrap();
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: "malformed-hash".into(),
+            audio_path: "C:/audio/malformed.wav".into(),
+            raw_transcript: "دەنگ".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.set_audio_identity(
+            "C:/audio/malformed.wav",
+            &crate::fingerprint::AudioIdentity { spectral: 42, content: "not-a-canonical-hash".into() },
+        )
+        .unwrap();
+
+        let fingerprint = AudioFingerprint::new();
+        assert_eq!(
+            rehydrate_dedup_index(&db, &fingerprint),
+            DedupReadiness::Unavailable(DedupUnavailableReason::IncompleteAudioIdentities { recordings: 3 })
+        );
+        assert_eq!(
+            fingerprint.count(),
+            0,
+            "complete neighbors must not create a falsely authoritative partial index while one recording is unhashed"
+        );
     }
 
     #[test]
@@ -1108,22 +1489,6 @@ mod tests {
         // and the batch importer onto different databases (they share the live DB + single-instance lock).
         assert_eq!(data_dir_override(Some("D:/cortex-data".into())), Some(PathBuf::from("D:/cortex-data")));
         assert_eq!(data_dir_override(None), None, "unset -> fall through to headless/platform resolution");
-    }
-
-    #[test]
-    fn scribe_commands_require_cloud_stt_consent() {
-        // Regression: the Scribe IPC commands (transcribe_audio_with_scribe, add_scribe_votes) upload
-        // raw audio (biometric) to ElevenLabs. They MUST refuse without explicit cloud-STT opt-in —
-        // this guards the shared gate both call before any key load or network request.
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = test_app_state(dir.path().to_path_buf());
-        // Default settings: cloud_stt_opt_in = false → consent gate refuses.
-        let denied = commands::require_cloud_stt_consent(&state);
-        assert!(denied.is_err(), "biometric audio egress must be refused without opt-in");
-        assert!(denied.unwrap_err().contains("opt-in"), "error should name the missing consent");
-        // After explicit opt-in, the gate allows it.
-        state.settings.lock().unwrap().cloud_stt_opt_in = true;
-        assert!(commands::require_cloud_stt_consent(&state).is_ok(), "opt-in permits Scribe egress");
     }
 
     #[test]

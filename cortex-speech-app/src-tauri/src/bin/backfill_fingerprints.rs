@@ -35,6 +35,16 @@ fn main() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("cortex-speech"));
 
+    // The apply pass decodes after its initial database read, then writes through the same external
+    // connection. Keep the complete pass on one generation by excluding the desktop process.
+    let _instance_lock = if apply {
+        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(&data_dir).map_err(|error| {
+            format!("Cannot apply fingerprint backfill while Cortex is running: {error}. Stop review and close the app first.")
+        })?)
+    } else {
+        None
+    };
+
     let db_path = data_dir.join("cortex-speech.db");
     println!("db    : {}", db_path.display());
     println!("mode  : {}\n", if apply { "APPLY (writes identities only)" } else { "DRY RUN (writes nothing)" });

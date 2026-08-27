@@ -3,7 +3,9 @@
  * latency_probe.cjs — p50/p95 wall-clock for the operations a reviewer actually waits on.
  *
  * Deep audit P2 #10 asks for published reliability/performance evidence: "p50/p95 import, first
- * transcript, search, review-save, and export on long files". The repo already measures RTF
+ * transcript, search, metadata-save, and export on long files". Durable review-decision latency is
+ * a separate evidence leg because it requires real playback authority; this probe must not relabel a
+ * metadata edit as a human decision. The repo already measures RTF
  * (`rtf-bench`), twelve microbenchmarks (`bench-budget`) and durability under hard kill
  * (`durability-drill`) — none of which is the number a human experiences. This measures that number,
  * end to end, through the REAL IPC on the REAL exe.
@@ -25,7 +27,8 @@
  *
  * Env: CORTEX_APP_EXE, CORTEX_DEBUG_PORT (default 9355), CORTEX_LATENCY_SAMPLES (default 12),
  *      CORTEX_AUDIO (the clip to import; default the committed CC-BY fixture),
- *      CORTEX_LATENCY_PACE_MS (default 250; see "PACE BETWEEN SAMPLES" below).
+ *      CORTEX_LATENCY_PACE_MS (default 250; see "PACE BETWEEN SAMPLES" below),
+ *      CORTEX_ASR_ENGINE (optional explicit diagnostic override; default WSL7B).
  */
 const { spawn, execSync } = require('child_process');
 const { chromium } = require('@playwright/test');
@@ -36,8 +39,11 @@ const { cleanupProfile, provisionEngine } = require('../e2e_profile.cjs');
 
 const REPO = __dirname.replace(/[\\/]scripts$/, '');
 const APP_EXE =
-  process.env.CORTEX_APP_EXE || path.join(REPO, 'src-tauri', 'target', 'release', 'cortex-speech-app.exe');
-const AUDIO = process.env.CORTEX_AUDIO || path.join(REPO, 'src-tauri', 'tests', 'fixtures', 'fleurs_ckb_sample.wav');
+  process.env.CORTEX_APP_EXE ||
+  path.join(REPO, 'src-tauri', 'target', 'release', 'cortex-speech-app.exe');
+const AUDIO =
+  process.env.CORTEX_AUDIO ||
+  path.join(REPO, 'src-tauri', 'tests', 'fixtures', 'fleurs_ckb_sample.wav');
 const DEBUG_PORT = process.env.CORTEX_DEBUG_PORT || '9355';
 const SAMPLES = Number(process.env.CORTEX_LATENCY_SAMPLES || 12);
 const PACE_MS = Number(process.env.CORTEX_LATENCY_PACE_MS || 250);
@@ -58,7 +64,11 @@ if (!fs.existsSync(APP_EXE)) die(`app exe not found: ${APP_EXE}`);
 if (!fs.existsSync(AUDIO)) die(`audio fixture not found: ${AUDIO}`);
 
 const PROD = process.env.APPDATA ? path.join(process.env.APPDATA, 'cortex-speech') : null;
-const norm = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+const norm = (p) =>
+  path
+    .resolve(p)
+    .replace(/[\\/]+$/, '')
+    .toLowerCase();
 const OWNS_DATA_DIR = !process.env.CORTEX_APP_DATA_DIR;
 let DATA_DIR = process.env.CORTEX_APP_DATA_DIR;
 if (DATA_DIR) {
@@ -91,8 +101,15 @@ function stats(samples) {
 }
 
 async function run() {
-  console.log(`==> Latency probe. profile=${DATA_DIR}  samples=${SAMPLES}  audio=${path.basename(AUDIO)}`);
-  if (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json`).then((r) => r.ok, () => false)) {
+  console.log(
+    `==> Latency probe. profile=${DATA_DIR}  samples=${SAMPLES}  audio=${path.basename(AUDIO)}`,
+  );
+  if (
+    await fetch(`http://127.0.0.1:${DEBUG_PORT}/json`).then(
+      (r) => r.ok,
+      () => false,
+    )
+  ) {
     die(`debug port ${DEBUG_PORT} already answering — set CORTEX_DEBUG_PORT.`);
   }
 
@@ -127,7 +144,9 @@ async function run() {
 
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`);
   const ctx = browser.contexts()[0];
-  const page = ctx.pages().find((p) => p.url().includes('localhost') || p.url().includes('1420')) || ctx.pages()[0];
+  const page =
+    ctx.pages().find((p) => p.url().includes('localhost') || p.url().includes('1420')) ||
+    ctx.pages()[0];
   await page.waitForSelector('[data-testid="app-root"]', { timeout: 60000 });
 
   // PROVISION THE ENGINE FIRST, exactly as e2e_real_app.cjs does. A fresh disposable profile has no
@@ -137,7 +156,9 @@ async function run() {
   // the profile it kept for diagnosis showed the truth: zero segments, and jobs rows for exports only.
   // That looked exactly like "import silently does nothing", which would have been a serious and
   // WRONG bug report.
-  await provisionEngine(page, process.env.CORTEX_ASR_ENGINE || 'CTC300M');
+  const engine =
+    process.env.CORTEX_GATE === '1' ? 'WSL7B' : process.env.CORTEX_ASR_ENGINE || 'WSL7B';
+  await provisionEngine(page, DATA_DIR, engine);
 
   const measured = await page.evaluate(
     async ({ audio, samples, out, pace }) => {
@@ -170,7 +191,11 @@ async function run() {
       let seg = null;
       for (let i = 0; i < 360 && !seg; i++) {
         const p = await invoke('get_segments_page', {
-          verified: null, query: null, sort: 'newest', limit: 50, cursor: null,
+          verified: null,
+          query: null,
+          sort: 'newest',
+          limit: 50,
+          cursor: null,
         }).catch(() => null);
         seg = (p && p.items && p.items[0]) || null;
         if (!seg) await new Promise((r) => setTimeout(r, 2000));
@@ -189,7 +214,11 @@ async function run() {
       let stable = 0;
       for (let i = 0; i < 900 && !settled; i++) {
         const p = await invoke('get_segments_page', {
-          verified: null, query: null, sort: 'newest', limit: 1, cursor: null,
+          verified: null,
+          query: null,
+          sort: 'newest',
+          limit: 1,
+          cursor: null,
         }).catch(() => null);
         const n = p ? p.total : -1;
         stable = n >= 0 && n === lastCount ? stable + 1 : 0;
@@ -199,34 +228,64 @@ async function run() {
         else await new Promise((r) => setTimeout(r, 2000));
       }
 
+      let probeSpeaker = seg ? (seg.speakerId ?? null) : null;
+
       for (let i = 0; i < samples; i++) {
         record(
           'library_page',
           await time(() =>
-            invoke('get_segments_page', { verified: null, query: null, sort: 'newest', limit: 300, cursor: null }),
+            invoke('get_segments_page', {
+              verified: null,
+              query: null,
+              sort: 'newest',
+              limit: 300,
+              cursor: null,
+            }),
           ),
         );
         record(
           'search',
           await time(() =>
             invoke('get_segments_page', {
-              verified: null, query: 'ه', sort: 'newest', limit: 300, cursor: null,
+              verified: null,
+              query: 'ه',
+              sort: 'newest',
+              limit: 300,
+              cursor: null,
             }),
           ),
         );
         if (seg) {
-          // REVIEW-SAVE: the targeted field update the editor actually uses on every keystroke pause.
+          // METADATA-SAVE: explicit per-field CAS, not a human review decision. Alternating values
+          // proves both real writes and server-ACK rebasing rather than timing an idempotent no-op.
+          const desiredSpeaker = `LATENCY_PROBE_${i % 2}`;
           record(
-            'review_save',
+            'metadata_save',
+            await time(async () => {
+              const updated = await invoke('update_segment_metadata_v1', {
+                request: {
+                  segmentId: seg.id,
+                  changes: [{ field: 'speakerId', expected: probeSpeaker, value: desiredSpeaker }],
+                },
+              });
+              probeSpeaker = updated.speakerId;
+            }),
+          );
+          record(
+            'waveform',
             await time(() =>
-              invoke('update_segment_fields', { segmentId: seg.id, fields: { annotatedTranscript: `probe ${i}` } }),
+              invoke('get_waveform', { path: audio, numPoints: 2000, alignmentJson: null }),
             ),
           );
-          record('waveform', await time(() => invoke('get_waveform', { path: audio, numPoints: 2000, alignmentJson: null })));
         }
-        record('export_jsonl', await time(() => invoke('export_dataset', { path: `${out}.${i}.jsonl`, format: 'jsonl' })));
+        record(
+          'export_jsonl',
+          await time(() =>
+            invoke('export_dataset', { path: `${out}.${i}.jsonl`, format: 'jsonl' }),
+          ),
+        );
 
-        // PACE BETWEEN SAMPLES. `update_segment_fields` and `export_dataset` sit behind the app's STRICT
+        // PACE BETWEEN SAMPLES. `update_segment_metadata_v1` and `export_dataset` sit behind the app's STRICT
         // token bucket (burst 5, refill 10/s — throttle.rs). Firing samples back to back with zero think
         // time drains that bucket and the 6th call returns "Rate limit exceeded". That is the limiter
         // working, NOT a defect: the editor autosaves on a 1s debounce, so a reviewer tops out near one
@@ -245,12 +304,15 @@ async function run() {
   killApp();
 
   const { results, errors, hadSegment, librarySize, settled } = measured;
-  if (!hadSegment) throw new Error('import produced no segment — every per-segment op would be unmeasured');
+  if (!hadSegment)
+    throw new Error('import produced no segment — every per-segment op would be unmeasured');
   const fatal = Object.entries(errors);
   if (fatal.length) {
     // An operation that ERRORED was still fast, and reporting its speed would be a lie about a
     // feature that did not work. Fail loudly rather than publish a flattering number.
-    throw new Error(`operations failed during measurement: ${fatal.map(([k, v]) => `${k}: ${v}`).join(' | ')}`);
+    throw new Error(
+      `operations failed during measurement: ${fatal.map(([k, v]) => `${k}: ${v}`).join(' | ')}`,
+    );
   }
 
   if (!settled) {
@@ -270,11 +332,15 @@ async function run() {
     (samples.length >= MIN_PCTL_N ? dist : single).push([name, stats(samples)]);
   }
 
-  console.log(`\n  library: ${librarySize} segments   audio: ${path.basename(AUDIO)}   pacing: ${PACE_MS}ms`);
+  console.log(
+    `\n  library: ${librarySize} segments   audio: ${path.basename(AUDIO)}   pacing: ${PACE_MS}ms`,
+  );
   console.log('\n  operation             n     p50        p95        min        max');
   console.log('  ' + '-'.repeat(64));
   for (const [name, s] of dist) {
-    console.log(`  ${name.padEnd(20)}${String(s.n).padStart(2)}  ${f(s.p50)}  ${f(s.p95)}  ${f(s.min)}  ${f(s.max)}`);
+    console.log(
+      `  ${name.padEnd(20)}${String(s.n).padStart(2)}  ${f(s.p50)}  ${f(s.p95)}  ${f(s.min)}  ${f(s.max)}`,
+    );
   }
   if (single.length) {
     console.log('\n  single observations — one import per run, so NO percentile is defined:');

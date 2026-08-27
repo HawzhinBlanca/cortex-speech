@@ -34,6 +34,7 @@ SRC = REPO_ROOT / "src-tauri" / "src"
 BY_DESIGN = {
     "export.rs": "an export is defined over the whole corpus — skipping rows would be wrong, not slow",
     "export_bundle.rs": "same: the bundle must describe every row its data files contain",
+    "transcript_export.rs": "TXT/SRT/VTT export must apply the same whole-corpus rights filter before sorting source timelines",
     "eval.rs": "the fine-tune pack ships every training-ready row by definition",
     "quality.rs": "corpus-wide quality metrics (duplicate groups, duration outliers) need every row",
     "jury/mod.rs": "adjudication reconciles the whole verified set",

@@ -61,6 +61,16 @@ pub fn validate_dataset(db: &Database) -> AppResult<ValidationReport> {
 
 pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> AppResult<ValidationReport> {
     let segments = db.get_segments(None)?;
+    validate_segments_with_settings(&segments, settings)
+}
+
+/// Validate an immutable library snapshot. Production bundle export uses this entry point so the
+/// validation report and every shipped row describe one database moment even if another process
+/// inserts or edits rows while the files are being generated.
+pub(crate) fn validate_segments_with_settings(
+    segments: &[crate::db::SpeechSegment],
+    settings: &AppSettings,
+) -> AppResult<ValidationReport> {
     let mut issues = Vec::new();
 
     // 1. Check audio file existence
@@ -84,7 +94,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
     // curator then hand-annotated (or the jury committed a verdict for) is valid and training-ready.
     // Flagging it spuriously raised an EmptyTranscript warning that blocks a production bundle export
     // under the default warning_threshold=0.
-    for seg in &segments {
+    for seg in segments {
         let has_content = !seg.raw_transcript.trim().is_empty()
             || seg.annotated_transcript.as_deref().is_some_and(|a| !a.trim().is_empty())
             || seg.verdict_transcript.as_deref().is_some_and(|v| !v.trim().is_empty());
@@ -101,7 +111,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
     }
 
     // 3. Check duration consistency (audio file vs stored)
-    for seg in &segments {
+    for seg in segments {
         if seg.duration_ms <= 0 {
             issues.push(ValidationIssue {
                 severity: IssueSeverity::Warning,
@@ -132,7 +142,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
     }
 
     // 5. Check annotation completeness
-    for seg in &segments {
+    for seg in segments {
         if let Some(ref ann) = seg.annotated_transcript {
             if ann.trim().is_empty() {
                 issues.push(ValidationIssue {
@@ -148,7 +158,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
     }
 
     // 6. WER/CER quality gates for annotated segments
-    for seg in &segments {
+    for seg in segments {
         if let Some(ref reference) = seg.annotated_transcript {
             if reference.trim().is_empty() {
                 continue;
@@ -201,7 +211,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
     }
 
     // 7. Check audio quality metrics (clipping and low RMS)
-    for seg in &segments {
+    for seg in segments {
         if let Some(clipping) = seg.clipping_ratio {
             if clipping > 0.01 {
                 issues.push(ValidationIssue {
@@ -229,7 +239,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
     }
 
     // 8. Flag segments with imprecise (energy-heuristic) alignment timestamps
-    for seg in &segments {
+    for seg in segments {
         if seg.alignment_json.is_some() && seg.alignment_quality.as_deref() == Some("energy_heuristic") {
             issues.push(ValidationIssue {
                 severity: IssueSeverity::Warning,
@@ -242,7 +252,7 @@ pub fn validate_dataset_with_settings(db: &Database, settings: &AppSettings) -> 
         }
     }
 
-    let quality = quality::compute_quality_from_segments_with_settings(&segments, settings);
+    let quality = quality::compute_quality_from_segments_with_settings(segments, settings);
     if settings.enforce_quality_gates && !quality.quality_gate_passed {
         issues.push(ValidationIssue {
             severity: IssueSeverity::Error,
@@ -369,7 +379,7 @@ mod tests {
         let mut s = make_seg("num-1", "/fake/num.wav", "تەمەنی ١٤ ساڵ");
         s.annotated_transcript = Some("تەمەنی ١٤ ساڵ".to_string()); // digit-form human reference
         s.normalized_transcript = Some("تەمەنی یەک چوار ساڵ".to_string()); // one-way verbalized
-        db.insert_segment(&s).unwrap();
+        db.insert_legacy_segment_fixture(&s).unwrap();
 
         let report = validate_dataset(&db).unwrap();
         let high_rate = |issues: &[ValidationIssue]| {
@@ -401,7 +411,7 @@ mod tests {
         db.initialize().unwrap();
         let mut seg = make_seg("annotated", "/fake/path.wav", "");
         seg.annotated_transcript = Some("دەقی دەستکارد".to_string());
-        db.insert_segment(&seg).unwrap();
+        db.insert_legacy_segment_fixture(&seg).unwrap();
         let report = validate_dataset(&db).unwrap();
         assert!(
             !report.warnings.iter().any(|i| i.category == IssueCategory::EmptyTranscript),
@@ -432,7 +442,7 @@ mod tests {
     fn test_validate_annotations() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&SpeechSegment {
+        db.insert_legacy_segment_fixture(&SpeechSegment {
             annotated_transcript: Some("".to_string()),
             ..make_seg("test1", "/path.wav", "hello")
         })

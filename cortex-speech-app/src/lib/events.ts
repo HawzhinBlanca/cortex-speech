@@ -1,12 +1,12 @@
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type DesktopEvent, type DesktopUnlisten as UnlistenFn } from './adapters/desktop';
 import { get } from 'svelte/store';
 import { notifications } from './stores/notificationStore';
-import { t } from './i18n';
+import { t, type Translate, type TranslationKey } from './i18n';
 
 // True-10 audit: every notification here was hardcoded English, so in the CKB locale the app went
 // mixed-language exactly where pipeline status/errors need to be clearest. Module-scope translator
 // (evaluated per call, so a locale switch applies immediately).
-const tr = (key: string, params?: Record<string, string>) => get(t)(key, params);
+const tr: Translate = (key, params) => get(t)(key, params);
 import {
   isProcessing,
   pipelinePhase,
@@ -57,7 +57,11 @@ export interface AgentPipelineStageEvent {
 }
 
 export interface BatchProgressEvent {
-  type: 'started' | 'progress' | 'completed';
+  // 'halted' is the champion hard stop (owner rule 2026-08-11): batch_transcribe emits it INSTEAD of
+  // 'completed' and it is the run's only terminal event. Leaving it out of this union is why the UI
+  // sat at "transcribing" forever after a halt and never named the cause.
+  type: 'started' | 'progress' | 'completed' | 'halted';
+  haltedBy?: string;
   total: number;
   current?: number;
   file?: string;
@@ -72,6 +76,16 @@ export type ImportCompleteHandler = (payload: ImportComplete) => void | Promise<
 export type BatchCompleteHandler = (payload: BatchProgressEvent) => void | Promise<void>;
 
 const unlisteners: UnlistenFn[] = [];
+
+/** Subscribe to a typed desktop event without exposing the Tauri event API to components. */
+export function subscribeDesktopEvent<T>(
+  event: string,
+  handler: (event: DesktopEvent<T>) => void,
+): Promise<UnlistenFn> {
+  return listen<T>(event, handler);
+}
+
+export type { DesktopEvent } from './adapters/desktop';
 let onImportComplete: ImportCompleteHandler | null = null;
 let onBatchComplete: BatchCompleteHandler | null = null;
 
@@ -97,7 +111,9 @@ async function refreshAfterImport(payload: ImportComplete): Promise<void> {
       notifications.success(tr('events.importSuccess', { n: String(payload.total) }));
     }
   } else if (payload.failed > 0) {
-    notifications.error(tr('events.importFailed'), { detail: tr('events.importFailedDetail') });
+    notifications.error(tr('events.importFailed'), {
+      publicDetail: tr('events.importFailedDetail'),
+    });
   }
 
   isProcessing.set(false);
@@ -112,7 +128,7 @@ async function refreshAfterImport(payload: ImportComplete): Promise<void> {
     try {
       await onImportComplete(payload);
     } catch (e) {
-      notifications.error(tr('events.refreshFailed'), { detail: String(e) });
+      notifications.error(tr('events.refreshFailed'), { cause: e });
     }
   }
 }
@@ -123,13 +139,18 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
   pipelinePhase.set('idle');
   agentPipelineStages.set([]);
 
-  const batchOps: Record<string, { partial: string; success: string }> = {
+  const batchOps: Readonly<Record<string, { partial: TranslationKey; success: TranslationKey }>> = {
     transcribe: { partial: 'events.batchTranscribePartial', success: 'events.transcribed' },
     verify: { partial: 'events.batchVerifyPartial', success: 'events.verified' },
-    assign_speaker: { partial: 'events.batchSpeakerPartial', success: 'events.speakerAssigned' },
     normalize: { partial: 'events.batchNormalizePartial', success: 'events.normalized' },
   };
-  if (payload.cancelled) {
+  // Checked FIRST, and as an error carrying its cause: a hard-stopped run must never be softened into
+  // the cancelled warning or a "{ok} OK, {failed} failed" partial tally. Canon 2026-08-11 — a
+  // partly-drafted dataset that looks finished is worse than a run that stopped, so the cause the
+  // backend named in haltedBy is the one thing the user has to see.
+  if (payload.type === 'halted') {
+    notifications.error(tr('errors.transcriptionFailed'), { cause: payload.haltedBy });
+  } else if (payload.cancelled) {
     notifications.warning(tr('events.batchCancelled'));
   } else if (payload.operation && batchOps[payload.operation]) {
     const keys = batchOps[payload.operation];
@@ -149,7 +170,7 @@ async function refreshAfterBatch(payload: BatchProgressEvent): Promise<void> {
     try {
       await onBatchComplete(payload);
     } catch (e) {
-      notifications.error(tr('events.batchRefreshFailed'), { detail: String(e) });
+      notifications.error(tr('events.batchRefreshFailed'), { cause: e });
     }
   }
 }
@@ -180,7 +201,8 @@ export async function startEventListeners() {
 
   const unlistenError = await listen<PipelineError>('pipeline-error', (event) => {
     const { file, error } = event.payload;
-    notifications.error(tr('events.processingError', { file }), { detail: error });
+    const fileName = file.split(/[/\\]/).pop()?.slice(0, 160) || tr('events.unknownFile');
+    notifications.error(tr('events.processingError', { file: fileName }), { cause: error });
   });
   unlisteners.push(unlistenError);
 
@@ -269,7 +291,9 @@ export async function startEventListeners() {
         total,
         percent: total > 0 ? Math.round((current / total) * 100) : 0,
       });
-    } else if (payload.type === 'completed') {
+    } else if (payload.type === 'completed' || payload.type === 'halted') {
+      // Both are terminal, so both must clear isProcessing/pipelinePhase/batchProgress and end the
+      // operation — a halt that skipped this left the app stuck "transcribing" with no way back.
       void refreshAfterBatch(payload);
     }
   });

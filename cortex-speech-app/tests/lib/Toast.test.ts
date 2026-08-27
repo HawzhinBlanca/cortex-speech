@@ -2,15 +2,20 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import Toast from '../../src/lib/Toast.svelte';
 import { notifications } from '../../src/lib/stores/notificationStore';
+import { locale } from '../../src/lib/i18n';
 
 describe('Toast', () => {
   beforeEach(() => {
     notifications.clear();
+    locale.set('en');
   });
 
   it('renders nothing when there are no notifications', () => {
-    render(Toast);
+    const { container } = render(Toast);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    const region = container.querySelector('[aria-live="polite"]');
+    expect(region).toHaveClass('w-[calc(100%-2rem)]');
+    expect(region).not.toHaveClass('w-full');
   });
 
   it('renders a notification when added to the store', async () => {
@@ -75,4 +80,19 @@ describe('Toast', () => {
     });
   });
 
+  it('renders only a typed public error reference, never backend prose', async () => {
+    render(Toast);
+    notifications.error('Save failed', {
+      cause: {
+        schema: 1,
+        code: 'WRITE_FAILED',
+        message: 'SQL failed at C:\\private\\library.db',
+        retryable: true,
+        suggestedAction: 'retry',
+        operationId: '018f6e4a-2d71-4c66-8e4b-9d3c4b7e5a10',
+      },
+    });
+    await waitFor(() => expect(screen.getByText(/WRITE_FAILED/)).toBeInTheDocument());
+    expect(screen.queryByText(/SQL|private|library\.db/)).not.toBeInTheDocument();
+  });
 });

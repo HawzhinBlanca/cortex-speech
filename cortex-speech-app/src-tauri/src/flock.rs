@@ -94,7 +94,11 @@ impl InstanceLock {
             let fd = file.as_raw_fd();
             let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
             if ret != 0 {
-                remove_lock_file(&lock_path, "failed Unix instance lock acquisition");
+                // ONLY THE HOLDER MAY UNLINK. This branch used to delete the lockfile on refusal — the
+                // LIVE holder's own file — so the next launch created a fresh inode, flock'd that
+                // instead of the one the holder owns, and two processes ran on one SQLite database:
+                // precisely what this lock exists to prevent. Our own fd is closed by the Drop of
+                // `file` below, which releases nothing (we never acquired the flock).
                 return Err("Another instance is already running".to_string());
             }
         }
@@ -171,6 +175,29 @@ mod tests {
         // the lock is stale in a way the retry could not clear.
         #[cfg(windows)]
         assert!(err.contains("cortex.lock"), "the message must name the lock file so the user has a way out: {err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_second_instance_must_not_delete_the_live_holders_lockfile() {
+        // The refusal path used to unlink the file it had just failed to lock — which belongs to the
+        // LIVE holder. The next launch then created a fresh inode and flock'd that successfully, so two
+        // processes ended up on one SQLite database while both believed they held the single-instance
+        // lock. The refusal must leave the holder's file exactly where it is.
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_path = dir.path().join("cortex.lock");
+        let _held = InstanceLock::try_lock(dir.path()).expect("first lock acquires");
+        let held_inode = std::fs::metadata(&lock_path).expect("the holder's lockfile").ino();
+
+        assert!(InstanceLock::try_lock(dir.path()).is_err(), "a live second instance must be refused");
+        assert!(lock_path.exists(), "a refused instance must not delete the live holder's lockfile");
+        assert_eq!(
+            std::fs::metadata(&lock_path).expect("the holder's lockfile survives").ino(),
+            held_inode,
+            "the holder's inode must be untouched — a replacement inode is what let a third launch in"
+        );
+        assert!(InstanceLock::try_lock(dir.path()).is_err(), "and the NEXT launch is still refused");
     }
 
     #[test]

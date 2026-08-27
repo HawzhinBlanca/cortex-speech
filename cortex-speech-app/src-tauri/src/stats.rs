@@ -1,8 +1,9 @@
 use crate::db::Database;
 use crate::error::AppResult;
 use serde::Serialize;
+use specta::Type;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetStats {
     pub total_segments: usize,
@@ -26,7 +27,7 @@ pub struct DatasetStats {
 /// Review-throughput instrumentation (M2.1). `median_seconds` is the median gap between consecutive
 /// human decisions, counting only within-session gaps (deltas above `SESSION_GAP_MS` are treated as
 /// breaks, not review time). This is the honest s/segment figure the C3 ≥3× gate measures against.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewTimingStats {
     /// Total rows in decision_log (one per recorded human decision that carried a timestamp).
@@ -40,7 +41,7 @@ pub struct ReviewTimingStats {
 /// Consecutive decisions more than this far apart are between-session breaks, not review time.
 const SESSION_GAP_MS: i64 = 300_000; // 5 minutes
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DurationHistogram {
     pub under_5s: usize,
@@ -50,35 +51,12 @@ pub struct DurationHistogram {
     pub over_30s: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakerStat {
     pub speaker_id: String,
     pub segment_count: usize,
     pub total_duration_seconds: f64,
-}
-
-/// The COMPLETE set of speakers (no truncation), sorted by segment count desc then id. Unlike
-/// `compute_stats().top_speakers`, which is a dashboard summary capped at 10, this is what the
-/// speaker-management panel needs so EVERY speaker can be renamed — not just the top ten.
-pub fn list_speakers(db: &Database) -> AppResult<Vec<SpeakerStat>> {
-    let conn = db.connection();
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(speaker_id, 'unknown') AS spk, COUNT(*), COALESCE(SUM(duration_ms), 0)
-         FROM speech_segments
-         GROUP BY spk",
-    )?;
-    let mut speakers: Vec<SpeakerStat> = stmt
-        .query_map([], |r| {
-            Ok(SpeakerStat {
-                speaker_id: r.get::<_, String>(0)?,
-                segment_count: r.get::<_, i64>(1)? as usize,
-                total_duration_seconds: r.get::<_, i64>(2)? as f64 / 1000.0,
-            })
-        })?
-        .collect::<Result<_, _>>()?;
-    speakers.sort_by(|a, b| b.segment_count.cmp(&a.segment_count).then_with(|| a.speaker_id.cmp(&b.speaker_id)));
-    Ok(speakers)
 }
 
 /// Median within-session seconds per decision from the ordered decision_log timestamps (M2.1).
@@ -327,28 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn list_speakers_returns_all_speakers_not_just_the_top_ten() {
-        // Round-2 audit LOW: the speaker-management panel used compute_stats().top_speakers, which is
-        // truncated to 10, so speakers beyond the top ten could never be renamed. list_speakers
-        // returns the complete set.
-        let db = Database::open(":memory:").unwrap();
-        db.initialize().unwrap();
-        for i in 0..12 {
-            let speaker = format!("SPEAKER_{i:02}");
-            db.insert_segment(&seg(&format!("s{i}"), 1_000, true, Some(&speaker), "x")).unwrap();
-        }
-        assert_eq!(list_speakers(&db).unwrap().len(), 12, "every distinct speaker is returned");
-        assert_eq!(compute_stats(&db).unwrap().top_speakers.len(), 10, "the dashboard summary stays capped at 10");
-    }
-
-    #[test]
     fn review_timing_median_uses_within_session_deltas_only() {
         // P1.1: proves decision_log is actually populated (the M2.1 write path was dead) AND that the
         // median read path counts only within-session gaps.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
         for i in 0..4 {
-            db.insert_segment(&seg(&format!("d{i}"), 3_000, false, Some("A"), "x")).unwrap();
+            db.insert_legacy_segment_fixture(&seg(&format!("d{i}"), 3_000, false, Some("A"), "x")).unwrap();
         }
         // Decisions at 1s, 4s, 6s (within-session deltas 3s, 2s) then one 500s later (a break, excluded).
         db.record_human_decision("d0", "accept", None, Some(1_000)).unwrap();
@@ -366,7 +329,7 @@ mod tests {
     fn review_timing_is_empty_without_timed_decisions() {
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("s1", 3_000, false, None, "x")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("s1", 3_000, false, None, "x")).unwrap();
         let rt = compute_stats(&db).unwrap().review_timing;
         assert_eq!(rt.decisions_logged, 0);
         assert_eq!(rt.median_seconds, None);
@@ -392,7 +355,7 @@ mod tests {
             seg("s2", 8_000, true, Some("A"), "سڵاو"), // u10 bucket, 8 UTF-8 bytes
             seg("s3", 35_000, false, Some("B"), "x"), // over_30s bucket, 1 byte
         ] {
-            db.insert_segment(&s).unwrap();
+            db.insert_legacy_segment_fixture(&s).unwrap();
         }
         let st = compute_stats(&db).unwrap();
 
@@ -421,9 +384,9 @@ mod tests {
         // never overstates the verified count by folding rejected clips into it.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("good", 1000, true, Some("A"), "ڕاست")).unwrap(); // verified-good
-        db.insert_segment(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap(); // pending
-        db.insert_segment(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap(); // verified=true but rejected
+        db.insert_legacy_segment_fixture(&seg("good", 1000, true, Some("A"), "ڕاست")).unwrap(); // verified-good
+        db.insert_legacy_segment_fixture(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap(); // pending
+        db.insert_legacy_segment_fixture(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap(); // verified=true but rejected
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
 
         let st = compute_stats(&db).unwrap();
@@ -446,9 +409,9 @@ mod tests {
         // A test that only checked the average would have called this clean.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("keep1", 1000, true, Some("A"), "abcd")).unwrap(); // 4 bytes
-        db.insert_segment(&seg("keep2", 1000, false, Some("A"), "ef")).unwrap(); // 2 bytes, pending
-        db.insert_segment(&seg("bad", 1000, true, Some("A"), "ZZZZZZZZZZ")).unwrap(); // 10 bytes, rejected
+        db.insert_legacy_segment_fixture(&seg("keep1", 1000, true, Some("A"), "abcd")).unwrap(); // 4 bytes
+        db.insert_legacy_segment_fixture(&seg("keep2", 1000, false, Some("A"), "ef")).unwrap(); // 2 bytes, pending
+        db.insert_legacy_segment_fixture(&seg("bad", 1000, true, Some("A"), "ZZZZZZZZZZ")).unwrap(); // 10 bytes, rejected
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
 
         let st = compute_stats(&db).unwrap();
@@ -469,7 +432,7 @@ mod tests {
         // whatever stale text sat in annotated/raw.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("edited", 1000, true, Some("A"), "old")).unwrap(); // raw = 3 bytes
+        db.insert_legacy_segment_fixture(&seg("edited", 1000, true, Some("A"), "old")).unwrap(); // raw = 3 bytes
         db.connection()
             .execute(
                 "UPDATE speech_segments SET verdict_transcript='corrected', human_decision='edit' WHERE id='edited'",
@@ -498,14 +461,14 @@ mod tests {
         // second copy of the filter would drift in exactly the same way and prove nothing.
         let db = Database::open(":memory:").unwrap();
         db.initialize().unwrap();
-        db.insert_segment(&seg("good", 1000, true, Some("A"), "دەقی ڕاست")).unwrap();
-        db.insert_segment(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap();
-        db.insert_segment(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("good", 1000, true, Some("A"), "دەقی ڕاست")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("pend", 1000, false, Some("A"), "چاوەڕوان")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("bad", 1000, true, Some("A"), "خراپ")).unwrap();
         db.connection().execute("UPDATE speech_segments SET human_decision='reject' WHERE id='bad'", []).unwrap();
         // A clip whose EFFECTIVE transcript is still the ASR placeholder, marked verified. Export
         // refuses to publish it (it is not a transcript); the dashboard must not call it verified
         // either, or it reports progress the dataset does not contain.
-        db.insert_segment(&seg("hold", 1000, true, Some("A"), "[Pending WSL 7B ASR]")).unwrap();
+        db.insert_legacy_segment_fixture(&seg("hold", 1000, true, Some("A"), "[Pending WSL 7B ASR]")).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("dataset.jsonl");

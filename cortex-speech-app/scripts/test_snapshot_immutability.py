@@ -11,7 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_snapshot_immutability import check  # noqa: E402
+from check_snapshot_immutability import check, discover_bindings  # noqa: E402
+from train_challenger import inspect_pack  # noqa: E402
 
 GOOD_ID = hashlib.sha256(b"rows").hexdigest()
 
@@ -47,20 +48,104 @@ def test_an_unparseable_config_fails() -> None:
     assert any("unparseable" in p for p in problems), problems
 
 
+def _pack(root: Path) -> tuple[Path, str, str]:
+    pack = root / "pack_at_recorded_location"
+    (pack / "clips").mkdir(parents=True)
+    row = {
+        "audio_path": "clips/one.wav",
+        "sentence": "دەق",
+        "duration_seconds": 1.0,
+        "segment_id": "one",
+        "source_recording": "source.wav",
+        "split": "train",
+        "decision": "accept",
+        "decision_revision": 1,
+        "grade": "gold",
+        "audio_processed": False,
+    }
+    manifest = pack / "finetune_manifest.jsonl"
+    manifest.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    (pack / "clips" / "one.wav").write_bytes(b"RIFF")
+    snapshot = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    config = json.dumps({"snapshotId": snapshot, "manifestSha256": snapshot, "emitted": 1})
+    provenance = {**json.loads(config), "schema": 2}
+    (pack / "pack_provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+    files = [manifest, pack / "pack_provenance.json", pack / "clips" / "one.wav"]
+    sums = "".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(pack).as_posix()}\n"
+        for path in sorted(files, key=lambda value: value.relative_to(pack).as_posix())
+    )
+    (pack / "SHA256SUMS").write_text(sums, encoding="utf-8", newline="\n")
+    return pack, snapshot, config
+
+
 def test_a_pack_edited_after_sealing_fails() -> None:
-    """The check that turns 'trained on snapshot X' from a claim into a fact."""
+    """The checker follows recorded pack_dir, then validates the complete root."""
     with tempfile.TemporaryDirectory() as raw:
         runs = Path(raw)
-        pack = runs / f"challenger_{GOOD_ID[:12]}"
-        pack.mkdir(parents=True)
+        pack, snapshot, config = _pack(runs)
+        _, evidence = inspect_pack(pack, snapshot, {"status": "sealed", "config": json.loads(config)})
+        record_dir = runs / "challenger_record"
+        record_dir.mkdir()
+        (record_dir / "challenger_run.json").write_text(
+            json.dumps(
+                {
+                    "snapshot_id": snapshot,
+                    "pack_dir": str(pack.resolve()),
+                    "snapshot_root_sha256": evidence["snapshot_root_sha256"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert check([(snapshot, "sealed", config)], runs) == [], "untouched recorded root must verify"
+
         manifest = pack / "finetune_manifest.jsonl"
+        manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
+        problems = check([(snapshot, "sealed", config)], runs)
+        assert any("CRLF/CR byte drift" in problem for problem in problems), problems
 
-        manifest.write_bytes(b"rows")  # hashes to GOOD_ID by construction
-        assert check([(GOOD_ID, "sealed", _config(GOOD_ID))], runs) == [], "the untouched pack must verify"
 
-        manifest.write_bytes(b"rows and one more")
-        problems = check([(GOOD_ID, "sealed", _config(GOOD_ID))], runs)
-        assert any("edited after sealing" in p for p in problems), problems
+def test_a_snapshot_without_recorded_pack_binding_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        problems = check([(GOOD_ID, "sealed", _config(GOOD_ID))], Path(raw))
+        assert any("no challenger_run.json" in problem for problem in problems), problems
+
+
+
+def test_an_invalidation_without_a_reason_is_still_a_failure() -> None:
+    """Historical evidence may be marked explicitly invalid — but only WITH a reason.
+
+    Otherwise the marker becomes a way to silence any inconvenient run, which is exactly the
+    "don't weaken a failing gate" line. A reasoned declaration is auditable; a bare flag is a
+    delete with extra steps. Regression guard: 2026-08-19.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        run = Path(raw) / "run_x"
+        run.mkdir()
+        (run / "challenger_run.json").write_text(
+            json.dumps({"evidence_status": "invalid"}), encoding="utf-8"
+        )
+        _, problems = discover_bindings(Path(raw))
+        assert any("no superseded_reason" in p for p in problems), problems
+
+
+def test_a_reasoned_supersession_is_honoured_and_not_a_binding() -> None:
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        run = Path(raw) / "run_y"
+        run.mkdir()
+        (run / "challenger_run.json").write_text(
+            json.dumps({"evidence_status": "superseded", "superseded_reason": "prepared-only, never trained"}),
+            encoding="utf-8",
+        )
+        bindings, problems = discover_bindings(Path(raw))
+        assert problems == [], problems
+        assert bindings == {}, "a superseded run must not contribute a binding"
 
 
 def main() -> int:

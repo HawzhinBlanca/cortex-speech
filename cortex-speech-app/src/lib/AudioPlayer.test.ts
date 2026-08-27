@@ -17,11 +17,35 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import AudioPlayer from './AudioPlayer.svelte';
 import AudioPlayerHost from '../../tests/fixtures/AudioPlayerHost.svelte';
+import { addPlaybackInterval, emptyPlaybackCoverage } from './playbackCoverage';
 import { notifications, type Notification } from './stores/notificationStore';
+import * as commandApi from './commands';
 
 vi.mock('./commands', () => ({
-  registerMediaAsset: vi.fn(async (path: string) => ({ id: `grant-${path}`, path, expiresAt: '' })),
-  getMediaAssetUrl: vi.fn(async (id: string) => `C:/cache/${id}.wav`),
+  registerMediaAsset: vi.fn(async () => ({
+    id: '52a492d4-14d8-4e24-9f5d-bc44221b48c1',
+    expiresAt: '',
+  })),
+  registerReviewMediaAsset: vi.fn(async () => ({
+    id: '2f2d9b66-8566-4d1c-8c14-e18d006b776f',
+    expiresAt: '',
+  })),
+  getMediaAssetUrl: vi.fn(async (id: string) => `http://cortex-media.localhost/${id}`),
+  cancelDesktopPlaybackSessionV1: vi.fn(async () => true),
+  beginDesktopPlaybackSessionV1: vi.fn(
+    async (
+      segmentId: string,
+      _mediaGrantId: string,
+      expectedRevision: number,
+      clientAttemptId: string,
+    ) => ({
+      playbackReceiptId: `receipt-${clientAttemptId}`,
+      segmentId,
+      segmentRevision: expectedRevision,
+      clipDurationMs: 10_000,
+      expiresAtMs: Date.now() + 60_000,
+    }),
+  ),
 }));
 
 /** Pending play() settlers, so pause() can abort them the way a real media element does. */
@@ -79,6 +103,7 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
   let unsubscribe: () => void;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     installMediaElementStub();
     pendingPlays = [];
     pendingPlayResolvers = [];
@@ -116,10 +141,116 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
       errors.map((n) => n.message),
       'advancing mid-start must not report a playback failure',
     ).toEqual([]);
-    expect(
-      get(notifications).length,
-      'no notification of any kind for a normal advance',
-    ).toBe(0);
+    expect(get(notifications).length, 'no notification of any kind for a normal advance').toBe(0);
+  });
+
+  it('keeps ordinary Library playback independent from review-proof authority', async () => {
+    render(AudioPlayer, {
+      props: { audioPath: 'D:/library/legacy-null-fingerprint.wav', clipKey: 'library-preview' },
+    });
+    await settle();
+
+    expect(commandApi.registerMediaAsset).toHaveBeenCalledWith(
+      'D:/library/legacy-null-fingerprint.wav',
+    );
+    expect(commandApi.registerReviewMediaAsset).not.toHaveBeenCalled();
+    expect(commandApi.beginDesktopPlaybackSessionV1).not.toHaveBeenCalled();
+  });
+
+  it('uses only a verified grant when a review surface requires playback proof', async () => {
+    render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/canonical.wav',
+        clipKey: 'seg-proof',
+        requirePlaybackProof: true,
+        expectedRevision: 0,
+      },
+    });
+    await settle();
+
+    expect(commandApi.registerReviewMediaAsset).toHaveBeenCalledWith('D:/review/canonical.wav');
+    expect(commandApi.registerMediaAsset).not.toHaveBeenCalled();
+    expect(commandApi.beginDesktopPlaybackSessionV1).toHaveBeenCalledWith(
+      'seg-proof',
+      '2f2d9b66-8566-4d1c-8c14-e18d006b776f',
+      0,
+      expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    );
+  });
+
+  it('reissues authority and clears old evidence when only the rendered revision changes', async () => {
+    const { rerender } = render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/same-source.wav',
+        clipKey: 'seg-same',
+        requirePlaybackProof: true,
+        expectedRevision: 7,
+      },
+    });
+    await settle();
+
+    const first = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls[0];
+    expect(first?.slice(0, 3)).toEqual(['seg-same', '2f2d9b66-8566-4d1c-8c14-e18d006b776f', 7]);
+
+    await rerender({ expectedRevision: 8 });
+    await settle();
+
+    const calls = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.slice(0, 3)).toEqual(['seg-same', '2f2d9b66-8566-4d1c-8c14-e18d006b776f', 8]);
+    expect(calls[1]?.[3]).not.toBe(calls[0]?.[3]);
+  });
+
+  it('retires the exact authority when URL resolution fails after begin succeeds', async () => {
+    vi.mocked(commandApi.getMediaAssetUrl).mockRejectedValueOnce(new Error('cache lookup failed'));
+    render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/url-failure.wav',
+        clipKey: 'seg-url-failure',
+        requirePlaybackProof: true,
+        expectedRevision: 4,
+      },
+    });
+    await settle();
+
+    const issuance = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls[0];
+    expect(issuance).toBeDefined();
+    const clientAttemptId = issuance![3];
+    expect(commandApi.cancelDesktopPlaybackSessionV1).toHaveBeenCalledWith(
+      `receipt-${clientAttemptId}`,
+      clientAttemptId,
+    );
+  });
+
+  it('retires every superseded A-B-A-B-A authority with its exact client attempt', async () => {
+    const { rerender, unmount } = render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/review/shared.wav',
+        clipKey: 'seg-a',
+        requirePlaybackProof: true,
+        expectedRevision: 0,
+      },
+    });
+    await settle();
+    for (const clipKey of ['seg-b', 'seg-a', 'seg-b', 'seg-a']) {
+      await rerender({ clipKey });
+      await settle();
+    }
+    unmount();
+    await settle();
+
+    const issuanceCalls = vi.mocked(commandApi.beginDesktopPlaybackSessionV1).mock.calls;
+    expect(issuanceCalls).toHaveLength(5);
+    expect(commandApi.cancelDesktopPlaybackSessionV1).toHaveBeenCalledTimes(5);
+    for (const issuance of issuanceCalls) {
+      const clientAttemptId = issuance[3];
+      expect(commandApi.cancelDesktopPlaybackSessionV1).toHaveBeenCalledWith(
+        `receipt-${clientAttemptId}`,
+        clientAttemptId,
+      );
+    }
   });
 
   it('a genuinely undecodable clip is STILL reported', async () => {
@@ -138,9 +269,60 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
     );
     await settle();
 
-    expect(errors.length, 'an undecodable clip is still an error the reviewer sees').toBeGreaterThan(
+    expect(
+      errors.length,
+      'an undecodable clip is still an error the reviewer sees',
+    ).toBeGreaterThan(0);
+  });
+
+  it('a media error retires an armed loop timer and remains terminal', async () => {
+    const { container } = render(AudioPlayer, {
+      props: {
+        audioPath: 'D:/queue/decodes-then-fails.wav',
+        clipKey: 'seg-terminal-error',
+        autoplay: true,
+        startTime: 0,
+        endTime: 0.04,
+      },
+    });
+    await settle();
+    const audio = container.querySelector('audio')!;
+    audio.dispatchEvent(new Event('loadedmetadata'));
+    await settle();
+    resolveNewestPlay();
+    await settle();
+
+    const loopButton = container.querySelector<HTMLButtonElement>(
+      '[data-testid="audio-player-options"] button:last-child',
+    );
+    expect(loopButton).not.toBeNull();
+    loopButton!.click();
+    audio.dispatchEvent(new Event('error'));
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(audio.paused).toBe(true);
+    expect(pendingPlays, 'the retired clip-stop timer must not restart broken media').toHaveLength(
       0,
     );
+    expect(container.querySelector('[data-testid="audio-player-timeline"]')).toBeNull();
+  });
+
+  it('never renders non-finite media metadata into the clock or seek range', async () => {
+    const { container } = render(AudioPlayer, {
+      props: { audioPath: 'D:/queue/stream-like.wav', clipKey: 'seg-stream' },
+    });
+    await settle();
+
+    const audio = container.querySelector('audio')!;
+    Object.defineProperty(audio, 'duration', { configurable: true, value: Infinity });
+    audio.dispatchEvent(new Event('loadedmetadata'));
+    await settle();
+
+    const timeline = container.querySelector('[data-testid="audio-player-timeline"]');
+    expect(timeline, 'loaded media exposes the transport').not.toBeNull();
+    expect(timeline?.textContent).not.toMatch(/Infinity|NaN/);
+    expect(timeline?.querySelector('input[type="range"]')).toHaveAttribute('max', '0');
   });
 
   it('the next clip of the SAME recording is not still blocked by the previous failure', async () => {
@@ -175,5 +357,96 @@ describe('AudioPlayer: a superseded play attempt is not a playback failure', () 
       container.querySelector('[data-testid="audio-player-timeline"]'),
       'playback started on the next clip, so the audio is audible and the decision must unblock',
     ).not.toBeNull();
+  });
+});
+
+describe('unique media-time accounting (playback evidence)', () => {
+  // `audioError` proved the absence of a FAILURE, never the presence of listening. These pin the
+  // measure that replaces it: media time actually advanced.
+  function player() {
+    // A minimal stand-in: `paused` is read-only on the real element, so the accounting rules are
+    // exercised against a writable shape rather than a live media element.
+    const el = { currentTime: 0, paused: false };
+    let coverage = emptyPlaybackCoverage();
+    let last: number | null = null;
+    const MAX = 1.5;
+    const CLIP_MS = 10_000;
+    return {
+      el,
+      get heardMs() {
+        return coverage.uniqueMs;
+      },
+      reset() {
+        coverage = emptyPlaybackCoverage();
+        last = null;
+      },
+      tick() {
+        if (el.paused) {
+          last = null;
+          return;
+        }
+        if (last !== null) {
+          const d = el.currentTime - last;
+          if (d > 0 && d <= MAX) {
+            coverage = addPlaybackInterval(coverage, last * 1000, el.currentTime * 1000, CLIP_MS);
+          }
+        }
+        last = el.currentTime;
+      },
+    };
+  }
+
+  it('counts forward playback', () => {
+    const p = player();
+    for (const t of [0, 0.25, 0.5, 0.75, 1.0]) {
+      p.el.currentTime = t;
+      p.tick();
+    }
+    expect(Math.round(p.heardMs)).toBe(1000);
+  });
+
+  it('does not count a seek as listening', () => {
+    const p = player();
+    p.el.currentTime = 0;
+    p.tick();
+    p.el.currentTime = 8; // scrubbed to the end
+    p.tick();
+    expect(p.heardMs).toBe(0);
+  });
+
+  it('does not count time while paused', () => {
+    const p = player();
+    p.el.currentTime = 0;
+    p.tick();
+    p.el.paused = true;
+    p.el.currentTime = 5;
+    p.tick();
+    expect(p.heardMs).toBe(0);
+  });
+
+  it('replaying the same half never adds up to the whole clip', () => {
+    const p = player();
+    for (const t of [0, 0.5, 1.0]) {
+      p.el.currentTime = t;
+      p.tick();
+    }
+    p.el.currentTime = 0; // back to the start
+    p.tick();
+    for (const t of [0.5, 1.0]) {
+      p.el.currentTime = t;
+      p.tick();
+    }
+    expect(Math.round(p.heardMs)).toBe(1000);
+  });
+
+  it('a new source resets the evidence', () => {
+    const p = player();
+    p.el.currentTime = 0;
+    p.tick();
+    p.el.currentTime = 1;
+    p.tick();
+    expect(p.heardMs).toBeGreaterThan(0);
+    p.reset();
+    expect(p.heardMs).toBe(0);
   });
 });

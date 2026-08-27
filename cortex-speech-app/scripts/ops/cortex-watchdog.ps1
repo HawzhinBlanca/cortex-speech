@@ -27,21 +27,28 @@
 # and it could not be: proving it for real means pressing Stop, which deletes the session file and
 # revokes the owner's live link. Ports and paths are overridable for the same reason — a drill must
 # never touch the real profile. Production behaviour is unchanged when neither is set.
-param([switch]$Register, [switch]$DryRun)
+param(
+    [switch]$Register,
+    [switch]$DryRun,
+    [ValidateSet('CortexWatchdog', 'CortexPrivateProductionWatchdog')]
+    [string]$TaskName = 'CortexWatchdog'
+)
 
 $ErrorActionPreference = 'Stop'
 $repoApp = Resolve-Path (Join-Path $PSScriptRoot '..\..')   # cortex-speech-app/
+$dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
+$port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
+$logDir = Join-Path $dataDir 'logs'
+$log = Join-Path $logDir 'watchdog.log'
 # CORTEX_WATCHDOG_EXE exists for the same reason the DATA_DIR/PORT overrides do: the three branches
 # that depend on a LIVE process could only ever be drilled when the real app happened to be running,
 # so the coverage of the force-kill decision — the most dangerous line in the availability path — was
 # a coin toss on machine state. With the exe path overridable, the drill points this at a harmless
 # decoy process it starts itself and reaches all three deterministically. Production is unaffected
-# when unset.
-$exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } else {
-    Join-Path $repoApp 'src-tauri\target\release\cortex-speech-app.exe'
-}
-$dataDir = if ($env:CORTEX_WATCHDOG_DATA_DIR) { $env:CORTEX_WATCHDOG_DATA_DIR } else { Join-Path $env:APPDATA 'cortex-speech' }
-$port = if ($env:CORTEX_WATCHDOG_PORT) { $env:CORTEX_WATCHDOG_PORT } else { '8737' }
+# when unset. Private production adds one stronger source: an atomically published, hash-bound active
+# release manifest in the data profile. A mutable cargo target is only a compatibility fallback before
+# the first managed release. Once the pointer exists, a malformed/tampered pointer is a hard stop; it
+# must never silently fall back to whichever binary a later build happened to overwrite.
 # TLS FIRST, then plain HTTP. Couch Review serves TLS on every interface with a self-signed
 # certificate it generates locally, so an http:// probe against it does not fail cleanly — it comes
 # back as "corrupt message of type InvalidContentType", which this script read as a DEAD PORT and
@@ -69,11 +76,22 @@ public static class CortexProbeCerts {
 } catch {
     # Already loaded in this session, or the type exists — either way the callback is set.
 }
-$logDir = Join-Path $dataDir 'logs'
-$log = Join-Path $logDir 'watchdog.log'
-
 # The one line a drill reads. Printed for every decision so a test asserts the CHOICE, not a side effect.
 function Report([string]$action) { Write-Output "WATCHDOG-ACTION: $action" }
+
+function Get-Sha256Hex([string]$path) {
+    # Do not depend on PowerShell module autoload during crash recovery. `Get-FileHash` is supplied
+    # by Microsoft.PowerShell.Utility and was unavailable in a real handover subprocess even though
+    # it existed interactively. The framework primitive is always present in the supported runtime.
+    $stream = [System.IO.File]::OpenRead($path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return -join @($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
 
 # Logging must never be able to stop the watchdog. With $ErrorActionPreference = 'Stop' a failed
 # Add-Content (full disk, the log opened by an editor, a locked profile) threw and aborted the run
@@ -86,25 +104,99 @@ function Write-Log([string]$msg) {
     } catch { }
 }
 
+function Get-VerifiedActiveRelease {
+    $pointerPath = Join-Path $dataDir 'active-private-production-release.json'
+    if (-not (Test-Path -LiteralPath $pointerPath)) { return $null }
+    try {
+        $value = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
+        $expected = @(
+            'schema', 'releaseId', 'expectedDatabaseSchema', 'appGitSha', 'createdAtUtc',
+            'directory', 'appExe', 'poolAdminExe', 'appSha256', 'poolAdminSha256',
+            'watchdogScript', 'watchdogSha256', 'operationsSha256',
+            'dedupManifest', 'dedupManifestSha256'
+        )
+        $actual = @($value.PSObject.Properties.Name)
+        $missing = @($expected | Where-Object { $_ -notin $actual })
+        $extra = @($actual | Where-Object { $_ -notin $expected })
+        if ($missing.Count -or $extra.Count) { throw "release pointer fields do not match schema 1" }
+        if ($value.schema -ne 1 -or $value.expectedDatabaseSchema -ne 65) {
+            throw 'release pointer does not require private-production database schema 65'
+        }
+        if ([string]$value.appGitSha -notmatch '^[0-9a-f]{40}$') { throw 'release pointer git SHA is invalid' }
+        foreach ($field in @('appSha256', 'poolAdminSha256', 'watchdogSha256', 'operationsSha256', 'dedupManifestSha256')) {
+            if ([string]$value.$field -notmatch '^[0-9a-f]{64}$') { throw "release pointer $field is invalid" }
+        }
+        $directory = (Resolve-Path -LiteralPath ([string]$value.directory) -ErrorAction Stop).Path.TrimEnd('\')
+        foreach ($field in @('appExe', 'poolAdminExe', 'watchdogScript', 'dedupManifest')) {
+            $resolved = (Resolve-Path -LiteralPath ([string]$value.$field) -ErrorAction Stop).Path
+            if (-not $resolved.StartsWith($directory + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "release pointer $field escapes its immutable release directory"
+            }
+            $value.$field = $resolved
+        }
+        $dedup = Get-Content -LiteralPath ([string]$value.dedupManifest) -Raw | ConvertFrom-Json
+        if ($dedup.manifestSchema -ne 1 -or [string]$dedup.manifestSha256 -ne [string]$value.dedupManifestSha256) {
+            throw 'release dedup manifest identity does not match the pointer'
+        }
+        if ($dedup.summary.unconfirmedRiskGroups -ne 0) { throw 'release dedup manifest has unresolved risk' }
+        $checks = @(
+            @([string]$value.appExe, [string]$value.appSha256),
+            @([string]$value.poolAdminExe, [string]$value.poolAdminSha256),
+            @([string]$value.watchdogScript, [string]$value.watchdogSha256)
+        )
+        foreach ($check in $checks) {
+            $actualSha = Get-Sha256Hex $check[0]
+            if ($actualSha -ne $check[1]) { throw "release artifact hash mismatch: $($check[0])" }
+        }
+        return $value
+    } catch {
+        Report 'blocked (active release pointer invalid)'
+        Write-Log "active release pointer refused: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+$activeRelease = if ($env:CORTEX_WATCHDOG_EXE) { $null } else { Get-VerifiedActiveRelease }
+$packagedExe = Join-Path $repoApp 'cortex-speech-app.exe'
+$legacyExe = Join-Path $repoApp 'src-tauri\target\release\cortex-speech-app.exe'
+$packagedPoolAdmin = Join-Path $repoApp 'pool_admin.exe'
+$legacyPoolAdmin = Join-Path $repoApp 'src-tauri\target\release\pool_admin.exe'
+$exe = if ($env:CORTEX_WATCHDOG_EXE) { $env:CORTEX_WATCHDOG_EXE } elseif ($null -ne $activeRelease) {
+    [string]$activeRelease.appExe
+} elseif (Test-Path -LiteralPath $packagedExe) { $packagedExe } else { $legacyExe }
+$poolAdmin = if ($env:CORTEX_WATCHDOG_POOL_ADMIN) { $env:CORTEX_WATCHDOG_POOL_ADMIN } elseif ($null -ne $activeRelease) {
+    [string]$activeRelease.poolAdminExe
+} elseif (Test-Path -LiteralPath $packagedPoolAdmin) { $packagedPoolAdmin } else { $legacyPoolAdmin }
+$session = Join-Path $dataDir 'couch_session.json'
+
 if ($Register) {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
     # Two triggers: at logon (the autostart), and a repeating clock (the healer). Task Scheduler
     # caps a repetition trigger's duration; (New-TimeSpan -Days 3650) is rejected on Win11, so the
     # logon trigger carries an indefinite repetition instead.
-    $logon = New-ScheduledTaskTrigger -AtLogOn
-    $logon.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+    # An unscoped AtLogOn trigger means "any user" and requires administrator rights. Production
+    # review runs only in this interactive user's WebView2 session, so bind the trigger to the exact
+    # logged-on principal. This is both least privilege and independently registerable during a
+    # recovery-safe handover.
+    $currentPrincipal = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $logon = New-ScheduledTaskTrigger -AtLogOn -User $currentPrincipal
+    # A repeating AtLogOn trigger registered after the user already logged on has no NextRunTime
+    # until the next sign-in. That left a newly deployed reviewer line unmonitored for the rest of
+    # the current session. Keep the logon trigger for future interactive sessions and add a separate
+    # clock trigger that starts within one minute of registration and repeats indefinitely.
+    $clock = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5)
     # Battery flags are ON by default and would silently disable the whole watchdog the moment Windows
     # believes it is on battery — which includes a desktop behind a UPS, exactly the machine most
     # likely to be running this. An always-on server must not stop healing itself during a power event.
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
         -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName 'CortexWatchdog' -Action $action -Trigger $logon `
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($logon, $clock) `
         -Settings $settings -Force | Out-Null
     Write-Log "registered (exe: $exe)"
-    Write-Output "CortexWatchdog registered: at-logon + every 5 minutes, run-only-when-logged-on."
+    Write-Output "$TaskName registered: at-logon + every 5 minutes, run-only-when-logged-on."
     exit 0
 }
 
@@ -173,9 +265,40 @@ if ($alive) {
     if (Test-Path $killCountFile) { Remove-Item $killCountFile -Force -ErrorAction SilentlyContinue }
     Report 'alive'
     if ($DryRun) { exit 0 }
+    # v65 private-production certification. This is a read-only SQLite/filesystem report: it does not
+    # fetch a queue, take a lease, mark a clip seen, or touch reviewer history. Run it on the same
+    # five-minute clock as liveness while a reviewer session is expected. A failed certification does
+    # NOT trigger the destructive restart path (restarting cannot repair missing audio/rights/backups),
+    # but it suppresses the dead-man success ping and leaves an actionable report in the data profile.
+    $certHealthy = $true
+    $dbPath = Join-Path $dataDir 'cortex-speech.db'
+    if ((Test-Path -LiteralPath $session) -and (Test-Path -LiteralPath $poolAdmin) -and (Test-Path -LiteralPath $dbPath)) {
+        $certError = Join-Path $logDir 'pool-certification.stderr.log'
+        $certOutput = @(& $poolAdmin certify --db $dbPath --require-review-ready 2> $certError)
+        $certExit = $LASTEXITCODE
+        if ($certOutput.Count -gt 0) {
+            try {
+                if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
+                $certPath = Join-Path $logDir 'pool-certification.json'
+                $certTemp = Join-Path $logDir ('.pool-certification-' + [guid]::NewGuid().ToString('N') + '.tmp')
+                [System.IO.File]::WriteAllText($certTemp, (($certOutput -join [Environment]::NewLine) + [Environment]::NewLine))
+                Move-Item -LiteralPath $certTemp -Destination $certPath -Force
+            } catch {
+                $certHealthy = $false
+                Write-Log "pool certification output could not be published: $($_.Exception.Message)"
+            }
+        }
+        if ($certExit -ne 0) {
+            $certHealthy = $false
+            $reason = try { (Get-Content -LiteralPath $certError -Raw -ErrorAction Stop).Trim() } catch { 'no stderr detail' }
+            Write-Log "pool certification FAILED (exit $certExit): $reason"
+        } else {
+            Write-Log 'pool certification OK (review-ready)'
+        }
+    }
     # Optional dead-man ping: silence at healthchecks.io alerts the owner's phone.
     $hcFile = Join-Path $dataDir 'healthcheck.url'
-    if (Test-Path $hcFile) {
+    if ($certHealthy -and (Test-Path $hcFile)) {
         $hc = (Get-Content $hcFile -TotalCount 1).Trim()
         if ($hc -match '^https://') {
             try { Invoke-WebRequest -Uri $hc -UseBasicParsing -TimeoutSec 10 | Out-Null } catch {}
@@ -192,7 +315,6 @@ if ($alive) {
 #     HEALTHY state — killing it here would resurrect-loop the app every 5 minutes and make Stop
 #     feel haunted. Leave a running app alone; only launch if the process itself is gone
 #     (the autostart half of this task).
-$session = Join-Path $dataDir 'couch_session.json'
 # Matched by PATH, not by name. `Get-Process -Name cortex-speech-app` force-kills ANY process with
 # that name — a second checkout, a debug build, an installed copy under Program Files — while the
 # relaunch below only ever starts THIS one. The watchdog would happily kill a build it is not
@@ -200,6 +322,49 @@ $session = Join-Path $dataDir 'couch_session.json'
 $exeFull = try { (Resolve-Path $exe -ErrorAction Stop).Path } catch { $exe }
 $proc = @(Get-Process -Name cortex-speech-app -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path -eq $exeFull })
+
+# A live batch importer deliberately owns the SAME exclusive `cortex.lock` as the GUI. Launching the
+# GUI while that lock is held cannot succeed, and repeating the attempt every five minutes turns an
+# expected long import into noisy failed starts while reviewers still see a dead link. Check the OS
+# handle, not mere file existence: a crashed process may leave a stale lockfile, but that file opens
+# successfully and the app's normal stale-lock recovery will remove it. Only a Windows sharing/lock
+# violation proves a live holder and defers; every other probe fault is operationally red. Once the
+# holder exits, the next watchdog tick resumes the ordinary launch path automatically.
+function Get-DatabaseLockState {
+    $lockPath = Join-Path $dataDir 'cortex.lock'
+    if (-not (Test-Path -LiteralPath $lockPath)) { return 'absent' }
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $lockPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        return 'free'
+    } catch [System.IO.IOException] {
+        # Only Windows sharing/lock violations prove that another live process owns the file. Treating
+        # disk faults, malformed paths or ACL damage as an ordinary importer made the watchdog report
+        # success while deferring forever. Preserve the actual fault for an actionable blocked state.
+        $win32 = $_.Exception.HResult -band 0xFFFF
+        if ($win32 -eq 32 -or $win32 -eq 33) { return 'held' }
+        throw
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+$lockState = try { Get-DatabaseLockState } catch {
+    Report 'blocked (database lock probe failed)'
+    Write-Log "database lock probe failed - refusing to launch blindly: $($_.Exception.Message)"
+    exit 1
+}
+if (-not $proc.Count -and $lockState -eq 'held') {
+    Report 'defer (live database lock held by importer/maintenance)'
+    Write-Log 'database lock is held by another process - deferring app launch without disturbing it'
+    exit 0
+}
+
 if (-not (Test-Path $session)) {
     if ($proc.Count) { Report 'leave-alone (deliberate Stop)'; exit 0 }   # the app is fine
     Report 'launch (no session, not running)'

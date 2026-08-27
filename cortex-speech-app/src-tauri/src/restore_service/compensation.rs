@@ -1,0 +1,838 @@
+//! Compensation-ledger semantic validation for staged restore generations.
+
+fn exact_review_entitlement(duration_ms: i64, basis_points: i64) -> Result<i64, String> {
+    if duration_ms <= 0 || !(0..=10_000).contains(&basis_points) {
+        return Err("review compensation has invalid duration or basis points".to_string());
+    }
+    let numerator = i128::from(duration_ms)
+        .checked_mul(i128::from(crate::db::REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR))
+        .and_then(|value| value.checked_mul(i128::from(basis_points)))
+        .ok_or_else(|| "review compensation arithmetic overflow".to_string())?;
+    let denominator = 3_600_000_i128 * 10_000_i128;
+    if numerator % denominator != 0 {
+        return Err("review compensation duration/rate is not an exact micro-IQD amount".to_string());
+    }
+    i64::try_from(numerator / denominator)
+        .map_err(|_| "review compensation entitlement exceeds the supported integer range".to_string())
+}
+
+fn review_action_basis_points(action: &str) -> Option<i64> {
+    match action {
+        "edit" => Some(crate::db::REVIEW_PAY_EDIT_BPS),
+        "accept" => Some(crate::db::REVIEW_PAY_ACCEPT_BPS),
+        "reject" => Some(crate::db::REVIEW_PAY_REJECT_BPS),
+        "skip" => Some(crate::db::REVIEW_PAY_SKIP_BPS),
+        _ => None,
+    }
+}
+
+pub(super) fn is_canonical_lowercase_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).map(|parsed| parsed.hyphenated().to_string() == value).unwrap_or(false)
+}
+
+pub(super) fn is_canonical_lowercase_64_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_compensation_reviewer(reviewer: &str) -> bool {
+    !reviewer.is_empty()
+        && reviewer == reviewer.trim()
+        && reviewer.chars().count() <= 40
+        && !reviewer.chars().any(char::is_control)
+}
+
+fn canonical_work_id_has_writer_shape(work_id: &str, reviewer: &str, duration_ms: i64) -> bool {
+    let reviewer_key = reviewer.trim().to_lowercase();
+    let prefix = format!("reviewer-work-v1:{}:{reviewer_key}:audio-segment-v1:", reviewer_key.len());
+    let Some(audio_identity) = work_id.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut parts = audio_identity.split(':');
+    let (Some(content_hash), Some(start), Some(end), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (start.parse::<i64>(), end.parse::<i64>()) else {
+        return false;
+    };
+    is_canonical_lowercase_64_hex(content_hash) && crate::db::source_span_matches_duration(start, end, duration_ms)
+}
+
+fn canonical_work_audio_identity<'a>(work_id: &'a str, reviewer: &str) -> Option<(&'a str, i64, i64)> {
+    let reviewer_key = reviewer.trim().to_lowercase();
+    let prefix = format!("reviewer-work-v1:{}:{reviewer_key}:audio-segment-v1:", reviewer_key.len());
+    let audio_identity = work_id.strip_prefix(&prefix)?;
+    let mut parts = audio_identity.split(':');
+    let content_hash = parts.next()?;
+    let start = parts.next()?.parse::<i64>().ok()?;
+    let end = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || !is_canonical_lowercase_64_hex(content_hash) || start < 0 || end <= start {
+        return None;
+    }
+    Some((content_hash, start, end))
+}
+
+/// Reproduce `Database::compensation_audio_identity_tx` and the reviewer namespace byte for byte.
+/// Restore validation cannot trust a ledger's self-declared work id: a forged target could otherwise
+/// split one clip into several invented work ids and earn the full rate on every split.
+fn canonical_compensation_work(
+    db: &crate::db::Database,
+    segment_id: &str,
+    reviewer: &str,
+    decision_revision: i64,
+) -> Result<Option<(String, i64)>, String> {
+    use rusqlite::OptionalExtension;
+
+    if !valid_compensation_reviewer(reviewer) {
+        return Err("database restore refused: compensation row has an invalid reviewer identity".to_string());
+    }
+    let row: Option<(Option<String>, Option<String>, i64, i64)> = db
+        .connection()
+        .query_row(
+            "SELECT audio_content_hash, alignment_json, duration_ms, COALESCE(review_revision, 0)
+               FROM speech_segments WHERE id = ?1",
+            [segment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| format!("restore target compensation segment identity is unreadable: {error}"))?;
+    let Some((content_hash, alignment_json, duration_ms, current_revision)) = row else {
+        return Ok(None);
+    };
+    if current_revision < decision_revision || current_revision < 0 {
+        return Err(format!(
+            "database restore refused: compensation segment {segment_id} regresses its decision revision"
+        ));
+    }
+    if current_revision != decision_revision {
+        return Ok(None);
+    }
+    if duration_ms <= 0 {
+        return Err(format!(
+            "database restore refused: current compensation segment {segment_id} has invalid duration"
+        ));
+    }
+    let content_hash = content_hash.as_deref().map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
+        format!("database restore refused: compensation segment {segment_id} has fallback audio identity")
+    })?;
+    let alignment_json = alignment_json.as_deref().ok_or_else(|| {
+        format!("database restore refused: compensation segment {segment_id} has no source-span identity")
+    })?;
+    let alignment: serde_json::Value = serde_json::from_str(alignment_json).map_err(|_| {
+        format!("database restore refused: compensation segment {segment_id} has invalid source-span identity")
+    })?;
+    let start = alignment.get("source_start_ms").and_then(serde_json::Value::as_i64);
+    let end = alignment.get("source_end_ms").and_then(serde_json::Value::as_i64);
+    let (Some(start), Some(end)) = (start, end) else {
+        return Err(format!(
+            "database restore refused: compensation segment {segment_id} has incomplete source-span identity"
+        ));
+    };
+    if !crate::db::source_span_matches_duration(start, end, duration_ms) {
+        return Err(format!(
+            "database restore refused: compensation segment {segment_id} source span disagrees with decoded duration"
+        ));
+    }
+    let reviewer_key = reviewer.trim().to_lowercase();
+    let audio_work_id = format!("audio-segment-v1:{content_hash}:{start}:{end}");
+    Ok(Some((format!("reviewer-work-v1:{}:{reviewer_key}:{audio_work_id}", reviewer_key.len()), duration_ms)))
+}
+
+/// Re-derive the current compensation ledger and settlements from their immutable inputs. Schema
+/// triggers protect future writes, but a restored database may contain pre-existing forged extras;
+/// this read-only pass proves their complete arithmetic/identity semantics before page publication.
+pub(crate) fn validate_review_compensation_semantics(db: &crate::db::Database) -> Result<(), String> {
+    use rusqlite::OptionalExtension;
+
+    #[derive(Clone)]
+    struct Event {
+        segment_id: String,
+        reviewer: String,
+        action: String,
+        compensation_action: Option<String>,
+        source: String,
+        duration_ms: Option<i64>,
+        operation_id: Option<String>,
+        operation_payload_hash: Option<String>,
+        requested_action: Option<String>,
+        requested_transcript: Option<String>,
+        served_transcript: Option<String>,
+        served_revision: Option<i64>,
+    }
+
+    #[derive(Clone)]
+    struct Ledger {
+        id: i64,
+        entry_id: String,
+        entry_key: String,
+        review_event_id: Option<i64>,
+        canonical_work_id: String,
+        canonical_identity_kind: String,
+        reviewer: String,
+        segment_id: String,
+        source: String,
+        compensation_action: String,
+        effective_decision: String,
+        decision_revision: Option<i64>,
+        duration_ms: i64,
+        rate_basis_points: i64,
+        entitlement_micro_iqd: i64,
+        delta_micro_iqd: i64,
+        corrected_entitlement_ms: i64,
+        delta_corrected_ms: i64,
+        reverses_entry_id: Option<String>,
+    }
+
+    let mut policy_statement = db
+        .connection()
+        .prepare(
+            "SELECT policy_version, effective_after_event_id, base_rate_micro_iqd_per_hour,
+                    edit_basis_points, accept_basis_points, reject_basis_points, skip_basis_points
+               FROM review_compensation_policies ORDER BY policy_version",
+        )
+        .map_err(|error| format!("restore target compensation policy is unreadable: {error}"))?;
+    let policies = policy_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|error| format!("restore target compensation policy is unreadable: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("restore target compensation policy is unreadable: {error}"))?;
+    drop(policy_statement);
+    if policies.len() != 1 || policies[0].0 != crate::db::REVIEW_PAY_POLICY_VERSION {
+        return Err(format!(
+            "database restore refused: target must contain only the exact {} compensation policy row",
+            crate::db::REVIEW_PAY_POLICY_VERSION
+        ));
+    }
+    let policy = &policies[0];
+    if (policy.2, policy.3, policy.4, policy.5, policy.6)
+        != (
+            crate::db::REVIEW_PAY_BASE_RATE_MICRO_IQD_PER_HOUR,
+            crate::db::REVIEW_PAY_EDIT_BPS,
+            crate::db::REVIEW_PAY_ACCEPT_BPS,
+            crate::db::REVIEW_PAY_REJECT_BPS,
+            crate::db::REVIEW_PAY_SKIP_BPS,
+        )
+    {
+        return Err(
+            "database restore refused: target compensation policy constants differ from this binary".to_string()
+        );
+    }
+    let cutoff = policy.1;
+    let effect_event_frontier: i64 = db
+        .connection()
+        .query_row(
+            "SELECT effective_after_review_event_id FROM review_effect_state WHERE singleton_key = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("restore target review-effect frontier is unreadable: {error}"))?;
+    let maximum_event_id: i64 = db
+        .connection()
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM review_events", [], |row| row.get(0))
+        .map_err(|error| format!("restore target compensation cutoff cannot be verified: {error}"))?;
+    if cutoff < 0 || cutoff > maximum_event_id {
+        return Err(format!(
+            "database restore refused: target compensation cutoff {cutoff} is outside review history 0..={maximum_event_id}"
+        ));
+    }
+
+    let mut event_statement = db
+        .connection()
+        .prepare(
+            "SELECT id, segment_id, reviewer, action, compensation_action, source, duration_ms,
+                    operation_id, operation_payload_hash, requested_action,
+                    requested_transcript, served_transcript, served_revision
+               FROM review_events WHERE id > ?1 ORDER BY id",
+        )
+        .map_err(|error| format!("restore target prospective compensation events are unreadable: {error}"))?;
+    let event_rows = event_statement
+        .query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                Event {
+                    segment_id: row.get(1)?,
+                    reviewer: row.get(2)?,
+                    action: row.get(3)?,
+                    compensation_action: row.get(4)?,
+                    source: row.get(5)?,
+                    duration_ms: row.get(6)?,
+                    operation_id: row.get(7)?,
+                    operation_payload_hash: row.get(8)?,
+                    requested_action: row.get(9)?,
+                    requested_transcript: row.get(10)?,
+                    served_transcript: row.get(11)?,
+                    served_revision: row.get(12)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("restore target prospective compensation events are unreadable: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("restore target prospective compensation events are unreadable: {error}"))?;
+    drop(event_statement);
+    let events = event_rows.into_iter().collect::<std::collections::HashMap<_, _>>();
+
+    let mut operation_ids = std::collections::HashSet::<String>::new();
+    for (event_id, event) in &events {
+        if !valid_compensation_reviewer(&event.reviewer)
+            || !matches!(event.source.as_str(), "couch" | "couch_spot_check")
+            || !matches!(event.action.as_str(), "accept" | "edit" | "reject" | "skip")
+        {
+            return Err(format!(
+                "database restore refused: post-cutoff review event {event_id} is not a valid production Couch action"
+            ));
+        }
+        let compensation_action = event.compensation_action.as_deref().ok_or_else(|| {
+            format!("database restore refused: post-cutoff review event {event_id} has no compensation action")
+        })?;
+        let requested_action = event.requested_action.as_deref().unwrap_or_default();
+        let requested_transcript = event.requested_transcript.as_deref().unwrap_or_default();
+        let served_transcript = event.served_transcript.as_deref().unwrap_or_default();
+        let served_revision = event.served_revision.unwrap_or(-1);
+        let expected_compensation = match requested_action {
+            "skip" => Some("skip"),
+            "bad" | "reject" => Some("reject"),
+            "accept" | "edit" => Some(
+                if crate::normalizer::learning_text_key(requested_transcript)
+                    == crate::normalizer::learning_text_key(served_transcript)
+                {
+                    "accept"
+                } else {
+                    "edit"
+                },
+            ),
+            _ => None,
+        };
+        let valid_action_pair = if event.source == "couch_spot_check" {
+            compensation_action == event.action && expected_compensation == Some(compensation_action)
+        } else {
+            match event.action.as_str() {
+                "skip" => compensation_action == "skip" && expected_compensation == Some("skip"),
+                "reject" => compensation_action == "reject" && expected_compensation == Some("reject"),
+                // Corpus provenance may reclassify an unchanged earlier human correction as edit
+                // while pay remains an accept, or an alternate ASR hypothesis as accept while pay
+                // remains an edit. Both are deliberate writer outcomes; no other cross-pair is.
+                "accept" | "edit" => {
+                    matches!(compensation_action, "accept" | "edit")
+                        && expected_compensation == Some(compensation_action)
+                }
+                _ => false,
+            }
+        };
+        if review_action_basis_points(compensation_action).is_none() || !valid_action_pair {
+            return Err(format!(
+                "database restore refused: post-cutoff review event {event_id} has invalid action/pay semantics"
+            ));
+        }
+        if requested_transcript != crate::db::to_nfc(requested_transcript.trim())
+            || served_transcript.is_empty()
+            || served_transcript != crate::db::to_nfc(served_transcript.trim())
+            || served_revision < 0
+        {
+            return Err(format!(
+                "database restore refused: post-cutoff review event {event_id} has invalid served/request evidence"
+            ));
+        }
+        let operation_id = event.operation_id.as_deref().unwrap_or_default();
+        if !is_canonical_lowercase_uuid(operation_id) || !operation_ids.insert(operation_id.to_string()) {
+            return Err(format!(
+                "database restore refused: post-cutoff Couch event {event_id} lacks a unique canonical lowercase UUID"
+            ));
+        }
+        let operation_hash = event.operation_payload_hash.as_deref().unwrap_or_default();
+        if !is_canonical_lowercase_64_hex(operation_hash) {
+            return Err(format!(
+                "database restore refused: post-cutoff Couch event {event_id} lacks a canonical payload hash"
+            ));
+        }
+        if !event.duration_ms.is_some_and(|duration| duration > 0) {
+            return Err(format!(
+                "database restore refused: post-cutoff review event {event_id} has no valid durable duration"
+            ));
+        }
+        if event.source == "couch_spot_check" {
+            let exact_results: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM spot_checks
+                      WHERE segment_id = ?1 AND reviewer = ?2 COLLATE NOCASE AND action = ?3",
+                    rusqlite::params![event.segment_id, event.reviewer, event.action],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("restore target spot-check compensation evidence is unreadable: {error}"))?;
+            if exact_results != 1 {
+                return Err(format!(
+                    "database restore refused: hidden review event {event_id} lacks its exact immutable spot-check result"
+                ));
+            }
+        }
+    }
+
+    let mut ledger_statement = db
+        .connection()
+        .prepare(
+            "SELECT id, entry_id, entry_key, review_event_id, canonical_work_id, canonical_identity_kind,
+                    reviewer, segment_id, source, compensation_action, effective_decision,
+                    decision_revision, duration_ms, rate_basis_points, entitlement_micro_iqd, delta_micro_iqd,
+                    corrected_entitlement_ms, delta_corrected_ms, reverses_entry_id
+               FROM review_compensation_ledger
+              WHERE policy_version = ?1 ORDER BY id",
+        )
+        .map_err(|error| format!("restore target compensation ledger is unreadable: {error}"))?;
+    let ledger_rows = ledger_statement
+        .query_map([crate::db::REVIEW_PAY_POLICY_VERSION], |row| {
+            Ok(Ledger {
+                id: row.get(0)?,
+                entry_id: row.get(1)?,
+                entry_key: row.get(2)?,
+                review_event_id: row.get(3)?,
+                canonical_work_id: row.get(4)?,
+                canonical_identity_kind: row.get(5)?,
+                reviewer: row.get(6)?,
+                segment_id: row.get(7)?,
+                source: row.get(8)?,
+                compensation_action: row.get(9)?,
+                effective_decision: row.get(10)?,
+                decision_revision: row.get(11)?,
+                duration_ms: row.get(12)?,
+                rate_basis_points: row.get(13)?,
+                entitlement_micro_iqd: row.get(14)?,
+                delta_micro_iqd: row.get(15)?,
+                corrected_entitlement_ms: row.get(16)?,
+                delta_corrected_ms: row.get(17)?,
+                reverses_entry_id: row.get(18)?,
+            })
+        })
+        .map_err(|error| format!("restore target compensation ledger is unreadable: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("restore target compensation ledger is unreadable: {error}"))?;
+    drop(ledger_statement);
+
+    let mut event_entry_counts = std::collections::HashMap::<i64, usize>::new();
+    let mut entries = std::collections::HashMap::<String, Ledger>::new();
+    let mut entry_keys = std::collections::HashSet::<String>::new();
+    let mut reversed_entries = std::collections::HashSet::<String>::new();
+    let mut balances = std::collections::HashMap::<String, i64>::new();
+    let mut corrected_balances = std::collections::HashMap::<String, i64>::new();
+    for ledger in &ledger_rows {
+        if ledger.id <= 0
+            || !is_canonical_lowercase_uuid(&ledger.entry_id)
+            || !valid_compensation_reviewer(&ledger.reviewer)
+            || !entry_keys.insert(ledger.entry_key.clone())
+        {
+            return Err(format!(
+                "database restore refused: compensation ledger entry {} has invalid or duplicate durable identity",
+                ledger.entry_id
+            ));
+        }
+        let decision_revision = ledger.decision_revision.ok_or_else(|| {
+            format!("database restore refused: compensation ledger entry {} has no decision revision", ledger.entry_id)
+        })?;
+        if ledger.canonical_identity_kind != "audio_content_hash+source_span"
+            || !canonical_work_id_has_writer_shape(&ledger.canonical_work_id, &ledger.reviewer, ledger.duration_ms)
+            || ledger.duration_ms <= 0
+            || decision_revision < 0
+        {
+            return Err(format!(
+                "database restore refused: compensation ledger entry {} disagrees with canonical segment/work identity",
+                ledger.entry_id
+            ));
+        }
+        if let Some((expected_work_id, segment_duration)) =
+            canonical_compensation_work(db, &ledger.segment_id, &ledger.reviewer, decision_revision)?
+        {
+            if ledger.canonical_work_id != expected_work_id || ledger.duration_ms != segment_duration {
+                return Err(format!(
+                    "database restore refused: current compensation ledger entry {} disagrees with its segment identity",
+                    ledger.entry_id
+                ));
+            }
+        }
+        let prior = *balances.get(&ledger.canonical_work_id).unwrap_or(&0);
+        let prior_corrected = *corrected_balances.get(&ledger.canonical_work_id).unwrap_or(&0);
+
+        if let Some(event_id) = ledger.review_event_id {
+            *event_entry_counts.entry(event_id).or_default() += 1;
+            let event = events.get(&event_id).ok_or_else(|| {
+                format!(
+                    "database restore refused: compensation ledger entry {} points outside the post-cutoff event range",
+                    ledger.entry_id
+                )
+            })?;
+            let expected_action = event
+                .compensation_action
+                .as_deref()
+                .ok_or_else(|| format!("database restore refused: event {event_id} has no compensation action"))?;
+            let event_duration = event
+                .duration_ms
+                .ok_or_else(|| format!("database restore refused: event {event_id} has no durable duration"))?;
+            if ledger.compensation_action != expected_action
+                || ledger.effective_decision != event.action
+                || ledger.segment_id != event.segment_id
+                || ledger.reviewer.trim().to_lowercase() != event.reviewer.trim().to_lowercase()
+                || ledger.source != event.source
+                || ledger.duration_ms != event_duration
+                || ledger.entry_key != format!("review-event:{event_id}")
+                || ledger.reverses_entry_id.is_some()
+                || (event.source == "couch" && event.action != "skip" && decision_revision == 0)
+                || ((event.source == "couch_spot_check" || event.action == "skip")
+                    && event.served_revision != Some(decision_revision))
+            {
+                return Err(format!(
+                    "database restore refused: compensation ledger entry {} disagrees with review event {event_id}",
+                    ledger.entry_id
+                ));
+            }
+            if event.action != "skip" && event_id > effect_event_frontier {
+                let receipt_revision = event
+                    .served_revision
+                    .ok_or_else(|| format!("database restore refused: paid event {event_id} has no served revision"))?;
+                if event.source == "couch" {
+                    let (effect_count, prior_revision): (i64, Option<i64>) = db
+                        .connection()
+                        .query_row(
+                            "SELECT COUNT(*), MIN(prior_revision)
+                               FROM human_decision_effect_events
+                              WHERE review_event_id = ?1 AND decision_revision = ?2",
+                            rusqlite::params![event_id, decision_revision],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|error| format!("restore target paid playback revision is unreadable: {error}"))?;
+                    if effect_count != 1 {
+                        return Err(format!(
+                            "database restore refused: paid corpus event {event_id} has no unique decision effect for playback binding"
+                        ));
+                    }
+                    let effect_prior_revision = prior_revision.ok_or_else(|| {
+                        format!("database restore refused: paid corpus event {event_id} has no receipt revision")
+                    })?;
+                    if effect_prior_revision != receipt_revision {
+                        return Err(format!(
+                            "database restore refused: paid corpus event {event_id} served revision disagrees with its decision effect"
+                        ));
+                    }
+                }
+                let (content_hash, source_start_ms, source_end_ms) = canonical_work_audio_identity(
+                    &ledger.canonical_work_id,
+                    &ledger.reviewer,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "database restore refused: paid event {event_id} has no canonical content-hash/source-span work identity"
+                    )
+                })?;
+                let retained_identity: Option<(Option<String>, i64, i64, Option<String>)> = db
+                    .connection()
+                    .query_row(
+                        "SELECT audio_content_hash, duration_ms, COALESCE(review_revision, 0), alignment_json
+                           FROM speech_segments WHERE id = ?1",
+                        [&ledger.segment_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()
+                    .map_err(|error| format!("restore target paid segment identity is unreadable: {error}"))?;
+                let Some((retained_hash, retained_duration, retained_revision, retained_alignment)) = retained_identity
+                else {
+                    return Err(format!(
+                        "database restore refused: post-v60 paid segment {} is missing; policy-3 evidence forbids reviewed-segment deletion",
+                        ledger.segment_id
+                    ));
+                };
+                let retained_span = crate::db::canonical_source_span(retained_alignment.as_deref());
+                if retained_hash.as_deref() != Some(content_hash)
+                    || retained_span != Some((source_start_ms, source_end_ms))
+                    || retained_duration != ledger.duration_ms
+                    || retained_revision < decision_revision
+                {
+                    return Err(format!(
+                        "database restore refused: paid review event {event_id} disagrees with its retained BLAKE3/source-span/duration identity"
+                    ));
+                }
+                let sufficient_receipts: i64 = db
+                    .connection()
+                    .query_row(
+                        "SELECT COUNT(*)
+                           FROM playback_receipts receipt
+                          WHERE receipt.segment_id = ?1
+                            AND receipt.reviewer = ?2 COLLATE NOCASE
+                            AND receipt.segment_revision = ?3
+                            AND receipt.audio_fingerprint = ?4
+                            AND receipt.source_start_ms = ?5
+                            AND receipt.source_end_ms = ?6
+                            AND receipt.clip_duration_ms = ?7
+                            AND (
+                                 receipt.policy_version = ?8
+                                 OR (
+                                      receipt.policy_version = ?9
+                                      AND receipt.authority_session_id IS NOT NULL
+                                      AND EXISTS (
+                                           SELECT 1 FROM playback_authority_consumptions_v4 consumption
+                                            WHERE consumption.playback_receipt_id = receipt.authority_session_id
+                                              AND consumption.namespace = ?10
+                                              AND consumption.operation_id = ?11
+                                              AND consumption.reviewer = ?2 COLLATE NOCASE
+                                              AND consumption.segment_id = ?1
+                                      )
+                                      AND (
+                                           ?10 <> 'canonical'
+                                           OR EXISTS (
+                                                SELECT 1 FROM human_decision_effect_events effect
+                                                 WHERE effect.review_event_id = ?12
+                                                   AND effect.playback_authority_session_id = receipt.authority_session_id
+                                           )
+                                      )
+                                 )
+                            )
+                            AND receipt.started_at_ms >= 0
+                            AND receipt.played_ms >= 0
+                            AND receipt.coverage_ratio >= ?13",
+                        rusqlite::params![
+                            ledger.segment_id,
+                            ledger.reviewer,
+                            receipt_revision,
+                            content_hash,
+                            source_start_ms,
+                            source_end_ms,
+                            ledger.duration_ms,
+                            crate::db::PLAYBACK_POLICY_VERSION,
+                            crate::db::DESKTOP_PLAYBACK_POLICY_VERSION,
+                            if event.source == "couch" { "canonical" } else { "spot_check" },
+                            event.operation_id.as_deref().unwrap_or_default(),
+                            event_id,
+                            crate::db::MIN_PLAYBACK_COVERAGE,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("restore target paid playback evidence is unreadable: {error}"))?;
+                if sufficient_receipts == 0 {
+                    return Err(format!(
+                        "database restore refused: paid review event {event_id} has no exact consumed policy-3/4 playback authority"
+                    ));
+                }
+            }
+            let expected_bps = review_action_basis_points(expected_action).ok_or_else(|| {
+                format!("database restore refused: ledger entry {} has an unsupported action", ledger.entry_id)
+            })?;
+            let entitlement = if expected_bps == 0 {
+                if ledger.duration_ms <= 0 {
+                    return Err(format!(
+                        "database restore refused: ledger entry {} has non-positive duration",
+                        ledger.entry_id
+                    ));
+                }
+                0
+            } else {
+                exact_review_entitlement(ledger.duration_ms, expected_bps)?
+            };
+            let expected_delta = if expected_action == "skip" {
+                0
+            } else {
+                entitlement.checked_sub(prior).ok_or_else(|| "review compensation delta overflow".to_string())?
+            };
+            let corrected_target = match expected_action {
+                "edit" => ledger.duration_ms,
+                "skip" => prior_corrected,
+                "accept" | "reject" => 0,
+                _ => return Err(format!("database restore refused: unsupported ledger action {expected_action}")),
+            };
+            let expected_corrected_delta = corrected_target
+                .checked_sub(prior_corrected)
+                .ok_or_else(|| "review corrected-entitlement delta overflow".to_string())?;
+            if ledger.rate_basis_points != expected_bps
+                || ledger.entitlement_micro_iqd != entitlement
+                || ledger.delta_micro_iqd != expected_delta
+                || ledger.corrected_entitlement_ms != corrected_target
+                || ledger.delta_corrected_ms != expected_corrected_delta
+            {
+                return Err(format!(
+                    "database restore refused: compensation rate/delta/corrected math is invalid at {}",
+                    ledger.entry_id
+                ));
+            }
+        } else if ledger.compensation_action == "undo" {
+            if ledger.effective_decision != "undo"
+                || ledger.source != "couch_undo"
+                || ledger.rate_basis_points != 0
+                || ledger.entitlement_micro_iqd != 0
+            {
+                return Err(format!(
+                    "database restore refused: undo ledger entry {} has invalid fixed semantics",
+                    ledger.entry_id
+                ));
+            }
+            let reversed_id = ledger.reverses_entry_id.as_deref().ok_or_else(|| {
+                format!("database restore refused: undo {} does not name an earlier entry", ledger.entry_id)
+            })?;
+            let reversed = entries.get(reversed_id).ok_or_else(|| {
+                format!("database restore refused: undo {} references a missing or later entry", ledger.entry_id)
+            })?;
+            let latest_eligible = entries
+                .values()
+                .filter(|entry| {
+                    entry.review_event_id.is_some()
+                        && entry.compensation_action != "undo"
+                        && entry.canonical_work_id == ledger.canonical_work_id
+                        && entry.reviewer.trim().eq_ignore_ascii_case(ledger.reviewer.trim())
+                        && !reversed_entries.contains(&entry.entry_id)
+                })
+                .max_by_key(|entry| entry.id)
+                .map(|entry| entry.entry_id.as_str());
+            if reversed.compensation_action == "undo"
+                || reversed.canonical_work_id != ledger.canonical_work_id
+                || reversed.segment_id != ledger.segment_id
+                || reversed.reviewer.trim().to_lowercase() != ledger.reviewer.trim().to_lowercase()
+                || reversed.duration_ms != ledger.duration_ms
+                || reversed.decision_revision != ledger.decision_revision
+                || latest_eligible != Some(reversed_id)
+                || !reversed_entries.insert(reversed_id.to_string())
+            {
+                return Err(format!(
+                    "database restore refused: undo {} does not exactly bind its earlier decision entry",
+                    ledger.entry_id
+                ));
+            }
+            let reversed_event_id = reversed.review_event_id.ok_or_else(|| {
+                format!("database restore refused: undo {} does not reverse a production decision", ledger.entry_id)
+            })?;
+            let reversed_event = events.get(&reversed_event_id).ok_or_else(|| {
+                format!("database restore refused: undo {} reverses an unknown event", ledger.entry_id)
+            })?;
+            let undo_operation = ledger.entry_key.strip_prefix("undo:").unwrap_or_default();
+            if reversed.source != "couch"
+                || reversed.effective_decision == "skip"
+                || !is_canonical_lowercase_uuid(undo_operation)
+                || reversed_event.operation_id.as_deref() != Some(undo_operation)
+            {
+                return Err(format!(
+                    "database restore refused: undo {} has invalid operation/event linkage",
+                    ledger.entry_id
+                ));
+            }
+            let expected_delta = reversed
+                .delta_micro_iqd
+                .checked_neg()
+                .ok_or_else(|| "review compensation undo overflow".to_string())?;
+            let expected_corrected_delta = reversed
+                .delta_corrected_ms
+                .checked_neg()
+                .ok_or_else(|| "review corrected-entitlement undo overflow".to_string())?;
+            let expected_corrected_entitlement = prior_corrected
+                .checked_add(expected_corrected_delta)
+                .ok_or_else(|| "review corrected-entitlement undo balance overflow".to_string())?;
+            if ledger.delta_micro_iqd != expected_delta
+                || ledger.delta_corrected_ms != expected_corrected_delta
+                || ledger.corrected_entitlement_ms != expected_corrected_entitlement
+            {
+                return Err(format!(
+                    "database restore refused: undo compensation math is invalid at {}",
+                    ledger.entry_id
+                ));
+            }
+        } else {
+            return Err(format!(
+                "database restore refused: ledger entry {} has neither event nor undo semantics",
+                ledger.entry_id
+            ));
+        }
+
+        let balance = prior
+            .checked_add(ledger.delta_micro_iqd)
+            .ok_or_else(|| "review compensation running balance overflow".to_string())?;
+        let corrected_balance = prior_corrected
+            .checked_add(ledger.delta_corrected_ms)
+            .ok_or_else(|| "review corrected-entitlement running balance overflow".to_string())?;
+        if balance < 0 || corrected_balance < 0 {
+            return Err(format!(
+                "database restore refused: compensation entry {} creates a negative running balance",
+                ledger.entry_id
+            ));
+        }
+        balances.insert(ledger.canonical_work_id.clone(), balance);
+        corrected_balances.insert(ledger.canonical_work_id.clone(), corrected_balance);
+        if entries.insert(ledger.entry_id.clone(), ledger.clone()).is_some() {
+            return Err("database restore refused: compensation ledger has duplicate entry identity".to_string());
+        }
+    }
+    for event_id in events.keys() {
+        if event_entry_counts.get(event_id).copied().unwrap_or(0) != 1 {
+            return Err(format!(
+                "database restore refused: post-cutoff review event {event_id} does not have exactly one current-policy ledger entry"
+            ));
+        }
+    }
+
+    let mut settlement_statement = db
+        .connection()
+        .prepare(
+            "SELECT settlement_id, reviewer, from_ledger_id_exclusive,
+                    through_ledger_id_inclusive, allocated_micro_iqd, payout_reference
+               FROM review_compensation_settlements
+              WHERE policy_version = ?1
+              ORDER BY reviewer COLLATE NOCASE, through_ledger_id_inclusive",
+        )
+        .map_err(|error| format!("restore target compensation settlements are unreadable: {error}"))?;
+    let settlements = settlement_statement
+        .query_map([crate::db::REVIEW_PAY_POLICY_VERSION], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| format!("restore target compensation settlements are unreadable: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("restore target compensation settlements are unreadable: {error}"))?;
+    drop(settlement_statement);
+    let maximum_ledger_id = ledger_rows.last().map(|row| row.id).unwrap_or(0);
+    let mut boundaries = std::collections::HashMap::<String, i64>::new();
+    let mut payout_references = std::collections::HashSet::<String>::new();
+    for (settlement_id, reviewer, from, through, amount, payout_reference) in settlements {
+        let reviewer_key = reviewer.trim().to_lowercase();
+        let expected_from = boundaries.get(&reviewer_key).copied().unwrap_or(0);
+        if !is_canonical_lowercase_uuid(&settlement_id)
+            || !valid_compensation_reviewer(&reviewer)
+            || from != expected_from
+            || through <= from
+            || through > maximum_ledger_id
+        {
+            return Err(format!(
+                "database restore refused: settlement {settlement_id} has a non-contiguous or invalid ledger range"
+            ));
+        }
+        let mut exact_amount = 0i64;
+        let mut matching_rows = 0usize;
+        for ledger in &ledger_rows {
+            if ledger.reviewer.trim().to_lowercase() == reviewer_key && ledger.id > from && ledger.id <= through {
+                exact_amount = exact_amount
+                    .checked_add(ledger.delta_micro_iqd)
+                    .ok_or_else(|| "review settlement amount overflow".to_string())?;
+                matching_rows += 1;
+            }
+        }
+        if matching_rows == 0 || exact_amount != amount {
+            return Err(format!(
+                "database restore refused: settlement {settlement_id} amount differs from its immutable ledger range"
+            ));
+        }
+        let reference = payout_reference.trim().to_string();
+        if reference.is_empty() || reference != payout_reference || !payout_references.insert(reference) {
+            return Err(format!(
+                "database restore refused: settlement {settlement_id} has an empty or duplicate payout reference"
+            ));
+        }
+        boundaries.insert(reviewer_key, through);
+    }
+    Ok(())
+}

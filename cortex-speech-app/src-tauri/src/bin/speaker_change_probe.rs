@@ -23,10 +23,10 @@
 //! common case; true cross-talk needs an overlap-aware segmentation model (pyannote powerset).
 //!
 //! READ-ONLY BY DEFAULT. Opens the library with SQLITE_OPEN_READ_ONLY, so it is safe to run while the
-//! app is up. `--persist` additionally opens a SECOND, read-write connection at the end and stores each
-//! measured score in `speech_segments.speaker_change_score` (Migration v47) — which is what turns this
-//! from a console printout into a flag the phone reviewer actually sees before deciding. Run that form
-//! with the app stopped, so the library has one writer.
+//! app is up. `--persist` additionally takes the desktop's exclusive instance lock before reading,
+//! then opens a SECOND, read-write connection at the end and stores each measured score in
+//! `speech_segments.speaker_change_score` (Migration v47). The lock enforces one coherent generation
+//! and refuses the persistent form until the app is closed.
 //!
 //! Usage: speaker_change_probe [<db_path>] [--export <dir>] [--persist]
 
@@ -83,6 +83,16 @@ fn main() -> Result<(), String> {
             let base = std::env::var("APPDATA").unwrap_or_default();
             format!("{base}\\cortex-speech\\cortex-speech.db")
         });
+    let _instance_lock = if persist {
+        let path = std::path::Path::new(&db_path);
+        let data_dir =
+            path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        Some(cortex_speech_app_lib::flock::InstanceLock::try_lock(data_dir).map_err(|error| {
+            format!("Cannot persist speaker-change scores while Cortex is running: {error}. Stop review and close the app first.")
+        })?)
+    } else {
+        None
+    };
     // Deliberately NOT `Database::open`: that opens read-write and runs `PRAGMA journal_mode=WAL`, which
     // is itself a write, and its `Connection::open` does not enable URI parsing — so a `file:…?mode=ro`
     // string would be taken as a literal filename and quietly create a stray empty database. Opening with

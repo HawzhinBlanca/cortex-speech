@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import { get } from 'svelte/store';
   import {
     segments,
@@ -12,10 +12,13 @@
   import { settings } from './stores/settingsStore';
   import { showReviewInbox, showConfirmDialog, isProcessing } from './stores/uiStore';
   import { physicalKey } from './keyboard';
-  import { t } from './i18n';
+  import { t, type TranslationKey } from './i18n';
   import Waveform from './Waveform.svelte';
   import AudioPlayer from './AudioPlayer.svelte';
   import EmptyState from './EmptyState.svelte';
+  import ReviewActionBar from './ReviewActionBar.svelte';
+  import ReviewDraftRecovery from './ReviewDraftRecovery.svelte';
+  import ReviewWordStrip from './ReviewWordStrip.svelte';
   import {
     parseWordTimestamps,
     parseSourceMeta,
@@ -27,8 +30,21 @@
   import { isPlaceholderTranscript } from './segmentQuality';
   import { revealReviewCompletion } from './reviewCompletion';
   import { parseEscalationEvidence, reasonLabelKey, reasonTone } from './reasonCodes';
-  import { formatUnknownError } from './errorText';
+  import { formatPublicErrorReference } from './errorText';
+  import { registerReviewDraftFlusher } from './reviewDraftFlush';
+  import {
+    ReviewDraftWriteCoordinator,
+    type RevisionBoundReviewDraftIntent,
+  } from './reviewDraftWriteCoordinator';
+  import { ReviewCommitOperationLedger, type ReviewCommitIntent } from './reviewCommitOperation';
+  import {
+    ReviewPlaybackAttemptLedger,
+    hasSufficientReviewPlayback,
+    isProvenUncommittedPlaybackFinalization,
+  } from './reviewPlaybackAttempt';
+  import { isCommittedReviewFor } from './reviewCommitResult';
   import type { SpeechSegment, WordTimestamp } from './types';
+  import type { ReviewDraftV1 } from './commands';
 
   interface Props {
     // Pro next-steps surfaced when the whole queue is reviewed (wired by App to its export / exit).
@@ -42,6 +58,10 @@
   // lands on the riskiest clips first. Off by default — the plain pending-first order is unchanged.
   let suspectFirst = $state(false);
   let reviewRows = $state<SpeechSegment[]>([]);
+  let reviewRevisions = $state<Record<string, number>>({});
+  let reviewEligibility = $state<
+    Record<string, { eligible: boolean; disabledReason: string | null }>
+  >({});
   let reviewCursor = $state<string | null>(null);
   let reviewTotal = $state(0);
   let reviewInitialTotal = $state(0);
@@ -50,28 +70,75 @@
   let reviewLoading = $state(false);
   let reviewLoadError = $state<string | null>(null);
   let hydratedReviewIds = $state<Set<string>>(new Set());
-  const hydrationInFlight = new Map<string, Promise<void>>();
+  type HydrationAttempt = {
+    generation: number;
+    baseRevision: number;
+    promise: Promise<void>;
+  };
+  const hydrationInFlight = new Map<string, HydrationAttempt>();
   let reviewLoadKey = '';
   let reviewGeneration = 0;
+  const commitOperations = new ReviewCommitOperationLedger();
+  const playbackAttempts = new ReviewPlaybackAttemptLedger();
+
+  function committedEffectId(
+    segmentId: string,
+    baseRevision: number,
+    commit: {
+      segmentId: string;
+      committedRevision: number;
+      decisionId: string;
+    },
+  ): number | null {
+    if (!isCommittedReviewFor(commit, segmentId, baseRevision)) {
+      notifications.error($t('notifications.loadSegmentsFailed'));
+      void loadReviewPage(true);
+      return null;
+    }
+    const effectEventId = api.reviewEffectId(commit.decisionId);
+    if (effectEventId === null) {
+      notifications.error($t('notifications.loadSegmentsFailed'));
+      void loadReviewPage(true);
+      return null;
+    }
+    return effectEventId;
+  }
 
   async function hydrateReviewRow(id: string, force = false) {
     if (!force && hydratedReviewIds.has(id)) return;
+    const generation = reviewGeneration;
+    const baseRevision = reviewRevisions[id];
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      throw new Error('review row hydration requires the exact rendered revision');
+    }
     const existing = hydrationInFlight.get(id);
-    if (existing) return existing;
+    if (existing && existing.generation === generation && existing.baseRevision === baseRevision) {
+      return existing.promise;
+    }
 
     const hydration = (async () => {
       const full = await api.getSegment(id);
-      // The row can disappear while IPC is in flight because a decision completed. Never resurrect it.
-      if (!reviewRows.some((row) => row.id === id)) return;
+      // A reset can serve the SAME id at a newer revision while this unversioned full-row hydration is
+      // still in flight. Pairing that stale row with the newer page's CAS token would let a reviewer
+      // overwrite truth they never saw. Only the exact page generation + revision that launched this
+      // request may install it; the replacement page starts its own hydration attempt.
+      if (
+        generation !== reviewGeneration ||
+        reviewRevisions[id] !== baseRevision ||
+        !reviewRows.some((row) => row.id === id)
+      ) {
+        return;
+      }
       reviewRows = reviewRows.map((row) => (row.id === id ? full : row));
       segments.update((rows) => rows.map((row) => (row.id === id ? full : row)));
       hydratedReviewIds = new Set([...hydratedReviewIds, id]);
     })();
-    hydrationInFlight.set(id, hydration);
+    const attempt = { generation, baseRevision, promise: hydration };
+    hydrationInFlight.set(id, attempt);
     try {
       await hydration;
     } finally {
-      hydrationInFlight.delete(id);
+      if (hydrationInFlight.get(id) === attempt) hydrationInFlight.delete(id);
     }
   }
 
@@ -85,6 +152,8 @@
       // replacement loads can record a decision against a clip the reviewer can no longer see in
       // context, and a failed reset must never masquerade as the successful all-done state.
       reviewRows = [];
+      reviewRevisions = {};
+      reviewEligibility = {};
       reviewCursor = null;
       reviewTotal = 0;
       reviewInitialTotal = 0;
@@ -98,35 +167,89 @@
     try {
       const statsPromise =
         reset && !query ? api.getDatasetStats().catch(() => null) : Promise.resolve(null);
-      const page = await api.getSegmentsPage({
-        verified: false,
-        query,
-        sort: suspectFirst ? 'suspectFirst' : 'oldest',
-        limit: 100,
-        cursor,
-      });
+      let pageRows: SpeechSegment[];
+      let pageRevisions: Record<string, number>;
+      let pageEligibility: Record<string, { eligible: boolean; disabledReason: string | null }>;
+      let pageNextCursor: string | null;
+      let pageTotal: number;
+      let pageFocusNarrowed: boolean;
+      if (suspectFirst) {
+        // The legacy suspect ranking remains during domain-by-domain migration, but its additive
+        // revision map comes from the SAME SQLite rows and therefore still authorizes typed commits.
+        const page = await api.getSegmentsPage({
+          verified: false,
+          query,
+          sort: 'suspectFirst',
+          limit: 100,
+          cursor,
+          focused: true,
+        });
+        pageRows = page.items;
+        pageRevisions = page.revisions ?? {};
+        // The suspect-first endpoint predates ReviewItemV1. Preserve the same fail-closed readiness
+        // rule locally until this optional ordering moves behind the versioned server contract.
+        pageEligibility = Object.fromEntries(
+          page.items.map((item) => {
+            const eligible =
+              Number.isSafeInteger(pageRevisions[item.id]) &&
+              pageRevisions[item.id] >= 0 &&
+              !isPlaceholderTranscript(item.rawTranscript);
+            return [
+              item.id,
+              {
+                eligible,
+                disabledReason: eligible ? null : 'TRANSCRIPT_NOT_READY',
+              },
+            ];
+          }),
+        );
+        pageNextCursor = page.nextCursor;
+        pageTotal = page.total;
+        pageFocusNarrowed = page.focusNarrowed === true;
+      } else {
+        const scope = query ? ({ kind: 'search', query } as const) : ({ kind: 'pending' } as const);
+        const page = await api.getReviewPageV1(scope, cursor, 100);
+        pageRows = page.items.map((item) => item.segment);
+        pageRevisions = Object.fromEntries(
+          page.items.map((item) => [item.segment.id, item.baseRevision]),
+        );
+        pageEligibility = Object.fromEntries(
+          page.items.map((item) => [
+            item.segment.id,
+            { eligible: item.eligible, disabledReason: item.disabledReason },
+          ]),
+        );
+        pageNextCursor = page.nextCursor;
+        pageTotal = page.total;
+        pageFocusNarrowed = page.focusNarrowed;
+      }
       const stats = await statsPromise;
       if (generation !== reviewGeneration) return;
       reviewLoadError = null;
-      reviewRows = reset ? page.items : [...reviewRows, ...page.items];
-      reviewCursor = page.nextCursor;
+      reviewRows = reset ? pageRows : [...reviewRows, ...pageRows];
+      reviewRevisions = reset ? pageRevisions : { ...reviewRevisions, ...pageRevisions };
+      reviewEligibility = reset ? pageEligibility : { ...reviewEligibility, ...pageEligibility };
+      reviewCursor = pageNextCursor;
+      focusNarrowed = pageFocusNarrowed;
       if (reset) {
-        reviewTotal = page.total;
-        reviewInitialTotal = page.total;
-        reviewCorpusTotal = stats?.totalSegments ?? page.total;
+        reviewTotal = pageTotal;
+        reviewInitialTotal = pageTotal;
+        reviewCorpusTotal = stats?.totalSegments ?? pageTotal;
         reviewInitiallyVerified = stats?.verifiedCount ?? 0;
         index = 0;
       }
     } catch (error) {
       if (generation !== reviewGeneration) return;
-      reviewLoadError = formatUnknownError(error, $t('notifications.loadSegmentsFailed'));
+      reviewLoadError = formatPublicErrorReference(error) ?? $t('errors.unknown');
       if (reset) {
         reviewRows = [];
+        reviewRevisions = {};
+        reviewEligibility = {};
         reviewCursor = null;
         reviewTotal = 0;
         reviewInitialTotal = 0;
       }
-      notifications.error($t('notifications.loadSegmentsFailed'), { detail: reviewLoadError });
+      notifications.error($t('notifications.loadSegmentsFailed'), { cause: error });
     } finally {
       if (generation === reviewGeneration) reviewLoading = false;
     }
@@ -148,6 +271,13 @@
   // search scopes; the verified-filter is ignored here because review mode has its own
   // pending-first ordering (a verified-only filter would render the queue permanently "all done").
   const searchScoped = $derived($searchQuery.trim().length > 0);
+  // A voice focus narrows this queue to one speaker's clips, so — exactly like a search — the queue
+  // is a SUBSET and corpus-wide progress claims are lies about it. Set from the server's own answer
+  // (it alone knows whether a focus file was in force for this fetch), never inferred from the flag
+  // we sent. Review 2026-08-20: draining 1,318 focused clips announced the whole 15,262-clip library
+  // as reviewed, because the completion banner only ever excluded the SEARCH subset.
+  let focusNarrowed = $state(false);
+  const subsetScoped = $derived(searchScoped || focusNarrowed);
 
   // Simple, focused review queue: one clip at a time. Pending (unverified) first,
   // then the rest — so a reviewer always lands on work that needs doing.
@@ -180,12 +310,27 @@
   const current = $derived(
     currentCandidate && hydratedReviewIds.has(currentCandidate.id) ? currentCandidate : null,
   );
+  const currentEligibility = $derived(
+    current
+      ? (reviewEligibility[current.id] ?? {
+          eligible: false,
+          disabledReason: 'REVIEW_ELIGIBILITY_UNKNOWN',
+        })
+      : null,
+  );
+  const eligibilityBlocked = $derived(currentEligibility?.eligible !== true);
+
+  function eligibilityReasonText(reason: string | null | undefined): string {
+    return reason === 'TRANSCRIPT_NOT_READY'
+      ? $t('review.transcriptNotReady')
+      : $t('review.eligibilityUnavailable');
+  }
   $effect(() => {
     const candidate = currentCandidate;
     if (!candidate || hydratedReviewIds.has(candidate.id)) return;
     void hydrateReviewRow(candidate.id).catch((error) => {
-      reviewLoadError = formatUnknownError(error, $t('notifications.loadSegmentsFailed'));
-      notifications.error($t('notifications.loadSegmentsFailed'), { detail: reviewLoadError });
+      reviewLoadError = formatPublicErrorReference(error) ?? $t('errors.unknown');
+      notifications.error($t('notifications.loadSegmentsFailed'), { cause: error });
     });
   });
   // Audit 2026-08-05: the position counter above counts the QUEUE while the progress text counted the
@@ -194,24 +339,24 @@
   // purpose — a fully-reviewed SEARCH SUBSET must never fire the completion banner. See
   // reviewProgress.ts, where that rule is unit-tested.
   const progress = $derived({
-    done: searchScoped
+    done: subsetScoped
       ? Math.max(0, reviewInitialTotal - reviewTotal)
       : Math.min(
           reviewCorpusTotal,
           reviewInitiallyVerified + Math.max(0, reviewInitialTotal - reviewTotal),
         ),
-    total: searchScoped ? reviewInitialTotal : reviewCorpusTotal,
+    total: subsetScoped ? reviewInitialTotal : reviewCorpusTotal,
     percent:
-      (searchScoped ? reviewInitialTotal : reviewCorpusTotal) > 0
+      (subsetScoped ? reviewInitialTotal : reviewCorpusTotal) > 0
         ? Math.round(
-            ((searchScoped
+            ((subsetScoped
               ? reviewInitialTotal - reviewTotal
               : reviewInitiallyVerified + reviewInitialTotal - reviewTotal) /
-              (searchScoped ? reviewInitialTotal : reviewCorpusTotal)) *
+              (subsetScoped ? reviewInitialTotal : reviewCorpusTotal)) *
               100,
           )
         : 0,
-    allReviewed: !searchScoped && reviewCorpusTotal > 0 && reviewTotal === 0,
+    allReviewed: !subsetScoped && reviewCorpusTotal > 0 && reviewTotal === 0,
   });
 
   $effect(() => {
@@ -248,7 +393,121 @@
   // Bound from AudioPlayer: non-null means this clip's audio could not load/play, so no decision
   // surface may record a human verdict on it (audit find 2026-08-17).
   let audioError = $state<string | null>(null);
+  const technicalUnusableReasons: readonly api.TechnicalUnusableReasonV1[] = [
+    'decodeFailed',
+    'missingFile',
+    'permissionDenied',
+    'corruptContainer',
+  ];
+  let technicalUnusableReason = $state<api.TechnicalUnusableReasonV1 | ''>('');
+  let technicalUnusableForId = $state<string | null>(null);
+  let technicalUnusableIntent = $state<api.MarkSegmentUnusableRequestV1 | null>(null);
+  $effect(() => {
+    const segmentId = current?.id ?? null;
+    if (segmentId === technicalUnusableForId) return;
+    technicalUnusableForId = segmentId;
+    technicalUnusableReason = '';
+    technicalUnusableIntent = null;
+  });
+  // Cumulative MEDIA time heard for the CURRENT clip; the player resets it on every
+  // source change, so a previous clip's listen can never travel with the reviewer.
+  let heardMs = $state(0);
+  let playbackReceiptId = $state<string | null>(null);
+  let playbackMediaGrantId = $state<string | null>(null);
+  let playbackClipDurationMs = $state<number | null>(null);
+  let heardIntervals = $state<readonly api.PlaybackIntervalV1[]>([]);
+  let reviewAudioPlayer = $state<
+    | {
+        pauseAndSnapshot: () => {
+          segmentId: string | null;
+          segmentRevision: number | null;
+          playbackReceiptId: string | null;
+          mediaGrantId: string | null;
+          clipDurationMs: number | null;
+          intervals: readonly api.PlaybackIntervalV1[];
+        };
+        restartPlaybackAuthority: () => void;
+      }
+    | undefined
+  >();
   let lastLoadedId = $state<string | null>(null);
+
+  $effect(() => {
+    if (!$showReviewInbox) return;
+    // The inbox is a separate review authority. Retire this surface's player (the template unmounts it)
+    // and clear parent-owned playback state before the foreground surface can issue a new receipt.
+    playing = false;
+    playbackReceiptId = null;
+    playbackMediaGrantId = null;
+    playbackClipDurationMs = null;
+    heardIntervals = [];
+    heardMs = 0;
+  });
+
+  async function finalizePlaybackAttempt(
+    seg: SpeechSegment,
+    baseRevision: number,
+  ): Promise<string | null> {
+    // Pause and snapshot inside AudioPlayer. Setting a bound parent flag is not synchronous evidence:
+    // the child may still have one final media delta between its last timeupdate and the click.
+    const authority = await reviewAudioPlayer?.pauseAndSnapshot();
+    playing = false;
+    if (
+      !authority ||
+      authority.segmentId !== seg.id ||
+      authority.segmentRevision !== baseRevision
+    ) {
+      notifications.error($t('review.mustListen'));
+      return null;
+    }
+    const alreadyFinalized = playbackAttempts.finalizedReceipt(seg.id, baseRevision);
+    if (alreadyFinalized) return alreadyFinalized;
+    const receiptId = authority.playbackReceiptId;
+    const grantId = authority.mediaGrantId;
+    const clipDurationMs = authority.clipDurationMs;
+    const intervals = authority.intervals.map(({ startMs, endMs }) => ({ startMs, endMs }));
+    if (
+      !receiptId ||
+      !grantId ||
+      !Number.isSafeInteger(clipDurationMs) ||
+      (clipDurationMs ?? 0) <= 0 ||
+      !hasSufficientReviewPlayback(intervals, clipDurationMs as number)
+    ) {
+      notifications.error($t('review.mustListen'));
+      return null;
+    }
+    const attempt = playbackAttempts.snapshot({
+      segmentId: seg.id,
+      baseRevision,
+      playbackReceiptId: receiptId,
+      mediaGrantId: grantId,
+      intervals,
+    });
+    try {
+      const finalized = await api.recordPlaybackReceipt({
+        playbackReceiptId: attempt.playbackReceiptId,
+        mediaGrantId: attempt.mediaGrantId,
+        intervals: attempt.intervals,
+      });
+      if (
+        finalized.playbackReceiptId !== attempt.playbackReceiptId ||
+        finalized.segmentId !== seg.id ||
+        finalized.segmentRevision !== baseRevision
+      ) {
+        throw new Error('playback receipt response identity mismatch');
+      }
+      playbackAttempts.markFinalized(seg.id, baseRevision, finalized.playbackReceiptId);
+      return finalized.playbackReceiptId;
+    } catch (error) {
+      // Retire only a typed server attestation emitted before the receipt transaction commits. Every
+      // other failure is ambiguous and keeps the first immutable union for byte-identical replay.
+      if (isProvenUncommittedPlaybackFinalization(error)) {
+        playbackAttempts.resolve(seg.id, baseRevision);
+        reviewAudioPlayer?.restartPlaybackAuthority();
+      }
+      throw error;
+    }
+  }
 
   // Engines that actually produced this clip's draft, recorded (never inferred) and shown as an
   // honest provenance badge.
@@ -274,33 +533,11 @@
     }
   }
 
-  // The engine id (matching api.engineLabel) that the champion re-transcribe ACTUALLY runs: the
-  // configured primary model, read from settings — never assumed. Keeps the provenance badge honest
-  // if the user switched the primary away from the default 7B.
-  function primaryEngineId(): string {
-    const s = get(settings);
-    // Champion supremacy matches the Rust router: WSL7B always outranks the optional embedded MMS
-    // toggle. Only a non-champion local selection may be overridden by MMS.
-    if (s.asrModel === 'wsl-7b') return 'omniasr-wsl-7b';
-    if (s.useFinetuned) return 'finetuned-mms-ckb';
-    const map: Record<string, string> = {
-      'wsl-7b': 'omniasr-wsl-7b',
-      'ctc-1b': 'omniasr-ctc-1b',
-      'ctc-300m': 'omniasr-ctc-300m',
-    };
-    return map[s.asrModel] ?? 'omniasr-wsl-7b';
-  }
-
-  // Re-transcribe THIS clip with a chosen engine when the current draft is wrong. 'champion' routes
-  // through the configured primary engine (the OmniASR-7B Champion by default — needs its server up);
-  // 'finetuned' runs the embedded fine-tuned MMS-1B only in an explicitly selected non-champion mode.
+  // Re-transcribe this clip only through the production champion. The backend commits the new text
+  // and exact model/cloud provenance atomically; this UI only reloads that authoritative row.
   let retranscribing = $state(false);
-  function retranscribe(engine: 'champion' | 'finetuned') {
+  function retranscribe() {
     const seg = current;
-    // P2.3b: refuse while a batch/import is running. doRetranscribe writes rawTranscript, which is NOT
-    // in the targeted field-update whitelist, so it must whole-row upsert — and the store row is stale
-    // vs the DB during a batch, so it would revert the batch's writes. Re-transcribe is itself a machine
-    // op, so refusing it during another machine run is correct (matches the curate transcribe handlers).
     if (!seg || retranscribing || saving || aligning || $isProcessing) return;
     // Human review is authoritative. Reopen/undo it first; an ASR request never doubles as an implicit
     // destructive undo, even behind a confirmation dialog that could become stale during inference.
@@ -308,38 +545,18 @@
       notifications.info($t('asr.reopenBeforeRetranscribe'));
       return;
     }
-    void doRetranscribe(engine);
+    void doRetranscribe();
   }
-  async function doRetranscribe(engine: 'champion' | 'finetuned') {
+  async function doRetranscribe() {
     const seg = current;
-    // `aligning` too: the clip-load background align persists fresh CTC timings mid-flight; an
-    // upsert built from the pre-align snapshot would revert them (stale-spread clobber). `$isProcessing`
-    // (P2.3b): rawTranscript is not field-update-whitelisted so this must whole-row upsert, which would
-    // revert a concurrent batch's writes (the store is stale vs the DB during a batch) — refuse instead.
     if (!seg || retranscribing || saving || aligning || $isProcessing) return;
     retranscribing = true;
     try {
-      const result =
-        engine === 'finetuned'
-          ? await api.transcribeSegmentFinetuned(seg.audioPath, seg.alignmentJson)
-          : await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
+      const result = await api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id);
       const text = result.text;
-      let updated: SpeechSegment;
-      if (engine === 'champion') {
-        // The champion command commits server-side after all enabled refinement succeeds. Reload that
-        // authoritative row; never spread/upsert the UI snapshot captured before a long GPU call.
-        updated = await api.getSegment(seg.id);
-      } else {
-        // Optional non-champion tools are explicit local experiments and still return a draft for the
-        // existing update path. They are hidden entirely while production champion mode is selected.
-        updated = {
-          ...freshRow(seg.id, seg),
-          rawTranscript: result.rawTranscript,
-          normalizedTranscript: null,
-          verified: false,
-        };
-        await api.updateSegment(updated);
-      }
+      // The champion command commits server-side after all enabled refinement succeeds. Reload that
+      // authoritative row; never spread/upsert the UI snapshot captured before a long GPU call.
+      const updated = await api.getSegment(seg.id);
       segments.update((list) => list.map((s) => (s.id === seg.id ? updated : s)));
       reviewRows = reviewRows.map((s) => (s.id === seg.id ? updated : s));
       notifications.success($t('review.retranscribed'));
@@ -356,27 +573,21 @@
       // the clip id is unchanged, so the load effect must stay a no-op; resetting it would re-run
       // loadConsensus and wipe the provenance badge we set just below.
       lastLoadedOriginal = text;
-      // The owner just produced this draft with the chosen engine, so name it on the provenance badge
-      // immediately (honest — it's exactly what was used). A single-engine re-transcribe has no
-      // The fine-tuned button always runs the MMS-1B; the
-      // champion button runs the CONFIGURED primary engine (pipeline.transcribe), so read it from
-      // settings rather than assuming the 7B — otherwise a user who switched the primary would get a
-      // badge naming a model that never ran.
-      draftModels = [engine === 'finetuned' ? 'finetuned-mms-ckb' : primaryEngineId()];
+      // Use the provenance committed by the backend, never a UI-side model assumption.
+      draftModels = updated.modelVersionId ? [updated.modelVersionId] : [];
       await ensureWordTimings(updated);
     } catch (e) {
-      // Champion (7B) down: fail closed and retry only the champion. Optional engines require an
-      // explicit non-champion selection in Settings, never an in-flow downgrade prompt.
-      if (engine === 'champion' && api.is7bUnavailableError(e)) {
+      // Champion down: fail closed and retry only the champion. There is no in-flow downgrade.
+      if (api.is7bUnavailableError(e)) {
         showConfirmDialog.set({
           title: $t('asr.championUnavailableTitle'),
           message: $t('asr.championUnavailableMessage'),
           confirmLabel: $t('asr.tryAgain'),
           danger: false,
-          onConfirm: () => void doRetranscribe('champion'),
+          onConfirm: () => void doRetranscribe(),
         });
       } else {
-        notifications.error($t('review.retranscribeFailed'), { detail: String(e) });
+        notifications.error($t('review.retranscribeFailed'), { cause: e });
       }
     } finally {
       retranscribing = false;
@@ -389,28 +600,98 @@
   async function markBad() {
     const seg = current;
     if (!seg || saving || retranscribing || aligning) return;
+    if (draftAuthorityBlockedKey) {
+      notifications.error($t(draftAuthorityBlockedKey));
+      return;
+    }
+    if (dirty) {
+      // Rejecting clears the revision-bound recovery draft in the human-decision transaction. Never
+      // let Mark bad silently discard a correction that is still visible in the editor.
+      notifications.error($t('review.rejectDisabledEdited'));
+      return;
+    }
+    if (eligibilityBlocked) {
+      notifications.error(eligibilityReasonText(currentEligibility?.disabledReason));
+      return;
+    }
     // A verdict on audio nobody could hear is indistinguishable downstream from a real listen, and
     // this is a VERBATIM corpus. Refuse rather than record it (audit find 2026-08-17).
     if (audioError) {
       notifications.error($t('review.cannotDecideWithoutAudio'));
       return;
     }
+    const baseRevision = reviewRevisions[seg.id];
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      notifications.error($t('notifications.loadSegmentsFailed'));
+      void loadReviewPage(true);
+      return;
+    }
     // No blocking confirm (true-10 audit): 'x' is undoable via Backspace now, so a native
     // window.confirm per press only broke the keyboard flow.
     saving = true;
+    let commitIntent: ReviewCommitIntent;
     try {
-      undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
-      // recordHumanDecision FIRST so a validation failure aborts before updateSegment commits (same
-      // ordering rationale as submit()). freshRow AFTER it: same stale-spread rationale as submit().
-      await api.recordHumanDecision(seg.id, 'reject', null);
-      // P2.3b: targeted field update (verified is whitelisted) — no whole-row upsert of the batch-stale
-      // store row, which would revert a concurrent batch's writes to this segment.
-      await api.updateSegmentFields(seg.id, { verified: true });
-      segments.update((list) => list.map((s) => (s.id === seg.id ? { ...s, verified: true } : s)));
+      await flushActiveReviewDraft();
+      if (
+        current?.id !== seg.id ||
+        reviewRevisions[seg.id] !== baseRevision ||
+        draftAuthorityBlocked ||
+        dirty
+      ) {
+        notifications.error($t('inbox.status.draftChangedDuringSave'));
+        return;
+      }
+      // Same receipt the submit() path posts, for the same reason. A reject permanently removes
+      // a clip from the corpus, so it is a verdict on the audio exactly as much as an accept is.
+      const finalizedReceiptId = await finalizePlaybackAttempt(seg, baseRevision);
+      if (!finalizedReceiptId) return;
+      commitIntent = {
+        segmentId: seg.id,
+        baseRevision,
+        decision: 'reject',
+        transcript: null,
+        reasonCode: null,
+        playbackReceiptId: finalizedReceiptId,
+      };
+      const commit = await api.commitReviewV1({
+        operationId: commitOperations.idFor(commitIntent),
+        ...commitIntent,
+      });
+      const effectEventId = committedEffectId(seg.id, baseRevision, commit);
+      if (effectEventId === null) return;
+      commitOperations.resolve(commitIntent);
+      playbackAttempts.resolve(seg.id, baseRevision);
+      // Undo authority is the immutable database effect id, never this renderer's pre-save row.
+      // Push only after the atomic decision commits, so a failed decision cannot create a phantom undo.
+      undoHistory = [
+        ...undoHistory,
+        { id: seg.id, effectEventId, operationId: crypto.randomUUID() },
+      ];
+      segments.update((list) =>
+        list.map((stored) =>
+          stored.id === seg.id
+            ? {
+                ...stored,
+                verified: true,
+                verdict: 'human_reject',
+                humanDecision: 'reject',
+                verdictTranscript: commit.authoritativeTranscript,
+              }
+            : stored,
+        ),
+      );
       const visibleId = current?.id ?? null;
       reviewRows = reviewRows.filter((s) => s.id !== seg.id);
+      const remainingRevisions = { ...reviewRevisions };
+      delete remainingRevisions[seg.id];
+      reviewRevisions = remainingRevisions;
+      const remainingEligibility = { ...reviewEligibility };
+      delete remainingEligibility[seg.id];
+      reviewEligibility = remainingEligibility;
       reviewTotal = Math.max(0, reviewTotal - 1);
       void refreshSegmentStats();
+      editCache.delete(seg.id);
+      draftWrites.acknowledge({ kind: 'delete', segmentId: seg.id, baseRevision });
       notifications.success($t('review.markedBad'));
       if (visibleId === seg.id) advance();
       else {
@@ -418,17 +699,133 @@
         if (visibleIndex >= 0) index = visibleIndex;
       }
     } catch (e) {
-      undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
-      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      if (api.isCommandErrorV1(e, 'NO_PLAYBACK_EVIDENCE'))
+        notifications.error($t('review.mustListen'));
+      else {
+        notifications.error($t('notifications.saveFailed'));
+        if (api.isCommandErrorV1(e, 'STALE_REVISION')) {
+          // A typed error alone is not a non-commit attestation: the transaction may have committed
+          // before a later response-stage failure. Keep both exact retry ledgers until a verified
+          // commit response resolves them; the refreshed authoritative revision naturally prevents
+          // the old intent from being applied to a different row state.
+          void loadReviewPage(true);
+        }
+      }
     } finally {
       saving = false;
     }
   }
 
-  // True-10 audit: in-loop undo. The global Ctrl+Z only reverts update_segment (not the human
-  // decision), leaving split state; this mirrors the inbox instead — clear the decision AND restore
-  // the pre-decision segment in one action, then re-land the cursor on the undone clip.
-  let undoHistory = $state<{ id: string; prev: SpeechSegment }[]>([]);
+  function isMarkedUnusableResponse(
+    response: api.MarkedSegmentUnusableV1,
+    request: api.MarkSegmentUnusableRequestV1,
+  ): boolean {
+    return (
+      response.segmentId === request.segmentId &&
+      response.committedRevision === request.baseRevision + 1 &&
+      response.reason === request.reason &&
+      /^flag-effect:[1-9][0-9]*$/.test(response.effectId)
+    );
+  }
+
+  /**
+   * Record a technical media disposition, never a human transcript verdict. This path deliberately
+   * does not finalize or submit playback evidence: a missing/undecodable file cannot produce honest
+   * listening proof. The exact operation id is retained across an uncertain response so Retry cannot
+   * duplicate the durable effect or silently switch reasons.
+   */
+  async function markTechnicallyUnusable() {
+    const seg = current;
+    const reason = technicalUnusableReason;
+    if (!seg || !audioError || !reason || saving || retranscribing || aligning) return;
+    if (draftAuthorityBlockedKey) {
+      notifications.error($t(draftAuthorityBlockedKey));
+      return;
+    }
+    if (dirty) {
+      notifications.error($t('review.rejectDisabledEdited'));
+      return;
+    }
+    const baseRevision = reviewRevisions[seg.id];
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      notifications.error($t('review.unusable.authorityMissing'));
+      return;
+    }
+    const matchingIntent =
+      technicalUnusableIntent?.segmentId === seg.id &&
+      technicalUnusableIntent.baseRevision === baseRevision &&
+      technicalUnusableIntent.reason === reason
+        ? technicalUnusableIntent
+        : null;
+    const request: api.MarkSegmentUnusableRequestV1 = matchingIntent ?? {
+      operationId: crypto.randomUUID(),
+      segmentId: seg.id,
+      baseRevision,
+      reason,
+    };
+    technicalUnusableIntent = request;
+    saving = true;
+    try {
+      await flushActiveReviewDraft();
+      if (
+        current?.id !== seg.id ||
+        reviewRevisions[seg.id] !== baseRevision ||
+        technicalUnusableReason !== reason ||
+        draftAuthorityBlocked ||
+        dirty
+      ) {
+        notifications.error($t('inbox.status.draftChangedDuringSave'));
+        return;
+      }
+      const response = await api.markSegmentUnusableV1(request);
+      if (!isMarkedUnusableResponse(response, request)) {
+        notifications.error($t('review.unusable.invalidResponse'));
+        return;
+      }
+      technicalUnusableIntent = null;
+      const visibleId = current?.id ?? null;
+      if (visibleId === seg.id) {
+        // The backend deleted this exact revision's crash-safe draft in the SAME transaction. Make
+        // the outgoing-clip effect see a clean baseline so it cannot enqueue a post-commit re-save.
+        lastLoadedOriginal = editText;
+      }
+      segments.update((list) =>
+        list.map((stored) =>
+          stored.id === seg.id ? { ...stored, escalated: true, verified: false } : stored,
+        ),
+      );
+      reviewRows = reviewRows.filter((row) => row.id !== seg.id);
+      const remainingRevisions = { ...reviewRevisions };
+      delete remainingRevisions[seg.id];
+      reviewRevisions = remainingRevisions;
+      const remainingEligibility = { ...reviewEligibility };
+      delete remainingEligibility[seg.id];
+      reviewEligibility = remainingEligibility;
+      hydratedReviewIds = new Set([...hydratedReviewIds].filter((id) => id !== seg.id));
+      reviewTotal = Math.max(0, reviewTotal - 1);
+      editCache.delete(seg.id);
+      draftWrites.acknowledge({ kind: 'delete', segmentId: seg.id, baseRevision });
+      void refreshSegmentStats();
+      notifications.success($t('review.unusable.marked'));
+      if (visibleId === seg.id) advance();
+      else {
+        const visibleIndex = visibleId ? queue.findIndex((row) => row.id === visibleId) : -1;
+        if (visibleIndex >= 0) index = visibleIndex;
+      }
+    } catch (error) {
+      notifications.error($t('review.unusable.markFailed'), {
+        cause: error,
+        publicDetail: api.reviewErrorMessage(error, $t('review.unusable.markFailedHint')),
+      });
+    } finally {
+      saving = false;
+    }
+  }
+
+  // The server owns the pre-decision snapshot. The renderer retains only the immutable effect id and
+  // one stable operation UUID, so a retry after a lost response is idempotent and cannot restore
+  // attacker-controlled or stale segment fields.
+  let undoHistory = $state<{ id: string; effectEventId: number; operationId: string }[]>([]);
 
   async function undoLast() {
     const last = undoHistory[undoHistory.length - 1];
@@ -436,26 +833,51 @@
     saving = true;
     undoHistory = undoHistory.slice(0, -1);
     try {
-      // LOSSLESS restore (2026-07-15 fix, reproduced in db::tests::redecision_undo_...): the old
-      // clearHumanDecision + updateSegment pair NULLed a PRIOR decision when undoing a REdecision,
-      // because updateSegment deliberately omits the decision columns. restoreSegmentSnapshot writes
-      // the whole pre-save snapshot — prior decision, verdict fields, escalation state and all — so
-      // undo returns the row to its exact pre-decision state in one atomic upsert.
-      await api.restoreSegmentSnapshot(last.prev);
-      segments.update((list) => list.map((s) => (s.id === last.id ? last.prev : s)));
-      if (!reviewRows.some((s) => s.id === last.id)) reviewRows = [last.prev, ...reviewRows];
-      else reviewRows = reviewRows.map((s) => (s.id === last.id ? last.prev : s));
-      hydratedReviewIds = new Set([...hydratedReviewIds, last.id]);
-      reviewTotal += 1;
-      void refreshSegmentStats();
+      const outcome = await api.undoHumanDecision(last.effectEventId, last.operationId);
+      if (outcome.status === 'conflict') {
+        // Nothing was undone. Preserve the immutable token so the conflict cannot silently erase the
+        // only retry/inspection handle for this exact decision.
+        undoHistory = [...undoHistory, last];
+        notifications.error($t('review.undoFailed'), {
+          publicDetail: $t('inbox.error.undoDecisionConflict'),
+        });
+        return;
+      }
+      const restored = outcome.segment;
+      reviewRevisions = { ...reviewRevisions, [last.id]: outcome.restoredRevision };
+      reviewEligibility = {
+        ...reviewEligibility,
+        [last.id]: {
+          eligible: !isPlaceholderTranscript(restored.rawTranscript),
+          disabledReason: isPlaceholderTranscript(restored.rawTranscript)
+            ? 'TRANSCRIPT_NOT_READY'
+            : null,
+        },
+      };
+      // The same segment id may re-enter the queue immediately. Force the load effect to consume the
+      // authoritative restored fields instead of treating that id as the already-loaded decided row.
       editCache.delete(last.id);
+      if (lastLoadedId === last.id) lastLoadedId = null;
+      segments.update((list) => list.map((s) => (s.id === last.id ? restored : s)));
+      const wasPending = reviewRows.some((s) => s.id === last.id);
+      if (!restored.verified) {
+        reviewRows = wasPending
+          ? reviewRows.map((s) => (s.id === last.id ? restored : s))
+          : [restored, ...reviewRows];
+        if (!wasPending) reviewTotal += 1;
+      } else if (wasPending) {
+        reviewRows = reviewRows.filter((s) => s.id !== last.id);
+        reviewTotal = Math.max(0, reviewTotal - 1);
+      }
+      hydratedReviewIds = new Set([...hydratedReviewIds, last.id]);
+      void refreshSegmentStats();
       const idx = queue.findIndex((s) => s.id === last.id);
       if (idx >= 0) index = idx;
       notifications.success($t('review.undone'));
     } catch (e) {
       // Not undone — put the entry back so the undo stays retryable.
       undoHistory = [...undoHistory, last];
-      notifications.error($t('review.undoFailed'), { detail: String(e) });
+      notifications.error($t('review.undoFailed'), { cause: e });
     } finally {
       saving = false;
     }
@@ -475,7 +897,7 @@
       const result = await api.runT2ForSegment(seg.id, $settings.llmApiKey);
       cloudCheck = { id: seg.id, result };
     } catch (e) {
-      notifications.error($t('review.cloudCheckFailed'), { detail: String(e) });
+      notifications.error($t('review.cloudCheckFailed'), { cause: e });
     } finally {
       cloudChecking = false;
     }
@@ -505,19 +927,13 @@
       : currentTime,
   );
 
-  // "Play exact words": when word timings exist, bound playback to the spoken span (first word →
-  // last word, small pad) so Play hears the words, not the silence/music the VAD chunk padded around
-  // them. Falls back to the whole clip when there are no word timings yet.
+  // The primary decision playback covers the complete database segment. Word chips can temporarily
+  // narrow playback, but accepting a clip requires hearing the same full source span the backend
+  // hashes and evaluates; silently skipping VAD padding could make an honest 85% receipt impossible
+  // or hide a defect in the omitted audio.
   const SPOKEN_PAD = 0.12;
-  const hasWords = $derived(words.length > 0 && range.endTime > range.startTime);
-  const playStart = $derived(
-    hasWords ? range.startTime + Math.max(0, words[0].start - SPOKEN_PAD) : range.startTime,
-  );
-  const playEnd = $derived(
-    hasWords
-      ? range.startTime + Math.min(clipLength, words[words.length - 1].end + SPOKEN_PAD)
-      : range.endTime,
-  );
+  const playStart = $derived(range.startTime);
+  const playEnd = $derived(range.endTime);
 
   // Lazily compute + PERSIST forced-alignment word timings the first time a clip is opened without
   // them, so the spoken-span playback + tap-a-word strip light up for the whole existing backlog
@@ -561,17 +977,10 @@
 
   function originalText(seg: SpeechSegment): string {
     // VERBATIM LAW (2026-08-12): the reviewer corrects the human draft else the champion's verbatim
-    // output — never the LLM-refined paraphrase column.
-    return seg.annotatedTranscript ?? seg.rawTranscript ?? '';
-  }
-
-  // Rebuild an upsert payload from the FRESHEST store copy of the row. update_segment writes the
-  // WHOLE row (insert_segment ON CONFLICT — including alignment_json and alignment_quality), so
-  // spreading a segment captured before a multi-second await lets the background aligner's freshly
-  // persisted CTC timings be silently reverted by the stale copy. ensureWordTimings reloads the
-  // store right after it persists, so re-reading by id at persist time carries those columns.
-  function freshRow(id: string, fallback: SpeechSegment): SpeechSegment {
-    return get(segments).find((s) => s.id === id) ?? fallback;
+    // output — never the LLM-refined paraphrase column. A BLANK annotated column is ABSENT, not a
+    // human draft: `??` only falls through on null, so an empty/whitespace annotated row masked the
+    // champion raw draft and served the reviewer an empty editor (canon: human ▸ annotated ▸ raw).
+    return seg.annotatedTranscript?.trim() ? seg.annotatedTranscript : (seg.rawTranscript ?? '');
   }
 
   // Plain (non-reactive) cache of in-progress edits keyed by segment id, so switching clips — via
@@ -579,22 +988,159 @@
   // correction. Cleared per id on a successful save.
   const editCache = new Map<string, string>();
   let lastLoadedOriginal = '';
+  let lastLoadedRevision: number | null = null;
+  let draftReadyId = $state<string | null>(null);
+  let draftConflict = $state<ReviewDraftV1 | null>(null);
+  let draftLoadError = $state<string | null>(null);
+  let draftRecovered = $state(false);
+  let draftSaving = $state(false);
+  let draftSaveFailed = $state(false);
+  let draftLoadSeq = 0;
+  const draftWrites = new ReviewDraftWriteCoordinator({
+    save: api.saveReviewDraftV1,
+    delete: api.deleteReviewDraftV1,
+    onStateChange: (segmentId) => {
+      if (current?.id === segmentId) draftSaving = draftWrites.isWriting(segmentId);
+    },
+    onWriteSucceeded: (intent) => {
+      if (current?.id === intent.segmentId && !draftWrites.hasDesired(intent.segmentId)) {
+        draftSaveFailed = false;
+      }
+    },
+    onWriteFailed: (intent, error) => {
+      if (current?.id !== intent.segmentId) return;
+      draftSaveFailed = true;
+      notifications.error($t('review.draftSaveFailed'), {
+        cause: error,
+        publicDetail: api.reviewErrorMessage(error, $t('review.draftSaveFailedHint')),
+      });
+    },
+  });
+  const draftAuthorityBlockedKey = $derived<TranslationKey | null>(
+    !current
+      ? null
+      : draftLoadError
+        ? 'inbox.disabled.draftUnavailable'
+        : draftReadyId !== current.id
+          ? 'inbox.disabled.draftLoading'
+          : draftConflict
+            ? 'inbox.disabled.draftConflict'
+            : null,
+  );
+  const draftAuthorityBlocked = $derived(draftAuthorityBlockedKey !== null);
+  const decisionBlocked = $derived(
+    eligibilityBlocked || audioError !== null || draftAuthorityBlocked,
+  );
+
+  function draftIntent(
+    segmentId: string,
+    baseRevision: number,
+    text: string,
+    original: string,
+  ): RevisionBoundReviewDraftIntent {
+    return text.trim() === original.trim()
+      ? { kind: 'delete', segmentId, baseRevision }
+      : { kind: 'save', segmentId, baseRevision, text };
+  }
+
+  function queueDraftWrite(
+    segmentId: string,
+    baseRevision: number,
+    text: string,
+    original: string,
+  ): Promise<void> {
+    return draftWrites.request(draftIntent(segmentId, baseRevision, text, original));
+  }
+
+  async function loadReviewDraft(seg: SpeechSegment, baseRevision: number, baseline: string) {
+    const seq = ++draftLoadSeq;
+    try {
+      // A fast A -> B -> A navigation can return while A's outgoing draft write is still queued.
+      // Reading before that chain settles can recover the older database value, overwrite the newer
+      // session edit, and then debounce the stale text back over the durable draft. Serialize the read
+      // behind this segment's exact pending chain; a failed write keeps authority blocked below.
+      await draftWrites.flushSegment(seg.id);
+      const draft = await api.getReviewDraftV1(seg.id);
+      if (seq !== draftLoadSeq || current?.id !== seg.id) return;
+      draftConflict = null;
+      draftRecovered = false;
+      draftSaveFailed = false;
+      draftLoadError = null;
+      if (!draft) {
+        draftWrites.acknowledge({ kind: 'delete', segmentId: seg.id, baseRevision });
+      } else if (draft.segmentId !== seg.id) {
+        // A malformed or stale IPC response must never place another clip's human text in this editor.
+        // Treat response identity exactly like commit identity: fail closed and require a fresh read.
+        throw new Error($t('inbox.error.draftIdentityMismatch'));
+      } else if (draft.baseRevision === baseRevision && editText === baseline) {
+        // Session memory can be newer than the last durable debounce (for example after a very fast
+        // navigation round-trip). Never replace non-server editor text with a different persisted
+        // candidate. Keep both visible and require the reviewer to choose.
+        if (baseline !== lastLoadedOriginal && draft.text !== baseline) {
+          draftConflict = draft;
+        } else {
+          editCache.set(seg.id, draft.text);
+          draftWrites.acknowledge({
+            kind: 'save',
+            segmentId: seg.id,
+            baseRevision,
+            text: draft.text,
+          });
+          editText = draft.text;
+          draftRecovered = draft.text.trim() !== baseline.trim();
+        }
+      } else {
+        // Never merge human text automatically. Server truth remains in the editor and the persisted
+        // local draft is shown beside it for an explicit reviewer choice.
+        draftConflict = draft;
+      }
+      draftReadyId = seg.id;
+    } catch (error) {
+      if (seq !== draftLoadSeq || current?.id !== seg.id) return;
+      draftReadyId = null;
+      draftLoadError = formatPublicErrorReference(error) ?? $t('errors.unknown');
+      notifications.error($t('review.draftLoadFailed'), {
+        cause: error,
+        publicDetail: api.reviewErrorMessage(error, $t('review.draftLoadFailedHint')),
+      });
+    }
+  }
 
   // Load the editable text + waveform whenever the current clip changes.
   $effect(() => {
     const seg = current;
-    if (!seg || seg.id === lastLoadedId) return;
+    const revision = seg ? (reviewRevisions[seg.id] ?? null) : null;
+    if (!seg || (seg.id === lastLoadedId && revision === lastLoadedRevision)) return;
     // Stash the OUTGOING clip's unsaved edit before we switch away — but if the user reverted it back
     // to the original, DROP any previously-cached edit so a discarded correction can't resurrect.
     if (lastLoadedId) {
+      const outgoingDraftReadable = draftReadyId === lastLoadedId && draftLoadError === null;
       if (editText.trim() !== lastLoadedOriginal.trim()) {
         editCache.set(lastLoadedId, editText);
       } else {
         editCache.delete(lastLoadedId);
       }
+      // A pending/failed read may hide an existing human draft. Never turn navigation into an
+      // authority-free delete of that unseen row. An unresolved stale-revision conflict is already
+      // durable; write only when the reviewer has also typed a distinct current-revision candidate.
+      if (
+        lastLoadedRevision !== null &&
+        outgoingDraftReadable &&
+        (!draftConflict || editText.trim() !== lastLoadedOriginal.trim())
+      ) {
+        void queueDraftWrite(lastLoadedId, lastLoadedRevision, editText, lastLoadedOriginal).catch(
+          () => undefined,
+        );
+      }
     }
+    draftReadyId = null;
+    draftConflict = null;
+    draftLoadError = null;
+    draftRecovered = false;
+    draftSaveFailed = false;
     lastLoadedId = seg.id;
     lastLoadedOriginal = originalText(seg);
+    lastLoadedRevision = revision;
     editText = editCache.get(seg.id) ?? lastLoadedOriginal;
     currentTime = 0;
     playing = false;
@@ -603,7 +1149,80 @@
     loadWaveform(seg);
     void ensureWordTimings(seg);
     void loadConsensus(seg);
+    if (lastLoadedRevision !== null) void loadReviewDraft(seg, lastLoadedRevision, editText);
   });
+
+  // Persist active edits after a short quiet period. Clip changes flush immediately above; the
+  // backend revision-checks each write so a late autosave cannot resurrect a cleared old draft.
+  $effect(() => {
+    const seg = current;
+    const text = editText;
+    const original = lastLoadedOriginal;
+    const baseRevision = lastLoadedRevision;
+    if (!seg || draftReadyId !== seg.id || baseRevision === null) return;
+    if (draftWrites.isDurable(draftIntent(seg.id, baseRevision, text, original))) return;
+    const timer = window.setTimeout(() => {
+      void queueDraftWrite(seg.id, baseRevision, text, original).catch(() => undefined);
+    }, 500);
+    return () => window.clearTimeout(timer);
+  });
+
+  async function flushActiveReviewDraft(): Promise<void> {
+    if (lastLoadedId && (draftReadyId !== lastLoadedId || draftLoadError !== null)) {
+      throw new Error($t('inbox.disabled.draftUnavailable'));
+    }
+    if (lastLoadedId && lastLoadedRevision !== null) {
+      // A conflict row is already crash-safe. Do not delete it merely because the server baseline is
+      // still visible; only a distinct new edit is safe to publish under the current revision.
+      if (!draftConflict || editText.trim() !== lastLoadedOriginal.trim()) {
+        await queueDraftWrite(lastLoadedId, lastLoadedRevision, editText, lastLoadedOriginal);
+      }
+    }
+    await draftWrites.flushAll();
+  }
+
+  const unregisterDraftFlusher = registerReviewDraftFlusher(flushActiveReviewDraft);
+  onDestroy(() => {
+    // Native close awaits this same barrier from App before destruction. This fallback covers
+    // ordinary component navigation; it cannot make teardown await, so errors remain visible through
+    // the registered close path and the durable draft status already rendered in this workspace.
+    void flushActiveReviewDraft().catch(() => undefined);
+    unregisterDraftFlusher();
+  });
+
+  function useConflictingDraft() {
+    if (!current || !draftConflict) return;
+    editText = draftConflict.text;
+    editCache.set(current.id, draftConflict.text);
+    draftConflict = null;
+    draftRecovered = true;
+  }
+
+  async function retryReviewDraftLoad() {
+    const seg = current;
+    const revision = seg ? reviewRevisions[seg.id] : undefined;
+    if (!seg || !Number.isSafeInteger(revision) || (revision ?? -1) < 0) return;
+    draftReadyId = null;
+    draftLoadError = null;
+    await loadReviewDraft(seg, revision as number, editText);
+  }
+
+  async function discardConflictingDraft() {
+    const conflict = draftConflict;
+    if (!current || !conflict) return;
+    try {
+      await api.deleteReviewDraftV1(current.id, conflict.baseRevision);
+      if (current?.id === conflict.segmentId) {
+        draftConflict = null;
+        draftRecovered = false;
+      }
+    } catch (error) {
+      notifications.error($t('review.draftDiscardFailed'), {
+        cause: error,
+        publicDetail: api.reviewErrorMessage(error, $t('review.draftDiscardFailed')),
+      });
+    }
+  }
 
   // Drop a stale getWaveform response: switching clips A -> B while A's decode (up to ~30 s for a large
   // source) is still in flight must NOT let A's later-resolving waveform overwrite B's. Last-call-wins via
@@ -624,8 +1243,8 @@
       // failure-looking-like-success class the read guards in commands.ts exist for, and the reviewer
       // may then verify a clip they never actually saw the shape of.
       waveformData = [];
-      waveformError = String(e);
-      notifications.error($t('review.waveformFailed'), { detail: waveformError });
+      waveformError = formatPublicErrorReference(e) ?? $t('errors.unknown');
+      notifications.error($t('review.waveformFailed'), { cause: e });
     }
   }
 
@@ -638,6 +1257,20 @@
     // pre-retranscribe draft that the in-flight run is about to overwrite — the human "accept" would
     // land on text the reviewer no longer sees.
     if (!seg || saving || retranscribing || aligning) return;
+    if (draftAuthorityBlockedKey) {
+      notifications.error($t(draftAuthorityBlockedKey));
+      return;
+    }
+    if (eligibilityBlocked) {
+      notifications.error(eligibilityReasonText(currentEligibility?.disabledReason));
+      return;
+    }
+    if (acceptAsIs && dirty) {
+      // Accept is only the unchanged fast path. Substituting `original` here used to discard the typed
+      // correction, clear its durable draft, and certify text the reviewer had just changed.
+      notifications.error($t('review.acceptDisabledEdited'));
+      return;
+    }
     // Same refusal as markBad: an unheard verdict is worse than no verdict in a VERBATIM corpus.
     // Same refusal as markBad: an unheard verdict is worse than no verdict in a VERBATIM corpus.
     if (audioError) {
@@ -661,34 +1294,75 @@
     // Map to a real human decision: an actual change is an "edit" (the typed text becomes gold), a
     // no-change save is an "accept".
     const isEdit = !acceptAsIs && text !== original;
+    const baseRevision = reviewRevisions[seg.id];
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      saving = false;
+      notifications.error($t('notifications.loadSegmentsFailed'));
+      void loadReviewPage(true);
+      return;
+    }
+    let commitIntent: ReviewCommitIntent;
     try {
-      undoHistory = [...undoHistory, { id: seg.id, prev: { ...seg } }];
-      // BOTH calls are required, recordHumanDecision FIRST: it validates the decision (an empty edit
-      // throws here) so a failure aborts BEFORE updateSegment commits — no split state where the clip
-      // is `verified` with no human_decision (or a blanked transcript). recordHumanDecision records the
-      // human_decision (so the jury never re-adjudicates) + feeds the learning flywheel; updateSegment
-      // marks `verified` (queue/progress advance) and writes annotated_transcript where the editor +
-      // FTS search read it. If updateSegment fails after recordHumanDecision, the clip stays unverified
-      // (in the queue) and re-review self-heals it.
+      // The typed decision is not a substitute for crash-safe draft durability. Persist the exact
+      // visible editor first so a transport loss or process death cannot erase the correction while
+      // the authoritative transaction is still unknown.
+      await flushActiveReviewDraft();
+      const visibleText = acceptAsIs ? originalText(current ?? seg).trim() : editText.trim();
+      if (
+        current?.id !== seg.id ||
+        reviewRevisions[seg.id] !== baseRevision ||
+        visibleText !== text ||
+        (acceptAsIs && dirty) ||
+        draftAuthorityBlocked
+      ) {
+        notifications.error($t('inbox.status.draftChangedDuringSave'));
+        return;
+      }
       // Accept-what-you-SEE: pass the displayed text even on accept so verdict_transcript (the
       // COALESCE-preferred gold source) becomes exactly what the human approved. Passing null let an
       // UNSEEN jury verdict_transcript survive and get exported as human-verified gold. For an edit the
       // typed text is the label; for an accept the displayed original is. (Backend only captures a
       // LOOP-0 memory / ledger row on 'edit', so an accept with text stays a pure verdict overwrite.)
-      await api.recordHumanDecision(seg.id, isEdit ? 'edit' : 'accept', text);
-      // Build the upsert AFTER the slow decision call (whole-file hash on 'edit' takes hundreds of
-      // ms) from the freshest store row: update_segment writes the whole row, so a pre-await spread
-      // would revert timings the background aligner persisted inside that window.
-      // P2.3b (audit F2 completeness): persist ONLY the whitelisted fields via the targeted field
-      // update — never a whole-row updateSegment of freshRow (the STORE row), which is stale vs the DB
-      // while a background batch (normalize/transcribe/rediarize) writes this segment on its own
-      // connection, so the upsert reverted the batch's freshly-written columns. A field update touches
-      // only annotatedTranscript + verified (both whitelisted), so it is clobber-safe vs a batch AND an
-      // aligner. The backend re-reads the fresh row under the db lock (no TOCTOU).
-      await api.updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true });
+      // Post the listening receipt BEFORE the verdict. The backend resolves this segment's
+      // revision and canonical decoded-PCM content hash itself and refuses a verdict without sufficient evidence, so
+      // a decision recorded on a clip nobody heard becomes impossible rather than merely discouraged.
+      // A failed receipt finalization aborts this save while the draft, clip, focus and audio state
+      // remain in place. Continuing with ambient or missing evidence would make the typed receipt
+      // field decorative rather than an authorization boundary.
+      const finalizedReceiptId = await finalizePlaybackAttempt(seg, baseRevision);
+      if (!finalizedReceiptId) return;
+      commitIntent = {
+        segmentId: seg.id,
+        baseRevision,
+        decision: isEdit ? 'edit' : 'accept',
+        transcript: text,
+        reasonCode: null,
+        playbackReceiptId: finalizedReceiptId,
+      };
+      const commit = await api.commitReviewV1({
+        operationId: commitOperations.idFor(commitIntent),
+        ...commitIntent,
+      });
+      const effectEventId = committedEffectId(seg.id, baseRevision, commit);
+      if (effectEventId === null) return;
+      commitOperations.resolve(commitIntent);
+      playbackAttempts.resolve(seg.id, baseRevision);
+      undoHistory = [
+        ...undoHistory,
+        { id: seg.id, effectEventId, operationId: crypto.randomUUID() },
+      ];
       segments.update((list) =>
-        list.map((s) =>
-          s.id === seg.id ? { ...s, annotatedTranscript: text, verified: true } : s,
+        list.map((stored) =>
+          stored.id === seg.id
+            ? {
+                ...stored,
+                verified: true,
+                verdictTranscript: commit.authoritativeTranscript,
+                annotatedTranscript: isEdit
+                  ? commit.authoritativeTranscript
+                  : stored.annotatedTranscript,
+              }
+            : stored,
         ),
       );
       // Capture navigation state BEFORE removing the saved row. Once it is filtered out, `current`
@@ -701,9 +1375,16 @@
         editedChips = {};
       }
       reviewRows = reviewRows.filter((s) => s.id !== seg.id);
+      const remainingRevisions = { ...reviewRevisions };
+      delete remainingRevisions[seg.id];
+      reviewRevisions = remainingRevisions;
+      const remainingEligibility = { ...reviewEligibility };
+      delete remainingEligibility[seg.id];
+      reviewEligibility = remainingEligibility;
       reviewTotal = Math.max(0, reviewTotal - 1);
       void refreshSegmentStats();
       editCache.delete(seg.id); // persisted — drop the in-progress copy
+      draftWrites.acknowledge({ kind: 'delete', segmentId: seg.id, baseRevision });
       notifications.success($t('saved'));
       // If the reviewer really navigated during the slow decision call, keep that clip selected after
       // the removal shifted array indices and never copy seg's editor state into it.
@@ -714,8 +1395,14 @@
       }
       advance();
     } catch (e) {
-      undoHistory = undoHistory.slice(0, -1); // the decision did not persist — drop the phantom entry
-      notifications.error($t('notifications.saveFailed'), { detail: String(e) });
+      if (api.isCommandErrorV1(e, 'NO_PLAYBACK_EVIDENCE'))
+        notifications.error($t('review.mustListen'));
+      else {
+        notifications.error($t('notifications.saveFailed'));
+        if (api.isCommandErrorV1(e, 'STALE_REVISION')) {
+          void loadReviewPage(true);
+        }
+      }
     } finally {
       saving = false;
     }
@@ -730,44 +1417,25 @@
     index = nextPending >= 0 ? nextPending : -1;
   }
   async function go(delta: number) {
+    if (current && (draftReadyId !== current.id || draftLoadError !== null)) {
+      notifications.error(
+        $t(draftLoadError ? 'inbox.disabled.draftUnavailable' : 'inbox.disabled.draftLoading'),
+      );
+      return;
+    }
     const target = Math.max(0, Math.min(queue.length - 1, index + delta));
     if (target === index) return;
-    // Persist any unsaved edit as a DRAFT before navigating, so the load $effect can't silently discard
-    // the reviewer's typed corrections when `current` changes. Navigation is not a verify, so the
-    // segment's `verified` state is left untouched; the edit is recoverable and Reset still discards it.
-    // A CLEARED textarea is dirty too but must NOT be drafted: persisting annotatedTranscript=''
-    // blanks the gold transcript with no undo entry (submit() refuses the same state). The cleared
-    // text survives in editCache for this session, so nothing is lost by skipping the persist.
-    // P2.3b: persist the navigation DRAFT via the targeted field update (annotatedTranscript only). The
-    // old whole-row updateSegment of the store row reverted a concurrent batch's writes to this segment
-    // (batch-stale store), and needed a `!aligning` skip to avoid reverting the aligner's timings too. A
-    // field update never touches alignmentJson, so it is clobber-safe vs BOTH a batch and an in-flight
-    // aligner — no `aligning` skip needed, and the draft is persisted immediately rather than deferred to
-    // the unmount flush / editCache.
-    if (dirty && current && !saving && editText.trim()) {
-      const seg = current;
-      const text = editText.trim();
-      saving = true;
-      try {
-        await api.updateSegmentFields(seg.id, { annotatedTranscript: text });
-        segments.update((list) =>
-          list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
-        );
-        reviewRows = reviewRows.map((s) =>
-          s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
-        );
-      } catch (e) {
-        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-      } finally {
-        saving = false;
-      }
-    }
+    // Navigation never writes review truth. The selection effect below keeps the outgoing edit in the
+    // session-local editCache and restores it when the reviewer returns; only submit() may durably
+    // commit transcript text together with its immutable human-decision effect.
     const targetRow = queue[target];
     if (targetRow) {
       try {
         await hydrateReviewRow(targetRow.id);
       } catch (error) {
-        notifications.error($t('notifications.loadSegmentsFailed'), { detail: String(error) });
+        notifications.error($t('notifications.loadSegmentsFailed'), {
+          cause: error,
+        });
         return;
       }
     }
@@ -777,38 +1445,6 @@
     if (current) editText = originalText(current);
     editedChips = {}; // revert the chip overlay too, so it can't claim a fix the reset gold lacks
   }
-
-  // Unmount flush (true-10 audit): editCache is component-local, so leaving review mode via the
-  // ActivityRail destroyed any in-progress correction with zero warning — the same data-loss class
-  // the curate autosave work eliminated. Persist the dirty edit as a DRAFT on teardown, exactly like
-  // go() does on navigation (annotatedTranscript only — never verified, so it is not a decision).
-  // Root-level $effect: its teardown runs once, on component destroy.
-  $effect(() => {
-    return () => {
-      const seg = current;
-      // The empty-edit guard mirrors go() and submit(): a cleared textarea on teardown must not
-      // persist annotatedTranscript='' and blank the gold transcript with no undo entry.
-      if (!seg || !dirty || saving || !editText.trim()) return;
-      const text = editText.trim();
-      // P2.3 (audit F2): persist ONLY annotatedTranscript via the TARGETED field update — never the
-      // whole-row updateSegment. The old whole-row draft spread the (possibly pre-align) store row, so
-      // if a background CTC alignment finished after teardown its real timings were reverted (the
-      // whole-row-clobber class). A field update never touches alignmentJson, so it is clobber-safe
-      // even mid-align and needs NO `aligning` guard — which would instead LOSE this edit, since
-      // editCache dies with the component and teardown cannot re-stash it.
-      segments.update((list) =>
-        list.map((s) => (s.id === seg.id ? { ...s, annotatedTranscript: text } : s)),
-      );
-      reviewRows = reviewRows.map((s) =>
-        s.id === seg.id ? { ...s, annotatedTranscript: text } : s,
-      );
-      // Fire-and-forget: teardown cannot await. Surface a failure — the notification store outlives
-      // this component — so a lost draft is never silent.
-      api.updateSegmentFields(seg.id, { annotatedTranscript: text }).catch((e) => {
-        notifications.error($t('notifications.saveFailed'), { detail: String(e) });
-      });
-    };
-  });
 
   // Transient word-bounded playback window. While set, the player plays exactly
   // [wordStartOverride, wordEndOverride] — so tapping a word plays THAT word (and Loop loops that
@@ -833,16 +1469,6 @@
   // Accept-as-is / undo never revert to a chip that claims a fix the gold transcript lacks.
   let editedChips = $state<Record<number, string>>({});
   const chipText = (w: WordTimestamp, i: number) => editedChips[i] ?? w.word;
-
-  // The word-strip container, so an explicit close (Enter/Escape) can restore focus to the chip
-  // (WCAG 2.4.3 — a removed <input> otherwise drops focus to <body>). NOT called on blur: a Tab/click
-  // away already moved focus correctly, and yanking it back would fight the reviewer.
-  let stripEl = $state<HTMLElement | undefined>();
-  function refocusChip(i: number) {
-    void tick().then(() =>
-      stripEl?.querySelector<HTMLButtonElement>(`[data-chip="${i}"]`)?.focus(),
-    );
-  }
 
   // Single tap / Enter / Space on a word chip = hear EXACTLY that word. Listen-only: it never opens
   // an input or steals keyboard focus, so the single-key review flow keeps working. Word times are
@@ -895,11 +1521,6 @@
     if (editingWordIndex === i) editingWordIndex = null;
   }
 
-  function focusOnMount(node: HTMLInputElement) {
-    node.focus();
-    node.select();
-  }
-
   // editWord: select THAT word in the transcript textarea (never rewrites it) — the safe fallback
   // when an inline edit can't be located confidently. Prefer the i-th editor token when it still
   // matches, else the first exact match, else just focus.
@@ -918,7 +1539,7 @@
     if (target) editEl.setSelectionRange(target.start, target.start + target.len);
   }
   function replay() {
-    clearWordOverride(); // replay the WHOLE spoken span, not a stale tapped-word window
+    clearWordOverride(); // replay the WHOLE segment, not a stale tapped-word window
     currentTime = playStart;
     playing = true;
   }
@@ -953,7 +1574,11 @@
     }
     const el = e.target as HTMLElement | null;
     const typing =
-      !!el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable);
+      !!el &&
+      (el.tagName === 'TEXTAREA' ||
+        el.tagName === 'INPUT' ||
+        el.tagName === 'SELECT' ||
+        el.isContentEditable);
     if (typing) {
       // Escape drops focus so the single-key review shortcuts resume; otherwise let typing through.
       if (e.key === 'Escape') {
@@ -995,11 +1620,13 @@
         break;
       case 'n':
       case 'ArrowRight':
+      case 'ArrowDown':
         e.preventDefault();
         void go(1);
         break;
       case 'p':
       case 'ArrowLeft':
+      case 'ArrowUp':
         e.preventDefault();
         void go(-1);
         break;
@@ -1046,7 +1673,11 @@
       <EmptyState
         variant="empty"
         title={$t('review.allDone')}
-        description={searchScoped ? $t('review.searchScopeEmpty') : $t('review.allDoneHint')}
+        description={searchScoped
+          ? $t('review.searchScopeEmpty')
+          : focusNarrowed
+            ? $t('review.focusScopeEmpty')
+            : $t('review.allDoneHint')}
       />
       <div class="flex flex-wrap justify-center gap-2">
         {#if progress.allReviewed && onExport}
@@ -1074,480 +1705,433 @@
   </div>
 {:else}
   {@const isVerified = current.verified}
-  <div class="h-full overflow-y-auto" bind:this={reviewScroller}>
-    <div class="mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6">
-      <!-- Completion banner: every clip verified → surface the next steps (export / done). The clips
+  <div class="flex h-full min-h-0 flex-col">
+    <div class="min-h-0 flex-1 overflow-y-auto" bind:this={reviewScroller}>
+      <div class="review-stack mx-auto flex max-w-3xl flex-col gap-5 px-4 py-6">
+        <!-- Completion banner: every clip verified → surface the next steps (export / done). The clips
            stay below so the reviewer can still scrub back and re-check any of them. -->
-      {#if progress.allReviewed}
-        <div
-          class="card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center"
-          data-testid="review-complete"
-        >
-          <div class="text-lg font-semibold text-emerald-300">
-            {$t('review.completeTitle').replace('{n}', String(reviewCorpusTotal))}
+        {#if progress.allReviewed}
+          <div
+            class="review-wide card border border-emerald-700/40 bg-emerald-950/20 p-5 text-center"
+            data-testid="review-complete"
+          >
+            <div class="text-lg font-semibold text-emerald-300">
+              {$t('review.completeTitle').replace('{n}', String(reviewCorpusTotal))}
+            </div>
+            <p class="mt-1 text-sm text-subtle">{$t('review.completeHint')}</p>
+            <div class="mt-4 flex flex-wrap justify-center gap-2">
+              {#if onExport}
+                <button
+                  type="button"
+                  class="btn btn-primary !text-sm"
+                  data-testid="review-complete-export"
+                  onclick={onExport}
+                >
+                  {$t('review.exportDataset')}
+                </button>
+              {/if}
+              <button type="button" class="btn btn-secondary !text-sm" onclick={() => (index = 0)}>
+                {$t('review.reviewAgain')}
+              </button>
+              {#if onDone}
+                <button type="button" class="btn btn-secondary !text-sm" onclick={onDone}>
+                  {$t('review.backToLibrary')}
+                </button>
+              {/if}
+            </div>
           </div>
-          <p class="mt-1 text-sm text-subtle">{$t('review.completeHint')}</p>
-          <div class="mt-4 flex flex-wrap justify-center gap-2">
-            {#if onExport}
+        {/if}
+
+        {#if subsetScoped}
+          <!-- Scope is never silent: the reviewer always sees they're on a subset. A voice focus is a
+             subset too, and used to be the one that said nothing (review 2026-08-20). -->
+          <div
+            class="review-wide rounded-lg border border-amber-600/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300"
+            data-testid="review-scope-banner"
+          >
+            {$t(searchScoped ? 'review.searchScope' : 'review.focusScope')
+              .replace('{n}', String(queue.length))
+              .replace('{m}', String(reviewCorpusTotal))}
+          </div>
+        {/if}
+
+        <!-- Progress -->
+        <div class="review-progress">
+          <div class="flex items-center justify-between gap-3">
+            <span class="text-sm font-medium text-muted">
+              {$t('review.progress')
+                .replace('{n}', String(index + 1))
+                .replace('{total}', String(queue.length))}
+            </span>
+            <div class="flex items-center gap-2">
               <button
                 type="button"
-                class="btn btn-primary !text-sm"
-                data-testid="review-complete-export"
-                onclick={onExport}
+                data-testid="suspect-first-toggle"
+                onclick={toggleSuspectFirst}
+                title={$t('review.suspectFirstHint')}
+                aria-pressed={suspectFirst}
+                class="rounded-md border px-2 py-1 text-xs transition-colors {suspectFirst
+                  ? 'border-accent bg-accent/15 text-accent'
+                  : 'border-surface-3 text-subtle hover:text-muted'}"
               >
-                {$t('review.exportDataset')}
+                {$t('review.suspectFirst')}
               </button>
-            {/if}
-            <button type="button" class="btn btn-secondary !text-sm" onclick={() => (index = 0)}>
-              {$t('review.reviewAgain')}
-            </button>
-            {#if onDone}
-              <button type="button" class="btn btn-secondary !text-sm" onclick={onDone}>
-                {$t('review.backToLibrary')}
-              </button>
-            {/if}
+              <span class="badge {isVerified ? 'badge-verified' : 'badge-pending'}">
+                {isVerified ? $t('verified') : $t('pending')}
+              </span>
+            </div>
           </div>
-        </div>
-      {/if}
-
-      {#if searchScoped}
-        <!-- Scope is never silent: the reviewer always sees they're on a subset. -->
-        <div
-          class="rounded-lg border border-amber-600/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300"
-          data-testid="review-scope-banner"
-        >
-          {$t('review.searchScope')
-            .replace('{n}', String(queue.length))
-            .replace('{m}', String(reviewCorpusTotal))}
-        </div>
-      {/if}
-
-      <!-- Progress -->
-      <div>
-        <div class="flex items-center justify-between gap-3">
-          <span class="text-sm font-medium text-muted">
-            {$t('review.progress')
-              .replace('{n}', String(index + 1))
-              .replace('{total}', String(queue.length))}
-          </span>
-          <div class="flex items-center gap-2">
-            <button
-              type="button"
-              data-testid="suspect-first-toggle"
-              onclick={toggleSuspectFirst}
-              title={$t('review.suspectFirstHint')}
-              aria-pressed={suspectFirst}
-              class="rounded-md border px-2 py-1 text-xs transition-colors {suspectFirst
-                ? 'border-accent bg-accent/15 text-accent'
-                : 'border-surface-3 text-subtle hover:text-muted'}"
-            >
-              {$t('review.suspectFirst')}
-            </button>
-            <span class="badge {isVerified ? 'badge-verified' : 'badge-pending'}">
-              {isVerified ? $t('verified') : $t('pending')}
-            </span>
+          <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-3">
+            <div
+              class="h-full rounded-full bg-accent transition-all duration-300"
+              style="width: {progress.percent}%"
+            ></div>
           </div>
-        </div>
-        <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-3">
-          <div
-            class="h-full rounded-full bg-accent transition-all duration-300"
-            style="width: {progress.percent}%"
-          ></div>
-        </div>
 
-        <!-- WHY this clip needs a human, from the jury's own record (P1.2). These are the reason codes
+          <!-- WHY this clip needs a human, from the jury's own record (P1.2). These are the reason codes
              the T0/T1/T2 gates persisted at decision time, NOT a fresh inference from the row's current
              values — the audio badge elsewhere answers "what is true now", this answers "why was this
              decided". A clip escalated for low_snr whose audio was later replaced still says so here.
              Absent record renders NOTHING: most clips were never escalated, and rows decided before the
              codes existed have no record. "No reasons" would be a claim the data cannot support. -->
-        {#if escalationReasons}
-          <div class="mt-2 flex flex-wrap items-center gap-1.5" data-testid="escalation-reasons">
-            <span class="text-[11px] uppercase tracking-wider text-subtle">
-              {$t('reason.whyEscalated')}
-            </span>
-            {#each escalationReasons.reasonCodes as code (code)}
-              {@const key = reasonLabelKey(code)}
-              <span
-                class="reason-chip reason-{reasonTone(code)}"
-                title={escalationReasons.policyVersion ?? undefined}
-              >
-                <!-- An unknown code renders VERBATIM rather than being dropped: if the backend gained a
+          {#if escalationReasons}
+            <div class="mt-2 flex flex-wrap items-center gap-1.5" data-testid="escalation-reasons">
+              <span class="text-[11px] uppercase tracking-wider text-subtle">
+                {$t('reason.whyEscalated')}
+              </span>
+              {#each escalationReasons.reasonCodes as code (code)}
+                {@const key = reasonLabelKey(code)}
+                <span
+                  class="reason-chip reason-{reasonTone(code)}"
+                  title={escalationReasons.policyVersion ?? undefined}
+                >
+                  <!-- An unknown code renders VERBATIM rather than being dropped: if the backend gained a
                      code this build does not know, an untranslated string is a prompt to add it, while a
                      silently shorter list hides the new information entirely. -->
-                {key ? $t(key) : code}
-              </span>
-            {/each}
-          </div>
-        {/if}
-        <div class="mt-1 flex items-center justify-between gap-3 text-xs text-subtle">
-          <!-- True-10 audit: source-file orientation — in a hundreds-of-clips sitting the reviewer
+                  {key ? $t(key) : code}
+                </span>
+              {/each}
+            </div>
+          {/if}
+          <div class="mt-1 flex items-center justify-between gap-3 text-xs text-subtle">
+            <!-- True-10 audit: source-file orientation — in a hundreds-of-clips sitting the reviewer
                had no idea WHICH recording the current clip came from.
                2026-08-05: the chunk position is its own span with a NOUN. It used to render as a bare
                "61/144" glued to the filename, one line under "Clip 1 of 144" and opposite
                "67 of 144 reviewed" — three unlabelled fractions sharing a denominator by coincidence.
                dir="ltr" stays on the FILENAME only; the CKB noun must not be forced into an LTR run. -->
-          <span class="flex min-w-0 items-center gap-1.5">
-            <span
-              class="truncate"
-              dir="ltr"
-              title={current.audioPath}
-              data-testid="review-source-file"
-            >
-              {segmentSourceFilename(current.audioPath)}
-            </span>
-            {#if chunkLabel}
-              <span class="shrink-0" data-testid="review-chunk-label"
-                >{$t('chunk')} <span dir="ltr">{chunkLabel}</span></span
+            <span class="flex min-w-0 items-center gap-1.5">
+              <span
+                class="truncate"
+                dir="ltr"
+                title={current.audioPath}
+                data-testid="review-source-file"
               >
-            {/if}
-          </span>
-          <span class="shrink-0">
-            {$t('review.reviewedCount')
-              .replace('{done}', String(progress.done))
-              .replace('{total}', String(progress.total))}
-          </span>
+                {segmentSourceFilename(current.audioPath)}
+              </span>
+              {#if chunkLabel}
+                <span class="shrink-0" data-testid="review-chunk-label"
+                  >{$t('chunk')} <span dir="ltr">{chunkLabel}</span></span
+                >
+              {/if}
+            </span>
+            <span class="shrink-0">
+              {$t('review.reviewedCount')
+                .replace('{done}', String(progress.done))
+                .replace('{total}', String(progress.total))}
+            </span>
+          </div>
         </div>
-      </div>
 
-      <!-- THE AUDIO BLOCK: waveform + scope hint + transport, one card, immediately above the
+        <!-- THE AUDIO BLOCK: waveform + scope hint + transport, one card, immediately above the
            correction box. Owner feedback 2026-08-13 — these were three separate cards with the
            editor far below, so listening and correcting could not be done without scrolling. -->
-      <div class="card overflow-hidden">
-        <div class="overflow-hidden">
-          {#if waveformError}
-            <!-- A flat strip and a failed decode look identical, and the reviewer would read the flat
+        <div class="review-audio-card card overflow-hidden">
+          <div class="overflow-hidden">
+            {#if waveformError}
+              <!-- A flat strip and a failed decode look identical, and the reviewer would read the flat
                strip as "quiet audio". Say which one it is, in place, and offer the retry. -->
-            <div
-              class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
-              data-testid="review-waveform-error"
-              role="status"
-            >
-              <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
-              <button
-                type="button"
-                class="btn btn-secondary shrink-0 !text-xs"
-                onclick={() => current && loadWaveform(current)}
+              <div
+                class="flex items-center justify-between gap-3 p-3 text-xs text-amber-300"
+                data-testid="review-waveform-error"
+                role="status"
               >
-                {$t('retry')}
-              </button>
-            </div>
-          {:else}
-            <Waveform
-              waveform={waveformData}
-              currentTime={clipPosition}
-              duration={clipLength}
-              {playing}
-              wordTimestamps={words}
-              onSeek={(time) => {
-                clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
-                currentTime = range.startTime + time;
-              }}
-            />
-          {/if}
-        </div>
-
-        <!-- Honest playback-scope hint: are we playing just the words, or the whole clip? -->
-        <div
-          class="flex items-center gap-2 border-t border-subtle px-3 py-2 text-xs text-subtle"
-          aria-live="polite"
-        >
-          {#if aligning}
-            <span
-              class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent"
-            ></span>
-            <span>{$t('review.aligningWords')}</span>
-          {:else if hasWords}
-            <span class="text-accent">●</span>
-            <span
-              >{$t('review.playingWordsOnly').replace(
-                '{sec}',
-                (playEnd - playStart).toFixed(1),
-              )}</span
-            >
-          {:else}
-            <span>{$t('review.playingWholeClip').replace('{sec}', clipLength.toFixed(1))}</span>
-          {/if}
-        </div>
-
-        <!-- Audio player — bounded to the SPOKEN SPAN (first→last word) when word timings exist, so Play
-           hears the exact words and not the silence/music the VAD chunk padded around them; otherwise
-           the whole clip. -->
-        <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
-           curate mode) — with it on, advancing to the next clip auto-plays the bounded spoken span,
-           removing one keypress + wait per clip, hundreds of times per review sitting. -->
-        <!-- start/endTime honour the transient tap-a-word override so a tapped word plays (and loops)
-           exactly itself; otherwise the full spoken span. -->
-        <AudioPlayer
-          audioPath={current.audioPath}
-          clipKey={current.id}
-          startTime={wordStartOverride ?? playStart}
-          endTime={wordEndOverride ?? playEnd}
-          displayStart={playStart}
-          displayEnd={playEnd}
-          bind:currentTime
-          bind:duration={playerDuration}
-          bind:playing
-          bind:audioError
-          autoplay={$settings.autoplaySegments}
-        />
-      </div>
-
-      <!-- Transcript: big, directly editable -->
-      <div class="card p-5">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <div class="text-xs font-semibold uppercase tracking-wider text-muted">
-              {$t('transcript')}
-            </div>
-            <p class="mt-0.5 text-xs text-subtle">{$t('review.editHint')}</p>
-            {#if draftModels.length > 0}
-              <p class="mt-1 text-[11px] text-subtle" dir="ltr">
-                {$t('review.draftBy')}
-                <span class="font-medium text-muted"
-                  >{draftModels.map((m) => api.engineLabel(m)).join(', ')}</span
-                >
-                {$t('review.notHumanVerified')}
-              </p>
-            {/if}
-          </div>
-          {#if dirty}
-            <button
-              type="button"
-              class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
-              onclick={resetToOriginal}
-            >
-              {$t('review.reset')}
-            </button>
-          {/if}
-        </div>
-        <textarea
-          bind:value={editText}
-          bind:this={editEl}
-          dir="rtl"
-          spellcheck="false"
-          class="input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"
-          placeholder={$t('editTranscript')}
-        ></textarea>
-      </div>
-
-      <!-- Listen-strip: tap a word to hear it; low-confidence words are highlighted -->
-      {#if words.length > 0}
-        <div class="card p-4">
-          <div class="flex items-center justify-between gap-3">
-            <div>
-              <div class="text-xs font-semibold uppercase tracking-wider text-muted">
-                {$t('review.listen')}
-              </div>
-              <p class="mt-0.5 text-xs text-subtle">{$t('review.listenHint')}</p>
-            </div>
-            <button
-              type="button"
-              class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
-              onclick={replay}
-            >
-              ↻ {$t('review.replay')}
-            </button>
-          </div>
-          <div
-            bind:this={stripEl}
-            dir="rtl"
-            class="font-kurdish mt-3 flex flex-wrap items-center gap-x-1 gap-y-2 text-2xl leading-loose"
-          >
-            {#each words as w, i (i)}
-              {#if editingWordIndex === i}
-                <!-- Inline chip editor: opened by a DELIBERATE double-tap / F2 (never a plain listen
-                     tap). Enter/blur commits (empty or unchanged = cancel), Escape cancels.
-                     stopPropagation so Enter/Ctrl+Enter can't leak to the window review shortcuts and
-                     save-verify the clip out from under a half-typed fix. -->
-                <input
-                  type="text"
-                  dir="rtl"
-                  lang="ckb"
-                  class="review-word-input"
-                  style={`width: ${Math.max(5, chipText(w, i).length + 3)}ch`}
-                  value={chipText(w, i)}
-                  aria-label={$t('review.editWordAria')}
-                  onblur={(e) => commitWordEdit(i, w, (e.target as HTMLInputElement).value, true)}
-                  onkeydown={(e) => {
-                    e.stopPropagation();
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      if (commitWordEdit(i, w, (e.target as HTMLInputElement).value))
-                        refocusChip(i);
-                    } else if (e.key === 'Escape') {
-                      cancelWordEdit(i);
-                      refocusChip(i);
-                    }
-                  }}
-                  use:focusOnMount
-                />
-              {:else}
+                <span class="min-w-0 truncate">{$t('review.waveformFailed')}</span>
                 <button
                   type="button"
-                  data-chip={i}
-                  class="review-word {editedChips[i]
-                    ? 'word-edited'
-                    : confClass(w.confidence)} {i === activeWordIndex ? 'word-active' : ''}"
-                  onclick={() => playWord(w)}
-                  ondblclick={() => startWordEdit(w, i)}
-                  onkeydown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      playWord(w);
-                    } else if (e.key === 'F2') {
-                      e.preventDefault();
-                      startWordEdit(w, i);
-                    }
-                  }}
-                  title={`${w.start.toFixed(2)}s · ${Math.round((w.confidence ?? 1) * 100)}% — ${$t('review.wordChipHint')}`}
+                  class="btn btn-secondary shrink-0 !text-xs"
+                  onclick={() => current && loadWaveform(current)}
                 >
-                  {chipText(w, i)}
+                  {$t('retry')}
                 </button>
-              {/if}
-            {/each}
-          </div>
-        </div>
-      {/if}
-
-      <!-- Consensus draft: an offline best-of-N vote across this clip's ASR models. Contested words
-           (the models disagreed) are highlighted so the eye lands on likely errors first; "Use draft"
-           starts the edit from a transcript better than any single model. -->
-      <!-- Fix-the-draft tools: the current transcript is wrong -> re-transcribe with a better engine,
-           or flag the clip bad (excluded from export, kept + reversible). -->
-      <div class="flex flex-wrap items-center gap-2">
-        <span class="text-[11px] uppercase tracking-wider text-subtle"
-          >{$t('review.retranscribe')}</span
-        >
-        <button
-          type="button"
-          class="btn btn-secondary !text-xs"
-          onclick={() => retranscribe('champion')}
-          disabled={retranscribing || saving}
-          title={$t('review.retranscribeChampionTitle')}
-        >
-          {retranscribing ? $t('review.retranscribing') : $t('review.retranscribeChampion')}
-        </button>
-        {#if $settings.asrModel !== 'wsl-7b'}
-          <button
-            type="button"
-            class="btn btn-secondary !text-xs"
-            onclick={() => retranscribe('finetuned')}
-            disabled={retranscribing || saving}
-            title={$t('review.retranscribeFinetunedTitle')}
-          >
-            {$t('review.retranscribeFinetuned')}
-          </button>
-        {/if}
-        {#if $settings.juryCloudOptIn}
-          <button
-            type="button"
-            class="btn btn-secondary !text-xs"
-            onclick={() => void runCloudCheck()}
-            disabled={cloudChecking || retranscribing || saving}
-            title={$t('review.cloudCheckTitle')}
-          >
-            {cloudChecking ? $t('review.cloudChecking') : $t('review.cloudCheck')}
-          </button>
-        {/if}
-      </div>
-
-      <!-- Cloud watcher verdict: Gemini's audio-grounded reading of THIS clip. Advisory only — the
-           reviewer decides; "use this text" fills the editor and still requires Save & next. -->
-      {#if cloudCheck && current && cloudCheck.id === current.id}
-        {@const verdict = cloudCheck.result.verdict}
-        <div class="rounded-md border border-cortex-700/40 bg-cortex-900/40 p-3 space-y-2">
-          {#if verdict}
-            {#if verdict.transcript.trim() === editText.trim()}
-              <p class="text-xs text-emerald-300">
-                ✓ {$t('review.cloudCheckAgrees')} ({Math.round(verdict.confidence * 100)}%)
-              </p>
+              </div>
             {:else}
-              <p dir="rtl" lang="ckb" class="font-mono text-sm text-end">{verdict.transcript}</p>
-              <p class="text-[11px] text-subtle">
-                {verdict.reason} · {Math.round(verdict.confidence * 100)}% · {verdict.votes}×
-              </p>
-              <button
-                type="button"
-                class="btn btn-secondary !text-xs"
-                onclick={() => (editText = verdict.transcript)}
-              >
-                {$t('review.cloudCheckUse')}
-              </button>
+              <Waveform
+                waveform={waveformData}
+                currentTime={clipPosition}
+                duration={clipLength}
+                {playing}
+                wordTimestamps={words}
+                onSeek={(time) => {
+                  clearWordOverride(); // a manual scrub leaves word-playback mode; play on to the span end
+                  currentTime = range.startTime + time;
+                }}
+              />
             {/if}
-          {:else}
-            <p class="text-xs text-amber-300">
-              {$t('review.cloudCheckEscalated')}{cloudCheck.result.error
-                ? ` — ${cloudCheck.result.error}`
-                : ''}
-            </p>
+          </div>
+
+          <!-- Honest playback-scope hint: decision playback always covers the full segment. -->
+          <div
+            class="flex items-center gap-2 border-t border-subtle px-3 py-2 text-xs text-subtle"
+            aria-live="polite"
+          >
+            {#if aligning}
+              <span
+                class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent"
+              ></span>
+              <span>{$t('review.aligningWords')}</span>
+            {:else}
+              <span>{$t('review.playingWholeClip').replace('{sec}', clipLength.toFixed(1))}</span>
+            {/if}
+          </div>
+
+          <!-- Audio player — decision playback is bounded to the complete database segment. A tapped
+           word may temporarily narrow the play window, while evidence coordinates remain anchored to
+           the full immutable source span. -->
+          <!-- True-10 audit: honor the autoplay setting (it was hardcoded off here while honored in
+           curate mode) — with it on, advancing to the next clip auto-plays the bounded spoken span,
+           removing one keypress + wait per clip, hundreds of times per review sitting. -->
+          <!-- start/endTime honour the transient tap-a-word override so a tapped word plays (and loops)
+           exactly itself; otherwise the full spoken span. -->
+          {#if !$showReviewInbox}
+            {#key `${current.id}\0${String(reviewRevisions[current.id])}`}
+              <AudioPlayer
+                bind:this={reviewAudioPlayer}
+                audioPath={current.audioPath}
+                clipKey={current.id}
+                startTime={wordStartOverride ?? playStart}
+                endTime={wordEndOverride ?? playEnd}
+                displayStart={playStart}
+                displayEnd={playEnd}
+                evidenceStart={range.startTime}
+                evidenceEnd={range.endTime}
+                bind:currentTime
+                bind:duration={playerDuration}
+                bind:playing
+                bind:audioError
+                bind:heardMs
+                bind:playbackReceiptId
+                bind:playbackMediaGrantId
+                bind:playbackClipDurationMs
+                bind:heardIntervals
+                autoplay={$settings.autoplaySegments}
+                requirePlaybackProof={true}
+                expectedRevision={reviewRevisions[current.id]}
+              />
+            {/key}
+          {/if}
+          {#if audioError}
+            <fieldset
+              class="m-3 mt-0 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3"
+              data-testid="review-technical-unusable"
+            >
+              <legend class="px-1 text-xs font-semibold text-amber-200">
+                {$t('review.unusable.title')}
+              </legend>
+              <p id="review-unusable-help" class="mb-2 text-xs text-subtle">
+                {$t('review.unusable.help')}
+              </p>
+              <div class="flex flex-wrap items-end gap-2">
+                <label class="min-w-48 flex-1 text-xs text-muted" for="review-unusable-reason">
+                  <span class="mb-1 block">{$t('review.unusable.reasonLabel')}</span>
+                  <select
+                    id="review-unusable-reason"
+                    class="input w-full"
+                    bind:value={technicalUnusableReason}
+                    disabled={saving}
+                    aria-describedby="review-unusable-help"
+                  >
+                    <option value="">{$t('review.unusable.reasonPlaceholder')}</option>
+                    {#each technicalUnusableReasons as reason}
+                      <option value={reason}>{$t(`review.unusable.reason.${reason}`)}</option>
+                    {/each}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  class="btn btn-secondary !text-amber-100"
+                  onclick={() => void markTechnicallyUnusable()}
+                  disabled={saving || !technicalUnusableReason || draftAuthorityBlocked || dirty}
+                  aria-describedby={draftAuthorityBlocked
+                    ? 'review-unusable-help review-draft-disabled-reason'
+                    : dirty
+                      ? 'review-unusable-help review-reject-disabled-reason'
+                      : 'review-unusable-help'}
+                >
+                  {saving ? $t('review.unusable.marking') : $t('review.unusable.mark')}
+                </button>
+              </div>
+            </fieldset>
           {/if}
         </div>
-      {/if}
 
-      <!-- Decisive actions. STICKY (external review 2026-08-06, P2.2): at 1280x720 this row sat below
-           the fold behind the waveform + word-diff + retranscribe tools, so the reviewer had to scroll
-           to every single decision. ReviewInbox's .verb-bar already proved the pattern; this reuses it.
-           Mark-bad lives here rather than up with the retranscribe tools because it is one of the four
-           decisions a reviewer makes about a clip (accept / save / bad audio / undo), not a tool. -->
-      <div
-        class="review-action-bar flex flex-wrap items-center gap-2"
-        role="group"
-        aria-label={$t('review.actionsLabel')}
-        data-testid="review-action-bar"
-      >
-        <button
-          type="button"
-          class="btn btn-secondary"
-          onclick={() => go(-1)}
-          disabled={index === 0}
-          aria-label={$t('prevSegment')}
-        >
-          {$t('review.prev')}
-        </button>
-        <button
-          type="button"
-          class="btn btn-secondary"
-          onclick={() => void undoLast()}
-          disabled={undoHistory.length === 0 || saving || retranscribing}
-          title={$t('review.undoLastTitle')}
-        >
-          ↩ {$t('review.undoLast')}
-        </button>
-        <button
-          type="button"
-          class="btn btn-secondary !text-rose-300 hover:!text-rose-200"
-          onclick={markBad}
-          disabled={saving || retranscribing}
-          title={$t('review.markBadTitle')}
-        >
-          {$t('review.markBad')}
-        </button>
-        <div class="flex flex-1 flex-wrap justify-end gap-2">
-          <button
-            type="button"
-            class="btn btn-secondary !py-2.5"
-            onclick={() => submit(true)}
-            disabled={saving}
-          >
-            ✓ {$t('review.acceptAsIs')}
-          </button>
-          <button
-            type="button"
-            class="btn btn-primary !py-2.5 !text-sm"
-            onclick={() => submit(false)}
-            disabled={saving || !editText.trim()}
-          >
-            {$t('review.saveNext')}
-          </button>
+        <!-- Transcript: big, directly editable -->
+        <div class="review-transcript-card card p-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <label
+                for="review-transcript-editor"
+                class="text-xs font-semibold uppercase tracking-wider text-muted"
+              >
+                {$t('transcript')}
+              </label>
+              <p class="mt-0.5 text-xs text-subtle">{$t('review.editHint')}</p>
+              {#if draftModels.length > 0}
+                <p class="mt-1 text-[11px] text-subtle" dir="ltr">
+                  {$t('review.draftBy')}
+                  <span class="font-medium text-muted"
+                    >{draftModels.map((m) => api.engineLabel(m)).join(', ')}</span
+                  >
+                  {$t('review.notHumanVerified')}
+                </p>
+              {/if}
+            </div>
+            {#if dirty}
+              <button
+                type="button"
+                class="ring-focus shrink-0 rounded-token px-2 py-1 text-xs text-subtle transition-colors hover:text-default"
+                onclick={resetToOriginal}
+              >
+                {$t('review.reset')}
+              </button>
+            {/if}
+          </div>
+          <ReviewDraftRecovery
+            conflict={draftConflict}
+            serverText={originalText(current)}
+            loadFailed={draftLoadError !== null}
+            saving={draftSaving}
+            saveFailed={draftSaveFailed}
+            recovered={draftRecovered}
+            onUseConflict={useConflictingDraft}
+            onDiscardConflict={() => void discardConflictingDraft()}
+            onRetryLoad={() => void retryReviewDraftLoad()}
+          />
+          <textarea
+            id="review-transcript-editor"
+            bind:value={editText}
+            bind:this={editEl}
+            dir="rtl"
+            lang="ckb"
+            spellcheck="false"
+            class="review-transcript-input input font-kurdish mt-3 min-h-[150px] w-full resize-none text-2xl leading-loose"
+            placeholder={$t('editTranscript')}
+          ></textarea>
         </div>
-        <!-- Inside the bar, not after it: a sticky element overlays whatever follows it, so a hint left
-             outside would be the one thing the bar covers. -->
-        <p class="w-full text-center text-[11px] text-subtle">
-          {$t('review.kbdHint')}
-        </p>
+
+        <!-- Listen-strip: tap a word to hear it; low-confidence words are highlighted -->
+        {#if words.length > 0}
+          <ReviewWordStrip
+            {words}
+            {activeWordIndex}
+            bind:editingWordIndex
+            {chipText}
+            confidenceClass={confClass}
+            isEdited={(wordIndex) => !!editedChips[wordIndex]}
+            onReplay={replay}
+            onPlay={playWord}
+            onStartEdit={startWordEdit}
+            onCommitEdit={commitWordEdit}
+            onCancelEdit={cancelWordEdit}
+          />
+        {/if}
+
+        <!-- Consensus draft: an offline best-of-N vote across this clip's ASR models. Contested words
+           (the models disagreed) are highlighted so the eye lands on likely errors first; "Use draft"
+           starts the edit from a transcript better than any single model. -->
+        <!-- Fix-the-draft tools: the current transcript is wrong -> re-transcribe with the champion,
+           or flag the clip bad (excluded from export, kept + reversible). -->
+        <div class="review-secondary flex flex-wrap items-center gap-2">
+          <span class="text-[11px] uppercase tracking-wider text-subtle"
+            >{$t('review.retranscribe')}</span
+          >
+          <button
+            type="button"
+            class="btn btn-secondary !text-xs"
+            onclick={retranscribe}
+            disabled={retranscribing || saving}
+            title={$t('review.retranscribeChampionTitle')}
+          >
+            {retranscribing ? $t('review.retranscribing') : $t('review.retranscribeChampion')}
+          </button>
+          {#if $settings.juryCloudOptIn}
+            <button
+              type="button"
+              class="btn btn-secondary !text-xs"
+              onclick={() => void runCloudCheck()}
+              disabled={cloudChecking || retranscribing || saving}
+              title={$t('review.cloudCheckTitle')}
+            >
+              {cloudChecking ? $t('review.cloudChecking') : $t('review.cloudCheck')}
+            </button>
+          {/if}
+        </div>
+
+        <!-- Cloud watcher verdict: Gemini's audio-grounded reading of THIS clip. Advisory only — the
+           reviewer decides; "use this text" fills the editor and still requires Save & next. -->
+        {#if cloudCheck && current && cloudCheck.id === current.id}
+          {@const verdict = cloudCheck.result.verdict}
+          <div
+            class="review-secondary rounded-md border border-cortex-700/40 bg-cortex-900/40 p-3 space-y-2"
+          >
+            {#if verdict}
+              {#if verdict.transcript.trim() === editText.trim()}
+                <p class="text-xs text-emerald-300">
+                  {$t('review.cloudCheckAgrees')} ({Math.round(verdict.confidence * 100)}%)
+                </p>
+              {:else}
+                <p dir="rtl" lang="ckb" class="font-mono text-sm text-end">{verdict.transcript}</p>
+                <p class="text-[11px] text-subtle">
+                  {verdict.reason} · {Math.round(verdict.confidence * 100)}% · {verdict.votes}×
+                </p>
+                <button
+                  type="button"
+                  class="btn btn-secondary !text-xs"
+                  onclick={() => (editText = verdict.transcript)}
+                >
+                  {$t('review.cloudCheckUse')}
+                </button>
+              {/if}
+            {:else}
+              <p class="text-xs text-amber-300">
+                {$t('review.cloudCheckEscalated')}{cloudCheck.result.error
+                  ? ` — ${cloudCheck.result.error}`
+                  : ''}
+              </p>
+            {/if}
+          </div>
+        {/if}
       </div>
     </div>
+
+    <ReviewActionBar
+      {eligibilityBlocked}
+      eligibilityReason={eligibilityReasonText(currentEligibility?.disabledReason)}
+      audioUnavailable={audioError !== null}
+      draftBlockedKey={draftAuthorityBlockedKey}
+      {dirty}
+      {saving}
+      {retranscribing}
+      previousDisabled={index === 0}
+      undoAvailable={undoHistory.length > 0}
+      {decisionBlocked}
+      editHasText={editText.trim().length > 0}
+      onPrevious={() => void go(-1)}
+      onUndo={() => void undoLast()}
+      onReject={() => void markBad()}
+      onAccept={() => void submit(true)}
+      onSave={() => void submit(false)}
+    />
   </div>
 {/if}
 
@@ -1582,65 +2166,30 @@
     color: var(--text-muted, var(--text));
   }
 
-  /* The four decisions (accept / save / bad audio / undo) stay on screen at every viewport.
-     `sticky`, not `fixed`: it keeps its space in the flow, so it can never sit on top of the waveform,
-     the transcript, or a 200%-zoom reflow — it only pins itself once it would scroll out of view.
-     Opaque background + top border so the content scrolling beneath it stays readable, and
-     safe-area padding so Windows scaling / an inset-bottom display cannot clip the buttons. */
-  .review-action-bar {
-    position: sticky;
-    bottom: 0;
-    z-index: 5;
-    background: var(--surface-1);
-    border-top: 1px solid var(--border);
-    padding-top: 12px;
-    padding-bottom: max(8px, env(safe-area-inset-bottom));
-    margin-inline: -1rem; /* bleed to the container's px-4 so the backdrop covers the full width */
-    padding-inline: 1rem;
-  }
-  .review-word {
-    border-radius: 0.375rem;
-    padding: 0.05rem 0.4rem;
-    color: var(--text);
-    cursor: pointer;
-    transition:
-      background-color 120ms ease,
-      color 120ms ease;
-  }
-  .review-word:hover {
-    background: var(--surface-3);
-  }
-  /* Low confidence = likely ASR error → draw the eye. Mid = worth a glance. */
-  .conf-mid {
-    background: color-mix(in srgb, var(--warning) 18%, transparent);
-  }
-  .conf-low {
-    background: color-mix(in srgb, var(--danger) 20%, transparent);
-  }
-  /* Karaoke highlight of the word currently being heard. Two classes so it always
-     wins over the single-class confidence tints. Uses an accent ring + faint tint +
-     bold (not an inverted fill) so the word keeps its high-contrast text colour in
-     both themes — a solid-accent fill would put light text on a light accent. */
-  .review-word.word-active {
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
-    box-shadow: inset 0 0 0 2px var(--accent);
-    font-weight: 700;
-  }
-  /* A chip carrying a committed inline fix (display overlay) — faint success tint so the reviewer
-     sees which words they corrected without it competing with the active-word highlight. */
-  .review-word.word-edited {
-    background: color-mix(in srgb, var(--success, #22c55e) 16%, transparent);
-  }
-  /* Inline chip editor: same footprint + type as the chip it replaces, accent ring = "editing". */
-  .review-word-input {
-    font: inherit;
-    border-radius: 0.375rem;
-    padding: 0.05rem 0.4rem;
-    color: var(--text);
-    background: var(--surface-3);
-    border: none;
-    outline: none;
-    box-shadow: inset 0 0 0 2px var(--accent);
-    text-align: right;
+  /* On the supported 1000x600 workstation floor, playback and transcript share the evidence row.
+     Secondary diagnostics stay available below it in the scroller, while the core correction loop is
+     completely visible without page scrolling. Taller and narrower screens retain the linear flow. */
+  @media (min-width: 800px) and (max-height: 700px) {
+    .review-stack {
+      display: grid;
+      max-width: none;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      align-content: start;
+      gap: 0.5rem;
+      padding: 0.5rem 1rem;
+    }
+    .review-wide,
+    .review-progress,
+    .review-secondary {
+      grid-column: 1 / -1;
+    }
+    .review-transcript-card {
+      padding: 0.75rem;
+    }
+    .review-transcript-input {
+      min-height: 100px;
+      font-size: 1.125rem;
+      line-height: 1.75rem;
+    }
   }
 </style>

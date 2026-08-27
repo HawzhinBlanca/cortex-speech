@@ -2,35 +2,36 @@
 
 The WSL side (champion serving + retrain) is a single point of failure outside the app's own
 backup/snapshot machinery. This runbook records what exists, what is irreplaceable vs re-buildable,
-and the exact recovery procedure. **Environment facts below were probed live on 2026-07-04**;
-steps marked *(verify on WSL)* are standard procedures not yet exercised end-to-end here.
+and the exact recovery procedure. **Environment facts below were re-probed live on 2026-08-20**
+(external review finding: this runbook still described `/root/cortex_env`, an env the runtime no
+longer uses — a recovery drill following it would have rebuilt the wrong environment at the wrong
+path). Steps marked *(verify on WSL)* are standard procedures not yet exercised end-to-end here.
 
-## What lives where (verified 2026-07-04)
+## What lives where (verified 2026-08-20)
 
 | Asset | Location (WSL) | Size | Replaceable? |
 |---|---|---|---|
-| Python venv `cortex_env` | `/root/cortex_env` (Python 3.12.3) | small | **Rebuildable** from the pin list below |
+| Python venv (SERVING) | `/home/ai/.venv-wsl-whisper` (Python 3.12.13) | small | **Rebuildable** from `scripts/wsl7b_requirements.lock` (committed, 158 pins, frozen from THIS venv) |
 | fairseq2 asset cache | `/root/.cache/fairseq2` | **59 GB** | **Re-downloadable** (slow — hours on a fast line); grows over time |
 | 7B champion adapter weights | `Kurdish_ASR_Model_Export/OmniASR_7B_Champion/` next to the repo (Windows side, reached via `/mnt/c/...`) | GBs | **IRREPLACEABLE** if the original training run is lost — back these up off-machine |
 | Server script | `Kurdish_ASR_Model_Export/OmniASR_7B_Champion/scripts/cortex_7b_server.py` | tiny | In the export folder; also copy into any backup |
 | Client (app side) | `cortex-speech-app/scripts/cortex_7b_client.py` | tiny | In git |
 
-## Pinned environment (probed from the live venv, 2026-07-04)
+## Pinned environment (frozen from the live SERVING venv, 2026-08-20)
+
+The complete, version-controlled lock is **`cortex-speech-app/scripts/wsl7b_requirements.lock`**
+(158 pins — `pip freeze` of `/home/ai/.venv-wsl-whisper`). Headline pins:
 
 ```
-python        3.12.3
-fairseq2      0.6
-fairseq2n     0.6
-torch         2.8.0
-peft          0.19.1
-transformers  4.46.3
-GPU           NVIDIA GeForce RTX 4090
+python        3.12.13  (Ubuntu 26.04 LTS)
+distro        Ubuntu 26.04 LTS
+GPUs          2x NVIDIA GeForce RTX 3090 Ti
+venv          /home/ai/.venv-wsl-whisper   <- the path the app and start helper default to
 ```
 
-Keep this table current: after any WSL env change, re-run
-`~/cortex_env/bin/pip list | grep -iE 'fairseq2|torch|peft|transformers'` and update here.
-For a complete freeze: `~/cortex_env/bin/pip freeze > cortex_env_freeze.txt` *(store next to the
-adapter backup)*.
+Keep the lock current: after any WSL env change,
+`wsl -- /home/ai/.venv-wsl-whisper/bin/pip freeze > cortex-speech-app/scripts/wsl7b_requirements.lock`
+and commit it — the lock in git IS the recovery source, not a note beside a backup.
 
 ## Backup priorities (do these BEFORE a disaster)
 
@@ -44,12 +45,12 @@ adapter backup)*.
 
 ### A. Venv lost/corrupted *(verify on WSL)*
 ```bash
-python3 -m venv ~/cortex_env
-~/cortex_env/bin/pip install fairseq2==0.6 fairseq2n==0.6 torch==2.8.0 peft==0.19.1 transformers==4.46.3
-# or, from the freeze snapshot: ~/cortex_env/bin/pip install -r cortex_env_freeze.txt
+python3 -m venv /home/ai/.venv-wsl-whisper
+/home/ai/.venv-wsl-whisper/bin/pip install -r /mnt/c/<repo>/cortex-speech-app/scripts/wsl7b_requirements.lock
 ```
-Torch must see the GPU: `~/cortex_env/bin/python -c "import torch; print(torch.cuda.is_available())"`
-→ `True`. If not, install the CUDA-enabled torch wheel matching the driver.
+Torch must see the GPUs:
+`/home/ai/.venv-wsl-whisper/bin/python -c "import torch; print(torch.cuda.is_available())"` → `True`.
+If not, install the CUDA-enabled torch wheel matching the driver.
 
 ### B. fairseq2 cache lost *(verify on WSL)*
 Nothing to restore by hand — fairseq2 re-downloads model assets into `~/.cache/fairseq2` on first
@@ -66,7 +67,8 @@ it usually survives, since it lives on the Windows filesystem).
 
 ## Smoke test (after ANY recovery)
 
-1. Start the server (from the export folder): `~/cortex_env/bin/python scripts/cortex_7b_server.py`
+1. Start the server the way the app does: `powershell -File cortex-speech-app/scripts/start_7b_server.ps1`
+   (it passes the app's own champion pointer; the server refuses to serve an unverified deployment)
 2. From Windows, the app's client must transcribe: the WSL preflight in the app (or
    `python scripts/cortex_7b_client.py` with a test clip) returns a non-empty Sorani transcript.
 3. In-app: import one small file with the WSL 7B engine selected — the import must NOT fall back

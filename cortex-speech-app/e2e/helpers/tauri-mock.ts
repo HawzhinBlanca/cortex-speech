@@ -9,9 +9,9 @@ export async function installTauriMock(page: Page): Promise<void> {
       rawTranscript: 'hello world',
       normalizedTranscript: 'hello world',
       annotatedTranscript: 'hello world',
-      alignmentJson: null,
+      alignmentJson: null as string | null,
       durationMs: 1500,
-      speakerId: 'SPEAKER_00',
+      speakerId: 'SPEAKER_00' as string | null,
       verified: false,
     };
 
@@ -25,7 +25,6 @@ export async function installTauriMock(page: Page): Promise<void> {
       asr_model_size: 'WSL7B',
       multi_engine_hypotheses: false,
       use_finetuned_asr: false,
-      cloud_stt_opt_in: false,
       external_asr_script_path: '/root/cortex_env/cortex_7b_client.py',
       vad_threshold: 0.5,
       min_segment_duration_ms: 3000,
@@ -106,7 +105,6 @@ export async function installTauriMock(page: Page): Promise<void> {
       unregisterCallback: (id: number) => {
         eventHandlers.delete(id);
       },
-      convertFileSrc: (path: string) => path,
       invoke: async (
         cmd: string,
         args?: {
@@ -115,6 +113,12 @@ export async function installTauriMock(page: Page): Promise<void> {
           searchQuery?: string;
           sortOrder?: string;
           id?: string;
+          audioPath?: string;
+          segmentId?: string;
+          expectedRevision?: number;
+          clientAttemptId?: string;
+          playbackReceiptId?: string;
+          intervals?: Array<{ startMs?: number; endMs?: number }>;
         },
       ) => {
         switch (cmd) {
@@ -122,6 +126,31 @@ export async function installTauriMock(page: Page): Promise<void> {
             return emptyLibrary()
               ? { items: [], total: 0, nextCursor: null }
               : { items: [mockSegment], total: 1, nextCursor: null };
+          case 'get_review_page_v1':
+            return emptyLibrary()
+              ? {
+                  items: [],
+                  total: 0,
+                  nextCursor: null,
+                  scopeLabel: 'pending',
+                  focusNarrowed: false,
+                }
+              : {
+                  items: [
+                    {
+                      segment: mockSegment,
+                      baseRevision: 0,
+                      eligible: true,
+                      disabledReason: null,
+                    },
+                  ],
+                  total: 1,
+                  nextCursor: null,
+                  scopeLabel: 'pending',
+                  focusNarrowed: false,
+                };
+          case 'get_review_draft_v1':
+            return null;
           case 'get_segment':
             if (emptyLibrary()) throw new Error('Segment no longer exists');
             return mockSegment;
@@ -146,20 +175,58 @@ export async function installTauriMock(page: Page): Promise<void> {
             return [mockSegment];
           case 'get_settings':
             return mockSettings;
+          case 'get_history_status_v1':
+            return { undoAction: null, redoAction: null };
+          case 'undo':
+          case 'redo':
+            return { action: null, status: { undoAction: null, redoAction: null } };
           case 'get_dataset_quality':
             return mockQuality;
           case 'get_dataset_certificate':
             return mockCertificate;
           case 'register_media_asset':
-            return { id: 'e2e-audio-grant' };
+          case 'register_review_media_asset':
+            return {
+              id: 'e2e-audio-grant',
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            };
           case 'get_media_asset_url':
             // Valid empty WAV. Keeping playback on a data URL exercises the successful grant path
             // without leaking test requests to the Vite server or flooding logs with expected 404s.
             return 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+          case 'begin_desktop_playback_session_v1':
+            return {
+              playbackReceiptId: crypto.randomUUID(),
+              segmentId: String(args?.segmentId ?? mockSegment.id),
+              segmentRevision: Number(args?.expectedRevision ?? 0),
+              clipDurationMs: mockSegment.durationMs,
+              expiresAtMs: Date.now() + 30 * 60_000,
+            };
+          case 'finalize_desktop_playback_session_v1': {
+            const uniquePlayedMs = (args?.intervals ?? []).reduce(
+              (total, interval) =>
+                total + Math.max(0, Number(interval.endMs ?? 0) - Number(interval.startMs ?? 0)),
+              0,
+            );
+            return {
+              playbackReceiptId: String(args?.playbackReceiptId ?? ''),
+              segmentId: String(args?.segmentId ?? mockSegment.id),
+              segmentRevision: Number(args?.expectedRevision ?? 0),
+              uniquePlayedMs,
+              clipDurationMs: mockSegment.durationMs,
+              coverageRatio: Math.min(1, uniquePlayedMs / mockSegment.durationMs),
+            };
+          }
+          case 'cancel_desktop_playback_session_v1':
+            return true;
           case 'get_waveform':
             return [0.1, 0.35, 0.8, 0.4, 0.15];
           case 'get_audio_duration':
             return 1.5;
+          case 'get_audio_health':
+            return { totalFiles: 1, missingFiles: 0, missingPaths: [] };
+          case 'take_last_crash':
+            return null;
           case 'get_training_grade_breakdown':
             // Match the fail-closed readiness contract. Falling through to null/object stubs makes
             // the Insights panel log an error on every E2E page load and leaves the accessibility
@@ -177,13 +244,48 @@ export async function installTauriMock(page: Page): Promise<void> {
             };
           case 'get_configured_providers':
             // Names only, never key values — matches the real configured_providers() contract.
-            return ['elevenlabs'];
+            return ['gemini'];
           case 'set_api_key':
             // Echo the post-save provider-NAMES list (never a key value), like the real command.
-            return ['elevenlabs', args?.provider ?? 'openrouter'];
-          case 'update_segment_fields':
-            // F10 partial autosave: true = the fresh row existed and the fields were applied.
-            return true;
+            return ['gemini', args?.provider ?? 'openrouter'];
+          case 'update_segment_metadata_v1': {
+            const request = args?.request as
+              | {
+                  segmentId?: string;
+                  changes?: Array<{
+                    field?: 'speakerId' | 'alignmentJson';
+                    expected?: string | null;
+                    value?: string | null;
+                  }>;
+                }
+              | undefined;
+            const speaker = request?.changes?.find((change) => change.field === 'speakerId');
+            const alignment = request?.changes?.find((change) => change.field === 'alignmentJson');
+            if (
+              (speaker &&
+                mockSegment.speakerId !== speaker.expected &&
+                mockSegment.speakerId !== speaker.value) ||
+              (alignment &&
+                mockSegment.alignmentJson !== alignment.expected &&
+                mockSegment.alignmentJson !== alignment.value)
+            ) {
+              throw {
+                schema: 1,
+                code: 'STALE_SEGMENT_METADATA',
+                message: 'The mock metadata changed. Reload it before saving.',
+                retryable: false,
+                suggestedAction: 'reloadClip',
+              };
+            }
+            if (speaker) mockSegment.speakerId = speaker.value ?? null;
+            if (alignment) mockSegment.alignmentJson = alignment.value ?? null;
+            return {
+              segmentId: request?.segmentId ?? 'seg-1',
+              speakerId: mockSegment.speakerId,
+              alignmentJson: mockSegment.alignmentJson,
+              changed: true,
+            };
+          }
           case 'couch_review_status':
             return { running: false, reviewers: [] };
           case 'start_couch_review':
@@ -238,10 +340,6 @@ export async function installTauriMock(page: Page): Promise<void> {
             ];
           case 'clear_tracing_spans':
             return null;
-          case 'transcribe_audio_with_scribe':
-            return 'سکرایب کوردی';
-          case 'add_scribe_votes':
-            return 1;
           case 'import_model_checkpoint':
             return args?.id ?? 'imported-candidate';
           case 'plugin:dialog|open':
@@ -304,28 +402,64 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'list_model_versions':
             return [
               {
-                id: 'finetuned-mms-ckb',
-                family: 'mms-ckb',
-                model_card_name: 'MMS-CTC-1B (ckb)',
-                checkpoint_sha256:
+                id: 'omniasr-7b-champion',
+                family: 'omniasr-7b',
+                modelCardName: 'Pinned Kurdish champion deployment',
+                checkpointSha256:
                   'a1b2c3d4e5f600112233445566778899aabbccddeeff00112233445566778899',
-                checkpoint_path: '',
-                source: 'fine-tune',
-                license: 'CC-BY-NC-4.0',
+                source: 'owner-finetune',
+                license: 'Apache-2.0',
                 status: 'champion',
               },
               {
-                id: 'omniasr-ctc-300m',
-                family: 'omniasr',
-                model_card_name: null,
-                checkpoint_sha256:
+                id: 'omniasr-7b-challenger',
+                family: 'omniasr-7b',
+                modelCardName: null,
+                checkpointSha256:
                   '00112233445566778899aabbccddeeffa1b2c3d4e5f6000000000000deadbeef',
-                checkpoint_path: '',
-                source: 'bundled',
-                license: 'CC-BY-4.0',
+                source: 'owner-finetune',
+                license: 'Apache-2.0',
                 status: 'candidate',
               },
             ];
+          case 'models_status':
+            return [
+              {
+                name: 'Silero VAD v4',
+                filename: 'silero_vad_v4.onnx',
+                downloaded: true,
+                exists: true,
+                sizeBytes: 2_000_000,
+                minSizeBytes: 1_000_000,
+                version: '4.0',
+                source: 'bundled',
+                downloadable: true,
+              },
+              {
+                name: 'CAM++ Speaker Embedding',
+                filename: 'campp/model.onnx',
+                downloaded: true,
+                exists: true,
+                sizeBytes: 12_000_000,
+                minSizeBytes: 10_000_000,
+                version: '1.0',
+                source: 'bundled',
+                downloadable: true,
+              },
+              {
+                name: 'AI Audio Denoiser',
+                filename: 'denoiser/model.onnx',
+                downloaded: true,
+                exists: true,
+                sizeBytes: 500_000,
+                minSizeBytes: 400_000,
+                version: '1.0',
+                source: 'bundled',
+                downloadable: true,
+              },
+            ];
+          case 'models_download_all':
+            return { downloaded: 0, failed: 0, total: 0, skipped: 0 };
           case 'get_inference_stats':
             return {
               vad: { calls: 0, failures: 0, p50_ms: 0, p99_ms: 0 },
@@ -378,11 +512,39 @@ export async function installTauriMock(page: Page): Promise<void> {
               errors: [],
               summary: '1 segment checked — no issues',
             };
-          case 'delete_segments_batch':
+          case 'delete_segments_v1': {
+            const ids = (args?.request as { ids?: string[] } | undefined)?.ids ?? [];
+            return { requestedCount: ids.length, deletedCount: ids.length };
+          }
+          case 'get_speaker_inventory_v1':
+            return [{ speakerId: 'SPEAKER_00', segmentCount: 1, totalDurationSeconds: 1.5 }];
+          case 'rename_speaker_v1': {
+            const request = args?.request as
+              | {
+                  sourceSpeakerId?: string | null;
+                  targetSpeakerId?: string;
+                  expectedSourceCount?: number;
+                  expectedTargetCount?: number;
+                }
+              | undefined;
+            return {
+              sourceSpeakerId: request?.sourceSpeakerId ?? null,
+              targetSpeakerId: request?.targetSpeakerId ?? '',
+              renamedCount: request?.expectedSourceCount ?? 0,
+              targetCount:
+                (request?.expectedSourceCount ?? 0) + (request?.expectedTargetCount ?? 0),
+              merged: (request?.expectedTargetCount ?? 0) > 0,
+            };
+          }
+          case 'assign_speakers_v1': {
+            const request = args?.request as
+              { ids?: string[]; targetSpeakerId?: string | null } | undefined;
+            const ids = request?.ids ?? [];
+            return { requestedCount: ids.length, changedCount: ids.length, unchangedCount: 0 };
+          }
           case 'export_huggingface_dataset':
             return null;
           case 'batch_verify':
-          case 'batch_assign_speaker':
           case 'batch_normalize':
           case 'batch_transcribe':
           case 'rediarize_segments':
@@ -400,7 +562,7 @@ export async function installTauriMock(page: Page): Promise<void> {
           case 'plugin:event|unlisten':
             return null;
           default:
-            return null;
+            throw new Error(`Unknown E2E Tauri mock command: ${cmd}`);
         }
       },
       // @tauri-apps/api/window reads these labels before registering the close-request handler.

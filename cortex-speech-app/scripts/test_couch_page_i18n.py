@@ -34,6 +34,11 @@ CKB_TS = APP / "src" / "lib" / "i18n" / "ckb.ts"
 # Phone strings whose Sorani is NEW and has NOT had a native review. Owner-gated: this list is the
 # acknowledgement. Adding a key here is a deliberate act; growing it silently is not possible.
 UNREVIEWED_SORANI = {
+    # The playback refusal (2026-08-19). Shown when a verdict is rejected because the clip was not
+    # played far enough — the one refusal a reviewer can fix themselves, so the wording has to be
+    # unambiguous in Sorani or it reads as the app being broken. NOT natively reviewed: on the
+    # owner's read list.
+    "mustListen",
     "heldByOthers",
     "linkExpired",
     "loadingMore",
@@ -47,9 +52,20 @@ UNREVIEWED_SORANI = {
     # one reads well: reviewers are paid per hour of audio reviewed, so this is the number they will
     # check against their own count.
     "audioDone",
+    # Reviewer compensation accounting. These labels intentionally distinguish lifetime earned,
+    # externally paid, still due, legacy reconciliation, and an unavailable ledger. New Sorani,
+    # NOT natively reviewed — owner read required before claiming language perfection.
+    "earned",
+    "paid",
+    "outstanding",
+    "earlierPayPending",
+    "accountingUnavailable",
     # Dialect routing (owner instruction 2026-08-16): shown to a reviewer restricted to a dialect
     # that currently has no clips. New Sorani, NOT natively reviewed — on the owner's read list.
     "noDialectWork",
+    # Flexible pool completion is reviewer-specific, never a claim that the corpus or an assigned
+    # task is complete. New Sorani, NOT natively reviewed — on the owner's read list.
+    "poolDone",
     # v47 speaker-change badge. New Sorani, NOT yet natively reviewed — it goes on the owner's list
     # with the other seven.
     "speakerChange",
@@ -176,7 +192,14 @@ def test_no_raw_server_english_is_shown_to_the_reviewer() -> None:
         # is not shown to anyone.
         if "e.message" in line
         and not line.lstrip().startswith("//")
-        and ("t(" in line or "textContent" in line or "toast(" in line or "showErr(" in line)
+        # `t(` as a CALL, not a substring: `/was made by/.test(e.message)` is routing LOGIC (the
+        # attribution-409 hold, 2026-08-20), renders nothing, and must not trip a rendering gate.
+        and (
+            re.search(r"(?<![A-Za-z0-9_.])t\(", line) is not None
+            or "textContent" in line
+            or "toast(" in line
+            or "showErr(" in line
+        )
     ]
     assert not offenders, (
         "raw English server text is being rendered to the reviewer:\n"

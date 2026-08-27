@@ -2,36 +2,48 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-// P2.3 (audit F2): the last two whole-row-clobber paths. These are UI-guard invariants in large Svelte
-// components (App.svelte's normalize handler, ReviewMode's unmount teardown) that cannot be exercised by
-// a lightweight unit test without mounting the whole heavy component tree — so they are pinned as source
-// invariants (the same approach the repo's python policy gates use). A regression to a whole-row upsert /
-// an unguarded handler fails these.
+// Schema-v60 review truth is committed only by the atomic human-decision command. These source pins make
+// generic whole-row writes and renderer-owned transcript drafts structurally unreachable.
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
-describe('whole-row clobber guards (P2.3 / audit F2)', () => {
-  it('the ReviewMode unmount flush persists via the TARGETED field update, never a whole-row updateSegment', () => {
+describe('schema-v60 frontend review-write boundary', () => {
+  it('ReviewMode navigation and unmount never persist renderer-owned transcript drafts', () => {
     const src = read('../../src/lib/ReviewMode.svelte');
-    const start = src.indexOf('Unmount flush');
-    const end = src.indexOf('Transient word-bounded', start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const flush = src.slice(start, end);
-    // Must persist only annotatedTranscript via the field update (leaves alignmentJson untouched)...
-    expect(flush).toContain('updateSegmentFields(seg.id, { annotatedTranscript:');
-    // ...and must NOT whole-row upsert here (that spread a stale row and reverted a mid-align aligner write).
-    expect(flush).not.toMatch(/api\.updateSegment\(/);
+    expect(src).toContain('const editCache = new Map<string, string>()');
+    expect(src).toContain('session-local editCache');
+    expect(src).not.toContain('api.updateSegmentMetadataV1(');
+    expect(src).not.toMatch(/api\.updateSegment\(/);
   });
 
-  it('handleNormalize refuses while a batch/import is running ($isProcessing guard)', () => {
-    const src = read('../../src/App.svelte');
-    const start = src.indexOf('async function handleNormalize');
-    expect(start).toBeGreaterThan(-1);
-    const body = src.slice(start, start + 700);
-    expect(body).toContain('if ($isProcessing) return;');
+  it('the library exposes only a fail-closed metadata partial writer', () => {
+    const app = read('../../src/Workstation.svelte');
+    const commands = read('../../src/lib/commands.ts');
+    const coordinator = read('../../src/lib/segmentMetadataCoordinator.ts');
+    expect(commands).not.toContain('export async function updateSegment(');
+    expect(commands).toContain("Pick<SpeechSegment, 'speakerId' | 'alignmentJson'>");
+    expect(commands).toContain('export async function updateSegmentMetadataV1(');
+    expect(commands).toContain('expected: SegmentMetadataBaseline');
+    expect(coordinator).toContain("key !== 'speakerId' && key !== 'alignmentJson'");
+    for (const forbidden of [
+      'handleSaveAnnotation',
+      'handleToggleVerify',
+      'handleNormalize',
+      'finishEditingWord',
+      'data-testid="verify-btn"',
+    ]) {
+      expect(app).not.toContain(forbidden);
+    }
+    expect(app).not.toMatch(/api\.updateSegment\(/);
   });
 
-  it('the 4 ReviewMode mutators are clobber-safe: submit/markBad/go use targeted field updates; doRetranscribe refuses a batch (P2.3b)', () => {
+  it('flushes intersecting metadata before deletion instead of cancelling a failed save', () => {
+    const app = read('../../src/Workstation.svelte');
+    expect(app).toContain('flushAutosaveForIds(autosave, ids)');
+    expect(app).toContain('flushAutosaveForIds(autosave, [seg.id])');
+    expect(app).not.toContain('cancelPendingSave');
+  });
+
+  it('ReviewMode mutators are clobber-safe and champion re-transcribe reloads the atomic backend commit', () => {
     const src = read('../../src/lib/ReviewMode.svelte');
     const region = (fn: string, next: string) => {
       const s = src.indexOf(fn);
@@ -40,20 +52,48 @@ describe('whole-row clobber guards (P2.3 / audit F2)', () => {
       expect(e, `missing ${next} after ${fn}`).toBeGreaterThan(s);
       return src.slice(s, e);
     };
-    // submit / markBad / go persist only whitelisted fields via the targeted update — never a whole-row
-    // upsert of the batch-stale store row.
+    // Human decisions are now one versioned backend-owned atomic commit. ReviewMode reloads the
+    // authoritative row and must not issue a second revision-bumping field write or stale upsert.
     const submit = region('async function submit(', 'function advance(');
-    expect(submit).toContain('updateSegmentFields(seg.id, { annotatedTranscript: text, verified: true })');
+    expect(submit).toContain('const commit = await api.commitReviewV1({');
+    expect(submit).toContain('baseRevision');
+    expect(submit).toContain('commit.authoritativeTranscript');
+    expect(submit).not.toContain('updateSegmentMetadataV1(seg.id');
     expect(submit).not.toMatch(/api\.updateSegment\(/);
     const markBad = region('async function markBad(', 'async function submit(');
-    expect(markBad).toContain('updateSegmentFields(seg.id, { verified: true })');
+    expect(markBad).toContain('const commit = await api.commitReviewV1({');
+    expect(markBad).toContain("decision: 'reject'");
+    expect(markBad).toContain('baseRevision');
+    expect(markBad).toContain('commit.authoritativeTranscript');
+    expect(markBad).not.toContain('updateSegmentMetadataV1(seg.id');
     expect(markBad).not.toMatch(/api\.updateSegment\(/);
     const go = region('async function go(', 'function resetToOriginal(');
-    expect(go).toContain('updateSegmentFields(seg.id, { annotatedTranscript: text })');
+    expect(go).toContain('session-local editCache');
+    expect(go).not.toContain('updateSegmentMetadataV1(');
     expect(go).not.toMatch(/api\.updateSegment\(/);
-    // doRetranscribe writes rawTranscript (not whitelisted) so it stays a whole-row upsert, but must be
-    // refused during a batch/import.
+    // Re-transcribe is champion-only: the backend commits transcript + provenance atomically, then the
+    // UI reloads that authoritative row. It must never whole-row upsert a stale frontend snapshot.
     const doRetranscribe = region('async function doRetranscribe(', 'async function markBad(');
     expect(doRetranscribe).toMatch(/if \(!seg[^)]*\$isProcessing\) return;/);
+    expect(doRetranscribe).toContain(
+      'api.transcribeSegment(seg.audioPath, seg.alignmentJson, seg.id)',
+    );
+    expect(doRetranscribe).toContain('const updated = await api.getSegment(seg.id)');
+    expect(doRetranscribe).toContain('updated.modelVersionId');
+    expect(doRetranscribe).not.toMatch(/api\.updateSegment\(/);
+    expect(doRetranscribe).not.toContain('transcribeSegmentFinetuned');
+  });
+
+  it('ReviewInbox uses immutable server effects for both decisions and flags', () => {
+    const src = read('../../src/lib/ReviewInbox.svelte');
+    expect(src).toContain('effectEventId: commit.effectEventId');
+    expect(src).toContain('api.undoHumanDecision(last.effectEventId, last.operationId)');
+    expect(src).toContain("api.recordReviewFlag(cur.id, 'Flagged for second-pass adjudication')");
+    expect(src).toContain('api.undoReviewFlag(last.effectEventId, last.operationId)');
+    expect(src).toMatch(
+      /async function undo\(\)[\s\S]*isSubmitting = true;[\s\S]*finally \{\s*isSubmitting = false;/,
+    );
+    expect(src).not.toContain('api.clearHumanDecision(');
+    expect(src).not.toContain('api.clearEscalation(');
   });
 });

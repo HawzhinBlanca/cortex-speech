@@ -2,6 +2,9 @@
   import { onMount, onDestroy } from 'svelte';
   import { t } from './i18n';
 
+  const isolate = (value: string | number): string =>
+    `${String.fromCodePoint(0x2068)}${String(value)}${String.fromCodePoint(0x2069)}`;
+
   interface Props {
     waveform: number[];
     currentTime?: number;
@@ -347,14 +350,6 @@
   <!-- Timeline Zoom Control bar -->
   <div class="flex items-center justify-between text-[10px] text-cortex-400 font-mono px-1">
     <div class="flex items-center gap-1.5">
-      <svg class="w-3 h-3 text-cortex-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          stroke-width="2"
-          d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v6m4-3H6"
-        />
-      </svg>
       <span>{$t('waveform.timelineZoom')}</span>
     </div>
     <div class="flex items-center gap-2">
@@ -365,7 +360,8 @@
         step="0.5"
         bind:value={zoom}
         class="w-32 h-1 bg-cortex-800 rounded-lg appearance-none cursor-pointer accent-indigo-500 focus:outline-none"
-        aria-label="Waveform zoom slider"
+        aria-label={$t('waveform.zoomSlider')}
+        dir="ltr"
       />
       <span class="w-8 text-end font-bold text-indigo-400">{zoom.toFixed(1)}x</span>
     </div>
@@ -381,11 +377,14 @@
       bind:this={canvas}
       class="block cursor-pointer select-none"
       role="slider"
-      aria-label="Audio waveform timeline"
+      aria-label={$t('waveform.audioTimeline')}
       aria-valuemin={0}
       aria-valuemax={duration}
       aria-valuenow={currentTime}
-      aria-valuetext={`${currentTime.toFixed(1)} seconds of ${duration.toFixed(1)} seconds`}
+      aria-valuetext={$t('waveform.position', {
+        current: isolate(currentTime.toFixed(1)),
+        duration: isolate(duration.toFixed(1)),
+      })}
       tabindex="0"
       onkeydown={handleTimelineKeydown}
       onpointerdown={handlePointerDown}

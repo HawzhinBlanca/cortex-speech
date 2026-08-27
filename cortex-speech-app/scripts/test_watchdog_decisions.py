@@ -38,14 +38,29 @@ SCRIPT = APP / "scripts" / "ops" / "cortex-watchdog.ps1"
 EXE = APP / "src-tauri" / "target" / "release" / "cortex-speech-app.exe"
 
 
-def free_port() -> int:
-    """A port nothing is listening on, so the probe is guaranteed to fail fast."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def reserve_dead_port() -> tuple[socket.socket, int]:
+    """Hold an exclusive, bound, non-listening port so every probe fails fast.
+
+    Merely asking Windows for a free ephemeral port and closing the socket leaves a race: a later
+    client probe can be assigned that same number as its source port and connect to itself. Keeping
+    the socket bound prevents reuse; deliberately never calling listen() keeps connections refused.
+    """
+    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is None:
+            raise AssertionError("Windows watchdog drill requires SO_EXCLUSIVEADDRUSE")
+        reservation.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        reservation.bind(("127.0.0.1", 0))
+        if reservation.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 0:
+            raise AssertionError("dead-port reservation unexpectedly entered listening state")
+        return reservation, reservation.getsockname()[1]
+    except BaseException:
+        reservation.close()
+        raise
 
 
-def run(data_dir: Path, port: int, exe: Path | None = None, grace_min: str = "0") -> str:
+def run_result(data_dir: Path, port: int, exe: Path | None = None, grace_min: str = "0") -> tuple[str, int]:
     # grace_min="0" by default so a freshly spawned decoy process is already past the STARTUP GRACE
     # and the kill path is reachable. Without this every kill case would report "starting-up": the
     # decoy is seconds old and the real grace is 20 minutes. The grace itself is covered by its own
@@ -68,7 +83,11 @@ def run(data_dir: Path, port: int, exe: Path | None = None, grace_min: str = "0"
     lines = [ln for ln in (out.stdout or "").splitlines() if ln.startswith("WATCHDOG-ACTION:")]
     if not lines:
         raise AssertionError(f"no decision reported.\nstdout:\n{out.stdout}\nstderr:\n{out.stderr}")
-    return lines[-1].split("WATCHDOG-ACTION:", 1)[1].strip()
+    return lines[-1].split("WATCHDOG-ACTION:", 1)[1].strip(), out.returncode
+
+
+def run(data_dir: Path, port: int, exe: Path | None = None, grace_min: str = "0") -> str:
+    return run_result(data_dir, port, exe, grace_min)[0]
 
 
 def app_is_running() -> bool:
@@ -114,6 +133,43 @@ def start_decoy(dir_: Path) -> tuple[subprocess.Popen[bytes], Path]:
     raise AssertionError(f"decoy process at {exe} never became visible to the watchdog's matcher")
 
 
+def start_lock_holder(lock_path: Path) -> subprocess.Popen[bytes]:
+    """Hold the real Windows sharing lock shape without running Cortex or touching its profile."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    escaped = str(lock_path).replace("'", "''")
+    command = (
+        f"$s=[System.IO.File]::Open('{escaped}',"
+        "[System.IO.FileMode]::OpenOrCreate,[System.IO.FileAccess]::ReadWrite,"
+        "[System.IO.FileShare]::None); try { Start-Sleep -Seconds 300 } finally { $s.Dispose() }"
+    )
+    proc = subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    probe = (
+        f"try {{ $s=[System.IO.File]::Open('{escaped}',"
+        "[System.IO.FileMode]::Open,[System.IO.FileAccess]::ReadWrite,"
+        "[System.IO.FileShare]::None); $s.Dispose(); exit 1 } "
+        "catch [System.IO.IOException] { $c=$_.Exception.HResult -band 0xFFFF; "
+        "if ($c -eq 32 -or $c -eq 33) { exit 0 }; exit 2 }"
+    )
+    for _ in range(50):
+        if lock_path.exists() and proc.poll() is None:
+            refused = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", probe],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            if refused.returncode == 0:
+                return proc
+        time.sleep(0.1)
+    proc.kill()
+    raise AssertionError(f"throwaway database lock holder never acquired {lock_path}")
+
+
 def main() -> int:
     # The subject is a PowerShell script driven by a Windows Task Scheduler entry, and this drill
     # copies `System32\WindowsPowerShell\v1.0\powershell.exe` to build its decoy. None of that exists
@@ -131,7 +187,6 @@ def main() -> int:
     if not SCRIPT.exists():
         print(f"watchdog script missing: {SCRIPT}", file=sys.stderr)
         return 1
-    dead = free_port()
     # Reported as context, not used as a gate any more: coverage no longer depends on it.
     running = app_is_running()
     failures: list[str] = []
@@ -156,6 +211,7 @@ def main() -> int:
         print(f"  {'OK  ' if ok else 'FAIL'} {label}: {got}")
 
     tmp = Path(tempfile.mkdtemp(prefix="cortex-wd-"))
+    dead_reservation, dead = reserve_dead_port()
     try:
         print(f"drilling on a throwaway profile ({tmp}) and dead port {dead}")
         print(f"  (the real app is {'running' if running else 'not running'} - every branch below is drilled either way)")
@@ -165,9 +221,37 @@ def main() -> int:
         no_proc_exe = tmp / "not-running" / "cortex-speech-app.exe"
         expect("no session + not running -> launch", run(tmp, dead, no_proc_exe), "launch")
 
-        # Session file present = the server is SUPPOSED to be up, so a dead port means bring it back.
-        (tmp / "couch_session.json").write_text('{"reviewers":{},"db_path":"x","spot_checks":[]}', encoding="utf-8")
-        expect("session + not running -> relaunch", run(tmp, dead, no_proc_exe), "relaunch")
+        # A live batch importer owns the same exclusive database lock as the GUI. The watchdog must
+        # wait for it rather than launching a GUI that is guaranteed to fail its instance guard. A
+        # stale lockfile is intentionally different: File.Open succeeds, so normal launch continues.
+        lock_holder = start_lock_holder(tmp / "cortex.lock")
+        try:
+            expect("live database lock + no session + no GUI -> defer", run(tmp, dead, no_proc_exe), "defer")
+            (tmp / "couch_session.json").write_text(
+                '{"reviewers":{},"db_path":"x","spot_checks":[]}', encoding="utf-8"
+            )
+            expect("live database lock + no GUI -> defer", run(tmp, dead, no_proc_exe), "defer")
+        finally:
+            lock_holder.kill()
+            lock_holder.wait(timeout=30)
+        expect(
+            "released holder leaves only a stale lock -> relaunch next tick",
+            run(tmp, dead, no_proc_exe),
+            "relaunch",
+        )
+        (tmp / "cortex.lock").unlink(missing_ok=True)
+
+        # A path/ACL/disk fault is not evidence that an importer owns the lock. It must be a distinct,
+        # non-successful blocked decision rather than a forever-green defer.
+        (tmp / "cortex.lock").mkdir()
+        blocked, blocked_code = run_result(tmp, dead, no_proc_exe)
+        expect("invalid lock path -> blocked, not importer defer", blocked, "blocked")
+        checked += 1
+        if blocked_code == 0:
+            failures.append("database lock probe fault exited 0; blocked launch must be operationally red")
+        else:
+            print("  OK   database lock probe fault exits nonzero")
+        (tmp / "cortex.lock").rmdir()
 
         # ── the process-ALIVE branches, against a decoy ────────────────────────
         # These are the ones that used to be SKIPped whenever the real app was down, which left the
@@ -184,7 +268,17 @@ def main() -> int:
             (tmp / "couch_session.json").write_text(
                 '{"reviewers":{},"db_path":"x","spot_checks":[]}', encoding="utf-8"
             )
-            expect("session + RUNNING + dead port -> kill and relaunch", run(tmp, dead, decoy_exe), "kill-and-relaunch")
+            app_lock_holder = start_lock_holder(tmp / "cortex.lock")
+            try:
+                expect(
+                    "session + RUNNING + own live lock + dead port -> kill and relaunch",
+                    run(tmp, dead, decoy_exe),
+                    "kill-and-relaunch",
+                )
+            finally:
+                app_lock_holder.kill()
+                app_lock_holder.wait(timeout=30)
+                (tmp / "cortex.lock").unlink(missing_ok=True)
 
             # THE KILL-LOOP CAP: three failed restarts and it must stop, not keep killing forever.
             (tmp / "logs").mkdir(exist_ok=True)
@@ -242,6 +336,7 @@ def main() -> int:
         print(f"\nwatchdog decision drill passed ({checked} branch assertion(s))")
         return 0
     finally:
+        dead_reservation.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
 

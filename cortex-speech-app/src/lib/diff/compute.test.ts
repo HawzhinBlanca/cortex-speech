@@ -58,4 +58,16 @@ describe('computeLocalDiff', () => {
       expect(d.stats.similarity).toBeLessThanOrEqual(100);
     }
   });
+
+  it('refuses oversized work instead of fabricating a 100% similarity result', () => {
+    const oversized = 'w '.repeat(10_001);
+    expect(() => computeLocalDiff(oversized, 'small')).toThrow(
+      expect.objectContaining({ schema: 1, code: 'DIFF_TOO_LARGE' }),
+    );
+
+    const expensive = 'w '.repeat(4_000);
+    expect(() => computeLocalDiff(expensive, expensive)).toThrow(
+      expect.objectContaining({ schema: 1, code: 'DIFF_TOO_COMPLEX' }),
+    );
+  });
 });

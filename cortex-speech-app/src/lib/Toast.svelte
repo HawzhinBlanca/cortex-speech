@@ -2,17 +2,11 @@
   import { notifications, type Notification } from './stores/notificationStore';
   import { fly, fade } from 'svelte/transition';
   import { flip } from 'svelte/animate';
+  import { t } from './i18n';
 
   let items: Notification[] = $state([]);
   notifications.subscribe((n) => (items = n));
 
-  const ICONS: Record<string, string> = { success: '✓', error: '✕', warning: '⚠', info: 'ℹ' };
-  const TINT: Record<string, string> = {
-    success: 'text-success',
-    error: 'text-danger',
-    warning: 'text-warning',
-    info: 'text-info',
-  };
   const BAR: Record<string, string> = {
     success: 'bg-success',
     error: 'bg-danger',
@@ -22,7 +16,7 @@
 </script>
 
 <div
-  class="pointer-events-none fixed bottom-4 end-4 z-[120] flex w-full max-w-sm flex-col gap-2.5"
+  class="pointer-events-none fixed bottom-4 end-4 z-[120] flex w-[calc(100%-2rem)] max-w-sm flex-col gap-2.5"
   aria-live="polite"
 >
   {#each items as notif (notif.id)}
@@ -35,18 +29,10 @@
     >
       <span class="absolute inset-y-0 start-0 w-1 {BAR[notif.type] ?? 'bg-accent'}"></span>
 
-      <span
-        class="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-surface-3 text-sm {TINT[
-          notif.type
-        ] ?? 'text-accent'}"
-      >
-        {ICONS[notif.type] ?? '•'}
-      </span>
-
       <div class="min-w-0 flex-1">
         <p class="text-sm font-medium text-default">{notif.message}</p>
         {#if notif.detail}
-          <p class="mt-0.5 truncate text-xs text-muted">{notif.detail}</p>
+          <bdi class="mt-0.5 block truncate text-xs text-muted" dir="auto">{notif.detail}</bdi>
         {/if}
         {#if notif.action}
           <button
@@ -60,21 +46,11 @@
       </div>
 
       <button
-        class="icon-btn absolute end-1.5 top-1.5 h-7 w-7"
+        class="absolute end-2 top-2 rounded px-1.5 py-1 text-[10px] text-muted hover:bg-surface-3 hover:text-default"
         onclick={() => notifications.dismiss(notif.id)}
-        aria-label="Dismiss"
+        aria-label={$t('dismiss')}
       >
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-        >
-          <path d="M18 6 6 18M6 6l12 12" />
-        </svg>
+        {$t('dismiss')}
       </button>
     </div>
   {/each}

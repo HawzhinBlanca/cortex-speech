@@ -3,9 +3,11 @@
 
 from pathlib import Path
 
+from _couch_policy_util import couch_surface
+
 
 def test_production_couch_is_tls_and_pairing_based() -> None:
-    source = (Path(__file__).parents[1] / "src-tauri" / "src" / "couch.rs").read_text(encoding="utf-8")
+    source = couch_surface(Path(__file__).parents[1] / "src-tauri" / "src")
     start = source.index("fn start_on_port(")
     stop = source.index("/// Stop the couch server", start)
     production_start = source[start:stop]

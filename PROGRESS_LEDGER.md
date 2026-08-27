@@ -1,5 +1,198 @@
 # Cortex Speech — Progress Ledger
 
+> **CURRENT PRIVATE-PRODUCTION AUTHORITY — 2026-08-24:** The June Wave-0 scorecard and “Current
+> Focus” sections immediately below are historical charter lineage, not the live reviewer-system
+> verdict. Current operational authority is
+> [`cortex-speech-app/docs/PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md`](cortex-speech-app/docs/PRIVATE_PRODUCTION_10_COMPLETION_AUDIT_2026-08-24.md),
+> the active immutable release pointer, and the generated schema-2 pool certification. The active
+> reviewer line is release `8ef5d3c1b29e-8a999c88e220-2ad63448136e`; it is review-ready, while the
+> human-reviewed dataset is correctly not final. Never use an older score, machine-state paragraph,
+> hidden-check requirement, model route, focus, or roster below as current production instruction.
+
+> **2026-08-25 — EVIDENCE-BACKED 10/10 INTEGRATION IN PROGRESS (NOT CERTIFIED):** Branch
+> `codex/10-10-integration` was created from schema-65 production commit `bd581ef`; the intent of the
+> 15 audit-remediation commits from `ea2ec3d` through `889672c` was replayed individually, preserving
+> migrations 1–65 and the flexible-pool authority. Conflict integrations retain the production
+> vectorized duplicate graph while comparing mixed sample rates, retain pool/staging isolation, and
+> retain every audit regression. The commit-to-regression map is
+> [`docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md`](docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md).
+> Measured checkpoint at `7f173fa`: duplicate policies **6/6 + 17/17**, frontend **310/310** across
+> 58 files, browser E2E/accessibility **97/97** with zero retries, all **121** reachable Python policy scripts, compensation readiness **38/38**, strict
+> Clippy **PASS**, rustfmt **PASS**, and the exact all-target/all-feature Rust command exited 0 with
+> **1,612 library tests passed**, 0 failed and 8 explicitly ignored plus green integration, soak,
+> binary and benchmark targets. Migrations 1–65 are byte-identical to `bd581ef`. The importer
+> fixture now executes the production `Database::initialize` boot step and its binary suite is
+> **6/6**. The typed/profiled verify-10 supervisor now has explicit argv/substeps (no `shell=True`),
+> per-gate timeouts, streamed
+> immutable attempt logs, Windows kill-on-close Job Objects, PID-creation/token/SHA leases with 5 s
+> heartbeat and 30 s stale threshold, fsynced event sequencing, non-certifying
+> `PASS-AFTER-RETRY`, hash-validated manifests and post-validation latest/status publication. Its
+> current fault regressions are **9/9** (concurrency, dead/PID-reused/wedged leases, child+grandchild
+> timeout, evidence-write failure, isolated worker and manifest binding). Generated versioned IPC and
+> revision-bound review commits landed at `df861d7`; attempt-bound audio with a 10,000-transition
+> randomized state-machine proof landed at `dd43844`. The first backend strangler slice landed at
+> `44222f6`: `DatabaseRuntime` now owns the serialized writer, a bounded four-connection read pool,
+> and restore admission; typed review reads and backup use restore-gated read snapshots, and the
+> runtime's four focused regressions prove capacity release, restore draining, writer-independent
+> reads and exact online backup migration history. `d554d4a` adds the first Tauri-free domain store: ten
+> segment/library/review read handlers now use bounded `SegmentQueryStore` snapshots, readers no
+> longer take the serialized-writer mutex just to discover the live database path, and a new
+> architecture policy forbids those handlers from regaining raw database authority. `dff94a4`
+> appends schema 66 for FULL-sync, revision-bound, non-authoritative desktop drafts; stale writes
+> cannot resurrect cleared work, matching drafts clear atomically with typed human decisions and
+> lost-response replays, stale drafts are shown beside server truth without automatic merge, and
+> exports/evaluation/payment/serving cannot query the draft table. `deddfd3` isolates Review,
+> Settings, Refinery, validation, review inbox, keyboard help, command palette, speaker, merge and WSL
+> workspaces behind literal dynamic imports with localized loading/failure, retry, stale-load isolation
+> and raw-error scrubbing. Both standalone preview and E2E mocks implement the typed review page/draft
+> contract and reject unknown commands instead of returning deceptive `null`. The production build now
+> walks Vite's complete transitive static manifest and fails over **125 KB JavaScript / 15 KB CSS**;
+> its exact result is **111.19 KB JS gzip and 11.20 KB CSS gzip**. A synthetic oversized transitive
+> dependency is rejected, so this is an enforced bundle gate rather than a copied measurement.
+> `08ae275` adds the first serialized review-adjacent write store: the desktop playback handler now
+> validates and delegates to a Tauri-free `PlaybackWriteStore`, whose observation DTO cannot carry a
+> client-authored revision, audio hash, source span or authoritative duration. The database resolves
+> those values and coverage under the writer lock. Three adversarial store tests prove a one-millisecond
+> claimed duration cannot inflate coverage, missing server identity writes no receipt, and invalid
+> timing leaves no partial row; the full playback selection passed 16/16 and the architecture policy
+> prevents the command from regaining raw database authority. `78f2a1c` adds a second serialized
+> write boundary: decision undo, review-flag creation, exact flag undo and the retired identity-free
+> clear endpoint now delegate through a Tauri-free `ReviewWriteStore`. Three focused regressions pin
+> exact response-loss replay, payload-conflict refusal, one immutable reversal per effect, idempotent
+> undo, and continued refusal of authority-free clearing; the architecture policy prevents those
+> four migrated commands from regaining raw database access. `7370068` expands that same serialized
+> boundary to both desktop decision contracts. Legacy operation-ID replay and typed revision-CAS
+> replay are resolved before current playback preflight; playback identity is derived under the
+> writer lock; typed draft clearing remains in the human-truth transaction; stale revisions retain
+> structured public error details; and navigation cursor persistence no longer gives either command
+> raw database authority. The existing 11 command regressions now execute through the store and pin
+> lost-response replay, playback enforcement, stale-revision refusal and injected draft-clear
+> rollback. `9a43316` adds a Tauri-free `RightsStore`: recording-scoped declarations and irreversible
+> consent withdrawal serialize through `DatabaseRuntime`, while rights/provenance listing uses a
+> bounded restore-gated read snapshot. Commands retain path/text validation and public DTO mapping
+> without raw database access. Two store regressions prove declaration scope and that a later metadata
+> declaration cannot resurrect withdrawn consent; a new architecture policy covers all three commands.
+> `6e72bcc` adds a Tauri-free `JobStore`: interrupted-import discovery and recent Job Center history
+> use bounded restore-gated snapshots, while interrupted-import discard stays serialized behind
+> `DatabaseRuntime`. Startup, resume and recent-job commands retain their rate/identifier validation
+> but no longer acquire raw database authority. Two store regressions and a four-command architecture
+> policy pin bounded newest-first reads and durable read/discard behavior. `d21f241` adds a Tauri-free
+> `SegmentWriteStore`: single and batch deletion capture exact server rows for undo before successful
+> removal, speaker rename uses the serialized writer, and commands retain input/rate validation without
+> raw database access. The deletion store returns an admission token held through session autosave, so
+> restore cannot split the database mutation from matching session persistence. Two store regressions
+> prove exact raw-transcript/speaker restoration and shared batch-delete/rename serialization; the
+> architecture and runtime-panic policies require delegation and explicit database error propagation.
+> The retired whole-row endpoint now refuses before acquiring database authority. `20148bb` completes
+> the active desktop segment-mutation slice by routing field-level updates through the same store. The
+> store now owns the curation whitelist, structural alignment validation, schema-60 human-truth guard and
+> exact history persistence; mixed restricted payloads refuse before mutation, and the command keeps
+> the restore-admission token alive through session autosave. Four focused store regressions plus the
+> expanded architecture policy passed on the same tree. `a0fb4df` expands `JobStore` to own the
+> tracked lifecycle of plain and Hugging Face dataset exports.
+> Both IPC commands still validate/rate-limit and dispatch off the UI thread, but no longer receive a
+> raw database handle or drive queued/running/terminal transitions. Restore admission now spans the
+> durable job and output publication. Four store regressions include a real disposable JSON export
+> ending in `succeeded` and an injected failure preserving its exact error plus stable failure code;
+> both architecture policies forbid regression. `888a2bd` completes the shipped export-command slice:
+> transcript, production bundle, reviewed-audio, gold-eval and fine-tune-pack exports now use the same
+> store-owned serialized database and durable job lifecycle. IPC retains rate/identifier/path checks
+> plus immutable settings, model-manager and ledger-path capture; every export receives a stable
+> domain-specific terminal failure code, and `commands/export.rs` contains no raw database or
+> job-transition authority. A fifth store regression publishes a real disposable transcript artifact
+> and proves its durable succeeded state. `7116887` moves the import recovery journal behind that same
+> `JobStore`: begin, per-file progress and completion now serialize through `DatabaseRuntime`, while
+> desktop production injects the exact runtime managed by `AppState`. Journal creation fails before
+> any clip can publish; progress or completion failure halts the import and leaves a visible running
+> journal for exact resume instead of reporting false success. Three focused regressions prove the
+> exact lifecycle, idempotent file stamps, progress/completion fault visibility and pre-decode refusal.
+> `1c443d9` adds a Tauri/HTTP-free `ImportWriteStore` for atomic segment-batch publication, exact
+> rollback and revision-CAS background alignment. Desktop imports reuse the exact `AppState` runtime;
+> standalone and cloned headless workers lazily converge on one shared runtime and fail closed if a
+> caller supplies a different database identity. The pipeline no longer directly calls the three
+> migrated database writers. Store regressions prove all-or-nothing publication and rollback plus
+> stale alignment preservation, and a cloned-worker regression proves runtime sharing and mismatch
+> refusal. `93ec2db` expands that boundary to source transcripts/provenance, persisted recording
+> identity, LOOP-0 evidence, auxiliary/champion hypotheses and targeted rediarization speaker updates.
+> Champion transcription now reads through a bounded restore-gated connection and commits through
+> the shared serialized runtime; verified human truth and existing votes remain protected. Four store
+> regressions cover the complete boundary, and architecture policies ban all ten migrated raw pipeline
+> writers. `56e98d0` moves champion target selection into `SegmentQueryStore`, closing the pipeline's
+> last raw read-connection escape. Exact alignment resolution, no-row behavior, multi-segment path
+> ambiguity and missing-schema propagation are regression-covered under a bounded restore-gated
+> snapshot. Other compatibility reads remain. `00f49f8` closes the new-import
+> placeholder-before-champion crash window: every champion and enabled-refiner result is completed in
+> memory before canonical publication, and one serialized savepoint publishes the file's finalized
+> segments, sole champion hypotheses and recording identity together. The boundary rejects blank or
+> placeholder transcripts, noncanonical deployment digests, mixed-source batches and any model that is
+> no longer the exact registry champion. An injected failure on the second hypothesis proves zero
+> segments and zero audio identity survive; infrastructure failure and worker panic leave the entire
+> file unpublished rather than depending on compensating deletion. The exact post-format tree passed
+> the complete **121-script** Python policy sweep, strict all-target/all-feature Clippy, rustfmt and the
+> all-target/all-feature Rust command with **1,608/0/8** library results plus every integration, soak,
+> binary and benchmark target green. Legacy interrupted-placeholder cleanup remains for old databases;
+> catastrophic cleanup failure in that legacy path and the separation between import-journal progress
+> and file publication are not claimed closed. `9a2a0c5` removes the restore-only raw writer escapes
+> from `AppState` and `DatabaseRuntime`: both restore commands now publish through one runtime-owned
+> boundary that requires the exact active reservation, pre-opens the replacement connection before
+> the live commit point, and replaces the sole writer before admission can reopen. A deterministic
+> generation test dirties connection-local SQLite state, restores a different database, and proves
+> the reopened writer resets its pragmas while both writer and bounded reader see only the restored
+> generation. Restore-focused Rust tests passed **54/54**; the exact post-format all-target/all-feature
+> command passed **1,609/0/8**, every other target exited zero, strict Clippy and rustfmt passed, and
+> all **121** policy scripts passed sequentially. Restore orchestration and validation still reside in
+> `commands.rs`; process-kill restore drills are not closed. `8d18260` then extracts process-wide
+> restore admission, fail-closed durable marker load/write/complete/clear, atomic restore-state I/O and
+> bare-restore pilot refusal into a 254-line Tauri-free `recovery` module. The command layer now only
+> resolves its data directory and supplies a writer-activity callback; the recovery module publishes
+> or reclaims admission before invoking that fence. Two module regressions prove reservation-before-
+> fence ordering with release on refusal and exact one-target/one-completion durable marker behavior.
+> The source policy forbids a Tauri, AppState or commands dependency and prevents marker authority
+> from returning to `commands.rs`. Exact proof is **1,611/0/8** library tests plus every target,
+> restore selection **54/54**, recovery module **2/2**, all **121** policies sequentially, strict
+> Clippy and rustfmt. Semantic database validation, snapshot-plan inspection, settings publication and
+> startup/named restore orchestration remain in `commands.rs` and are not claimed extracted.
+> `c5e3748` moves typed snapshot plans, atomic cross-file routing-state installation, controlled-pilot
+> policy publication and strict settings restoration into the same Tauri-free `recovery` module.
+> Dataset-coupled settings are restored while current cloud consent, champion/ASR routing and GPU/runtime
+> controls are preserved and durably saved before runtime publication or barrier completion. The command
+> layer retains AppState publication but no longer owns state-file writes. Three recovery regressions now
+> include a cloud-enabled historical snapshot restored under revoked live consent, and source policies
+> follow the extracted helpers without becoming vacuous. Exact proof is **1,612/0/8** library tests plus
+> every all-target integration, soak, binary and benchmark target, recovery module **3/3**, all **121**
+> policies sequentially, strict all-target/all-feature Clippy and rustfmt. Semantic snapshot/pilot
+> inspection, durable database validation and startup/named/bare orchestration remain in `commands.rs`;
+> process-kill restore drills and the 50,000-segment hammer remain open.
+> `ad3085d` moves policy/absence artifact parsing, manifest-bound pilot-to-database inspection and the
+> composite optional-state restore-plan builder into `recovery`. Policy-bearing snapshots still require
+> a verified manifest, exact controlled focus, schema support for durable hidden keys and a baseline no
+> later than their own review-event maximum; legacy manifestless snapshots preserve rather than relax
+> live policy. The source policy prevents all three inspectors from returning to commands. The exact
+> tree passed **1,612/0/8** library tests plus every target, all **121** policies sequentially, strict
+> all-target/all-feature Clippy and rustfmt. Durable review-history/pilot semantic validation,
+> authoritative-floor comparison and top-level startup/named/bare restore transactions remain in
+> `commands.rs`; process-kill restore drills and the 50,000-segment hammer remain open.
+> `7f173fa` moves named-restore artifact staging and final manifest rehash, the mandatory pre-restore
+> safety snapshot, exact safety-pin selector/reuse and the durable transaction-begin boundary into
+> `recovery`. A new transaction still refuses selector drift or a completed generation, verifies an
+> interrupted restore's original pin before reuse, and arms fail-closed restore parking immediately
+> before writing the durable pending marker. The source policy requires all four boundaries in
+> `recovery`, absent from production commands, and pins arm-before-marker ordering. The exact tree
+> passed **1,612/0/8** library tests plus every all-target/all-feature integration, soak, binary and
+> benchmark target, all **121** policies sequentially, strict all-target/all-feature Clippy and
+> rustfmt. Durable review-history/pilot semantic validation, authoritative-floor comparison,
+> database target semantics, the full named transaction and startup/named/bare restore orchestration
+> remain in `commands.rs`; process-kill restore drills and the 50,000-segment hammer remain open.
+> Import process-kill/resume and performance proof, Couch decomposition,
+> export-kill/disk-full campaigns and the 50,000-segment hammer remain open.
+> This entry is
+> deliberately **not a green
+> claim**: timeout calibration, three full fault campaigns, backend/frontend decomposition,
+> certification-grade soak/field sessions, Windows signing/VM/a11y/usability/pilot evidence and the
+> separate model attestation remain pending. The requested `PAY_POLICY_REQUIRED` external-pool shutdown conflicts
+> with active owner-FINAL schema-65 pool canon and is not implemented without literal
+> `change canon: <item>` authorization; no pay was minted, backfilled or altered.
+
 ## 1. Overall 10/10 Gate Status
 
 * **Stop Condition (`verify-10` checker)**: **GREEN — narrow M0/M1 gate only** (`make verify-10` exits 0: manifest sync, asset presence, ledger schema, license-compatibility). This is **NOT** the full-charter 10/10. **Honest grade as of 2026-07-09: ≈7/10** (36-agent adversarially-verified audit, [docs/TRUE_RATING_2026-07-09.md](docs/TRUE_RATING_2026-07-09.md)); lineage 6.5 (07-02) → 6.5 (07-06 deep-check) → ~7.0 (07-09). The scorecard table below is the ORIGINAL Wave-0 blueprint scorecard, retained for history; the current per-dimension grades live in the 07-09 rating doc. The remaining gap to a declared 10/10 is owner-gated measurement (P2.2 benchmark → marathon → retrain cycle → P7 re-audit).
@@ -2241,7 +2434,7 @@ stored. **Correction to iteration 202:** autologin was called "optional"; for fu
 is mandatory, and ARSO covers only the update-initiated case. Nothing in this repo touches the
 account password; autologin stays an owner step.
 
-**Live verification after rebuild:** the pre-rebuild link still authenticates (same token, `Hawzhin`,
+**Live verification after rebuild:** the pre-rebuild link still authenticates (same token, `Reviewer H`,
 29 items = 25 work + 4 interleaved checks); the page served by the running binary is **byte-identical**
 to the source asset (sha256 `ae21d65463c62aeb`, 37220 bytes both sides), which is the real proof the
 `include_str!` fix shipped rather than a stale binary. Watchdog disabled across the build window and
@@ -2289,7 +2482,7 @@ test fail with the predicted symptom, then restoring; the fail-before output is 
   FINISHED, not repeated.
 - *Attribution could be stolen.* `localStorage` is per-origin, not per-reviewer. Queued decisions now
   name their author and the server refuses a mismatch. Verified live on the running server:
-  `409 this decision was made by Hemn, not Hawzhin`, with the clip left `verified=0`, `reviewed_by=NULL`.
+  `409 this decision was made by Hemn, not Reviewer H`, with the clip left `verified=0`, `reviewed_by=NULL`.
 - *"Saved" was a lie and the draft was deleted.* An offline save now says QUEUED. A refused replay
   still drops the queued decision (retrying cannot change a real answer) but KEEPS the typed text and
   raises a persistent banner.
@@ -2944,7 +3137,7 @@ reviewer token:
 | Probe | Result |
 |---|---|
 | `POST /api/claim` | **200** |
-| `GET /api/queue` | **200** — reviewer `Hawzhin`, 29 items, `pendingTotal=116`, `heldByOthers=0` |
+| `GET /api/queue` | **200** — reviewer `Reviewer H`, 29 items, `pendingTotal=116`, `heldByOthers=0` |
 | `GET /api/audio/<id>` | **200**, 390060 bytes, `ETag: "b386c3e8ff2e48a3"`, `Cache-Control: private, max-age=31536000, immutable`, `Accept-Ranges: bytes` |
 | `Range: bytes=0-1` | **206**, `Content-Range: bytes 0-1/390060`, 2 bytes returned |
 | `HEAD` | **200**, `Content-Length: 390060`, 0-byte body |
@@ -7697,7 +7890,7 @@ anywhere. Verified from the public internet, not just locally:
     GET /api/queue             -> 401      (no credential)
     GET /api/queue?t=<REAL>    -> 401      <- the leak, closed
     POST /api/claim {token}    -> 200 + Set-Cookie
-    GET /api/queue (cookie)    -> 200, reviewer=Lamo / reviewer=Sewa
+    GET /api/queue (cookie)    -> 200, reviewer=Reviewer G / reviewer=Reviewer E
 
 35 test call sites authenticated with `?t=` and would have gone on proving a door the product no
 longer has; they present cookies now. Two tests changed SUBJECT rather than syntax and are recorded in
@@ -7759,14 +7952,14 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ## Iteration 266 — the review session went live, and the save button that discarded the key
 
 **Two reviewers are working over the public internet, verified end to end from a browser.** The
-session is up for Lamo and Sewa on the Funnel host; 15 checks pass against the public URL, not
+session is up for Reviewer G and Reviewer E on the Funnel host; 15 checks pass against the public URL, not
 localhost: shell 200, `/api/queue` and `/api/audio/<id>` 401 without the cookie, a REAL token in
 `?t=` still 401, claim 200 with `HttpOnly; SameSite=Strict`, an unknown token refused identically,
 and a 373 KB clip actually streaming to the reviewer.
 
 Backend checks were not enough on their own — last iteration a dead `queryToken` reference rendered
 the reviewer page blank while every API check passed. So the page was loaded in a real browser this
-time: "Cortex · Lamo", clip 1 of 494, RTL intact, the audio element carrying a real 11.7 s duration,
+time: "Cortex · Reviewer G", clip 1 of 494, RTL intact, the audio element carrying a real 11.7 s duration,
 zero console errors, and the token gone from the address bar (claimed into the cookie and stripped by
 `history.replaceState`, so a screenshot cannot leak it).
 
@@ -8371,12 +8564,12 @@ true, which is the finding: no gate covered this class until this iteration.
 **Measured, on the live DB (read-only), 2026-08-13.** Of 180 `accept` decisions, **36 freeze text
 that matches NO ASR hypothesis on file** — not the champion `omniasr-wsl-7b`, not
 `finetuned-mms-ckb`, not `omniasr-ctc-300m`, not `omniasr-ctc-1b`. All 36 are pre-fix (before the
-2026-08-12 11:54 clear); 33 by Rubar, 3 by Lamo. Character divergence from the champion's own
+2026-08-12 11:54 clear); 33 by Reviewer A, 3 by Reviewer G. Character divergence from the champion's own
 transcript: median 5.2%, max 14.2%. Split by era, the control is clean: **0 of 31 post-fix accepts**
 diverge, which is what proves the accept path copies the served text verbatim — so a diverging
 accept means the text served was never the champion's.
 
-Sample (id `3330566c`, Rubar, 2026-08-11):
+Sample (id `3330566c`, Reviewer A, 2026-08-11):
 
 * champion RAW: `خێزانەکەمان بێ بە کۆمەڵگاکە بێ بە مامۆستایانی ئاینی بێت کە...`
 * APPROVED:     `خێزانەکەمان، کۆمەڵگاکە، یان مامۆستایانی ئایینی، کە...`
@@ -8475,23 +8668,23 @@ it rather than tapping accept.
 
 | reviewer | checks | noticed | mean CER vs the known answer |
 |---|---:|---:|---:|
-| Sewa | 16 | 14 (88%) | 0.102 |
-| Hawzhin | 5 | 5 (100%) | 0.045 |
-| **Rubar** | **4** | **1 (25%)** | 0.069 |
-| Lamo | 2 | 1 (50%) | 0.080 |
+| Reviewer E | 16 | 14 (88%) | 0.102 |
+| Reviewer H | 5 | 5 (100%) | 0.045 |
+| **Reviewer A** | **4** | **1 (25%)** | 0.069 |
+| Reviewer G | 2 | 1 (50%) | 0.080 |
 
 **Second, independent instrument — the real corpus.** Share of each reviewer's decisions where the
 final text is byte-identical to the draft they were handed:
 
 | reviewer | decisions | accept | edit | reject | text unchanged |
 |---|---:|---:|---:|---:|---:|
-| Sewa | 152 | 39 | 106 | 7 | 30% |
-| **Rubar** | **266** | **133** | 130 | 3 | **51%** |
-| Lamo | 27 | 2 | 19 | 6 | 30% |
+| Reviewer E | 152 | 39 | 106 | 7 | 30% |
+| **Reviewer A** | **266** | **133** | 130 | 3 | **51%** |
+| Reviewer G | 27 | 2 | 19 | 6 | 30% |
 
-Rubar hands the draft back untouched on half her clips against 30% for both peers, and on the
-known-answer clips she changed 1 of 4 — leaving 5.2%, 5.8% and 13.7% CER against text a human had
-already established. The 20 requeued clips she redid today came back 19 accepts with ZERO character
+Reviewer A hands the draft back untouched on half their clips against 30% for both peers, and on the
+known-answer clips they changed 1 of 4 — leaving 5.2%, 5.8% and 13.7% CER against text a human had
+already established. The 20 requeued clips they redid today came back 19 accepts with ZERO character
 change and 1 edit.
 
 **Held against this, honestly.** Four checks is a small sample and this file's own docstring says to
@@ -8501,12 +8694,12 @@ careful reviewer would accept. And under the verbatim law, accepting the champio
 unchanged is often CORRECT, because what the refiner used to "fix" was frequently the speaker's own
 disfluency. None of that explains 1-of-4 on clips where the answer was already known.
 
-**Why it matters more than the numbers suggest:** Rubar has made 266 of the corpus's decisions —
-more than Sewa and Lamo combined. The dataset's quality is dominated by the reviewer with the
+**Why it matters more than the numbers suggest:** Reviewer A has made 266 of the corpus's decisions —
+more than Reviewer E and Reviewer G combined. The dataset's quality is dominated by the reviewer with the
 weakest listening signal.
 
 **The instrument is not exhausted:** answer keys are owner-desktop decisions, excluded per reviewer
-only once used, so Rubar can still receive up to 18 more checks. The cheap next measurement is more
+only once used, so Reviewer A can still receive up to 18 more checks. The cheap next measurement is more
 of her own clips, not an argument about these four.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
@@ -8537,24 +8730,24 @@ produce. Spot-check pool healthy (22 keys).
 human-decided, which is what it was built to be, but nobody should call 454 clips a fine-tuning set
 without saying how small it is.
 
-**The QC signal got STRONGER, not weaker, with more data.** Rubar received 3 more known-answer clips
+**The QC signal got STRONGER, not weaker, with more data.** Reviewer A received 3 more known-answer clips
 after the earlier scorecard and changed none of them:
 
 | reviewer | checks | noticed | decisions owned |
 |---|---:|---:|---:|
-| Sewa | 16 | 14 (88%) | 152 |
-| Hawzhin | 5 | 5 (100%) | 27 (desktop) |
-| **Rubar** | **7** | **1 (14%)** | **288** |
-| Lamo | 2 | 1 (50%) | 27 |
+| Reviewer E | 16 | 14 (88%) | 152 |
+| Reviewer H | 5 | 5 (100%) | 27 (desktop) |
+| **Reviewer A** | **7** | **1 (14%)** | **288** |
+| Reviewer G | 2 | 1 (50%) | 27 |
 
-**Do NOT read `mean_cer` as a quality ranking** — Sewa's is HIGHER than Rubar's (0.102 vs 0.049)
-while Sewa notices 88% and Rubar notices 14%. The answer keys are owner-desktop decisions, and a reviewer
+**Do NOT read `mean_cer` as a quality ranking** — Reviewer E's is HIGHER than Reviewer A's (0.102 vs 0.049)
+while Reviewer E notices 88% and Reviewer A notices 14%. The answer keys are owner-desktop decisions, and a reviewer
 writing true verbatim can legitimately diverge from a key that was standardized. `noticed` is the
 robust signal because it measures engagement, not agreement.
 
-**The exposure, stated plainly:** Rubar decided 288 of 494 clips — 58% of the corpus, more than every
-other reviewer combined — and she is the one reviewer whose listening signal is weak. The cheap next
-measurement is a blind second pass: route a sample of her 153 accepts through Sewa and measure the
+**The exposure, stated plainly:** Reviewer A decided 288 of 494 clips — 58% of the corpus, more than every
+other reviewer combined — and is the one reviewer whose listening signal is weak. The cheap next
+measurement is a blind second pass: route a sample of their 153 accepts through Reviewer E and measure the
 disagreement rate. That also builds the double-pass adjudication tier the charter still lacks.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
@@ -8821,8 +9014,8 @@ questions earlier iterations asked and got wrong.
 **FIVE OF EIGHT REVIEWERS HAD A QUEUE OF ZERO, and two independent bugs hid each other.** The 1,031
 recovered clips were relinked into `D:\Kurdish Corpora\sorani\ZarPodcast`, but `dialect.rs` still
 mapped only their pre-recovery path (`SoraniVoice_PC_`), so all 535 pending Sorani clips were
-UNMAPPED — and the dialect check fails closed, so every Sorani-only reviewer (Alle, Roza, Sabat,
-Lamo, Sewa) was served nothing. Simultaneously the roster file itself was inert: it shipped with a
+UNMAPPED — and the dialect check fails closed, so every Sorani-only reviewer (Reviewer B, Reviewer D, Reviewer F,
+Reviewer G, Reviewer E) was served nothing. Simultaneously the roster file itself was inert: it shipped with a
 `"_comment"` string explaining how to edit it, and a strict `HashMap<String, Vec<String>>` parse
 rejects that outright, whose failure path is "unrestricted" — so the dialect protection was OFF for
 everyone from the moment it was installed, including the three reviewers it was written for. A
@@ -8933,7 +9126,7 @@ verified+decided copy (106 groups) then decided (6) then the canonical fuller fi
 deleted in the same BEGIN IMMEDIATE transaction, `review_events` kept as append-only history.
 Library 14,828 → 14,658. Post-conditions, all measured on the live DB: 0 duplicate groups, 0 orphan
 child rows (plus 5 PRE-EXISTING stale spot_checks rows from the 08-13 incident found and removed),
-FTS in sync, integrity_check ok. Payment totals honestly adjusted (Sewa 25.0 → 17.8 min — her
+FTS in sync, integrity_check ok. Payment totals honestly adjusted (Reviewer E 25.0 → 17.8 min — their
 double-reviewed twins were the bulk of the 117).
 
 **The 37 defective verified clips went back to the paid reviewers**, not to the owner: 27 two-voice
@@ -9645,3 +9838,2048 @@ challenger trainer that gate D is blocked on, and gate B's ~10,000 human labels.
 would be motion without progress, which §8 says to stop rather than dress up.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (afternoon) — integrating the Codex flywheel range
+
+Cherry-picked `0fbb85f` + `4b496d1` from `cortex-speech-codex-flywheel` onto `origin/main` as
+`integrate/codex-flywheel` (PR #71). **36 files, +10,715 / −1,150.** Not merged.
+
+### The merge is mechanically clean, and the handoff's premise was wrong
+
+The handoff said the primary repo "remains unchanged at 282250d, with no Claude process or integration
+commits detected". `282250d` IS a Claude commit (the watchdog ledger), and primary was at `040d8ae`
+with #64–#69 merged. More usefully: the Codex base `4b0d597` is PR #66, which lands AFTER #64, #65 and
+#67 — so the range already CONTAINS the pack-export rewrite, the review fixes and the champion-script
+fallback rather than conflicting with them.
+
+```
+codex range files: 37      primary-since-base files: 4
+OVERLAP: (empty)
+git diff 4b0d597..4b496d1 -- '*/migrations/*'  ->  0 lines
+```
+
+Zero conflicts, zero migration collision. `cargo fmt`, `svelte-check` (448 files), `eslint` clean;
+275 frontend tests pass.
+
+### A false red I raised and withdrew
+
+I first reported **5 Rust failures in champion-supremacy territory**. That was my own artifact:
+`CARGO_TARGET_DIR` pointed at a scratch dir under `AppData/Local/Temp`, and `resolve_wsl_7b_client`
+finds the bundled client by walking exe-relative hops (`../../../../scripts/cortex_7b_client.py`)
+that reach the repo from `target/debug/deps` and reach nothing from a temp dir. Re-run in the repo's
+own target dir: **1250 passed, 0 failed**. Champion supremacy is not broken by the range. Withdrawn on
+the PR rather than left standing.
+
+### Three real defects found and fixed
+
+1. **UI freeze** — `start_champion_engine` had become a sync `#[tauri::command]` running
+   `restart_current_champion` inline: tree-kill the held child and spawn a wsl.exe loading ~30 GB, all
+   on the UI thread, while its own doc comment still said "returns immediately". Now `async` +
+   `run_blocking`, matching the sibling command.
+2. **Hygiene** — a WSL-mounted per-user profile path hardcoded in a tracked file of a public repo.
+   (The gate then caught my explanatory comment for containing the forbidden pattern. Correct of it.)
+3. **An aliased-temp-dir test failure** on macOS AND Windows CI that passed locally.
+   `test_atomic_replace_failure_leaves_no_partial_output` compared `_atomic_publish`'s RESOLVED
+   `destination` against the UNRESOLVED `out`; wherever the temp dir is an alias the inner
+   AssertionError masks the injected OSError. Reproduced locally with a Windows 8.3 short path:
+
+   ```
+   alias: C:\...\Temp\CO968B~1
+   OLD  destination == out          -> False   <- the CI failure
+   NEW  destination == resolved_out -> True
+   ```
+
+   **I first called this an ordering bug** (`temporary = None` after a call that can throw). Wrong —
+   the `finally` unlinks the temp file correctly and no partial output was ever left behind. Recorded
+   because the wrong diagnosis was published on the PR before the right one.
+
+### Three stale pins left RED on purpose
+
+| pin | pins on | replaced by |
+|---|---|---|
+| `test_agentic_pipeline_policy` | literal `"omniasr-wsl-7b"` | dynamic deployment identity |
+| `test_rust_runtime_panic_policy` | `probe_wsl_7b_server` | exact-identity health check |
+| `test_champion_supremacy_policy` | `CHAMPION_MODEL_ID` in the filter | per-row `model_version_id` |
+
+One architectural change, three greppable pins — the documented failure mode here (a changed symbol
+breaks a pin, and the pin must be fixed in the same commit). Editing a pin to match new code is how a
+guarantee gets silently dropped, so they stay red.
+
+**The owner ruling they wait on:** the new filter keeps hypotheses matching the segment's own
+persisted `model_version_id` and returns NONE when provenance is absent. Stale 300M/1B/MMS/Scribe
+votes are still discarded, and votes from a *different champion deployment* now are too — stronger
+than a fixed string. But a row drafted by a weaker engine BEFORE WSL7B was selected now surfaces that
+engine's hypothesis, where the old code showed none. Honest provenance, but it relaxes "in champion
+mode you only ever see champion output" — the rule that exists because 494/494 clips were once
+silently drafted by a weaker engine.
+
+### Not done, not claimed
+
+No release-profile clippy run by me, no e2e, no fresh EXE/MSI, no exact-HEAD sweep. The live champion,
+database and registry were not touched. The WebView2 verification of the desktop review fix remains
+UNFINISHED: the harness runs, reaches Review & Correct, and correctly refuses to pass without a
+working positive control — but the component's own `play()` path never fired, so it proves nothing yet.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (late afternoon) — the pin chain, and the one that was not a pin
+
+PR #71 completed: **82/82 python policies, Rust 1250 passed / 0 failed, frontend 275 passed**, fmt /
+typecheck / lint clean. Six stale assertions across two files, every one from a SINGLE architectural
+change (fixed champion string -> content-addressed identity).
+
+### Each guarantee traced to its new home BEFORE its assertion was touched
+
+| stale assertion | where the guarantee actually moved |
+|---|---|
+| `probe_wsl_7b_server` reaping | BOTH surviving loops: `pipeline.rs` still reaps via `kill_and_reap_wsl_child` (>=3 sites — cancel, timeout, failure), and `engine_runtime::terminate_and_reap` closes the Job Object then BREAKS every not-yet-exited arm into an unconditional `kill` + `wait` |
+| `Ok((raw, _))` blank guard | INTACT — `parse_wsl_segment_result` merely returns a struct now |
+| `"omniasr-wsl-7b"` literal | `registry::champion_identity` binding, PLUS a new assertion that a mismatched `result.model_version_id` is refused |
+| `external_asr_script_path()` | `resolve_wsl_7b_client(...)` — the configured path is one INPUT to resolution; a bundled client also counts |
+| 2 renamed regression tests | their current names, each confirmed to cover the same scenario (`pipeline_tests.rs:451`, `:656` with segment id `"preflight-refused"`) |
+
+**Not one was relaxed.** The reap gate now guards two loops where it guarded one; the provenance gate
+gained an assertion it did not have.
+
+### The find that justified refusing to batch-update
+
+`test_wsl_refinement_loop_refuses_blank_draft` looked like another renamed-symbol pin. It is the
+**blank-transcript-never-overwrites-good** guard — the data-loss bug already fixed twice in this repo.
+A batch update of "obviously stale" pins had a one-in-six chance of blessing its removal. It survived
+the range; that was established by READING THE CODE, not by trusting the pin.
+
+Both critical pins were then proven non-vacuous by deleting the guarantee and watching them fail:
+
+```
+terminate_and_reap must end in an unconditional kill + wait; without it a launcher that
+never reports exit is leaked
+
+the WSL-7B refinement loop does not guard a blank draft before the atomic champion commit
+— an empty 7B result would overwrite a good transcript with ""
+```
+
+### Seven defects found in the incoming range
+
+UI freeze (`start_champion_engine` running a ~30 GB server start inline on the UI thread), a hardcoded
+per-user profile path in a tracked file of a public repo, an aliased-temp-dir test failure (reproduced
+locally with a Windows 8.3 short path), a stale bundle pin, **the champion-supremacy relaxation**, and
+two of my own (a swallowed registry-read error, and a pin my 4-arg signature broke).
+
+### Two false alarms I raised and withdrew
+
+* **"5 Rust failures in champion-supremacy territory"** — my `CARGO_TARGET_DIR` pointed at a scratch
+  dir, where `resolve_wsl_7b_client`'s exe-relative hops reach nothing. In the repo's target dir:
+  1250/0.
+* **"an ordering bug in `_atomic_publish`"** — the `finally` unlinks correctly; the real cause was a
+  resolved-vs-unresolved path comparison in its TEST.
+
+A third was avoided by checking timestamps: a "Windows Release Gate failed" event fired 26 seconds
+AFTER the new run started — a stale signal for the previous head, not a failure of this work.
+
+### Standing assessment, unchanged
+
+This is infrastructure for a flywheel that cannot turn yet: no trainer exists, the registry holds 0
+rows, and the last snapshot's test split was 4 clips. Gate B needs **~10,000 human labels** and nothing
+technical is in the way. The live champion, database and registry were untouched throughout.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (evening) — the review that found what my review missed
+
+Codex reviewed PR #71 and returned **Request changes**. I verified every finding against the code and
+the live database before agreeing with any of it. Six of six check out. One is release-blocking, and
+it is worse than reported.
+
+### P0 — the challenger could never have trained on this corpus
+
+`train_challenger.py` admitted only `decision` in `{None, "accept"}`. `eval.rs` exports the review
+decision verbatim, and `edit` is what a reviewer produces when they read the champion draft and type
+the correct text. Measured on the live DB, not remembered:
+
+```
+edit    241        accept  188        reject   18 (already excluded by grade)      <null>  15458
+```
+
+**241 of 429 usable labels — 56% — were classified "non-training".** And pack problems are fail-closed
+(`if pack_problems: return 2`), so this never merely dropped those rows: **a single edited row refused
+the entire run.** Gate D was unreachable for a reason nobody had measured.
+
+Fixed by mirroring the Rust authority, `quality::is_human_rejected` — only a human REJECTION is
+non-training. Fail-before, with the old validator restored:
+
+```
+AssertionError: human corrections are training data, not contamination:
+["finetune_manifest.jsonl:1 carries non-training decision 'edit'",
+ "finetune_manifest.jsonl:2 carries non-training decision 'human_edit'"]
+```
+
+Two tests, both directions, so widening the set cannot become a hole. **82/82 python policies pass.**
+The line came from `b0c7f7a` — inside the range I integrated, reviewed, and reported seven defects on
+without catching this one. Every fixture in the cycle policy used `"accept"`.
+
+### Gate B: I have been quoting the wrong bar
+
+I repeatedly told the owner "~10,000 labels and nothing technical is in the way". The count is roughly
+right and the framing was wrong. `docs/LOOP_TO_10.md` gate B is **≥ 25 h labeled, top-1 recording
+≤ 30 %, ≥ 25 labeled recordings** — diversity is mandatory, not a bonus. Measured now:
+
+```
+labeled clips      : 429
+labeled duration   : 1.09 h  (65.1 min)      needs >= 25 h
+labeled recordings : 5                       needs >= 25
+top-1 share        : 94.5%                   needs <= 30%
+mean clip length   : 9.1 s
+```
+
+At 9.1 s, 25 h is ~9,890 clips — so the number was fine, but **10,000 more Lamofull clips would leave
+top-1 near 99 % and recordings at 5, and gate B would still fail.** Review order is the diversity
+lever, and the ledger now says so.
+
+### The WebView2 proof, recorded where it survives the session
+
+Codex correctly noted the PR-head ledger called this unfinished and no artifact backed it. It has now
+run, with a working positive control that proves the harness can SEE a genuine failure:
+
+```
+clip label: "بەش 126/429" -> "بەش 110/429"
+positive control saw the playback toast: true
+positive control OK — a real failure IS reported and IS visible to this harness
+stalling play() so it stays pending; driving 8 rapid advances...
+playback toast during the advance race: no
+RESULT: PASS
+```
+
+Four earlier runs were vacuous and I reported none of them as a pass: the on-disk key is
+`autoplay_segments` (snake_case), and the camelCase name is the serde-renamed FRONTEND view, so
+autoplay stayed off and no `play()` was ever pending.
+
+### Where I would not go as far as the review
+
+* **No promotion initiation path** — confirmed, zero non-test callers of `start_promotion`. But
+  `champion_promotion_runtime.rs` opens by saying so deliberately: recovery only, because "until
+  promotion evidence is backend-minted and owner-authorized, 'no initiation surface' is the only
+  honest trust boundary". A documented decision, not an oversight. Gate E is still blocked either way.
+* **Two IPC writes in `ReviewMode`** — confirmed as fact. The ordering is deliberate and the partial
+  state is the SAFE one: `recordHumanDecision` runs first and validates, so a failure in
+  `updateSegment` leaves the clip UNVERIFIED and still in the queue, where re-review self-heals it.
+  Worth closing; not a data-loss hazard today.
+
+### Standing correction
+
+Green CI on PR #71 means `verify_10.py --static`. It has never run gates C/D/E live, and I let "all
+four checks green" carry more weight than it earns. The live champion, database and registry were
+untouched throughout.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (evening) — gate D turns for the first time, and stops where the corpus stops
+
+The flywheel's train step had **no compatible trainer at all**. `train_challenger.py` hands an
+external trainer `--manifest --out --base --contract` and refuses to say "trained" without hashed
+consumption evidence; the real trainer (`train_omni_7b.py`, fairseq2 + PEFT LoRA, DDP under WSL)
+speaks `--train_jsonl`/`--output_dir` and emits none of it. `scripts/omni7b_trainer_adapter.py` is
+the bridge. It attests only what it can prove: rows consumed parsed from the TRAINER'S OWN stdout,
+a recipe hash over the trainer file plus hyperparameters, an environment hash over the measured
+toolchain, and a seed applied by a launcher shim (the trainer has no `--seed`, and a number that
+steers nothing is decoration).
+
+### The measured result
+
+**A challenger trained on 403 of the owner's corrected labels beats the champion.** Same 348 frozen
+FLEURS ckb clips, same manifest bytes (`ed7130755aaf14e1`), same normalization basis:
+
+```
+                     CER                          WER
+champion    7.91%  [6.83, 9.15]        33.97%  [32.23, 35.78]
+challenger  7.56%  [6.32, 9.01]        28.22%  [26.35, 30.18]
+
+MAPSSWE word: z = +7.81   p = 5.887e-15   N=348  -> challenger better  (SIGNIFICANT)
+MAPSSWE char: z = +0.88   p = 3.769e-01   N=348  -> challenger better  (NOT significant)
+```
+
+**The WER gain is significant; the CER gain is not.** Both are reported because reporting only the
+significant one would be a lie by selection. Honest limits: one epoch, 403 clips, ~94 % of the
+labeled duration from a single recording, evaluated out of domain on FLEURS. This proves the
+machinery and the direction — not a promotable model.
+
+The training set was 403 rows of which **235 were `edit` rows** — the human corrections the P0
+validator was rejecting outright. Those corrections are what produced the gain. Before this
+morning's fix the run could not have happened: the real pack went from **241 preflight problems to
+0** once `edit` was admitted, the 241 − 6 difference being exactly the 235 edits.
+
+### Gate D, step by step
+
+| step | state | evidence |
+|---|---|---|
+| snapshot | **PASS** | sealed `23db46a0…`, pack verified 0 problems |
+| train | **PASS** | `CHALLENGER: TRAINED + VERIFIED`; `check_challenger_loop.audit_run` -> **NONE, fully bound** |
+| eval | **PASS** | both scorecards above, paired MAPSSWE |
+| verdict | **BLOCKED** | see below — not a tooling gap |
+
+Challenger identity, served through the real production path on GPU 1:
+
+```
+model_id  omniasr-7b-challenger-eb0105fdb6a57fdcc5b568ff
+adapter   79,768,688 B  6f938f78…   (incumbent: same size, c348ade8… — same LoRA shape, new weights)
+[gpu1] LoRA applied. Pipeline ready. serving on 127.0.0.1:8798
+```
+
+### Why the verdict is corpus-blocked, measured not inferred
+
+```
+EVAL SLICES: REFUSED - 348 manifest row(s) did not resolve to exactly one library segment
+(first: [0, 1, 2, 3, 4]); zero protected slices were produced
+```
+
+`promotion_gate.py` mandates manifest-bound protected slices; `build_eval_slices.py` builds them only
+from eval rows resolvable to live library segments. FLEURS is external and deliberately never
+imported — and importing it is **not** a legitimate workaround, because the pack selects training
+rows from the library, so it would risk exactly the train/test leak the split policy prevents. The
+library-resident alternative is **11 held-out clips across 4 recordings (7/2/1/1)** against a
+>= 5-per-group floor.
+
+**Gate D's verdict is therefore gated on gate B.** Labels are not merely the largest workload; they
+are the prerequisite that makes the promotion machinery exercisable at all.
+
+Also missing and now written: nothing generated the scorecard provenance sidecar the gate requires —
+only the gate that consumes it. `scripts/emit_scorecard_provenance.py` derives the challenger's
+fields through the gate's OWN `load_challenger_run`, so the sidecar cannot disagree with what the
+gate re-verifies.
+
+### The champion cannot currently survive a restart
+
+Found while restoring the GPUs, and more serious than the thing it interrupted. The on-disk
+`cortex_7b_server.py` refuses to start without a schema-2 champion pointer:
+
+```
+FATAL: refusing to serve an unverified champion deployment:
+no champion pointer configured / unsupported champion pointer schema
+```
+
+The live `champion.json` is `{"champions": {}, "schema": 1}`, and the RUNNING server was started
+from an older code path (`CORTEX_7B_MODEL_DIR=/home/ai/cortex_champion_model`, no pointer). So the
+champion serves fine while it lives, but **a reboot, a watchdog relaunch, or any restart would not
+bring it back**. This is pre-existing and independent of this work; it is Codex's finding #2
+confirmed empirically. All five hashes `bootstrap_legacy_champion.py` pins verify against the files
+on disk, so the incumbent IS reconstructible — installing that pointer is an owner-gated deployment
+and was not done.
+
+### Operating discipline
+
+The canary ran beside a live champion with **zero reviewer downtime**. GPU 1 was freed by stopping
+only its worker: the parent deliberately does not respawn (`SERVING DEGRADED on 1 of 2 replica(s)`),
+so no app restart and no couch interruption. Verified mid-operation, not merely by port — the
+champion transcribed real clips at 7.49 % CER while the challenger trained on the other card. WSL
+reports GPU memory through `vmwp`; `nvidia-smi` per-GPU figures do not track WSL allocations at all
+(holding 14 GiB moved it by 0 MiB), so the split was confirmed with a deliberate allocation probe.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-18 (night) — the champion restore, and the outage it took to find the real cause
+
+The canary had left the champion on one GPU (its second worker was stopped to free GPU 1). Restoring
+it surfaced a latent fault far more serious than the missing card: **the champion could not restart
+at all.**
+
+```
+FATAL: refusing to serve an unverified champion deployment:
+       no champion pointer configured / champion pointer omniasr-7b must be an object
+```
+
+The running server had been started by an older exe through the retired `CORTEX_7B_MODEL_DIR` path
+(read directly from `/proc/<pid>/environ`), while the working-tree `cortex_7b_server.py` now requires
+a schema-2 champion pointer — and the live `champion.json` was `{"champions": {}, "schema": 1}`. So
+the champion served fine while it lived, but a reboot, a watchdog relaunch, or any restart would not
+have brought it back. Pre-existing, and independent of the canary.
+
+### What actually fixed it — registration, not a pointer file
+
+Writing a correct `champion.json` by hand was **not** enough: the app regenerates that file from its
+registry on startup (`registry::sync_champion_pointer` selects `model_versions WHERE status =
+'champion'`), and the registry held **0 rows**, so it promptly overwrote the hand-written pointer
+with an empty one. This is Codex's finding #2 confirmed exactly: the legacy deployment had to be
+manifest-generated, verified **and registered**.
+
+The full sequence that worked:
+
+1. `bootstrap_legacy_champion.py` run **inside WSL** — over the 9P share `os.replace` fails with
+   `WinError 50 (The request is not supported)`, so the atomic publish cannot happen from Windows.
+   All five pinned hashes verified against the files on disk.
+   -> `omniasr-7b-legacy-c348ade8a816`, deployment `ae33143ec8b25f45`
+2. Pointer resolution proven through the server's OWN `load_champion_pointer` before any restart —
+   no 31 GB model load needed to de-risk it.
+3. The incumbent registered in `model_versions` (status `champion`).
+4. Frontend + `cargo build --release` from PR head (7m 42s), then restart.
+
+Result — both cards, with a verified deployment identity the champion never had before:
+
+```
+Devices: GPUs [0, 1] — pre-forking one worker process per GPU
+[gpu0] LoRA applied. Pipeline ready. serving on 127.0.0.1:8799
+[gpu1] LoRA applied. Pipeline ready. serving on 127.0.0.1:8799
+       model=omniasr-7b-legacy-c348ade8a816  deployment=ae33143ec8b25f45
+16,424 MB phys_0 | 16,410 MB phys_1 | ports 8737 + 8799 LISTENING | watchdog Ready
+```
+
+Verified by real transcription, not by a listening socket.
+
+### The outage, stated plainly
+
+Restarting the app before registering the incumbent took the champion **down for roughly ten
+minutes** (18:53 to 19:04). No reviewer was active (0 decisions in the preceding 3 h), and the couch
+server returned with the app, but it was a real outage and it was mine: I had proven the pointer
+loaded and did not anticipate that the app would rewrite it from an empty registry. The correct
+order — register first, restart second — is now recorded above.
+
+### A check that proved nothing
+
+An earlier claim that the old exe "contains CORTEX_7B_CHAMPION_POINTER -> 0 occurrences" used
+`strings`, which returns 0 for **every** string in this environment, including ones certainly present
+(`cortex_7b_server.py`, `CORTEX_7B_PORT`). Re-done with `grep -a`, the rebuilt exe carries
+`CORTEX_7B_CHAMPION_POINTER` (1) and no longer carries `CORTEX_7B_MODEL_DIR` (0). The original
+conclusion held only because it rested on `/proc/<pid>/environ`, which was direct evidence; the
+`strings` line was decoration that could have been wrong in either direction.
+
+A second near-miss: `tail -f` on the append-only champion log replayed the FATAL from the FIRST
+failed restart, which read as a fresh failure of the fix. Timestamps (log mtime 18:53:49, well before
+the current start) showed it was stale — the same "check the timestamp before chasing it" lesson as
+the CI event on 2026-08-18.
+
+Live state changed by this work, deliberately and with owner approval: `model_versions` gained the
+incumbent row, `champion.json` is now a valid schema-2 pointer (previous contents backed up to
+`champion.json.bak-before-restore-2026-08-18`), `/home/ai/cortex_champion_model/deployment_manifest.json`
+was created, and the app exe was rebuilt from PR head.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 — the accept that lied, and the backup that was a database and nothing else
+
+Two defects found by taking the certification brief's Phase 1 and Phase 4 literally. Both were
+invisible to every existing gate, and both were found by reading the LIVE system rather than the code.
+
+### An accept that claimed the champion wrote a human's words
+
+`check_review_serving_provenance` reds on segment `82681df2-5ec9-4ef3-8ef0-e3ec968159c9`. Its
+append-only history:
+
+```
+Reviewer G skip -> Reviewer A edit -> Reviewer G edit -> Reviewer E edit -> Reviewer A edit -> Reviewer D edit -> Reviewer H ACCEPT
+```
+
+Five humans corrected the clip; the sixth pressed Accept on what they saw. `accept` asserts something
+checkable — an ASR engine produced this exact text and a human approved it unchanged — and the
+accepted text carries a name and punctuation present in NONE of the segment's four hypotheses.
+
+Classification now happens in the backend at the one choke point every path converges on, from the
+stored bytes rather than the renderer's word: matches a hypothesis -> `accept`; matches none ->
+`edit` (human-authored); **no hypotheses on file at all -> unchanged.** That last case was a bug in
+the first draft — absence of recorded provenance is not evidence of human authorship, and
+reclassifying there launders in the opposite direction. It broke an existing pack-provenance test,
+and the test was right.
+
+### The off-drive backup held the database alone
+
+`take_snapshot_at_from` read `EXTRA_STATE` (settings.json, champion.json) from the DESTINATION. For a
+local snapshot destination == primary, so it worked and every test passed. Off-drive they are
+different disks. Measured on the live system:
+
+```
+F:\cortex-backups\snapshots\snapshot_1787091336: ['cortex-speech.db']          <- 11 of 11 trees
+%APPDATA%\cortex-speech\snapshots\snapshot_1787091336: ['champion.json', 'cortex-speech.db', 'settings.json']
+```
+
+Worse than missing metadata: a restore from that tree returns **no champion pointer**, and the 7B
+server refuses to start without one — the disaster backup would resurrect a library that cannot
+transcribe. Fail-before, with only the fixed line reverted:
+
+```
+panicked: settings.json is missing from the off-drive snapshot — a restore from it could not
+recover the champion pointer or the owner's settings
+```
+
+Added alongside: a canonical `SNAPSHOT_MANIFEST.json` (size + SHA-256 per file, written into staging
+before the promoting rename, so a promoted snapshot always has one), and `scripts/restore_drill.py`,
+which restores into a DISPOSABLE profile and checks quick_check, foreign keys, migration version, row
+counts and champion identity. It carries its own negative control:
+
+```
+PRIMARY  : schema 54, {'speech_segments': 15905, 'review_events': 646, 'spot_checks': 31,
+           'model_versions': 1}, champion omniasr-7b-legacy-c348ade8a816 — 1 problem (no manifest;
+           these trees predate the manifest code)
+OFFSITE  : correctly REFUSED (4 problems, incl. both missing state files) -- --expect-fail
+```
+
+### Two of my own checks that proved nothing
+
+* `PRAGMA user_version` reported 0 and read as "migrations did not travel". The app tracks migrations
+  in `schema_migrations`; the snapshot was fine and the drill was wrong. Corrected to read what the
+  app reads — version 54.
+* `PRAGMA synchronous` read 2 (FULL) from a fresh Python connection. The pragma is PER-CONNECTION, so
+  that measured my own default, not the app's. `db.rs` sets NORMAL; the audit's durability finding
+  stands and is NOT yet fixed.
+
+Rust 1260 passed / 0 failed, clippy 0 diagnostics, 85/85 python policies. No live data was modified:
+the violating row's repair is deliberately deferred until the offsite fix is in the running binary
+and a validated restore exists, per the brief's own ordering.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (cont.) — three gate legs that were testing the environment, and a certified binary
+
+Sweep moved **36 PASS / 5 FAIL -> 38 PASS / 3 FAIL** on an idle machine.
+
+`bench-budget` now PASSES. Its earlier failure was measured while a challenger was training and two
+scorecards were running on both GPUs — my own concurrency, exactly the trap recorded in
+[[sweeps-need-an-idle-machine]]. It was reported as "likely my artifact" at the time rather than as a
+regression, and that held.
+
+### The three legs
+
+* **snapshot-immutability** — failed on the pre-flywheel `challenger_canary_01` (prepared-only, never
+  trained, no pack binding). Excluding it was the easy and wrong fix. The gate now honours an
+  EXPLICIT, reasoned `evidence_status` with a `superseded_reason`, PRINTS it every run, and still
+  fails both a record that merely lacks the hash and an invalidation with no reason — otherwise the
+  marker becomes a way to silence any inconvenient run.
+* **ignored-real-model** — `champion_selected_refuses_to_downgrade_to_the_finetuned_model` depended on
+  the machine having no 7B client script, so it failed the moment the real champion was running. Fixed
+  that, and it then failed with "Segment not found in database": the pipeline resolves a SEGMENT
+  before selecting an engine, so **this test had never exercised the no-downgrade rule at all**. It
+  now seeds the row and points the client at an absolute POSIX path that does not exist.
+* **champion-7b-preflight** — "no such table: model_versions". The preflight compares the champion's
+  EXACT identity against the registry, but the fixture DB was never migrated and held no champion, so
+  the leg proved nothing about identity. It now migrates and registers the live champion.
+
+### Durability, measured
+
+```
+MEASURED: 0.6 ms per durable human decision (n=40)
+```
+
+The decision commit alone escalates to `synchronous=FULL`. SQLite refuses the pragma inside a
+transaction ("Safety level may not be changed inside a transaction" — found by running it), so it
+happens before the write opens and drops back after. Every other write here is reproducible; a human
+decision is not.
+
+### The binary is now identity-certified
+
+```
+commit f7c34d1f75dfb26f8d377910021c58b32b647f04   tree 22d44d5e74bf505065769d012a206e9cfe363a32
+exe    498b5b8334bf2be99f047652acfb246567fcbf63e71a341bc6784c832dbb4432  (baked commit VERIFIED)
+sbom   1171 components  2c0e8527b590723f          signature UNSIGNED (owner-descoped 2026-07-10)
+```
+
+The MSI was NOT built: it fails with `os error 32` because the running app holds
+`models/onnxruntime.dll`, and distribution is owner-descoped. Taking the champion down for a descoped
+artifact was not worth it; the reason is recorded in `artifacts/release_provenance.json` rather than
+omitted.
+
+### Checks of mine that proved nothing (four this session)
+
+`strings` (returns 0 for every string here), `PRAGMA user_version` (the app uses `schema_migrations`),
+`PRAGMA synchronous` from a fresh connection (per-connection, so it measured my own default), and a
+clippy run without `-D warnings` **from cache** that printed nothing and was reported as "0
+diagnostics" — that one reached CI as a real dead-code failure. A check that cannot fail is not a
+check; each of these was caught and corrected rather than reported.
+
+Also self-inflicted and caught: I removed a `drop(db)` from an unrelated test by matching an
+identical three-line block, and a `| tail` masked a FAILED MSI build as exit 0.
+
+**GO_LINKS: NO** (Phase 3 playback evidence untouched; Phase 8 unstarted).
+**GO_MODEL_PROMOTION: NO** (Gate B: 1.09 h of 25, 5 recordings of 25, top-1 94.5 %).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (late) — Phase 3: proving a clip was HEARD, not merely loaded
+
+The decision surfaces gated on `audioError` — the ABSENCE of a failure, which is not the presence of
+listening. A clip that loaded fine and was never played was indistinguishable from one a reviewer
+listened to twice, and nothing in the row said which. For a verbatim corpus that is the difference
+between a label and a guess.
+
+Landed this session:
+
+* **migration 55 / `playback_receipts`** — keyed by (segment, revision), bound to the audio
+  fingerprint, storing cumulative media time, coverage and the policy version that judged it.
+* **`has_sufficient_playback_evidence` / `require_playback_evidence`** — fail-closed with
+  `E_NO_PLAYBACK_EVIDENCE`. Coverage bar 0.90: not 1.0 (a reviewer who has heard the sentence stops
+  before the trailing silence, and demanding the last frame trains them to leave it running rather
+  than listen), not 0.5 (half a Sorani sentence is where a plausible-but-wrong verdict comes from).
+  `reject` is covered too — marking a clip bad is a judgement about AUDIO, and a wrongly rejected clip
+  is silently dropped from the corpus.
+* **`AudioPlayer.heardMs`** — only forward movement of a not-paused element counts; a jump beyond one
+  tick is a seek, not listening; a source change resets it, so a previous clip's listen never travels.
+* **IPC + ReviewMode wiring** — the receipt is posted BEFORE the verdict, and its revision and
+  fingerprint are resolved SERVER-SIDE. A client that could name them could mint a receipt for a clip
+  it never heard; then the guard would be comparing the client's claim with the client's claim.
+
+18 tests across Rust and the frontend pin the rules that matter: a previous clip's listen cannot
+unlock the next, different audio bytes do not count, a correction needs its own listen, an
+opened-but-never-played clip is not evidence, a zero-duration clip fails closed instead of dividing
+its way to 100 %, and a scrub is not a listen.
+
+**Not yet enforcing.** The guard is proven but is not called from the decision path, because the phone
+surface (`couch.html`) does not post receipts yet: switching it on first would refuse every decision
+from all eight live reviewers. The running binary is unchanged.
+
+Rust 1275 / 0, clippy `-D warnings` 0, frontend 280 tests, typecheck 448 files / 0 errors.
+
+**GO_LINKS: NO** — couch.html receipts, guard wiring, real-device verification (WebView2 + Funnel),
+Phase 8 link drill.
+**GO_MODEL_PROMOTION: NO** — Gate B: 1.09 h of 25, 5 recordings of 25. ~9,800 listening decisions,
+which is reviewer time and cannot be engineered.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (final) — enforcement in observation, and a security finding I nearly fabricated
+
+Phase 3 is wired end to end and now runs in OBSERVE-ONLY mode on the phone path: the guard is asked
+the real question and its answer is logged, but no decision is refused.
+
+The remaining unknown was never the rule — it is whether `timeupdate` fires often enough on a real
+mobile browser through the Funnel for coverage to reach the bar. Switching to hard refusal on an
+assumption about that would, if wrong, reject every decision from all eight reviewers at once.
+Observation makes the LIVE SYSTEM answer it: a day of real reviewing shows whether receipts land with
+sensible coverage, and only then is enforcement a one-line change backed by evidence.
+
+Watch for `PLAYBACK_EVIDENCE_OBSERVE` in the log. Zero of them across a day of reviewing means mobile
+accounting works and enforcement is safe to switch on.
+
+### Phase 8, the part that needs no reviewer session
+
+```
+public shell            : HTTP 200, 77,816 bytes
+secrets in public shell : NONE
+queue    without cookie : HTTP 401 -> REFUSED
+audio    without cookie : HTTP 401 -> REFUSED
+decision without cookie : HTTP 401 -> REFUSED
+```
+
+The rest of Phase 8 (cookie flags, ranged-audio authorisation, idempotent replay, revocation, reissue)
+needs a claim session, and a 9th reviewer cannot be created: canon caps the roster at 8 and a 9th
+raises the spot-check floor to 27 keys against the 24 that exist.
+
+### The fifth check of mine that proved nothing
+
+The first run of those probes reported **"audio SERVED without cookie (!!)"**. False. The couch server
+is HTTPS-only, plain HTTP timed out, and the probe treated a connection failure as "not refused" —
+it would have been a fabricated security finding. Re-run over TLS, everything refuses correctly.
+
+Five this session: `strings` (0 for every string), `PRAGMA user_version` (wrong migration table),
+`PRAGMA synchronous` (per-connection), a CACHED clippy run without `-D warnings` (reached CI as a real
+dead-code failure), and this one. **A check whose failure mode is indistinguishable from its pass mode
+is not a check** — every one of these looked conclusive and was empty.
+
+### Standing verdicts
+
+**GO_LINKS: NO** — enforcement observing, not refusing; Phase 8 needs a claim session.
+**GO_MODEL_PROMOTION: NO** — Gate B: 1.09 h of 25, 5 recordings of 25. ~9,800 listening decisions,
+which is reviewer time and cannot be engineered.
+
+Phases 1, 2, 4, 7 complete. 5 at 3-of-5 (rest terminates at Gate B). 3, 6, 8 blocked on a phone, a
+corpus and a reviewer slot respectively — none of them code.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (later) — the enforcement green light was vacuous, and the coverage denominator was the client's
+
+Asked to wire enforcement "after the log shows no `PLAYBACK_EVIDENCE_OBSERVE`". The log did show none.
+It was still not permission, and the reason is worth keeping.
+
+### Why zero warnings meant nothing
+
+```
+running exe bakes                    : c6c1bee   (NOT ddeb2c3, which added the guard)
+PLAYBACK_EVIDENCE_OBSERVE in the exe : 0 occurrences (grep -a)
+record_playback_receipt in the exe   : present
+playback_receipts rows               : 0
+last phone decision                  : 2026-08-18 21:19:20   (18 events, 21:11-21:19)
+running exe built                    : 2026-08-19 05:50      (8.5 h AFTER those decisions)
+```
+
+The observe guard was never deployed, so it could not warn; the receipt-minting build went live after
+the last phone review, so nothing had minted a receipt. Zero and zero, and the honest reading is
+"this code has never executed". Flipping to hard refusal on it would have shipped a rejection path to
+all eight reviewers on no evidence at all.
+
+`check_playback_enforcement_readiness.py` now asks whether the warning COULD have fired before
+treating its absence as evidence: marker present in the binary, real decisions in the window, more
+than one reviewer represented (playback ticks come from a device, not a policy), every decision
+covered at the bar. Negative controls drive it against this exact shape and require NOT READY; a
+positive control requires READY so it is not merely a refuser. Live verdict: **NOT READY, 2 checks
+failed** — which is the true state, not a failure of the work.
+
+### Half the guard was comparing the client with itself
+
+The receipt resolves revision and fingerprint server-side precisely so a client cannot mint evidence
+for a clip it never loaded — and then took the coverage DENOMINATOR from the client anyway. A page
+reporting `heardMs: 100, clipDurationMs: 100` for a 1.5 s sentence scored 1.00 and cleared the 0.90
+bar on a tenth of a second of audio.
+
+```
+before fix : receipt recorded clip_duration_ms = 100  (client's claim)
+after fix  : receipt recorded clip_duration_ms = 1500 (server's row), coverage 0.067 -> REFUSED
+live rows carrying a duration : 15,905 of 15,905, so the client's number is now dead in practice
+```
+
+### Phase 8 does not need a reviewer slot — the earlier entry was wrong
+
+Recorded above: "the rest of Phase 8 needs a claim session, and a 9th reviewer cannot be created".
+Five of those six items are already pinned against the REAL server on disposable in-memory profiles,
+which is exactly the dedicated audit profile the brief asked for, at zero cost to the roster. Each run
+individually and confirmed as `1 passed`, never a filtered-out zero:
+
+```
+cookie flags (Secure/HttpOnly/SameSite=Strict, pairing secret != session)  pairing_mints_distinct_secure_bounded_sessions
+token gate on every route, two reviewers kept apart                        live_server_gates_every_route_...
+a valid token in the query string is worthless                             a_valid_token_in_the_query_string_is_worthless
+idempotent replay, never recorded twice                                    a_legacy_interrupted_decision_..., a_mid_session_server_restart_...
+revocation, and revocation surviving a restart                             revoking_one_reviewer_..., ..._must_outlive_a_restart, durable_stop_marker_...
+sleep / restart                                                            a_lease_that_lapsed_while_the_phone_slept_..., a_spot_check_served_before_a_restart_...
+```
+
+Ranged-audio authorisation needed no new test: the auth gate returns 401 before the `Range` header is
+read and before any route dispatch, so a Range-specific bypass would require moving the audio route
+above the gate — which the existing 401 test already catches. Checking beat writing.
+
+### Gate B's refusal was blaming the corpus
+
+`EVAL SLICES: REFUSED - 348 manifest row(s) did not resolve to exactly one library segment` reads as
+corruption in `speech_segments`. Measured:
+
+```
+manifest rows        : 348
+rows with 0 matches  : 348
+rows with >1 match   : 0
+manifest             : runs/eval/fleurs_ckb_iq_frozen.eval.tsv  (FLEURS — external by canon)
+```
+
+Every row, not some. FLEURS clips are not library clips and never will be, so library-derived slices
+(speaker, dialect, SNR, source) cannot be built from that manifest at all. That is a question about
+which eval set gets sliced — a promotion-policy decision, owner-gated — not a corruption to hunt. The
+message now says so. The gate still REFUSES; nothing was weakened.
+
+### Standing verdicts
+
+**GO_LINKS: NO** — enforcement still observing. The precondition is now measurable rather than
+assumed, and the instrument that measures it exists and currently reads NOT READY.
+**GO_MODEL_PROMOTION: NO** — unchanged. Gate B: 1.09 h of 25, 5 recordings of 25.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (pilot) — the two-reviewer pilot answered the device question, and found a workflow instead
+
+Bar lowered 0.90 -> 0.85 on the owner's call. Full sweep at exact HEAD: **RED**, 40 of 41 kept gates
+PASS, the one failure `challenger-loop` (one trained challenger, no linked verdict — the FLEURS eval
+manifest cannot produce library-derived slices). 9 legs owner-descoped, 3 owner-gated pending, so
+`CORTEX 10/10: ALL GATES GREEN` remains unreachable by the aggregator's own definition.
+
+### The device question is answered, and the answer is clean
+
+```
+reviewer   receipts   mean coverage   min coverage
+Reviewer A       22           0.981          0.932     every single one above the bar
+Reviewer H       18           0.721          0.000
+```
+
+Reviewer A's second device produced 22 receipts and not one false refusal. That was the whole point of the
+pilot: `timeupdate` fires on a browser, not on a policy, and one phone proved nothing about another.
+Two phones now agree.
+
+### What enforcement would actually have refused
+
+5 of 40. One is the case the guard exists for (0.352 — a 9.8 s clip decided after 3.5 s). The other
+four are a single pattern:
+
+```
+12:05:56  reject  clip 11797ms  heard 0ms
+12:05:56  reject  clip  8145ms  heard 0ms
+12:05:57  reject  clip  8575ms  heard 0ms
+12:05:57  reject  clip  7450ms  heard 0ms
+```
+
+Four rejects in two seconds with zero playback. Not a device fault and not dishonesty — a rapid
+rejection sweep, which is a real way to work. It is also indistinguishable, to the guard, from
+deleting corpus without listening.
+
+That is now an owner decision the pilot surfaced and no amount of code can settle: **does the guard
+gate a REJECT?** An accept or an edit injects text and must require listening. A reject removes a
+clip permanently, from a corpus whose size is already the binding blocker (1.10 h of 25). Refusing
+unheard rejects protects the corpus and breaks the sweep workflow; exempting them keeps the workflow
+and lets a careless reviewer silently delete clips nobody heard. Currently everything except `skip`
+is gated.
+
+### A gate of mine that manufactured the evidence it existed to refuse
+
+`check_playback_enforcement_readiness.py` reported **0 decisions while a reviewer was mid-session**.
+SQLite `datetime('now')` writes UTC and the tracing log stamps Zulu; the default window came from the
+exe mtime in LOCAL time, so on this UTC+3 box it discarded the last three hours — and with them the
+first genuine below-bar receipt. Seventh check of mine this session that proved nothing, and the only
+one that actively misled rather than merely failing to inform. Pinned by
+`test_the_default_window_is_utc_like_the_rows_it_filters`.
+
+### Standing verdicts
+
+**GO_PILOT: YES** (running). **GO_LINKS: NO** — 40 of 20 decisions and 2 of 2 reviewers now pass;
+coverage is the last gate leg and it hangs on the reject question above, not on a defect.
+**GO_MODEL_PROMOTION: NO** — unchanged. Gate B: 1.10 h of 25, 6 recordings of 25.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (enforcement) — the guard now refuses, rejects included
+
+Owner call: bar to 0.85, rejects gated, enforcement live. Deployed at HEAD `128a067`; the running exe
+carries `PLAYBACK_EVIDENCE_REFUSED` and no longer carries the observe marker, verified against a
+negative control that returned 0. Eight reviewer links answering, champion pointer intact, exe fresh.
+
+A verdict on a clip played below the bar is refused with **428**. `skip` stays exempt — it writes no
+verdict, and gating it would leave a reviewer who cannot hear a clip with no legal move at all.
+
+### Two bugs the existing tests caught, both the same shape
+
+The server's own failure was being reported as the reviewer's fault:
+
+  * a locked database makes the evidence check unanswerable, and the first draft returned 428. Someone
+    who listened properly would replay the clip and be refused again, forever. Unanswerable is now 500.
+  * a receipt that could not be WRITTEN left nothing to judge, so a busy database refused honest work.
+    Now 500 — and it claims the lease first, or a transient error hands the clip to the next
+    reviewer's batch while the reviewer still has it open with their correction typed.
+
+Neither was visible from the enforcement code alone; both surfaced because 34 tests went red and one
+of them asserted `500, "a locked database must surface as a server error, not a verdict"`.
+
+### The Funnel link, and why the app never had it
+
+A reviewer lost audio mid-session and five skips silently failed to reach the server. Server healthy
+(shell 0.04 s, zero ERROR lines), every audio file present, all eight queues live, public Funnel
+answering in 0.05 s from outside. The app hands out a LAN URL and a tailnet URL; both die when the
+phone leaves the network, and iOS suspends the VPN whenever the app is backgrounded. The one link that
+still worked was the one never handed out. Now read from `tailscale serve status --json` — three
+conditions or no row, because a guessed hostname resolves and then refuses.
+
+### Gates that caught me this round
+
+  * repo hygiene: the owner's real device hostname went into a tracked test fixture. Redacted.
+  * the readiness pin: its marker string no longer existed in the source — exactly the "passes on
+    silence" trap it was written for. The gate is reframed for enforcement rather than retired.
+  * clippy MSRV: `is_none_or` is 1.82, the project floor is 1.81.
+  * a tab had eaten `C:\Program Files\Tailscale\tailscale.exe` into `Tailscale<TAB>ailscale.exe`.
+
+Rust 1282 passed, clippy -D warnings clean, 86 python policies, typecheck 0 errors.
+
+### Standing verdicts
+
+**GO_PILOT: YES.** **GO_LINKS: NO** — enforcement is live but has not yet refused a real reviewer;
+the first `PLAYBACK_EVIDENCE_REFUSED` in the log is the live proof, and it has not happened yet.
+**GO_MODEL_PROMOTION: NO** — Gate B unchanged: 1.10 h of 25, 6 recordings of 25.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (hunt) — the brutal bug hunt: 14 agents, 8 confirmed-certain, and a deploy that would have bricked the desktop
+
+Six specialised finders swept the codebase in parallel (read-only, while a reviewer worked live),
+32 raw findings deduped to 21, the top 8 adversarially verified — a second set of agents instructed
+to REFUTE each claim. All 8 survived as CONFIRMED at "certain". 1.56M tokens, 319 tool calls, 14 min.
+
+### The one that mattered most
+
+The staged desktop-enforcement build — already compiled, waiting only for the reviewer to finish so
+it could deploy — would have refused essentially every honest desktop verdict. Clips are windows into
+shared source files (403 of 414 exportable clips live in ONE recording), and both desktop surfaces
+report the WHOLE file's length as the coverage denominator: an honest full listen of a 10 s clip
+scored ~0.004 against the 0.85 bar. The hold-for-Reviewer A pause is the only reason it wasn't live.
+
+### Confirmed and fixed (each failing-first where a test could be written)
+
+1. **One front door for receipts** — db::record_playback_receipt resolves revision, fingerprint AND
+   denominator from the row, overriding every caller's claims. The desktop's `path:` vs `id:`
+   fingerprint deadlock died in the same stroke.
+2. **Listening is personal** — the guard matched segment+revision+fingerprint only, so reviewer A's
+   listen evidenced reviewer B's blind verdict. Guard, gate and requeue tool all reviewer-scoped now.
+3. **heardMs never reset between same-file clips** — resetHeardTime() had ZERO external callers;
+   clip B passed on clip A's minutes. Reset now fires on every clipKey change in the shared player.
+4. **Undo punished listening** — the decision bumps the revision past its own receipt, so re-deciding
+   a clip just heard and undone was refused 428. The undo txn carries the reviewer's best receipt
+   forward; fingerprint equality is what makes that honest. Measured 428 before, 200 after; another
+   reviewer still gets 428.
+5. **funnel_host under the COUCH mutex with no timeout** — a wedged tailscale.exe would have frozen
+   every status call and is_running(), the restore fence. Bounded 3 s, cached per process.
+6. **requeue --apply rerun wiped good re-reviews** — it judged every event in the window, not the
+   segment's LATEST decision. Plus the 'T'-separator fence bypass ('T' sorts after digits, so an ISO
+   timestamp sailed past the lexicographic fence into an empty window).
+7. **exe-freshness blind to build config** — commits touching only package-lock/vite/svelte/tsconfig
+   read as "non-source" and certified a stale exe as HEAD.
+8. **Desktop refusals in raw English** — E_NO_PLAYBACK_EVIDENCE shown verbatim; now review.mustListen
+   in both languages (Sorani awaiting the owner's native read, with the phone's copy).
+
+### Found, verified or plausible, NOT yet fixed — owner should know
+
+* **Side-door verdict writers**: batch_verify, write_segment_verdict, restore_segment_snapshot and
+  update_segment_fields can set verified/verdict without the listening guard. Some are legitimate
+  (undo/restore, owner batch tools with their own audit trail); whether batch_verify should demand
+  evidence is a policy call, not a code call.
+* Outbox flush before `me` is known can 409-destroy another reviewer's queued decision (phone).
+* api_decision mints the receipt at the CURRENT revision before the rowVersion CAS — a stale outbox
+  replay can mint evidence at a revision the phone never saw.
+* Spot-check pairs can outlive a batch-unverify, silently mis-scoring a real re-review.
+* The readiness gate's ±5 s window can pair one receipt with two same-segment decisions.
+
+### The instrument lied twice today before the hunt
+
+Local-time window vs UTC rows (hid 3 h of live work), then current-revision matching vs
+revision-bumping decisions (called nine correctly-guarded decisions unevidenced). Both times the gate
+UNDER-reported the system. The hunt's verifiers were told to refute, not confirm — same lesson.
+
+Totals after fixes: Rust 1288 passed, clippy -D warnings 0, vitest 280, 86 policy scripts, typecheck
+0 errors. Gate: READY (32/32 evidenced, 2 reviewers). Deployed exe still 128a067 — rebuild pending.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-19 (voice focus) — one host's voice, found by cross-file presence, confirmed 15/15 by ear, now the whole queue
+
+Owner goal for this phase: collect the KBHP host's voice, clean and single-speaker, for voice cloning;
+guests later. Reviewer hours are the scarce resource, so the QUEUE narrows to his clips. The library
+does not change: nothing relabelled, nothing deleted, and removing one data-dir file restores the
+full queue on the next fetch.
+
+### Finding him
+
+The per-file SPEAKER_xx labels name nobody — the same person is SPEAKER_05 in one episode and
+SPEAKER_04 in the next (measured across the 32 files). `host_voice_probe` embedded every single-speaker
+clip with the production CAM++ service and clustered across ALL files at once:
+
+```
+clips embedded   8,753 (single-speaker, >= 2 s, across 25 of 32 files)
+clusters            39
+  cluster  files  audio  clips
+        1   24/25  2.25h   905   <- one voice in nearly every episode
+       28    1/25  1.06h   415   <- one file only: a guest
+       29    1/25  1.01h   408   <- one file only: a guest
+```
+
+Ranked by DISTINCT FILES PRESENT, not volume: a long-winded guest out-talks the host in their own
+episode, but cannot appear in 24 of them.
+
+### The owner's ear, blind
+
+15 clips, two-thirds candidate and one-third deliberately not, shuffled, audio embedded in a page so
+nothing had to be found or decoded. Owner: "all Kawa except 1, 2, 11, 13, 14." Scored against the
+key: **15 of 15 agree**. The activator is built to REFUSE past one disagreement — it refused once
+earlier when the owner ran the example command with my placeholder numbers (7 disagreements, wrote
+nothing), which is the safety working.
+
+### Live, proven at the serving path for all eight reviewers
+
+```
+Reviewer H / Reviewer A / Reviewer C   served 29 = 25 Kawa + 4 spot-checks   pendingTotal 905
+Reviewer B / Reviewer G / Reviewer D / Reviewer F / Reviewer E   served 0, pendingTotal 0  ("No clips in your dialect yet")
+```
+
+Kawa is Hawleri, the five are Sorani-restricted by the owner's roster, and the owner's decision is to
+leave them: Hawleri reviewers only this phase. The spot-checks (1 in 8 by canon) still fire inside
+the focus — the QC does not care which voice is being collected.
+
+### Two things caught on the way
+
+* The background `tauri build` wait-loop declared "done" on a STALE exe (it checked for cargo while
+  vite was still running; no focus code in the binary). Caught by the negative-control grep before
+  deploy; rebuilt in the foreground.
+* `check_reviewer_queues_live` reported 15,318 servable while every real queue held 905 — it
+  mirrored the pending query but not the focus, and would have read OK against an empty queue. Now
+  reads the same file the server reads; honest, it immediately surfaced the five-empty-queues fact.
+
+Caveats carried: 7 of 32 episodes contributed no candidate clips (no single-speaker scoring yet);
+clusters 10 and 17 (12 and 11 files) may be the host on other mic days — a second blind round could
+roughly double his hours. Not now: 905 clips / 2.25 h is a working set, and the reviewers should be
+on it rather than waiting.
+
+**GO_LINKS: YES** (Hawleri roster). **GO_MODEL_PROMOTION: NO** — unchanged.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-20 (round 2) — the suspects were him: Kawa's set grows 905 -> 1,352 clips
+
+Round 2 sampled the two clusters that looked like the host on other mic days (10: 185 clips/12
+files, 17: 262 clips/11 files) — 6 clips each, plus 3 controls drawn from the already-confirmed
+905, shuffled. Owner verdict: all 15 are Kawa. Scored per cluster: controls 3/3 (round valid),
+cluster 10 6/6 MERGE, cluster 17 6/6 MERGE.
+
+```
+focus now : 1,352 clips | 3.35 h | across all 25 scored episodes | all pending
+serving   : the three Hawleri reviewers, pendingTotal 1352, 25 Kawa + 4 spot-checks per batch
+            Sorani-restricted reviewers still 0, by owner decision
+```
+
+The merge machinery refuses two ways by design (pinned): a cluster confirmed on only some of its
+clips is rejected whole, and a missed control voids the round. Neither fired — but they existed
+before the verdict did, which is the order that makes a clean merge mean something.
+
+Remaining Kawa upside, not taken now: 7 of 32 episodes still have no speaker-change scores, so
+none of their clips could enter any cluster. Scoring them and re-probing would grow the set again.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+## 2026-08-20 (round 2 hunt) — 24 confirmed findings fixed, and Kawa's masters were 48 kHz all along
+
+Second adversarial sweep (54 agents: 6 scoped finders, 2 independent refuters per finding): 24
+raw findings, 24 confirmed, 0 disputed. All-confirmed earned extra suspicion, so every finding was
+re-verified by hand against the source before any fix — all 24 held. Every fix landed with a test
+that fails on the pre-fix code (spot-verified by swapping HEAD files back in).
+
+The ones that mattered most:
+
+* Policy fail-closed had TWO remaining holes: a roster KEY that mismatches the live name by
+  case/whitespace bound nobody (the 2026-08-16 incident back through the keyhole — lookup now
+  matches the session layer's name rules, colliding keys are a broken file), and the Python
+  mirrors parsed NaN/Infinity that serde 503s (parse_constant rejector, repo precedent).
+* My own morning fix was incomplete: the receipt front door re-resolved revision AFTER the fence,
+  re-opening the manufactured-evidence window. The mint is now a single atomic
+  check-and-insert (`record_playback_receipt_if_at_revision`) — verified revision or no row.
+* The reorder had broken skips (fenced into an endless boomerang + false "work lost") and served
+  spot checks (one bulk stamp away from 409ing every check in flight). Both are now fence-exempt;
+  a stale-serve skip lands WITHOUT evidence.
+* Pay integrity: the review_events audit row now commits INSIDE the decision transaction, the
+  event snapshots its clip's duration (migration v56), and reviewed_audio_ms LEFT JOINs — so a
+  kill window or a deleted clip can no longer erase paid work. reject_speaker_change_clips
+  collapsed to the same one-commit finalize.
+* Shared-phone identity: attribution-409s HOLD work for its author (both flush and live paths),
+  drafts/refused banners are reviewer-scoped, a background refill no longer yanks the reviewer to
+  clip 0 mid-listen (and re-showing the same clip no longer zeroes heardMs).
+* Settings: auto-saves clamp unsaved consent GRANTS (Cancel genuinely cancels, measured leak
+  closed), rollbacks target the last BACKEND-confirmed state, the inbox autonomy dial updates the
+  global store. Gate mirrors: live_reviewers honors the revocation marker + db_path binding;
+  enforcement readiness matches receipts the way the guard does (any age at the decided revision).
+
+```
+cargo test        1305/1305 green (after: 2 migration tests taught that v56 exists)
+clippy            clean, release + dev
+vitest            283 pass (55 files) — 3 new consent tests fail-before-verified
+python policies   87 scripts pass; queue-gate core 14 tests
+```
+
+**Kawa audio verdict (owner question): GOOD — and better than we were using.** The 1,352-clip
+focus (3.35 h): SNR median 40 dB (2 clips under 20), zero clipping, RMS median −24.7 dBFS,
+192 of 201 min pass SNR≥20 + RMS≥−30. Stored per-clip QC verified exact against re-measured audio
+(8/8, Δ 0.0 dB). The find: the pipeline's 16 kHz WAVs are downmixed copies — the true masters are
+48 kHz stereo 320 kbps MP3s (all 32 episodes, timeline-identical: lag 0.0 ms, corr 0.999), and
+every focus clip carries source offsets. Cloning exports must cut from the masters (8–12 kHz
+sibilance the 16 k copies cannot carry) and loudness-normalize per clip (episode medians spread
+−29.1…−21.7 dBFS). No re-recording, no reviewer workflow change.
+
+Accepted, not fixed: same-name link reissue to a different human is indistinguishable by design
+(the name IS the identity unit); global speaker identity across the corpus remains the strategic
+open item.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-20 (champion) — the 7.5/10 review was right, and the champion pipeline is now proven at the serving path
+
+The external engineering review retracted its near-10 and rated 0f7d9ae ~7.5/10 with nine champion
+-pipeline blockers. All 19 cited code sites verified by hand: substantively correct (two
+overstatements noted: worker death was loud-but-permanent, not silent; all-GPU default matches this
+rig's intent — the silent-CPU fallback was the real hazard). Fixed in four commits
+(e9e869d, 6815605, e21ee38, 930a6a1), each with the pins updated in the same commit:
+
+1. Crash-atomic imports: resume discriminates interrupted stages (placeholder/empty drafts) from
+   completed files and discards+redoes them; adopting the 2026-08-14 incident state is now
+   impossible.
+2. Halt-on-first-failure at EVERY level: directory imports stop at the first failing file (resume
+   journal makes it cheap); an exhausted-empty champion result rolls the file back and halts —
+   escalate-and-continue is gone.
+3. One commit owner: batch_transcribe no longer re-writes the champion's atomic commit
+   (TranscriptionDraft.committed_by_pipeline, exactly one true site, pinned).
+4. Direct transport: Rust speaks the server protocol itself. Gone per clip: a Python interpreter
+   spawn, a ~108 MB live DB+WAL copy into WSL, TWO full decodes of a 55-80 min episode. Server
+   decodes only the clip window (ffmpeg -ss/-t). MEASURED same clip (9.5s, 42.6 min into EP26):
+   8.64s -> 3.42s warm server-side; in-app champion draft ~1.4s in the E2E.
+5. Cancellation: batch threads its token into the 7B call; the gate wait is cancellable (100ms
+   polls); the socket read polls cancel every 500ms.
+6. Fleet: dead workers respawn on their own device (bounded 3, backoff, unit-tested 4/4); GPU
+   discovery failure is a HARD STOP (CPU only by name); auto-discovery takes only cards with
+   >=20 GB free (measured: WSL-side nvidia-smi sees replica VRAM on this rig).
+7. Factory refinement default Local -> None: a fresh install's champion no longer depends on an
+   unrelated LLM endpoint (privacy pin updated: None is stricter).
+8. Gates test production: verify_10's champion probe speaks the protocol and matches the pinned
+   deploymentSha256 (verified green against the live server); the 7B test leg's skips are loud and
+   fatal under CORTEX_REQUIRE_7B=1; ONE port accessor ends the health-vs-transcribe port drift.
+9. Reproducible recovery: scripts/wsl7b_requirements.lock (158 pins frozen from the LIVE venv,
+   py3.12.13/Ubuntu 26.04); WSL_DR_RUNBOOK corrected off /root/cortex_env; start_7b_server.ps1
+   passes the champion pointer the server actually requires (it was setting an ignored variable).
+
+PROVEN AT THE SERVING PATH (deployed exe e21ee38, real audio, real 7B server):
+```
+E2E WSL7B : import -> VAD -> champion draft (direct transport) -> re-transcribe -> couch TLS
+            -> skip writes nothing -> 428 on evidence-free verdict (asserted) -> decision
+            persisted verified+attributed -> REAL-DATA RUN OK
+identity  : health probe sha ae33143e... == champion.json pin (content check, not port-open)
+suite     : cargo 1309/1309 | clippy clean | vitest 283 | python policies 87/87
+```
+
+Found live during the E2E (blocker #6's shape, reproduced): a second app instance's champion
+supervision churns 6-minute warm-ups against a port it can never own; production single-instance
+self-heals (measured: pkill -> supervision respawn) but slowly. Fast child-exit detection on the
+Rust side and multi-instance port arbitration are the honest remaining lifecycle gaps, now tracked.
+
+Still open and owner-facing: the 20-decision enforcement canary (needs real reviewing on this
+build), spot-check pool 22/24, and the strategic speaker-identity/train-test-split design.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-20 (voice focus) — the desktop was still playing guests, and the canary needs a Hawleri speaker
+
+The owner, reviewing on desktop with the Kawa_Hawleri focus active, heard guests. The focus was
+real, live, and narrowing every PHONE queue — and the desktop review page had never heard of it.
+`pending_segment_ids_focused` was couch-only; the desktop reads through `get_segments_page`, which
+served the whole library. Fourth incident of the same class: the check lived on one serving path
+while another path served the lie.
+
+Fix (65deefa): `get_segments_page_focused` joins the allow-list in SQL (`json_each`) so rows,
+COUNT, and keyset pages agree; the focus SET is hashed into the cursor scope, so a cursor dies
+when `voice_focus.json` changes (its total was computed under the retired list); the command
+mirrors couch's fail-closed wording on a present-but-broken file; ReviewMode asks `focused: true`;
+curate/library stays unfocused on purpose — the queue narrows, the library does not.
+
+```
+proof     : db test desktop_review_page_narrows_to_the_voice_focus_but_the_library_does_not
+            (guest never enters the queue; total counts the queue; focused cursor refused against
+            an edited set AND against the full library)
+pins      : test_voice_focus_policy +1 — one anchor per serving layer (couch, db, command,
+            ReviewMode) + curate must never turn the focus on
+suite     : cargo 1310/1310 | clippy clean | vitest 283 | svelte-check 0 | 88/88 policy scripts
+deployed  : exe at HEAD 65deefa, supervision OK (8 links answering), stale installers deleted
+```
+
+Same session, the canary and the roster met: readiness is 22 decisions / coverage-clean but
+single-reviewer — and the live queue gate shows why the second reviewer hasn't appeared. The
+Kawa_Hawleri focus leaves every sorani-only reviewer (Reviewer B, Reviewer G, Reviewer D, Reviewer F, Reviewer E) with a live
+link and ZERO servable clips; Reviewer B's "empty queue" screenshot was the system obeying the roster,
+not a bug. The second canary reviewer must be Reviewer A or Reviewer C. Owner decision surfaced: five paid
+links are idle for as long as the focus holds.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-20 (couch sessions) — six of eight reviewers were locked out by the server's amnesia
+
+Asked why one reviewer's link "doesn't work", and the answer was not the one I gave first. My initial
+read — dialect roster x voice focus = 0 clips, therefore a people problem — was HALF the story and
+the wrong half. Measured properly, six of eight paid reviewers had stopped at staggered dates
+(Reviewer E/Reviewer G 08-13, Reviewer D/Reviewer F 08-15, Reviewer C 08-16, Reviewer B 08-17) and the cause was a defect.
+
+The pairing tokens were durable. The COOKIE the page authenticates with was not: `CouchState` was
+rebuilt with `..CouchState::default()` on every start, so the server forgot every session it had
+issued while the browser went on presenting one valid for its full 24 h `Max-Age`. The app restarts
+4-9 times a DAY on this machine (48 in the nine days measured) — every restart a mass logout. And the
+reviewer could not recover: the page strips `#t=` from the address bar after claiming, so a bookmark
+or the installed PWA (`start_url` "/") carries no token to re-claim with. Settled 401 renders as the
+terminal "link expired", no Retry. Nothing expired; the server had amnesia. Nothing logged it either,
+so "their link is dead" and "they stopped working" were indistinguishable from the owner's side.
+
+```
+LIVE, same machine, same cookie, at the serving path:
+  before (unfixed 65deefa) : /api/queue 200 -> restart -> 401   session FORGOTTEN
+  after  (fixed   0224dad) : /api/queue 200 -> restart -> 200   session SURVIVED
+  live log : "Couch Review restored 1 live session(s) — saved shortcuts keep working"
+fail-before: reverting the restore reds the new test; source restored byte-identical (0813a620be3a7681)
+suite     : cargo 1311/1311 | clippy clean | vitest 283 | 88/88 policy scripts
+deployed  : exe at HEAD 0224dad, supervision OK (8 links answering), watchdog re-enabled
+```
+
+Fix: sessions are DPAPI-protected at rest beside the pairing tokens, restored on resume, filtered by
+roster name AND by TTL (restoring resumes, never extends); `session_issued` is wall-clock because an
+`Instant` cannot cross the restart it is saved for; `persist_session_state()` runs on claim and on the
+sliding page-load renewal; the pairing/session separation is untouched. Refused requests now LOG.
+
+Owner-facing: the reviewers' OLD cookies were never saved and cannot be resurrected — each device
+needs its original `#t=` link once more, and after that restarts stop mattering. Two gaps this
+exposed, now known: `check_supervision_live.py` proves only that the PORT answers and that the file
+lists N reviewers — it never presents a credential, so it read OK through nine days of total
+lockout; and the 20-decision enforcement canary has been measuring a system most reviewers could
+not log into.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-21 (review) — the desktop fix was half a fix, and the Inbox was 89% guests
+
+An xhigh-recall review of the branch found 11 defects. The first one undid the previous entry's
+claim: `ReviewInbox` serves the ESCALATION queue — it plays clips, mints playback receipts and
+records accept/edit/reject — and applied no focus at all. Narrowing the review page had left the
+owner's actual complaint reachable one tab over.
+
+```
+escalated & awaiting a human : 11331
+  inside the voice focus     :  1293
+  OUTSIDE it (guests etc.)   : 10038   <- 89% of what the Inbox served
+```
+
+Ten of eleven fixed, one deliberately skipped. The ones worth naming:
+
+  * the Inbox obeys the focus, and `voice_focus::resolve` is now THE entry point — one three-arm
+    policy, one refusal wording. Re-deriving it per call site is exactly how the desktop missed it,
+    and how the Inbox then missed it again;
+  * a narrowed queue can no longer claim the library is finished. `allReviewed` excluded only the
+    SEARCH subset, so draining 1,318 focused clips announced all 15,262 as reviewed. The banner and
+    empty state now say which subset, in both locales, with no speaker name in tracked strings;
+  * `durable_pairing_codes()`: the empty-map guard existed at one save site and not at the newer
+    per-claim one, where it would have written a linkless session file over a good one;
+  * `supervise_workers` re-checks the stopping event AFTER its backoff — a SIGTERM landing mid-wait
+    used to fork a replica nothing would ever signal, orphaning ~19 GB of VRAM and the listen port;
+  * the ffmpeg seek starts early and trims exactly. MEASURED on a 320 kbps MP3 master at 42 min: a
+    bare seek left the first 10 ms as wrong as the signal was loud (0.0 dB) and 10-50 ms at -5.4 dB
+    — the word ONSET — while everything past 50 ms was bit-identical. With the pad the onset
+    measures -381 dB against the exact whole-file slice;
+  * the stale-installer check compares against the newest SOURCE instead of a 15-minute tolerance
+    that was wider than a full build (CLAUDE.md: never weaken a gate).
+
+SKIPPED, with the reasoning recorded on `resolve()`: caching the focus file. A 2 s TTL was built and
+reverted — it kept serving clips through a file that had just become broken, which the existing
+fail-closed test caught at once. Fail-closed means "on the next fetch", and this policy exists
+because pointing paid reviewers at the wrong audio costs money per minute.
+
+And the monitoring gap that hid the nine-day lockout is closed. `check_reviewer_links_live.py`
+DPAPI-decrypts each reviewer's real pairing token, claims a session with it, and fetches their real
+queue — the thing `check_supervision_live.py` never did, which is why it read OK throughout.
+
+```
+REVIEWER LINKS (live, deployed build, real credentials)
+  3 reviewers IN with 29 clips served / 1293 pending
+  5 reviewers IN but 0 clips  (the Hawleri focus against a sorani-only roster)
+  0 links refused
+suite    : cargo 1315/1315 | clippy clean | vitest 283 | svelte-check 0 | 88/88 policy scripts
+deployed : exe at HEAD 245a472, supervision OK, freshness OK
+```
+
+Owner-facing, unchanged by any of this: each device still needs its original link ONCE more (cookies
+that were never saved cannot be resurrected), and five paid links stay idle while the focus holds.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+## 2026-08-21 (paid-review hardening) — focused champion provenance is green; production readiness is not
+
+The owner requested a proof-backed, reliability-only audit before the first paid review batch, with
+the fine-tuned OmniASR-7B champion as the sole normal drafting path and no GPU disturbance. This
+audit did not start any ASR model, model server, or GPU workload.
+
+Measured state:
+
+```
+active Hawleri focus       : 1293 playable pending; 1293/1293 exact champion provenance
+global untouched backlog  : 8731 rows without champion hypothesis (focus must remain enforced)
+live review serving       : watchdog disabled; port 8737 down; 8/8 saved links unreachable
+reviewer allocation       : Reviewer B/Reviewer G/Reviewer D/Reviewer F/Reviewer E have 0 eligible clips under this focus
+hidden-check pool         : 0,2,0,2,0,0,0,0 — all eight reviewers below floor
+playback canary           : 0/20 post-deployment decisions
+frontend                  : 283 tests; typecheck/lint/build pass; format check red on 6 old files
+Rust full library suite   : 1340 pass, 8 ignored, 1 fail (compensation-law contradiction only)
+Python policy suite       : 86/88 scripts; ledger staleness fixed by this entry, watchdog still red
+```
+
+Reliability fixes in the dirty, uncommitted worktree: decision-time row-version/focus/dialect
+authorization; idempotent legacy retries; immutable/retryable spot-check scoring; globally ordered
+session persistence so a stale snapshot cannot resurrect a revoked reviewer; case-normalized dialect
+rosters; reviewed-audio export restricted to current human accept/edit with exact revision-bound
+metadata; public reviewer redaction; and production bundle rights/source-byte rechecks with BLAKE3
+source and recipient-readable licence/credit manifests. Production bundle generation now uses a
+fresh sibling stage, one frozen core-row snapshot, selected-ID DPO output, stored canonical-PCM
+verification, and publish-on-success rename; stale or partial files cannot be sealed. Independent
+concurrency review found no production deadlock, lock inversion, or unguarded save path. Targeted
+export suites passed (19 audio, 39 bundle, 65 dataset with 1 ignored, 10 validation, 18 learning).
+The final rights gate also replaced punctuation-stripping licence normalization with an exact,
+case-insensitive alias allowlist. Sorani/Chinese compound suffixes and punctuation suffixes now fail
+closed instead of collapsing to `CC0-1.0`; 39/39 bundle tests and an independent validator passed.
+
+Stop-ship contradiction: protected `docs/OWNER_CANON.md` defines compensation differently from both
+the owner's latest 100% edit / 10% unchanged accept / 10% valid reject request and the current dirty
+code (accept/edit 100%, reject 0%). The mismatch is the full Rust suite's sole failure. No pay logic
+was changed; owner authorization must be the literal phrase `change canon: review compensation`.
+The eventual ledger must use policy versions, canonical work IDs, idempotency keys, integer micro-IQD,
+reversals, and settlement state; rejected audio remains outside every dataset and corrected-duration
+total even if a valid reject earns the proposed 10% review fee.
+
+Dataset boundary remains strategic: hardened production bundles are ASR-oriented. Generic audio
+export still lacks equivalent commit-time consent/source-byte sealing, and the app has no explicit
+first-class sibling `asr/<export_id>` and `tts/<export_id>` artifacts. TTS needs preserved-rate masters,
+speaker/session/consent provenance, and deterministic speaker-disjoint splits.
+
+Verdict: **NO-GO for paid production**, not 10/10. Engineering reliability is materially higher, but
+compensation authorization, supervision, credentialed links, deliberate roster allocation, hidden
+checks, a two-reviewer 20-decision canary, export snapshot closure, and backup/restore plus load drills
+must pass before release-candidate status.
+
+## 2026-08-21 (GPU-safe recovery) — code green; serving remains deliberately fail-closed
+
+The initial global champion-provenance result above was wrong. The gate hard-coded the historical
+`omniasr-wsl-7b` label even though the authoritative registry identifies the same pinned deployment
+as `omniasr-7b-legacy-c348ade8a816` (deployment SHA-256
+`ae33143ec8b25f45e393f4aa484c3a3d165850f0dc15e95254dd6e4cb4c05cbf`). The corrected gate resolves
+exactly one `omniasr-7b` champion, admits the old alias only for that immutable id/hash tuple, and
+uses a bound model-plus-transcript `EXISTS` check. Twelve resolver/fallback regressions pass. During
+the live import it rejects only the single segment currently between placeholder insertion and its
+champion hypothesis; the earlier 8,731-row claim must not be used.
+
+The running `batch_importer.exe` owns the same exclusive `cortex.lock` as the GUI and was left
+untouched. At 18:08 +03:00 it had completed 5,136 of 6,922 Lamo WAVs; 5,135 had champion hypotheses
+and one was the expected in-flight placeholder. The existing OmniASR-7B server remained the sole
+model listener on `127.0.0.1:8799`. No 300M/1B inference, ElevenLabs Scribe call, extra model server,
+or GPU restart was performed. Live settings remain `WSL7B`, cloud STT off, with champion process
+supervision temporarily disabled so review-only startup cannot duplicate the importer's workers; a
+timestamped settings backup exists beside the live settings file.
+
+The watchdog now probes the OS lock rather than file existence: real Windows sharing violations
+defer cleanly, stale lockfiles continue to launch, and all other probe faults block nonzero. Its
+throwaway-process drill passes 13 branches, and the live dry run reports `defer` on the importer.
+The watchdog task remains disabled intentionally because automatic launch after import would expose
+five empty reviewer queues and exhausted hidden-check pools. The exact hardened release binary was
+rebuilt from HEAD (`07debb908967d285a87abb7f47c1752e281e671cc8a1bea1fdf35f4243255e03`), and the freshness gate
+passes.
+
+Verification after the fixes: 1,341 Rust library tests passed (0 failed, 8 ignored); 283 frontend
+tests passed across 55 files; Svelte/TypeScript typecheck and ESLint passed; formatting/diff checks
+passed; champion hard-stop, agentic export, playback, provenance, queue, spot-pool, and watchdog
+policy regressions passed. The Python policy sweep's only remaining red test is the deliberately
+disabled live watchdog gate.
+
+The unauthorized partial compensation edit (accept/edit 100%, reject 0%) was removed, restoring the
+currently protected distinct-reviewed-clip rule and eliminating the Rust contradiction. The desired
+edit 100% / unchanged accept 10% / valid reject 10% schedule is still not implemented; it requires
+the literal owner authorization `change canon: review compensation` and a versioned immutable ledger.
+
+Serving-path result remains **NO-GO**: all eight links are down while the importer owns the database;
+Reviewer B/Reviewer G/Reviewer D/Reviewer F/Reviewer E have zero eligible Hawleri work; hidden-check capacity is
+0,2,0,2,0,0,0,0; and the exact new binary has 0/20 required playback-evidenced decisions. Those are
+real campaign/owner/reviewer prerequisites, not defects that may be fabricated away.
+
+## 2026-08-21 18:23 +03:00 — final certification checkpoint
+
+The result remains **NO-GO for real paid review**. This is a proof-backed operational stop, not a
+code-quality guess.
+
+Fresh read-only evidence:
+
+```
+importer             : PID 57180 still active; 5359/6922 source rows at sample; GUI absent
+listeners            : OmniASR-7B only on 127.0.0.1:8799; review port 8737 absent
+browser/a11y E2E     : 95/95 passed against a fresh mocked-Tauri Vite instance
+freshness logic      : 22/22 passed
+release attestation  : FAIL — 12 compiled Rust source inputs are uncommitted
+format/diff hygiene  : cargo fmt --check PASS; git diff --check PASS
+```
+
+The corrected freshness gate now rejects dirty tracked, staged, renamed, or untracked build inputs.
+The executable SHA-256 `07debb908967d285a87abb7f47c1752e281e671cc8a1bea1fdf35f4243255e03`
+is therefore a tested local candidate, not an immutable reproducible release. Version the intended
+source and rebuild before production certification.
+
+Operational blockers remain: the importer's exclusive lock, disabled watchdog, dead reviewer
+serving path, five empty Hawleri reviewer queues, hidden-check counts `0,2,0,2,0,0,0,0`, and a
+`0/20` exact-build two-reviewer playback canary. Three genuine Hawleri answer keys are only the
+minimum needed to cross the structural hidden-check floor for the three compatible reviewers; under
+the current 25-item/every-eighth-hidden cadence, a balanced full 1,293-clip Hawleri shift needs about
+69 genuine Hawleri keys. Keys must never be fabricated. A Sorani campaign is possible only after an
+explicit owner campaign/focus/roster decision.
+
+No ASR inference, smaller model, ElevenLabs Scribe call, model restart, GPU workload, campaign
+mutation, reviewer credential claim, or production service start was performed during this final
+checkpoint.
+
+The concurrent live provenance probe passed human-field and accepted-text provenance, then failed
+closed on exactly one new untouched in-flight row with no champion hypothesis
+(`86d131f6-8a80-470e-9089-9464c869bcdf`). This is consistent with the importer's known two-step write
+window and is precisely why the gate must be rerun only after the importer exits and then pass clean.
+
+## 2026-08-21 18:47 +03:00 — handover accepted; hidden-check exhaustion now fails closed
+
+Accepted `cortex-speech-app/docs/HANDOVER_TO_CODEX.md` from commit `e68c9f9` as the coordination and
+ownership surface. The highest-value unclaimed reliability gap was the listening-check pool silently
+ending while paid review continued. The fixed `>= 200` planning target was replaced with an
+enforceable capacity contract derived from the actual Rust serving constants and live campaign.
+
+Commit `3694999` (`fix(review): fail closed when listening proof expires`) now provides both layers:
+
+- `check_spot_check_pool.py` mirrors the live focus, roster, dialect routing, on-disk audio, prior
+  per-reviewer scores, and Rust `QUEUE_BATCH=25` / `SPOT_CHECK_EVERY=8` constants. It computes the
+  refill-rounded worst-case key requirement for each reviewer because no enforced work quota
+  prevents one eligible reviewer from draining the campaign.
+- A credentialed durable serving session now refuses a batch with retryable HTTP 503 when fewer
+  genuine checks exist than the batch requires, and releases every work lease from that unserved
+  batch immediately. Adding a genuine key makes the next request work without restart.
+- Ephemeral internal/test sessions retain best-effort behavior; synthetic keys remain forbidden.
+- `verify_10.py` carries the full-campaign capacity gate permanently.
+
+Fresh live read-only result:
+
+```
+human decisions : 623
+active focus     : yes
+cadence          : 25 work clips; ceil(batch/8) checks per refill
+Reviewer H       : 2 available / 207 required for 1293 accessible work clips
+Reviewer C       : 2 / 207 for 1293
+Reviewer A       : 0 / 207 for 1293
+other five       : 0 / 3 with zero accessible Hawleri work
+```
+
+The earlier estimate of 69 keys assumed a balanced three-reviewer split that the application does
+not enforce. It is not a production safety bound. The 207 figure is the requirement against the
+current unchanged backlog; genuine owner adjudications inside the focus both add keys and reduce
+pending work, so the gate recomputes the target on every run.
+
+Verification: spot-check Python core 7/7; runtime pause/unpause/lease regression passed; Couch
+88/89; full Rust 1,341 passed, 1 failed, 8 ignored; Python policies 88/89. The two reds are preserved
+and unrelated to `3694999`: live watchdog intentionally disabled during import, and compensation
+commit `e68c9f9` changed reject pay to zero while an existing canonical Couch test still requires a
+reject to count as reviewed audio. Do not edit the money rule/test/canon by implication; owner
+authorization remains `change canon: review compensation`.
+
+## 2026-08-23 — schema-61 release-gate convergence
+
+Hardened the Reviewer A-first/Reviewer B-second Lamo campaign without contacting reviewers, starting services,
+or loading a GPU. Production review ownership remains fail-closed: generic machine writers cannot
+author or overwrite human decisions, and historical test data now enters only through explicit
+test-only legacy fixtures. Fixed a real stale machine-upsert defect that could erase an existing
+`speaker_change_score` when an unrelated update carried no new measurement.
+
+Fresh automated evidence from the working release candidate: the complete Rust library suite passed
+1,508 tests with 0 failures (8 explicitly isolated hardware/benchmark tests); all 209 database tests,
+69 command/recovery tests, and 19 jury tests passed; frontend typecheck reported 0 errors and warnings;
+292 Vitest tests passed; ESLint, Prettier, and the Vite production build passed. All 101 Python policy
+scripts passed. The wider all-target run then exposed two directory-import failures: schema-v60
+imports still entered the retired machine-jury path and failed on its first forbidden verdict write.
+The shared jury core now makes every current-schema caller a no-write human-review handoff, so file,
+directory, audiobook, and direct-command paths cannot drift; the 10-test import E2E suite and a new
+schema-boundary regression pass. The remaining integration/property/soak targets also pass after
+their historical fixtures were made explicit instead of weakening schema-v60 production guards.
+`cargo fmt --check`, all-target clippy with warnings denied, and `git diff --check` are green. Source baseline:
+`4b9965486836cd33f3b9eb1e97a439065472c19e`.
+
+## 2026-08-24 — schema-63 private-production hardening in isolated worktree
+
+Implemented and verified the flexible-pool resolution authority in the isolated
+`codex/review-production-v63` worktree without touching the live database or GPUs. Any two distinct
+eligible reviewers with an exact matching keep/reject outcome resolve a clip; disagreement admits one
+blinded third judgment; any matching pair among three resolves; three distinct outcomes require an
+append-only owner adjudication; skip is non-judgmental; undo invalidates dependent authority and
+requeues. Resolved clips leave the queue and no fourth review is served.
+
+Added fail-closed exact owner-rights stamping, immutable per-voice certificates, deterministic staged
+ASR/TTS export, read-only certification, five-minute watchdog certification, and an isolated daily
+restore drill. On the live-sized clone, queue p95 measured 542.413 ms for Reviewer A and 537.993 ms for
+Reviewer B against the 750 ms gate; two-reviewer decision commit p95 measured 4.889 ms against the 500 ms
+gate. A real offsite snapshot restored and verified in 3.355 seconds against the five-minute RTO.
+
+Release-boundary hardening now stages an immutable, hash-bound app/admin/operations bundle outside
+the live tree, migrates and certifies a live-sized clone first, gates exposure behind a maintenance
+marker, and journals every handover phase. The watchdog refuses malformed or tampered active-release
+pointers. Recovery restores the pinned v62 snapshot only when no v63 judgment exists; after the first
+v63 judgment it preserves that database and permits only a verified schema-63-compatible binary
+rollback. A staged rehearsal passed at schema 63 with all 20,323 audio clips present and exact rights
+coverage. Canonical read-only probes found 20,321 available clips for Reviewer A and 17,374 for Reviewer B,
+materialized a valid 223,916-byte RIFF/WAVE clip, and verified live submission idempotency authority.
+
+Final isolated verification: Rust library 1,527 passed / 0 failed / 8 intentionally ignored
+hardware/isolated-benchmark tests; binary tests passed; strict Clippy and Rust formatting passed;
+Tauri integration passed; the synthetic soak passed; frontend 292 passed with lint, formatting,
+typecheck (0 errors/warnings), and production build green; all 103 Python policy scripts passed,
+including the 13-branch watchdog drill, 24 recovery-snapshot tests, 19 restore tests, and 8 immutable
+release-controller tests. `git diff --check` is green. No live production mutation or GPU use occurred
+at this checkpoint; commit-bound release build and controlled handover remain next.
+
+The first controlled handover attempt then failed closed before snapshot or migration. Windows
+PowerShell 5 represented the controller's one-element JSON executable list as a nested `Object[]`, so
+the exact-path stop filter matched nothing and the still-running v62 app retained `cortex.lock`.
+Recovery also could not overwrite the administrator-owned legacy `CortexWatchdog` task. The live app,
+schema 62, 877 review events, zero pool decisions, port, and both links remained unchanged; the legacy
+watchdog was re-enabled and the aborted journal/recovery task were cleared only after those facts were
+re-proved. The replacement uses a flat exact-path transport with a real renamed-`ping.exe` termination
+regression, waits after force-stop, and registers a separate user-owned
+`CortexPrivateProductionWatchdog` bound to the immutable release while leaving the protected legacy
+task available only for pre-migration fallback. Its logon trigger is explicitly scoped to the current
+interactive Windows principal; the prior unscoped “any user” trigger required administrator rights.
+
+The second handover reached schema 63 and candidate launch, then the watchdog correctly refused to
+bless the active pointer because its hash verifier depended on module-autoloaded `Get-FileHash`, which
+was unavailable in that real subprocess. Automatic recovery restored the pinned schema-62 snapshot,
+preserved the failed v63 database in `recovery-quarantine`, relaunched the fallback, and re-proved both
+links with 877 events and zero pool decisions unchanged. The watchdog now computes SHA-256 directly
+through `System.Security.Cryptography.SHA256`; a full valid immutable pointer passed in a throwaway
+profile, while the malformed-pointer refusal regression remains green.
+
+## 2026-08-24 — final non-human private-production boundary audit
+
+Starting from tested release `0a22485` and source-hardening commit `040e544`, audited every remaining
+non-human Milestone 1–3 boundary while the known-good reviewer release stayed live and GPUs remained
+untouched. Future production imports now require an existing explicit `CORTEX_APP_DATA_DIR` that is
+canonical-path separate from the live profile; missing, aliased, nested, ancestor, and live paths fail
+closed. `pool_admin` now classifies every command before database access: writers require the shared
+instance lock, ordinary observations use an OS/SQLite `READ_ONLY` stable transaction, and five-minute
+certification uses a WAL-consistent disposable in-memory snapshot because the bundled SQLite FTS5
+integrity validator performs an internal write and otherwise reports false corruption. Certification
+schema 2 separately reports human consensus, owner adjudication, and unresolved conflict totals.
+
+The rotating snapshot loop no longer sleeps ten minutes after a completed capture, which accumulated
+backup-duration drift beyond the ten-minute RPO. It advances from fixed monotonic deadlines on a
+nine-minute cadence, leaving a one-minute capture/jitter margin while retaining ten snapshots locally
+and off-drive.
+
+The first staged candidate was refused before deployment when its clone certification reported the
+FTS5/query-only incompatibility. The live database and reviewer server were not touched. Reproduction
+on a persistent live-sized clone proved source audio 20,323/20,323, exact rights 20,323/20,323, and
+healthy SQLite only when certification used the writable detached copy; focused regressions now pin
+that exact access split. Full post-correction evidence: Rust library 1,534 passed / 0 failed / 8
+hardware-or-model-isolated ignored; pool-admin binary 6/6; frontend 292/292; Playwright 97/97; typecheck
+0 errors and 0 warnings; ESLint, production Vite build, Rust formatting, all-target/all-feature Clippy
+with warnings denied, and `git diff --check` green. The complete 103-file Python run passed every
+technical policy and deliberately red-marked only this ledger as four commits stale; this entry closes
+that administrative gate before the final exact rerun and controlled handover.
+
+## 2026-08-24 — final release and completion-audit correction
+
+Commit `8ef5d3c1b29e41ea926bcf8ab22e3b8b2e68334d` was built as immutable release
+`8ef5d3c1b29e-8a999c88e220-2ad63448136e`, passed the live-sized schema-63 clone, and completed a
+protected same-schema handover. Independent live proof after exposure: exactly one active release
+process; database integrity healthy with zero foreign-key violations; 20,323/20,323 audio clips and
+20,323/20,323 exact rights; preserved Reviewer A and Reviewer B local/Funnel credentials; valid WAV and
+idempotency probes; queue p95 153.54 ms and 150.97 ms; fresh local and `F:` snapshots; and watchdog
+result zero on its five-minute clock. No GPU or ASR inference ran.
+
+The final requirement audit then reproduced a real proof defect: the export crash tests shared one
+process-global `AtomicBool`, so parallel Rust scheduling could make a normal export consume another
+test's fault or make the crash test miss it. The first unforced run failed 3/19 for exactly that
+cross-test contamination. Commit `18423dee480ac5bcff577d02c5d22b02415afc68` scopes the one-shot
+fault to the calling test thread and removes a second process-global environment mutation from the
+7B semaphore test. The original 19-test selection then passed 20/20; the six export tests passed five
+consecutive 16-thread repetitions; the full Rust library passed 1,535/1,535 with eight intentional
+hardware/model ignores; pool-admin 6/6 and batch-importer 3/3 passed; strict all-target/all-feature
+Clippy, formatting, and diff integrity passed. This audit-only correction preserves production
+semantics, so the known-good reviewer release was deliberately not interrupted or replaced.
+
+The final operational audit then found one mode drift in the proof harness, not in the reviewer
+runtime: the standalone live-link checker supported generic flexible-pool authentication, but the
+master verification command still demanded the retired legacy pilot-policy file. Commit
+`cfa403162582b799c50bcb070c70d4a47f2f8d12` adds one fail-closed
+`--require-private-production` contract shared by the live-link checker, release controller, and
+master verifier. It requires the exact schema-63 pool registry, complete immutable membership,
+distinct durable reviewer identities, exact database binding, fixed port, and no simultaneous legacy
+pilot policy; pre-pool databases still fall back to the exact legacy contract. Twenty focused policy
+tests and nine release-controller tests passed. Fresh read-only checks authenticated Reviewer B and Reviewer A
+through both local HTTPS and the public Funnel without minting sessions, taking leases, or changing
+review data. This proof-only correction also requires no live release interruption.
+
+A deeper master-verifier run then reproduced two more legacy-only false blockers. The final review
+certificate demanded the retired 8,278-ID controlled-pilot focus, and compensation readiness demanded
+the absent pilot policy. The playback canary read only legacy `review_events`, so no future schema-63
+pool judgment could ever satisfy its 20-decision evidence bar. Commit
+`bd9235fb572d2e849f0ad7a7d869764b7a5f254f` selects all three authorities by the active review mode.
+Flexible production now hash-verifies the immutable active release and its own `pool_admin`, requires
+a fresh full-integrity report with internally consistent pool/champion/voice/resolution/audio/rights/
+disk/snapshot authority, proves legacy pay remains immutable but operationally deferred with zero
+post-pool event/ledger leakage, and audits effective pool decisions against their exact served
+revision, decoded-PCM hash, source span, duration, guard version, and playback receipt. Pre-pool mode
+retains every strict legacy canary and compensation requirement.
+
+Focused proof: review-mode certification 24/24, compensation 34/34, playback 35/35, and all 103
+Python policy files passed, including the full watchdog drill. The real flexible-mode certificate is
+green (`reviewReady=true`, `finalDatasetReady=false`); deferred compensation is green with zero
+post-pool legacy events, ledger entries, operation collisions, or foreign-key violations. The
+listening evidence gate is now truthfully reachable but remains externally incomplete at 0/20
+post-release decisions across two reviewer browsers. Reviewers satisfy that through ordinary game
+play; engineering does not fabricate or backdate it. No live database, reviewer server, or GPU was
+changed, so the healthy immutable release was deliberately not restarted.
+
+## 2026-08-24 — schema-65 excluded-duplicate legal-lineage hardening
+
+An isolated schema-64 audit reproduced a fail-closed rights defect before deployment: the duplicate
+exclusion trigger guarded `review_revision`, while the schema-53 metadata trigger increments that
+revision after every segment update. A legitimate rights revocation or provenance correction on an
+excluded duplicate was therefore misclassified as human-review evidence and aborted. Schema 65 now
+guards only the actual review-authority columns; excluded rows still cannot become canonical review
+work, while rights revocation and metadata lineage remain writable and revision-bound. Regression
+tests prove both sides and prove an interrupted v65 migration is atomic and recoverable.
+
+Commit `93bbfd310919bdd7cedae34fde7fc892fb61e069` also advances snapshot, restore, certification,
+watchdog, and immutable-release boundaries to schema 65. Recovery now proves the pre-exposure
+schema-64 snapshot can be restored and its managed last-known-good release reactivated, while any
+post-exposure schema-65 judgment blocks destructive database rollback. Full isolated evidence before
+the release build: Rust library 1,541 passed / 0 failed / 8 intentional hardware or benchmark ignores;
+all binary tests, strict Clippy and formatting, snapshot 26/26, restore 21/21, release recovery 11/11,
+integrity 12/12, compensation 34/34, final-certification 24/24, and watchdog 13/13 passed. The live
+schema-64 reviewer service and GPUs remained untouched; exact-commit build, clone preflight, and
+protected handover remain pending.
+
+The protected v64→v65 handover and a subsequent same-schema proof-tool release both passed live-sized
+clone preflight before exposure. Active release
+`3aca5885867b-3e1014f35b6f-af72e4ccbf6a-363def17e69f` is built from exact commit
+`3aca5885867bc77a87fe669cbee48556a84a04a5`; app/admin/operations SHA-256 values are
+`3e1014f35b6f542312e25ebc3e095be8c754fa00d7edc78c9e1a3ef777f41605`,
+`b3cc0dfd35163f1512d399da6f8cbc119e92c88d5fa4ef20192a53bde3361a7b`, and
+`af72e4ccbf6a7ae9eb5b988197073096d4ec6d439c32fa019b158604837c6378`. Independent live proof found
+one exact listener, schema 65 quick/full integrity `ok`, zero foreign keys, 16,990/16,990 canonical
+audio, exact rights, zero dedup risk, and `reviewReady=true`. The mode-aware queue proof reports Reviewer B
+14,041 and Reviewer A 16,988 eligible clips after dialect policy; both local and Funnel links authenticate
+read-only. Fresh verified local and `F:` schema-65 snapshots satisfy the ten-minute RPO, and snapshot
+`F:/cortex-backups/snapshots/snapshot_1787574862` restored alone in 3.925 seconds. The watchdog is
+enabled with last result zero. Human resolution remains incomplete; no GPU or ASR inference ran.
+
+## 2026-08-24 — schema-65 master-verifier reality check
+
+An unabridged master sweep against the live private-production boundary exposed proof drift that
+smaller focused suites had not shown. The legacy duplicate gate included all 3,333 already excluded
+audit rows and falsely called the certified dedup manifest a new import; the schema-contract gate was
+hardcoded to schema 60; runtime gates searched only the mutable developer target although production
+intentionally runs a hash-pinned immutable release; and two Rust integration fixtures still assumed
+pre-schema-65 migration/model state. The training snapshot and challenger gates were also confirmed
+to be genuinely incomplete—not verifier defects—because the existing sealed fine-tune pack has no
+trained challenger binding or measured verdict.
+
+Commit `0983d54eef9acde19c2fe6265017dd83e28ccec5` fixes the proof boundary without changing reviewer
+runtime semantics. Duplicate auditing first validates source/canonical/exclusion/risk counts and then
+scans only the canonical overlay; missing or inconsistent authority remains red. Schema verification
+replays migrations 57 and 60-65 in order and binds 162 exact objects, including the v65 replacement
+trigger. Runtime discovery validates pointer containment, executable SHA-256, and baked git SHA before
+exporting the active immutable executable to probes. The quality fixture now rolls schema 65 back six
+steps to its intended schema-59 legacy boundary, and model-status testing no longer assumes optional
+300M/1B artifacts must be absent.
+
+Measured proof: the live schema contract is green at schema 65; the canonical 16,990-clip duplicate
+scan reports zero cross-file duplicate content; all 105 Python policy scripts pass; Clippy, formatting,
+syntax, and diff integrity pass; the counted Rust aggregate ran 1,649 tests across 43 binaries with a
+1,541/0/8 library result; and the exact active binary passed a positive-control egress probe with
+2,389 offline workload loops and zero non-loopback backend TCP endpoints. Final live readback kept
+`reviewReady=true`, both Reviewer B/Reviewer A links authenticating, supervision green, complete audio/rights,
+zero integrity/dedup risk, and fresh local/offsite snapshots. Human progress remains two Reviewer A
+judgments, zero resolutions, and 0/20 playback canary decisions. The active release was deliberately
+not restarted, and no live database write, GPU, model server, ASR inference, or synthetic judgment was
+used.
+
+## 2026-08-24 — bounded master fuzz proof completed
+
+Commit `bc1b5f7b5c186f83f7a15b2b7eaa74627ec8dd52` closes the last interrupted engineering
+proof from the schema-65 master sweep. The Windows gate now uses `wsl --exec`, a per-checkout ext4
+Cargo cache, one all-target ASAN build, and direct execution of the exact built harnesses. Runtime
+corpus/artifacts remain derived Linux-cache state; committed corpus seeds are copied read-only. The
+gate rejects an empty target list, build failure, timeout, unsafe target name, nonzero exit, missing
+`DONE`, and even an exit-zero `#0 DONE` result.
+
+Measured final run: cache 149,597 iterations; diff 106,129; normalizer 41,326; validation 5,398,283;
+total 5,695,335 with zero crashes. All 106 Python policy scripts, including five fail-closed fuzz
+policy assertions, passed on the final code. Live read-only certification remained `reviewReady=true`
+at schema 65 with all 162 contract objects exact, quick/full integrity `ok`, zero foreign keys,
+16,990/16,990 canonical audio, exact rights 20,323/20,323, zero dedup risk, fresh verified local and
+`F:` snapshots, Reviewer B/Reviewer A authenticating, and supervision green with 424.8 GB free. Human progress stayed
+two Reviewer A judgments, zero resolutions, and 0/20 post-release playback decisions. No reviewer restart,
+live database write, GPU, model server, ASR inference, or synthetic judgment occurred.
+
+## 2026-08-25 — deep adversarial audit, and the remediation of 53 of its 55 findings
+
+A 43-agent adversarial audit ran over the whole Rust/Python/Svelte surface at `1282578`
+(13 subsystem hunters, one skeptic per finding instructed to REFUTE by reading the code, then a
+completeness critic over the subsystems nobody owned; 855 tool uses). **51 defects survived
+verification — 6 high, 15 medium, 30 low — and 3 claims were refuted and recorded as refuted.**
+The report is `audit-2026-08-25/DEEP_BRUTAL_AUDIT.md`; what was done about it is
+`audit-2026-08-25/REMEDIATION.md`. Auditor's grade, explicitly a judgment and not harness output:
+**8.4/10**.
+
+Three gates were RED on the machine at the time, from real runs, not review opinion: the
+**CortexWatchdog scheduled task was registered but DISABLED** (healthy until 08-24 05:12, then
+disabled and never re-enabled — with the app restarting 4-9x/day this is the dead-phone-link
+incident re-armed); `PROGRESS_LEDGER.md` was **7 commits stale**; and `spot-check-pool` reported
+**0 of 1,107 required answer keys for each of 4 reviewers**. The watchdog is re-enabled and its gate
+now prints `WATCHDOG GATE: OK (CortexWatchdog state=Ready)`. This entry closes the second.
+
+The third is NOT fixed, deliberately: the gate's own contract says fixing it is an owner action,
+and fabricating answer keys is forbidden. The live database says 53 candidate keys exist
+(`verified = 1`, `reviewed_by IS NULL`) and **0 of them are inside the active focus** — the only
+honest remedies are owner adjudication at the desktop inside the focus, or narrowing the campaign.
+
+Fourteen fix commits landed (`86719e3`..`d759515`, plus `e69198c`), each carrying a regression gate.
+The six high findings: the champion's hard-stop event was emitted by the backend and silently
+dropped by the only frontend listener, so a halt wedged the UI at "transcribing" and never named its
+cause; `batch_importer` — the owner's primary import lane — built an empty `AudioFingerprint` and
+never rehydrated it, leaving the headless path with zero cross-run duplicate protection while
+printing a false "Resuming" line; `check_dataset_duplicates.py` divided sample counts by a hard-coded
+16 kHz and promised a resample step that did not exist anywhere in the file, so a 48k/16k pair of the
+same audio cleared as a legitimate repeat; pool and blinded-second-pass decisions passed the full
+playback-evidence gate and appended nothing to the ledger; and `run_gold_eval_with_transcriber`
+tallied per-clip failures into a `tracing::warn!` and published a headline CER over the survivors.
+
+**Correction on live evidence:** `review_pool_decisions` and `independent_review_decisions` are both
+**0 rows**. The unpaid-work defect is real and the wiring genuinely absent, but no reviewer has been
+shorted — the exposure is prospective. The readiness gate now counts and loudly reports uncredited
+playback-evidenced decisions per reviewer with duration, and **mints nothing**: whether a
+non-canonical second pass is payable under `review-iqd-v1-2026-08-21` is an owner decision requiring
+`change canon:`, not an agent's.
+
+Three defects were found while fixing, none of them in the audit. `review_pool.rs` carried two
+clippy errors and had **never been linted** — it is absent at `21c639d`, the last fully-swept commit,
+and arrived in `e2b256c`, one of the seven unledgered commits (verified with `git cat-file`), so the
+unledgered-commit problem was never mere bookkeeping. `test_rust_runtime_panic_policy.py` listed
+`remove_lock_file(&lock_path, "failed Unix instance lock acquisition")` as **required** — the very
+call by which a refused second instance deletes the live holder's lockfile; it is now forbidden. And
+two agent fixes overreached and were caught by existing tests: excluding placeholders (not just
+rejects) from the quality counters would have hidden clips the champion has not drafted, and a
+reviewed-baseline guard on the generic upserts made a conflicting upsert a silent no-op against the
+pinned v60 contract. Both narrowed/removed; `merge_dataset_json`'s own pre-existing guard was briefly
+removed with them and restored verbatim.
+
+One methodology error of mine, recorded because the honesty law applies to the auditor too: five
+`pipeline` tests were first reported as pre-existing failures. They were not. Running with
+`CARGO_TARGET_DIR=scratch-target` (to dodge the running app's DLL lock) put
+`scripts/cortex_7b_client.py` out of reach of `resolve_wsl_7b_client`, which walks up from
+`current_exe()`; the baseline comparison used the same flag, so the artifact reproduced and looked
+like proof. Against the normal target dir all five pass. **There are no pre-existing test failures.**
+
+Phase 4 went further than expected and hit a structural wall worth recording. Both scorecards are
+real measured runs over a byte-identical frozen manifest (`ed713075…`): champion
+`omniasr-7b-legacy-c348ade8a816` at **micro CER 7.913%** and challenger
+`omniasr-7b-challenger-eb0105fdb6a5` at **7.556%**, N=348 each. The champion's provenance sidecar —
+the missing piece that made a verdict impossible — was emitted with the repo's own
+`emit_scorecard_provenance.py`, which re-hashes every component from disk and fails closed against
+the manifest's pinned hashes; the adapter hashes to `c348ade8a816…`, matching `champion.json`'s
+`deploymentSha256` pin. But `promotion_gate.py` requires `--slices` and `build_eval_slices.py`
+refuses: `none of the 348 manifest row(s) name a clip in this library`. Protected slices derive from
+library metadata (speaker, dialect, SNR); the frozen FLEURS eval lives in `gold_segments`, which
+carries only id/path/reference/holdout/hash. **The challenger loop is structurally unclosable on the
+corpus canon designates as the frozen eval set** — that, not an unrun cycle, is why `runs/` holds
+zero verdicts. Closing it needs enriched gold metadata or an owner-authorized in-library holdout eval
+set. Weakening the slice requirement was not considered.
+
+Evidence, from real runs on this machine: `cargo test --lib` **1,542 passed, 0 failed, 8 ignored**
+(429.86s), and the db suite 209/209 after the final lint cleanup; `cargo clippy --all-targets --
+-D warnings` **clean** (it had 4 errors, two of them the never-linted `review_pool.rs` pair);
+`cargo fmt --check` clean; `npm run typecheck` **0 errors across 449 files**; `npm test` **297 passed
+across 56 files**; `npm run test:python-policies` **105 of 105 policy test scripts passed** (the
+ledger-staleness gate goes green with this entry). The policy suite grew 101 -> 105 scripts, and each new file
+was checked for a working `__main__` block — without one it is counted as passed while asserting
+nothing. Live gates: watchdog OK, and `check_review_serving_provenance.py` passes on the live
+database **under the tightened invariants** (skip-bearing rows are no longer exempt), which also
+proves no violation was hiding among them.
+
+Not ship-green, and this entry does not claim otherwise. `spot-check-pool` and `challenger-loop`
+remain RED for the reasons above; `iaa-kappa-ceiling`, `cordi-dialect-fairness` and
+`refinery-lift-in-product` remain owner-gated. Only a full `verify_10.py` run at the release commit
+can print `GREEN - PERSONAL-USE SHIP-READY`.
+
+## 2026-08-27 — backend module ceiling closed and generated IPC migration resumed
+
+The schema-65 integration line completed the incremental decomposition of every mutable oversized
+Rust production facade without changing registered Tauri command names, dual-writing human truth,
+or touching the live database or release pointer. Commits `ea20b50`, `fd2fc48`, `b0170c8`,
+`e12edcc`, `c91cd12`, and `e8a8557` split evaluation publication, review-pool deduplication,
+processing, commands, Couch, and database authority into cohesive sibling modules. Historical
+migrations 1–65 remain byte-identical. The fail-closed architecture scanner now covers 151 shipped
+Rust modules with zero failures; the only exception is exact-hash-bound immutable migration
+history. The clean backend code commit `e8a85577fee7a7d7b72ee8b18f8d4c2356074484` passed the
+complete locked Rust graph once without retry: 1,849 passed, 0 failed, and 43 explicit ignores,
+including importer 14/14, soak 1/1, and Tauri integration 1/1. Commit `332e12c` bound that proof in
+the integration finding matrix and Obsidian project record.
+
+The next exact contract slice moved the complete desktop-history domain (`undo`, `redo`,
+`can_undo`, `can_redo`) from the handwritten bridge to generated Tauri Specta bindings. Undo and
+redo now expose renderer-safe `CommandErrorV1` refusals; database-busy remains explicitly
+retryable, while hostile SQL, token, and private-path text cannot cross IPC. Capability queries use
+the same typed-result envelope, and compile-time tests prevent all four commands from returning to
+the legacy inventory. The deterministic policy now measures 116 invoked commands: 17 generated and
+99 explicitly contained handwritten calls. Focused proof passed 1/1 Rust public-error tests, 34/34
+history-related Rust tests, 26/26 frontend command/adapter tests, and the complete 437/437 frontend
+suite; generated-binding drift, TypeScript/Svelte diagnostics, lint, formatting, strict all-target/all-feature Clippy, backend
+layering, main-thread, panic, and secret-hygiene gates are green.
+
+This is an integration checkpoint, not certification. Coverage remains below the declared floors;
+99 handwritten IPC calls and the oversized Review/Settings workspaces remain; the 50,000-segment,
+fault, performance, accessibility, signed-Windows, owner-session, pilot, and comparator evidence is
+absent. The only honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — generated library/metadata contracts and conflict-safe autosave
+
+Commits `6c5cb53`, `1e47eab`, `d8f0454`, and `5551fc1` continued the generated IPC migration through
+transcript utilities, renderer-safe diagnostics, bounded library reads, and versioned segment
+metadata. The last slice retires the generic renderer field writer: speaker/alignment edits now carry
+the exact server value observed and execute as an atomic per-field compare-and-set. Stale same-field
+writes fail with a scrubbed typed conflict, mixed conflicts make no partial mutation, and exact
+response-loss replay is idempotent. Failed autosave now rejects and remains in an ordered retry queue,
+so a native close cannot acknowledge an unsaved edit; retained comparison baselines are bounded to
+current or pending work instead of accumulating large alignment JSON across visited clips.
+
+Exact proof at clean `5551fc1bdebfdfc2dd9b2c521791172ff33159e3`: the locked Rust all-target
+graph passed with 1,739 library tests, zero failures and eight explicit library ignores plus green
+binary/integration/soak/shell/benchmark targets; frontend passed 456/456 across 74 files; Playwright
+passed 101/101; all 128 reachable Python policy scripts passed; strict Clippy with warnings denied,
+rustfmt, generated bindings, Svelte/TypeScript, ESLint, Prettier, source layering, secret hygiene and
+survivor/port checks were green. One development frontend run exceeded the frozen Workstation ceiling
+by one line and is not counted; the corrected file is 2,489 lines. The latency probe now honestly names
+this operation `metadata_save` and leaves durable playback-authorized decision latency unmeasured.
+
+The inventory at that commit is 116 invoked commands: 31 generated and 85 handwritten. Coverage,
+workspace decomposition, real decision latency, timeout calibration, certifying verifier runs,
+50,000-segment concurrency/recovery/performance, signed Windows/VM/manual accessibility, owner field
+sessions, comparator study and pilot evidence remain red. Production data, processes, ports,
+credentials, migrations and the active immutable release pointer were untouched. The verdict remains
+**INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — evidence-safe deletion, atomic speaker changes, and exact history inverses
+
+Commits `9de2fc2dcbef982aa49f64ebc2a285e7270232b8`, `4bd4b4d7`, and
+`fb16b2e8b969c3129eebc74eb67ce1f9aaa24d96` close three desktop mutation hazards without changing
+historical migrations or touching production state. Segment deletion now captures exact server rows,
+refuses duplicate/missing identifiers and protected review authority before mutation, and restores a
+complete server snapshot on Undo. Speaker rename, merge, and batch assignment are revision-aware,
+all-or-nothing, replay-safe operations with exact server-owned Undo and Redo. Async command workers
+retain restore admission until database mutation and crash-session persistence both finish, so a
+cancelled renderer future cannot commit a change and silently skip session recovery state.
+
+The history boundary no longer sends backend English descriptions or separately polls racy boolean
+capabilities. Its generated V1 contract returns a stable action enum plus one coherent post-mutation
+status. Renderer Undo/Redo is single-flight and locally translated in English and Sorani. Delete and
+batch-transcription history now use writer-reserved savepoints, exact endpoint compare-and-set, and
+whole-command rollback; deterministic batch Redo stores both server-observed endpoints. Injected
+late-row failures prove that a partial multi-row inverse is never published, while stale rows refuse
+without consuming the retryable history entry.
+
+Exact proof on `fb16b2e8b969c3129eebc74eb67ce1f9aaa24d96`: strict all-target Clippy passed
+with warnings denied; `cargo test --all-targets` passed 1,755 library tests with zero failures and
+eight explicit library ignores, then every binary, integration, property, reliability, shell,
+87.92-second soak, Tauri-integration and benchmark target completed successfully. Frontend proof was
+466/466 unit tests across 78 files and 101/101 Playwright tests; Svelte/TypeScript reported zero
+errors and warnings; ESLint, Prettier, rustfmt, generated IPC, secret hygiene, migration immutability,
+and all 128 reachable Python policy scripts passed. The production bundle measured 120.66 KB gzip
+initial JavaScript and 11.42 KB gzip initial CSS, below the 125 KB and 15 KB budgets. No final gate
+needed a test retry; an earlier mistyped policy-runner path executed no gate and is not represented as
+product evidence.
+
+This is the strongest integrated source checkpoint so far, not a product attestation. The verifier
+still truthfully reports ten missing evidence classes: timeout calibration, verifier fault campaigns,
+coverage/mutation thresholds, architecture contract, known-defect ledger, schema clone/restore,
+concurrency/performance/memory, owner workflow/recovery, deployment/reboot runs, and owner field
+sessions. Signed Windows artifacts, clean-VM update/rollback, manual accessibility, pilot, and paired
+comparator proof also remain absent. Production databases, releases, ports, credentials, models and
+reviewer work were not touched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED —
+NOT 10/10**.
+
+## 2026-08-27 — verifier-owned architecture and known-defect evidence
+
+Commits `6a261edd1cc724fd212cb2ac0f81c059bc4c4783` and
+`0f3e81373b9f68ddb2819eaf62101d9342c6a4cb` replace two self-authored certification placeholders
+with class-specific, fail-closed evidence. `architecture-contract-evidence` measures the Rust module
+ceiling, generated-versus-handwritten IPC inventory, Svelte composition/workspace/component ceilings,
+and direct desktop-runtime imports. `known-defect-ledger-evidence` validates a strict tracked defect
+inventory and binds every audit/tracking authority to canonical bytes from the exact Git commit. Its
+evidence cannot verify unless `clean-source-tree` also passes. The Windows LF/CRLF materialization
+false negative found by the first clean-commit run is pinned by a regression test; Git blob bytes,
+not checkout-translated bytes, are now the authority.
+
+The history persistence extraction moved 309 lines from `db/segments.rs` into the cohesive
+`db/history.rs` sibling without changing command behavior. The segment store is back to 1,822
+production lines, and the 152-module Rust architecture scan has zero failures. Focused exact proof:
+20/20 history tests, 12/12 segment-write store tests, strict all-target Clippy, frontend typecheck,
+lint and formatting, 30/30 verifier supervisor/fault-contract tests, and the repaired segment-store
+policy passed. The complete 128-script policy campaign found only the extraction-sensitive path
+assertion; after the policy was pointed at the new authority, that test and the policy reachability
+meta-gate passed independently.
+
+On clean `0f3e81373b9f68ddb2819eaf62101d9342c6a4cb`, the exact known-defect artifact passed with
+zero supported-flow P0/P1/P2 blockers and a SHA-256-bound ledger. The architecture artifact honestly
+failed: Rust passed, but 80 handwritten IPC contracts, one dynamic bridge, and ten oversized Svelte
+files remain. This is proof of a narrower known-defect inventory and an exact architecture worklist,
+not release certification. Production data, releases, ports, credentials, models, migrations and
+reviewer work were untouched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED —
+NOT 10/10**.
+
+## 2026-08-27 — generated diagnostics, local-state and analytics IPC contracts
+
+Commits `addbd24a5e2fa57ebdd09b839890a72595e5ce5d`,
+`a140b2343a32d7cb361d71d1ddc10a67132ba3e8`, and
+`3347c71702719e52a1d3d875ac85404b8060f54f` move twelve renderer-reachable commands from the
+handwritten compatibility inventory to checked-in Tauri Specta bindings. The first tranche covers
+fingerprint diagnostics, operation cancellation, configured providers, bounded API-key persistence,
+and session save/restore. The second covers dataset statistics, dataset quality, training-grade
+breakdown, conformal certification, and label-quality lift. Generated command failures now use
+`CommandErrorV1`; analytics failures scrub database/internal details, and certificate probabilities
+are rejected unless finite and within their exact public domains.
+
+The measured IPC inventory improved from 34 generated / 80 handwritten to 46 generated / 68
+handwritten. The scanner reports zero generated commands with a noncanonical error type. The one
+remaining dynamic bridge is confined to the legacy adapter. The architecture gate still fails
+honestly because 68 handwritten contracts, that bridge, and ten oversized Svelte files remain; the
+Rust architecture subgate is green.
+
+During the complete policy campaign, the `save_session` rate-limit source policy rejected rustfmt's
+multiline spelling even though the runtime command already contained the correct limiter. The policy
+now recognizes the call expression across formatting whitespace and strips line comments so a
+comment-only spoof cannot pass. Its positive and negative scanner regression and the policy
+reachability meta-gate pass.
+
+Post-change proof: focused analytics and API/session Rust tests passed, strict all-target Clippy and
+rustfmt passed, the frontend passed 476/476 tests across 83 files with zero Svelte/TypeScript,
+ESLint, or Prettier findings, generated-binding drift and secret-hygiene gates passed, and the
+verifier supervisor passed 30/30 fault-contract tests. A fresh complete campaign then passed all 128
+reachable Python policy scripts, including syntax compilation and the real watchdog timing drill.
+No production database, release pointer, port, credential, model, migration, reviewer decision, or
+payment state was touched. The verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT
+10/10**.
+
+## 2026-08-27 — opaque renderer media grants and deterministic redirect refusal proof
+
+Commits `90dcfbca84a1e6aa6449338ed21fb7a097a26c3f` and
+`93676500a7ec57d847d46b949c2b4f37672e511f` close a renderer privacy and capability flaw: the media
+command previously returned an absolute cache path even though its contract described an opaque
+grant. The public generated `MediaGrant` now contains only a canonical RFC 4122 version-4 grant ID
+and expiry. The renderer accepts only the private `cortex-media:` origin (or its exact Windows
+loopback-origin form), while backend registry state remains the sole path authority. The generic
+Tauri asset filesystem protocol, `convertFileSrc`, renderer path conversion, and asset CSP origins
+are removed.
+
+The private media protocol is live-grant-only, GET/HEAD-only, query-free, canonical-ID-only, and
+returns generic empty error bodies with `no-store` and `nosniff`. Reads hold an immutable cache-file
+lease, execute through bounded blocking work, allow at most eight concurrent protocol workers, and
+cap each response at 1,024,000 bytes. Single byte ranges are supported; multiple ranges and malformed
+or stale grants fail closed. All three media commands are checked-in Specta contracts returning
+`CommandErrorV1`; renderer-visible failures are bounded and scrub paths, SQL, tokens, and backend
+details. The IPC architecture inventory is now 49 generated, 65 handwritten, one closed dynamic
+legacy bridge, and zero generated commands with noncanonical errors.
+
+The same hunt found a nondeterministic security-test fixture rather than a production redirect bug:
+the local redirect server could close with an unread POST body, causing Windows to surface a TCP
+reset before the client could prove redirect refusal. It now consumes the declared request body
+before returning 307. The isolated redirect-refusal test passed 30 consecutive runs and passed again
+inside the full Rust campaign.
+
+Post-freeze proof: 1,766 nonignored Rust library tests passed with zero failures and eight explicit
+ignores; every binary, integration, property, reliability, shell, 61.19-second soak, Tauri, and user
+data target reached a green result. The first aggregate command then exited 1 because its libtest-only
+`--test-threads=1` argument was forwarded to Criterion; this invocation is retained as failed proof,
+not reclassified. A corrected exact run of the `audio`, `diff`, and `normalizer` benchmark targets
+passed. The frontend passed 489/489 tests across 85 files and 101/101 Playwright tests; Svelte/
+TypeScript, ESLint, Prettier, strict all-target/all-feature Clippy, rustfmt, generated bindings,
+security policy, and all 128 Python policy scripts passed. Verifier supervisor proof was 30/30;
+`npm audit --audit-level=high` reported zero vulnerabilities; `cargo deny check` passed; the production
+bundle measured 120.95 KB gzip initial JavaScript and 11.42 KB gzip initial CSS.
+
+This is not a 10/10 attestation. The measured architecture gate remains red with 65 handwritten IPC
+calls, one legacy dynamic bridge, and ten oversized Svelte files. Coverage/mutation thresholds,
+timeout calibration, full verifier fault campaigns as certifying manifests, live-sized schema-65
+clone/restore, 50,000-segment concurrency and performance, exact owner workflow/recovery, immutable
+deployment/reboot runs, real champion/hardware exercises, signed Windows/VM/manual accessibility,
+field sessions, comparator study, pilot, and model evidence remain absent. Production databases,
+release pointers, processes, ports, credentials, models, migrations, reviewer decisions, and payment
+state were untouched. The honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT CERTIFIED — NOT
+10/10**.
+
+## 2026-08-27 — generated model/engine IPC and renderer-safe registry mutations
+
+Commits `a3b743abf0d0070c2ad73a1967a2dd7f6fb8a97a` and
+`5f1bec63e0374207790f668396d2a1cd39c0743d` move eight model-management commands from the
+handwritten compatibility bridge to checked-in Tauri Specta contracts. Read/start coverage is
+`models_status`, `models_download_all`, `get_champion_engine_status`, `start_champion_engine`, and
+`list_model_versions`; registry-write coverage is `import_model_checkpoint`,
+`import_model_deployment`, and `bootstrap_legacy_champion`. Renderer DTOs are versioned and
+camel-cased, model paths remain backend-only, development preview returns the same result shape as
+production, and the frontend preserves structured `CommandErrorV1` values instead of flattening
+them to strings.
+
+The champion-status command no longer turns a registry database failure into a false “no champion”
+state or forwards raw engine/WSL diagnostics. Registry mutations validate inputs before worker
+admission and reduce hashing, manifest, database, pointer, path, SQL, and restore-fence failures to
+bounded public codes. The restore fence and async-worker ownership remain intact; no simultaneous
+old/new write path was introduced. Focused Rust proof passed 2/2 typed public-contract tests and
+33/33 registry tests. Frontend proof passed 492/492 tests across 86 files with zero Svelte/TypeScript,
+ESLint, or Prettier findings. Generated-binding regeneration, secret hygiene, model-provenance,
+owner-canon (12/12 pins), and UI-thread policy gates passed. The measured IPC inventory is now 114
+invoked commands: 57 generated, 57 explicitly contained handwritten, one closed dynamic bridge, and
+zero generated commands with a noncanonical error contract.
+
+Strict Clippy for the second commit did not produce a source verdict: Windows refused a Tauri build
+artifact with `os error 32` while the separately owned pool agent's concurrent Cargo process held it
+open. The failure is retained as an uncompleted proof, not rewritten as a pass. The scoped diff check
+was clean, and the Rust contract/registry test binaries compiled and passed. Pool/Couch/reviewer-link/
+compensation files were neither edited nor staged by this tranche; they remain owned by the concurrent
+pool workstream. Production databases, releases, credentials, ports, models, migrations, reviewer
+truth, and payment state were untouched.
+
+This closes eight concrete IPC/error-leak imperfections but does not satisfy the architecture class:
+57 handwritten calls, the closed legacy bridge, and ten oversized Svelte files remain. The prior
+coverage/mutation, calibrated certifying-manifest, schema-clone, 50,000-segment fault/performance,
+owner workflow/deployment/reboot/field, signed Windows/VM/manual-accessibility, comparator, pilot, and
+model-evidence gaps also remain. The honest verdict remains **INTEGRATED SOURCE IMPROVED — NOT
+CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — generated durable Job Center contract
+
+Commit `5132b6d8a2065618c99facd9cc8e63d5ff9e1747` moves `get_jobs` out of the handwritten IPC
+bridge. The native boundary now returns `JobV1` with an exact generated five-state union and
+renderer-safe `CommandErrorV1` failures; database and path detail can no longer cross into the UI.
+The development browser preview also returns the production list shape instead of rejecting the Job
+Center as an unknown mock command. No job lifecycle transition, durable row, or database schema was
+changed.
+
+Proof ran after the independently owned pool fix landed as base commit `4446cbb2`: the focused Rust
+wire/error test passed 1/1, the focused frontend adapter tests passed 2/2, the complete frontend
+suite passed 494/494 across 87 files, Svelte/TypeScript reported zero errors and warnings, and ESLint,
+Prettier, strict library/all-feature Clippy with warnings denied, rustfmt, generated-binding drift,
+secret hygiene, scoped diff, and IPC policy gates passed. The measured IPC inventory is now 58
+generated / 56 handwritten / one closed dynamic bridge / zero noncanonical generated errors.
+
+The proof used a separate Cargo target because the pool workstream held the default Windows target;
+Cargo removed all 9,729 disposable build artifacts (11.8 GiB) afterward. Pool/Couch/reviewer and
+compensation source was not edited or staged in this commit. Production data, migrations, release
+pointers, ports, credentials, models, reviewer truth, and payment state were untouched. Architecture
+and the previously declared release/evidence classes remain incomplete, so this is **NOT CERTIFIED —
+NOT 10/10**.
+
+## 2026-08-27 — integrated source freeze after pool and typed-IPC convergence
+
+Commit `f00282cac13a1e965f24e4a772453d6729a94899` repairs three proof-surface defects exposed by a
+complete campaign: champion-release policy now requires the generated `ModelVersionSummaryV1` and
+`CommandErrorV1` boundary; restore-admission policy verifies guard assignment plus propagated failure
+instead of demanding one literal `begin_mutation()?` spelling; and the opaque-media rejection fixture
+no longer hardcodes a fake private Windows user-profile URL. The first 129-script campaign remains a
+failed diagnostic with four named failures: those two stale scanners, that repository-hygiene finding,
+and generated-binding compilation colliding with the concurrently running Rust target.
+
+Fresh proof was then run without that contention. On clean
+`f00282cac13a1e965f24e4a772453d6729a94899`, one uninterrupted sequential campaign passed all 129
+reachable Python policy scripts, including generated-binding regeneration, the repaired scanners,
+pool pay-fence scope, repository hygiene, verifier supervisor 30/30, the real watchdog timing drill,
+and Python byte compilation. The current frontend passed 494/494 tests across 87 files with zero
+Svelte/TypeScript, ESLint, or Prettier findings. Playwright passed 101/101 with zero retries on clean
+`009220f1c41fd17995e974d47dc34095bf6f6bc2`.
+
+The same integrated Rust source at `009220f1c41fd17995e974d47dc34095bf6f6bc2` completed one
+uninterrupted `cargo test --all-targets`: 1,771 library tests passed, zero failed, eight library tests
+were explicitly ignored, and every binary, integration, property, reliability, 88.38-second soak,
+Tauri, user-data, and Criterion audio/diff/normalizer target passed. Another 35 target-specific tests
+were explicitly ignored because they require live models, network, or real media. Strict
+library/all-feature Clippy with warnings denied had already passed on the same production Rust source.
+The later `f00282c` commit changes only Python policies and one TypeScript test fixture, not production
+Rust or frontend code.
+
+This is a strong integrated source freeze, not certifying evidence. Final runs may not contain ignored
+or skipped checks; the policy campaign also reports that its optional jiwer numeric-equivalence check
+was skipped because jiwer is absent, and Couch Sorani policy still identifies 19 strings awaiting
+owner linguistic review. Architecture remains 58 generated / 56 handwritten IPC calls, one closed
+dynamic bridge, and ten oversized Svelte files. Coverage/mutation thresholds, calibrated certifying
+manifests, live-sized schema-65 clone/restore, 50,000-segment concurrency/performance/memory, exact
+owner workflow/deployment/reboot/field evidence, signed Windows VM/manual-accessibility evidence,
+comparator/pilot evidence, and model evidence remain incomplete. No production data, active release,
+credentials, reviewer truth, or payment state was changed. Honest verdict: **INTEGRATED SOURCE GREEN
+FOR THE NAMED GATES — NOT CERTIFIED — NOT 10/10**.
+
+## 2026-08-27 — owner-workstation-only execution plan locked
+
+Owner direction narrows the active release target to the current Windows 11 workstation and one
+desktop user. `docs/OWNER_WORKSTATION_10_10_EXECUTION_PLAN_2026-08-27.md` is now the controlling
+execution order from starting commit `865c5c01e5c7a4c1b1f53fa0c1dc11cb3ee101bb`. Public installer
+signing/updater work, servicing-release VM matrices, comparator studies, external pilots/reviewers,
+and broad ASR-superiority evidence do not block this owner verdict. Local human truth, exact champion
+identity, crash recovery, schema-65 clone compatibility, offline privacy, internal concurrency,
+coverage/mutation, performance/memory, exact-binary proof, cold reboot, and thirty owner sessions
+remain mandatory.
+
+The execution order is proof integrity first: pin the desktop Python verifier environment with
+`jiwer==4.0.0`, route all 43 explicit Rust opt-in tests without letting an owner-critical check hide
+behind an ignore, and refresh coverage at the exact clean SHA. Then close the 56 handwritten IPC
+commands, one dynamic bridge, ten oversized Svelte owners, coverage/mutation thresholds, hostile
+local campaigns, real champion workflow, and final no-retry verifier/burn-in evidence. Rust's current
+mechanical architecture gate is green; the measured renderer inventory remains 58 generated, 56
+handwritten, one dynamic, and zero noncanonical generated errors.
+
+Pool/Couch/reviewer implementation remains owned by the separate pool workstream. This plan verifies
+its shared-database and API seams but does not create overlapping implementation edits. No production
+database, release pointer, credential, process, port, reviewer truth, or payment state was changed.
+Honest status: **OWNER SCOPE AND PLAN LOCKED — IMPLEMENTATION PENDING — NOT 10/10**.

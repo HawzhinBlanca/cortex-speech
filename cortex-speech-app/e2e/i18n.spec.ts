@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { installTauriMock } from './helpers/tauri-mock';
+import { openHeaderOverflow, openSettingsFromHeader } from './helpers/header';
 
 test.describe('i18n and locale switching', () => {
   test.beforeEach(async ({ page }) => {
@@ -14,6 +15,7 @@ test.describe('i18n and locale switching', () => {
 
   test('default state shows the English toggle target (locale is ckb)', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     // The toggle shows the language you'll switch TO, in its own endonym ('English' / 'کوردی').
     const toggle = page.getByTestId('locale-toggle');
@@ -22,6 +24,7 @@ test.describe('i18n and locale switching', () => {
 
   test('toggle switches locale to English', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     const toggle = page.getByTestId('locale-toggle');
     expect(await toggle.textContent()).toBe('English');
@@ -34,16 +37,19 @@ test.describe('i18n and locale switching', () => {
 
   test('UI text updates when locale changes', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     await expect(page.getByLabel('کردنەوەی فایلی دەنگ')).toBeVisible();
 
     await page.getByTestId('locale-toggle').click();
+    await openHeaderOverflow(page);
 
     await expect(page.getByLabel('Open audio file')).toBeVisible();
   });
 
   test('locale toggle is accessible by keyboard', async ({ page }) => {
     await page.goto('/');
+    await openHeaderOverflow(page);
 
     const toggle = page.getByTestId('locale-toggle');
     await toggle.focus();
@@ -53,10 +59,12 @@ test.describe('i18n and locale switching', () => {
   test('settings panel language selects are present', async ({ page }) => {
     await page.goto('/');
 
-    await page.getByTestId('settings-btn').click();
+    await openSettingsFromHeader(page);
     const settings = page.locator('role=dialog');
 
-    const langSelect = settings.locator('select').filter({ has: page.locator('option[value="ckb"]') });
+    const langSelect = settings
+      .locator('select')
+      .filter({ has: page.locator('option[value="ckb"]') });
     await expect(langSelect).toBeVisible();
   });
 });

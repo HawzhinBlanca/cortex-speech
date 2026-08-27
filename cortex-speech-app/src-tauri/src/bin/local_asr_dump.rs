@@ -6,12 +6,11 @@
 //! those acoustic engines have earned a vote (or only a raised hand) needs their CER on the SAME
 //! frozen gold set the champion's 7.02% comes from — and nobody has ever measured them there.
 //!
-//! Uses the app's own `AsrPool` + `AsrLoadConfig`, i.e. the exact decoder production runs, so the
-//! number describes the engine the reviewers would actually be shown. Output is
+//! Uses the library's `AsrPool` + `AsrLoadConfig` to measure the offline diagnostic decoder. Output is
 //! `<wav_path>\t<reference>\t<hypothesis>`, scored by `scripts/scorecard_gemini.py` (which imports
 //! the champion's normalization and bootstrap) — one format, one metric, no second opinion.
 //!
-//! Usage: local_asr_dump <manifest.tsv> <out.tsv> <ctc300m|ctc1b|finetuned> [--limit N]
+//! Usage: local_asr_dump <manifest.tsv> <out.tsv> <ctc300m|ctc1b> [--limit N]
 //!
 //! Reads audio only; writes only the TSV. It never touches the app database, so it is safe to run
 //! while reviewers work.
@@ -33,12 +32,11 @@ fn app_data_dir() -> PathBuf {
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 3 {
-        return Err("usage: local_asr_dump <manifest.tsv> <out.tsv> <ctc300m|ctc1b|finetuned> [--limit N]".into());
+        return Err("usage: local_asr_dump <manifest.tsv> <out.tsv> <ctc300m|ctc1b> [--limit N]".into());
     }
     let (manifest, out_path) = (PathBuf::from(&args[0]), PathBuf::from(&args[1]));
-    // AsrModelSize carries no fine-tuned variant: the fine-tuned MMS is reached through its own
-    // IPC path, not the CTC pool, so this tool covers the two CTC engines only. Naming the limit
-    // beats silently scoring the wrong model under a "finetuned" label.
+    // This standalone read-only tool covers the two CTC diagnostics. The MMS verifier is a separate
+    // offline test path; naming the limit beats silently scoring the wrong model under another label.
     let model_size = match args[2].as_str() {
         "ctc300m" => AsrModelSize::CTC300M,
         "ctc1b" => AsrModelSize::CTC1B,
@@ -47,9 +45,9 @@ fn main() -> Result<(), String> {
     let limit: Option<usize> =
         args.iter().position(|a| a == "--limit").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok());
 
-    // Same resolution the app uses, so a user-downloaded model is found exactly as in production.
+    // Use the shared per-file resolver so explicitly installed diagnostic artifacts are found.
     let models = ModelManager::new(app_data_dir().join("models"));
-    // PER-FILE, matching the production fix: resolved_dir() is all-or-nothing, so a user dir holding
+    // PER-FILE: resolved_dir() is all-or-nothing, so a user dir holding
     // some engines orphans a bundled-only one. Measured 2026-08-13 — an EMPTY user-dir
     // omniasr-ctc-1b/ made all 922 clips fail "models missing" beside a 1 GB bundled copy.
     let relative = match args[2].as_str() {

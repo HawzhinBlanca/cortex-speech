@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fade, scale } from 'svelte/transition';
   import { focusTrap } from './actions/focusTrap';
+  import { t } from './i18n';
 
   type Size = 'sm' | 'md' | 'lg' | 'xl' | 'full';
 
@@ -78,18 +79,8 @@
               <p id="modal-desc" class="mt-0.5 text-xs text-muted">{description}</p>
             {/if}
           </div>
-          <button class="icon-btn -me-1" aria-label="Close dialog" onclick={onClose}>
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-            >
-              <path d="M18 6 6 18M6 6l12 12" />
-            </svg>
+          <button class="btn-ghost -me-1 text-xs" aria-label={$t('close')} onclick={onClose}>
+            {$t('close')}
           </button>
         </header>
       {/if}
