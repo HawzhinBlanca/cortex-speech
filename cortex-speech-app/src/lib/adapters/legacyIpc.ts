@@ -44,7 +44,6 @@ export const LEGACY_IPC_COMMANDS = [
   'get_escalation_rate_trend',
   'get_intelligence_report',
   'get_interrupted_import',
-  'get_jobs',
   'get_quarantine_notice',
   'get_segment_consensus',
   'get_waveform',

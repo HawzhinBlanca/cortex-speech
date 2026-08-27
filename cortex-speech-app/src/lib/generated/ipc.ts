@@ -172,6 +172,7 @@ export const commands = {
 	getDatasetCertificate: (targetError: number, confidenceLevel: number) => typedError<ConformalCertificate, CommandErrorV1>(__TAURI_INVOKE("get_dataset_certificate", { targetError, confidenceLevel })),
 	// Measured raw-ASR vs post-jury label-quality lift (M3.1) over human-verified segments.
 	getLabelQualityLift: () => typedError<LabelQualityLift, CommandErrorV1>(__TAURI_INVOKE("get_label_quality_lift")),
+	getJobs: () => typedError<JobV1[], CommandErrorV1>(__TAURI_INVOKE("get_jobs")),
 	modelsStatus: () => typedError<ModelStatusEntryV1[], CommandErrorV1>(__TAURI_INVOKE("models_status")),
 	modelsDownloadAll: () => typedError<ModelDownloadSummaryV1, CommandErrorV1>(__TAURI_INVOKE("models_download_all")),
 	/**
@@ -500,6 +501,23 @@ export type InferenceStatsV1 = {
 	vad: InferenceKindStatsV1,
 	asr: InferenceKindStatsV1,
 	model_load_ms: number,
+};
+
+/**
+ *  Recent durable jobs (newest first) for a UI activity surface — a long op bracketed via
+ *  `Database::run_tracked` shows here as running/succeeded/failed, and a crash residue reaped at
+ *  startup shows as failed/INTERRUPTED. Cheap read; safe to poll.
+ */
+export type JobStateV1 = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export type JobV1 = {
+	id: string,
+	kind: string,
+	state: JobStateV1,
+	progress: number,
+	completed: number,
+	total: number | null,
+	errorCode: string | null,
 };
 
 /**

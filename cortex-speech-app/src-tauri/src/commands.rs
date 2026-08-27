@@ -552,11 +552,111 @@ pub async fn merge_dataset_json(json_content: String, state: State<'_, AppState>
 /// Recent durable jobs (newest first) for a UI activity surface — a long op bracketed via
 /// `Database::run_tracked` shows here as running/succeeded/failed, and a crash residue reaped at
 /// startup shows as failed/INTERRUPTED. Cheap read; safe to poll.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStateV1 {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl From<crate::jobs::JobState> for JobStateV1 {
+    fn from(state: crate::jobs::JobState) -> Self {
+        match state {
+            crate::jobs::JobState::Queued => Self::Queued,
+            crate::jobs::JobState::Running => Self::Running,
+            crate::jobs::JobState::Succeeded => Self::Succeeded,
+            crate::jobs::JobState::Failed => Self::Failed,
+            crate::jobs::JobState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobV1 {
+    pub id: String,
+    pub kind: String,
+    pub state: JobStateV1,
+    pub progress: f64,
+    pub completed: i64,
+    pub total: Option<i64>,
+    pub error_code: Option<String>,
+}
+
+impl From<crate::jobs::Job> for JobV1 {
+    fn from(job: crate::jobs::Job) -> Self {
+        Self {
+            id: job.id,
+            kind: job.kind,
+            state: job.state.into(),
+            progress: job.progress,
+            completed: job.completed,
+            total: job.total,
+            error_code: job.error_code,
+        }
+    }
+}
+
+fn public_job_read_error(_private_detail: &str) -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "JOB_CENTER_UNAVAILABLE",
+        "The Job Center could not read durable operation status. Open Health for recovery options.",
+        true,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+}
+
+fn public_job_rate_limited_error() -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "JOB_CENTER_BUSY",
+        "The Job Center is refreshing too quickly. Retry in a moment.",
+        true,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+}
+
 #[tauri::command]
-pub async fn get_jobs(state: State<'_, AppState>) -> Result<Vec<crate::jobs::Job>, String> {
-    RATE_LIMITER.check("get_jobs")?;
+#[specta::specta]
+pub async fn get_jobs(state: State<'_, AppState>) -> Result<Vec<JobV1>, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("get_jobs").map_err(|_| public_job_rate_limited_error())?;
     let store = state.job_store();
-    run_blocking(move || store.list_recent(50).map_err(|error| error.to_string())).await
+    run_blocking(move || {
+        store.list_recent(50).map(|jobs| jobs.into_iter().map(JobV1::from).collect()).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| public_job_read_error(&error))
+}
+
+#[cfg(test)]
+mod typed_job_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn job_wire_state_is_exact_and_private_failures_are_scrubbed() {
+        let job = JobV1::from(crate::jobs::Job {
+            id: "job-1".to_string(),
+            kind: "import".to_string(),
+            state: crate::jobs::JobState::Failed,
+            progress: 0.5,
+            completed: 1,
+            total: Some(2),
+            error_code: Some("INTERRUPTED".to_string()),
+        });
+        let wire = serde_json::to_value(job).expect("serialize public job");
+        assert_eq!(wire["state"], "failed");
+        assert_eq!(wire["errorCode"], "INTERRUPTED");
+
+        let hostile = public_job_read_error(r"SQL token=secret D:\private\jobs.sqlite");
+        let wire = serde_json::to_string(&hostile).expect("serialize public job error");
+        assert!(wire.contains("JOB_CENTER_UNAVAILABLE"));
+        assert!(wire.contains("openHealth"));
+        for forbidden in ["SQL", "token", "secret", "D:\\", "private", "jobs.sqlite"] {
+            assert!(!wire.contains(forbidden));
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════

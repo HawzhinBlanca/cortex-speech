@@ -23,6 +23,7 @@ if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
     'get_active_learning_queue',
     'get_escalation_queue',
     'get_escalation_rate_trend',
+    'get_jobs',
     'list_agent_import_reports',
     'list_agent_stage_events',
     'list_db_snapshots',

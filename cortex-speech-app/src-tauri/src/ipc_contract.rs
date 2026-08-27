@@ -689,6 +689,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::get_training_grade_breakdown,
             crate::commands::get_dataset_certificate,
             crate::commands::get_label_quality_lift,
+            crate::commands::get_jobs,
             crate::commands::models_status,
             crate::commands::models_download_all,
             crate::commands::get_champion_engine_status,
@@ -728,6 +729,8 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<crate::quality::TrainingGradeBreakdown>()
         .typ::<crate::quality::conformal::ConformalCertificate>()
         .typ::<crate::eval::LabelQualityLift>()
+        .typ::<crate::commands::JobStateV1>()
+        .typ::<crate::commands::JobV1>()
         .typ::<crate::models::ModelArtifactSourceV1>()
         .typ::<crate::models::ModelStatusEntryV1>()
         .typ::<crate::commands::ModelDownloadSummaryV1>()

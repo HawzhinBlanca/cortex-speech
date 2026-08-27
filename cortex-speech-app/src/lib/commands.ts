@@ -18,6 +18,7 @@ import type {
   MarkedSegmentUnusableV1,
   MarkSegmentUnusableRequestV1,
   InferenceStatsV1,
+  JobV1,
   MediaGrant,
   ModelDownloadSummaryV1,
   ModelStatusEntryV1,
@@ -510,20 +511,14 @@ export async function getChampionEngineStatus(): Promise<EngineStatus> {
   return result.data;
 }
 
-/** A durable background job (P0 #3 Job Supervisor). Mirrors crate::jobs::Job (camelCase). */
-export interface Job {
-  id: string;
-  kind: string;
-  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
-  progress: number;
-  completed: number;
-  total: number | null;
-  errorCode: string | null;
-}
+/** A durable background job (P0 #3 Job Supervisor). */
+export type Job = JobV1;
 
 /** Recent durable jobs (newest first) for the activity surface. Cheap read; safe to poll. */
 export async function getJobs(): Promise<Job[]> {
-  return invokeLegacy<Job[]>('get_jobs');
+  const result = await generatedCommands.getJobs();
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Start the champion 7B server (WSL) from the app; returns immediately, then poll status. */
