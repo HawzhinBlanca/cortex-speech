@@ -1112,10 +1112,28 @@ pub fn batch_transcribe(
     Ok(serde_json::json!({ "status": "started" }))
 }
 
+fn validate_normalization_text(text: &str) -> Result<(), crate::ipc_contract::CommandErrorV1> {
+    validate::validate_text(text, 100_000, "Normalization text").map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "INVALID_NORMALIZATION_TEXT",
+            "The transcript normalization input is invalid.",
+            false,
+        )
+    })
+}
+
 #[tauri::command]
-pub fn normalize_text(text: String, state: State<'_, AppState>) -> Result<String, String> {
-    RATE_LIMITER.check("normalize_text")?;
-    validate::validate_text(&text, 100000, "Normalization text")?;
+#[specta::specta]
+pub fn normalize_text(text: String, state: State<'_, AppState>) -> Result<String, crate::ipc_contract::CommandErrorV1> {
+    RATE_LIMITER.check("normalize_text").map_err(|_| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "RATE_LIMITED",
+            "Too many normalization requests. Retry in a moment.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry)
+    })?;
+    validate_normalization_text(&text)?;
     let settings = state.lock_settings();
     let config = crate::normalizer::NormalizationConfig {
         normalize_numbers: settings.auto_normalize,
@@ -1125,4 +1143,19 @@ pub fn normalize_text(text: String, state: State<'_, AppState>) -> Result<String
     };
     let normalizer = crate::normalizer::SoraniNormalizer::with_config(config);
     Ok(normalizer.normalize(&text))
+}
+
+#[cfg(test)]
+mod typed_normalization_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn normalization_validation_error_is_typed_and_scrubbed() {
+        let hostile = format!("token=secret {}", "x".repeat(100_000));
+        let error = validate_normalization_text(&hostile).expect_err("oversized normalization input must refuse");
+        let wire = serde_json::to_string(&error).expect("serialize normalization error");
+        assert!(wire.contains("INVALID_NORMALIZATION_TEXT"));
+        assert!(!wire.contains("secret"));
+        assert!(!wire.contains("token"));
+    }
 }

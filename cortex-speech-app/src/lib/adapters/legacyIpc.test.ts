@@ -37,6 +37,10 @@ const compileTimeContractProof = (): void => {
   void invokeCritical('undo');
   // @ts-expect-error generated history queries cannot regress into the legacy inventory
   void invokeLegacy<unknown>('can_redo');
+  // @ts-expect-error transcript utilities are generated, not handwritten
+  void invokeLegacy<unknown>('compute_diff');
+  // @ts-expect-error generated normalization cannot regress into the legacy inventory
+  void invokeLegacy<unknown>('normalize_text');
   // @ts-expect-error destructive restore requires its exact source argument
   void invokeCritical('db_restore');
   // @ts-expect-error the legacy bridge accepts a closed command union, not runtime strings

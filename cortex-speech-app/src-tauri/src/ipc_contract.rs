@@ -393,7 +393,9 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             crate::commands::undo,
             crate::commands::redo,
             crate::commands::can_undo,
-            crate::commands::can_redo
+            crate::commands::can_redo,
+            crate::commands::normalize_text,
+            crate::commands::compute_diff
         ])
         .typed_error_impl(
             r#"async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

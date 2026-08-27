@@ -1,4 +1,5 @@
 import type { DiffChange, DiffResult } from './types';
+import type { CommandErrorV1 } from '../generated/ipc';
 
 const MAX_WORDS = 10_000;
 const MAX_LCS_CELLS = 12_500_000;
@@ -40,18 +41,17 @@ function extractLcs(a: string[], b: string[], dp: number[][]): string[] {
   return result;
 }
 
-function emptyGuardResult(raw: string, annotated: string): DiffResult {
+function localDiffRefusal(code: 'DIFF_TOO_LARGE' | 'DIFF_TOO_COMPLEX'): CommandErrorV1 {
   return {
-    raw,
-    annotated,
-    changes: [],
-    stats: {
-      added_words: 0,
-      removed_words: 0,
-      changed_words: 0,
-      unchanged_words: 0,
-      similarity: 100,
-    },
+    schema: 1,
+    code,
+    message:
+      code === 'DIFF_TOO_LARGE'
+        ? 'The transcript comparison is too large to process safely.'
+        : 'The transcript comparison would require too much memory.',
+    retryable: false,
+    suggestedAction: null,
+    operationId: null,
   };
 }
 
@@ -93,12 +93,12 @@ export function computeLocalDiff(raw: string, annotated: string): DiffResult {
   const annotatedWords = annotated.split(/\s+/).filter(Boolean);
 
   if (rawWords.length > MAX_WORDS || annotatedWords.length > MAX_WORDS) {
-    return emptyGuardResult(raw, annotated);
+    throw localDiffRefusal('DIFF_TOO_LARGE');
   }
 
   const dp = buildLcsTable(rawWords, annotatedWords);
   if (!dp) {
-    return emptyGuardResult(raw, annotated);
+    throw localDiffRefusal('DIFF_TOO_COMPLEX');
   }
 
   const lcs = extractLcs(rawWords, annotatedWords, dp);

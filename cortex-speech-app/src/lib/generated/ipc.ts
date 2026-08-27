@@ -86,6 +86,8 @@ export const commands = {
 	redo: () => typedError<string | null, CommandErrorV1>(__TAURI_INVOKE("redo")),
 	canUndo: () => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("can_undo")),
 	canRedo: () => typedError<boolean, CommandErrorV1>(__TAURI_INVOKE("can_redo")),
+	normalizeText: (text: string) => typedError<string, CommandErrorV1>(__TAURI_INVOKE("normalize_text", { text })),
+	computeDiff: (raw: string, annotated: string) => typedError<TextDiff, CommandErrorV1>(__TAURI_INVOKE("compute_diff", { raw, annotated })),
 };
 
 /* Types */
@@ -146,6 +148,21 @@ export type DesktopPlaybackSessionV1 = {
 	segmentRevision: number,
 	clipDurationMs: number,
 	expiresAtMs: number,
+};
+
+export type DiffChange = {
+	op: DiffOp,
+	value: string,
+};
+
+export type DiffOp = "Equal" | "Insert" | "Delete" | "Replace";
+
+export type DiffStats = {
+	added_words: number,
+	removed_words: number,
+	changed_words: number,
+	unchanged_words: number,
+	similarity: number,
 };
 
 export type MarkSegmentUnusableRequestV1 = {
@@ -381,6 +398,13 @@ export type SuggestedActionV1 = "retry" | "openHealth" | "openModels" | "reloadC
  *  camelCase reason codes so audit/export policy does not depend on localized prose.
  */
 export type TechnicalUnusableReasonV1 = "decodeFailed" | "missingFile" | "permissionDenied" | "corruptContainer";
+
+export type TextDiff = {
+	raw: string,
+	annotated: string,
+	changes: DiffChange[],
+	stats: DiffStats,
+};
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

@@ -17,6 +17,7 @@ import type {
   SettingsPatchResultV1,
   SettingsPatchV1,
   SettingsSnapshotV1,
+  TextDiff,
 } from './generated/ipc';
 export type {
   ActiveVoiceFocusV1,
@@ -129,7 +130,9 @@ export async function batchTranscribe(ids: string[]): Promise<{ status: string }
 }
 
 export async function normalizeText(text: string): Promise<string> {
-  return invokeLegacy<string>('normalize_text', { text });
+  const result = await generatedCommands.normalizeText(text);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 export async function alignSegment(
@@ -1356,33 +1359,10 @@ export async function canRedo(): Promise<boolean> {
   return result.data;
 }
 
-export async function computeDiff(
-  raw: string,
-  annotated: string,
-): Promise<{
-  raw: string;
-  annotated: string;
-  changes: Array<{ op: string; value: string }>;
-  stats: {
-    added_words: number;
-    removed_words: number;
-    changed_words: number;
-    unchanged_words: number;
-    similarity: number;
-  };
-}> {
-  return invokeLegacy<{
-    raw: string;
-    annotated: string;
-    changes: Array<{ op: string; value: string }>;
-    stats: {
-      added_words: number;
-      removed_words: number;
-      changed_words: number;
-      unchanged_words: number;
-      similarity: number;
-    };
-  }>('compute_diff', { raw, annotated });
+export async function computeDiff(raw: string, annotated: string): Promise<TextDiff> {
+  const result = await generatedCommands.computeDiff(raw, annotated);
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Back up the live library to `dest` on a DEDICATED connection (the UI stays responsive), then

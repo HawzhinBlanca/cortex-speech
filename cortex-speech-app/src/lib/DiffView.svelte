@@ -33,9 +33,12 @@
     loading = true;
     error = null;
 
+    // Desktop refusals are authoritative. Falling back after `DIFF_TOO_LARGE`/`DIFF_TOO_COMPLEX`
+    // would repeat the same memory-heavy work in the renderer and previously turned a refusal into
+    // a fabricated 100% similarity result. Browser preview uses the bounded local implementation.
     const compute = isTauriRuntime()
-      ? api.computeDiff(source, target).catch(() => computeLocalDiff(source, target))
-      : Promise.resolve(computeLocalDiff(source, target));
+      ? api.computeDiff(source, target)
+      : Promise.resolve().then(() => computeLocalDiff(source, target));
 
     compute
       .then((result) => {

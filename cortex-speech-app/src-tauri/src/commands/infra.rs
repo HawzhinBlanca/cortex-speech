@@ -10,10 +10,51 @@
 
 use super::{run_blocking, RATE_LIMITER, STRICT_RATE_LIMITER};
 use crate::diff::TextDiff;
+use crate::ipc_contract::{CommandErrorV1, SuggestedActionV1};
 use crate::validation::input as validate;
 use crate::AppState;
 use std::sync::Arc;
 use tauri::State;
+
+const MAX_PUBLIC_DIFF_WORDS: usize = 10_000;
+const MAX_PUBLIC_DIFF_LCS_CELLS: usize = 12_500_000;
+
+fn diff_rate_limited_error() -> CommandErrorV1 {
+    CommandErrorV1::new("RATE_LIMITED", "Too many transcript comparisons. Retry in a moment.", true)
+        .suggested(SuggestedActionV1::Retry)
+}
+
+fn validate_public_diff_input(raw: &str, annotated: &str) -> Result<(), CommandErrorV1> {
+    validate::validate_text(raw, 100_000, "Raw text")
+        .and_then(|_| validate::validate_text(annotated, 100_000, "Annotated text"))
+        .map_err(|_| CommandErrorV1::new("INVALID_DIFF_INPUT", "The transcript comparison input is invalid.", false))?;
+
+    let raw_words = raw.split_whitespace().count();
+    let annotated_words = annotated.split_whitespace().count();
+    if raw_words > MAX_PUBLIC_DIFF_WORDS || annotated_words > MAX_PUBLIC_DIFF_WORDS {
+        return Err(CommandErrorV1::new(
+            "DIFF_TOO_LARGE",
+            "The transcript comparison is too large to process safely.",
+            false,
+        )
+        .detail("rawWords", raw_words as i64)
+        .detail("annotatedWords", annotated_words as i64)
+        .detail("maxWords", MAX_PUBLIC_DIFF_WORDS as i64));
+    }
+
+    let requested_cells = raw_words.saturating_mul(annotated_words);
+    if requested_cells > MAX_PUBLIC_DIFF_LCS_CELLS {
+        return Err(CommandErrorV1::new(
+            "DIFF_TOO_COMPLEX",
+            "The transcript comparison would require too much memory.",
+            false,
+        )
+        .detail("rawWords", raw_words as i64)
+        .detail("annotatedWords", annotated_words as i64)
+        .detail("maxCells", MAX_PUBLIC_DIFF_LCS_CELLS as i64));
+    }
+    Ok(())
+}
 
 /// Return a one-line summary of the most recent crash report (if the last session panicked), surfaced
 /// exactly once. The frontend shows it as a notification on startup so a mid-review crash — after which
@@ -86,15 +127,50 @@ pub fn get_fingerprint_count(state: State<'_, AppState>) -> Result<usize, String
 }
 
 #[tauri::command]
-pub fn compute_diff(raw: String, annotated: String) -> Result<TextDiff, String> {
-    RATE_LIMITER.check("compute_diff")?;
-    validate::validate_text(&raw, 100000, "Raw text")?;
-    validate::validate_text(&annotated, 100000, "Annotated text")?;
+#[specta::specta]
+pub fn compute_diff(raw: String, annotated: String) -> Result<TextDiff, CommandErrorV1> {
+    RATE_LIMITER.check("compute_diff").map_err(|_| diff_rate_limited_error())?;
+    validate_public_diff_input(&raw, &annotated)?;
     let meta = crate::telemetry::Tracer::metadata(vec![
         ("raw_len", raw.len().to_string()),
         ("ann_len", annotated.len().to_string()),
     ]);
     Ok(crate::telemetry::TRACER.record("diff.compute", meta, || crate::diff::compute_diff(&raw, &annotated)))
+}
+
+#[cfg(test)]
+mod typed_diff_ipc_tests {
+    use super::*;
+
+    #[test]
+    fn public_diff_refuses_misleading_or_memory_unsafe_work() {
+        let oversized = "w ".repeat(MAX_PUBLIC_DIFF_WORDS + 1);
+        let error = validate_public_diff_input(&oversized, "small").expect_err("oversized diff must refuse");
+        assert_eq!(error.code, "DIFF_TOO_LARGE");
+        assert_eq!(error.details.get("maxWords"), Some(&crate::ipc_contract::CommandErrorDetailV1::Number(10_000.0)));
+
+        let expensive = "w ".repeat(4_000);
+        let error = validate_public_diff_input(&expensive, &expensive).expect_err("memory-heavy diff must refuse");
+        assert_eq!(error.code, "DIFF_TOO_COMPLEX");
+        assert_eq!(
+            error.details.get("maxCells"),
+            Some(&crate::ipc_contract::CommandErrorDetailV1::Number(12_500_000.0))
+        );
+
+        let acceptable = "w ".repeat(3_500);
+        validate_public_diff_input(&acceptable, &acceptable)
+            .expect("comparison below the cell ceiling must pass admission");
+    }
+
+    #[test]
+    fn public_diff_validation_error_is_typed_and_contains_no_input() {
+        let hostile = format!("token=secret {}", "x".repeat(100_000));
+        let error = validate_public_diff_input(&hostile, "ok").expect_err("invalid input must refuse");
+        let wire = serde_json::to_string(&error).expect("serialize public diff error");
+        assert!(wire.contains("INVALID_DIFF_INPUT"));
+        assert!(!wire.contains("secret"));
+        assert!(!wire.contains("token"));
+    }
 }
 
 #[tauri::command]

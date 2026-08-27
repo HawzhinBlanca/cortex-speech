@@ -8,6 +8,7 @@ import {
   canUndo,
   cancelDesktopPlaybackSessionV1,
   commitReviewV1,
+  computeDiff,
   deleteReviewDraftV1,
   getSettings,
   getActiveVoiceFocusV1,
@@ -18,6 +19,7 @@ import {
   listAgentImportReports,
   listAgentStageEvents,
   markSegmentUnusableV1,
+  normalizeText,
   recordHumanDecision,
   recordReviewFlag,
   redo,
@@ -68,6 +70,53 @@ describe('generated desktop history contract', () => {
     await expect(undo()).rejects.toBe(refusal);
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith('undo');
+  });
+});
+
+describe('generated transcript utility contract', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('preserves exact normalization and diff command names, arguments, and results', async () => {
+    const diff = {
+      raw: 'a c',
+      annotated: 'a b c',
+      changes: [
+        { op: 'Equal' as const, value: 'a' },
+        { op: 'Insert' as const, value: 'b' },
+        { op: 'Equal' as const, value: 'c' },
+      ],
+      stats: {
+        added_words: 1,
+        removed_words: 0,
+        changed_words: 0,
+        unchanged_words: 2,
+        similarity: 200 / 3,
+      },
+    };
+    invokeMock.mockResolvedValueOnce('normalized').mockResolvedValueOnce(diff);
+
+    await expect(normalizeText('raw')).resolves.toBe('normalized');
+    await expect(computeDiff('a c', 'a b c')).resolves.toEqual(diff);
+    expect(invokeMock.mock.calls).toEqual([
+      ['normalize_text', { text: 'raw' }],
+      ['compute_diff', { raw: 'a c', annotated: 'a b c' }],
+    ]);
+  });
+
+  it('preserves a typed memory refusal without converting it to prose', async () => {
+    const refusal = {
+      schema: 1,
+      code: 'DIFF_TOO_COMPLEX',
+      message: 'The transcript comparison would require too much memory.',
+      retryable: false,
+      suggestedAction: null,
+      operationId: null,
+    };
+    invokeMock.mockRejectedValueOnce(refusal);
+
+    await expect(computeDiff('raw', 'annotated')).rejects.toBe(refusal);
   });
 });
 
