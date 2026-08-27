@@ -913,6 +913,7 @@ mod core;
 pub use core::*;
 mod decisions;
 mod finalization;
+mod history;
 mod jobs_rights;
 mod playback;
 mod queries_recovery;

@@ -156,7 +156,7 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
             if required not in body:
                 raise AssertionError(f"{action} no longer holds restore admission through session save: {required}")
 
-    history_database = read("db/segments.rs")
+    history_database = read("db/history.rs")
     for required in (
         "SAVEPOINT history_machine_snapshot",
         "SAVEPOINT history_batch_transcription",
@@ -167,6 +167,8 @@ def test_migrated_commands_validate_then_delegate_without_raw_database_authority
     ):
         if required not in history_database:
             raise AssertionError(f"atomic history database boundary lost {required!r}")
+    if "pub(crate) fn apply_history_machine_snapshot(" in read("db/segments.rs"):
+        raise AssertionError("history persistence regressed into the segment store")
     for required in (
         "fn multi_row_delete_undo_rolls_back_the_complete_restore_on_late_failure()",
         "fn delete_redo_refuses_the_complete_batch_when_one_restored_row_changed()",

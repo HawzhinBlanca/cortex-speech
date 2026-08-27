@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "policy": {
+    "blockingSeverities": ["P0", "P1", "P2"],
+    "blockingStatuses": ["OPEN", "REOPENED"],
+    "rule": "A release profile is blocked by every OPEN or REOPENED P0, P1, or P2 defect whose supportedProfiles includes that profile. Unsupported or deliberately disabled workflows must remain explicit; they are never silently omitted."
+  },
+  "auditAuthorities": [
+    {
+      "id": "deep-brutal-audit-2026-08-25",
+      "report": "audit-2026-08-25/DEEP_BRUTAL_AUDIT.md",
+      "remediation": "audit-2026-08-25/REMEDIATION.md",
+      "integrationMatrix": "docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md"
+    }
+  ],
+  "defects": [
+    {
+      "id": "ARCH-IPC-001",
+      "severity": "P3",
+      "status": "OPEN",
+      "supportedProfiles": ["owner-product", "windows-product", "full-charter"],
+      "summary": "The generated IPC migration is incomplete; the closed legacy adapter still contains handwritten command contracts.",
+      "trackingAuthority": "docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md"
+    },
+    {
+      "id": "ARCH-FRONTEND-001",
+      "severity": "P3",
+      "status": "OPEN",
+      "supportedProfiles": ["owner-product", "windows-product", "full-charter"],
+      "summary": "Several frontend workspaces and presentational components remain above the locked final architecture ceilings.",
+      "trackingAuthority": "docs/10_10_INTEGRATION_FINDING_MATRIX_2026-08-25.md"
+    },
+    {
+      "id": "POOL-PAY-POLICY-001",
+      "severity": "P2",
+      "status": "OPEN",
+      "supportedProfiles": [],
+      "summary": "External flexible-pool work has no owner-approved compensation policy and is outside the supported release scope until PAY_POLICY_REQUIRED is resolved by owner canon.",
+      "trackingAuthority": "audit-2026-08-25/REMEDIATION.md"
+    }
+  ]
+}

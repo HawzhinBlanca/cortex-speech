@@ -941,6 +941,8 @@ PROFILE_FULL = "full-charter"
 PROFILES = frozenset({PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_MODEL, PROFILE_FULL})
 
 PENDING_EXTERNAL = "PENDING_EXTERNAL"
+EVIDENCE_VERIFIED = "VERIFIED"
+EVIDENCE_FAILED = "FAILED_VALIDATION"
 
 
 @dataclass(frozen=True)
@@ -1103,11 +1105,12 @@ def evidence_contract_document() -> dict[str, object]:
             "self-authored pass flags are never accepted."
         ),
         "freshnessPolicy": {
-            "state": "UNIMPLEMENTED_FAIL_CLOSED",
+            "state": "PARTIAL_CLASS_SPECIFIC_FAIL_CLOSED",
             "rule": (
                 "A VERIFIED class must carry validator-produced measuredAt plus either an expiresAt "
                 "that is checked again when the proof is published and consumed, or a hash-bound "
-                "immutableAuthority explaining why expiry does not apply. Until that class-specific "
+                "immutableAuthority explaining why expiry does not apply. Implemented validators are "
+                "recomputed from their exact gate artifacts when the proof is consumed. Until class-specific "
                 "logic exists, the class remains PENDING_EXTERNAL; no global magic time window is inferred."
             ),
         },
@@ -1116,6 +1119,7 @@ def evidence_contract_document() -> dict[str, object]:
                 "id": spec.id,
                 "profiles": sorted(spec.profiles),
                 "description": spec.description,
+                "validatorGate": EVIDENCE_VALIDATOR_GATES.get(spec.id, (None, (), ""))[0],
             }
             for spec in EVIDENCE_CLASSES
         ],
@@ -1408,7 +1412,10 @@ GATE_FORCED_ENVIRONMENT_BY_ID: dict[str, dict[str, str]] = {
     "champion-7b-preflight": {"CORTEX_REQUIRE_7B": "1"},
 }
 
-GATE_ARTIFACT_REQUIREMENTS_BY_ID: dict[str, tuple[str, ...]] = {}
+GATE_ARTIFACT_REQUIREMENTS_BY_ID: dict[str, tuple[str, ...]] = {
+    "architecture-contract-evidence": ("architecture-contract.json",),
+    "known-defect-ledger-evidence": ("known-defect-ledger.json",),
+}
 
 RUST_COVERAGE_ENVIRONMENT_ALLOWLIST = GATE_BASE_ENVIRONMENT
 
@@ -1727,6 +1734,329 @@ def _typed_gate(row: Sequence[object]) -> GateSpec:
     )
 
 
+KNOWN_DEFECT_LEDGER = REPO_ROOT / "docs" / "KNOWN_DEFECTS.v1.json"
+_ARCHITECTURE_ARTIFACT = "architecture-contract.json"
+_KNOWN_DEFECT_ARTIFACT = "known-defect-ledger.json"
+
+
+def _load_json_without_duplicate_keys(path: Path) -> object:
+    def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise EvidenceError(f"{path.name} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs_hook)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"cannot read strict JSON authority {path}: {error}") from error
+
+
+def _tracked_authority_binding(path: Path, full_sha: str) -> dict[str, object]:
+    resolved = path.resolve(strict=True)
+    try:
+        relative = resolved.relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError as error:
+        raise EvidenceError(f"authority path escapes the repository: {path}") from error
+    committed = _git_file_bytes(full_sha, relative)
+    observed = resolved.read_bytes()
+    if observed != committed:
+        raise EvidenceError(f"authority file differs from exact Git commit {full_sha}: {relative}")
+    return {
+        "path": relative,
+        "gitBlobSha1": _git_blob_id(full_sha, relative),
+        "sha256": hashlib.sha256(observed).hexdigest(),
+        "bytes": len(observed),
+    }
+
+
+def _safe_tracked_path(value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise EvidenceError(f"{label} must be a non-empty repository-relative POSIX path")
+    candidate = Path(value)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise EvidenceError(f"{label} is not a safe repository-relative path")
+    resolved = (REPO_ROOT / candidate).resolve(strict=True)
+    try:
+        resolved.relative_to(REPO_ROOT.resolve())
+    except ValueError as error:
+        raise EvidenceError(f"{label} escapes the repository") from error
+    return resolved
+
+
+def _fn_known_defect_ledger() -> bool:
+    """Audit the exact tracked defect inventory and emit one immutable-source evidence artifact."""
+
+    artifact_path = LOG_DIR / _KNOWN_DEFECT_ARTIFACT
+    full_sha = _full_git_sha()
+    report: dict[str, object] = {
+        "schema": 1,
+        "classId": "known-defect-ledger",
+        "fullGitSha": full_sha,
+        "measuredAt": utc_now(),
+        "immutableAuthority": "exact-git-commit",
+        "passed": False,
+        "failures": [],
+    }
+    try:
+        ledger = _load_json_without_duplicate_keys(KNOWN_DEFECT_LEDGER)
+        if not isinstance(ledger, dict) or set(ledger) != {
+            "schema",
+            "policy",
+            "auditAuthorities",
+            "defects",
+        }:
+            raise EvidenceError("known-defect ledger root must have the exact schema-1 field set")
+        if (
+            not isinstance(ledger.get("schema"), int)
+            or isinstance(ledger.get("schema"), bool)
+            or ledger.get("schema") != 1
+        ):
+            raise EvidenceError("known-defect ledger schema is not 1")
+        policy = ledger.get("policy")
+        if not isinstance(policy, dict) or set(policy) != {
+            "blockingSeverities",
+            "blockingStatuses",
+            "rule",
+        }:
+            raise EvidenceError("known-defect policy has a non-exact shape")
+        if policy.get("blockingSeverities") != ["P0", "P1", "P2"]:
+            raise EvidenceError("known-defect policy weakened the P0/P1/P2 release floor")
+        if policy.get("blockingStatuses") != ["OPEN", "REOPENED"]:
+            raise EvidenceError("known-defect policy weakened open/reopened blocking status")
+        if not isinstance(policy.get("rule"), str) or len(str(policy["rule"])) < 80:
+            raise EvidenceError("known-defect policy does not state its release rule")
+
+        authorities = ledger.get("auditAuthorities")
+        if not isinstance(authorities, list) or not authorities:
+            raise EvidenceError("known-defect ledger has no audit authority")
+        authority_ids: set[str] = set()
+        authority_bindings: list[dict[str, object]] = []
+        for authority in authorities:
+            if not isinstance(authority, dict) or set(authority) != {
+                "id",
+                "report",
+                "remediation",
+                "integrationMatrix",
+            }:
+                raise EvidenceError("known-defect audit authority has a non-exact shape")
+            authority_id = authority.get("id")
+            if (
+                not isinstance(authority_id, str)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]{7,79}", authority_id)
+                or authority_id in authority_ids
+            ):
+                raise EvidenceError("known-defect audit authority id is invalid or duplicated")
+            authority_ids.add(authority_id)
+            for field in ("report", "remediation", "integrationMatrix"):
+                authority_bindings.append(
+                    _tracked_authority_binding(
+                        _safe_tracked_path(authority.get(field), f"auditAuthorities.{field}"),
+                        full_sha,
+                    )
+                )
+
+        defects = ledger.get("defects")
+        if not isinstance(defects, list):
+            raise EvidenceError("known-defect ledger defects must be an array")
+        defect_ids: set[str] = set()
+        normalized: list[dict[str, object]] = []
+        blockers: list[str] = []
+        allowed_profiles = {PROFILE_OWNER, PROFILE_WINDOWS, PROFILE_MODEL, PROFILE_FULL}
+        for defect in defects:
+            if not isinstance(defect, dict) or set(defect) != {
+                "id",
+                "severity",
+                "status",
+                "supportedProfiles",
+                "summary",
+                "trackingAuthority",
+            }:
+                raise EvidenceError("known-defect row has a non-exact shape")
+            defect_id = defect.get("id")
+            if (
+                not isinstance(defect_id, str)
+                or not re.fullmatch(r"[A-Z0-9][A-Z0-9-]{5,79}", defect_id)
+                or defect_id in defect_ids
+            ):
+                raise EvidenceError("known-defect id is invalid or duplicated")
+            defect_ids.add(defect_id)
+            severity = defect.get("severity")
+            status = defect.get("status")
+            profiles = defect.get("supportedProfiles")
+            summary = defect.get("summary")
+            if severity not in {"P0", "P1", "P2", "P3"}:
+                raise EvidenceError(f"known defect {defect_id} has unknown severity")
+            if status not in {"OPEN", "REOPENED", "FIXED", "CLOSED"}:
+                raise EvidenceError(f"known defect {defect_id} has unknown status")
+            if (
+                not isinstance(profiles, list)
+                or len(profiles) != len(set(profiles))
+                or any(profile not in allowed_profiles for profile in profiles)
+            ):
+                raise EvidenceError(f"known defect {defect_id} has invalid supported profiles")
+            if not isinstance(summary, str) or not summary.strip() or len(summary) > 500:
+                raise EvidenceError(f"known defect {defect_id} has invalid summary")
+            tracking = _tracked_authority_binding(
+                _safe_tracked_path(
+                    defect.get("trackingAuthority"),
+                    f"defects.{defect_id}.trackingAuthority",
+                ),
+                full_sha,
+            )
+            if severity in policy["blockingSeverities"] and status in policy["blockingStatuses"] and profiles:
+                blockers.append(defect_id)
+            normalized.append(
+                {
+                    "id": defect_id,
+                    "severity": severity,
+                    "status": status,
+                    "supportedProfiles": profiles,
+                    "trackingAuthority": tracking,
+                }
+            )
+
+        report.update(
+            {
+                "ledger": _tracked_authority_binding(KNOWN_DEFECT_LEDGER, full_sha),
+                "auditAuthorities": authority_bindings,
+                "defects": normalized,
+                "blockingDefectIds": blockers,
+                "passed": not blockers,
+            }
+        )
+    except (EvidenceError, OSError, ValueError) as error:
+        report["failures"] = [str(error)]
+    atomic_write_json(artifact_path, report)
+    return report.get("passed") is True
+
+
+def _load_ipc_policy_module():
+    source = APP / "scripts" / "test_ipc_contract_policy.py"
+    name = "cortex_ipc_architecture_contract"
+    spec = importlib.util.spec_from_file_location(name, source)
+    if spec is None or spec.loader is None:
+        raise EvidenceError("cannot load the committed IPC contract scanner")
+    module = importlib.util.module_from_spec(spec)
+    scripts_path = str(source.parent)
+    inserted = scripts_path not in sys.path
+    if inserted:
+        sys.path.insert(0, scripts_path)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # noqa: BLE001 - a broken scanner is evidence failure
+        raise EvidenceError(f"cannot execute the committed IPC contract scanner: {error}") from error
+    finally:
+        if inserted:
+            sys.path.remove(scripts_path)
+    return module
+
+
+def _fn_architecture_contract() -> bool:
+    """Measure the locked final architecture contract; current debt must produce a red artifact."""
+
+    artifact_path = LOG_DIR / _ARCHITECTURE_ARTIFACT
+    full_sha = _full_git_sha()
+    failures: list[str] = []
+    report: dict[str, object] = {
+        "schema": 1,
+        "classId": "architecture-contract",
+        "fullGitSha": full_sha,
+        "measuredAt": utc_now(),
+        "immutableAuthority": "exact-git-commit",
+        "passed": False,
+    }
+    try:
+        rust_module = _rust_quality_module()
+        rust_verdict = rust_module.evaluate_architecture()
+        rust_document = rust_module._architecture_json(rust_verdict)
+        failures.extend(f"rust: {item}" for item in rust_verdict.failures)
+
+        ipc_module = _load_ipc_policy_module()
+        handwritten, generated, dynamic = ipc_module.frontend_invocations()
+        if not generated:
+            failures.append("ipc: generated command inventory is empty")
+        if handwritten:
+            failures.append(
+                f"ipc: {len(handwritten)} handwritten command contract(s) remain; final target is zero"
+            )
+        if dynamic:
+            failures.append(
+                f"ipc: {len(dynamic)} dynamic command-name bridge(s) remain; final target is zero"
+            )
+
+        workspace_limits = {
+            "src/Workstation.svelte": 500,
+            "src/lib/ReviewMode.svelte": 500,
+            "src/lib/ReviewInbox.svelte": 500,
+            "src/lib/SettingsPanel.svelte": 500,
+            "src/lib/StatsDashboard.svelte": 500,
+        }
+        frontend_measurements: list[dict[str, object]] = []
+        svelte_files = sorted((APP / "src").rglob("*.svelte"))
+        if not svelte_files:
+            raise EvidenceError("frontend architecture scan found no Svelte files")
+        for path in svelte_files:
+            relative = path.relative_to(APP).as_posix()
+            lines = len(path.read_text(encoding="utf-8").splitlines())
+            if relative == "src/App.svelte":
+                limit = 350
+                kind = "composition-shell"
+            elif relative in workspace_limits:
+                limit = workspace_limits[relative]
+                kind = "workspace-controller"
+            else:
+                limit = 350
+                kind = "presentational-component"
+            passed = lines <= limit
+            if not passed:
+                failures.append(
+                    f"frontend: {relative} has {lines} lines above the {limit}-line {kind} ceiling"
+                )
+            source = path.read_text(encoding="utf-8")
+            direct_runtime = bool(re.search(r"@tauri-apps|\binvoke\s*\(", source))
+            if direct_runtime:
+                failures.append(f"frontend: {relative} imports or invokes the desktop runtime directly")
+            frontend_measurements.append(
+                {
+                    "path": relative,
+                    "kind": kind,
+                    "lines": lines,
+                    "maxLines": limit,
+                    "passed": passed,
+                    "directDesktopRuntime": direct_runtime,
+                    "sha256": sha256_file(path),
+                }
+            )
+
+        report.update(
+            {
+                "rust": rust_document,
+                "ipc": {
+                    "generatedCount": len(generated),
+                    "handwrittenCount": len(handwritten),
+                    "dynamicCount": len(dynamic),
+                    "handwrittenCommands": sorted(handwritten),
+                    "dynamicSites": sorted(dynamic),
+                },
+                "frontend": {
+                    "measurements": frontend_measurements,
+                    "compositionShellMaxLines": 350,
+                    "workspaceControllerMaxLines": 500,
+                    "presentationalComponentMaxLines": 350,
+                },
+            }
+        )
+    except (EvidenceError, OSError, ValueError) as error:
+        failures.append(str(error))
+    report["failures"] = failures
+    report["passed"] = not failures
+    atomic_write_json(artifact_path, report)
+    return not failures
+
+
 # (name, tier, kind, payload, cwd, env_probe, charter_ref)
 #   kind "fn"  -> payload is a callable returning bool
 #   kind "cmd" -> payload is a shell command string
@@ -1742,6 +2072,8 @@ GATES = [
     ("branch-protection", 1, "fn", check_branch_protection, None, _probe_branch_protection, "Git+integrity: main is protected on the remote, admins included (was OWNER_GATED item 49 - clicks done 2026-08-08, now machine-verified every sweep)"),
     ("python-policies", 1, "cmd", "npm run test:python-policies", APP, None, "honesty/privacy/CI/dataset policy tests"),
     ("rust-architecture-truth", 1, "cmd", f'"{sys.executable}" scripts/rust_quality_gate.py architecture', APP, None, "Fail-closed shipped-Rust architecture ceiling: every production module stays below 2,000 logical lines unless an exact SHA-bound immutable-history exception applies. Oversized production modules are RED, never warnings."),
+    ("architecture-contract-evidence", 1, "fn", _fn_architecture_contract, None, None, "Hash-bound final architecture contract: Rust module ceilings, zero handwritten/dynamic IPC, bounded frontend workspaces/components, and no component-level desktop runtime imports."),
+    ("known-defect-ledger-evidence", 1, "fn", _fn_known_defect_ledger, None, None, "Hash-bound strict known-defect inventory with zero OPEN/REOPENED P0, P1 or P2 defect in any supported release profile."),
     ("spot-check-pool", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_spot_check_pool.py"}"', APP, None, "The listening-QC must cover the WHOLE accessible paid-review campaign, not merely be able to fire once. The gate mirrors live focus, roster, dialect, on-disk audio, prior per-reviewer scores, and the Rust queue/check cadence; it derives each reviewer's worst-case key requirement because no enforced quota prevents one eligible reviewer from draining the queue. MEASURED 2026-08-21: the Hawleri campaign exposed 1,293 work clips but only 0-2 fresh keys per reviewer, so the old floor-of-3 gate would have gone green after three owner edits and then silently stopped measuring. Answer keys must be genuine owner-adjudicated/is_gold rows; never synthetic."),
     ("dataset-duplicates", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_dataset_duplicates.py"}"', APP, None, "The same-recording-under-different-names audit, on the LIVE library. FOUND BY THE OWNER'S EARS 2026-08-17, not by any gate: one recording lived under three filenames as different ENCODES, so the byte fingerprint saw three distinct files — ~68 duplicate sentences entered the corpus and 33 were reviewed (paid) twice, and duplicate content across nominally-different recordings can straddle a train/test split. Signal: source-timeline offset AND transcript agreeing across different files. Baseline 70, ratchets DOWN only."),
     ("snapshot-immutability", 1, "cmd", f'"{sys.executable}" "{APP / "scripts" / "check_snapshot_immutability.py"}"', APP, None, "Gate C of docs/PLAN_TRUE_10.md. A training run cites a dataset snapshot id, and every CER measured from the resulting model hangs off that citation. This proves, on the LIVE library, that the id IS the content hash of the manifest it sealed (not a label someone chose), that no id is reused, that the sealed config names its own id, and that any pack still on disk still hashes to the snapshot it claims. Without it, 'trained on snapshot X' is decoration and every number downstream is unanchored. SKIP-ENV until the first pack is exported — it reports on data that exists and never invents a pass."),
@@ -2376,7 +2708,15 @@ def run_gate(
     )
 
 
-def write_status_md(path, head, quick, results, verdict, profile=PROFILE_FULL):
+def write_status_md(
+    path,
+    head,
+    quick,
+    results,
+    verdict,
+    profile=PROFILE_FULL,
+    evidence_results: list[dict[str, object]] | None = None,
+):
     """Emit the proof-local generated view of the completed gate results.
 
     Hand-written docs that restate which gates pass go stale silently — OWNER_HANDOFF.md
@@ -2392,8 +2732,10 @@ def write_status_md(path, head, quick, results, verdict, profile=PROFILE_FULL):
     rows = "\n".join(f"| `{name}` | {status} |" for name, status, _, _ in results)
     descoped = "\n".join(f"| `{name}` | {why} |" for name, why in DESCOPED)
     gated = "\n".join(f"| `{name}` | {why} |" for name, why in OWNER_GATED)
-    pending = "\n".join(
-        f"| `{spec.id}` | {spec.description} |" for spec in _required_evidence_specs(profile)
+    evidence_rows = evidence_results or list(_pending_evidence_results(profile))
+    evidence_table = "\n".join(
+        f"| `{item['classId']}` | {item['status']} | {item['detail']} |"
+        for item in evidence_rows
     )
     body = f"""<!-- GENERATED inside an immutable proof run by scripts/verify_10.py. Do not edit. -->
 
@@ -2409,13 +2751,13 @@ def write_status_md(path, head, quick, results, verdict, profile=PROFILE_FULL):
 |---|---|
 {rows}
 
-## Required certification evidence — pending
+## Required certification evidence
 
-These classes are not satisfied by this run. No user-authored pass flag is accepted.
+Only class-specific validator artifacts can produce `VERIFIED`. No user-authored pass flag is accepted.
 
-| Evidence class | Required proof |
-|---|---|
-{pending}
+| Evidence class | Status | Required proof / result |
+|---|---|---|
+{evidence_table}
 
 ## Outside the selected certification contract (never counted as a pass)
 
@@ -2799,7 +3141,7 @@ def _model_attestation_binding() -> dict[str, object] | None:
 
 
 def _known_defect_digest(
-    results: list[dict[str, object]], evidence_results: list[dict[str, str]]
+    results: list[dict[str, object]], evidence_results: list[dict[str, object]]
 ) -> str:
     unresolved = {
         "nonPassGates": [
@@ -2807,7 +3149,7 @@ def _known_defect_digest(
             for result in results
             if result.get("status") != PASS
         ],
-        "pendingEvidenceClasses": [
+        "unresolvedEvidenceClasses": [
             result["classId"]
             for result in evidence_results
             if result.get("status") != "VERIFIED"
@@ -4056,12 +4398,210 @@ def _manifest_artifacts(run_dir: Path) -> list[dict[str, object]]:
     return artifacts
 
 
-def _validate_evidence_results(profile: str, value: object) -> list[dict[str, str]]:
-    expected = _pending_evidence_results(profile)
+EVIDENCE_VALIDATOR_GATES: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "architecture-contract": (
+        "architecture-contract-evidence",
+        (
+            "clean-source-tree",
+            "architecture-contract-evidence",
+            "rust-architecture-truth",
+            "python-policies",
+            "typecheck",
+            "lint-js",
+        ),
+        _ARCHITECTURE_ARTIFACT,
+    ),
+    "known-defect-ledger": (
+        "known-defect-ledger-evidence",
+        ("clean-source-tree", "known-defect-ledger-evidence"),
+        _KNOWN_DEFECT_ARTIFACT,
+    ),
+}
+
+
+def _validate_class_evidence_artifact(
+    class_id: str,
+    path: Path,
+    *,
+    expected_sha: str,
+) -> dict[str, object]:
+    value = _load_json_without_duplicate_keys(path)
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("schema"), int)
+        or isinstance(value.get("schema"), bool)
+        or value.get("schema") != 1
+    ):
+        raise EvidenceError(f"{class_id} evidence artifact has the wrong schema")
+    if (
+        value.get("classId") != class_id
+        or value.get("fullGitSha") != expected_sha
+        or value.get("immutableAuthority") != "exact-git-commit"
+        or value.get("passed") is not True
+        or value.get("failures") != []
+    ):
+        raise EvidenceError(f"{class_id} evidence artifact is failed, stale, or substituted")
+    _parse_utc(value.get("measuredAt"), f"{class_id}.measuredAt")
+    if class_id == "known-defect-ledger":
+        if value.get("blockingDefectIds") != []:
+            raise EvidenceError("known-defect evidence carries unresolved supported-flow blockers")
+        if not isinstance(value.get("ledger"), dict) or not isinstance(value.get("defects"), list):
+            raise EvidenceError("known-defect evidence omits its ledger or normalized defect rows")
+    elif class_id == "architecture-contract":
+        rust = value.get("rust")
+        ipc = value.get("ipc")
+        frontend = value.get("frontend")
+        if not isinstance(rust, dict) or rust.get("passed") is not True:
+            raise EvidenceError("architecture evidence does not pass the Rust module contract")
+        if (
+            not isinstance(ipc, dict)
+            or ipc.get("handwrittenCount") != 0
+            or ipc.get("dynamicCount") != 0
+            or not isinstance(ipc.get("generatedCount"), int)
+            or isinstance(ipc.get("generatedCount"), bool)
+            or ipc.get("generatedCount", 0) <= 0
+        ):
+            raise EvidenceError("architecture evidence does not prove generated-only static IPC")
+        measurements = frontend.get("measurements") if isinstance(frontend, dict) else None
+        if (
+            not isinstance(measurements, list)
+            or not measurements
+            or any(
+                not isinstance(item, dict)
+                or item.get("passed") is not True
+                or item.get("directDesktopRuntime") is not False
+                for item in measurements
+            )
+        ):
+            raise EvidenceError("architecture evidence does not pass every frontend boundary")
+    else:
+        raise EvidenceError(f"no semantic validator exists for evidence class {class_id}")
+    return value
+
+
+def _derive_evidence_results(
+    profile: str,
+    results: list[dict[str, object]],
+    proof_root: Path,
+    expected_sha: str,
+) -> list[dict[str, object]]:
+    by_gate: dict[str, dict[str, object]] = {}
+    for result in results:
+        gate_id = result.get("gateId") if isinstance(result, dict) else None
+        if not isinstance(gate_id, str) or gate_id in by_gate:
+            raise EvidenceError("cannot derive evidence from missing or duplicate gate results")
+        by_gate[gate_id] = result
+
+    derived: list[dict[str, object]] = []
+    for spec in _required_evidence_specs(profile):
+        binding = EVIDENCE_VALIDATOR_GATES.get(spec.id)
+        if binding is None:
+            derived.append(
+                {
+                    "classId": spec.id,
+                    "status": PENDING_EXTERNAL,
+                    "detail": spec.description,
+                }
+            )
+            continue
+        validator_gate, prerequisites, artifact_name = binding
+        missing = [gate_id for gate_id in prerequisites if gate_id not in by_gate]
+        if missing:
+            derived.append(
+                {
+                    "classId": spec.id,
+                    "status": EVIDENCE_FAILED,
+                    "detail": (
+                        "class-specific validator prerequisites are absent: "
+                        + ", ".join(missing)
+                    ),
+                }
+            )
+            continue
+        non_pass = [
+            gate_id for gate_id in prerequisites if by_gate[gate_id].get("status") != PASS
+        ]
+        if non_pass:
+            derived.append(
+                {
+                    "classId": spec.id,
+                    "status": EVIDENCE_FAILED,
+                    "detail": (
+                        "class-specific validation did not pass: " + ", ".join(non_pass)
+                    ),
+                }
+            )
+            continue
+        expected_relative = f"gates/{validator_gate}/{artifact_name}"
+        artifacts = by_gate[validator_gate].get("artifacts")
+        if not isinstance(artifacts, list):
+            raise EvidenceError(f"{spec.id} validator gate has no artifact inventory")
+        matches = [
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, dict) and artifact.get("path") == expected_relative
+        ]
+        if len(matches) != 1:
+            raise EvidenceError(f"{spec.id} validator has no unique required artifact")
+        artifact = matches[0]
+        artifact_path = (proof_root / expected_relative).resolve()
+        try:
+            artifact_path.relative_to(proof_root.resolve())
+        except ValueError as error:
+            raise EvidenceError(f"{spec.id} evidence artifact escapes the proof root") from error
+        size = artifact.get("bytes")
+        if (
+            not artifact_path.is_file()
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or artifact_path.stat().st_size != size
+            or sha256_file(artifact_path) != artifact.get("sha256")
+        ):
+            raise EvidenceError(f"{spec.id} evidence artifact hash/size binding is invalid")
+        document = _validate_class_evidence_artifact(
+            spec.id,
+            artifact_path,
+            expected_sha=expected_sha,
+        )
+        derived.append(
+            {
+                "classId": spec.id,
+                "status": EVIDENCE_VERIFIED,
+                "detail": spec.description,
+                "measuredAt": document["measuredAt"],
+                "immutableAuthority": {
+                    "kind": "exact-git-commit",
+                    "fullGitSha": expected_sha,
+                },
+                "evidence": {
+                    "gateId": validator_gate,
+                    "path": expected_relative,
+                    "sha256": artifact["sha256"],
+                    "bytes": size,
+                },
+            }
+        )
+    return derived
+
+
+def _validate_evidence_results(
+    profile: str,
+    value: object,
+    *,
+    results: list[dict[str, object]] | None = None,
+    proof_root: Path | None = None,
+    expected_sha: str | None = None,
+) -> list[dict[str, object]]:
+    if results is None or proof_root is None or expected_sha is None:
+        expected: list[dict[str, object]] = list(_pending_evidence_results(profile))
+    else:
+        expected = _derive_evidence_results(profile, results, proof_root, expected_sha)
     if value != expected:
         raise EvidenceError(
             "certification evidence classes were omitted, substituted, reordered, or self-asserted; "
-            "all currently unimplemented class validators must remain pending"
+            "implemented results must be rederived from exact validator artifacts and unimplemented "
+            "classes must remain pending"
         )
     return expected
 
@@ -4820,7 +5360,13 @@ def _validate_completed_manifest(
     if len(results) != len(expected_gates) or actual_ids != expected_ids or len(set(actual_ids)) != len(actual_ids):
         raise EvidenceError("proof results do not exactly match the ordered selected gate set")
 
-    evidence_results = _validate_evidence_results(str(profile), manifest.get("certificationEvidence"))
+    evidence_results = _validate_evidence_results(
+        str(profile),
+        manifest.get("certificationEvidence"),
+        results=results,
+        proof_root=path.parent,
+        expected_sha=expected_sha,
+    )
     reconstructed_code, reconstructed_verdict = _profile_verdict(
         str(profile),
         quick,
@@ -5049,7 +5595,7 @@ def _profile_verdict(
     profile: str,
     quick: bool,
     results: list[tuple[str, str, float, str]],
-    evidence_results: list[dict[str, str]] | None = None,
+    evidence_results: list[dict[str, object]] | None = None,
     *,
     stale_takeover: bool = False,
     diagnostic_authority_overrides: bool = False,
@@ -5207,6 +5753,12 @@ def aggregate_main(
                     print(f"     {detail}", flush=True)
                 _assert_source_state(full_sha, source_tree_digest, checkout_state_digest)
 
+            evidence_results = _derive_evidence_results(
+                profile,
+                result_documents,
+                run_dir,
+                full_sha,
+            )
             code, verdict = _profile_verdict(
                 profile,
                 quick,
@@ -5226,7 +5778,15 @@ def aggregate_main(
                     f"\n[status-md] external target retired ({status_md}); wrote proof-local STATUS.md instead",
                     flush=True,
                 )
-            write_status_md(run_dir / "STATUS.md", full_sha, quick, results, verdict, profile)
+            write_status_md(
+                run_dir / "STATUS.md",
+                full_sha,
+                quick,
+                results,
+                verdict,
+                profile,
+                evidence_results,
+            )
             _assert_source_state(full_sha, source_tree_digest, checkout_state_digest)
             journal.append(
                 "run_end",

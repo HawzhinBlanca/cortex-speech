@@ -478,11 +478,21 @@ class Verify10SupervisorTests(unittest.TestCase):
                 & set(self.verify.LIVE_AUTHORITY_OVERRIDE_ENVIRONMENT)
             )
         freshness = registry["evidenceContract"]["freshnessPolicy"]
-        self.assertEqual(freshness["state"], "UNIMPLEMENTED_FAIL_CLOSED")
+        self.assertEqual(freshness["state"], "PARTIAL_CLASS_SPECIFIC_FAIL_CLOSED")
         self.assertIn("measuredAt", freshness["rule"])
         self.assertIn("expiresAt", freshness["rule"])
         self.assertIn("immutableAuthority", freshness["rule"])
         self.assertIn("PENDING_EXTERNAL", freshness["rule"])
+        classes = {item["id"]: item for item in registry["evidenceContract"]["classes"]}
+        self.assertEqual(
+            classes["architecture-contract"]["validatorGate"],
+            "architecture-contract-evidence",
+        )
+        self.assertEqual(
+            classes["known-defect-ledger"]["validatorGate"],
+            "known-defect-ledger-evidence",
+        )
+        self.assertIsNone(classes["owner-field-sessions"]["validatorGate"])
 
     def test_evidence_and_release_contracts_fail_closed_on_omission_or_substitution(self) -> None:
         profile = self.verify.PROFILE_WINDOWS
@@ -521,6 +531,139 @@ class Verify10SupervisorTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(self.verify.EvidenceError, "legacy aggregate path is retired"):
             self.verify._retired_aggregate_main(False)
+
+    def test_class_evidence_is_rederived_from_the_exact_validator_artifact(self) -> None:
+        sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            proof_root = Path(temporary)
+            relative = Path("gates") / "known-defect-ledger-evidence" / "known-defect-ledger.json"
+            artifact_path = proof_root / relative
+            artifact_path.parent.mkdir(parents=True)
+            artifact = {
+                "schema": 1,
+                "classId": "known-defect-ledger",
+                "fullGitSha": sha,
+                "measuredAt": "2026-08-27T00:00:00Z",
+                "immutableAuthority": "exact-git-commit",
+                "passed": True,
+                "failures": [],
+                "blockingDefectIds": [],
+                "ledger": {},
+                "defects": [],
+            }
+            self.supervisor.atomic_write_json(artifact_path, artifact)
+            results = [
+                {"gateId": "clean-source-tree", "status": self.verify.PASS},
+                {"gateId": "architecture-contract-evidence", "status": self.verify.FAIL},
+                {"gateId": "rust-architecture-truth", "status": self.verify.PASS},
+                {"gateId": "python-policies", "status": self.verify.PASS},
+                {"gateId": "typecheck", "status": self.verify.PASS},
+                {"gateId": "lint-js", "status": self.verify.PASS},
+                {
+                    "gateId": "known-defect-ledger-evidence",
+                    "status": self.verify.PASS,
+                    "artifacts": [
+                        {
+                            "path": relative.as_posix(),
+                            "sha256": self.supervisor.sha256_file(artifact_path),
+                            "bytes": artifact_path.stat().st_size,
+                        }
+                    ],
+                },
+            ]
+            evidence = self.verify._derive_evidence_results(
+                self.verify.PROFILE_OWNER,
+                results,
+                proof_root,
+                sha,
+            )
+            by_id = {item["classId"]: item for item in evidence}
+            self.assertEqual(
+                by_id["architecture-contract"]["status"],
+                self.verify.EVIDENCE_FAILED,
+            )
+            self.assertEqual(
+                by_id["known-defect-ledger"]["status"],
+                self.verify.EVIDENCE_VERIFIED,
+            )
+            self.assertEqual(
+                self.verify._validate_evidence_results(
+                    self.verify.PROFILE_OWNER,
+                    evidence,
+                    results=results,
+                    proof_root=proof_root,
+                    expected_sha=sha,
+                ),
+                evidence,
+            )
+
+            forged = json.loads(json.dumps(evidence))
+            next(
+                item for item in forged if item["classId"] == "known-defect-ledger"
+            )["evidence"]["sha256"] = "0" * 64
+            with self.assertRaises(self.verify.EvidenceError):
+                self.verify._validate_evidence_results(
+                    self.verify.PROFILE_OWNER,
+                    forged,
+                    results=results,
+                    proof_root=proof_root,
+                    expected_sha=sha,
+                )
+
+    def test_known_defect_validator_blocks_supported_p2_but_keeps_disabled_scope_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger_path = root / "known.json"
+            artifact_dir = root / "artifacts"
+            artifact_dir.mkdir()
+            ledger = json.loads(self.verify.KNOWN_DEFECT_LEDGER.read_text(encoding="utf-8"))
+            ledger["defects"][0]["severity"] = "P2"
+            ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+            binding = {
+                "path": "authority.md",
+                "gitBlobSha1": "b" * 40,
+                "sha256": "c" * 64,
+                "bytes": 1,
+            }
+            patches = (
+                mock.patch.object(self.verify, "KNOWN_DEFECT_LEDGER", ledger_path),
+                mock.patch.object(self.verify, "LOG_DIR", artifact_dir),
+                mock.patch.object(self.verify, "_full_git_sha", return_value="a" * 40),
+                mock.patch.object(self.verify, "_safe_tracked_path", return_value=ledger_path),
+                mock.patch.object(
+                    self.verify,
+                    "_tracked_authority_binding",
+                    return_value=binding,
+                ),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                self.assertFalse(self.verify._fn_known_defect_ledger())
+            report = json.loads(
+                (artifact_dir / self.verify._KNOWN_DEFECT_ARTIFACT).read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["blockingDefectIds"], ["ARCH-IPC-001"])
+
+            ledger["defects"][0]["severity"] = "P3"
+            ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                self.assertTrue(self.verify._fn_known_defect_ledger())
+            report = json.loads(
+                (artifact_dir / self.verify._KNOWN_DEFECT_ARTIFACT).read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["blockingDefectIds"], [])
+            disabled_p2 = next(
+                item for item in report["defects"] if item["id"] == "POOL-PAY-POLICY-001"
+            )
+            self.assertEqual(disabled_p2["supportedProfiles"], [])
+
+            ledger["schema"] = True
+            ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                self.assertFalse(self.verify._fn_known_defect_ledger())
+            report = json.loads(
+                (artifact_dir / self.verify._KNOWN_DEFECT_ARTIFACT).read_text(encoding="utf-8")
+            )
+            self.assertIn("schema is not 1", report["failures"][0])
 
     def test_windows_proof_consumer_rebinds_every_required_role_to_measured_bundle(self) -> None:
         profile = self.verify.PROFILE_WINDOWS
