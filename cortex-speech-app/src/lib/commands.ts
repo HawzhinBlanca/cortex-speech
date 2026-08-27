@@ -837,13 +837,15 @@ export async function importModelCheckpoint(args: {
   license: string;
   modelCardName?: string | null;
 }): Promise<string> {
-  return invokeCritical('import_model_checkpoint', {
-    id: args.id,
-    checkpointPath: args.checkpointPath,
-    source: args.source,
-    license: args.license,
-    modelCardName: args.modelCardName ?? null,
-  });
+  const result = await generatedCommands.importModelCheckpoint(
+    args.id,
+    args.checkpointPath,
+    args.source,
+    args.license,
+    args.modelCardName ?? null,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -857,13 +859,15 @@ export async function importModelDeployment(args: {
   source: string;
   license: string;
 }): Promise<ModelVersion> {
-  return invokeCritical('import_model_deployment', {
-    manifestPath: args.manifestPath,
-    expectedDeploymentSha256: args.expectedDeploymentSha256,
-    expectedModelId: args.expectedModelId,
-    source: args.source,
-    license: args.license,
-  });
+  const result = await generatedCommands.importModelDeployment(
+    args.manifestPath,
+    args.expectedDeploymentSha256,
+    args.expectedModelId,
+    args.source,
+    args.license,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /**
@@ -877,12 +881,14 @@ export async function bootstrapLegacyChampion(args: {
   expectedModelId: string;
   license: string;
 }): Promise<ModelVersion> {
-  return invokeCritical('bootstrap_legacy_champion', {
-    manifestPath: args.manifestPath,
-    expectedDeploymentSha256: args.expectedDeploymentSha256,
-    expectedModelId: args.expectedModelId,
-    license: args.license,
-  });
+  const result = await generatedCommands.bootstrapLegacyChampion(
+    args.manifestPath,
+    args.expectedDeploymentSha256,
+    args.expectedModelId,
+    args.license,
+  );
+  if (result.status === 'error') throw result.error;
+  return result.data;
 }
 
 /** Persisted session view-state (snake_case, as serialized by the backend). */

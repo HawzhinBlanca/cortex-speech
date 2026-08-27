@@ -22,7 +22,6 @@ export const LEGACY_IPC_COMMANDS = [
   'align_segment',
   'batch_normalize',
   'batch_transcribe',
-  'bootstrap_legacy_champion',
   'build_scorecard',
   'check_agentic_readiness',
   'compute_signal_anomaly_scores',
@@ -51,8 +50,6 @@ export const LEGACY_IPC_COMMANDS = [
   'get_waveform',
   'import_audio_file',
   'import_directory',
-  'import_model_checkpoint',
-  'import_model_deployment',
   'import_verified_segments_as_gold',
   'list_agent_import_reports',
   'list_agent_stage_events',
@@ -116,35 +113,6 @@ type CriticalLegacyIpcContract = {
   export_agreement_sample: {
     args: undefined;
     result: CommandResult<'exportAgreementSample'>;
-  };
-  import_model_checkpoint: {
-    args: {
-      id: string;
-      checkpointPath: string;
-      source: string;
-      license: string;
-      modelCardName: string | null;
-    };
-    result: CommandResult<'importModelCheckpoint'>;
-  };
-  import_model_deployment: {
-    args: {
-      manifestPath: string;
-      expectedDeploymentSha256: string;
-      expectedModelId: string;
-      source: string;
-      license: string;
-    };
-    result: CommandResult<'importModelDeployment'>;
-  };
-  bootstrap_legacy_champion: {
-    args: {
-      manifestPath: string;
-      expectedDeploymentSha256: string;
-      expectedModelId: string;
-      license: string;
-    };
-    result: CommandResult<'bootstrapLegacyChampion'>;
   };
   get_quarantine_notice: { args: undefined; result: CommandResult<'getQuarantineNotice'> };
   list_db_snapshots: { args: undefined; result: CommandResult<'listDbSnapshots'> };

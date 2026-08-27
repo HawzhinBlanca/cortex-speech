@@ -190,6 +190,25 @@ export const commands = {
 	// The model registry, newest-first within each family — what a registry panel lists.
 	listModelVersions: () => typedError<ModelVersionSummaryV1[], CommandErrorV1>(__TAURI_INVOKE("list_model_versions")),
 	/**
+	 *  Import an externally fine-tuned checkpoint into the registry as a gated candidate. The SHA is
+	 *  computed server-side from the file; the caller never supplies it. Promotion is a separate,
+	 *  gated step (not exposed yet — it must run through the eval gate), so this can only ever add a
+	 *  candidate, never crown a champion.
+	 */
+	importModelCheckpoint: (id: string, checkpointPath: string, source: string, license: string, modelCardName: string | null) => typedError<string, CommandErrorV1>(__TAURI_INVOKE("import_model_checkpoint", { id, checkpointPath, source, license, modelCardName })),
+	/**
+	 *  Import a content-addressed OmniASR-7B deployment. Identity comes from the verified manifest,
+	 *  never from renderer-supplied model/card fields, and all four behavior-determining components are
+	 *  hashed before the DB lock is acquired.
+	 */
+	importModelDeployment: (manifestPath: string, expectedDeploymentSha256: string, expectedModelId: string, source: string, license: string) => typedError<ModelVersionSummaryV1, CommandErrorV1>(__TAURI_INVOKE("import_model_deployment", { manifestPath, expectedDeploymentSha256, expectedModelId, source, license })),
+	/**
+	 *  One-time admission of the historically measured incumbent. This is deliberately a different
+	 *  command from challenger import: the registry family must be completely empty and the verified
+	 *  composite must match every owner-measured legacy pin. It cannot be reused for a future model.
+	 */
+	bootstrapLegacyChampion: (manifestPath: string, expectedDeploymentSha256: string, expectedModelId: string, license: string) => typedError<ModelVersionSummaryV1, CommandErrorV1>(__TAURI_INVOKE("bootstrap_legacy_champion", { manifestPath, expectedDeploymentSha256, expectedModelId, license })),
+	/**
 	 *  Complete, non-lossy speaker inventory for the management panel. SQL NULL stays distinct from a
 	 *  literal `unknown` id, and backend failures are reduced to a stable renderer-safe contract.
 	 */
@@ -548,8 +567,8 @@ export type ModelStatusEntryV1 = {
 };
 
 /**
- *  Versioned renderer contract for a model-registry row. Legacy import commands retain their
- *  historical snake-case response until they migrate independently.
+ *  Versioned renderer-safe registry row. The durable checkpoint path remains backend-only; the UI
+ *  needs the content identity and provenance, never a local filesystem location.
  */
 export type ModelVersionSummaryV1 = {
 	id: string,

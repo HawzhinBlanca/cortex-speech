@@ -16,21 +16,8 @@ pub struct EngineStatusV1 {
     pub reason: Option<String>,
 }
 
-/// Renderer-safe registry row. The durable checkpoint path remains backend-only; the UI needs the
-/// content identity and provenance, never a local filesystem location.
-#[derive(serde::Serialize)]
-pub struct ModelVersionSummary {
-    pub id: String,
-    pub family: String,
-    pub model_card_name: Option<String>,
-    pub checkpoint_sha256: String,
-    pub source: String,
-    pub license: String,
-    pub status: String,
-}
-
-/// Versioned renderer contract for a model-registry row. Legacy import commands retain their
-/// historical snake-case response until they migrate independently.
+/// Versioned renderer-safe registry row. The durable checkpoint path remains backend-only; the UI
+/// needs the content identity and provenance, never a local filesystem location.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelVersionSummaryV1 {
@@ -41,20 +28,6 @@ pub struct ModelVersionSummaryV1 {
     pub source: String,
     pub license: String,
     pub status: String,
-}
-
-impl From<crate::registry::ModelVersion> for ModelVersionSummary {
-    fn from(version: crate::registry::ModelVersion) -> Self {
-        Self {
-            id: version.id,
-            family: version.family,
-            model_card_name: version.model_card_name,
-            checkpoint_sha256: version.checkpoint_sha256,
-            source: version.source,
-            license: version.license,
-            status: version.status,
-        }
-    }
 }
 
 impl From<crate::registry::ModelVersion> for ModelVersionSummaryV1 {
@@ -83,6 +56,54 @@ fn public_model_registry_error(_private_detail: &str) -> crate::ipc_contract::Co
         false,
     )
     .suggested(crate::ipc_contract::SuggestedActionV1::OpenModels)
+}
+
+const MODEL_MUTATION_RESTORE_BLOCKED: &str = "MODEL_MUTATION_RESTORE_BLOCKED";
+
+fn invalid_model_import_error(field: &str) -> crate::ipc_contract::CommandErrorV1 {
+    crate::ipc_contract::CommandErrorV1::new(
+        "INVALID_MODEL_IMPORT",
+        "The model import request is invalid. Check the highlighted model field.",
+        false,
+    )
+    .suggested(crate::ipc_contract::SuggestedActionV1::OpenModels)
+    .detail("field", field)
+}
+
+fn validate_model_identifier(value: &str, field: &str) -> Result<(), crate::ipc_contract::CommandErrorV1> {
+    validate::validate_identifier(value).map_err(|_| invalid_model_import_error(field))
+}
+
+fn validate_deployment_request(
+    manifest_path: &str,
+    expected_deployment_sha256: &str,
+    expected_model_id: &str,
+    license: &str,
+) -> Result<(), crate::ipc_contract::CommandErrorV1> {
+    validate_model_identifier(expected_model_id, "expectedModelId")?;
+    validate_model_identifier(license, "license")?;
+    if expected_deployment_sha256.len() != 64
+        || !expected_deployment_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_model_import_error("expectedDeploymentSha256"));
+    }
+    if manifest_path.trim().is_empty() || manifest_path.len() > 4096 || manifest_path.chars().any(char::is_control) {
+        return Err(invalid_model_import_error("manifestPath"));
+    }
+    Ok(())
+}
+
+fn public_model_write_error(code: &str, message: &str, private_detail: &str) -> crate::ipc_contract::CommandErrorV1 {
+    if private_detail == MODEL_MUTATION_RESTORE_BLOCKED {
+        return crate::ipc_contract::CommandErrorV1::new(
+            "RESTORE_IN_PROGRESS",
+            "Model changes are unavailable while database recovery is in progress. Retry afterward.",
+            true,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::Retry);
+    }
+    crate::ipc_contract::CommandErrorV1::new(code, message, false)
+        .suggested(crate::ipc_contract::SuggestedActionV1::OpenModels)
 }
 
 /// The model registry, newest-first within each family — what a registry panel lists.
@@ -132,6 +153,34 @@ mod typed_model_registry_ipc_tests {
             assert!(!wire.contains(forbidden));
         }
     }
+
+    #[test]
+    fn model_write_validation_and_failures_are_closed_typed_and_renderer_safe() {
+        let invalid = validate_deployment_request("", "NOT-A-SHA", "bad id", "")
+            .expect_err("invalid deployment request must refuse before worker admission");
+        let invalid = serde_json::to_value(invalid).expect("serialize validation refusal");
+        assert_eq!(invalid["code"], "INVALID_MODEL_IMPORT");
+        assert_eq!(invalid["details"]["field"], "expectedModelId");
+
+        let restore = public_model_write_error(
+            "MODEL_DEPLOYMENT_IMPORT_FAILED",
+            "The deployment could not be verified and registered. Open Models for recovery options.",
+            MODEL_MUTATION_RESTORE_BLOCKED,
+        );
+        assert_eq!(restore.code, "RESTORE_IN_PROGRESS");
+        assert!(restore.retryable);
+
+        let hostile = public_model_write_error(
+            "MODEL_DEPLOYMENT_IMPORT_FAILED",
+            "The deployment could not be verified and registered. Open Models for recovery options.",
+            r"manifest D:\private\deployment.json token=secret SQL mismatch",
+        );
+        let wire = serde_json::to_string(&hostile).expect("serialize model write failure");
+        assert!(wire.contains("MODEL_DEPLOYMENT_IMPORT_FAILED"));
+        for forbidden in ["deployment.json", "D:\\", "private", "token", "secret", "SQL", "mismatch"] {
+            assert!(!wire.contains(forbidden));
+        }
+    }
 }
 
 /// Import an externally fine-tuned checkpoint into the registry as a gated candidate. The SHA is
@@ -139,6 +188,7 @@ mod typed_model_registry_ipc_tests {
 /// gated step (not exposed yet — it must run through the eval gate), so this can only ever add a
 /// candidate, never crown a champion.
 #[tauri::command]
+#[specta::specta]
 pub async fn import_model_checkpoint(
     id: String,
     checkpoint_path: String,
@@ -146,20 +196,22 @@ pub async fn import_model_checkpoint(
     license: String,
     model_card_name: Option<String>,
     state: State<'_, AppState>,
-) -> Result<String, String> {
-    STRICT_RATE_LIMITER.check("import_model_checkpoint")?;
-    validate::validate_identifier(&id)?;
-    validate::validate_identifier(&source)?;
-    validate::validate_identifier(&license)?;
+) -> Result<String, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("import_model_checkpoint").map_err(|_| model_registry_rate_limited_error())?;
+    validate_model_identifier(&id, "id")?;
+    validate_model_identifier(&source, "source")?;
+    validate_model_identifier(&license, "license")?;
     if let Some(ref card) = model_card_name {
-        validate::validate_text(card, 256, "model_card_name")?;
+        validate::validate_text(card, 256, "model_card_name")
+            .map_err(|_| invalid_model_import_error("modelCardName"))?;
     }
-    let checkpoint_path = validate::validate_file_path(&checkpoint_path)?;
+    let checkpoint_path =
+        validate::validate_file_path(&checkpoint_path).map_err(|_| invalid_model_import_error("checkpointPath"))?;
     let db = state.db_arc();
     run_blocking(move || {
         // Own the restore fence in the worker itself. Cancelling the async IPC must not detach the
         // multi-GB hash from the generation it will eventually mutate.
-        let _mutation = begin_mutation()?;
+        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         // Hash the (potentially multi-GB) checkpoint off the main thread AND before taking the DB lock
         // — holding the global db mutex across the full-file SHA-256 would starve every UI DB poll.
         let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
@@ -177,12 +229,20 @@ pub async fn import_model_checkpoint(
         .map_err(|e| e.to_string())
     })
     .await
+    .map_err(|error| {
+        public_model_write_error(
+            "MODEL_CHECKPOINT_IMPORT_FAILED",
+            "The checkpoint could not be verified and registered. Open Models for recovery options.",
+            &error,
+        )
+    })
 }
 
 /// Import a content-addressed OmniASR-7B deployment. Identity comes from the verified manifest,
 /// never from renderer-supplied model/card fields, and all four behavior-determining components are
 /// hashed before the DB lock is acquired.
 #[tauri::command]
+#[specta::specta]
 pub async fn import_model_deployment(
     manifest_path: String,
     expected_deployment_sha256: String,
@@ -191,24 +251,15 @@ pub async fn import_model_deployment(
     license: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<ModelVersionSummary, String> {
-    STRICT_RATE_LIMITER.check("import_model_deployment")?;
-    validate::validate_identifier(&source)?;
-    validate::validate_identifier(&license)?;
-    validate::validate_identifier(&expected_model_id)?;
-    if expected_deployment_sha256.len() != 64
-        || !expected_deployment_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("expectedDeploymentSha256 must be a canonical lowercase SHA-256".into());
-    }
-    if manifest_path.trim().is_empty() || manifest_path.len() > 4096 || manifest_path.chars().any(char::is_control) {
-        return Err("manifestPath is empty, too long, or contains control characters".into());
-    }
+) -> Result<ModelVersionSummaryV1, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("import_model_deployment").map_err(|_| model_registry_rate_limited_error())?;
+    validate_model_identifier(&source, "source")?;
+    validate_deployment_request(&manifest_path, &expected_deployment_sha256, &expected_model_id, &license)?;
     let db = state.db_arc();
     run_blocking(move || {
         // Manifest verification can take ten minutes. It and the final registry write are one
         // generation-bound mutation, and the guard must outlive cancellation of the async caller.
-        let _mutation = begin_mutation()?;
+        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -237,16 +288,24 @@ pub async fn import_model_deployment(
         };
         let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::registry::register_verified_deployment_record(&db, &verified, &source, &license)
-            .map(ModelVersionSummary::from)
+            .map(ModelVersionSummaryV1::from)
             .map_err(|error| error.to_string())
     })
     .await
+    .map_err(|error| {
+        public_model_write_error(
+            "MODEL_DEPLOYMENT_IMPORT_FAILED",
+            "The deployment could not be verified and registered. Open Models for recovery options.",
+            &error,
+        )
+    })
 }
 
 /// One-time admission of the historically measured incumbent. This is deliberately a different
 /// command from challenger import: the registry family must be completely empty and the verified
 /// composite must match every owner-measured legacy pin. It cannot be reused for a future model.
 #[tauri::command]
+#[specta::specta]
 pub async fn bootstrap_legacy_champion(
     manifest_path: String,
     expected_deployment_sha256: String,
@@ -254,25 +313,22 @@ pub async fn bootstrap_legacy_champion(
     license: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<ModelVersionSummary, String> {
-    STRICT_RATE_LIMITER.check("bootstrap_legacy_champion")?;
-    validate::validate_identifier(&expected_model_id)?;
-    validate::validate_identifier(&license)?;
-    if expected_deployment_sha256.len() != 64
-        || !expected_deployment_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("expectedDeploymentSha256 must be a canonical lowercase SHA-256".into());
-    }
-    if manifest_path.trim().is_empty() || manifest_path.len() > 4096 || manifest_path.chars().any(char::is_control) {
-        return Err("manifestPath is empty, too long, or contains control characters".into());
-    }
+) -> Result<ModelVersionSummaryV1, crate::ipc_contract::CommandErrorV1> {
+    STRICT_RATE_LIMITER.check("bootstrap_legacy_champion").map_err(|_| model_registry_rate_limited_error())?;
+    validate_deployment_request(&manifest_path, &expected_deployment_sha256, &expected_model_id, &license)?;
     let db = state.db_arc();
-    let data_dir =
-        state.lock_data_dir().clone().ok_or_else(|| "application data directory is unavailable".to_string())?;
+    let data_dir = state.lock_data_dir().clone().ok_or_else(|| {
+        crate::ipc_contract::CommandErrorV1::new(
+            "MODEL_STATE_UNAVAILABLE",
+            "The application data location is unavailable. Open Health for recovery options.",
+            false,
+        )
+        .suggested(crate::ipc_contract::SuggestedActionV1::OpenHealth)
+    })?;
     run_blocking(move || {
         // Champion publication spans external verification, a registry transaction, and an atomic
         // pointer update. Never allow a restore to split those across database generations.
-        let _mutation = begin_mutation()?;
+        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -300,9 +356,16 @@ pub async fn bootstrap_legacy_champion(
         let model = crate::registry::bootstrap_verified_legacy_deployment(&db, &verified, &license)
             .map_err(|error| error.to_string())?;
         crate::registry::sync_champion_pointer(&db, &data_dir).map_err(|error| error.to_string())?;
-        Ok(ModelVersionSummary::from(model))
+        Ok(ModelVersionSummaryV1::from(model))
     })
     .await
+    .map_err(|error| {
+        public_model_write_error(
+            "LEGACY_CHAMPION_BOOTSTRAP_FAILED",
+            "The pinned legacy champion could not be admitted. Open Models for recovery options.",
+            &error,
+        )
+    })
 }
 
 /// Complete, non-lossy speaker inventory for the management panel. SQL NULL stays distinct from a

@@ -1,7 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import {
+  bootstrapLegacyChampion,
   getChampionEngineStatus,
+  importModelCheckpoint,
+  importModelDeployment,
   listModelVersions,
   modelsDownloadAll,
   modelsStatus,
@@ -92,5 +95,86 @@ describe('generated model-management IPC contracts', () => {
     invokeMock.mockRejectedValueOnce(refusal);
 
     await expect(getChampionEngineStatus()).rejects.toEqual(refusal);
+  });
+
+  it('binds every registry-write argument through the generated contract', async () => {
+    invokeMock.mockReset();
+    const deploymentSha = 'c'.repeat(64);
+    const candidate: ModelVersionSummaryV1 = {
+      id: 'candidate-2',
+      family: 'omniasr-7b',
+      modelCardName: null,
+      checkpointSha256: 'd'.repeat(64),
+      source: 'owner-finetune',
+      license: 'Apache-2.0',
+      status: 'candidate',
+    };
+    const champion: ModelVersionSummaryV1 = {
+      ...candidate,
+      id: 'champion-legacy',
+      status: 'champion',
+    };
+    invokeMock
+      .mockResolvedValueOnce('candidate-2')
+      .mockResolvedValueOnce(candidate)
+      .mockResolvedValueOnce(champion);
+
+    await expect(
+      importModelCheckpoint({
+        id: 'candidate-2',
+        checkpointPath: 'D:/private/candidate.onnx',
+        source: 'owner-finetune',
+        license: 'Apache-2.0',
+      }),
+    ).resolves.toBe('candidate-2');
+    await expect(
+      importModelDeployment({
+        manifestPath: 'D:/private/deployment.json',
+        expectedDeploymentSha256: deploymentSha,
+        expectedModelId: 'candidate-2',
+        source: 'owner-finetune',
+        license: 'Apache-2.0',
+      }),
+    ).resolves.toEqual(candidate);
+    await expect(
+      bootstrapLegacyChampion({
+        manifestPath: '/srv/cortex/deployment.json',
+        expectedDeploymentSha256: deploymentSha,
+        expectedModelId: 'champion-legacy',
+        license: 'Apache-2.0',
+      }),
+    ).resolves.toEqual(champion);
+
+    expect(invokeMock.mock.calls).toEqual([
+      [
+        'import_model_checkpoint',
+        {
+          id: 'candidate-2',
+          checkpointPath: 'D:/private/candidate.onnx',
+          source: 'owner-finetune',
+          license: 'Apache-2.0',
+          modelCardName: null,
+        },
+      ],
+      [
+        'import_model_deployment',
+        {
+          manifestPath: 'D:/private/deployment.json',
+          expectedDeploymentSha256: deploymentSha,
+          expectedModelId: 'candidate-2',
+          source: 'owner-finetune',
+          license: 'Apache-2.0',
+        },
+      ],
+      [
+        'bootstrap_legacy_champion',
+        {
+          manifestPath: '/srv/cortex/deployment.json',
+          expectedDeploymentSha256: deploymentSha,
+          expectedModelId: 'champion-legacy',
+          license: 'Apache-2.0',
+        },
+      ],
+    ]);
   });
 });
