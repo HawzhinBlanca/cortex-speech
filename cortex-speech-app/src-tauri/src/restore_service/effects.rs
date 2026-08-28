@@ -1796,3 +1796,145 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_review_effect_semantics;
+    use crate::db::Database;
+
+    // This module's own fixtures rather than the ones in commands.rs: those live in another file's
+    // test module (unimportable), and that file is under active refactor elsewhere, so growing it
+    // would only manufacture merge conflicts. Everything here is deliberately minimal — one paid
+    // clip, one real decision — because each test's job is to corrupt exactly ONE thing.
+
+    fn canonical_operation(index: u64) -> String {
+        format!("00000000-0000-4000-8000-{index:012x}")
+    }
+
+    /// A segment carrying the canonical pay evidence: content hash, fingerprint, source span.
+    fn paid_segment(db: &Database, id: &str) {
+        db.insert_segment(&crate::db::SpeechSegment {
+            id: id.to_string(),
+            audio_path: format!("{id}.wav"),
+            raw_transcript: "machine draft".to_string(),
+            duration_ms: 1_000,
+            confidence: Some(0.99),
+            ..crate::db::SpeechSegment::default()
+        })
+        .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET audio_content_hash = ?2,
+                        audio_fingerprint = ?3,
+                        alignment_json = '{\"source_start_ms\":0,\"source_end_ms\":1000}',
+                        duration_ms = 1000
+                  WHERE id = ?1",
+                rusqlite::params![id, "a".repeat(64), 424_242_i64],
+            )
+            .unwrap();
+    }
+
+    fn seeded_db(id: &str) -> Database {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        paid_segment(&db, id);
+        db
+    }
+
+    /// Record a real Couch review event through the production API.
+    fn couch_event(db: &Database, id: &str, action: &str, index: u64) {
+        db.record_review_event_with_operation(
+            id,
+            "Reviewer",
+            action,
+            "couch",
+            i64::try_from(index).unwrap(),
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(id, action, "", "Reviewer"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_clean_restore_target_passes_and_the_frontier_row_is_singular() {
+        // The baseline: without this, every refusal below could be passing for the wrong reason.
+        let db = seeded_db("clean-clip");
+        validate_review_effect_semantics(&db).expect("a freshly initialized database is a valid restore target");
+
+        couch_event(&db, "clean-clip", "skip", 401);
+        validate_review_effect_semantics(&db).expect("a skip creates no effect and stays valid");
+
+        // review_effect_state is the schema-v60 frontier and must be exactly one row. The FIRST
+        // version of this test tried to insert a second row and asserted only `if rows > 1` — but
+        // the column is `singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1)`, so a second
+        // row is impossible and the assertion never ran. A conditional assertion that cannot fire
+        // is not a test. The reachable violation is ZERO rows: a restored file whose frontier was
+        // dropped has no cutoff at all, and every pre-v60 row would read as effective.
+        db.connection().execute("DROP TRIGGER review_effect_state_immutable_delete", []).unwrap();
+        assert_eq!(db.connection().execute("DELETE FROM review_effect_state", []).unwrap(), 1);
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("one canonical schema-v60 frontier row"), "{error}");
+    }
+
+    #[test]
+    fn a_forged_effect_on_a_non_decision_event_is_refused() {
+        // A skip is not a decision: it pays nothing and must leave no human-decision effect. Forging
+        // one would invent paid, reviewed truth for a clip nobody judged — so the trigger is dropped
+        // first (a restored file may already contain rows written with triggers disabled, which is
+        // exactly the case this whole validation pass exists for).
+        let db = seeded_db("forged-clip");
+        couch_event(&db, "forged-clip", "skip", 402);
+        validate_review_effect_semantics(&db).unwrap();
+
+        let event_id: i64 =
+            db.connection().query_row("SELECT MAX(id) FROM review_events", [], |row| row.get(0)).unwrap();
+        let prior_revision = db.segment_review_revision("forged-clip").unwrap().unwrap();
+        db.connection().execute("DROP TRIGGER human_decision_effect_events_validate_review_event_insert", []).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_annotated_transcript,
+                     decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated)
+                 VALUES (?1, 'forged-clip', 'Reviewer', 'couch', 'edit',
+                         'served transcript', 'forged edit', 'forged edit', 1,
+                         '2026-08-29 00:00:00', ?2, ?2 + 1, 0, 0)",
+                rusqlite::params![event_id, prior_revision],
+            )
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("must not create a human-decision effect"), "{error}");
+    }
+
+    #[test]
+    fn a_decision_event_stripped_of_its_pay_effect_is_refused() {
+        // The mirror of the forgery above, and the one that costs a reviewer money: a real Couch
+        // decision whose human/pay effect is missing from the restored file. The work happened; the
+        // evidence that it should be paid did not survive. Publishing that silently is the failure.
+        let db = seeded_db("stripped-clip");
+        let revision = db.segment_review_revision("stripped-clip").unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            "stripped-clip",
+            "accept",
+            Some("machine draft"),
+            "Reviewer",
+            revision,
+            &canonical_operation(403),
+            &crate::db::review_operation_payload_hash("stripped-clip", "accept", "machine draft", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        validate_review_effect_semantics(&db).expect("a genuine phone decision is a valid restore target");
+
+        db.connection().execute("DROP TRIGGER IF EXISTS human_decision_effect_events_immutable_delete", []).ok();
+        let removed = db.connection().execute("DELETE FROM human_decision_effect_events", []).unwrap();
+        assert_eq!(removed, 1, "the fixture must have created exactly one pay effect to remove");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("does not have exactly one matching human/pay effect"),
+            "a decision without its pay effect must be refused: {error}"
+        );
+    }
+}
