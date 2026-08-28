@@ -2690,4 +2690,200 @@ mod tests {
         let error = stamp_owner_supplied_pool_rights(&db).unwrap_err();
         assert!(error.contains("revoked rights"), "unexpected refusal: {error}");
     }
+
+    #[test]
+    fn voice_certificate_refuses_forged_identity_digests_and_incomplete_dedup_authority() {
+        // The certificate is the pay-and-provenance seal on an exported voice; every refusal arm
+        // below is a way a forged or stale seal could otherwise claim a finished dataset.
+        let (_dir, db, pool) = one_clip_pool("first text");
+        let good_git_sha = "a".repeat(40);
+        let digest = "b".repeat(64);
+        let base = || VoiceCertificateInput {
+            voice_name: "Lamo",
+            resolution_sha256: &digest,
+            rights_sha256: &digest,
+            audio_sha256: &digest,
+            reviewer_sha256: &digest,
+            export_manifest_sha256: &digest,
+            export_sha256sums_sha256: &digest,
+            certificate_json: "{}",
+            certificate_sha256: &digest,
+            retained_segments: 1,
+            rejected_segments: 0,
+            total_duration_ms: 1_000,
+            created_at_ms: 1_000,
+        };
+
+        // Identity, timing, and build provenance are checked before anything else.
+        let bad_git_short = "a".repeat(39);
+        let bad_git_upper = "A".repeat(40);
+        let identity_cases: Vec<(&str, VoiceCertificateInput, &str)> = vec![
+            ("blank voice", VoiceCertificateInput { voice_name: "   ", ..base() }, "invalid identity"),
+            ("negative duration", VoiceCertificateInput { total_duration_ms: -1, ..base() }, "invalid identity"),
+            ("zero timestamp", VoiceCertificateInput { created_at_ms: 0, ..base() }, "invalid identity"),
+        ];
+        for (label, input, expected) in identity_cases {
+            let error = validate_voice_certificate_evidence(&db, &pool, &input, &good_git_sha).unwrap_err();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+        for (label, sha) in
+            [("short build sha", bad_git_short.as_str()), ("re-cased build sha", bad_git_upper.as_str())]
+        {
+            let error = validate_voice_certificate_evidence(&db, &pool, &base(), sha).unwrap_err();
+            assert!(error.contains("invalid identity"), "{label}: {error}");
+        }
+
+        // Each of the seven digests is refused BY NAME, so a broken caller knows which one it sent.
+        let bad = "not-a-digest";
+        let digest_cases: Vec<(VoiceCertificateInput, &str)> = vec![
+            (VoiceCertificateInput { resolution_sha256: bad, ..base() }, "resolution digest is invalid"),
+            (VoiceCertificateInput { rights_sha256: bad, ..base() }, "rights digest is invalid"),
+            (VoiceCertificateInput { audio_sha256: bad, ..base() }, "audio digest is invalid"),
+            (VoiceCertificateInput { reviewer_sha256: bad, ..base() }, "reviewer digest is invalid"),
+            (VoiceCertificateInput { export_manifest_sha256: bad, ..base() }, "export manifest digest is invalid"),
+            (VoiceCertificateInput { export_sha256sums_sha256: bad, ..base() }, "export checksums digest is invalid"),
+            (VoiceCertificateInput { certificate_sha256: bad, ..base() }, "certificate digest is invalid"),
+        ];
+        for (input, expected) in digest_cases {
+            let error = validate_voice_certificate_evidence(&db, &pool, &input, &good_git_sha).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+
+        // Unparseable certificate JSON is its own refusal, not a silent mismatch.
+        let error = validate_voice_certificate_evidence(
+            &db,
+            &pool,
+            &VoiceCertificateInput { certificate_json: "{broken", ..base() },
+            &good_git_sha,
+        )
+        .unwrap_err();
+        assert!(error.contains("voice certificate JSON is invalid"), "{error}");
+
+        // And with every field well-formed, a pool whose dedup authority was never applied cannot
+        // certify ANY voice — a certificate without the v64 dedup proof is not evidence.
+        let error = validate_voice_certificate_evidence(&db, &pool, &base(), &good_git_sha).unwrap_err();
+        assert!(error.contains("does not match its complete v64 pool authority"), "{error}");
+    }
+
+    /// A database seeded exactly like one_clip_pool but stopped BEFORE activation, so each
+    /// refusal test can corrupt one piece of segment evidence and watch activate() refuse it.
+    fn unactivated_db(ids: &[&str]) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        seed_champion(&db);
+        assert_eq!(crate::migrations::rollback(&db, 8).unwrap(), vec![67, 66, 65, 64, 63, 62, 61, 60]);
+        for id in ids {
+            let audio = dir.path().join(format!("{id}.wav"));
+            std::fs::write(&audio, b"wav").unwrap();
+            db.insert_segment_full(&reviewed_segment(id, &audio, "Rezan", "reviewed text")).unwrap();
+        }
+        assert_eq!(crate::migrations::run_migrations(&db).unwrap(), vec![60, 61, 62, 63, 64, 65, 66, 67]);
+        for (index, id) in ids.iter().enumerate() {
+            // Digits are valid lowercase-sha bytes, and one digit per segment keeps hashes distinct.
+            db.connection()
+                .execute(
+                    "UPDATE speech_segments SET audio_content_hash=?1 WHERE id=?2",
+                    rusqlite::params![index.to_string().repeat(64)[..64].to_string(), id],
+                )
+                .unwrap();
+        }
+        (dir, db)
+    }
+
+    const POOL_ID: &str = "123e4567-e89b-42d3-a456-426614174050";
+
+    fn member(segment_id: &str, voice_name: &str) -> PoolMemberInput {
+        PoolMemberInput { segment_id: segment_id.into(), voice_name: voice_name.into() }
+    }
+
+    #[test]
+    fn pool_activation_refuses_every_kind_of_broken_member_evidence() {
+        // Input-shape refusals need no segment at all.
+        let (_dir, db) = unactivated_db(&["clip"]);
+        assert!(activate(&db, "not-a-uuid", &[member("clip", "Lamo")])
+            .unwrap_err()
+            .contains("must be a canonical UUID"));
+        for (label, input) in [
+            ("blank segment id", member("  ", "Lamo")),
+            ("blank voice", member("clip", "  ")),
+            ("oversized voice", member("clip", &"v".repeat(81))),
+        ] {
+            let error = activate(&db, POOL_ID, &[input]).unwrap_err();
+            assert!(error.contains("invalid segment id or voice name"), "{label}: {error}");
+        }
+        assert!(activate(&db, POOL_ID, &[member("clip", "Lamo"), member("clip", "Sara")])
+            .unwrap_err()
+            .contains("assigned to two voice characters"));
+        assert!(activate(&db, POOL_ID, &[member("ghost", "Lamo")])
+            .unwrap_err()
+            .contains("segment ghost does not exist"));
+
+        // Evidence refusals: one corruption per case, each on a fresh seeded database, and the
+        // error must NAME the defect — an activation that fails vaguely is undiagnosable.
+        let evidence_cases: [(&str, &str, &str); 6] = [
+            (
+                "empty champion draft",
+                "UPDATE speech_segments SET raw_transcript='   ' WHERE id='clip'",
+                "no usable champion transcript",
+            ),
+            (
+                "placeholder-only draft",
+                "UPDATE speech_segments SET raw_transcript='[MUSIC]' WHERE id='clip'",
+                "no usable champion transcript",
+            ),
+            (
+                "non-champion engine",
+                "UPDATE speech_segments SET model_version_id='finetuned-mms-ckb' WHERE id='clip'",
+                "not backed by the current OmniASR-7B champion",
+            ),
+            (
+                "missing audio hash",
+                "UPDATE speech_segments SET audio_content_hash=NULL WHERE id='clip'",
+                "no canonical audio-content hash",
+            ),
+            (
+                "missing source span",
+                "UPDATE speech_segments SET alignment_json='{}' WHERE id='clip'",
+                "no canonical source span",
+            ),
+            (
+                "inverted timing",
+                "UPDATE speech_segments SET alignment_json='{\"source_start_ms\":1000,\"source_end_ms\":1000}' WHERE id='clip'",
+                "invalid audio timing evidence",
+            ),
+        ];
+        for (label, sabotage, expected) in evidence_cases {
+            let (_dir, db) = unactivated_db(&["clip"]);
+            db.connection().execute(sabotage, []).unwrap();
+            let error = activate(&db, POOL_ID, &[member("clip", "Lamo")]).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+
+        // Two members that are the SAME canonical audio window are one clip wearing two ids —
+        // admitting both would pay for the same listening twice.
+        let (_dir, db) = unactivated_db(&["clip-a", "clip-b"]);
+        db.connection()
+            .execute(
+                "UPDATE speech_segments SET audio_content_hash=?1 WHERE id IN ('clip-a','clip-b')",
+                ["7".repeat(64)],
+            )
+            .unwrap();
+        let error = activate(&db, POOL_ID, &[member("clip-a", "Lamo"), member("clip-b", "Lamo")]).unwrap_err();
+        assert!(error.contains("same canonical audio window"), "{error}");
+    }
+
+    #[test]
+    fn an_active_pool_is_immutable_but_reactivation_of_the_same_pool_is_idempotent() {
+        let (_dir, db, pool) = one_clip_pool("first text");
+        // The exact same activation is a harmless replay and returns the existing pool…
+        let again = activate(&db, &pool.pool_id, &[member("clip", "Lamo")]).unwrap();
+        assert_eq!(
+            (again.pool_id.as_str(), again.focus_sha256.as_str()),
+            (pool.pool_id.as_str(), pool.focus_sha256.as_str())
+        );
+        // …while ANY different pool — even just a different id over the same clips — is refused.
+        let error = activate(&db, "999e4567-e89b-42d3-a456-426614174999", &[member("clip", "Lamo")]).unwrap_err();
+        assert!(error.contains("a different immutable review pool is already active"), "{error}");
+    }
 }
