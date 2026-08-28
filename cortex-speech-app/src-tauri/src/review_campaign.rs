@@ -2201,8 +2201,49 @@ mod tests {
         // first-pass work land after the freeze it claims to prove. The boundary must be exact.
         let (db, ids, _base, _temp) = seeded_first_pass(2);
         let maximum = db.max_review_event_id().unwrap();
-        assert!(activate_second_pass(&db, &ids, maximum - 1).is_err());
+        let error = activate_second_pass(&db, &ids, maximum - 1).unwrap_err();
+        assert!(error.contains("compare-and-swap failed"), "{error}");
         assert!(load(&db).unwrap().unwrap().progress.is_none(), "a refused activation must write nothing");
+    }
+
+    #[test]
+    fn second_pass_activation_refuses_every_broken_precondition() {
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert!(activate_second_pass(&empty, &HashSet::new(), 0)
+            .unwrap_err()
+            .contains("no sequential review campaign"));
+
+        // Already past the boundary: activation is a one-way door, not an idempotent call.
+        let (activated, ids_activated, _base) = activated_second_pass();
+        let maximum = activated.max_review_event_id().unwrap();
+        assert!(activate_second_pass(&activated, &ids_activated, maximum)
+            .unwrap_err()
+            .contains("not at the first-pass transition boundary"));
+
+        // A focus that is not byte-for-byte the policy's focus — one clip swapped — is refused
+        // before anything is written, whatever its size.
+        let (db, ids, _base2, _temp) = seeded_first_pass(2);
+        let boundary = db.max_review_event_id().unwrap();
+        let mut swapped: HashSet<String> = ids.iter().cloned().collect();
+        let removed = swapped.iter().next().unwrap().clone();
+        swapped.remove(&removed);
+        swapped.insert("some-other-clip".into());
+        assert!(activate_second_pass(&db, &swapped, boundary)
+            .unwrap_err()
+            .contains("supplied focus does not match the immutable first-pass policy"));
+
+        // A boundary before the campaign even activated is nonsense on its face.
+        assert!(activate_second_pass(&db, &ids, -1).unwrap_err().contains("predates campaign activation"));
+
+        // One focus clip losing its verified first-pass effect makes the transition unprovable,
+        // and the refusal names the exact count so the gap is findable.
+        let mut sorted: Vec<String> = ids.iter().cloned().collect();
+        sorted.sort();
+        db.connection().execute("UPDATE speech_segments SET verified = 0 WHERE id = ?1", [&sorted[0]]).unwrap();
+        let incomplete = activate_second_pass(&db, &ids, boundary).unwrap_err();
+        assert!(incomplete.contains("first pass is not complete: 1/2"), "{incomplete}");
+        assert!(load(&db).unwrap().unwrap().progress.is_none(), "every refusal above must write nothing");
     }
 
     #[test]
