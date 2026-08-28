@@ -1024,8 +1024,19 @@ mod tests {
         assert!(source.is_file());
     }
 
+    /// The technical-probe registry is a process-global static with a hard concurrency cap of
+    /// TECHNICAL_PROBE_MAX_CONCURRENCY, and `cargo test` runs these tests in parallel. Without this
+    /// lock a sibling test can hold a slot while
+    /// `technical_probe_strictly_limits_distinct_blocking_sources` is mid-setup: its second worker is
+    /// then refused with ProbeBusy and returns WITHOUT reaching `started.wait()`, so its 3-party
+    /// Barrier waits forever for a party that will never arrive. A std Barrier has no timeout, so the
+    /// whole suite hangs — which is exactly how the Rust coverage prerequisite burned its full 7200s
+    /// budget on CI while reporting nothing. Same idiom as GLOBAL_SESSION_LOCK in couch.rs.
+    static PROBE_REGISTRY_SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn technical_probe_strictly_limits_distinct_blocking_sources() {
+        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let started = Arc::new(std::sync::Barrier::new(3));
         let release = Arc::new(std::sync::Barrier::new(3));
         let mut workers = Vec::new();
@@ -1071,6 +1082,7 @@ mod tests {
 
     #[test]
     fn concurrent_long_healthy_audio_claims_create_zero_effects() {
+        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (directory, store, runtime) = store_with_clip();
         // Sixteen minutes at 8 kHz is deliberately much larger than a review clip. The probe walks
         // packets without accumulating PCM; same-source callers share at most one active flight.
@@ -1112,6 +1124,7 @@ mod tests {
 
     #[test]
     fn truncated_audio_tail_is_never_accepted_as_clean_eof() {
+        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("truncated-tail.wav");
         write_wav(&path, 16_000, 16_000);
