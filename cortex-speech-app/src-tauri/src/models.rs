@@ -1312,20 +1312,30 @@ pub fn init_ort_dylib_path() {
         }
     }
 
-    // 2. Bundled under the active models directory. On Windows the library is
-    //    packaged inside a directory literally named `onnxruntime.dll`; all
-    //    platforms also accept it placed flat in the models directory.
+    // 2. Bundled under the models directory, resolved PER FILE. On Windows the library is packaged
+    //    inside a directory literally named `onnxruntime.dll`; all platforms also accept it flat.
+    //
+    //    `resolve_model_file`, NOT `active_models_dir().join`: the latter keys the ONE bundled root
+    //    on OmniASR-CTC presence (`select_bundled_models_dir`), but the CTC weights are
+    //    OPTIONAL_ASR_ITEMS that `fetch-models` deliberately never downloads on a standard path. So
+    //    a models directory holding the Silero VAD AND this very runtime is not recognised at all:
+    //    the root falls back to `<exe>/models`, which does not exist under cargo-llvm-cov's deeper
+    //    `target/llvm-cov-target/debug/deps` layout, the library is never found, and because `ort`
+    //    is built with load-dynamic it then BLOCKS on the system loader rather than failing —
+    //    45 s per attempt. Measured on CI 2026-08-28: 8 tests failed exactly that way, and before
+    //    the VAD probe existed the same condition hung the whole coverage run past its 7200 s
+    //    budget with no output at all. This is the identical all-or-nothing class that
+    //    `bundled_dir_containing` was written to fix, recurring in the runtime loader.
     if resolved_path.is_none() {
-        let active_dir = active_models_dir();
         #[cfg(target_os = "windows")]
         {
-            let nested = active_dir.join("onnxruntime.dll").join(dylib);
+            let nested = resolve_model_file(&format!("onnxruntime.dll/{dylib}"));
             if nested.exists() {
                 resolved_path = Some(nested);
             }
         }
         if resolved_path.is_none() {
-            let flat = active_dir.join(dylib);
+            let flat = resolve_model_file(dylib);
             if flat.exists() {
                 resolved_path = Some(flat);
             }
@@ -1930,6 +1940,52 @@ mod tests {
         std::fs::write(user_dir.join(OMNIASR_CTC_300M_TOKENS), b"tokens").expect("truncated tokens");
 
         assert_ne!(resolve_models_dir(&user_dir), user_dir);
+    }
+
+    #[test]
+    fn the_onnx_runtime_is_found_in_a_models_dir_that_has_no_optional_asr_weights() {
+        // CI 2026-08-28: `fetch-models` downloads the Silero VAD and onnxruntime.dll but NOT the
+        // OmniASR CTC weights (they are OPTIONAL_ASR_ITEMS). `select_bundled_models_dir` keys the
+        // one bundled root on CTC presence, so that directory was not recognised at all, the ORT
+        // library was never found, and `ort` — built with load-dynamic — BLOCKED on the system
+        // loader instead of failing: 45 s per attempt, 8 failed tests, and before the VAD probe
+        // existed a mute two-hour coverage timeout. Per-file resolution must find the runtime in a
+        // directory whose only contents are the VAD and the runtime itself.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(models.join("onnxruntime.dll")).expect("nested runtime dir");
+        let dylib = ort_dylib_filename();
+        let nested = models.join("onnxruntime.dll").join(dylib);
+        std::fs::write(&nested, b"runtime bytes").expect("runtime");
+        std::fs::write(models.join("silero_vad_v4.onnx"), b"vad").expect("vad");
+        for _ in 0..500 {
+            if nested.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // No CTC weights anywhere in this directory — exactly the CI shape.
+        assert!(!models.join(OMNIASR_CTC_300M_MODEL).exists());
+        assert!(
+            !omniasr_ctc_300m_present_in(&models) && !omniasr_ctc_1b_present_in(&models),
+            "fixture must reproduce the CI shape: a models dir with NO optional ASR weights"
+        );
+        // The selector cannot identify this root. Candidate order mirrors the real thing: the
+        // exe-relative dir comes FIRST and under cargo-llvm-cov's deeper target layout it does not
+        // exist, while the genuine models dir comes later. With no CTC weights in either, the
+        // selector falls back to `candidates.first()` — the nonexistent one — and orphans the dir
+        // that actually holds the runtime.
+        let exe_relative = tmp.path().join("llvm-cov-target").join("debug").join("deps").join("models");
+        assert!(!exe_relative.exists(), "fixture: the exe-relative candidate must be absent");
+        assert_eq!(
+            select_bundled_models_dir(vec![exe_relative.clone(), models.clone()]),
+            exe_relative,
+            "precondition: with no CTC anywhere the selector orphans the real models dir"
+        );
+        // ...but per-file resolution still finds the runtime inside it.
+        let found = resolve_file_in(None, &models, &format!("onnxruntime.dll/{dylib}"));
+        assert_eq!(found, nested, "per-file resolution must locate the bundled ONNX runtime");
+        assert!(found.exists(), "the resolved runtime path must exist");
     }
 
     #[test]
