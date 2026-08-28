@@ -1120,7 +1120,7 @@ pub fn clear_human_decision(state: State<'_, AppState>, segment_id: String) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_review_v1_on, mark_segment_unusable_v1_on, persist_whole_segment_update_on,
+        commit_review_v1_on, mark_segment_unusable_v1_on, persist_whole_segment_update_on, public_playback_error,
         public_precommit_playback_binding_error, public_segment_delete_error, public_segment_metadata_error,
         public_speaker_rename_error, record_human_decision_on, retired_legacy_decision_error,
         validate_playback_receipt_identity,
@@ -1135,6 +1135,46 @@ mod tests {
         require_listened, ReviewWriteStore, SegmentDeleteError, SegmentMetadataUpdateError, SpeakerRenameError,
     };
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn every_playback_refusal_maps_to_a_typed_public_code_and_scrubs_the_backend_text() {
+        use crate::ipc_contract::SuggestedActionV1 as A;
+        // (internal marker, public code, retryable, suggested action) — one row per arm, in the
+        // mapper's own order so a shadowed marker would show up as the WRONG code, not a miss.
+        let arms: [(&str, &str, bool, A); 16] = [
+            ("E_PLAYBACK_COVERAGE_INSUFFICIENT", "PLAYBACK_COVERAGE_INSUFFICIENT", true, A::Retry),
+            ("E_NO_PLAYBACK_EVIDENCE", "NO_PLAYBACK_EVIDENCE", true, A::ReloadClip),
+            ("E_PLAYBACK_TIME_IMPLAUSIBLE", "PLAYBACK_TIME_IMPLAUSIBLE", true, A::ReloadClip),
+            ("E_PLAYBACK_REVISION_CHANGED", "PLAYBACK_REVISION_CHANGED", true, A::ReloadClip),
+            ("E_PLAYBACK_EVIDENCE_CHANGED", "PLAYBACK_EVIDENCE_CHANGED", true, A::ReloadClip),
+            ("session is missing or expired", "PLAYBACK_SESSION_EXPIRED", true, A::ReloadClip),
+            ("token expired mid-flight", "PLAYBACK_SESSION_EXPIRED", true, A::ReloadClip),
+            ("active-time budget exceeded", "PLAYBACK_SESSION_EXPIRED", true, A::ReloadClip),
+            ("E_PLAYBACK_SESSION_LIMIT", "PLAYBACK_SESSION_LIMIT", true, A::ReloadClip),
+            ("E_PLAYBACK_SESSION_FINALIZED", "PLAYBACK_SESSION_FINALIZED", false, A::Retry),
+            ("E_PLAYBACK_CANCEL_IDENTITY_MISMATCH", "PLAYBACK_CANCEL_IDENTITY_MISMATCH", false, A::ReloadClip),
+            ("receipt covers a different imported source", "PLAYBACK_AUTHORITY_MISMATCH", false, A::ReloadClip),
+            ("receipt covers a different interval union", "PLAYBACK_AUTHORITY_MISMATCH", false, A::ReloadClip),
+            ("Database Is LOCKED by another writer", "DATABASE_BUSY", true, A::Retry),
+            ("the DATABASE IS BUSY right now", "DATABASE_BUSY", true, A::Retry),
+            ("some backend detail nobody phone-side should read", "PLAYBACK_PROOF_FAILED", false, A::OpenHealth),
+        ];
+        for (marker, code, retryable, action) in arms {
+            // The internal text rides inside a larger message, the way real errors arrive.
+            let internal = format!("refused: {marker} (C:\\private\\owner-profile\\clip.wav)");
+            let error = public_playback_error(&internal);
+            assert_eq!(error.code, code, "{marker}");
+            assert_eq!(error.retryable, retryable, "{marker}");
+            assert_eq!(error.suggested_action, Some(action), "{marker}");
+            // The mapper exists to SCRUB: no fragment of the backend text — least of all a private
+            // filesystem path — may survive into what a reviewer's phone displays.
+            assert!(
+                !error.message.contains("owner-profile") && !error.message.contains(marker),
+                "{marker}: public message leaked internal text: {}",
+                error.message
+            );
+        }
+    }
 
     #[test]
     fn finalization_media_binding_refusal_is_a_typed_proven_non_commit() {
