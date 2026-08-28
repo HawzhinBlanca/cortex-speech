@@ -836,3 +836,147 @@ pub(crate) fn validate_review_compensation_semantics(db: &crate::db::Database) -
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        canonical_work_audio_identity, canonical_work_id_has_writer_shape, exact_review_entitlement,
+        is_canonical_lowercase_64_hex, is_canonical_lowercase_uuid, review_action_basis_points,
+        valid_compensation_reviewer,
+    };
+
+    const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn work_id(reviewer_key: &str, hash: &str, start: i64, end: i64) -> String {
+        format!("reviewer-work-v1:{}:{reviewer_key}:audio-segment-v1:{hash}:{start}:{end}", reviewer_key.len())
+    }
+
+    #[test]
+    fn entitlement_is_the_published_rate_computed_exactly_or_refused() {
+        // The policy is 18,000 IQD per audio-hour at full rate, so one second of `edit` work is
+        // exactly 5 IQD = 5_000_000 micro-IQD. Asserting the literal keeps a rate change from
+        // silently passing as "still exact".
+        assert_eq!(exact_review_entitlement(1_000, crate::db::REVIEW_PAY_EDIT_BPS).unwrap(), 5_000_000);
+        assert_eq!(exact_review_entitlement(3_600_000, crate::db::REVIEW_PAY_EDIT_BPS).unwrap(), 18_000_000_000);
+        // accept/reject are a tenth of the edit rate; skip is unpaid and must compute to zero
+        // rather than being refused -- a skip is legitimate work product, worth nothing.
+        assert_eq!(exact_review_entitlement(1_000, crate::db::REVIEW_PAY_ACCEPT_BPS).unwrap(), 500_000);
+        assert_eq!(exact_review_entitlement(1_000, crate::db::REVIEW_PAY_REJECT_BPS).unwrap(), 500_000);
+        assert_eq!(exact_review_entitlement(1_000, crate::db::REVIEW_PAY_SKIP_BPS).unwrap(), 0);
+
+        for (label, duration, bps) in [
+            ("zero duration", 0_i64, 10_000_i64),
+            ("negative duration", -1, 10_000),
+            ("negative basis points", 1_000, -1),
+            ("basis points above 100%", 1_000, 10_001),
+        ] {
+            let error = exact_review_entitlement(duration, bps).unwrap_err();
+            assert!(error.contains("invalid duration or basis points"), "{label}: {error}");
+        }
+
+        // Money must divide exactly into micro-IQD. A fraction of a micro-IQD is refused rather
+        // than rounded -- rounding is how a ledger and its reviewers quietly stop agreeing.
+        let error = exact_review_entitlement(1, 1).unwrap_err();
+        assert!(error.contains("not an exact micro-IQD amount"), "{error}");
+
+        // An entitlement past i64 is refused rather than wrapped. 2e15 ms of audio is absurd, which
+        // is the point: absurd input must fail loudly at the boundary, not become a negative debt.
+        let error = exact_review_entitlement(2_000_000_000_000_000, crate::db::REVIEW_PAY_EDIT_BPS).unwrap_err();
+        assert!(error.contains("exceeds the supported integer range"), "{error}");
+
+        // NOTE: the i128 overflow arm above it is deliberately unreachable from here -- with
+        // basis points capped at 10_000 and duration an i64, the product tops out around 1.7e33,
+        // far below i128::MAX. It is defence in depth against a future caller, not dead code, and
+        // is left untested rather than exercised through a fake path that would prove nothing.
+    }
+
+    #[test]
+    fn every_paid_action_has_a_rate_and_nothing_else_does() {
+        for (action, expected) in [
+            ("edit", crate::db::REVIEW_PAY_EDIT_BPS),
+            ("accept", crate::db::REVIEW_PAY_ACCEPT_BPS),
+            ("reject", crate::db::REVIEW_PAY_REJECT_BPS),
+            ("skip", crate::db::REVIEW_PAY_SKIP_BPS),
+        ] {
+            assert_eq!(review_action_basis_points(action), Some(expected), "{action}");
+        }
+        // Case and whitespace are NOT normalized here: an action that does not match exactly earns
+        // nothing, so a ledger row carrying "Edit" cannot claim the edit rate.
+        for unknown in ["Edit", "edit ", "", "approve", "undo", "flag"] {
+            assert_eq!(review_action_basis_points(unknown), None, "{unknown:?} must not carry a rate");
+        }
+    }
+
+    #[test]
+    fn a_compensation_reviewer_identity_is_exact_and_bounded() {
+        assert!(valid_compensation_reviewer("Rubar"));
+        assert!(valid_compensation_reviewer(&"n".repeat(40)));
+        for bad in ["", " Rubar", "Rubar ", "Ru\u{0007}bar", "Ru\nbar"] {
+            assert!(!valid_compensation_reviewer(bad), "{bad:?} must be refused");
+        }
+        assert!(!valid_compensation_reviewer(&"n".repeat(41)), "the 40-character bound must bind");
+    }
+
+    #[test]
+    fn a_work_id_cannot_be_split_reattributed_or_invented() {
+        // This is the anti-fraud rule the module's own comment names: without it "a forged target
+        // could split one clip into several invented work ids and earn the full rate on every
+        // split". A work id is only canonical if it reproduces the writer's exact namespace.
+        let genuine = work_id("rubar", HASH, 0, 1_000);
+        assert!(canonical_work_id_has_writer_shape(&genuine, "Rubar", 1_000), "the real shape must be accepted");
+        assert_eq!(canonical_work_audio_identity(&genuine, "Rubar"), Some((HASH, 0, 1_000)));
+        // The reviewer key is lowercased, so the same person typed differently still matches.
+        assert!(canonical_work_id_has_writer_shape(&genuine, "  RUBAR  ", 1_000));
+
+        // Re-attribution: one reviewer's work id must not validate under another's name, or paid
+        // work could be moved between people by editing a single string.
+        assert!(!canonical_work_id_has_writer_shape(&genuine, "Alle", 1_000));
+        assert_eq!(canonical_work_audio_identity(&genuine, "Alle"), None);
+
+        // The length prefix is why "rub" + "ar:..." cannot impersonate "rubar": the count and the
+        // key must agree, so a shifted boundary fails instead of silently re-parsing.
+        let forged_prefix = format!("reviewer-work-v1:3:rubar:audio-segment-v1:{HASH}:0:1000");
+        assert!(!canonical_work_id_has_writer_shape(&forged_prefix, "Rubar", 1_000));
+
+        // Splitting: half the clip claimed as a whole unit must not validate against the real
+        // duration, which is what stops one paid clip becoming several.
+        let split = work_id("rubar", HASH, 0, 500);
+        assert!(!canonical_work_id_has_writer_shape(&split, "Rubar", 1_000), "a half span cannot claim a full clip");
+
+        for (label, id) in [
+            ("non-hex content hash", work_id("rubar", &"z".repeat(64), 0, 1_000)),
+            ("short content hash", work_id("rubar", &"a".repeat(63), 0, 1_000)),
+            ("uppercase content hash", work_id("rubar", &HASH.to_uppercase(), 0, 1_000)),
+            ("inverted span", work_id("rubar", HASH, 1_000, 0)),
+            ("unparseable span", format!("reviewer-work-v1:5:rubar:audio-segment-v1:{HASH}:zero:1000")),
+            ("extra identity segment", format!("reviewer-work-v1:5:rubar:audio-segment-v1:{HASH}:0:1000:9")),
+            ("wrong namespace", format!("reviewer-work-v2:5:rubar:audio-segment-v1:{HASH}:0:1000")),
+            ("bare identity", format!("{HASH}:0:1000")),
+        ] {
+            assert!(!canonical_work_id_has_writer_shape(&id, "Rubar", 1_000), "{label} must be refused");
+            assert_eq!(canonical_work_audio_identity(&id, "Rubar"), None, "{label} must yield no identity");
+        }
+
+        // A negative start is refused by the identity reader even though the shape check is
+        // satisfied by the span/duration rule -- the two guards do not rely on each other.
+        let negative = work_id("rubar", HASH, -1_000, 0);
+        assert_eq!(canonical_work_audio_identity(&negative, "Rubar"), None);
+    }
+
+    #[test]
+    fn canonical_digest_and_uuid_shapes_are_strict() {
+        assert!(is_canonical_lowercase_64_hex(HASH));
+        for bad in ["", &"a".repeat(63), &"a".repeat(65), &HASH.to_uppercase(), &"g".repeat(64)] {
+            assert!(!is_canonical_lowercase_64_hex(bad), "{bad:?}");
+        }
+        // A UUID WITH HEX LETTERS in it: the first version of this test used
+        // "00000000-0000-4000-8000-000000000001", whose .to_uppercase() is a no-op because it
+        // contains no letters -- so the "uppercase is refused" case was asserting against the
+        // valid value and failed. The case only means something with letters to re-case.
+        let canonical = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        assert!(is_canonical_lowercase_uuid(canonical));
+        for bad in [canonical.to_uppercase(), canonical.replace('-', ""), "not-a-uuid".to_string(), String::new()] {
+            assert!(!is_canonical_lowercase_uuid(&bad), "{bad:?}");
+        }
+    }
+}
