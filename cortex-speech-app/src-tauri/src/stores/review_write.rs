@@ -1081,6 +1081,72 @@ mod tests {
     }
 
     #[test]
+    fn a_follower_shares_the_leaders_flight_and_never_runs_its_own_probe() {
+        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let leader_started = Arc::clone(&started);
+        let leader = std::thread::spawn(move || {
+            probe_technical_audio_failure_single_flight_with(
+                &"a".repeat(64),
+                Some(&"b".repeat(64)),
+                Path::new("unused"),
+                move |_path, _deadline| {
+                    leader_started.wait();
+                    release_rx.recv().unwrap();
+                    TechnicalAudioFailureEvidence {
+                        observation: TechnicalAudioProbeObservation::Healthy,
+                        source_blake3: Some("leader-evidence".into()),
+                    }
+                },
+            )
+        });
+        // After this, the leader's flight is REGISTERED and blocked on the channel: it cannot
+        // complete (and deregister) until the helper below releases it, so the same-key call from
+        // this thread is guaranteed to join as a follower, never to become a second leader.
+        started.wait();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(750));
+            let _ = release_tx.send(());
+        });
+        // The follower's own closure returns a SENTINEL: if the single-flight ever ran it, the
+        // evidence below would say decode-failed and the assertion names the defect exactly.
+        let follower = probe_technical_audio_failure_single_flight_with(
+            &"a".repeat(64),
+            Some(&"b".repeat(64)),
+            Path::new("unused"),
+            |_path, _deadline| TechnicalAudioFailureEvidence {
+                observation: TechnicalAudioProbeObservation::DecodeFailed,
+                source_blake3: Some("follower-probe-ran-when-it-must-not".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(follower.observation, TechnicalAudioProbeObservation::Healthy);
+        assert_eq!(follower.source_blake3.as_deref(), Some("leader-evidence"));
+        let leader_evidence = leader.join().unwrap().unwrap();
+        assert_eq!(leader_evidence, follower, "one probe, one answer, every waiter");
+        assert!(lock_probe_registry().active.is_empty(), "the finished flight must deregister");
+    }
+
+    #[test]
+    fn a_panicking_probe_is_contained_as_inconclusive_and_frees_its_slot() {
+        let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A decoder crash must neither poison the registry nor invent a verdict: Inconclusive is
+        // the honest "the probe itself failed", and the slot must come back for the next claim.
+        let evidence = probe_technical_audio_failure_single_flight_with(
+            &"2".repeat(64),
+            None,
+            Path::new("unused"),
+            |_path, _deadline| panic!("decoder blew up mid-probe"),
+        )
+        .unwrap();
+        assert_eq!(evidence.observation, TechnicalAudioProbeObservation::Inconclusive);
+        assert_eq!(evidence.source_blake3, None);
+        assert!(lock_probe_registry().active.is_empty(), "a crashed probe must still free its slot");
+    }
+
+    #[test]
     fn concurrent_long_healthy_audio_claims_create_zero_effects() {
         let _serial = PROBE_REGISTRY_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (directory, store, runtime) = store_with_clip();

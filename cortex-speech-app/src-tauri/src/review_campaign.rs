@@ -1929,4 +1929,306 @@ mod tests {
         assert!(output.join("SHA256SUMS").is_file());
         assert!(output.join("_COMPLETE.json").is_file());
     }
+
+    /// A valid progress body for `phase`, built the way activate_second_pass/adjudicate would
+    /// persist it — each test below then breaks exactly ONE clause and must be refused for it.
+    fn valid_progress(policy: &SequentialReviewCampaign, phase: CampaignPhase) -> CampaignProgress {
+        let (decisions, adjudications, conflicts) = match phase {
+            CampaignPhase::FirstPassActive | CampaignPhase::SecondPassActive => (0, 0, 0),
+            CampaignPhase::AdjudicationActive => (policy.focus_segment_count, 0, 1),
+            CampaignPhase::Completed => (policy.focus_segment_count, policy.focus_segment_count, 0),
+        };
+        CampaignProgress {
+            schema_version: 1,
+            campaign_id: policy.campaign_id.clone(),
+            phase,
+            transition_id: "223e4567-e89b-42d3-a456-426614174111".into(),
+            first_reviewer: "Rezan".into(),
+            second_reviewer: SECOND_PASS_REVIEWER.into(),
+            focus_segment_count: policy.focus_segment_count,
+            focus_sha256: policy.focus_sha256.clone(),
+            max_review_event_id: policy.activated_at_review_event_id,
+            independent_decision_count: decisions,
+            adjudication_count: adjudications,
+            conflicts_remaining: conflicts,
+        }
+    }
+
+    fn parse_progress_of(
+        progress: &CampaignProgress,
+        policy: &SequentialReviewCampaign,
+    ) -> Result<CampaignProgress, String> {
+        parse_progress(&serde_json::to_string(progress).unwrap(), policy)
+    }
+
+    #[test]
+    fn progress_binding_refuses_every_single_field_drift() {
+        let policy = valid_policy();
+
+        // The reference bodies themselves must parse, or the refusals below prove nothing.
+        for phase in [CampaignPhase::SecondPassActive, CampaignPhase::AdjudicationActive, CampaignPhase::Completed] {
+            let parsed = parse_progress_of(&valid_progress(&policy, phase), &policy).unwrap();
+            assert_eq!(parsed.phase, phase);
+        }
+
+        assert!(parse_progress("{not json", &policy).unwrap_err().contains("progress is invalid"));
+
+        // Reviewer names are trimmed BEFORE the binding comparison, exactly like the roster.
+        let mut padded = valid_progress(&policy, CampaignPhase::SecondPassActive);
+        padded.first_reviewer = " Rezan ".into();
+        padded.second_reviewer = format!(" {SECOND_PASS_REVIEWER} ");
+        assert!(parse_progress_of(&padded, &policy).is_ok());
+
+        // Every clause of the binding check refuses on its own: progress written for any OTHER
+        // campaign, count, digest, or event boundary must never be accepted by this one.
+        let breaks: Vec<(&str, Box<dyn Fn(&mut CampaignProgress)>)> = vec![
+            ("schema_version", Box::new(|p| p.schema_version = 2)),
+            ("campaign_id", Box::new(|p| p.campaign_id = "323e4567-e89b-42d3-a456-426614174222".into())),
+            ("first_reviewer", Box::new(|p| p.first_reviewer = "Aram".into())),
+            ("second_reviewer", Box::new(|p| p.second_reviewer = "Rezan".into())),
+            ("focus_segment_count", Box::new(|p| p.focus_segment_count += 1)),
+            ("focus_sha256", Box::new(|p| p.focus_sha256 = "b".repeat(64))),
+            ("max_review_event_id", Box::new(|p| p.max_review_event_id -= 1)),
+        ];
+        for (label, sabotage) in breaks {
+            let mut progress = valid_progress(&policy, CampaignPhase::SecondPassActive);
+            sabotage(&mut progress);
+            let error = parse_progress_of(&progress, &policy).unwrap_err();
+            assert!(error.contains("does not match the bound campaign"), "{label}: {error}");
+        }
+
+        // The transition id is evidence, so a non-canonical or re-cased UUID is a forgery, not a nit.
+        let mut bad_uuid = valid_progress(&policy, CampaignPhase::SecondPassActive);
+        bad_uuid.transition_id = "not-a-uuid".into();
+        assert!(parse_progress_of(&bad_uuid, &policy).unwrap_err().contains("must be a canonical UUID"));
+        let mut upper_uuid = valid_progress(&policy, CampaignPhase::SecondPassActive);
+        upper_uuid.transition_id = upper_uuid.transition_id.to_uppercase();
+        assert!(parse_progress_of(&upper_uuid, &policy).unwrap_err().contains("lowercase hyphenated"));
+    }
+
+    #[test]
+    fn progress_phase_invariants_refuse_impossible_histories() {
+        let policy = valid_policy();
+
+        // First-pass state lives in the immutable base policy; a progress row claiming it is a
+        // second copy of the phase authority and gets refused outright.
+        let first = valid_progress(&policy, CampaignPhase::FirstPassActive);
+        assert!(parse_progress_of(&first, &policy).unwrap_err().contains("represented by the immutable base policy"));
+
+        // A freshly activated second pass cannot already contain completed work.
+        for sabotage in [
+            (|p: &mut CampaignProgress| p.independent_decision_count = 1) as fn(&mut CampaignProgress),
+            |p| p.adjudication_count = 1,
+            |p| p.conflicts_remaining = 1,
+        ] {
+            let mut progress = valid_progress(&policy, CampaignPhase::SecondPassActive);
+            sabotage(&mut progress);
+            assert!(parse_progress_of(&progress, &policy).unwrap_err().contains("premature completion counts"));
+        }
+
+        // Adjudication exists only BETWEEN a complete independent pass and the last conflict.
+        for sabotage in [
+            (|p: &mut CampaignProgress| p.independent_decision_count -= 1) as fn(&mut CampaignProgress),
+            |p| p.conflicts_remaining = 0,
+            |p| p.adjudication_count = p.focus_segment_count,
+        ] {
+            let mut progress = valid_progress(&policy, CampaignPhase::AdjudicationActive);
+            sabotage(&mut progress);
+            assert!(parse_progress_of(&progress, &policy).unwrap_err().contains("impossible completion counts"));
+        }
+
+        // "Completed" with anything left over is the lie this whole module exists to prevent.
+        for sabotage in [
+            (|p: &mut CampaignProgress| p.independent_decision_count -= 1) as fn(&mut CampaignProgress),
+            |p| p.adjudication_count -= 1,
+            |p| p.conflicts_remaining = 1,
+        ] {
+            let mut progress = valid_progress(&policy, CampaignPhase::Completed);
+            sabotage(&mut progress);
+            assert!(parse_progress_of(&progress, &policy).unwrap_err().contains("not complete"));
+        }
+    }
+
+    #[test]
+    fn policy_validation_refuses_every_malformed_field() {
+        // Each variant breaks ONE validate() clause. The error text is asserted so a test can never
+        // pass because a DIFFERENT clause fired first.
+        let cases: Vec<(Box<dyn Fn(&mut SequentialReviewCampaign)>, &str)> = vec![
+            (Box::new(|p| p.schema_version = 2), "schema_version must be 1"),
+            (Box::new(|p| p.campaign_id = "nope".into()), "must be a canonical UUID"),
+            (Box::new(|p| p.campaign_id = p.campaign_id.to_uppercase()), "lowercase hyphenated"),
+            (Box::new(|p| p.mode = "parallel".into()), "mode/status is unsupported"),
+            (Box::new(|p| p.status = "second_pass_active".into()), "mode/status is unsupported"),
+            (Box::new(|p| p.reviewer = "   ".into()), "invalid reviewer"),
+            (Box::new(|p| p.reviewer = "x".repeat(41)), "invalid reviewer"),
+            (Box::new(|p| p.reviewer = "Re\u{0007}zan".into()), "invalid reviewer"),
+            (Box::new(|p| p.reviewer = "Aram".into()), "authorized only for Rezan"),
+            (Box::new(|p| p.after_review_event_id = -1), "invalid event boundary or focus size"),
+            (
+                Box::new(|p| p.activated_at_review_event_id = p.after_review_event_id - 1),
+                "invalid event boundary or focus size",
+            ),
+            (Box::new(|p| p.focus_segment_count = 0), "invalid event boundary or focus size"),
+            (Box::new(|p| p.focus_sha256 = "a".repeat(63)), "lowercase SHA-256"),
+            (Box::new(|p| p.focus_sha256 = "A".repeat(64)), "lowercase SHA-256"),
+            (Box::new(|p| p.focus_sha256 = "g".repeat(64)), "lowercase SHA-256"),
+        ];
+        for (sabotage, expected) in cases {
+            let mut policy = valid_policy();
+            sabotage(&mut policy);
+            let error = parse(&serde_json::to_string(&policy).unwrap()).unwrap_err();
+            assert!(error.contains(expected), "expected '{expected}', got: {error}");
+        }
+    }
+
+    /// A live second-pass campaign whose every piece of database evidence is genuine — the
+    /// starting point each forgery test then corrupts in exactly one place.
+    fn activated_second_pass() -> (Database, HashSet<String>, SequentialReviewCampaign) {
+        let (db, ids, base, temp) = seeded_first_pass(2);
+        let maximum = db.max_review_event_id().unwrap();
+        activate_second_pass(&db, &ids, maximum).unwrap();
+        // The tempdir only backs first-pass WAVs; the authority checks below never open audio.
+        drop(temp);
+        (db, ids, base)
+    }
+
+    #[test]
+    fn database_triggers_make_campaign_evidence_tamper_proof() {
+        // First attempt at this test forged evidence with plain UPDATE/DELETE and the DATABASE
+        // refused every one — the migration triggers are a deeper layer than load()'s checks.
+        // So pin the triggers themselves: this is the layer that holds even against code that
+        // forgot to call the validators.
+        let (db, _ids, _base) = activated_second_pass();
+        let tampers: [(&str, &str, &str); 4] = [
+            (
+                "registry update",
+                "UPDATE review_campaign_registry SET focus_segment_count = focus_segment_count + 1",
+                "immutable",
+            ),
+            ("registry delete", "DELETE FROM review_campaign_registry", "immutable"),
+            (
+                "transition rewrite",
+                "UPDATE review_campaign_transitions SET max_review_event_id = max_review_event_id + 1",
+                "append-only",
+            ),
+            ("transition delete", "DELETE FROM review_campaign_transitions", "append-only"),
+        ];
+        for (label, sql, expected) in tampers {
+            let error = db.connection().execute(sql, []).unwrap_err().to_string();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+        assert!(load(&db).is_ok(), "surviving every refused tamper, the campaign is still genuine");
+    }
+
+    #[test]
+    fn registry_mismatch_is_refused_when_the_policy_itself_drifts() {
+        // The registry rows are trigger-immutable, so the reachable version of "registry does not
+        // match" is the POLICY setting drifting out from under it — settings values are plain rows.
+        // A rewritten activation boundary parses fine on its own; the registry comparison is what
+        // catches that it no longer matches the activation actually recorded.
+        let (db, _ids, base) = activated_second_pass();
+        let mut drifted = base.clone();
+        drifted.progress = None;
+        drifted.activated_at_review_event_id += 1;
+        db.connection()
+            .execute(
+                "UPDATE settings SET value=?2 WHERE key=?1",
+                rusqlite::params![SEQUENTIAL_CAMPAIGN_SETTINGS_KEY, serde_json::to_string(&drifted).unwrap()],
+            )
+            .unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("registry does not exactly match the base policy"), "{error}");
+    }
+
+    #[test]
+    fn progress_digest_pins_the_exact_stored_bytes_not_the_meaning() {
+        // Rewriting the progress setting with the SAME semantic content but different bytes must be
+        // refused: the transition row hashes the stored bytes, so byte drift IS tampering evidence.
+        let (db, _ids, _base) = activated_second_pass();
+        let raw: String = db
+            .connection()
+            .query_row("SELECT value FROM settings WHERE key=?1", [SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let reserialized = serde_json::to_string_pretty(&value).unwrap();
+        assert_ne!(raw, reserialized, "the reserialization must actually change the bytes");
+        db.connection()
+            .execute(
+                "UPDATE settings SET value=?2 WHERE key=?1",
+                rusqlite::params![SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY, reserialized],
+            )
+            .unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("disagrees with its immutable transition"), "{error}");
+    }
+
+    #[test]
+    fn campaign_authority_never_serves_two_masters() {
+        // A second campaign's registry row anywhere in the database poisons the exclusivity the
+        // whole authority model depends on — every table is scoped to exactly one campaign id.
+        let (db, _ids, base) = activated_second_pass();
+        db.connection()
+            .execute(
+                "INSERT INTO review_campaign_registry
+                    (campaign_id, focus_segment_count, focus_sha256, first_reviewer, second_reviewer,
+                     after_review_event_id, activated_at_review_event_id)
+                 VALUES('999e4567-e89b-42d3-a456-426614174999', 1, ?1, 'Rezan', ?2, 0, 0)",
+                rusqlite::params!["c".repeat(64), SECOND_PASS_REVIEWER],
+            )
+            .unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("not exclusively bound"), "{error}");
+        assert_eq!(base.reviewer, "Rezan");
+    }
+
+    #[test]
+    fn orphan_progress_without_its_policy_is_refused_and_empty_is_clean() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        assert_eq!(load(&db).unwrap(), None, "an empty database has no campaign and no error");
+        db.connection()
+            .execute("INSERT INTO settings(key,value) VALUES(?1,'{}')", [SEQUENTIAL_CAMPAIGN_PROGRESS_SETTINGS_KEY])
+            .unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("without its base campaign policy"), "{error}");
+    }
+
+    #[test]
+    fn stale_activation_boundary_is_refused() {
+        // Activating the second pass with an event boundary BELOW the durable maximum would let
+        // first-pass work land after the freeze it claims to prove. The boundary must be exact.
+        let (db, ids, _base, _temp) = seeded_first_pass(2);
+        let maximum = db.max_review_event_id().unwrap();
+        assert!(activate_second_pass(&db, &ids, maximum - 1).is_err());
+        assert!(load(&db).unwrap().unwrap().progress.is_none(), "a refused activation must write nothing");
+    }
+
+    #[test]
+    fn phase_accessors_route_authority_to_exactly_one_reviewer_per_phase() {
+        // Through parse(), not the raw fixture: the fixture's " Rezan " padding is deliberately
+        // untrimmed so the parse tests can prove the trim — here the canonical form is the input.
+        let mut policy = parse(&serde_json::to_string(&valid_policy()).unwrap()).unwrap();
+
+        // No progress: the first pass is active and belongs to the named first reviewer.
+        assert_eq!(policy.phase(), CampaignPhase::FirstPassActive);
+        assert_eq!(policy.authorized_reviewer(), Some("Rezan"));
+        assert!(!policy.is_blinded_second_pass() && !policy.is_completed());
+
+        // Second pass: authority moves to the progress row's second reviewer, blinded.
+        policy.progress = Some(valid_progress(&valid_policy(), CampaignPhase::SecondPassActive));
+        assert_eq!(policy.authorized_reviewer(), Some(SECOND_PASS_REVIEWER));
+        assert!(policy.is_blinded_second_pass());
+        assert!(policy.matches_reviewer(&format!("  {}  ", SECOND_PASS_REVIEWER.to_uppercase())));
+        assert!(!policy.matches_reviewer("Rezan"), "the first reviewer must be locked out of the blinded pass");
+
+        // Adjudication and completion: NO reviewer works through the phone path at all.
+        for phase in [CampaignPhase::AdjudicationActive, CampaignPhase::Completed] {
+            policy.progress = Some(valid_progress(&valid_policy(), phase));
+            assert_eq!(policy.authorized_reviewer(), None);
+            assert!(!policy.matches_reviewer("Rezan") && !policy.matches_reviewer(SECOND_PASS_REVIEWER));
+        }
+        assert!(policy.is_completed());
+    }
 }
