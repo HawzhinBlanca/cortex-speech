@@ -2874,6 +2874,152 @@ mod tests {
     }
 
     #[test]
+    fn pool_load_refuses_champion_drift_and_evidence_tampering_at_some_layer() {
+        // Champion demoted mid-pool: the pool froze one champion identity, and serving drafts
+        // under a different (or absent) champion would silently break provenance.
+        let (_dir, db, _pool) = one_clip_pool("first text");
+        db.connection().execute("UPDATE model_versions SET status='candidate' WHERE id=?1", [TEST_CHAMPION]).unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("no active champion"), "{error}");
+        db.connection().execute("UPDATE model_versions SET status='champion' WHERE id=?1", [TEST_CHAMPION]).unwrap();
+        assert!(load(&db).is_ok(), "restoring the champion restores the pool");
+
+        // Champion checkpoint swapped in place: same id, different bytes. The pool pinned the
+        // deployment digest, so the swap must refuse.
+        db.connection()
+            .execute(
+                "UPDATE model_versions SET checkpoint_sha256=?1 WHERE id=?2",
+                rusqlite::params!["d".repeat(64), TEST_CHAMPION],
+            )
+            .unwrap();
+        let error = load(&db).unwrap_err();
+        assert!(error.contains("champion identity no longer matches"), "{error}");
+        db.connection()
+            .execute(
+                "UPDATE model_versions SET checkpoint_sha256=?1 WHERE id=?2",
+                rusqlite::params!["c".repeat(64), TEST_CHAMPION],
+            )
+            .unwrap();
+
+        // Evidence tampering: whichever layer refuses — an immutability trigger below, or load()'s
+        // digest check above — the tamper must not survive. The assertion names the layer that held.
+        match db.connection().execute("DELETE FROM review_pool_registry", []) {
+            Err(trigger) => {
+                let text = trigger.to_string();
+                assert!(text.contains("immutable"), "registry delete refused for the wrong reason: {text}");
+            }
+            Ok(_) => {
+                let error = load(&db).unwrap_err();
+                assert!(error.contains("without its immutable registry"), "{error}");
+            }
+        }
+        match db
+            .connection()
+            .execute("UPDATE review_pool_members SET raw_transcript='tampered' WHERE segment_id='clip'", [])
+        {
+            Err(trigger) => {
+                let text = trigger.to_string();
+                assert!(text.contains("immutable"), "member rewrite refused for the wrong reason: {text}");
+            }
+            Ok(_) => {
+                let error = load(&db).unwrap_err();
+                assert!(error.contains("does not match its immutable registry digest"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn pool_decision_refusals_stale_no_ops_and_the_pay_once_per_reviewer_rule() {
+        let (_dir, db, pool) = one_clip_pool("دەقی چامپیۆن");
+        let (_, revision) = db.get_segment_by_id_with_revision("clip").unwrap().unwrap();
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        let base = || PoolDecisionInput {
+            segment_id: "clip",
+            reviewer: "Rubar",
+            action: "edit",
+            submitted_transcript: Some("corrected text"),
+            served_transcript: "دەقی چامپیۆن",
+            served_revision: revision,
+            audio_content_hash: Some(&hash_a),
+            source_start_ms: Some(0),
+            source_end_ms: Some(1_000),
+            duration_ms: 1_000,
+            requested_action: "edit",
+            requested_transcript: "corrected text",
+            operation_id: "60000000-0000-4000-8000-000000000099",
+            operation_payload_hash: &hash_b,
+            created_at_ms: 1_000,
+        };
+
+        let refusals: Vec<(&str, PoolDecisionInput, &str)> = vec![
+            ("outside the pool", PoolDecisionInput { segment_id: "ghost", ..base() }, "outside the active review pool"),
+            ("forged operation id", PoolDecisionInput { operation_id: "nope", ..base() }, "must be a canonical UUID"),
+            (
+                "malformed payload hash",
+                PoolDecisionInput { operation_payload_hash: "xyz", ..base() },
+                "invalid identity or timing evidence",
+            ),
+            ("zero timestamp", PoolDecisionInput { created_at_ms: 0, ..base() }, "invalid identity or timing evidence"),
+            (
+                "negative revision",
+                PoolDecisionInput { served_revision: -1, ..base() },
+                "invalid identity or timing evidence",
+            ),
+            ("zero duration", PoolDecisionInput { duration_ms: 0, ..base() }, "invalid identity or timing evidence"),
+            ("blank reviewer", PoolDecisionInput { reviewer: "   ", ..base() }, "invalid identity or timing evidence"),
+            (
+                "edit without transcript",
+                PoolDecisionInput { submitted_transcript: None, ..base() },
+                "action/transcript is invalid",
+            ),
+            (
+                "edit with blank transcript",
+                PoolDecisionInput { submitted_transcript: Some(" "), ..base() },
+                "action/transcript is invalid",
+            ),
+            (
+                "reject with transcript",
+                PoolDecisionInput { action: "reject", ..base() },
+                "action/transcript is invalid",
+            ),
+            ("unknown action", PoolDecisionInput { action: "approve", ..base() }, "action/transcript is invalid"),
+        ];
+        for (label, input, expected) in refusals {
+            let error = record_decision(&db, &pool, &input).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+
+        // Stale served evidence is a silent no-op — the clip changed under the reviewer, so the
+        // decision vanishes instead of landing against fresher truth. Text drift likewise.
+        assert_eq!(
+            record_decision(&db, &pool, &PoolDecisionInput { served_revision: revision + 1, ..base() }).unwrap(),
+            None
+        );
+        assert_eq!(
+            record_decision(&db, &pool, &PoolDecisionInput { served_transcript: "different serving", ..base() })
+                .unwrap(),
+            None
+        );
+        let rows: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM review_pool_decisions", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "no refusal or no-op may leave a decision row (a row here is pay evidence)");
+
+        // One decision per reviewer per clip — the pay-once rule — and the identity is
+        // case/trim-normalized, so "RUBAR " is not a second payable opinion.
+        decide(&db, &pool, "Rubar", "دەقی ڕوبار", "60000000-0000-4000-8000-000000000001", 2_000);
+        for duplicate in ["Rubar", "RUBAR  "] {
+            let error = record_decision(&db, &pool, &PoolDecisionInput { reviewer: duplicate, ..base() }).unwrap_err();
+            assert!(error.contains("duplicated for this reviewer"), "{duplicate}: {error}");
+        }
+
+        // A second matching opinion resolves the clip; after that NOBODY records against it.
+        decide(&db, &pool, "Alle", "دەقی ڕوبار", "60000000-0000-4000-8000-000000000002", 3_000);
+        let error = record_decision(&db, &pool, &PoolDecisionInput { reviewer: "Roza", ..base() }).unwrap_err();
+        assert!(error.contains("already resolved"), "{error}");
+    }
+
+    #[test]
     fn an_active_pool_is_immutable_but_reactivation_of_the_same_pool_is_idempotent() {
         let (_dir, db, pool) = one_clip_pool("first text");
         // The exact same activation is a harmless replay and returns the existing pool…
