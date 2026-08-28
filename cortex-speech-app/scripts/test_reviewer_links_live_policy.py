@@ -575,7 +575,13 @@ class ReviewerLinksPolicyTests(unittest.TestCase):
     def test_dpapi_parser_rejects_malformed_ciphertext(self):
         gate = load_gate()
         for malformed in ("dpapi:QU JD", "dpapi:QUJD!"):
-            with self.assertRaises(Exception):
+            # ValueError, NOT bare Exception. Off Windows this parser reaches ctypes.WinDLL for
+            # anything that survives it, so `Exception` is satisfied by the resulting AttributeError
+            # no matter what the input is -- the case would pass on Linux and macOS while asserting
+            # nothing, and deleting `validate=True` from the b64decode would go unnoticed on two of
+            # the three CI platforms. binascii.Error subclasses ValueError so both real rejections
+            # (bad prefix, bad base64) still match; AttributeError does not.
+            with self.assertRaises(ValueError):
                 gate.dpapi_unprotect(malformed)
 
     # SKIP: live product authority is Windows-only — CryptUnprotectData reaches ctypes.WinDLL, which
