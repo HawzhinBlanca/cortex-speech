@@ -2206,6 +2206,296 @@ mod tests {
     }
 
     #[test]
+    fn independent_decision_refusals_name_every_broken_precondition() {
+        let (db, ids, _base) = activated_second_pass();
+        let policy = load(&db).unwrap().unwrap();
+        let mut sorted: Vec<String> = ids.iter().cloned().collect();
+        sorted.sort();
+        let id = sorted[0].as_str();
+        let segment = db.get_segment_by_id(id).unwrap().unwrap();
+        let raw = segment.raw_transcript.clone();
+        let content_hash = db.segment_audio_content_hash(id).unwrap().unwrap();
+        let span = db.segment_source_span(id).unwrap().unwrap();
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        let payload_hash = crate::db::review_operation_payload_hash(id, "accept", &raw, SECOND_PASS_REVIEWER);
+        let wrong_identity_hash = crate::db::review_operation_payload_hash(id, "accept", &raw, "Rezan");
+        // A closure, not a value: struct update syntax would consume a shared base between cases.
+        let base = || IndependentDecisionInput {
+            segment_id: id,
+            reviewer: SECOND_PASS_REVIEWER,
+            action: "accept",
+            submitted_transcript: Some(&raw),
+            served_transcript: &raw,
+            served_revision: revision,
+            audio_content_hash: Some(&content_hash),
+            playback_authority_session_id: None,
+            source_start_ms: Some(span.0),
+            source_end_ms: Some(span.1),
+            duration_ms: 1_000,
+            requested_action: "accept",
+            requested_transcript: &raw,
+            operation_id: "40000000-0000-4000-8000-000000000001",
+            operation_payload_hash: &payload_hash,
+            created_at_ms: 5_000,
+        };
+
+        // The base input itself must be recordable, or every refusal below is vacuous. Recorded
+        // LAST would collide with the cases, so prove it via a dry check at the end instead.
+        let cases: Vec<(&str, IndependentDecisionInput, &str)> = vec![
+            (
+                "first reviewer locked out",
+                IndependentDecisionInput { reviewer: "Rezan", ..base() },
+                "outside the active",
+            ),
+            ("unknown reviewer", IndependentDecisionInput { reviewer: "Sara", ..base() }, "outside the active"),
+            (
+                "forged operation id",
+                IndependentDecisionInput { operation_id: "not-a-uuid", ..base() },
+                "must be a canonical UUID",
+            ),
+            (
+                "malformed payload hash",
+                IndependentDecisionInput { operation_payload_hash: "abc123", ..base() },
+                "invalid operation or timing evidence",
+            ),
+            (
+                "zero timestamp",
+                IndependentDecisionInput { created_at_ms: 0, ..base() },
+                "invalid operation or timing evidence",
+            ),
+            (
+                "negative served revision",
+                IndependentDecisionInput { served_revision: -1, ..base() },
+                "invalid operation or timing evidence",
+            ),
+            (
+                "negative duration",
+                IndependentDecisionInput { duration_ms: -1, ..base() },
+                "invalid operation or timing evidence",
+            ),
+            (
+                "accept without transcript",
+                IndependentDecisionInput { submitted_transcript: None, ..base() },
+                "action/transcript is invalid",
+            ),
+            (
+                "accept with blank transcript",
+                IndependentDecisionInput { submitted_transcript: Some("   "), ..base() },
+                "action/transcript is invalid",
+            ),
+            (
+                "reject with transcript",
+                IndependentDecisionInput { action: "reject", requested_action: "reject", ..base() },
+                "action/transcript is invalid",
+            ),
+            (
+                "unknown action",
+                IndependentDecisionInput { action: "approve", requested_action: "approve", ..base() },
+                "action/transcript is invalid",
+            ),
+            (
+                "payload hash minted for the wrong identity",
+                IndependentDecisionInput { operation_payload_hash: &wrong_identity_hash, ..base() },
+                "does not match the campaign's canonical reviewer identity",
+            ),
+            (
+                "skip consuming playback authority",
+                // The payload hash covers requested_action ("accept"), so the base hash stays
+                // valid here and the refusal below is proven to be the SKIP rule, nothing earlier.
+                IndependentDecisionInput {
+                    action: "skip",
+                    submitted_transcript: None,
+                    playback_authority_session_id: Some("session-1"),
+                    ..base()
+                },
+                "skip must not consume a playback authority",
+            ),
+            (
+                "operation id already bound to canonical review truth",
+                IndependentDecisionInput { operation_id: "00000000-0000-4000-8000-000000000001", ..base() },
+                "E_REVIEW_OPERATION_NAMESPACE_COLLISION",
+            ),
+        ];
+        for (label, input, expected) in cases {
+            let error = record_independent_decision(&db, &policy, &input).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+        // Nothing above may have landed: the decisions table must still be empty.
+        let recorded: i64 =
+            db.connection().query_row("SELECT COUNT(*) FROM independent_review_decisions", [], |r| r.get(0)).unwrap();
+        assert_eq!(recorded, 0, "every refusal must leave zero decision rows behind");
+
+        // Stale served evidence is not an error but a NO-OP: the reviewer judged a segment that
+        // changed under them, so the decision must vanish rather than land against fresher truth.
+        let stale = record_independent_decision(
+            &db,
+            &policy,
+            &IndependentDecisionInput { served_revision: revision + 1, ..base() },
+        )
+        .unwrap();
+        assert_eq!(stale, None, "a decision against a stale revision must be a silent no-op");
+        let drifted_transcript = format!("{raw} DRIFTED");
+        let drifted = record_independent_decision(
+            &db,
+            &policy,
+            &IndependentDecisionInput { served_transcript: &drifted_transcript, ..base() },
+        )
+        .unwrap();
+        assert_eq!(drifted, None, "a decision against drifted served text must be a silent no-op");
+
+        // And the base input really was valid all along: it records once everything is genuine.
+        let landed = record_independent_decision(&db, &policy, &base()).unwrap();
+        assert!(landed.is_some(), "the unmodified base input must record");
+    }
+
+    fn record_second_pass(
+        db: &Database,
+        policy: &SequentialReviewCampaign,
+        id: &str,
+        index: usize,
+        action: &str,
+        text: Option<&str>,
+    ) {
+        let segment = db.get_segment_by_id(id).unwrap().unwrap();
+        let raw = segment.raw_transcript.clone();
+        let content_hash = db.segment_audio_content_hash(id).unwrap().unwrap();
+        let span = db.segment_source_span(id).unwrap().unwrap();
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        let operation_id = format!("50000000-0000-4000-8000-{:012x}", index + 1);
+        let requested_text = text.unwrap_or(&raw);
+        let payload_hash = crate::db::review_operation_payload_hash(id, action, requested_text, SECOND_PASS_REVIEWER);
+        record_independent_decision(
+            db,
+            policy,
+            &IndependentDecisionInput {
+                segment_id: id,
+                reviewer: SECOND_PASS_REVIEWER,
+                action,
+                submitted_transcript: text.or(if action == "reject" { None } else { Some(&raw) }),
+                served_transcript: &raw,
+                served_revision: revision,
+                audio_content_hash: Some(&content_hash),
+                playback_authority_session_id: None,
+                source_start_ms: Some(span.0),
+                source_end_ms: Some(span.1),
+                duration_ms: 1_000,
+                requested_action: action,
+                requested_transcript: requested_text,
+                operation_id: &operation_id,
+                operation_payload_hash: &payload_hash,
+                created_at_ms: 9_000 + index as i64,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn adjudication_refuses_missing_campaigns_wrong_phases_and_malformed_manual_input() {
+        let empty = Database::open(":memory:").unwrap();
+        empty.initialize().unwrap();
+        assert!(adjudicate_and_advance(&empty, &[]).unwrap_err().contains("no sequential review campaign"));
+
+        // First pass still active: adjudication has nothing to adjudicate yet.
+        let (db_first, _ids, _base, _temp) = seeded_first_pass(2);
+        assert!(adjudicate_and_advance(&db_first, &[]).unwrap_err().contains("not ready for second-pass adjudication"));
+
+        // Second pass active but not one independent decision recorded: completion cannot be
+        // manufactured by adjudicating early — and the refusal says exactly what is missing.
+        let (db_early, _ids2, _base2) = activated_second_pass();
+        assert!(adjudicate_and_advance(&db_early, &[]).unwrap_err().contains("independent pass is incomplete"));
+
+        // Manual validation runs AFTER completeness (the first draft of this test learned that
+        // from the error text), so malformed payloads need a genuinely complete second pass.
+        let (db, ids3, _base3) = activated_second_pass();
+        let policy = load(&db).unwrap().unwrap();
+        let mut sorted: Vec<String> = ids3.iter().cloned().collect();
+        sorted.sort();
+        for (index, id) in sorted.iter().enumerate() {
+            record_second_pass(&db, &policy, id, index, "accept", None);
+        }
+        let manual = |segment_id: &str, action: &str, text: Option<&str>, who: &str| ManualAdjudication {
+            segment_id: segment_id.into(),
+            final_action: action.into(),
+            final_transcript: text.map(str::to_string),
+            adjudicator: who.into(),
+        };
+        let malformed = [
+            ("blank segment", manual("  ", "retain", Some("x"), "Hawzhin"), "blank, duplicate, or reserved"),
+            ("blank adjudicator", manual("s", "retain", Some("x"), "   "), "blank, duplicate, or reserved"),
+            ("system identity", manual("s", "retain", Some("x"), "System:me"), "blank, duplicate, or reserved"),
+            ("retain without text", manual("s", "retain", None, "Hawzhin"), "action/transcript is invalid"),
+            ("reject with text", manual("s", "reject", Some("x"), "Hawzhin"), "action/transcript is invalid"),
+            ("unknown action", manual("s", "accept", Some("x"), "Hawzhin"), "action/transcript is invalid"),
+        ];
+        for (label, item, expected) in malformed {
+            let error = adjudicate_and_advance(&db, &[item]).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+        let duplicate = adjudicate_and_advance(
+            &db,
+            &[manual("s", "retain", Some("x"), "Hawzhin"), manual("s", "reject", None, "Hawzhin")],
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("blank, duplicate, or reserved"), "{duplicate}");
+    }
+
+    #[test]
+    fn a_conflict_walks_the_full_adjudication_lifecycle_and_only_a_human_can_close_it() {
+        let (db, ids, _base) = activated_second_pass();
+        let policy = load(&db).unwrap().unwrap();
+        let mut sorted: Vec<String> = ids.iter().cloned().collect();
+        sorted.sort();
+
+        // Segment 0: the second reviewer independently lands on the same text — exact agreement.
+        // Segment 1: they edit to something different — a genuine conflict no system may resolve.
+        record_second_pass(&db, &policy, &sorted[0], 0, "accept", None);
+        record_second_pass(&db, &policy, &sorted[1], 1, "edit", Some("a genuinely different transcription"));
+
+        let progress = adjudicate_and_advance(&db, &[]).unwrap();
+        assert_eq!(progress.phase, CampaignPhase::AdjudicationActive);
+        assert_eq!((progress.adjudication_count, progress.conflicts_remaining), (1, 1));
+
+        // The consensus seal is attributed to the system, and says so.
+        let (kind, adjudicator): (String, String) = db
+            .connection()
+            .query_row(
+                "SELECT resolution_kind, adjudicator FROM review_campaign_adjudications WHERE segment_id=?1",
+                [&sorted[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), adjudicator.as_str()), ("exact_agreement", "system:exact-independent-agreement"));
+
+        // Re-running without the human's answer must refuse, naming the outstanding count —
+        // never quietly complete, never guess.
+        let stuck = adjudicate_and_advance(&db, &[]).unwrap_err();
+        assert!(stuck.contains("1 campaign conflicts still require explicit manual adjudication"), "{stuck}");
+
+        // A manual verdict for a clip outside the campaign (or already sealed) is refused whole.
+        let stray = ManualAdjudication {
+            segment_id: "not-in-campaign".into(),
+            final_action: "retain".into(),
+            final_transcript: Some("x".into()),
+            adjudicator: "Hawzhin".into(),
+        };
+        assert!(adjudicate_and_advance(&db, &[stray]).unwrap_err().contains("already sealed or outside the campaign"));
+
+        // The human closes the conflict; the campaign completes and the export gate opens.
+        let resolved = ManualAdjudication {
+            segment_id: sorted[1].clone(),
+            final_action: "retain".into(),
+            final_transcript: Some("a genuinely different transcription".into()),
+            adjudicator: "Hawzhin".into(),
+        };
+        let done = adjudicate_and_advance(&db, &[resolved]).unwrap();
+        assert_eq!(done.phase, CampaignPhase::Completed);
+        assert_eq!((done.adjudication_count, done.conflicts_remaining), (2, 0));
+        assert!(require_finalized_production_export(&db, "production export").is_ok());
+        assert!(load(&db).unwrap().unwrap().is_completed());
+    }
+
+    #[test]
     fn phase_accessors_route_authority_to_exactly_one_reviewer_per_phase() {
         // Through parse(), not the raw fixture: the fixture's " Rezan " padding is deliberately
         // untrimmed so the parse tests can prove the trim — here the canonical form is the input.
