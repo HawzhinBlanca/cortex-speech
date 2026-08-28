@@ -90,6 +90,30 @@ jobs:
           cargo fetch --locked --manifest-path src-tauri/Cargo.toml
       - name: Run separately supervised, no-retry coverage authority
         run: python "${{ github.workspace }}/scripts/verify_10.py" --rust-coverage-prerequisite
+      # Two hours of runner time currently produce one line -- "exit=1" -- because the supervisor
+      # streams the child into worker.log under the system temp dir and nothing ever reads it. That
+      # makes a timeout indistinguishable from a real failure, and leaves "was it still compiling or
+      # already running tests?" unanswerable, which is exactly the fact needed to fix it. Read-only,
+      # failure-only, and it cannot change a verdict: the job has already failed by the time it runs.
+      - name: Surface the coverage evidence when the measurement fails
+        if: failure()
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $root = Join-Path ([System.IO.Path]::GetTempPath()) 'cortex-verify10'
+          if (-not (Test-Path $root)) { Write-Host "no evidence root at $root"; exit 0 }
+          foreach ($log in Get-ChildItem $root -Recurse -Include 'worker.log','events.jsonl' -ErrorAction SilentlyContinue) {
+            $size = [math]::Round($log.Length / 1KB, 1)
+            Write-Host "`n===== $($log.FullName)  (${size} KB) ====="
+            if ($log.Name -eq 'worker.log') {
+              Write-Host "--- first 40 lines (what it was asked to do) ---"
+              Get-Content $log.FullName -TotalCount 40
+              Write-Host "--- last 120 lines (where the budget went) ---"
+              Get-Content $log.FullName -Tail 120
+            } else {
+              Get-Content $log.FullName -Tail 40
+            }
+          }
       # if: always() -- the build products are worth keeping precisely when the measurement ran out
       # of time, because that is the run whose successor needs them. Skipped on an exact hit so a
       # green run does not re-upload what it just restored.
