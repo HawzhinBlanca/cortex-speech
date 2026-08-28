@@ -63,8 +63,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Install exact nightly used only for branch coverage
         run: rustup toolchain install nightly-2026-07-11 --profile minimal --component llvm-tools-preview
-      - name: Cache exact Rust dependency inputs
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # restore/save split, NOT plain actions/cache: the combined action only saves in a post step
+      # that is skipped when the job fails, and this job's whole cost IS the cold compile. Every run
+      # so far missed the cache, spent its budget rebuilding, exceeded the measurement's internal
+      # 7200s limit, failed -- and then saved nothing, so the next run started cold again. That is a
+      # loop with no exit: the prerequisite has never once concluded success in this repo.
+      # Saving with `if: always()` pays the build once and lets the next run spend its budget on the
+      # measurement instead. It raises no ceiling -- test_workflow_policy caps jobs at 180 min and
+      # says in as many words to make the work smaller rather than lift the limit.
+      - name: Restore exact Rust dependency inputs
+        id: coverage-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -81,6 +90,18 @@ jobs:
           cargo fetch --locked --manifest-path src-tauri/Cargo.toml
       - name: Run separately supervised, no-retry coverage authority
         run: python "${{ github.workspace }}/scripts/verify_10.py" --rust-coverage-prerequisite
+      # if: always() -- the build products are worth keeping precisely when the measurement ran out
+      # of time, because that is the run whose successor needs them. Skipped on an exact hit so a
+      # green run does not re-upload what it just restored.
+      - name: Save exact Rust dependency inputs
+        if: always() && steps.coverage-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cortex-speech-app/src-tauri/target
+          key: windows-coverage-cargo-${{ hashFiles('cortex-speech-app/src-tauri/Cargo.lock', 'cortex-speech-app/scripts/rust_coverage_toolchain.json') }}
 
   windows-release-gate:
     name: Windows Release Gate
@@ -94,6 +115,13 @@ jobs:
     steps:
       - name: Require successful immutable Rust coverage prerequisite
         shell: pwsh
+        # This step runs BEFORE actions/checkout, but the job defaults every `run` to
+        # cortex-speech-app/ -- which does not exist until checkout creates it. So the step died on
+        # "The directory name is invalid" before it could read RUST_COVERAGE_RESULT at all, and the
+        # required Windows status failed for a reason unrelated to coverage: it could never have
+        # passed even on a green prerequisite. Point it at the workspace root, which the runner
+        # always creates, so the refusal below is what actually decides this job.
+        working-directory: ${{ github.workspace }}
         env:
           RUST_COVERAGE_RESULT: ${{ needs.rust-coverage-prerequisite.result }}
         run: |
