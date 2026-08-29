@@ -207,15 +207,15 @@ pub async fn import_model_checkpoint(
     }
     let checkpoint_path =
         validate::validate_file_path(&checkpoint_path).map_err(|_| invalid_model_import_error("checkpointPath"))?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
         // Own the restore fence in the worker itself. Cancelling the async IPC must not detach the
         // multi-GB hash from the generation it will eventually mutate.
-        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
+        let mutation = database.begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         // Hash the (potentially multi-GB) checkpoint off the main thread AND before taking the DB lock
         // — holding the global db mutex across the full-file SHA-256 would starve every UI DB poll.
         let sha = crate::registry::hash_checkpoint(&checkpoint_path).map_err(|e| e.to_string())?;
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::registry::register_checkpoint(
             &db,
             &id,
@@ -255,11 +255,11 @@ pub async fn import_model_deployment(
     STRICT_RATE_LIMITER.check("import_model_deployment").map_err(|_| model_registry_rate_limited_error())?;
     validate_model_identifier(&source, "source")?;
     validate_deployment_request(&manifest_path, &expected_deployment_sha256, &expected_model_id, &license)?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
         // Manifest verification can take ten minutes. It and the final registry write are one
         // generation-bound mutation, and the guard must outlive cancellation of the async caller.
-        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
+        let mutation = database.begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -286,7 +286,7 @@ pub async fn import_model_deployment(
             }
             local.record()
         };
-        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::registry::register_verified_deployment_record(&db, &verified, &source, &license)
             .map(ModelVersionSummaryV1::from)
             .map_err(|error| error.to_string())
@@ -316,7 +316,7 @@ pub async fn bootstrap_legacy_champion(
 ) -> Result<ModelVersionSummaryV1, crate::ipc_contract::CommandErrorV1> {
     STRICT_RATE_LIMITER.check("bootstrap_legacy_champion").map_err(|_| model_registry_rate_limited_error())?;
     validate_deployment_request(&manifest_path, &expected_deployment_sha256, &expected_model_id, &license)?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     let data_dir = state.lock_data_dir().clone().ok_or_else(|| {
         crate::ipc_contract::CommandErrorV1::new(
             "MODEL_STATE_UNAVAILABLE",
@@ -328,7 +328,7 @@ pub async fn bootstrap_legacy_champion(
     run_blocking(move || {
         // Champion publication spans external verification, a registry transaction, and an atomic
         // pointer update. Never allow a restore to split those across database generations.
-        let _mutation = begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
+        let mutation = database.begin_mutation().map_err(|_| MODEL_MUTATION_RESTORE_BLOCKED.to_string())?;
         let verified = if manifest_path.starts_with('/') {
             let server = crate::engine_runtime::server_script_path(&app)
                 .ok_or_else(|| "bundled cortex_7b_server.py verifier could not be resolved".to_string())?;
@@ -352,7 +352,7 @@ pub async fn bootstrap_legacy_champion(
             }
             local.record()
         };
-        let db = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         let model = crate::registry::bootstrap_verified_legacy_deployment(&db, &verified, &license)
             .map_err(|error| error.to_string())?;
         crate::registry::sync_champion_pointer(&db, &data_dir).map_err(|error| error.to_string())?;
@@ -463,26 +463,26 @@ pub async fn undo(
     app: tauri::AppHandle,
 ) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("undo").map_err(|_| history_rate_limited_error())?;
-    let database = state.db_arc();
+    let database = state.db_runtime();
     let history = state.history_arc_for_restore();
     let worker_app = app.clone();
-    let (result, _mutation) = tokio::task::spawn_blocking(move || {
-        let mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
-        let database = database.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = tokio::task::spawn_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+        let database_guard = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         let history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let action = history.undo(&database).map_err(|error| public_history_error("undo", &error.to_string()))?;
+        let action = history.undo(&database_guard).map_err(|error| public_history_error("undo", &error.to_string()))?;
         let status = history_status(&history);
         drop(history);
-        drop(database);
+        drop(database_guard);
         if action.is_some() {
             if let Some(app_state) = worker_app.try_state::<AppState>() {
                 app_state.session_auto_save();
             }
         }
-        Ok::<_, crate::ipc_contract::CommandErrorV1>((
-            crate::ipc_contract::HistoryMutationResultV1 { action: action.map(Into::into), status },
-            mutation,
-        ))
+        Ok::<_, crate::ipc_contract::CommandErrorV1>(crate::ipc_contract::HistoryMutationResultV1 {
+            action: action.map(Into::into),
+            status,
+        })
     })
     .await
     .map_err(|_| {
@@ -503,26 +503,26 @@ pub async fn redo(
     app: tauri::AppHandle,
 ) -> Result<crate::ipc_contract::HistoryMutationResultV1, crate::ipc_contract::CommandErrorV1> {
     RATE_LIMITER.check("redo").map_err(|_| history_rate_limited_error())?;
-    let database = state.db_arc();
+    let database = state.db_runtime();
     let history = state.history_arc_for_restore();
     let worker_app = app.clone();
-    let (result, _mutation) = tokio::task::spawn_blocking(move || {
-        let mutation = crate::database_runtime::begin_mutation().map_err(|_| history_restore_in_progress_error())?;
-        let database = database.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = tokio::task::spawn_blocking(move || {
+        let mutation = database.begin_mutation().map_err(|_| history_restore_in_progress_error())?;
+        let database_guard = database.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
         let history = history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let action = history.redo(&database).map_err(|error| public_history_error("redo", &error.to_string()))?;
+        let action = history.redo(&database_guard).map_err(|error| public_history_error("redo", &error.to_string()))?;
         let status = history_status(&history);
         drop(history);
-        drop(database);
+        drop(database_guard);
         if action.is_some() {
             if let Some(app_state) = worker_app.try_state::<AppState>() {
                 app_state.session_auto_save();
             }
         }
-        Ok::<_, crate::ipc_contract::CommandErrorV1>((
-            crate::ipc_contract::HistoryMutationResultV1 { action: action.map(Into::into), status },
-            mutation,
-        ))
+        Ok::<_, crate::ipc_contract::CommandErrorV1>(crate::ipc_contract::HistoryMutationResultV1 {
+            action: action.map(Into::into),
+            status,
+        })
     })
     .await
     .map_err(|_| {
@@ -1139,19 +1139,18 @@ pub fn cancel_wsl_refinement() -> Result<(), crate::ipc_contract::CommandErrorV1
 #[tauri::command]
 pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_acoustic_scores")?;
-    let mutation = begin_mutation()?;
     let settings_gpu = {
         let s = state.lock_settings();
         s.enable_gpu
     };
     let models_dir = state.lock_model_manager().models_dir.clone();
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let _mutation = mutation;
+        let mutation = database.begin_mutation()?;
         // P1.3: `WHERE ctc_score IS NULL` instead of reading the whole library and `continue`-ing past
         // every row that already has one. After the first pass this returns nothing at all.
         let segments = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             db.get_pending_segments(crate::db::PendingWork::CtcScore).map_err(|e| e.to_string())?
         };
 
@@ -1211,7 +1210,7 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
                 }
             };
 
-            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            let guard = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             guard.update_ctc_score(&seg.id, score).map_err(|e| e.to_string())?;
             count += 1;
         }
@@ -1224,14 +1223,13 @@ pub async fn compute_acoustic_scores(state: State<'_, AppState>) -> Result<usize
 #[tauri::command]
 pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result<usize, String> {
     RATE_LIMITER.check("compute_signal_anomaly_scores")?;
-    let mutation = begin_mutation()?;
     let models_dir = state.lock_model_manager().models_dir.clone();
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let _mutation = mutation;
+        let mutation = database.begin_mutation()?;
         // P1.3: `WHERE signal_anomaly_score IS NULL` — see the CTC sibling above.
         let segments = {
-            let db = db.lock().unwrap_or_else(|p| p.into_inner());
+            let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             db.get_pending_segments(crate::db::PendingWork::SignalAnomaly).map_err(|e| e.to_string())?
         };
 
@@ -1279,7 +1277,7 @@ pub async fn compute_signal_anomaly_scores(state: State<'_, AppState>) -> Result
                 }
             };
 
-            let guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            let guard = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             guard.update_signal_anomaly_score(&seg.id, score).map_err(|e| e.to_string())?;
             count += 1;
         }
