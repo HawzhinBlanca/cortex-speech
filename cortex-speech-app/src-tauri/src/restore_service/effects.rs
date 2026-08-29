@@ -1937,4 +1937,190 @@ mod tests {
             "a decision without its pay effect must be refused: {error}"
         );
     }
+
+    /// A real phone decision, returning its effect id. The effect rows are trigger-protected, so
+    /// every corruption below drops the guard first — a restored file can already contain rows
+    /// written with triggers disabled, which is the situation this whole pass exists for.
+    fn decided(db: &Database, id: &str, index: u64) -> i64 {
+        let revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.record_phone_human_decision_by_at_revision_with_operation(
+            id,
+            "edit",
+            Some("corrected text"),
+            "Reviewer",
+            revision,
+            &canonical_operation(index),
+            &crate::db::review_operation_payload_hash(id, "edit", "corrected text", "Reviewer"),
+        )
+        .unwrap()
+        .unwrap();
+        db.connection().query_row("SELECT MAX(id) FROM human_decision_effect_events", [], |row| row.get(0)).unwrap()
+    }
+
+    /// Put the connection into the state a RESTORED FILE can genuinely arrive in: triggers dropped,
+    /// CHECK constraints ignored, foreign keys off. This is not a way around the schema — it is the
+    /// threat model. Every corruption below is refused by a CHECK or FK on a normally-configured
+    /// connection (measured: `decision_revision = prior_revision + 1`, the accept/edit transcript
+    /// CHECK, and the review_event_id FK all bite first), so those constraints ARE the first line of
+    /// defence and are worth knowing about. The validator is the second line, and it is the only one
+    /// that still applies to bytes written elsewhere with the guards disabled — which is exactly why
+    /// `validate_review_effect_semantics` exists and why these arms must be tested.
+    fn unlock_effects(db: &Database) {
+        for trigger in [
+            "human_decision_effect_events_immutable_update",
+            "human_decision_effect_events_validate_review_event_insert",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+        }
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+    }
+
+    #[test]
+    fn an_effect_that_breaks_its_revision_or_identity_boundary_is_refused() {
+        // decision_revision must be exactly prior_revision + 1. Anything else means the effect
+        // claims a place in the revision chain it did not earn, which is how a forged decision
+        // slips ahead of, or on top of, a real one.
+        // Each corruption is pinned to the message it ACTUALLY produces, not to the one it seems
+        // like it should. A revision-shifted effect is caught earlier, by the event/effect pay
+        // match: once the revision moves, the effect no longer answers for its event. That refusal
+        // is correct and is the one worth pinning; asserting the later message would have meant
+        // loosening the test until it passed.
+        let corruptions: [(&str, &str, &str); 4] = [
+            (
+                "revision skips ahead",
+                "UPDATE human_decision_effect_events SET decision_revision = prior_revision + 2",
+                "does not have exactly one matching human/pay effect",
+            ),
+            (
+                "revision regresses",
+                "UPDATE human_decision_effect_events SET decision_revision = prior_revision",
+                "does not have exactly one matching human/pay effect",
+            ),
+            (
+                // Also caught by the pay match rather than the identity check: the effect's action
+                // must answer its event's action, so retyping it as an unpaid `skip` breaks the
+                // pairing before the identity clause is ever reached.
+                "non-decision action",
+                "UPDATE human_decision_effect_events SET action = 'skip'",
+                "does not have exactly one matching human/pay effect",
+            ),
+            (
+                "blank decision timestamp",
+                "UPDATE human_decision_effect_events SET decision_corrected_at = '  '",
+                "violates its immutable identity/revision boundary",
+            ),
+        ];
+        for (label, sabotage, expected) in corruptions {
+            let db = seeded_db("identity-clip");
+            decided(&db, "identity-clip", 420);
+            validate_review_effect_semantics(&db).expect("the genuine decision must validate first");
+            unlock_effects(&db);
+            db.connection().execute(sabotage, []).unwrap();
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains(expected), "{label}: expected '{expected}', got: {error}");
+        }
+    }
+
+    #[test]
+    fn an_effect_whose_post_decision_text_is_not_canonical_is_refused() {
+        // The decision transcript IS the reviewer's paid output. A blank one, or one that
+        // disagrees with the annotated transcript the dataset actually serves, means the row no
+        // longer records what the human decided — and `annotated_transcript` is human-only by law.
+        let corruptions: [(&str, &str); 3] = [
+            (
+                "blank decision text",
+                "UPDATE human_decision_effect_events SET decision_transcript = '   ', decision_annotated_transcript = '   '",
+            ),
+            (
+                "decision text disagrees with what is served",
+                "UPDATE human_decision_effect_events SET decision_annotated_transcript = 'something else'",
+            ),
+            (
+                "untrimmed decision text is not NFC-canonical",
+                "UPDATE human_decision_effect_events SET decision_transcript = '  corrected text  ', decision_annotated_transcript = '  corrected text  '",
+            ),
+        ];
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("text-clip");
+            decided(&db, "text-clip", 421);
+            validate_review_effect_semantics(&db).unwrap();
+            unlock_effects(&db);
+            db.connection().execute(sabotage, []).unwrap();
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(error.contains("no exact canonical post-decision transcript"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_phone_effect_pointing_at_a_missing_event_is_refused() {
+        // A phone effect names the review event that authorized it. Repointing it at an event that
+        // does not exist severs the decision from its provenance while leaving it in the dataset:
+        // paid, reviewed-looking truth with nothing behind it.
+        let db = seeded_db("orphan-clip");
+        decided(&db, "orphan-clip", 422);
+        validate_review_effect_semantics(&db).unwrap();
+        unlock_effects(&db);
+        db.connection().execute("UPDATE human_decision_effect_events SET review_event_id = 999999", []).unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("names no post-v60 review event")
+                || error.contains("does not have exactly one matching human/pay effect"),
+            "severing an effect from its event must be refused, either as an orphan effect or as an \
+             event left without its pay effect: {error}"
+        );
+    }
+
+    #[test]
+    fn a_review_event_without_canonical_provenance_is_refused() {
+        // The event carries the build and playback-guard provenance that makes a Couch decision
+        // auditable. A restored file whose events lost it cannot prove which build produced them.
+        let corruptions: [(&str, &str); 3] = [
+            ("unknown playback guard", "UPDATE review_events SET playback_guard_version = 'legacy-v0'"),
+            ("truncated build sha", "UPDATE review_events SET app_git_sha = 'abc123'"),
+            ("forged operation id", "UPDATE review_events SET operation_id = 'not-a-uuid'"),
+        ];
+        // Every case must reach a verdict, and the test must PROVE it reached one. The first draft
+        // used `continue` when the corrupting write was refused, which would have let all three
+        // cases skip and the test pass having asserted nothing -- the same vacuous shape as the
+        // frontier test above. Now each case records which layer refused, and the tally is asserted.
+        let mut refused_by_schema = 0;
+        let mut refused_by_validator = 0;
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("provenance-clip");
+            decided(&db, "provenance-clip", 423);
+            validate_review_effect_semantics(&db).unwrap();
+            // The REAL trigger names — the first draft guessed
+            // ("review_events_immutable_update", "review_events_no_update"), neither of which
+            // exists, so every corruption bounced off the untouched guards and the test proved
+            // nothing. The tally assertion below is what surfaced that.
+            for trigger in [
+                "review_events_v60_post_cutoff_immutable_update",
+                "review_events_v60_provenance_immutable_update",
+                "review_event_operation_immutable_update",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+            }
+            if db.connection().execute(sabotage, []).is_err() {
+                refused_by_schema += 1; // an immutability trigger held: also a pass, but a different one
+                continue;
+            }
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks canonical Couch/build/playback provenance")
+                    || error.contains("does not have exactly one matching human/pay effect"),
+                "{label}: {error}"
+            );
+            refused_by_validator += 1;
+        }
+        assert_eq!(
+            refused_by_schema + refused_by_validator,
+            3,
+            "every provenance corruption must reach a verdict from some layer"
+        );
+        assert!(
+            refused_by_validator > 0,
+            "at least one corruption must survive the schema and be caught by the VALIDATOR, or this \
+             test proves only that triggers exist ({refused_by_schema} refused by schema)"
+        );
+    }
 }
