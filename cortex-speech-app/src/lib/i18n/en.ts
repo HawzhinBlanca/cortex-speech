@@ -163,7 +163,7 @@ export const en = {
   // Refusal, not a warning: the decision was NOT recorded. A verdict on audio nobody could hear is
   // indistinguishable from a real listen once it is in the corpus (audit find 2026-08-17).
   'review.cannotDecideWithoutAudio':
-    "This clip's audio could not be played, so no decision can be saved for it. Skip it, or fix the audio and reload.",
+    "This clip's audio could not be played, so no decision can be saved for it. Move to the next clip without recording a decision, or fix the audio and reload.",
   'review.unusable.title': 'Audio recovery',
   'review.unusable.help':
     'Retry first. If this clip is genuinely unusable, choose the exact technical reason. This records no transcript decision and does not pretend playback occurred.',
@@ -187,13 +187,56 @@ export const en = {
   'review.unusable.authorityMissing':
     'This clip’s revision could not be verified. Reload the queue before marking it unusable.',
   'review.undoFailed': 'Undo failed',
-  'review.undoLast': 'Undo review',
+  'review.undoLast': 'Undo last review action',
+  'review.retryUndoStatus': 'Retry Undo status',
+  'review.retryExactUndo': 'Retry same Undo',
+  'review.reloadAfterUndo': 'Reload after Undo',
+  'review.reconcileSavedDecision': 'Reconcile saved decision',
+  'review.undoErrorCode': 'Undo status code: {code}',
+  'review.undoDisabledEdited': 'Save or discard the current correction before using Undo.',
+  'review.undoDisabled.processing': 'Wait for the current transcription or alignment to finish.',
+  'review.undoDisabled.loading':
+    'Undo history is still loading. Wait before making another review decision.',
+  'review.undoDisabled.failed':
+    'Undo history could not be read. Use Undo to retry before making another review decision.',
+  'review.undoDisabled.blocked': 'The latest desktop review action cannot be undone safely.',
+  'review.undoDisabled.none': 'There is no committed desktop review action to undo.',
+  'review.undoDisabled.reconciling':
+    'An Undo attempt is still being reconciled. No new review decision can be saved yet.',
+  'review.undoDisabled.projectionStale':
+    'Undo reached the database, but this view must reload before another decision can be saved.',
+  'review.undoDisabled.legacyHistory':
+    'The latest review action predates durable desktop Undo and cannot be undone here.',
+  'review.undoDisabled.latestDecisionUndone':
+    'The latest review decision has already been undone. Save a new decision before using Undo again.',
+  'review.undoDisabled.flagShadowed':
+    'The latest flag no longer matches current segment truth, so Undo is blocked safely.',
+  'review.undoDisabled.latestFlagUndone':
+    'The latest flag has already been undone. Save a new decision before using Undo again.',
+  'review.undoDisabled.decisionShadowed':
+    'The latest decision no longer matches current segment truth, so Undo is blocked safely.',
+  'review.undoStatusRetryFailed':
+    'Undo history is still unavailable. Check database health, then use Undo to retry.',
+  'review.undoUncertain':
+    'The Undo result is uncertain. New decisions are blocked; use Undo again to reconcile the same operation.',
+  'review.undoProjectionReloadRequired':
+    'Undo reached a terminal result, but this view did not reload authoritatively. New decisions stay blocked; use Undo to retry the reload.',
+  'review.truthProjectionReloadRequired':
+    'The save may be durable, but every open view could not be reloaded authoritatively. New decisions stay blocked; use Undo to retry reconciliation.',
+  'review.truthProjectionRecovered':
+    'The saved decision and every open view are now reconciled with database truth.',
+  'review.truthWriteUncertainRestart':
+    'The save result is uncertain after two exact attempts. All further decisions are blocked. Restart Cortex to reopen from database truth; your draft is retained.',
+  'review.undoAppliedAuthorityUnavailable':
+    'Undo was reconciled and the data reloaded, but Undo history could not be refreshed. Use Undo to retry before saving another decision.',
+  'review.undoRestoredOutsideScope':
+    'Decision undone. The restored clip is outside the current review filter.',
   'review.retranscribeVerifiedTitle': 'Replace a verified transcript?',
   'review.retranscribeVerifiedMessage':
     'This clip is human-verified. Re-transcribing replaces your reviewed text with a fresh machine draft and reopens the clip. You can restore it with Undo review.',
   'review.retranscribeVerifiedConfirm': 'Re-transcribe anyway',
   'review.undoLastTitle':
-    'Reopen the last clip you saved (clears its decision so you can correct and re-save it). Shortcut: Backspace',
+    'Undo the most recent review decision or flag when the database proves it is still current. Shortcut: Backspace',
   'review.cloudCheck': 'Gemini check',
   'review.cloudChecking': 'Asking Gemini…',
   'review.cloudCheckTitle':
@@ -218,6 +261,10 @@ export const en = {
   'review.saveNext': 'Save & next',
   'review.prev': 'Back',
   'review.reset': 'Original',
+  'review.resetConfirmTitle': 'Replace your correction with the original?',
+  'review.resetConfirmMessage':
+    'This removes the current correction and its crash-safe draft. This reset cannot be undone.',
+  'review.resetConfirmAction': 'Use original',
   'review.draftSaving': 'Saving recovery draft…',
   'review.draftRecovered': 'Recovered your unsaved draft from this workstation.',
   'review.draftSaveFailed': 'Recovery draft not saved',
@@ -233,6 +280,9 @@ export const en = {
   'review.localDraft': 'Saved local draft',
   'review.useLocalDraft': 'Use saved draft',
   'review.discardLocalDraft': 'Discard saved draft',
+  'review.discardDraftConfirmTitle': 'Discard this saved draft?',
+  'review.discardDraftConfirmMessage':
+    'This permanently deletes the saved local draft and keeps the current server transcript. This cannot be undone.',
   'review.draftDiscardFailed': 'The saved draft could not be discarded.',
   'review.kbdHint':
     'Keys: A accept · E edit · X mark bad · Space play/pause · R replay · N/P next/prev · Backspace undo · Ctrl+Enter save & next',
@@ -307,15 +357,18 @@ export const en = {
   'inbox.editTitle': 'Edit (e)',
   'inbox.reject': 'Reject',
   'inbox.rejectTitle': 'Reject (x)',
-  'inbox.skip': 'Skip',
-  'inbox.skipTitle': 'Skip (s)',
+  'inbox.skip': 'Next — no decision',
+  'inbox.skipTitle': 'Move to the next clip without recording a decision (s)',
   'inbox.flag': 'Flag',
   'inbox.flagTitle': 'Flag for second pass (f)',
   'inbox.undoTitle': 'Undo (Backspace)',
   'inbox.reviewActions': 'Review actions',
   'inbox.disabled.juryRunning': 'The jury pipeline is already running.',
   'inbox.disabled.saving': 'A review change is still being saved. Wait for it to finish.',
+  'inbox.disabled.noNext': 'There is no next clip in this queue.',
   'inbox.disabled.alreadyReviewed': 'This segment already has a committed review decision.',
+  'inbox.disabled.alreadyFlagged':
+    'This segment already has a saved second-pass flag. Undo that exact flag before flagging it again.',
   'inbox.disabled.notEligible':
     'This segment is not eligible for a review decision. Reload the queue after its transcript is ready.',
   'inbox.disabled.audioUnavailable': 'Audio is unavailable. Retry playback before deciding.',
@@ -366,12 +419,16 @@ export const en = {
     'The correction changed while its recovery draft was being saved. Review the latest text and save again.',
   'inbox.status.rejected': 'Rejected',
   'inbox.status.rejectFailed': 'Failed to reject: {err}',
-  'inbox.status.skipped': 'Skipped',
+  'inbox.status.skipped': 'No decision was recorded for this clip.',
   'inbox.status.finishEditBeforeNavigation':
     'Save or cancel the current correction before changing segments.',
   'inbox.status.flagged': 'Flagged for second pass',
   'inbox.status.flagFailed': 'Failed to flag: {err}',
+  'inbox.status.flagInvalidResponse':
+    'The flag response could not be verified. The escalation queue is being reloaded.',
   'inbox.status.undone': 'Undone',
+  'inbox.status.undoRestoredOutsideScope':
+    'Undone. The restored clip is outside the escalation queue.',
   'inbox.status.undoFailed': 'Failed to undo: {err}',
   focusSearch: 'Focus search',
   openSettings: 'Open settings',
@@ -387,6 +444,7 @@ export const en = {
   kurdish: 'کوردی',
   english: 'English',
   localeToggle: 'Switch language',
+  localeLoadFailed: 'The language pack could not be loaded. Your current language was kept.',
   models: 'AI Models',
   'models.downloadAll': 'Download All',
   'models.notDownloaded': 'Not downloaded',
@@ -480,12 +538,21 @@ export const en = {
   ready: 'Ready',
   'import.interrupted': 'An import was interrupted ({done}/{total} files done). Resume it?',
   'import.resume': 'Resume',
-  'import.discard': 'Discard',
+  'import.discard': 'Delete recovery record',
+  'import.discardConfirmTitle': 'Delete interrupted-import recovery?',
+  'import.discardConfirmMessage':
+    'This deletes only the recovery record. Imported clips stay in the library, but this interrupted import can no longer be resumed.',
+  'import.discardConfirmAction': 'Delete recovery record',
   'import.resumeStarted': 'Resuming import — already-done files are skipped.',
   'import.resumeFailed': 'Could not resume the import',
   'import.discardFailed': 'Could not discard the interrupted import',
   'import.recoveryBusy': 'Finishing the current import recovery action.',
+  'import.recoveryChecking': 'Checking the authoritative import recovery state.',
+  'import.workspaceBusy': 'Finish the current workspace operation before recovering an import.',
   'import.recoveryCheckFailed': 'Could not check for an interrupted import',
+  'import.recoveryAuthorityUnknown':
+    'Import recovery state could not be read. Recovery actions are disabled until the check succeeds.',
+  'import.retryRecoveryCheck': 'Retry recovery check',
   importComplete: 'Import complete',
   importFailed: 'Import failed',
   eventListenersFailed: 'Failed to start event listeners',
@@ -567,6 +634,7 @@ export const en = {
   'errors.unknown': 'An unexpected error occurred. Retry the action or check workspace health.',
   'openFile.imported': 'File imported',
   'openFile.multiChunk': 'Imported {count} segments from file',
+  'openFile.choosing': 'Choose an audio file…',
   'openFile.failed': 'Failed to open file',
   validateDataset: 'Validate dataset',
   'stats.title': 'Dataset Statistics',
@@ -602,8 +670,86 @@ export const en = {
   'events.importSuccess': 'Successfully processed {n} file(s)',
   'events.importFailed': 'Import failed',
   'events.importFailedDetail': 'See pipeline error for details',
+  'import.startAbortedBusy': 'Import did not start because another operation began.',
+  'import.responseLostStatus': 'Import response lost — verifying the accepted run…',
+  'import.responseLost': 'The import response was interrupted',
+  'import.responseLostRunningDetail':
+    'The backend confirms this exact import is still running. Cortex kept it active and will reconcile it automatically.',
+  'import.responseLostUncertainDetail':
+    'Cortex cannot yet prove whether this exact import started, so new imports remain blocked while it checks again.',
+  'import.settledRecovered':
+    'Import worker finished; the library was refreshed from durable state.',
+  'batch.responseLostStatus': 'Batch response lost — verifying the accepted operation…',
+  'batch.responseLost': 'The batch response was interrupted',
+  'batch.responseLostRunningDetail':
+    'The backend confirms this exact batch is still running. Cortex kept it active and will reconcile it automatically.',
+  'batch.responseLostUncertainDetail':
+    'Cortex cannot yet prove whether this exact batch started, so new work remains blocked while it checks again.',
+  'batch.settledRecovered':
+    'The batch worker stopped; the library was refreshed from durable state.',
+  'batch.adoptionChecking': 'Checking for durable batch work…',
+  'batch.adoptionRunning': 'Reconnected to an active batch of {n} clips.',
+  'batch.startCancelled': 'Batch start was cancelled before work began.',
+  'batch.startCancelledDetail': 'No batch work was admitted. Retry when you are ready.',
+  'batch.startAuthorityLost': 'Batch start could not be verified safely.',
+  'batch.startAuthorityLostDetail':
+    'No batch work was admitted. Restart Cortex and inspect the existing diagnostics if this repeats.',
+  'batch.restoreGenerationChanged': 'The workspace changed before the batch could start.',
+  'batch.restoreGenerationChangedDetail':
+    'No batch work was admitted. Retry after the current restore or recovery operation finishes.',
+  'batch.adoptionUnavailable': 'Active batch state could not be verified',
+  'batch.adoptionUnavailableDetail':
+    'Cortex kept new batch work locked and will retry automatically. Retry now only after the desktop backend is responsive.',
+  'batch.adoptionMalformed': 'Active batch state is invalid',
+  'batch.adoptionMalformedDetail':
+    'Cortex refused to guess which batch is active. New batch work remains locked; retry the check or restart after checking workspace health.',
+  'batch.acknowledgementPending': 'Batch result verified — confirming durable receipt…',
+  'batch.acknowledgementFailed': 'Batch result acknowledgement is still pending',
+  'batch.acknowledgementFailedDetail':
+    'The exact outcome was handled, but durable acknowledgement was not confirmed. Cortex kept new batch work locked and will retry the same operation ID safely.',
+  'batch.outcomeUnavailable': 'The batch stopped, but its result cannot yet be verified',
+  'batch.outcomeUnavailableDetail':
+    'Cortex is keeping the workstation locked while it retries the exact terminal-status check. Do not assume the batch completed.',
+  'batch.eventOutcomeMismatch': 'Batch event disagreed with durable status',
+  'batch.eventOutcomeMismatchDetail':
+    'Cortex ignored the event and used the exact retained backend result. This inconsistency must be investigated before release.',
+  'import.recoveryBlocksNew': 'Resolve interrupted-import recovery first',
+  'import.recoveryBlocksNewJournalDetail':
+    'Resume or delete the visible recovery record before starting another import.',
+  'import.recoveryBlocksNewUnknownDetail':
+    'Cortex cannot yet verify recovery state. Retry the recovery check before importing.',
   'events.refreshFailed': 'Failed to refresh segments',
   'events.batchCancelled': 'Batch operation cancelled',
+  'events.batchHalt.championUnavailable':
+    'The exact champion is unavailable. Open Health and retry only after it is ready.',
+  'events.batchHalt.championIdentityMismatch':
+    'The running model is not the registered champion. No further clips were transcribed.',
+  'events.batchHalt.modelIdentityChanged':
+    'The model identity changed during the batch. Remaining clips were left untouched.',
+  'events.batchHalt.sourceChanged':
+    'A source changed after import. Reload or re-import it before transcribing.',
+  'events.batchHalt.audioDecodeFailed':
+    'An audio source could not be decoded. The batch stopped before continuing.',
+  'events.batchHalt.segmentMissing':
+    'A requested segment no longer exists. Refresh the library before retrying.',
+  'events.batchHalt.writeFailed':
+    'A transcript could not be saved durably. The batch stopped and must not be treated as complete.',
+  'events.batchHalt.normalizationFailed':
+    'Normalization could not be committed durably. The batch stopped before continuing.',
+  'events.batchHalt.refinementFailed':
+    'Transcript refinement failed. The batch stopped before continuing.',
+  'events.batchHalt.juryFailed':
+    'Post-transcription adjudication failed. Drafts may exist, but the run is not complete.',
+  'events.batchHalt.workerStartFailed':
+    'The batch was admitted, but its native worker could not start. No untracked work was continued.',
+  'events.batchHalt.processInterrupted':
+    'A previous desktop process interrupted this batch. Applied items were preserved and remaining items were abandoned.',
+  'events.batchHalt.evidenceInvalid':
+    'Durable batch evidence failed validation. Check workspace health before starting another batch.',
+  'events.batchHalt.generic':
+    'Batch transcription stopped safely. Check workspace health before retrying.',
+  'events.batchHalt.workerPanicked':
+    'The native batch worker stopped unexpectedly. Durable results were refreshed, but the batch did not complete cleanly.',
   'events.batchTranscribePartial': 'Batch transcribe: {ok} OK, {failed} failed',
   'events.batchVerifyPartial': 'Batch verify: {ok} OK, {failed} failed',
   'events.batchSpeakerPartial': 'Batch speaker assign: {ok} OK, {failed} failed',
@@ -615,6 +761,9 @@ export const en = {
   'events.batchRefreshFailed': 'Failed to refresh after batch operation',
   'events.unknownFile': 'unknown file',
   'events.processingError': 'Error processing {file}',
+  'events.processingErrorDetail': 'Processing stopped safely. Retry; open Health if it continues.',
+  'events.enrichmentErrorDetail':
+    'The import is saved, but optional enrichment could not finish. You can review the saved clips; open Health if this repeats.',
   'events.pipelineStarted': 'Pipeline started',
   'events.wslPartial': 'WSL 7B batch: {ok} transcribed, {failed} failed',
   'events.wslDone': 'WSL 7B batch complete: {n} transcribed',
@@ -735,6 +884,21 @@ export const en = {
   'agentReport.none': 'none',
   'agentReport.loadFailed': 'Failed to load agent report',
   'agentReport.stageLoadFailed': 'Failed to load agent stage log',
+  'agentReport.unknown': 'Unknown',
+  'agentReport.unknownDate': 'Unknown date',
+  'agentReport.blockerCount': '{count} blocker(s)',
+  'agentReport.runFailedDetail':
+    'This run stopped safely. Open Health or the native logs for diagnostic details.',
+  'agentReport.check.sourceReference': 'Whole-file source references',
+  'agentReport.check.primaryAsr': 'Primary ASR',
+  'agentReport.check.hypothesisCoverage': 'Multi-model hypothesis coverage',
+  'agentReport.check.readinessSnapshot': 'Readiness snapshot',
+  'agentReport.stage.sourceReference': 'Source reference',
+  'agentReport.stage.audioChunking': 'Audio chunking',
+  'agentReport.stage.multiModelHypotheses': 'Multi-model hypotheses',
+  'agentReport.stage.juryAdjudication': 'Jury adjudication',
+  'agentReport.stage.datasetPromotion': 'Dataset promotion',
+  'agentReport.stage.agentReport': 'Agent report',
   'shortcuts.none': 'No shortcuts registered',
   'notifications.loadSegmentsFailed': 'Failed to load segments',
   'notifications.undoInReview': 'Press Backspace to undo the last review decision',
@@ -813,7 +977,7 @@ export const en = {
   'speaker.renameFailed': 'Rename failed',
   'speaker.renameSuccess': 'Updated {n} segments',
   'speaker.mergeConfirm':
-    "Rename '{source}' to '{target}'? '{target}' already exists ({n} segments) — this MERGES both speakers into one and cannot be undone.",
+    "Rename '{source}' to '{target}'? '{target}' already exists ({n} segments) — this MERGES both speakers into one. You can reverse the exact merge with Undo after saving.",
   // Audio player
   'audio.loadFailed': 'Failed to load audio file',
   'audio.proofFailed': 'Playback proof could not start. Reload the clip and try again.',
@@ -1023,6 +1187,7 @@ export const en = {
   'history.action.updateSegment': 'Update segment',
   'history.action.deleteSegments': 'Delete segments',
   'history.action.batchTranscribe': 'Batch transcription',
+  'history.action.batchNormalize': 'Batch normalization',
   'history.action.speakerAssignment': 'Speaker assignment',
   'history.action.unknown': 'Previous action',
   'waveform.zoomSlider': 'Waveform zoom',
@@ -1060,6 +1225,7 @@ export const en = {
   'agentReport.status.notRequired': 'Not required',
   'agentReport.status.ready': 'Ready',
   'agentReport.status.completed': 'Completed',
+  'agentReport.status.skipped': 'Skipped',
   'agentReport.status.failed': 'Failed',
   'agentReport.status.running': 'Running',
   'agentReport.status.degraded': 'Degraded',
