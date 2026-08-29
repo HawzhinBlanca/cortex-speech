@@ -11883,3 +11883,51 @@ Pool/Couch/reviewer implementation remains owned by the separate pool workstream
 its shared-database and API seams but does not create overlapping implementation edits. No production
 database, release pointer, credential, process, port, reviewer truth, or payment state was changed.
 Honest status: **OWNER SCOPE AND PLAN LOCKED — IMPLEMENTATION PENDING — NOT 10/10**.
+
+---
+
+## 2026-08-29 — Robustness loop on `public/clean-release` (PR #72 branch)
+
+Doctrine: `docs/ROBUSTNESS_LOOP.md`. One-day continuous, in-session, owner-directed. Product work is
+confined to this worktree; ops tooling lives on `deploy/link-health`. Codex's trees are never touched,
+and any target whose fix would land in a file codex is refactoring is SKIPPED (that rule sent the
+`ipc` domain — the second-largest by uncovered branches — back untaken, because codex holds
+`commands.rs` and nearly every `commands/*.rs`).
+
+**Coverage work (CI-confirmed, critical-domain branch coverage):**
+
+| domain | before | after |
+|---|---|---|
+| review | 41.67% | 61.73% |
+| payment | 55.66% | 62.26% |
+| restore | 56.85% | 58.41% |
+
+- `71f6e448` guarded two tests requiring the optional OmniASR 300M fixture CI never downloads.
+- `bfd7f280` `f50671af` `15509821` review-campaign forgery refusals, adjudication lifecycle,
+  second-pass activation refusals; `d1d7c81a` all sixteen playback-error mapper arms.
+- `f1d7417b` `a334408f` pool activation + voice certificate + decision refusals, and the pay-once
+  rule (a re-typed `"RUBAR  "` cannot become a second payable opinion).
+- `6deb6f84` pay arithmetic asserted as literals (1s edit = 5_000_000 micro-IQD) and the anti-split
+  work-id namespace — the rule stopping one clip becoming several paid work ids.
+- `629947b0` `3d4d74c4` restore effect-graph refusals: forged effect on a skip event, a decision
+  stripped of its pay effect, a deleted v60 frontier, revision/identity/text/provenance corruptions.
+
+**Defect found and fixed — restore refused a legitimate phone Undo.**
+`validate_review_effect_semantics` compared the UNDO's operation id against `review_events.operation_id`,
+which carries the DECISION's — different values by construction, in TWO separate queries. Any backup
+containing an undone phone decision was refused. Reproduced entirely through production APIs
+(`record_phone_human_decision_…` + `undo_human_decision`); live path is `couch/decisions.rs` `api_undo`.
+Failed closed, so nothing was ever corrupted. Fixed by removing both impossible clauses; the binding
+remains complete via `entry_key = 'undo:' || <undo op>` plus full field-by-field negation checks.
+No policy pin depended on the clause (checked first). Regression tests cover both directions: a
+genuine undo restores, and four broken inverses (deleted, mis-keyed, non-negating, paying out) are
+still refused.
+
+**Process defects caught in this loop's own work, all recorded in commit messages:** an assertion
+that could never fire (`CHECK(singleton_key = 1)` makes a second row impossible), a `.to_uppercase()`
+no-op on a letterless UUID, two guessed trigger names that made a test bounce off untouched guards,
+a scoreboard that printed GREEN at `lines=79.12/85`, and three coverage measurements lost to a
+linker OOM that was diagnosed twice by inference before the error was read.
+
+Honest status: **the tests and the restore fix stand on their own; PR #72's thresholds remain far
+out of reach by this method — roughly 1,780 more covered branches across five domains.**

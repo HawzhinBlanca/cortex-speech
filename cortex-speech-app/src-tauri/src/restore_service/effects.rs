@@ -619,8 +619,19 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
                             AND original.reverses_entry_id IS NULL
                            JOIN review_compensation_ledger reversal
                              ON reversal.reverses_entry_id = original.entry_id
+                          -- ?2 is the UNDO's operation id, taken from
+                          -- human_decision_effect_reversals.operation_id. It is bound here to the
+                          -- INVERSE ledger entry (`entry_key = 'undo:' || ?2`), which is where it
+                          -- belongs. It must NOT be compared against event.operation_id: that
+                          -- column holds the DECISION's operation, a different value by
+                          -- construction, so `event.operation_id = ?2` could never be true and this
+                          -- query refused every genuine phone undo -- state that couch's own
+                          -- api_undo produces. The binding stays complete without it: event.id
+                          -- pins the event, original.review_event_id pins that event's one
+                          -- un-reversed pay entry, reversal.reverses_entry_id pins the inverse to
+                          -- that exact entry, and the field equalities below prove the inverse is
+                          -- an exact negation.
                           WHERE event.id = ?1
-                            AND event.operation_id = ?2
                             AND reversal.id > ?3
                             AND reversal.entry_key = 'undo:' || ?2
                             AND reversal.policy_version = original.policy_version
@@ -698,9 +709,14 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
                    JOIN human_decision_effect_reversals effect_reversal
                      ON effect_reversal.effect_event_id = effect.id
                    JOIN review_events event ON event.id = effect.review_event_id
+                  -- The same impossible comparison as the effect-side query above, in its second
+                  -- home: effect_reversal.operation_id is the UNDO's operation, event.operation_id
+                  -- is the DECISION's, so `event.operation_id = effect_reversal.operation_id` never
+                  -- held and every genuine phone undo was refused here too. The entry_key join
+                  -- already binds the inverse to its undo operation; the review_events join is kept
+                  -- because it still requires the effect's event to exist.
                   WHERE reversal.id = ?1
-                    AND reversal.entry_key = 'undo:' || effect_reversal.operation_id
-                    AND event.operation_id = effect_reversal.operation_id",
+                    AND reversal.entry_key = 'undo:' || effect_reversal.operation_id",
                 [reversal_id],
                 |row| row.get(0),
             )
@@ -2122,5 +2138,100 @@ mod tests {
             "at least one corruption must survive the schema and be caught by the VALIDATOR, or this \
              test proves only that triggers exist ({refused_by_schema} refused by schema)"
         );
+    }
+
+    /// A paid phone decision that was then undone through the production APIs, exactly as
+    /// `couch::api_undo` does it. Returns the effect id the reversal hangs off.
+    fn decided_then_undone(db: &Database, id: &str, decide_index: u64, undo_index: u64) -> i64 {
+        let effect_id = decided(db, id, decide_index);
+        // The actor must OWN the effect -- an anonymous caller cannot reverse a reviewer's paid
+        // decision -- which is why couch passes Some(reviewer) at couch/decisions.rs.
+        assert!(matches!(
+            db.undo_human_decision(effect_id, Some("Reviewer"), &canonical_operation(undo_index)).unwrap(),
+            crate::db::HumanDecisionUndoOutcome::Applied { .. }
+        ));
+        effect_id
+    }
+
+    #[test]
+    fn a_genuine_phone_undo_is_a_valid_restore_target() {
+        // REGRESSION. This state -- decide on the phone, then Undo -- was refused outright with
+        // "lacks its exact operation-bound compensation inverse", because the query compared the
+        // UNDO's operation id against the review event's, which carries the DECISION's. Those
+        // differ by construction, so any backup containing an undone phone decision could not be
+        // restored. Built here entirely from production APIs: no forgery, no dropped triggers.
+        let db = seeded_db("genuine-undo");
+        decided_then_undone(&db, "genuine-undo", 430, 431);
+
+        // The evidence the validator must accept, asserted so this test documents the shape.
+        let (events, reversals): (i64, i64) = db
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM review_events),
+                        (SELECT COUNT(*) FROM human_decision_effect_reversals)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((events, reversals), (1, 1));
+        let inverses: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_compensation_ledger WHERE reverses_entry_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inverses, 1, "the undo must have produced exactly one compensation inverse");
+
+        validate_review_effect_semantics(&db).expect("a phone decision undone through the production API must restore");
+    }
+
+    #[test]
+    fn a_forged_or_missing_pay_inverse_is_still_refused_after_the_fix() {
+        // The other half of the regression: removing the impossible clause must not have opened the
+        // door. Each corruption below breaks the inverse in a way that would let an undo stand
+        // while the money it claws back does not move, or moves by the wrong amount.
+        let corruptions: [(&str, &str); 4] = [
+            ("inverse deleted entirely", "DELETE FROM review_compensation_ledger WHERE reverses_entry_id IS NOT NULL"),
+            (
+                "inverse keyed to a different undo operation",
+                "UPDATE review_compensation_ledger SET entry_key = 'undo:00000000-0000-4000-8000-0000000009ff'
+                  WHERE reverses_entry_id IS NOT NULL",
+            ),
+            (
+                "inverse does not negate the amount",
+                "UPDATE review_compensation_ledger SET delta_micro_iqd = delta_micro_iqd + 1
+                  WHERE reverses_entry_id IS NOT NULL",
+            ),
+            (
+                "inverse pays out instead of clawing back",
+                "UPDATE review_compensation_ledger SET entitlement_micro_iqd = 5000000
+                  WHERE reverses_entry_id IS NOT NULL",
+            ),
+        ];
+        for (label, sabotage) in corruptions {
+            let db = seeded_db("forged-inverse");
+            decided_then_undone(&db, "forged-inverse", 432, 433);
+            validate_review_effect_semantics(&db).expect("the genuine undo must validate first");
+
+            for trigger in [
+                "review_compensation_ledger_immutable_update",
+                "review_compensation_ledger_immutable_delete",
+                "review_compensation_ledger_append_only_update",
+                "review_compensation_ledger_append_only_delete",
+            ] {
+                db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+            }
+            db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+            let changed = db.connection().execute(sabotage, []).unwrap_or(0);
+            assert!(changed > 0, "{label}: the corruption must actually apply, or this case proves nothing");
+
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("lacks its exact operation-bound compensation inverse"),
+                "{label}: a broken pay inverse must still be refused: {error}"
+            );
+        }
     }
 }

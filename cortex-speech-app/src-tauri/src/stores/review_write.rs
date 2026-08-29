@@ -1107,7 +1107,15 @@ mod tests {
         // this thread is guaranteed to join as a follower, never to become a second leader.
         started.wait();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(750));
+            // Hold the leader's slot as BRIEFLY as the test allows. The probe registry is a
+            // process-global with only TECHNICAL_PROBE_MAX_CONCURRENCY slots, and tests in other
+            // modules (which cannot take PROBE_REGISTRY_SERIAL) probe through it too -- measured
+            // 2026-08-29, a full-suite run refused
+            // commands::segments_write::…::healthy_audio_direct_invocation with AUDIO_PROBE_BUSY
+            // while slots were occupied here. The follower attaches to an already-registered
+            // flight by key lookup, so it needs only enough time to reach the call; 120 ms is
+            // ample and occupies the shared registry six times less than the original 750 ms.
+            std::thread::sleep(Duration::from_millis(120));
             let _ = release_tx.send(());
         });
         // The follower's own closure returns a SENTINEL: if the single-flight ever ran it, the
