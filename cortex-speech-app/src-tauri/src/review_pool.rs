@@ -2936,7 +2936,7 @@ mod tests {
         let hash_b = "b".repeat(64);
         let base = || PoolDecisionInput {
             segment_id: "clip",
-            reviewer: "Rubar",
+            reviewer: "Alpha",
             action: "edit",
             submitted_transcript: Some("corrected text"),
             served_transcript: "دەقی چامپیۆن",
@@ -3006,16 +3006,16 @@ mod tests {
         assert_eq!(rows, 0, "no refusal or no-op may leave a decision row (a row here is pay evidence)");
 
         // One decision per reviewer per clip — the pay-once rule — and the identity is
-        // case/trim-normalized, so "RUBAR " is not a second payable opinion.
-        decide(&db, &pool, "Rubar", "دەقی ڕوبار", "60000000-0000-4000-8000-000000000001", 2_000);
-        for duplicate in ["Rubar", "RUBAR  "] {
+        // case/trim-normalized, so "ALPHA " is not a second payable opinion.
+        decide(&db, &pool, "Alpha", "دەقی تاقیکردنەوە", "60000000-0000-4000-8000-000000000001", 2_000);
+        for duplicate in ["Alpha", "ALPHA  "] {
             let error = record_decision(&db, &pool, &PoolDecisionInput { reviewer: duplicate, ..base() }).unwrap_err();
             assert!(error.contains("duplicated for this reviewer"), "{duplicate}: {error}");
         }
 
         // A second matching opinion resolves the clip; after that NOBODY records against it.
-        decide(&db, &pool, "Alle", "دەقی ڕوبار", "60000000-0000-4000-8000-000000000002", 3_000);
-        let error = record_decision(&db, &pool, &PoolDecisionInput { reviewer: "Roza", ..base() }).unwrap_err();
+        decide(&db, &pool, "Bravo", "دەقی تاقیکردنەوە", "60000000-0000-4000-8000-000000000002", 3_000);
+        let error = record_decision(&db, &pool, &PoolDecisionInput { reviewer: "Delta", ..base() }).unwrap_err();
         assert!(error.contains("already resolved"), "{error}");
     }
 

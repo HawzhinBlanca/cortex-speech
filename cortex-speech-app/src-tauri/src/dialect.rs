@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn rubar_and_hawzhin_take_both() {
+    fn two_unrestricted_reviewers_take_both() {
         let both = vec![HAWLERI.to_string(), SORANI.to_string()];
         assert!(reviewer_may_judge(Some(&both), r"D:\x\KBHP-EP07.wav"));
         assert!(reviewer_may_judge(Some(&both), r"C:\x\SoraniVoice_PC_\clip.wav"));

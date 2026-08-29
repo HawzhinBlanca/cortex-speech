@@ -11906,7 +11906,7 @@ and any target whose fix would land in a file codex is refactoring is SKIPPED (t
 - `bfd7f280` `f50671af` `15509821` review-campaign forgery refusals, adjudication lifecycle,
   second-pass activation refusals; `d1d7c81a` all sixteen playback-error mapper arms.
 - `f1d7417b` `a334408f` pool activation + voice certificate + decision refusals, and the pay-once
-  rule (a re-typed `"RUBAR  "` cannot become a second payable opinion).
+  rule (a re-typed `"ALPHA  "` cannot become a second payable opinion).
 - `6deb6f84` pay arithmetic asserted as literals (1s edit = 5_000_000 micro-IQD) and the anti-split
   work-id namespace — the rule stopping one clip becoming several paid work ids.
 - `629947b0` `3d4d74c4` restore effect-graph refusals: forged effect on a skip event, a decision
@@ -11931,3 +11931,31 @@ linker OOM that was diagnosed twice by inference before the error was read.
 
 Honest status: **the tests and the restore fix stand on their own; PR #72's thresholds remain far
 out of reach by this method — roughly 1,780 more covered branches across five domains.**
+
+## 2026-08-29 — The published tree names no reviewer, and a gate now says so
+
+`origin` is a PUBLIC repository. The reviewers are private individuals who agreed to transcribe
+audio, not to appear in a public git history. 577 name occurrences were scrubbed across 41 files
+once. Sixteen came back the same day this entry was written, in test fixtures that used real
+reviewer names as sample data, and `git blame` attributes every one of them to commits made hours
+earlier in this session. Nothing objected, because nothing was checking: the rule existed only in a
+human's memory.
+
+`scripts/test_deidentified_tree.py` now checks it. The forbidden names are stored as SALTED SHA-256
+digests, never as literals — a gate that spelled the names out would be the leak it exists to
+prevent, and this way the gate file itself stays publishable. It tokenizes every tracked text file,
+lowercases, hashes, and compares. Two exclusions are deliberate and documented in the file: the
+repository author's own name, which git records as commit authorship, and the VOICE names of the
+corpus speakers, which are dataset identity the owner holds distribution rights to.
+
+The gate immediately found five occurrences a case-sensitive `git grep -w` sweep had missed —
+a lowercase reviewer name embedded in work-id fixtures, and three test FUNCTION names. Fixtures were renamed
+to neutral identifiers (Alpha, Bravo, Delta), preserving the byte lengths the work-id length-prefix
+assertions depend on (the old and new fixture names are both five characters, so `reviewer-work-v1:5:` stays
+true). No policy script pinned any of the renamed test functions; that was checked before renaming,
+because a renamed symbol silently breaks a greppable pin.
+
+Measured: 1,812/1,812 library tests, 0 failed, 8 ignored. The gate carries an anti-vacuity check that
+proves a real reviewer name hashes into the forbidden set while a neutral fixture name does not, so
+a future edit cannot leave it asserting nothing. No live database write, no deploy, no reviewer
+restart.

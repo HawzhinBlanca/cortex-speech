@@ -909,9 +909,9 @@ mod tests {
 
     #[test]
     fn a_compensation_reviewer_identity_is_exact_and_bounded() {
-        assert!(valid_compensation_reviewer("Rubar"));
+        assert!(valid_compensation_reviewer("Alpha"));
         assert!(valid_compensation_reviewer(&"n".repeat(40)));
-        for bad in ["", " Rubar", "Rubar ", "Ru\u{0007}bar", "Ru\nbar"] {
+        for bad in ["", " Alpha", "Alpha ", "Al\u{0007}pha", "Al\npha"] {
             assert!(!valid_compensation_reviewer(bad), "{bad:?} must be refused");
         }
         assert!(!valid_compensation_reviewer(&"n".repeat(41)), "the 40-character bound must bind");
@@ -922,45 +922,45 @@ mod tests {
         // This is the anti-fraud rule the module's own comment names: without it "a forged target
         // could split one clip into several invented work ids and earn the full rate on every
         // split". A work id is only canonical if it reproduces the writer's exact namespace.
-        let genuine = work_id("rubar", HASH, 0, 1_000);
-        assert!(canonical_work_id_has_writer_shape(&genuine, "Rubar", 1_000), "the real shape must be accepted");
-        assert_eq!(canonical_work_audio_identity(&genuine, "Rubar"), Some((HASH, 0, 1_000)));
+        let genuine = work_id("alpha", HASH, 0, 1_000);
+        assert!(canonical_work_id_has_writer_shape(&genuine, "Alpha", 1_000), "the real shape must be accepted");
+        assert_eq!(canonical_work_audio_identity(&genuine, "Alpha"), Some((HASH, 0, 1_000)));
         // The reviewer key is lowercased, so the same person typed differently still matches.
-        assert!(canonical_work_id_has_writer_shape(&genuine, "  RUBAR  ", 1_000));
+        assert!(canonical_work_id_has_writer_shape(&genuine, "  ALPHA  ", 1_000));
 
         // Re-attribution: one reviewer's work id must not validate under another's name, or paid
         // work could be moved between people by editing a single string.
-        assert!(!canonical_work_id_has_writer_shape(&genuine, "Alle", 1_000));
-        assert_eq!(canonical_work_audio_identity(&genuine, "Alle"), None);
+        assert!(!canonical_work_id_has_writer_shape(&genuine, "Bravo", 1_000));
+        assert_eq!(canonical_work_audio_identity(&genuine, "Bravo"), None);
 
-        // The length prefix is why "rub" + "ar:..." cannot impersonate "rubar": the count and the
+        // The length prefix is why "alp" + "ha:..." cannot impersonate "alpha": the count and the
         // key must agree, so a shifted boundary fails instead of silently re-parsing.
-        let forged_prefix = format!("reviewer-work-v1:3:rubar:audio-segment-v1:{HASH}:0:1000");
-        assert!(!canonical_work_id_has_writer_shape(&forged_prefix, "Rubar", 1_000));
+        let forged_prefix = format!("reviewer-work-v1:3:alpha:audio-segment-v1:{HASH}:0:1000");
+        assert!(!canonical_work_id_has_writer_shape(&forged_prefix, "Alpha", 1_000));
 
         // Splitting: half the clip claimed as a whole unit must not validate against the real
         // duration, which is what stops one paid clip becoming several.
-        let split = work_id("rubar", HASH, 0, 500);
-        assert!(!canonical_work_id_has_writer_shape(&split, "Rubar", 1_000), "a half span cannot claim a full clip");
+        let split = work_id("alpha", HASH, 0, 500);
+        assert!(!canonical_work_id_has_writer_shape(&split, "Alpha", 1_000), "a half span cannot claim a full clip");
 
         for (label, id) in [
-            ("non-hex content hash", work_id("rubar", &"z".repeat(64), 0, 1_000)),
-            ("short content hash", work_id("rubar", &"a".repeat(63), 0, 1_000)),
-            ("uppercase content hash", work_id("rubar", &HASH.to_uppercase(), 0, 1_000)),
-            ("inverted span", work_id("rubar", HASH, 1_000, 0)),
-            ("unparseable span", format!("reviewer-work-v1:5:rubar:audio-segment-v1:{HASH}:zero:1000")),
-            ("extra identity segment", format!("reviewer-work-v1:5:rubar:audio-segment-v1:{HASH}:0:1000:9")),
-            ("wrong namespace", format!("reviewer-work-v2:5:rubar:audio-segment-v1:{HASH}:0:1000")),
+            ("non-hex content hash", work_id("alpha", &"z".repeat(64), 0, 1_000)),
+            ("short content hash", work_id("alpha", &"a".repeat(63), 0, 1_000)),
+            ("uppercase content hash", work_id("alpha", &HASH.to_uppercase(), 0, 1_000)),
+            ("inverted span", work_id("alpha", HASH, 1_000, 0)),
+            ("unparseable span", format!("reviewer-work-v1:5:alpha:audio-segment-v1:{HASH}:zero:1000")),
+            ("extra identity segment", format!("reviewer-work-v1:5:alpha:audio-segment-v1:{HASH}:0:1000:9")),
+            ("wrong namespace", format!("reviewer-work-v2:5:alpha:audio-segment-v1:{HASH}:0:1000")),
             ("bare identity", format!("{HASH}:0:1000")),
         ] {
-            assert!(!canonical_work_id_has_writer_shape(&id, "Rubar", 1_000), "{label} must be refused");
-            assert_eq!(canonical_work_audio_identity(&id, "Rubar"), None, "{label} must yield no identity");
+            assert!(!canonical_work_id_has_writer_shape(&id, "Alpha", 1_000), "{label} must be refused");
+            assert_eq!(canonical_work_audio_identity(&id, "Alpha"), None, "{label} must yield no identity");
         }
 
         // A negative start is refused by the identity reader even though the shape check is
         // satisfied by the span/duration rule -- the two guards do not rely on each other.
-        let negative = work_id("rubar", HASH, -1_000, 0);
-        assert_eq!(canonical_work_audio_identity(&negative, "Rubar"), None);
+        let negative = work_id("alpha", HASH, -1_000, 0);
+        assert_eq!(canonical_work_audio_identity(&negative, "Alpha"), None);
     }
 
     #[test]
