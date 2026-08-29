@@ -56,6 +56,16 @@ if a checkable pin drifts from what is written here.
   1,352-id focus, yielding an exact 8,274-id union. This is additive, not replacement. Activation does
   not authorize serving: stale-release, provenance, playback, dialect and hidden-check gates remain
   fail closed, and the focus file is changed only through a validated atomic tool, never by hand.
+- **Consensus review canon (owner, 2026-08-29 — "THIS MAKE CANON").** A sentence is decided by **any
+  two DIFFERENT reviewers**, never by a named role. No reviewer is designated "first pass" or "second
+  pass": a reviewer opens their link, is served an audio, corrects it, and any other reviewer may take
+  the next one. Two different reviewers agreeing resolves the clip; when the first two disagree a
+  **third** reviewer is served it. Work distributes naturally rather than being assigned — if one
+  reviewer judges ten clips, their second opinions may come from several different people (two from
+  one reviewer, two from another, and so on). The independence requirement is enforced PER CLIP (the
+  same person may never be two of its opinions), never per person, so throughput scales with however
+  many reviewers are working. This supersedes the sequential single-reviewer campaign model for
+  deciding sentences.
 - Max 8 named reviewers; per-reviewer tokens; Stop revokes durably.
 - Dialect routing: **KBHP = Hawleri** (all 32 episodes, owner-confirmed). The organized corpus tree
   declares dialect by folder (`Kurdish Corpora\<dialect>\`). Unmapped sources FAIL CLOSED for
