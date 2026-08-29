@@ -121,9 +121,9 @@ pub fn compute_stats(db: &Database) -> AppResult<DatasetStats> {
     // substr(), not LIKE: SQLite's LIKE is case-INSENSITIVE for ASCII while Rust's `starts_with` is
     // not, so LIKE would exclude a '[pending…' row that the export keeps — drift in the other
     // direction. `n/a` and `null` DO compare case-insensitively, matching eq_ignore_ascii_case.
-    // VERBATIM LAW (2026-08-12): human-decided verdict → annotated → champion raw. Machine text
-    // (jury verdicts without a human decision, LLM-refined normalized) never surfaces as THE
-    // transcript — mirrors the updated quality::training_transcript_with_source exactly.
+    // Product review projection (VERBATIM LAW): frozen human verdict → human annotation → immutable
+    // champion raw. `normalized_transcript` is machine evidence only and never enters this authority.
+    // Mirrors `quality::effective_transcript` exactly.
     const EFFECTIVE: &str = "TRIM(CASE
             WHEN TRIM(COALESCE(verdict_transcript,'')) <> ''
                  AND (LOWER(COALESCE(human_decision,'')) IN ('accept','edit','human_accept','human_edit')
@@ -442,6 +442,30 @@ mod tests {
 
         let st = compute_stats(&db).unwrap();
         assert_eq!(st.total_chars, 9, "must measure the human's 'corrected' (9), not the stale raw 'old' (3)");
+    }
+
+    #[test]
+    fn char_totals_never_promote_machine_derived_text() {
+        let db = Database::open(":memory:").unwrap();
+        db.initialize().unwrap();
+        db.insert_legacy_segment_fixture(&seg("derived", 1000, false, Some("A"), "raw")).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                 SET normalized_transcript='refined', normalizer_version='cortex-machine-review-final-v1'
+                 WHERE id='derived'",
+                [],
+            )
+            .unwrap();
+
+        let pending = compute_stats(&db).unwrap();
+        assert_eq!(pending.total_chars, 3, "an unreviewed clip must measure immutable champion raw");
+
+        db.connection()
+            .execute("UPDATE speech_segments SET human_decision='accept', verified=1 WHERE id='derived'", [])
+            .unwrap();
+        let accepted = compute_stats(&db).unwrap();
+        assert_eq!(accepted.total_chars, 3, "legacy human acceptance must fall back to immutable raw text");
     }
 
     #[test]

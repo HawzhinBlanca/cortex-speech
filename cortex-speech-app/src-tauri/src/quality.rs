@@ -524,8 +524,7 @@ pub fn human_verified_text(seg: &SpeechSegment) -> Option<&str> {
 /// EVIDENCE (hypotheses, retrieval), never the transcript. "human_verified" requires a real human
 /// decision — the `verified` flag alone proves a click, not a reading (audit defects #7/#8/#15).
 fn training_transcript_with_source(seg: &SpeechSegment) -> (&str, &'static str) {
-    let human_decided = decision_is(seg.human_decision.as_deref(), &["accept", "edit", "human_accept", "human_edit"])
-        || decision_is(seg.verdict.as_deref(), &["human_accept", "human_edit"]);
+    let human_decided = has_human_transcript_decision(seg);
 
     if human_decided {
         // The text captured at decision time, else the human's typed annotation, else the raw draft
@@ -554,11 +553,18 @@ fn non_empty(text: Option<&str>) -> Option<&str> {
     text.filter(|value| !value.trim().is_empty())
 }
 
-/// The best available human-facing transcript for a segment (human-decided verdict → annotated →
-/// champion raw; VERBATIM LAW — machine paraphrase never surfaces). Shared by training-grade logic
-/// and the plain transcript/subtitle export. SQL mirror: `stats.rs::EFFECTIVE`.
+/// The authoritative text presented by product review/export surfaces.
+///
+/// VERBATIM LAW: a frozen human decision wins, followed by a human annotation, followed by the
+/// immutable champion raw transcript. `normalized_transcript` is derived machine evidence and must
+/// never become the review draft, exported transcript, duplicate authority, or training text.
 pub fn effective_transcript(seg: &SpeechSegment) -> &str {
     training_transcript_with_source(seg).0
+}
+
+fn has_human_transcript_decision(seg: &SpeechSegment) -> bool {
+    decision_is(seg.human_decision.as_deref(), &["accept", "edit", "human_accept", "human_edit"])
+        || decision_is(seg.verdict.as_deref(), &["human_accept", "human_edit"])
 }
 
 fn decision_is(value: Option<&str>, accepted: &[&str]) -> bool {
@@ -1172,6 +1178,32 @@ mod tests {
         assert!(!is_effective_placeholder(&edited), "a human-corrected placeholder is real text");
         // Real ASR text is never a placeholder.
         assert!(!is_effective_placeholder(&seg("r", "ئەمڕۆ باشە", 4000)));
+    }
+
+    #[test]
+    fn effective_review_projection_never_promotes_derived_machine_text() {
+        let mut pending = seg("derived", "champion raw", 4_000);
+        pending.normalized_transcript = Some("configured final".to_string());
+        assert_eq!(
+            effective_transcript(&pending),
+            "champion raw",
+            "derived machine text is evidence only under the Verbatim Law"
+        );
+
+        pending.annotated_transcript = Some("human draft".to_string());
+        assert_eq!(effective_transcript(&pending), "human draft");
+
+        let mut legacy_accept = seg("legacy", "historically accepted raw", 4_000);
+        legacy_accept.normalized_transcript = Some("later machine final".to_string());
+        legacy_accept.human_decision = Some("accept".to_string());
+        assert_eq!(
+            effective_transcript(&legacy_accept),
+            "historically accepted raw",
+            "later machine text must not reinterpret a human decision lacking a frozen verdict"
+        );
+
+        legacy_accept.verdict_transcript = Some("frozen human truth".to_string());
+        assert_eq!(effective_transcript(&legacy_accept), "frozen human truth");
     }
 
     #[test]
