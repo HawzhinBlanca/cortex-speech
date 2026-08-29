@@ -47,12 +47,12 @@ pub async fn transcribe_segment(
     if let Some(ref aj) = alignment_json {
         validate::validate_alignment_json(aj)?;
     }
-    let mutation = super::begin_mutation()?;
     // Clone the pipeline (Arc-wrapped internals) so the global pipeline mutex is released before the
     // possibly-long WSL/ONNX transcription, and run it OFF the main thread so the UI stays responsive.
     let pipeline = state.lock_pipeline().clone();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let _mutation = mutation;
+        let _mutation = database.begin_mutation()?;
         let id = segment_id.as_deref().ok_or_else(|| {
             "E_TRANSCRIPTION_SOURCE_UNBOUND: an imported segment id is required for transcription".to_string()
         })?;
@@ -103,18 +103,17 @@ pub async fn align_segment(
         return Err("Alignment text cannot be empty".to_string());
     }
     validate::validate_text(&text, 100000, "Alignment text")?;
-    let mutation = super::begin_mutation()?;
     // Clone the pipeline OUT of the lock so the global mutex is released before the slow decode +
     // ONNX forced alignment, and run the whole align + persist OFF the main thread — holding either
     // lock (or blocking the UI thread) serializes every other pipeline command (get_import_status
     // polling, transcribe, get_waveform) for the whole alignment. ProcessingPipeline is Clone; align
     // takes &self.
     let pipeline = state.lock_pipeline().clone();
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let _mutation = mutation;
+        let mutation = database.begin_mutation()?;
         let stored_segment = if let Some(ref id) = segment_id {
-            let db_guard = db.lock().unwrap_or_else(|p| p.into_inner());
+            let db_guard = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
             db_guard
                 .get_segment_by_id(id)
                 .map_err(|error| format!("Failed to reload segment {id} before alignment: {error}"))?
@@ -137,7 +136,7 @@ pub async fn align_segment(
         if let Some(ref id) = segment_id {
             if !timestamps.is_empty() {
                 let merged = crate::chunking::merge_word_timestamps(alignment_json.as_deref(), &timestamps);
-                let db = db.lock().unwrap_or_else(|p| p.into_inner());
+                let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
                 let persisted = db
                     .update_segment_alignment_if_unchanged(id, alignment_json.as_deref(), &merged, quality.as_db_str())
                     .map_err(|error| format!("Failed to persist word timings + quality for {id}: {error}"))?;
@@ -157,13 +156,13 @@ pub async fn rediarize_segments(ids: Vec<String>, state: State<'_, AppState>) ->
     for id in &ids {
         validate::validate_identifier(id)?;
     }
-    let mutation = super::begin_mutation()?;
     // Clone the pipeline and let it open its own DB connection, so neither the global pipeline nor
     // db mutex is held across the per-file decode + diarization-inference loop, and run it OFF the
     // main thread so the UI stays responsive for the decode duration.
     let pipeline = state.lock_pipeline().clone();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let _mutation = mutation;
+        let _mutation = database.begin_mutation()?;
         pipeline.rediarize_segments(&ids).map_err(|e| e.to_string())
     })
     .await
