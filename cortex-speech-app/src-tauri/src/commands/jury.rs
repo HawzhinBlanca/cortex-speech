@@ -40,9 +40,10 @@ pub async fn run_t0_gate(
         }
         (s.jury_autonomy_level.clone(), s.irt_ability_learning_enabled)
     };
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::jury::run_t0_gate(&db, &segment_ids, &autonomy, learn).map_err(|e| e.to_string())
     })
     .await
