@@ -1459,6 +1459,51 @@ mod tests {
     }
 
     #[test]
+    fn non_16khz_window_resampling_is_not_a_whole_buffer_identity_protocol() {
+        // Characterization for import identity: the FIR and sinc resamplers need neighboring source
+        // samples. Splitting a 44.1 kHz source resets that context at every boundary, so concatenated
+        // canonical windows are intentionally NOT byte-identical to one whole-buffer resample. Import,
+        // retry and later source verification must therefore all choose one fixed window protocol;
+        // switching based on review chunk settings turns unchanged audio into a false replacement.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("route-change-44k.wav");
+        write_tone_wav(&path, 44_100, 2.0, 1);
+
+        let (whole_rate, whole_pcm) = decode_to_pcm(&path).expect("whole-buffer decode");
+        let whole_hash = crate::fingerprint::AudioFingerprint::content_hash(&whole_pcm, whole_rate);
+
+        let mut windowed = crate::fingerprint::StreamingIdentity::new();
+        let mut windows = 0usize;
+        decode_pcm_windows(&path, 500, |window| {
+            windows += 1;
+            windowed.push(&window.pcm, window.sample_rate);
+            Ok(())
+        })
+        .expect("windowed decode");
+        let windowed_hash = windowed.finish().content;
+
+        assert!(windows > 1, "fixture must cross a resampling boundary");
+        assert_ne!(
+            whole_hash, windowed_hash,
+            "a route-sensitive identity test must expose the 44.1 kHz boundary-state difference"
+        );
+    }
+
+    #[test]
+    fn evaluation_identity_decoders_use_the_fixed_import_window_protocol() {
+        let evaluation_source = include_str!("eval.rs");
+        let evaluation_production =
+            evaluation_source.split("\n#[cfg(test)]\nmod tests").next().unwrap_or(evaluation_source);
+        let identity_decodes = evaluation_production.matches("decode_pcm_windows(").count();
+        let fixed_windows = evaluation_production.matches("crate::audio::DECODE_WINDOW_MS").count();
+        assert_eq!(identity_decodes, 3, "evaluation has three source-identity/materialization decoders");
+        assert_eq!(
+            fixed_windows, identity_decodes,
+            "every evaluation identity/materialization decoder must use the fixed 90-second import protocol"
+        );
+    }
+
+    #[test]
     fn normalize_pcm_rms_moves_level_toward_the_target() {
         // A quiet tone normalised to a louder target must get louder, and the waveform shape must
         // survive: normalisation may not invert, clip, or NaN the signal.

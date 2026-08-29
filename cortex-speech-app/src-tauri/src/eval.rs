@@ -70,7 +70,7 @@ fn required_gold_audio_content_hash(gold: &GoldSegment) -> AppResult<&str> {
 fn canonical_audio_content_hash(path: &std::path::Path) -> AppResult<String> {
     let mut identity = crate::fingerprint::StreamingIdentity::new();
     let mut samples = 0usize;
-    crate::audio::decode_pcm_windows(path, 30_000, |window| {
+    crate::audio::decode_pcm_windows(path, crate::audio::DECODE_WINDOW_MS, |window| {
         samples = samples.saturating_add(window.pcm.len());
         identity.push(&window.pcm, window.sample_rate);
         Ok(())
@@ -337,7 +337,7 @@ fn materialize_verified_gold_wav(gold: &GoldSegment, output_path: &std::path::Pa
                 .map_err(|error| AppError::Other(format!("cannot create verified gold WAV: {error}")))?;
             let mut identity = crate::fingerprint::StreamingIdentity::new();
             let mut sample_count = 0usize;
-            crate::audio::decode_pcm_windows(&gold.audio_path, 30_000, |window| {
+            crate::audio::decode_pcm_windows(&gold.audio_path, crate::audio::DECODE_WINDOW_MS, |window| {
                 identity.push(&window.pcm, window.sample_rate);
                 sample_count = sample_count.saturating_add(window.pcm.len());
                 for sample in window.pcm {
@@ -415,7 +415,7 @@ where
         on_clip(&spans[index].segment_id, pcm16)
     };
 
-    crate::audio::decode_pcm_windows(audio_path, 30_000, |window| {
+    crate::audio::decode_pcm_windows(audio_path, crate::audio::DECODE_WINDOW_MS, |window| {
         rate = window.sample_rate.max(1);
         identity.push(&window.pcm, rate);
         source_samples = source_samples.saturating_add(window.pcm.len());
