@@ -47,6 +47,12 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
         prior_corrected_at: Option<String>,
         prior_reviewed_by: Option<String>,
         reversal_operation: Option<String>,
+        /// Which desktop request contract wrote this row: Some(1) for the typed
+        /// `commit_review_v1` path, None for the retired legacy command. The two use DIFFERENT
+        /// payload-hash domains, so the digest cannot be checked without knowing which.
+        desktop_review_contract_version: Option<i64>,
+        /// The policy-4 authority the typed desktop contract hashes into its payload digest.
+        playback_authority_session_id: Option<String>,
     }
 
     #[derive(Clone)]
@@ -419,7 +425,8 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
                     effect.prior_annotated_transcript, effect.prior_verdict,
                     effect.prior_verdict_transcript, effect.prior_rationale, effect.prior_escalated,
                     effect.prior_human_decision, effect.prior_corrected_at,
-                    effect.prior_reviewed_by, reversal.operation_id
+                    effect.prior_reviewed_by, reversal.operation_id,
+                    effect.desktop_review_contract_version, effect.playback_authority_session_id
                FROM human_decision_effect_events effect
                LEFT JOIN human_decision_effect_reversals reversal
                  ON reversal.effect_event_id = effect.id
@@ -458,6 +465,8 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
                 prior_corrected_at: row.get(26)?,
                 prior_reviewed_by: row.get(27)?,
                 reversal_operation: row.get(28)?,
+                desktop_review_contract_version: row.get(29)?,
+                playback_authority_session_id: row.get(30)?,
             })
         })
         .map_err(|error| format!("restore target human-decision effects are unreadable: {error}"))?
@@ -568,12 +577,41 @@ pub(crate) fn validate_review_effect_semantics(db: &crate::db::Database) -> Resu
                             .requested_transcript
                             .as_deref()
                             .map_or(true, |text| crate::db::to_nfc(text.trim()) == text && !text.is_empty())
-                        && crate::db::desktop_decision_payload_hash(
-                            &effect.segment_id,
-                            requested_action,
-                            effect.requested_transcript.as_deref(),
-                            Some(timestamp_ms),
-                        ) == payload_hash
+                        // DISPATCH ON THE CONTRACT THAT WROTE THE ROW. The typed desktop path
+                        // (`commit_review_v1`) hashes with `desktop_review_v1_payload_hash` over
+                        // (segment_id, base_revision, decision, corrected, authority_session_id)
+                        // under the domain prefix "cortex-desktop-review-ipc-v1\0"; the retired
+                        // legacy command used `desktop_decision_payload_hash` under
+                        // "cortex-desktop-human-decision-v1\0". Different prefixes cannot produce
+                        // equal digests, so recomputing only the legacy formula -- as this did --
+                        // refused EVERY production desktop decision, and with the legacy command
+                        // retired ("no production write path") that is all of them. Any restore of
+                        // a database containing one desktop review was refused. `db/core.rs` and
+                        // `db/review.rs` already dispatch on this column; this pass did not even
+                        // SELECT it. Legacy rows keep the old formula, so nothing is loosened.
+                        && match (effect.desktop_review_contract_version, effect.playback_authority_session_id.as_deref())
+                        {
+                            (Some(1), Some(authority_session_id)) => {
+                                crate::db::desktop_review_v1_payload_hash(
+                                    &effect.segment_id,
+                                    effect.prior_revision,
+                                    requested_action,
+                                    effect.requested_transcript.as_deref(),
+                                    authority_session_id,
+                                ) == payload_hash
+                            }
+                            // v1 without its authority is not a v1 row: the writer requires one
+                            // (finalization.rs), so its absence is corruption, not a legacy row.
+                            (Some(_), _) => false,
+                            (None, _) => {
+                                crate::db::desktop_decision_payload_hash(
+                                    &effect.segment_id,
+                                    requested_action,
+                                    effect.requested_transcript.as_deref(),
+                                    Some(timestamp_ms),
+                                ) == payload_hash
+                            }
+                        }
                 }
                 _ => false,
             };
@@ -2290,5 +2328,160 @@ mod tests {
                 || error.contains("is not owned by one exact human-effect reversal"),
             "an active decision whose pay was reversed must be refused: {error}"
         );
+    }
+
+    /// Insert the effect row the TYPED desktop contract produces, exactly as
+    /// `finalize_desktop_review_v1_with_playback` + `record_human_decision_by_with_finalize` write
+    /// it: source='desktop', review_event_id NULL, reviewer NULL, contract version 1, a policy-4
+    /// authority id, and an operation_payload_hash from `desktop_review_v1_payload_hash` over
+    /// (segment_id, base_revision, decision, corrected, authority_session_id).
+    ///
+    /// Inserted directly rather than driven through the command layer because minting a real
+    /// policy-4 authority needs the whole playback stack; the SHAPE is what this test is about, and
+    /// it is taken from the writer's own code rather than invented.
+    fn insert_typed_desktop_effect(db: &Database, id: &str, authority: &str, hash: &str) {
+        let prior_revision = db.segment_review_revision(id).unwrap().unwrap();
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+        for trigger in [
+            "human_decision_effect_events_validate_review_event_insert",
+            "human_decision_effect_events_immutable_update",
+            // Requires the authority to reference a real policy-4 receipt row. Minting one needs
+            // the whole playback stack, and a restored file can arrive without the trigger anyway
+            // -- which is the state this validator exists to judge.
+            "human_decision_effect_events_v67_policy4_validate_insert",
+        ] {
+            db.connection().execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), []).ok();
+        }
+        db.connection()
+            .execute(
+                "INSERT INTO human_decision_effect_events
+                    (review_event_id, segment_id, reviewer, source, action,
+                     served_transcript, decision_transcript, decision_annotated_transcript,
+                     decision_verified, decision_corrected_at,
+                     prior_revision, decision_revision, prior_verified, prior_escalated,
+                     operation_id, operation_payload_hash, requested_action, requested_transcript,
+                     requested_timestamp_ms, desktop_review_contract_version,
+                     playback_authority_session_id)
+                 VALUES (NULL, ?1, NULL, 'desktop', 'edit',
+                         'machine draft', 'desktop corrected', 'desktop corrected', 1,
+                         '2026-08-29 00:00:00', ?2, ?2 + 1, 0, 0,
+                         ?3, ?4, 'edit', 'desktop corrected', ?5, 1, ?6)",
+                rusqlite::params![
+                    id,
+                    prior_revision,
+                    canonical_operation(450),
+                    hash,
+                    1_700_000_000_000_i64,
+                    authority,
+                ],
+            )
+            .unwrap();
+        // A real write advances the segment too; without this the row claims a decision revision
+        // the segment never reached and a DIFFERENT guard fires first ("segment ... predates its
+        // latest review-effect revision"), which would have hidden whether the digest check works.
+        db.connection()
+            .execute(
+                "UPDATE speech_segments
+                    SET review_revision = ?2 + 1,
+                        verified = 1,
+                        human_decision = 'edit',
+                        annotated_transcript = 'desktop corrected',
+                        verdict = 'human_edit',
+                        verdict_transcript = 'desktop corrected',
+                        -- Must EQUAL the effect's decision_corrected_at: the segment's stable human
+                        -- state is compared field-for-field against what the effect chain implies.
+                        corrected_at = '2026-08-29 00:00:00'
+                  WHERE id = ?1",
+                rusqlite::params![id, prior_revision],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_typed_desktop_review_is_a_valid_restore_target() {
+        // REGRESSION. The desktop branch recomputed the RETIRED legacy digest
+        // (`desktop_decision_payload_hash`, domain "cortex-desktop-human-decision-v1\0") while the
+        // only shipping desktop writer stores `desktop_review_v1_payload_hash` (domain
+        // "cortex-desktop-review-ipc-v1\0"). Different domain prefixes cannot collide, so the
+        // comparison was false for EVERY production desktop decision and any backup containing one
+        // was refused. Mirror image of the phone-undo defect fixed in 22e2ddeb, in the same file.
+        let db = seeded_db("typed-desktop");
+        let authority = "11111111-2222-4333-8444-555555555555";
+        let prior_revision = db.segment_review_revision("typed-desktop").unwrap().unwrap();
+        let genuine = crate::db::desktop_review_v1_payload_hash(
+            "typed-desktop",
+            prior_revision,
+            "edit",
+            Some("desktop corrected"),
+            authority,
+        );
+        // The two digests must differ, or this test would pass for the wrong reason.
+        let legacy = crate::db::desktop_decision_payload_hash(
+            "typed-desktop",
+            "edit",
+            Some("desktop corrected"),
+            Some(1_700_000_000_000),
+        );
+        assert_ne!(genuine, legacy, "the two payload-hash domains must be distinct");
+
+        insert_typed_desktop_effect(&db, "typed-desktop", authority, &genuine);
+        validate_review_effect_semantics(&db)
+            .expect("a typed desktop review written by the shipping contract must restore");
+    }
+
+    #[test]
+    fn a_forged_typed_desktop_review_is_still_refused() {
+        // The other half: teaching the validator the v1 contract must not let anything through.
+        // Each case is a row claiming contract 1 whose digest does not answer for its own contents.
+        let authority = "11111111-2222-4333-8444-555555555555";
+        let cases: [(&str, fn(&str, i64, &str) -> String); 3] = [
+            // The retired legacy digest, which is precisely what the buggy validator expected.
+            ("legacy digest on a v1 row", |id, _rev, _auth| {
+                crate::db::desktop_decision_payload_hash(id, "edit", Some("desktop corrected"), Some(1_700_000_000_000))
+            }),
+            // A v1 digest bound to a DIFFERENT playback authority -- replaying another clip's proof.
+            ("v1 digest for another authority", |id, rev, _auth| {
+                crate::db::desktop_review_v1_payload_hash(
+                    id,
+                    rev,
+                    "edit",
+                    Some("desktop corrected"),
+                    "99999999-2222-4333-8444-555555555555",
+                )
+            }),
+            // A v1 digest over text the row does not contain -- the transcript was swapped after.
+            ("v1 digest over different text", |id, rev, auth| {
+                crate::db::desktop_review_v1_payload_hash(id, rev, "edit", Some("something else entirely"), auth)
+            }),
+        ];
+        for (label, forge) in cases {
+            let db = seeded_db("forged-desktop");
+            let prior_revision = db.segment_review_revision("forged-desktop").unwrap().unwrap();
+            let hash = forge("forged-desktop", prior_revision, authority);
+            insert_typed_desktop_effect(&db, "forged-desktop", authority, &hash);
+            let error = validate_review_effect_semantics(&db).unwrap_err();
+            assert!(
+                error.contains("outside the exact anonymous desktop operation boundary"),
+                "{label}: must still be refused, got: {error}"
+            );
+        }
+
+        // And a row claiming contract 1 with NO authority is corruption, not a legacy row: the
+        // writer requires an authority for v1, so it must not fall back to the legacy formula.
+        let db = seeded_db("no-authority");
+        let prior_revision = db.segment_review_revision("no-authority").unwrap().unwrap();
+        let hash = crate::db::desktop_review_v1_payload_hash(
+            "no-authority",
+            prior_revision,
+            "edit",
+            Some("desktop corrected"),
+            authority,
+        );
+        insert_typed_desktop_effect(&db, "no-authority", authority, &hash);
+        db.connection()
+            .execute("UPDATE human_decision_effect_events SET playback_authority_session_id = NULL", [])
+            .unwrap();
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("outside the exact anonymous desktop operation boundary"), "{error}");
     }
 }
