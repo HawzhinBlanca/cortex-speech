@@ -2234,4 +2234,61 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn an_undo_must_carry_a_canonical_operation_identity() {
+        // The undo's operation id is what addresses its pay inverse (`entry_key = 'undo:' || id`).
+        // A non-canonical id can address nothing, so the decision reversal would stand while the
+        // money it claws back never moves. Only testable now that a genuine undo validates at all.
+        let db = seeded_db("undo-identity");
+        let effect_id = decided_then_undone(&db, "undo-identity", 440, 441);
+        validate_review_effect_semantics(&db).expect("the genuine undo must validate first");
+
+        db.connection().execute("DROP TRIGGER IF EXISTS human_decision_effect_reversals_immutable_update", []).ok();
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+        let changed = db
+            .connection()
+            .execute(
+                "UPDATE human_decision_effect_reversals SET operation_id = 'not-a-uuid' WHERE effect_event_id = ?1",
+                [effect_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the corruption must apply, or this test proves nothing");
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(error.contains("has no canonical operation UUID"), "{error}");
+    }
+
+    #[test]
+    fn pay_clawed_back_while_the_decision_still_stands_is_refused() {
+        // The asymmetry that costs a reviewer money. The compensation inverse survives the restore
+        // but the decision reversal does not, so the edit reads as ACTIVE and still sits in the
+        // dataset while the pay for it was reversed. Publishing that silently is the whole failure.
+        let db = seeded_db("half-undo");
+        let effect_id = decided_then_undone(&db, "half-undo", 442, 443);
+        validate_review_effect_semantics(&db).expect("the genuine undo must validate first");
+
+        db.connection().execute("DROP TRIGGER IF EXISTS human_decision_effect_reversals_immutable_delete", []).ok();
+        db.connection().execute_batch("PRAGMA ignore_check_constraints = ON; PRAGMA foreign_keys = OFF;").unwrap();
+        let removed = db
+            .connection()
+            .execute("DELETE FROM human_decision_effect_reversals WHERE effect_event_id = ?1", [effect_id])
+            .unwrap();
+        assert_eq!(removed, 1, "exactly one decision reversal must be removed");
+        let surviving_inverse: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM review_compensation_ledger WHERE reverses_entry_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(surviving_inverse, 1, "the pay inverse must remain -- that asymmetry IS the defect under test");
+
+        let error = validate_review_effect_semantics(&db).unwrap_err();
+        assert!(
+            error.contains("already has a compensation inverse")
+                || error.contains("is not owned by one exact human-effect reversal"),
+            "an active decision whose pay was reversed must be refused: {error}"
+        );
+    }
 }
