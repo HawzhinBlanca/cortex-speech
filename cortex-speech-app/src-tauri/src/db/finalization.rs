@@ -169,6 +169,23 @@ impl Database {
                     return Ok((Some(commit), cleared_draft));
                 }
             }
+            if audit_source.is_none() {
+                let operation_collision_count: i64 = tx.query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM review_events WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM human_decision_effect_events WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM human_decision_effect_reversals WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM review_flag_effect_events WHERE operation_id=?1)
+                       + (SELECT COUNT(*) FROM review_flag_effect_reversals WHERE operation_id=?1)",
+                    params![operation_id],
+                    |row| row.get(0),
+                )?;
+                if operation_collision_count != 0 {
+                    return Err(AppError::Validation(
+                        "desktop decision operation UUID is already bound to another review action".into(),
+                    ));
+                }
+            }
             let Some((prior, prior_revision, stored_content_hash)) = Self::decision_snapshot_on(&tx, segment_id)?
             else {
                 tx.rollback()?;

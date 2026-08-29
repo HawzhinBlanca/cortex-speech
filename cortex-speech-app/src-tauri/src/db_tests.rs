@@ -8379,6 +8379,67 @@ fn desktop_decision_retry_returns_the_original_commit_and_uuid_reuse_or_late_ret
 }
 
 #[test]
+fn desktop_decision_refuses_uuid_already_bound_to_a_review_flag() {
+    let db = make_db();
+    db.insert_segment(&make_segment("desktop-cross-action", "/desktop-cross-action.wav")).unwrap();
+    let audio_content_hash = ensure_test_audio_content_hash(&db, "desktop-cross-action");
+    let revision = db.segment_review_revision("desktop-cross-action").unwrap().unwrap();
+    let (source_start_ms, source_end_ms) = db.segment_source_span("desktop-cross-action").unwrap().unwrap();
+    assert!(db
+        .record_playback_receipt_if_at_revision(
+            &PlaybackReceipt {
+                segment_id: "desktop-cross-action".into(),
+                segment_revision: revision,
+                audio_content_hash: audio_content_hash.clone(),
+                reviewer: None,
+                session_id: Some("desktop".into()),
+                started_at_ms: 1_700_000_000_000,
+                played_ms: 1_000,
+                clip_duration_ms: 1_000,
+                source_start_ms: None,
+                source_end_ms: None,
+            },
+            revision,
+        )
+        .unwrap());
+    let proof = PlaybackDecisionProof {
+        segment_revision: revision,
+        audio_content_hash,
+        source_start_ms,
+        source_end_ms,
+        authority_session_id: None,
+        source_lease: None,
+    };
+    let operation_id = "21111111-2222-4333-8444-555555555555";
+    db.record_review_flag("desktop-cross-action", "second-pass review", operation_id).unwrap();
+
+    let error = db
+        .finalize_human_review_with_playback(
+            "desktop-cross-action",
+            "accept",
+            Some("test"),
+            Some(1_700_000_000_001),
+            &proof,
+            operation_id,
+        )
+        .expect_err("one operation UUID must not authorize two review action kinds");
+    assert!(error.to_string().contains("already bound to another review action"), "{error}");
+
+    let unchanged = db.get_segment_by_id("desktop-cross-action").unwrap().unwrap();
+    assert!(unchanged.human_decision.is_none());
+    assert!(!unchanged.verified);
+    let decision_events: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM human_decision_effect_events WHERE segment_id='desktop-cross-action'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(decision_events, 0, "the cross-action refusal must precede every decision side effect");
+}
+
+#[test]
 fn a_full_listen_is_sufficient_evidence() {
     let db = make_db();
     insert_playback_segment(&db, "pb-1", 9_000);
