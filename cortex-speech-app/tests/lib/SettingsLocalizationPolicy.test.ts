@@ -125,6 +125,8 @@ describe('settings and playback localization policy', () => {
 
   it('keeps AudioPlayer controls and user-facing failures behind translation keys', () => {
     const source = readFileSync(resolve(root, 'src/lib/AudioPlayer.svelte'), 'utf8');
+    const controller = readFileSync(resolve(root, 'src/lib/audioPlayerController.ts'), 'utf8');
+    const playbackSurface = `${source}\n${controller}`;
     const requiredKeys = [
       'audio.controls',
       'audio.play',
@@ -136,12 +138,21 @@ describe('settings and playback localization policy', () => {
       'audio.loopFailed',
       'audio.playbackFailed',
       'audio.loadFailed',
+      'audio.proofFailed',
       'retry',
     ];
     for (const key of requiredKeys) {
-      const expected =
-        key === 'audio.loopOn' || key === 'audio.loopOff' ? `'${key}'` : `$t('${key}')`;
-      expect(source).toContain(expected);
+      const expected = [
+        'audio.loopFailed',
+        'audio.playbackFailed',
+        'audio.loadFailed',
+        'audio.proofFailed',
+      ].includes(key)
+        ? `translate('${key}')`
+        : key === 'audio.loopOn' || key === 'audio.loopOff'
+          ? `'${key}'`
+          : `$t('${key}')`;
+      expect(playbackSurface).toContain(expected);
     }
 
     for (const hardcodedCopy of [
@@ -153,7 +164,7 @@ describe('settings and playback localization policy', () => {
       "attemptPlay('Playback blocked or file not found')",
       "error = 'Failed to load audio file'",
     ]) {
-      expect(source).not.toContain(hardcodedCopy);
+      expect(playbackSurface).not.toContain(hardcodedCopy);
     }
   });
 });
