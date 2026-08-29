@@ -630,6 +630,71 @@ fn export_jsonl_replaces_existing_file() {
 }
 
 #[test]
+fn export_primary_training_labels_preserve_exact_verbatim_codepoints() {
+    use arrow_array::Array;
+
+    // Arabic Kaf/Yeh and ZWNJ are deliberately chosen because the derived Sorani normalizer changes
+    // them. Every primary label must still round-trip the stored authority exactly while a separately
+    // computed normalized view remains available to downstream consumers that explicitly request it.
+    let exact = "كوردي هه\u{200c} ١٤";
+    assert_ne!(crate::normalizer::canonical_training_text(exact), exact, "fixture must detect normalization");
+    let mut segment = sample_segment("verbatim-codepoints");
+    segment.raw_transcript = exact.to_string();
+    segment.normalized_transcript = Some(crate::normalizer::canonical_training_text(exact));
+
+    let directory = tempfile::tempdir().unwrap();
+    let json_path = directory.path().join("exact.json");
+    export_json(&json_path, &sample_metadata(), std::slice::from_ref(&segment)).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(json["segments"][0]["trainingTranscript"], exact);
+
+    let jsonl_path = directory.path().join("exact.jsonl");
+    export_jsonl(&jsonl_path, std::slice::from_ref(&segment)).unwrap();
+    let jsonl: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&jsonl_path).unwrap().trim_end()).unwrap();
+    assert_eq!(jsonl["trainingTranscript"], exact);
+
+    let csv_path = directory.path().join("exact.csv");
+    export_csv(&csv_path, std::slice::from_ref(&segment)).unwrap();
+    let mut csv_reader = csv::Reader::from_path(&csv_path).unwrap();
+    let headers = csv_reader.headers().unwrap().clone();
+    let training_index = headers.iter().position(|field| field == "training_transcript").unwrap();
+    let csv_row = csv_reader.records().next().unwrap().unwrap();
+    assert_eq!(&csv_row[training_index], exact);
+
+    let parquet_path = directory.path().join("exact.parquet");
+    export_parquet(&parquet_path, std::slice::from_ref(&segment)).unwrap();
+    let parquet_file = std::fs::File::open(&parquet_path).unwrap();
+    let parquet_reader =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap().build().unwrap();
+    let batches: Vec<_> = parquet_reader.collect::<Result<Vec<_>, _>>().unwrap();
+    let parquet_labels =
+        batches[0].column_by_name("training_transcript").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(parquet_labels.value(0), exact);
+
+    let wav_path = directory.path().join("verbatim.wav");
+    write_silent_wav(&wav_path);
+    segment.audio_path = wav_path.to_string_lossy().into_owned();
+    let database = Database::open(":memory:").unwrap();
+    database.initialize().unwrap();
+    database.insert_legacy_segment_fixture(&segment).unwrap();
+    let hf_dir = directory.path().join("huggingface");
+    export_huggingface_dataset(&database, &hf_dir, &crate::settings::AppSettings::default()).unwrap();
+    let mut hf_labels = Vec::new();
+    for split in ["train", "validation", "test"] {
+        let metadata = hf_dir.join("data").join(split).join("metadata.csv");
+        if !metadata.exists() {
+            continue;
+        }
+        let mut reader = csv::Reader::from_path(metadata).unwrap();
+        hf_labels.extend(reader.records().map(|record| record.unwrap()[1].to_string()));
+    }
+    assert_eq!(hf_labels, vec![exact.to_string()], "HF primary transcription must remain byte-exact");
+    let readme = std::fs::read_to_string(hf_dir.join("README.md")).unwrap();
+    assert!(readme.contains("exact stored Verbatim-Law authority"));
+}
+
+#[test]
 fn export_csv_replaces_existing_file() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let path = tmp_dir.path().join("dataset.csv");

@@ -841,9 +841,9 @@ fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppRe
     let mut planned: Vec<(&crate::db::SpeechSegment, &crate::quality::TrainingGradeReport, String)> = Vec::new();
     for (seg, report) in graded.iter().filter(|(_, report)| report.training_ready) {
         safe_export_clip_id(&seg.id)?;
-        // Canonical Sorani orthography for the SHIPPED sentence — ك/ک, ي/ی, ه/ھ variants unified so
-        // the retrain corpus has one label per grapheme (mixed forms inflate the CTC label space).
-        let sentence = crate::normalizer::canonical_training_text(&report.transcript);
+        // Verbatim Law: the training sentence is the exact stored authority selected by the grade.
+        // Variant-normalized text may key deduplication below, but cannot replace the primary label.
+        let sentence = report.transcript.clone();
         if sentence.trim().is_empty() {
             skipped += 1;
             continue;
@@ -1025,7 +1025,7 @@ fn export_finetune_pack_inner(db: &Database, out_dir: &std::path::Path) -> AppRe
         // failure this provenance record exists to prevent.
         "splitPolicy": "assign_splits 80/10/10 over AUDIO-CONTENT groups (audio_content_hash, else full path) — every clip sharing audio content lands in one split, so a re-encode cannot straddle. NOT speaker-disjoint: diarizer labels are per-recording indices, not identities, so two recordings of one person may land in different splits.",
         "rowSchema": "audio_path, sentence, duration_seconds, segment_id, source_recording, split, decision, decision_revision, grade, audio_processed",
-        "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; canonical Sorani orthography; variant-aware dedup; one row per (recording, span, text) at its LATEST review_revision",
+        "selectionPolicy": "training_ready (GOLD/SILVER) via quality::training_grade_for_segment; holdout-excluded; exact Verbatim-Law label; variant-aware dedup key only; one row per (recording, span, text) at its LATEST review_revision",
     });
     // Seal it. INSERT OR IGNORE: re-exporting identical data is a no-op and an existing snapshot is
     // never rewritten, so a training run can cite `snapshotId` and trust it did not move.
@@ -2935,10 +2935,10 @@ mod tests {
     }
 
     #[test]
-    fn finetune_pack_ships_canonical_orthography_and_dedups_variants() {
-        // True-10 audit: human-typed and ASR text mix Sorani codepoint variants (ك/ک, ي/ی). The
-        // shipped sentence must be canonicalized, and two rows on the same audio span differing
-        // ONLY by codepoint variant must dedup to ONE training row.
+    fn finetune_pack_preserves_the_selected_verbatim_label_and_dedups_variants() {
+        // Variant folding is a useful DEDUP key, but it may never rewrite the primary label while
+        // retaining the selected row's transcript provenance. Two equivalent rows collapse to one;
+        // whichever exact row wins keeps its own stored codepoints.
         let db = open_mem_db();
         let tmp = tempfile::TempDir::new().unwrap();
         let wav = tmp.path().join("v.wav");
@@ -2976,8 +2976,19 @@ mod tests {
         assert_eq!(result.skipped, 1, "the variant duplicate is skipped as a dup");
 
         let manifest = std::fs::read_to_string(out.path().join("finetune_manifest.jsonl")).unwrap();
-        assert!(manifest.contains("کوردی"), "the shipped sentence uses the canonical Kurdish forms");
-        assert!(!manifest.contains("كوردي"), "no Arabic codepoint variants ship: {manifest}");
+        let row: serde_json::Value = serde_json::from_str(manifest.trim_end()).unwrap();
+        let segment_id = row["segment_id"].as_str().unwrap();
+        let expected = match segment_id {
+            "arabic" => "كوردي",
+            "kurdish" => "کوردی",
+            other => panic!("unexpected selected segment {other}"),
+        };
+        assert_eq!(row["sentence"], expected, "the selected row's exact Verbatim-Law label must survive");
+        assert_eq!(
+            crate::normalizer::canonical_training_text(row["sentence"].as_str().unwrap()),
+            "کوردی",
+            "the separately derived comparison key still collapses the variants"
+        );
     }
 
     #[test]

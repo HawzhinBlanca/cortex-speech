@@ -16,7 +16,9 @@ Static source checks, sandbox-safe:
   2. corrections.rs::loop0_draft_text (aligner/LOOP-0 text) — annotated ▸ raw only.
   3. segmentQuality.ts::effectiveTranscript — the frontend mirror, same order.
   4. ReviewMode.svelte::originalText — the reviewer-facing draft, annotated ▸ raw only.
-  5. No `normalizedTranscript ??` fallback anywhere in a .svelte file — the tell-tale shape of
+  5. Flat/Hugging Face/fine-tune primary labels preserve exact stored codepoints; normalization may
+     still serve as an explicitly derived field or variant-aware dedup key.
+  6. No `normalizedTranscript ??` fallback anywhere in a .svelte file — the tell-tale shape of
      machine-processed text outranking the verbatim draft in a display/align chain.
 """
 
@@ -82,6 +84,20 @@ def main() -> int:
             if term in body:
                 failures.append(f"{path.name}::{name} references {term} — machine text must never be the transcript")
 
+    export_source = (APP / "src-tauri" / "src" / "export.rs").read_text(encoding="utf-8")
+    export_tests = (APP / "src-tauri" / "src" / "export_tests.rs").read_text(encoding="utf-8")
+    eval_source = (APP / "src-tauri" / "src" / "eval.rs").read_text(encoding="utf-8")
+    if "canonical_training_text(&grade.transcript)" in export_source:
+        failures.append("export.rs rewrites the grade-selected primary label through canonical_training_text")
+    if "canonical_training_text(&report.transcript)" in export_source:
+        failures.append("export.rs rewrites the report-selected primary label through canonical_training_text")
+    if "let sentence = crate::normalizer::canonical_training_text(&report.transcript)" in eval_source:
+        failures.append("eval.rs fine-tune pack rewrites the grade-selected primary label")
+    if "export_primary_training_labels_preserve_exact_verbatim_codepoints" not in export_tests:
+        failures.append("all primary export formats need an exact-codepoint Verbatim-Law regression")
+    if "finetune_pack_preserves_the_selected_verbatim_label_and_dedups_variants" not in eval_source:
+        failures.append("fine-tune export needs exact-label plus variant-dedup regression evidence")
+
     # The tell-tale fallback shape in any display/align chain. `?? ''` is exempt: that is a plain
     # null-to-empty render of the normalized COLUMN itself (a labeled field), not machine text
     # outranking another transcript source.
@@ -97,7 +113,7 @@ def main() -> int:
             print(f"FAIL: {f}")
         print(f"VERBATIM-TRAINING-TEXT: {len(failures)} violation(s)")
         return 1
-    print("VERBATIM-TRAINING-TEXT: transcript precedence is human > champion-raw everywhere")
+    print("VERBATIM-TRAINING-TEXT: primary labels preserve human verdict > annotation > champion raw")
     return 0
 
 

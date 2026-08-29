@@ -221,11 +221,11 @@ impl ExportSegmentRecord {
         sanitized.reviewed_by = None;
         Self {
             segment: sanitized,
-            // Canonicalize the SHIPPED training text (fold ك/ک, ي/ی, heh forms, ZWNJ/tatweel; digits
-            // and diacritics untouched) exactly like the HF exporter, so JSON/JSONL/CSV/Parquet emit
-            // byte-identical training_transcript for a segment — mixed orthography must not re-enter the
-            // corpus and fragment the CTC label space through the flat exports.
-            training_transcript: crate::normalizer::canonical_training_text(&report.transcript),
+            // Verbatim Law: the primary training label is the exact stored authority selected by the
+            // grade (human verdict > annotation > champion raw). Orthographic normalization is useful
+            // as explicitly labeled derived evidence and as a dedup key, never as a replacement label
+            // that still claims the original transcript_source.
+            training_transcript: report.transcript,
             transcript_source: report.transcript_source,
             training_grade: report.grade,
             training_ready: report.training_ready,
@@ -1400,15 +1400,13 @@ pub fn export_huggingface_dataset(
                         let verified_str = if seg.verified { "1" } else { "0" };
                         let training_ready_str = if grade.training_ready { "1" } else { "0" };
                         let reasons = grade.reasons.join("; ");
-                        // Canonical Sorani orthography for the shipped transcription (ك/ک, ي/ی, ه/ھ
-                        // unified — mixed codepoint variants inflate the CTC label space downstream),
-                        // then the formula-injection guard on every caller-influenced column. The clip
+                        // Preserve the exact grade-selected Verbatim-Law transcript, then apply the
+                        // formula-injection transport guard on every caller-influenced CSV column. The clip
                         // name is included: sanitized_clip_filename() maps '=', '+' and '@' to '_' but
                         // PRESERVES '-', which csv_safe_cell() itself treats as a formula lead, so a
                         // source stem beginning with '-' otherwise reached metadata.csv unguarded.
-                        let canonical_transcript = crate::normalizer::canonical_training_text(&grade.transcript);
                         let hf_filename = csv_safe_cell(filename.as_str());
-                        let hf_transcript = csv_safe_cell(&canonical_transcript);
+                        let hf_transcript = csv_safe_cell(&grade.transcript);
                         let hf_speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                         let hf_reasons = csv_safe_cell(reasons.as_str());
 
@@ -1572,10 +1570,10 @@ This dataset was exported from Cortex Speech Processor.
 | **Total** | {} | {:.2} |
 
 ## Text Normalization Policy
-The `transcription` column is orthographically canonicalized for Sorani: Arabic-script codepoint
-variants are unified (Kaf ك→ک, Yeh ي→ی, Heh→ھ/ە forms; tatweel/ZWNJ folded) so each grapheme has
-one form across human-typed and ASR-produced text. Digits are preserved exactly as written (no
-number verbalization), and diacritics are left untouched.
+The `transcription` column preserves the exact stored Verbatim-Law authority selected for each row:
+human verdict, then human annotation, then champion raw. It is not silently orthographically
+normalized or rewritten. Consumers that need normalized Sorani must create and label that derived
+view explicitly; the source label and its codepoints remain recoverable unchanged.
 {composition_md}"#,
         settings.hf_license,
         settings.hf_license,
@@ -1756,9 +1754,8 @@ fn export_csv(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResult<(
                 let raw = csv_safe_cell(seg.raw_transcript.as_str());
                 let normalized = csv_safe_cell(seg.normalized_transcript.as_deref().unwrap_or(""));
                 let annotated = csv_safe_cell(seg.annotated_transcript.as_deref().unwrap_or(""));
-                // Canonicalize the shipped training column like the HF exporter (see ExportSegmentRecord).
-                let training_text = crate::normalizer::canonical_training_text(&grade.transcript);
-                let training = csv_safe_cell(&training_text);
+                // Preserve the exact grade-selected Verbatim-Law label in the primary training column.
+                let training = csv_safe_cell(&grade.transcript);
                 let speaker = csv_safe_cell(seg.speaker_id.as_deref().unwrap_or(""));
                 let reasons_cell = csv_safe_cell(reasons.as_str());
                 wtr.write_record([
@@ -1877,11 +1874,10 @@ fn export_parquet(path: &std::path::Path, segments: &[SpeechSegment]) -> AppResu
     let duration_ms: Int64Array = segments.iter().map(|s| Some(s.duration_ms)).collect();
     let speaker_id: StringArray = segments.iter().map(|s| s.speaker_id.as_deref()).collect();
     let verified: BooleanArray = segments.iter().map(|s| Some(s.verified)).collect();
-    // Canonicalize the shipped training column like the HF/JSON/CSV exporters so all four formats emit
-    // byte-identical training text for a segment (no mixed-orthography re-entry via Parquet).
-    let training_texts: Vec<String> =
-        grade_reports.iter().map(|report| crate::normalizer::canonical_training_text(&report.transcript)).collect();
-    let training_transcript: StringArray = training_texts.iter().map(|t| Some(t.as_str())).collect();
+    // Primary labels preserve the exact grade-selected Verbatim-Law authority. A consumer may derive
+    // a separately labeled normalized view, but Parquet must not rewrite the source transcript bytes.
+    let training_transcript: StringArray =
+        grade_reports.iter().map(|report| Some(report.transcript.as_str())).collect();
     let transcript_source: StringArray =
         grade_reports.iter().map(|report| Some(report.transcript_source.as_str())).collect();
     let training_grade: StringArray = grade_reports.iter().map(|report| Some(report.grade.as_str())).collect();
