@@ -49,7 +49,9 @@ describe('owner review command deadlines', () => {
     await vi.advanceTimersByTimeAsync(REVIEW_OPERATION_TIMEOUT_MS);
     expect(resolved).not.toHaveBeenCalled();
     expect(rejected).toHaveBeenCalledOnce();
-    expect(rejected.mock.calls[0]?.[0]).toMatchObject({ message: 'E_PLAYBACK_FINALIZATION_TIMEOUT' });
+    expect(rejected.mock.calls[0]?.[0]).toMatchObject({
+      message: 'E_PLAYBACK_FINALIZATION_TIMEOUT',
+    });
 
     nativeCall.resolve({
       playbackReceiptId: 'receipt-original',
