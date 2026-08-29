@@ -1,6 +1,7 @@
 import { invokeCritical, invokeLegacy } from './adapters/legacyIpc';
 import { commands as generatedCommands } from './generated/ipc';
 import { formatUnknownError } from './errorText';
+import { withReviewOperationTimeout } from './reviewOperationTimeout';
 import type {
   ActiveVoiceFocusV1,
   AssignedSpeakersV1,
@@ -263,10 +264,13 @@ function isSegmentsPagePayload(value: unknown): value is SegmentsPage {
 }
 
 export async function getSegment(segmentId: string): Promise<SpeechSegment> {
-  const result = await generatedCommands.getSegment(segmentId);
+  const result = await withReviewOperationTimeout(
+    generatedCommands.getSegment(segmentId),
+    'E_SEGMENT_LOAD_TIMEOUT',
+  );
   if (result.status === 'error') throw result.error;
   const data = result.data;
-  if (!isSpeechSegmentPayload(data)) {
+  if (!isSpeechSegmentPayload(data) || data.id !== segmentId) {
     throw new Error('get_segment returned an invalid payload');
   }
   return data;
@@ -351,7 +355,10 @@ export async function getVoiceFocusReviewPageV1(
  */
 export async function commitReviewV1(request: CommitReviewRequestV1): Promise<CommittedReviewV1> {
   const invokeExact = async (): Promise<CommittedReviewV1> => {
-    const result = await generatedCommands.commitReviewV1(request);
+    const result = await withReviewOperationTimeout(
+      generatedCommands.commitReviewV1(request),
+      'E_REVIEW_COMMIT_TIMEOUT',
+    );
     if (result.status === 'error') throw result.error;
     return result.data;
   };
@@ -373,7 +380,10 @@ export async function markSegmentUnusableV1(
   request: MarkSegmentUnusableRequestV1,
 ): Promise<MarkedSegmentUnusableV1> {
   const invokeExact = async (): Promise<MarkedSegmentUnusableV1> => {
-    const result = await generatedCommands.markSegmentUnusableV1(request);
+    const result = await withReviewOperationTimeout(
+      generatedCommands.markSegmentUnusableV1(request),
+      'E_MARK_UNUSABLE_TIMEOUT',
+    );
     if (result.status === 'error') throw result.error;
     return result.data;
   };
@@ -1708,10 +1718,13 @@ export async function recordPlaybackReceipt(args: {
     startMs: Math.max(0, Math.round(interval.startMs)),
     endMs: Math.max(0, Math.round(interval.endMs)),
   }));
-  const result = await generatedCommands.finalizeDesktopPlaybackSessionV1(
-    args.playbackReceiptId,
-    args.mediaGrantId,
-    intervals,
+  const result = await withReviewOperationTimeout(
+    generatedCommands.finalizeDesktopPlaybackSessionV1(
+      args.playbackReceiptId,
+      args.mediaGrantId,
+      intervals,
+    ),
+    'E_PLAYBACK_FINALIZATION_TIMEOUT',
   );
   if (result.status === 'error') throw result.error;
   return result.data;
