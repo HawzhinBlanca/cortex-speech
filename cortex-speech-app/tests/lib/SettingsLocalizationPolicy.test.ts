@@ -6,17 +6,26 @@ const root = resolve(import.meta.dirname, '../..');
 
 describe('settings and playback localization policy', () => {
   it('keeps AI and Jury settings prose behind translation keys', () => {
-    const source = readFileSync(resolve(root, 'src/lib/SettingsPanel.svelte'), 'utf8');
+    const owner = readFileSync(resolve(root, 'src/lib/SettingsPanel.svelte'), 'utf8');
+    const ai = readFileSync(resolve(root, 'src/lib/SettingsAiTab.svelte'), 'utf8');
+    const jury = readFileSync(resolve(root, 'src/lib/SettingsJuryTab.svelte'), 'utf8');
+    const keyController = readFileSync(
+      resolve(root, 'src/lib/settingsKeyController.svelte.ts'),
+      'utf8',
+    );
+    const source = `${owner}\n${ai}\n${jury}\n${keyController}`;
     const apiKeyField = readFileSync(resolve(root, 'src/lib/ApiKeyField.svelte'), 'utf8');
-    expect(source).toContain("labelKey: 'settings.aiTab'");
-    expect(source).toContain("labelKey: 'settings.juryTab'");
-    expect(source).toContain("import ApiKeyField from './ApiKeyField.svelte'");
-    const start = source.indexOf("{:else if activeTab === 'ai'}");
-    const end = source.indexOf("{:else if activeTab === 'diagnostics'}", start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
+    expect(owner).toContain("labelKey: 'settings.aiTab'");
+    expect(owner).toContain("labelKey: 'settings.juryTab'");
+    expect(owner).toContain("import SettingsAiTab from './SettingsAiTab.svelte'");
+    expect(owner).toContain("import SettingsJuryTab from './SettingsJuryTab.svelte'");
+    expect(ai).toContain("import ApiKeyField from './ApiKeyField.svelte'");
+    expect(jury).toContain("import ApiKeyField from './ApiKeyField.svelte'");
 
-    const section = source.slice(start, end).replace(/<!--[\s\S]*?-->/g, '');
+    const markup = (component: string) => component.slice(component.indexOf('</script>') + 9);
+    const section = `${markup(ai)}\n${markup(jury)}`
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replaceAll('=>', '⇒');
     const visibleLatinText = [...section.matchAll(/>([^<{]*[A-Za-z][^<{]*)</g)]
       .map((match) => match[1].trim())
       .filter(Boolean);
@@ -99,8 +108,8 @@ describe('settings and playback localization policy', () => {
       expect(source).not.toContain(hardcodedNotice);
       expect(apiKeyField).not.toContain(hardcodedNotice);
     }
-    expect(source).toContain("$t('settings.apiKeySavedToast'");
-    expect(source).toContain("$t('settings.apiKeySaveFailedToast'");
+    expect(keyController).toContain("translate('settings.apiKeySavedToast'");
+    expect(keyController).toContain("get(t)('settings.apiKeySaveFailedToast'");
   });
 
   it('keeps the Inbox local-only notice behind translation keys', () => {
