@@ -665,9 +665,10 @@ pub async fn relink_audio(search_dir: String, state: State<'_, AppState>) -> Res
     // leak) on the is_file() stat and then PERSIST the UNC path into the row. Syntactic guard, zero I/O
     // (no canonicalize: the picked dir is searched as-is); also subsumes the prior null-byte check.
     validate::reject_unc_path(&search_dir)?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         db.relink_audio(std::path::Path::new(&search_dir)).map_err(|e| e.to_string())
     })
     .await
