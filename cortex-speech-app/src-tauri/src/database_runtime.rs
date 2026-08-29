@@ -58,6 +58,13 @@ impl DatabaseRuntime {
         self.writer.lock()
     }
 
+    /// Enter mutation authority on this exact runtime before waiting for its serialized writer.
+    /// A restore reservation must observe the active mutation and refuse rather than replacing the
+    /// database after a successful write has already been reported.
+    pub(crate) fn begin_mutation(&self) -> Result<MutationGuard<'_>, String> {
+        self.admission.begin_mutation()
+    }
+
     /// Open one stable, query-only WAL snapshot under a bounded permit. Restore admission spans the
     /// complete reader lifetime so a command cannot observe two database generations.
     pub(crate) fn open_read(&self) -> AppResult<ReadDatabase<'_>> {
