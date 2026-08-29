@@ -123,9 +123,18 @@ export function publicErrorReference(value: unknown): PublicErrorReference {
     };
   }
 
-  // Some legacy commands still reject with an `E_*` token. Preserve that identifier, never prose.
-  if (typeof value === 'string') {
-    const match = /(?:^|\s)(E_[A-Z0-9_]{1,61})(?=\s|:|\.|,|;|$)/u.exec(value.trim());
+  // Some legacy commands still reject with an `E_*` token. Tauri/browser bridges may preserve it
+  // as a string or wrap it in an Error-like `message`; inspect through the hostile-safe accessor and
+  // preserve only the closed identifier, never surrounding prose.
+  const legacyMessage = structured ? readProperty(structured, 'message') : undefined;
+  const legacyText =
+    typeof value === 'string'
+      ? value
+      : typeof legacyMessage === 'string'
+        ? legacyMessage
+        : undefined;
+  if (legacyText) {
+    const match = /(?:^|\s)(E_[A-Z0-9_]{1,61})(?=\s|:|\.|,|;|$)/u.exec(legacyText.trim());
     const code = safeCode(match?.[1]);
     return code ? { code } : {};
   }

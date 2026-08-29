@@ -70,6 +70,9 @@ describe('public error boundary', () => {
       'write failed E_DATABASE_LOCKED: C:\\private\\library.db; SQL stack follows',
     );
     expect(rendered).toBe('E_DATABASE_LOCKED');
+    expect(publicErrorReference(new Error('E_FILE_PICKER_CANCELLED: private detail'))).toEqual({
+      code: 'E_FILE_PICKER_CANCELLED',
+    });
   });
 
   it('is total for hostile values and bounded for every output', () => {
