@@ -5,6 +5,18 @@ import { describe, expect, it } from 'vitest';
 const root = resolve(import.meta.dirname, '../..');
 
 describe('320 CSS-pixel reflow policy', () => {
+  it('keeps modal content and confirmation actions reachable at extreme zoom', () => {
+    const modal = readFileSync(resolve(root, 'src/lib/Modal.svelte'), 'utf8');
+    const confirm = readFileSync(resolve(root, 'src/lib/ConfirmDialog.svelte'), 'utf8');
+
+    expect(modal).toMatch(/modal-backdrop[^"\n]*overflow-y-auto/);
+    expect(modal).toContain('flex-wrap items-center justify-end');
+    const shortViewport = modal.slice(modal.indexOf('@media (max-height: 360px)'));
+    expect(shortViewport).toMatch(/\.modal-dialog\s*{[^}]*max-height:\s*none;[^}]*overflow:\s*visible;/s);
+    expect(shortViewport).toMatch(/\.modal-body\s*{[^}]*flex:\s*none;[^}]*overflow:\s*visible;/s);
+    expect(confirm.match(/max-w-full whitespace-normal text-center/g)).toHaveLength(3);
+  });
+
   it('keeps the audio timeline shrinkable inside a wrapping toolbar', () => {
     const source = readFileSync(resolve(root, 'src/lib/AudioPlayer.svelte'), 'utf8');
     expect(source).toMatch(
