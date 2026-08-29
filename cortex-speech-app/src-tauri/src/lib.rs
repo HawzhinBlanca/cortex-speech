@@ -418,8 +418,34 @@ impl AppState {
         crate::stores::SegmentWriteStore::new(self.db.clone(), Arc::clone(&self.history))
     }
 
+    pub(crate) fn save_session_view_state(
+        &self,
+        search_query: String,
+        sort_order: String,
+        filter_verified: Option<bool>,
+    ) -> crate::error::AppResult<()> {
+        let mutation = self.db.begin_mutation().map_err(crate::error::AppError::Other)?;
+        let db = self.db.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned database lock during session view-state save");
+            poisoned.into_inner()
+        });
+        let mut session = self.lock_session();
+        session.set_view_state(search_query, sort_order, filter_verified);
+        session.save(&db)
+    }
+
     pub fn session_save(&self) {
-        let db = self.lock_db();
+        let mutation = match self.db.begin_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                tracing::warn!(%error, "Session save refused by database restore admission");
+                return;
+            }
+        };
+        let db = self.db.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned database lock during session save");
+            poisoned.into_inner()
+        });
         if let Err(error) = self.lock_session().save(&db) {
             tracing::error!("Session save failed: {error}");
         }
@@ -428,7 +454,17 @@ impl AppState {
     /// Best-effort navigation breadcrumb after durable review truth commits. Commands do not need
     /// raw database authority merely to keep restart position current.
     pub(crate) fn persist_review_cursor(&self, segment_id: &str) {
-        let db = self.lock_db();
+        let mutation = match self.db.begin_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                tracing::warn!(%error, segment_id, "Review cursor save refused by database restore admission");
+                return;
+            }
+        };
+        let db = self.db.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned database lock during review cursor save");
+            poisoned.into_inner()
+        });
         let mut session = self.lock_session();
         session.set_current_segment(segment_id);
         if let Err(error) = session.save(&db) {
@@ -437,7 +473,17 @@ impl AppState {
     }
 
     pub fn session_auto_save(&self) {
-        let db = self.lock_db();
+        let mutation = match self.db.begin_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                tracing::warn!(%error, "Session autosave refused by database restore admission");
+                return;
+            }
+        };
+        let db = self.db.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| {
+            tracing::warn!("Recovering poisoned database lock during session autosave");
+            poisoned.into_inner()
+        });
         if let Err(error) = self.lock_session().auto_save(&db) {
             tracing::error!("Session autosave failed: {error}");
         }
@@ -1727,6 +1773,54 @@ mod tests {
         }));
 
         assert_eq!(state.lock_db().integrity_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn session_view_save_and_restore_admission_are_linearized_before_the_writer_lock() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut state = test_app_state(directory.path().to_path_buf());
+        let isolated_path = directory.path().join("isolated-session.db");
+        let database = Database::open(isolated_path.to_string_lossy().as_ref()).unwrap();
+        database.initialize().unwrap();
+        state.db = DatabaseRuntime::isolated_for_test(database);
+        let state = Arc::new(state);
+        let runtime = state.db_runtime();
+
+        let held_writer = runtime.lock().unwrap();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            worker_state.save_session_view_state("writer first".into(), "oldest".into(), Some(true))
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.mutation_active_for_test() {
+            assert!(Instant::now() < deadline, "session writer never entered restore admission");
+            std::thread::yield_now();
+        }
+        assert!(
+            runtime.try_reserve_restore_for_test().is_err(),
+            "restore must refuse an admitted session writer even while it waits for SQLite"
+        );
+        drop(held_writer);
+        worker.join().unwrap().unwrap();
+        let saved = state.lock_session().load().expect("writer-first session is durable");
+        assert_eq!(saved.search_query, "writer first");
+        assert_eq!(saved.sort_order, "oldest");
+        assert_eq!(saved.filter_verified, Some(true));
+
+        let restore = runtime.try_reserve_restore_for_test().unwrap();
+        let error = state
+            .save_session_view_state("must not land".into(), "newest".into(), Some(false))
+            .expect_err("restore-first admission must refuse the session write");
+        assert!(error.to_string().contains("restore"), "unexpected admission error: {error}");
+        let retained = state.lock_session().load().expect("the prior session remains authoritative");
+        assert_eq!(retained.search_query, "writer first");
+        drop(restore);
+
+        state.save_session_view_state("after restore".into(), "newest".into(), None).unwrap();
+        let resumed = state.lock_session().load().expect("session writes resume after restore admission releases");
+        assert_eq!(resumed.search_query, "after restore");
+        assert_eq!(resumed.sort_order, "newest");
+        assert_eq!(resumed.filter_verified, None);
     }
 
     #[test]

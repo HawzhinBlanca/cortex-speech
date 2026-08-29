@@ -27,6 +27,11 @@ impl DatabaseRuntime {
         Self::with_admission(database, DEFAULT_READ_CONNECTIONS, DEFAULT_READ_WAIT, Arc::clone(&RESTORE_ADMISSION))
     }
 
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test(database: Database) -> Self {
+        Self::with_admission(database, DEFAULT_READ_CONNECTIONS, DEFAULT_READ_WAIT, Arc::new(RestoreAdmission::new()))
+    }
+
     fn with_admission(
         database: Database,
         max_reads: usize,
@@ -63,6 +68,16 @@ impl DatabaseRuntime {
     /// database after a successful write has already been reported.
     pub(crate) fn begin_mutation(&self) -> Result<MutationGuard<'_>, String> {
         self.admission.begin_mutation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve_restore_for_test(&self) -> Result<RestoreReservation<'_>, String> {
+        self.admission.try_reserve()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutation_active_for_test(&self) -> bool {
+        self.admission.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).mutations_active > 0
     }
 
     /// Open one stable, query-only WAL snapshot under a bounded permit. Restore admission spans the
