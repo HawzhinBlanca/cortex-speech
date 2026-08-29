@@ -28,9 +28,10 @@ pub async fn import_gold_segments(
             Ok::<_, String>(crate::eval::GoldSegmentInput { audio_path, ..inp })
         })
         .collect::<Result<_, _>>()?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::eval::import_gold_segments(&db, validated).map_err(|e| e.to_string())
     })
     .await
@@ -62,9 +63,10 @@ pub async fn run_gold_eval(
 ) -> Result<crate::eval::EvalRunResult, String> {
     RATE_LIMITER.check("run_gold_eval")?;
     let model_id = external_hypothesis_label(&model_id);
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::eval::run_gold_eval(&db, &model_id, hypotheses).map_err(|e| e.to_string())
     })
     .await
@@ -95,9 +97,10 @@ pub async fn create_gold_from_file(audio_path: String, state: State<'_, AppState
     if audio_path.contains('\0') {
         return Err("Audio path contains null bytes".to_string());
     }
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::eval::create_gold_from_verified_file(&db, &audio_path).map_err(|e| e.to_string())
     })
     .await
@@ -107,9 +110,10 @@ pub async fn create_gold_from_file(audio_path: String, state: State<'_, AppState
 #[tauri::command]
 pub async fn import_verified_segments_as_gold(state: State<'_, AppState>) -> Result<usize, String> {
     STRICT_RATE_LIMITER.check("import_verified_segments_as_gold")?;
-    let db = state.db_arc();
+    let database = state.db_runtime();
     run_blocking(move || {
-        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        let mutation = database.begin_mutation()?;
+        let db = database.lock_after_mutation(&mutation).unwrap_or_else(|p| p.into_inner());
         crate::eval::import_verified_segments_as_gold(&db).map_err(|e| e.to_string())
     })
     .await
