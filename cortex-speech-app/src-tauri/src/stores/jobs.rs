@@ -1,6 +1,6 @@
 //! Durable job, interrupted-import and tracked-export access.
 
-use crate::database_runtime::{begin_mutation, DatabaseRuntime};
+use crate::database_runtime::{DatabaseRuntime, MutationGuard};
 use crate::db::ImportJob;
 use crate::error::{AppError, AppResult};
 use crate::eval::{FinetunePackResult, GoldEvalExport};
@@ -21,8 +21,16 @@ impl JobStore {
         Self { runtime }
     }
 
-    fn lock(&self, operation: &str) -> std::sync::MutexGuard<'_, crate::db::Database> {
-        self.runtime.lock().unwrap_or_else(|poisoned| {
+    fn begin_mutation(&self) -> AppResult<MutationGuard<'_>> {
+        self.runtime.begin_mutation().map_err(AppError::Other)
+    }
+
+    fn lock_after_mutation(
+        &self,
+        operation: &str,
+        mutation: &MutationGuard<'_>,
+    ) -> std::sync::MutexGuard<'_, crate::db::Database> {
+        self.runtime.lock_after_mutation(mutation).unwrap_or_else(|poisoned| {
             tracing::warn!(operation, "Recovering poisoned database lock during a job write");
             poisoned.into_inner()
         })
@@ -33,33 +41,33 @@ impl JobStore {
     }
 
     pub(crate) fn discard_interrupted_import(&self, job_id: &str) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("discard_interrupted_import").discard_import_job(job_id)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("discard_interrupted_import", &mutation).discard_import_job(job_id)
     }
 
     pub(crate) fn begin_import(&self, directory: &str, total_files: usize) -> AppResult<String> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("begin_import").begin_import_job(directory, total_files)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("begin_import", &mutation).begin_import_job(directory, total_files)
     }
 
     pub(crate) fn handoff_import_for_resume(&self, prior_job_id: &str) -> AppResult<String> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("handoff_import_for_resume").handoff_import_job_for_resume(prior_job_id)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("handoff_import_for_resume", &mutation).handoff_import_job_for_resume(prior_job_id)
     }
 
     pub(crate) fn continue_import(&self, job_id: &str, directory: &str, total_files: usize) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("continue_import").continue_import_job(job_id, directory, total_files)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("continue_import", &mutation).continue_import_job(job_id, directory, total_files)
     }
 
     pub(crate) fn mark_import_file_done(&self, job_id: &str, path: &str) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("mark_import_file_done").mark_import_file_done(job_id, path)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("mark_import_file_done", &mutation).mark_import_file_done(job_id, path)
     }
 
     pub(crate) fn complete_import(&self, job_id: &str) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("complete_import").complete_import_job(job_id)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("complete_import", &mutation).complete_import_job(job_id)
     }
 
     pub(crate) fn list_recent(&self, limit: i64) -> AppResult<Vec<Job>> {
@@ -73,8 +81,8 @@ impl JobStore {
         error_code: &str,
         work: impl FnOnce(&crate::db::Database) -> AppResult<T>,
     ) -> AppResult<T> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock(kind).run_tracked(job_id, kind, error_code, work)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation(kind, &mutation).run_tracked(job_id, kind, error_code, work)
     }
 
     pub(crate) fn export_dataset(&self, job_id: &str, path: &Path, format: &ExportFormat) -> AppResult<()> {

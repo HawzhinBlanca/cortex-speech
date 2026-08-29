@@ -1,6 +1,6 @@
 //! Durable import and processing write boundaries for publication, evidence, metadata and rollback.
 
-use crate::database_runtime::{begin_mutation, DatabaseRuntime};
+use crate::database_runtime::{DatabaseRuntime, MutationGuard};
 use crate::db::{
     ChampionTranscriptionSourceSnapshot, SegmentHypothesis, SourceAudioProvenance, SourceTranscriptRecord,
     SpeechSegment,
@@ -19,16 +19,24 @@ impl ImportWriteStore {
         Self { runtime }
     }
 
-    fn lock(&self, operation: &str) -> MutexGuard<'_, crate::db::Database> {
-        self.runtime.lock().unwrap_or_else(|poisoned| {
+    fn begin_mutation(&self) -> AppResult<MutationGuard<'_>> {
+        self.runtime.begin_mutation().map_err(AppError::Other)
+    }
+
+    fn lock_after_mutation(
+        &self,
+        operation: &str,
+        mutation: &MutationGuard<'_>,
+    ) -> MutexGuard<'_, crate::db::Database> {
+        self.runtime.lock_after_mutation(mutation).unwrap_or_else(|poisoned| {
             tracing::warn!(operation, "Recovering poisoned database lock during an import write");
             poisoned.into_inner()
         })
     }
 
     pub(crate) fn publish_segments(&self, segments: &[SpeechSegment]) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("publish_import_segments").insert_segments_batch(segments)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("publish_import_segments", &mutation).insert_segments_batch(segments)
     }
 
     pub(crate) fn publish_segments_with_identity(
@@ -36,8 +44,9 @@ impl ImportWriteStore {
         segments: &[SpeechSegment],
         identity: &AudioIdentity,
     ) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("publish_import_segments_with_identity").insert_segments_with_audio_identity_batch(segments, identity)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("publish_import_segments_with_identity", &mutation)
+            .insert_segments_with_audio_identity_batch(segments, identity)
     }
 
     pub(crate) fn publish_champion_segments(
@@ -46,8 +55,8 @@ impl ImportWriteStore {
         deployment_sha256: &str,
         identity: Option<&AudioIdentity>,
     ) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("publish_champion_import_segments").insert_champion_segments_batch(
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("publish_champion_import_segments", &mutation).insert_champion_segments_batch(
             segments,
             deployment_sha256,
             identity,
@@ -55,8 +64,8 @@ impl ImportWriteStore {
     }
 
     pub(crate) fn rollback_segments(&self, segment_ids: &[String]) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("rollback_import_segments").delete_segments_batch(segment_ids)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("rollback_import_segments", &mutation).delete_segments_batch(segment_ids)
     }
 
     pub(crate) fn update_alignment_if_unchanged(
@@ -66,8 +75,8 @@ impl ImportWriteStore {
         alignment_json: &str,
         quality: &str,
     ) -> AppResult<bool> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("update_import_alignment").update_segment_alignment_if_unchanged(
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("update_import_alignment", &mutation).update_segment_alignment_if_unchanged(
             segment_id,
             expected_alignment,
             alignment_json,
@@ -76,28 +85,28 @@ impl ImportWriteStore {
     }
 
     pub(crate) fn upsert_source_transcript(&self, record: &SourceTranscriptRecord) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("upsert_import_source_transcript").upsert_source_transcript(record)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("upsert_import_source_transcript", &mutation).upsert_source_transcript(record)
     }
 
     pub(crate) fn upsert_source_audio_provenance(&self, record: &SourceAudioProvenance) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("upsert_import_source_provenance").upsert_source_audio_provenance(record)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("upsert_import_source_provenance", &mutation).upsert_source_audio_provenance(record)
     }
 
     pub(crate) fn record_loop0_shadow(&self, segment_id: &str, memory_fired: bool) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("record_import_loop0_shadow").record_loop0_shadow(segment_id, memory_fired)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("record_import_loop0_shadow", &mutation).record_loop0_shadow(segment_id, memory_fired)
     }
 
     pub(crate) fn update_machine_speaker(&self, segment_id: &str, speaker_id: &str) -> AppResult<bool> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("update_machine_speaker").update_speaker_id(segment_id, Some(speaker_id))
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("update_machine_speaker", &mutation).update_speaker_id(segment_id, Some(speaker_id))
     }
 
     pub(crate) fn insert_hypothesis(&self, hypothesis: &SegmentHypothesis) -> AppResult<()> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("insert_import_hypothesis").insert_hypothesis(hypothesis)
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("insert_import_hypothesis", &mutation).insert_hypothesis(hypothesis)
     }
 
     #[cfg(test)]
@@ -109,14 +118,15 @@ impl ImportWriteStore {
         confidence_source: Option<&str>,
         cloud_call: bool,
     ) -> AppResult<bool> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("commit_import_champion_transcript").commit_champion_transcript_if_unreviewed(
-            champion,
-            expected_deployment_sha256,
-            normalized_transcript,
-            confidence_source,
-            cloud_call,
-        )
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("commit_import_champion_transcript", &mutation)
+            .commit_champion_transcript_if_unreviewed(
+                champion,
+                expected_deployment_sha256,
+                normalized_transcript,
+                confidence_source,
+                cloud_call,
+            )
     }
 
     pub(crate) fn commit_bound_champion_transcript_if_unreviewed(
@@ -128,15 +138,16 @@ impl ImportWriteStore {
         cloud_call: bool,
         expected_source: &ChampionTranscriptionSourceSnapshot,
     ) -> AppResult<bool> {
-        let _mutation = begin_mutation().map_err(AppError::Other)?;
-        self.lock("commit_bound_import_champion_transcript").commit_bound_champion_transcript_if_unreviewed(
-            champion,
-            expected_deployment_sha256,
-            normalized_transcript,
-            confidence_source,
-            cloud_call,
-            expected_source,
-        )
+        let mutation = self.begin_mutation()?;
+        self.lock_after_mutation("commit_bound_import_champion_transcript", &mutation)
+            .commit_bound_champion_transcript_if_unreviewed(
+                champion,
+                expected_deployment_sha256,
+                normalized_transcript,
+                confidence_source,
+                cloud_call,
+                expected_source,
+            )
     }
 }
 
