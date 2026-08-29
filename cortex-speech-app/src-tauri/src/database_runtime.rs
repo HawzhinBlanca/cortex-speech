@@ -47,6 +47,17 @@ impl DatabaseRuntime {
         self.admission.lock(&self.writer)
     }
 
+    /// Acquire the serialized writer after this runtime's mutation authority is already held.
+    /// Re-entering `RestoreAdmission::lock` here would hold the admission mutex while waiting for
+    /// the database mutex, preventing restore from observing `mutations_active` and refusing.
+    pub(crate) fn lock_after_mutation(&self, mutation: &MutationGuard<'_>) -> LockResult<MutexGuard<'_, Database>> {
+        assert!(
+            std::ptr::eq(self.admission.as_ref(), mutation.admission),
+            "database writer mutation authority belongs to another runtime"
+        );
+        self.writer.lock()
+    }
+
     /// Open one stable, query-only WAL snapshot under a bounded permit. Restore admission spans the
     /// complete reader lifetime so a command cannot observe two database generations.
     pub(crate) fn open_read(&self) -> AppResult<ReadDatabase<'_>> {
@@ -425,6 +436,23 @@ mod tests {
         drop(first);
         let reopened = runtime.open_read().unwrap();
         assert_eq!(reopened.segment_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn writer_lock_after_mutation_keeps_restore_admission_closed() {
+        let (_directory, runtime) = file_runtime(1, Duration::from_millis(20));
+        let mutation = runtime.admission.begin_mutation().expect("claim runtime mutation authority");
+        {
+            let database = runtime.lock_after_mutation(&mutation).unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(database.segment_count().unwrap(), 0);
+        }
+
+        let error = runtime.admission.try_reserve().err().expect("restore must see the active mutation");
+        assert!(error.contains("mutation is already in progress"), "{error}");
+        drop(mutation);
+
+        let reservation = runtime.admission.try_reserve().expect("restore may proceed after mutation release");
+        drop(reservation);
     }
 
     #[test]
